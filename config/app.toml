@@ -3,70 +3,99 @@
 # не создавать — сервис запустится «из коробки».
 # Переопределение через окружение: FUMOX_СЕКЦИЯ__КЛЮЧ, например
 # FUMOX_ADMIN__TOKEN=secret (двойное подчёркивание разделяет секции).
+#
+# Fumox — application configuration (SPEC §12, ADMIN_PLAN §2).
+# Every key has a default: the file may be trimmed down to the sections you
+# need or omitted entirely — the service runs out of the box.
+# Environment overrides: FUMOX_SECTION__KEY, e.g. FUMOX_ADMIN__TOKEN=secret
+# (a double underscore separates the section from the key).
 
 [server]
 # Публичный слушатель для GET /sub/{id} и GET /src/{id}.
+# Public listener for GET /sub/{id} and GET /src/{id}.
 bind = "0.0.0.0:8080"
 
 [database]
 # SQLite (WAL) — единственный источник истины.
+# SQLite (WAL) — the single source of truth.
 path = "fumox.db"
-busy_timeout_ms = 5000      # обязателен: пишут два процесса (server и probe)
+# обязателен: пишут два процесса (server и probe)
+# required: two processes write to the database (server and probe)
+busy_timeout_ms = 5000
 max_connections = 8
 
 [fetch]
 # Загрузка источников (PLAN, пробелы 4–5, 12).
+# Source fetching (PLAN, gaps 4–5, 12).
 connect_timeout_secs = 10
 read_timeout_secs = 30
-max_response_bytes = 10485760   # 10 МиБ; защита от decompression-bomb
-max_concurrency = 4             # семафор параллельных загрузок
-max_retries = 2                 # только для устранимых классов (network, http_server)
-retry_base_backoff_ms = 500     # экспоненциальный backoff от этой базы
-# user_agent = "fumox/0.1"     # переопределяется headers конкретного источника
+max_response_bytes = 10485760   # 10 МиБ; защита от decompression-bomb / 10 MiB; decompression-bomb guard
+max_concurrency = 4             # семафор параллельных загрузок / concurrency semaphore for fetches
+# только для устранимых классов (network, http_server)
+# retries apply only to recoverable error classes (network, http_server)
+max_retries = 2
+retry_base_backoff_ms = 500     # экспоненциальный backoff от этой базы / exponential backoff base for retries
+# user_agent = "fumox/0.1"     # переопределяется headers конкретного источника / overridden by per-source headers
 
 [geo]
-# Гео-обогащение MaxMind GeoLite2 (SPEC §6). Файлы .mmdb не коммитятся.
+# Гео-обогащение MaxMind GeoLite2 (SPEC §6). Файлы .mmdb не коммитятся; при
+# старте сервер сам скачивает отсутствующие/устаревшие базы в db_dir, если
+# каталог доступен для записи.
+# MaxMind GeoLite2 geo enrichment (SPEC §6). The .mmdb files are never
+# committed; at startup the server downloads missing/stale databases into
+# db_dir on its own, provided the directory is writable.
 enabled = true
-db = "country"                # country | city | asn (по умолчанию Country)
-db_dir = "config"             # каталог с GeoLite2-{Country,City,ASN}.mmdb
-cache_max_entries = 16384     # кэш host→geo (moka)
+db = "country"                # country | city | asn (по умолчанию Country / Country by default)
+db_dir = "data"             # каталог с GeoLite2-{Country,City,ASN}.mmdb / directory holding GeoLite2-{Country,City,ASN}.mmdb
+cache_max_entries = 16384     # кэш host→geo (moka) / host→geo cache (moka)
 dns_timeout_secs = 5
 
 [admin]
 # Админка (ADMIN_PLAN §2–3). Пустой token = админка отключена (отдаёт 404).
+# Admin panel (ADMIN_PLAN §2–3). An empty token disables the panel (it answers 404).
 enabled = true
 token = "change-me"
-bind = "127.0.0.1:8081"       # отдельный слушатель; наружу — reverse-proxy/SSH-туннель
-session_ttl_hours = 168       # 7 дней
-allow_private_urls = false    # SSRF-защита источников
-rate_limit = "120/min"        # /admin/* кроме login
+# отдельный слушатель; наружу — reverse-proxy/SSH-туннель
+# a separate listener; expose it through a reverse proxy or an SSH tunnel
+bind = "127.0.0.1:8081"
+session_ttl_hours = 168       # 7 дней / 7 days
+allow_private_urls = false    # SSRF-защита источников / SSRF guard for source URLs
+rate_limit = "120/min"        # /admin/* кроме login / /admin/* except login
 login_rate_limit = "5/min"    # POST /admin/login
-locales_dir = "locales"       # каталог переводов админки (<код>.toml); новый файл = новый язык после рестарта
+# каталог переводов админки (<код>.toml); новый файл = новый язык после рестарта
+# admin UI translation catalogs (<code>.toml); a new file adds a language after restart
+locales_dir = "locales"
 
 [probe]
 # Демон проверки живучести (SPEC §8).
-cycle_interval_secs = 60      # период цикла планирования
-sample_size = 50              # случайная выборка прокси за цикл (без всплесков)
-fail_limit = 3                # неудач подряд до карантина
+# Health-check daemon (SPEC §8).
+cycle_interval_secs = 600      # период цикла планирования / scheduling cycle period
+sample_size = 50              # случайная выборка прокси за цикл (без всплесков) / random proxy sample per cycle (no bursts)
+fail_limit = 3                # неудач подряд до карантина / consecutive failures before quarantine
 connect_timeout_secs = 10     # T1: TCP-connect
 tls_timeout_secs = 10         # T1: TLS-handshake
 concurrency = 8
-heartbeat_interval_secs = 30  # meta-ключ probe_heartbeat для админки
+heartbeat_interval_secs = 30  # meta-ключ probe_heartbeat для админки / probe_heartbeat meta key consumed by the admin panel
 # Второй шанс: окно [24ч, 48ч) после карантина (SPEC §8.3a):
+# second_chance_at = quarantined_at + min + U(0..spread), UTC.
+# Second chance: a recheck window of [24h, 48h) after quarantine (SPEC §8.3a):
 # second_chance_at = quarantined_at + min + U(0..spread), UTC.
 second_chance_min_hours = 24
 second_chance_spread_hours = 24
-retention_interval_secs = 86400   # период ротации истории
+retention_interval_secs = 86400   # период ротации истории / history rotation period
 
 [meow]
 # meow-rs — отдельный системный сервис (SPEC §8.2); Fumox им не управляет,
 # только дёргает REST API и перезагружает конфиг через PUT /configs.
+# meow-rs runs as a separate system service (SPEC §8.2); Fumox does not manage
+# it — it only calls its REST API and reloads its config via PUT /configs.
 api_addr = "127.0.0.1:9090"
-config_path = "config/meow.yaml"  # Clash YAML, генерируется probe
-test_url = "http://www.gstatic.com/generate_204"  # может быть заблокирован — поменять
+config_path = "config/meow.yaml"  # Clash YAML, генерируется probe / Clash YAML generated by the probe
+test_url = "http://www.gstatic.com/generate_204"  # может быть заблокирован — поменять / may be blocked — replace it with a reachable one
 timeout_secs = 10
 
 [retention]
 # Ротация истории (ежедневная задача в probe).
+# History rotation (a daily task in the probe daemon).
 probe_results_days = 14
 fetch_log_days = 30

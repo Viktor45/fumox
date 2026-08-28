@@ -11,19 +11,13 @@
 {% else %}
 <span id="refresh-status">
   {% if ok %}
-    <span class="badge on">
-      {% match done_message %}
-        {% when Some with (message) %}{{ message }}
-        {% when None %}{{ self.t("common.done") }}
-      {% endmatch %}
-    </span>
+    <span class="badge on">{{ self.t("common.done") }}</span>
   {% else %}
-    <span class="badge error">
-      {% match done_message %}
-        {% when Some with (message) %}{{ message }}
-        {% when None %}{{ self.t("common.error") }}
-      {% endmatch %}
-    </span>
+    <span class="badge error">{{ self.t("common.error") }}</span>
   {% endif %}
+  {% match done_message %}
+    {% when Some with (message) %} <span class="small">{{ message }}</span>
+    {% when None %}
+  {% endmatch %}
 </span>
 {% endif %}

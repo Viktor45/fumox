@@ -12,6 +12,7 @@ use crate::events::EventBus;
 use crate::fetcher::Fetcher;
 use crate::ingest;
 use fumox_core::db::DbPool;
+use fumox_core::geo::GeoResolver;
 use fumox_core::models::Source;
 use fumox_core::repo::sources;
 use std::collections::HashSet;
@@ -55,6 +56,15 @@ impl SchedulerState {
     }
 }
 
+/// Shared resources every ingestion task needs; cheap to clone per task.
+#[derive(Clone)]
+struct IngestEnv {
+    pool: DbPool,
+    fetcher: Fetcher,
+    caches: Caches,
+    geo: Arc<GeoResolver>,
+}
+
 /// Run the scheduler until the process shuts down.
 ///
 /// `refresh_rx` carries source ids that must be refreshed immediately
@@ -63,24 +73,31 @@ pub async fn run(
     pool: DbPool,
     fetcher: Fetcher,
     caches: Caches,
+    geo: Arc<GeoResolver>,
     state: SchedulerState,
     events: EventBus,
     mut refresh_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
+    let env = IngestEnv {
+        pool,
+        fetcher,
+        caches,
+        geo,
+    };
     let mut tick = tokio::time::interval(SWEEP_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                sweep(&pool, &fetcher, &caches, &state, &events).await;
+                sweep(&env, &state, &events).await;
             }
             maybe_id = refresh_rx.recv() => {
                 let Some(source_id) = maybe_id else {
                     break; // channel closed — shutting down
                 };
-                if let Ok(Some(source)) = sources::get(&pool, &source_id).await {
+                if let Ok(Some(source)) = sources::get(&env.pool, &source_id).await {
                     // Explicit "refresh now": always hit the network.
-                    spawn_ingest(&pool, &fetcher, &caches, &state, &events, source, true);
+                    spawn_ingest(&env, &state, &events, source, true);
                 } else {
                     tracing::warn!(source = %source_id, "refresh requested for unknown source");
                 }
@@ -90,14 +107,8 @@ pub async fn run(
 }
 
 /// One scheduler sweep: ingest every enabled source that is due.
-async fn sweep(
-    pool: &DbPool,
-    fetcher: &Fetcher,
-    caches: &Caches,
-    state: &SchedulerState,
-    events: &EventBus,
-) {
-    let due = match sources::list(pool, true).await {
+async fn sweep(env: &IngestEnv, state: &SchedulerState, events: &EventBus) {
+    let due = match sources::list(&env.pool, true).await {
         Ok(all) => {
             let now = fumox_core::models::now_ts();
             all.into_iter()
@@ -119,7 +130,7 @@ async fn sweep(
 
     let mut tasks = JoinSet::new();
     for source in due {
-        if let Some(handle) = spawn_ingest(pool, fetcher, caches, state, events, source, false) {
+        if let Some(handle) = spawn_ingest(env, state, events, source, false) {
             tasks.spawn(handle);
         }
     }
@@ -129,17 +140,13 @@ async fn sweep(
 /// Spawn one ingestion task if the source is not already in flight.
 /// Returns the join handle, or `None` when skipped.
 fn spawn_ingest(
-    pool: &DbPool,
-    fetcher: &Fetcher,
-    caches: &Caches,
+    env: &IngestEnv,
     state: &SchedulerState,
     events: &EventBus,
     source: Source,
     force: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let pool = pool.clone();
-    let fetcher = fetcher.clone();
-    let caches = caches.clone();
+    let env = env.clone();
     let state = state.clone();
     let events = events.clone();
     let source_id = source.id.clone();
@@ -147,6 +154,12 @@ fn spawn_ingest(
     // The in-flight guard is acquired atomically (mutex + set insert) inside
     // the spawned task; a duplicate spawn for the same source returns early.
     let fut = async move {
+        let IngestEnv {
+            pool,
+            fetcher,
+            caches,
+            geo,
+        } = env;
         if !state.acquire_source(&source_id).await {
             tracing::debug!(source = %source_id, "source already fetching; skipping");
             return;
@@ -159,7 +172,7 @@ fn spawn_ingest(
             Ok(permit) => permit,
             Err(_) => return, // semaphore closed during shutdown
         };
-        let outcome = ingest::ingest_source(&pool, &fetcher, &caches, &source, force).await;
+        let outcome = ingest::ingest_source(&pool, &fetcher, &caches, &geo, &source, force).await;
         drop(permit);
         state.release_source(&source_id).await;
         match outcome {

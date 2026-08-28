@@ -48,7 +48,7 @@
           {% when None %}<span class="muted">—</span>
         {% endmatch %}
       </td></tr>
-      <tr><th>{{ self.t("src.endpoint") }}</th><td class="mono small"><a href="{{ serve_path }}">{{ serve_path }}</a></td></tr>
+      <tr><th>{{ self.t("src.endpoint") }}</th><td class="mono small"><a href="{{ serve_url }}">{{ serve_url }}</a></td></tr>
       <tr><th>{{ self.t("src.encoding") }}</th><td>{{ source.encoding.as_str() }}</td></tr>
       <tr><th>{{ self.t("src.input_format") }}</th><td>
         {% match source.input_format %}

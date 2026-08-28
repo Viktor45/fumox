@@ -79,11 +79,11 @@ Concretely, Fumox:
 What this means in practice:
 
 | Without Fumox                                                    | With Fumox                                 |
-|------------------------------------------------------------------|--------------------------------------------|
+| ---------------------------------------------------------------- | ------------------------------------------ |
 | A dozen subscription URLs, each dying or changing without notice | One stable URL per use case                |
 | Dead proxies sit in your client until you notice                 | Dead proxies are quarantined automatically |
 | The same node appears three times under different names          | Duplicates are merged across all sources   |
-| Names like `relay-01-xyz`                                        | Names like `🇩🇪 Germany · relay-01-xyz`     |
+| Names like `relay-01-xyz`                                        | Names like `🇩🇪 Germany · relay-01-xyz`      |
 | One format per source                                            | One format per profile — you choose        |
 
 ## 2. How it works
@@ -308,7 +308,7 @@ All public endpoints live on the public listener (default port **8080**).
 | Endpoint        | Description                                                                  |
 | --------------- | ---------------------------------------------------------------------------- |
 | `GET /sub/{id}` | Merged subscription for a **profile**. `{id}` is the profile id or its slug. |
-| `GET /src/{id}` | Parsed proxies of a **single source**. `{id}` is the source id or slug.      |
+| `GET /src/{id}` | Parsed proxies of a **single source**, alive-only (never-probed, quarantined and removed proxies are excluded). `{id}` is the source id or slug. |
 | `GET /healthz`  | Liveness probe, returns `ok`.                                                |
 
 ### Access tokens
@@ -636,6 +636,8 @@ MaxMind GeoLite2 databases.
 
 **Setup:**
 
+Manual installation (e.g. with your own MaxMind license) works the same:
+
 1. Register a free account at <https://www.maxmind.com/en/geolite2/signup>.
 2. Download the database you need via
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/).
@@ -645,6 +647,10 @@ MaxMind GeoLite2 databases.
 Pick the database with `[geo].db` (`country` by default). If the file is
 missing, geo enrichment quietly disables itself (a warning is logged) and
 everything else keeps working. MaxMind updates their databases weekly.
+
+Fumox fetches the databases itself: at startup the server checks
+`[geo].db_dir` and downloads any GeoLite2 database that is missing, broken
+or older than a month from a public release mirror.
 
 **Name templates.** The `geo.template` pipeline setting (default
 `"{flag} {country} · {name}"`) supports these placeholders:
@@ -659,10 +665,19 @@ everything else keeps working. MaxMind updates their databases weekly.
 | `{name}`    | The original display name             | —                        |
 
 A placeholder with no data behind it collapses to nothing — extra whitespace
-and dangling separators are cleaned up, so
-`"{flag} {country} {city} · {name}"` still looks right when the city is
-unknown. The name is left completely untouched only when there is no geo data
-at all. DNS and geo lookups are cached (hosts repeat a lot).
+and dangling separators are cleaned up, so `"{flag} {country} {city} · {name}"`
+still looks right when the city is unknown. The name is left completely
+untouched only when there is no geo data at all. DNS and geo lookups are
+cached (hosts repeat a lot).
+
+**Stored geo facts.** The country, city and ASN resolved for each proxy are
+persisted to the database at ingest time (and a background pass at startup
+fills in proxies that were ingested before a database was available). This is
+what feeds the admin panel: the country filter in the *Proxies* list and the
+*Geography* block of the proxy card show stored facts, so they populate after
+the next source refresh or server restart — even if no subscription has been
+requested yet. A fresh lookup that returns nothing never erases facts already
+stored.
 
 ## 12. Data, backups, retention
 
@@ -733,7 +748,7 @@ WantedBy=multi-user.target
 | `X-Fumox-Stale: true` header                                          | Some sources are temporarily unreachable; last good data is being served. The fetch log shows which sources and why (`error_class`).               |
 | Source shows `parse_error`                                            | The source returned HTTP 200 but unparseable content (anti-bot page, CDN stub, format change). The last good snapshot is served meanwhile.         |
 | Source won't save: "private URL" error                                | The URL resolves to a loopback/private address and `allow_private_urls` is false. That's the SSRF guard working.                                   |
-| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir`, or `[geo].enabled = false`. Check the startup log for a geo warning.                            |
+| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`.                                                                      |
 | T2 checks never run, probe logs mention meow backoff                  | meow-rs is down or `[meow].api_addr` is wrong. In Docker, it must be `meow:9090`; the config path must be the shared volume (`/shared/meow.yaml`). |
 | `SQLITE_BUSY` errors in logs                                          | `busy_timeout_ms` was removed or set too low while two processes write to the DB. Restore the default (5000).                                      |
 | Build fails: `sqlite3.h: No such file`                                | Install the system SQLite dev package (`libsqlite3-dev` on Debian/Ubuntu).                                                                         |

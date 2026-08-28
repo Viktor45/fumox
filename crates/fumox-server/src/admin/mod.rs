@@ -15,12 +15,13 @@ use crate::events::EventBus;
 use crate::fetcher::Fetcher;
 use crate::scheduler::SchedulerState;
 use askama::Template;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::config::{AdminConfig, MeowConfig, ProbeConfig, RetentionConfig};
 use fumox_core::db::DbPool;
 use fumox_core::geo::GeoResolver;
 use i18n::Lang;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Shared state for every admin handler.
@@ -40,6 +41,9 @@ pub struct AdminState {
     pub fetcher: Fetcher,
     /// The `[admin]` configuration block (token, rate limits, TTL).
     pub admin: AdminConfig,
+    /// Public subscription listener (`[server].bind`); its port builds the
+    /// serve links shown on the source/profile cards.
+    pub server_bind: SocketAddr,
     /// Read-only probe/meow/retention settings shown on `/admin/probe`
     /// (ADMIN_PLAN §4.5).
     pub probe: ProbeConfig,
@@ -95,6 +99,7 @@ impl AdminState {
             events,
             fetcher,
             admin: config.admin.clone(),
+            server_bind: config.server.bind,
             probe: config.probe.clone(),
             meow: config.meow.clone(),
             retention: config.retention.clone(),
@@ -104,6 +109,14 @@ impl AdminState {
             admin_limiter,
             locales,
         }
+    }
+
+    /// Base URL for the serve links shown on the source/profile cards:
+    /// the host the admin panel was opened on (Host header) with the
+    /// public port from `[server].bind`, https when the admin request
+    /// itself arrived over https (see `request_is_https`).
+    fn serve_base(&self, headers: &HeaderMap) -> String {
+        serve_base(self.server_bind, headers)
     }
 
     /// Session TTL as a duration.
@@ -249,6 +262,71 @@ async fn static_htmx() -> impl IntoResponse {
     )
 }
 
+/// Build the base URL of the public subscription endpoints from the
+/// public listener address and the request's `Host` header: the host the
+/// admin panel was opened on, with the public port from `[server].bind`.
+/// The default port (80/443 matching the scheme) is omitted.
+fn serve_base(bind: SocketAddr, headers: &HeaderMap) -> String {
+    let scheme = if request_is_https(headers) {
+        "https"
+    } else {
+        "http"
+    };
+    let host = host_from_headers(bind, headers);
+    let default_port =
+        (scheme == "http" && bind.port() == 80) || (scheme == "https" && bind.port() == 443);
+    if default_port {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}:{}", bind.port())
+    }
+}
+
+/// Hostname for serve links: the host part of the request's `Host` header
+/// (admin port stripped, IPv6 brackets kept); without a usable header, the
+/// bound IP — unless it is unspecified, then loopback.
+fn host_from_headers(bind: SocketAddr, headers: &HeaderMap) -> String {
+    match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        Some(h) if !h.is_empty() => {
+            if let Some(rest) = h.strip_prefix('[') {
+                format!("[{}]", rest.split(']').next().unwrap_or(rest))
+            } else {
+                h.rsplit_once(':')
+                    .map_or_else(|| h.to_string(), |(host, _)| host.to_string())
+            }
+        }
+        _ => {
+            let ip = bind.ip();
+            if ip.is_unspecified() {
+                "127.0.0.1".to_string()
+            } else if ip.is_ipv6() {
+                format!("[{ip}]")
+            } else {
+                ip.to_string()
+            }
+        }
+    }
+}
+
+/// True when the admin request itself arrived over https through a
+/// TLS-terminating reverse proxy: `X-Forwarded-Proto: https` (de facto
+/// standard) or an RFC 7239 `Forwarded: proto=https` element. Fumox never
+/// terminates TLS itself, so without such a header the scheme is http.
+fn request_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|p| p.trim().eq_ignore_ascii_case("https")))
+        || headers
+            .get(header::FORWARDED)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.to_ascii_lowercase()
+                    .split([',', ';'])
+                    .any(|p| p.trim().trim_start_matches("proto=") == "https")
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +338,74 @@ mod tests {
     use tower::ServiceExt;
 
     const TOKEN: &str = "test-admin-token";
+
+    #[test]
+    fn serve_base_uses_host_header_and_public_port() {
+        let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "vpn.example.com:8081".parse().unwrap());
+        assert_eq!(serve_base(bind, &h), "http://vpn.example.com:8080");
+
+        // Host without a port.
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        assert_eq!(serve_base(bind, &h), "http://vpn.example.com:8080");
+
+        // IPv6 keeps its brackets; the admin port is stripped.
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "[::1]:8081".parse().unwrap());
+        assert_eq!(serve_base(bind, &h), "http://[::1]:8080");
+
+        // No Host header: loopback for an unspecified bind address,
+        // the bound IP itself when it is specific.
+        assert_eq!(serve_base(bind, &HeaderMap::new()), "http://127.0.0.1:8080");
+        let bind: SocketAddr = "192.168.1.5:8080".parse().unwrap();
+        assert_eq!(
+            serve_base(bind, &HeaderMap::new()),
+            "http://192.168.1.5:8080"
+        );
+    }
+
+    #[test]
+    fn serve_base_switches_to_https_behind_tls_proxy() {
+        let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        h.insert(
+            header::HeaderName::from_static("x-forwarded-proto"),
+            "https".parse().unwrap(),
+        );
+        assert_eq!(serve_base(bind, &h), "https://vpn.example.com:8080");
+
+        // RFC 7239 Forwarded header.
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        h.insert(
+            header::FORWARDED,
+            "for=10.0.0.1;proto=https".parse().unwrap(),
+        );
+        assert_eq!(serve_base(bind, &h), "https://vpn.example.com:8080");
+
+        // Explicit http stays http.
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        h.insert(
+            header::HeaderName::from_static("x-forwarded-proto"),
+            "http".parse().unwrap(),
+        );
+        assert_eq!(serve_base(bind, &h), "http://vpn.example.com:8080");
+
+        // A default port matching the scheme is omitted from the URL.
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        h.insert(
+            header::HeaderName::from_static("x-forwarded-proto"),
+            "https".parse().unwrap(),
+        );
+        let bind: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        assert_eq!(serve_base(bind, &h), "https://vpn.example.com");
+    }
 
     fn admin_config(admin_limit: u32) -> fumox_core::config::AdminConfig {
         fumox_core::config::AdminConfig {

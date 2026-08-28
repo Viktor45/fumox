@@ -11,6 +11,7 @@
 use crate::cache::Caches;
 use crate::fetcher::{FetchFailure, FetchedPayload, Fetcher};
 use fumox_core::db::DbPool;
+use fumox_core::geo::GeoResolver;
 use fumox_core::models::{ProxyEntry, Source};
 use fumox_core::repo::{fetch_log, proxies, sources};
 
@@ -42,10 +43,17 @@ impl IngestOutcome {
 /// source TTL) short-circuits the HTTP fetch — the database is already
 /// reconciled from that payload (SPEC §7 raw cache). Forced refreshes
 /// ("обновить сейчас" from the admin panel) always hit the network.
+///
+/// Geo facts are resolved per proxy host while the raw payload is already
+/// parsed (the resolver caches both DNS and lookups) and persisted onto the
+/// `proxies.geo_*` columns during reconciliation, so the admin panel's
+/// country filter and geo card work without waiting for a subscription
+/// render (SPEC §6).
 pub async fn ingest_source(
     pool: &DbPool,
     fetcher: &Fetcher,
     caches: &Caches,
+    geo: &GeoResolver,
     source: &Source,
     force: bool,
 ) -> IngestOutcome {
@@ -78,7 +86,8 @@ pub async fn ingest_source(
     match parse_payload(source, &payload) {
         Ok(entries) => {
             let found = entries.len();
-            match proxies::reconcile_source(pool, &source.id, &entries, now).await {
+            let geo_stamps = resolve_geo_stamps(geo, &entries).await;
+            match proxies::reconcile_source(pool, &source.id, &entries, &geo_stamps, now).await {
                 Ok(stats) => {
                     journal_success(pool, source, &payload, found, now).await;
                     IngestOutcome::Ok {
@@ -159,6 +168,27 @@ pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome
             message,
         },
     }
+}
+
+/// Resolve geo facts for every parsed entry, parallel to `entries`. With an
+/// inactive resolver (geo disabled or database missing) every stamp is
+/// `None`, which the upsert treats as "keep what is stored".
+async fn resolve_geo_stamps(
+    geo: &GeoResolver,
+    entries: &[ProxyEntry],
+) -> Vec<Option<proxies::GeoStamp>> {
+    if !geo.is_active() {
+        return Vec::new();
+    }
+    let mut stamps = Vec::with_capacity(entries.len());
+    for entry in entries {
+        stamps.push(
+            geo.resolve(&entry.host)
+                .await
+                .map(|info| proxies::GeoStamp::from_info(&info)),
+        );
+    }
+    stamps
 }
 
 /// Decode + parse the raw payload according to the source settings.

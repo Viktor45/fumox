@@ -569,6 +569,7 @@ struct ProfileDetailTemplate {
     csrf: String,
     profile: Profile,
     serve_path: String,
+    serve_url: String,
     token_display: String,
     pipeline_display: String,
     composition: Vec<CompositionRow>,
@@ -650,6 +651,14 @@ pub async fn profile_detail(
             ),
         };
 
+    let serve_path = format!(
+        "/sub/{}",
+        profile.slug.clone().unwrap_or_else(|| profile.id.clone())
+    );
+    // Absolute serve link: the host the admin panel was opened on with the
+    // public port from [server].bind (ADMIN_PLAN §4.2).
+    let serve_url = format!("{}{}", state.serve_base(&headers), serve_path);
+
     let token_display = profile
         .access_token
         .as_deref()
@@ -663,10 +672,8 @@ pub async fn profile_detail(
             theme,
             active: "profiles",
             csrf: state.csrf_for(&headers),
-            serve_path: format!(
-                "/sub/{}",
-                profile.slug.clone().unwrap_or_else(|| profile.id.clone())
-            ),
+            serve_path,
+            serve_url,
             token_display,
             pipeline_display: profile
                 .pipeline

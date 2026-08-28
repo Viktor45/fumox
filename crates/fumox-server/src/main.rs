@@ -9,6 +9,8 @@ mod admin;
 mod cache;
 mod events;
 mod fetcher;
+mod geo_backfill;
+mod geo_download;
 mod ingest;
 mod pipeline;
 mod scheduler;
@@ -42,11 +44,22 @@ async fn main() -> anyhow::Result<()> {
     let pool = fumox_core::db::connect_pool(&config.database).await?;
     fumox_core::db::migrate(&pool).await?;
 
+    // Best-effort GeoLite2 database download into [geo].db_dir: fetch what
+    // is missing, broken or older than a month. Runs before the geo
+    // resolver opens the files; failures never block startup (SPEC §6).
+    geo_download::ensure_geo_databases(&config).await;
+
     // Background source refresh loop: fetch → parse → reconcile → journal.
     let fetcher = Fetcher::new(config.fetch.clone(), config.admin.allow_private_urls);
     let scheduler_state = SchedulerState::new(config.fetch.max_concurrency);
     let caches = Caches::new();
     let geo = Arc::new(fumox_core::geo::GeoResolver::new(&config.geo));
+    // Fill the geo columns of proxies ingested before a database existed
+    // (background: never blocks startup, SPEC §6).
+    tokio::spawn(geo_backfill::backfill_missing_geo(
+        pool.clone(),
+        geo.clone(),
+    ));
     // Push updates to the admin panel over SSE (ADMIN_PLAN §9); the
     // scheduler publishes fetch lifecycle events onto this bus.
     let events = events::EventBus::new();
@@ -58,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         fetcher.clone(),
         caches.clone(),
+        geo.clone(),
         scheduler_state.clone(),
         events.clone(),
         refresh_rx,

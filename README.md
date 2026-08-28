@@ -77,3 +77,14 @@ The **[User Guide](./USERGUIDE.md)** is the place to start: what Fumox is,
 how it works, deployment (Docker Compose / image / source), the full
 configuration reference, and day-to-day usage. Russian version:
 [USERGUIDE.ru.md](./USERGUIDE.ru.md).
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+All trademarks are the property of their respective owners.
+
+Database Copyright (c) [MaxMind](https://www.maxmind.com/), Inc.
+- [GeoLite2 End User License Agreement](https://www.maxmind.com/en/geolite2/eula)
+- [GeoIP2 End User License Agreement](https://www.maxmind.com/en/end-user-license-agreement)
+- [Creative Commons Corporation Attribution-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-sa/4.0/)

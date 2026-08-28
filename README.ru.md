@@ -76,3 +76,14 @@ GeoLite2-базы MaxMind (`.mmdb`) не входят в репозиторий 
 Fumox, как он устроен, развёртывание (Docker Compose / образ / сборка из
 исходников), полный справочник по конфигурации и повседневное использование.
 Английская версия: [USERGUIDE.md](./USERGUIDE.md).
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+All trademarks are the property of their respective owners.
+
+Database Copyright (c) [MaxMind](https://www.maxmind.com/), Inc.
+- [GeoLite2 End User License Agreement](https://www.maxmind.com/en/geolite2/eula)
+- [GeoIP2 End User License Agreement](https://www.maxmind.com/en/end-user-license-agreement)
+- [Creative Commons Corporation Attribution-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-sa/4.0/)

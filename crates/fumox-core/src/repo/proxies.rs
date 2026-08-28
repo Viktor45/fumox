@@ -13,8 +13,41 @@
 //!    with no remaining links is marked `removed`.
 
 use crate::db::DbPool;
+use crate::geo::GeoInfo;
 use crate::models::{Param, ProxyEntry, Scheme};
 use sqlx::FromRow;
+
+/// The geo facts of one proxy, as stored in the `proxies.geo_*` columns.
+///
+/// Produced by the server at ingest time (and by the startup backfill);
+/// `None` fields mean "unknown", never "erase" — the upsert keeps existing
+/// values when a fresh lookup yields nothing (transient DNS failures must
+/// not wipe stored facts).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeoStamp {
+    /// ISO-3166-1 alpha-2 code, e.g. `"DE"` (Country/City database).
+    pub country: Option<String>,
+    /// City name (City database only).
+    pub city: Option<String>,
+    /// Autonomous system as `AS{n}` (ASN database only).
+    pub asn: Option<String>,
+}
+
+impl GeoStamp {
+    /// Project a resolved [`GeoInfo`] onto the persisted columns.
+    pub fn from_info(info: &GeoInfo) -> Self {
+        Self {
+            country: info.country_code.clone(),
+            city: info.city_name.clone(),
+            asn: info.asn.map(|asn| format!("AS{asn}")),
+        }
+    }
+
+    /// Whether the stamp carries no facts at all.
+    pub fn is_empty(&self) -> bool {
+        self.country.is_none() && self.city.is_none() && self.asn.is_none()
+    }
+}
 
 /// Outcome counters of one reconciliation pass (logging/admin metrics).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -97,10 +130,15 @@ impl ProxyRow {
 
 /// Upsert all entries of one fetch and reconcile links for the source.
 /// Runs in a single transaction.
+///
+/// `geo` runs parallel to `entries` (indexed access; a shorter slice or a
+/// `None` element means "no fresh geo facts" — the COALESCE upsert branch
+/// then keeps whatever is already stored).
 pub async fn reconcile_source(
     pool: &DbPool,
     source_id: &str,
     entries: &[ProxyEntry],
+    geo: &[Option<GeoStamp>],
     now: i64,
 ) -> crate::Result<ReconciliationStats> {
     let mut stats = ReconciliationStats::default();
@@ -127,21 +165,30 @@ pub async fn reconcile_source(
     // rule atomically with the refresh of mutable fields.
     let mut proxy_ids: Vec<i64> = Vec::with_capacity(entries.len());
     let mut seen_in_batch: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (entry, fingerprint) in entries.iter().zip(&fingerprints) {
+    for (idx, (entry, fingerprint)) in entries.iter().zip(&fingerprints).enumerate() {
         let params_json =
             super::json_to_text(&serde_json::Value::Object(entry.known_params_json()))?;
         let unknown_json =
             super::json_to_text(&serde_json::Value::Object(entry.unknown_params_json()))?;
+        let geo = geo
+            .get(idx)
+            .and_then(|stamp| stamp.as_ref())
+            .cloned()
+            .unwrap_or_default();
         let (id,): (i64,) = sqlx::query_as(
             "INSERT INTO proxies
                 (fingerprint, scheme, name, host, port, credential,
-                 params, unknown_params, raw_line, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 params, unknown_params, raw_line,
+                 geo_country, geo_city, geo_asn, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(fingerprint) DO UPDATE SET
                 name = excluded.name,
                 params = excluded.params,
                 unknown_params = excluded.unknown_params,
                 raw_line = excluded.raw_line,
+                geo_country = COALESCE(excluded.geo_country, proxies.geo_country),
+                geo_city = COALESCE(excluded.geo_city, proxies.geo_city),
+                geo_asn = COALESCE(excluded.geo_asn, proxies.geo_asn),
                 updated_at = excluded.updated_at,
                 status = CASE WHEN proxies.status IN ('removed', 'quarantine')
                               THEN 'unknown' ELSE proxies.status END,
@@ -170,6 +217,9 @@ pub async fn reconcile_source(
         .bind(&params_json)
         .bind(&unknown_json)
         .bind(&entry.raw_line)
+        .bind(&geo.country)
+        .bind(&geo.city)
+        .bind(&geo.asn)
         .bind(now)
         .bind(now)
         .fetch_one(&mut *tx)
@@ -228,6 +278,38 @@ pub async fn reconcile_source(
 
     tx.commit().await?;
     Ok(stats)
+}
+
+/// Batch of `(id, host)` rows that carry no geo facts at all (all three
+/// `geo_*` columns NULL), ordered by id past `after_id` — keyset pagination,
+/// so rows the resolver cannot answer are skipped without reappearing.
+pub async fn list_missing_geo(
+    pool: &DbPool,
+    after_id: i64,
+    limit: i64,
+) -> crate::Result<Vec<(i64, String)>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, host FROM proxies
+         WHERE id > ? AND geo_country IS NULL AND geo_city IS NULL AND geo_asn IS NULL
+         ORDER BY id LIMIT ?",
+    )
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Store resolved geo facts on one proxy row.
+pub async fn update_geo(pool: &DbPool, id: i64, geo: &GeoStamp) -> crate::Result<()> {
+    sqlx::query("UPDATE proxies SET geo_country = ?, geo_city = ?, geo_asn = ? WHERE id = ?")
+        .bind(&geo.country)
+        .bind(&geo.city)
+        .bind(&geo.asn)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn get_by_fingerprint(
@@ -843,7 +925,7 @@ mod tests {
             entry("one", "h1.example.com", 443),
             entry("two", "h2.example.com", 8443),
         ];
-        let stats = reconcile_source(&pool, "srcA0000000", &entries, 1000)
+        let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 1000)
             .await
             .unwrap();
         assert_eq!(stats.inserted, 2);
@@ -858,9 +940,15 @@ mod tests {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let original = entry("old-name", "h1.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&original), 1000)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&original),
+            &[],
+            1000,
+        )
+        .await
+        .unwrap();
 
         // Simulate probe state accumulated since the first fetch.
         let fp = original.fingerprint();
@@ -871,9 +959,15 @@ mod tests {
             .unwrap();
 
         let renamed = entry("new-name", "h1.example.com", 443);
-        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&renamed), 2000)
-            .await
-            .unwrap();
+        let stats = reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&renamed),
+            &[],
+            2000,
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.updated, 1);
         assert_eq!(stats.inserted, 0);
 
@@ -889,11 +983,17 @@ mod tests {
         make_source(&pool, "srcA0000000").await;
         let kept = entry("kept", "h1.example.com", 443);
         let gone = entry("gone", "h2.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", &[kept.clone(), gone.clone()], 1000)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            &[kept.clone(), gone.clone()],
+            &[],
+            1000,
+        )
+        .await
+        .unwrap();
 
-        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&kept), 2000)
+        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&kept), &[], 2000)
             .await
             .unwrap();
         assert_eq!(stats.unlinked, 1);
@@ -912,16 +1012,16 @@ mod tests {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("x", "h1.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), 1000)
+        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
             .await
             .unwrap();
-        reconcile_source(&pool, "srcA0000000", &[], 2000)
+        reconcile_source(&pool, "srcA0000000", &[], &[], 2000)
             .await
             .unwrap();
         assert_eq!(status_of(&pool, &e).await.0, "removed");
 
         // Reappearing in a live source resets the lifecycle.
-        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), 3000)
+        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 3000)
             .await
             .unwrap();
         assert_eq!(stats.resurrected, 1);
@@ -941,7 +1041,7 @@ mod tests {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("x", "h1.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), 1000)
+        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
             .await
             .unwrap();
 
@@ -957,7 +1057,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), 2000)
+        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 2000)
             .await
             .unwrap();
         assert_eq!(stats.resurrected, 1);
@@ -978,12 +1078,24 @@ mod tests {
         make_source(&pool, "srcB0000000").await;
         let shared = entry("shared", "h1.example.com", 443);
 
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&shared), 1000)
-            .await
-            .unwrap();
-        reconcile_source(&pool, "srcB0000000", std::slice::from_ref(&shared), 1100)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&shared),
+            &[],
+            1000,
+        )
+        .await
+        .unwrap();
+        reconcile_source(
+            &pool,
+            "srcB0000000",
+            std::slice::from_ref(&shared),
+            &[],
+            1100,
+        )
+        .await
+        .unwrap();
         // One proxy row, two links.
         let row = get_by_fingerprint(&pool, &shared.fingerprint())
             .await
@@ -998,7 +1110,7 @@ mod tests {
         assert_eq!(links.len(), 2);
 
         // Dropping from source A only: still linked via B.
-        let stats = reconcile_source(&pool, "srcA0000000", &[], 2000)
+        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000)
             .await
             .unwrap();
         assert_eq!(stats.unlinked, 1);
@@ -1006,7 +1118,7 @@ mod tests {
         assert_eq!(status_of(&pool, &shared).await.0, "unknown");
 
         // Dropping from B as well: now it is removed.
-        let stats = reconcile_source(&pool, "srcB0000000", &[], 3000)
+        let stats = reconcile_source(&pool, "srcB0000000", &[], &[], 3000)
             .await
             .unwrap();
         assert_eq!(stats.removed, 1);
@@ -1019,7 +1131,7 @@ mod tests {
         make_source(&pool, "srcA0000000").await;
         let a = entry("name-A", "h1.example.com", 443);
         let b = entry("name-B", "h1.example.com", 443); // same fingerprint
-        let stats = reconcile_source(&pool, "srcA0000000", &[a, b], 1000)
+        let stats = reconcile_source(&pool, "srcA0000000", &[a, b], &[], 1000)
             .await
             .unwrap();
         assert_eq!(stats.inserted, 1);
@@ -1036,7 +1148,7 @@ mod tests {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("conv", "h1.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), 1000)
+        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
             .await
             .unwrap();
         let row = get_by_fingerprint(&pool, &e.fingerprint())
@@ -1069,13 +1181,20 @@ mod tests {
             &pool,
             "srcA0000000",
             &[shared.clone(), only_a.clone(), quarantined.clone()],
+            &[],
             1000,
         )
         .await
         .unwrap();
-        reconcile_source(&pool, "srcB0000000", std::slice::from_ref(&shared), 1100)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcB0000000",
+            std::slice::from_ref(&shared),
+            &[],
+            1100,
+        )
+        .await
+        .unwrap();
 
         // Put one proxy into quarantine.
         sqlx::query("UPDATE proxies SET status = 'quarantine' WHERE fingerprint = ?")
@@ -1408,5 +1527,80 @@ mod tests {
         let due = select_due_quarantine(&pool, next, 100).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].stage(), QuarantineStage::Recheck15m);
+    }
+
+    #[tokio::test]
+    async fn reconcile_stores_geo_and_keeps_it_when_fresh_lookup_empty() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let e = entry("geo", "h1.example.com", 443);
+        let stamp = GeoStamp {
+            country: Some("DE".into()),
+            city: Some("Frankfurt".into()),
+            asn: Some("AS24940".into()),
+        };
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[Some(stamp)],
+            1000,
+        )
+        .await
+        .unwrap();
+        let row = get_by_fingerprint(&pool, &e.fingerprint())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.geo_country.as_deref(), Some("DE"));
+        assert_eq!(row.geo_city.as_deref(), Some("Frankfurt"));
+        assert_eq!(row.geo_asn.as_deref(), Some("AS24940"));
+
+        // Refetch with an inactive resolver (all-None stamps): stored facts
+        // are preserved, never wiped by a missing lookup.
+        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 2000)
+            .await
+            .unwrap();
+        let row = get_by_fingerprint(&pool, &e.fingerprint())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.geo_country.as_deref(), Some("DE"));
+        assert_eq!(row.geo_city.as_deref(), Some("Frankfurt"));
+        assert_eq!(row.geo_asn.as_deref(), Some("AS24940"));
+    }
+
+    #[tokio::test]
+    async fn missing_geo_listing_and_update() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let e = entry("geo", "h1.example.com", 443);
+        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
+            .await
+            .unwrap();
+
+        let missing = list_missing_geo(&pool, 0, 500).await.unwrap();
+        let id = missing
+            .iter()
+            .find(|(_, host)| host == "h1.example.com")
+            .expect("row without geo must be listed")
+            .0;
+
+        let stamp = GeoStamp {
+            country: Some("US".into()),
+            city: None,
+            asn: None,
+        };
+        update_geo(&pool, id, &stamp).await.unwrap();
+        let row = get_by_fingerprint(&pool, &e.fingerprint())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.geo_country.as_deref(), Some("US"));
+        assert_eq!(row.geo_city, None);
+
+        // The row has country data now, so it no longer counts as missing.
+        let missing = list_missing_geo(&pool, 0, 500).await.unwrap();
+        assert!(missing.iter().all(|(known, _)| known != &id));
     }
 }

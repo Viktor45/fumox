@@ -93,6 +93,11 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
   line-height: 1.45;
+  /* Soft-wrap: any token longer than its box (URLs, fingerprints, error
+     text, raw proxy lines) wraps instead of stretching tables, panels,
+     grids, toasts and dialogs. `anywhere` also lets table/grid columns
+     shrink below min-content, which stops the column blowout. */
+  overflow-wrap: anywhere;
 }
 
 a { color: var(--accent); text-decoration: none; }
@@ -154,6 +159,8 @@ a:hover { text-decoration: underline; }
 @media (max-width: 900px) {
   .grid.cols-2, .grid.cols-3, .grid.cols-4 { grid-template-columns: 1fr; }
 }
+/* Long unbreakable content shrinks the panel, never the grid columns. */
+.grid > * { min-width: 0; }
 
 /* ---------- panels & cards ---------- */
 
@@ -342,6 +349,9 @@ pre.code {
   word-break: break-all;
   border: 1px solid var(--border);
 }
+/* Panel <pre> blocks (pipeline JSON, params, raw lines, output preview):
+   the browser default `white-space: pre` would never wrap long lines. */
+pre.mono { white-space: pre-wrap; }
 
 .kv { width: 100%; border-collapse: collapse; }
 .kv th, .kv td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left; }

@@ -13,8 +13,10 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
-# MaxMind GeoLite2 databases (large binaries, download separately)
+# MaxMind GeoLite2 databases (large binaries, auto-downloaded at startup
+# when missing/stale) and their in-flight temporary downloads
 config/*.mmdb
+config/*.mmdb.*
 
 # Runtime-generated meow-rs config (written by fumox-probe)
 config/meow.yaml

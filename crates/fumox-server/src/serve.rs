@@ -366,7 +366,12 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
     let rows = proxies::list_with_source(&state.pool, std::slice::from_ref(&source.id))
         .await
         .map_err(ErrorReply::internal)?;
-    let candidates = rows_to_candidates(rows.into_iter().map(|linked| linked.proxy).collect(), 0);
+    let mut candidates =
+        rows_to_candidates(rows.into_iter().map(|linked| linked.proxy).collect(), 0);
+    // /src serves only health-checked, currently-alive proxies: rows that
+    // were never probed (unknown), quarantined or removed stay out even when
+    // the pipeline's health filter would let them through.
+    candidates.retain(|c| c.status == ProxyStatus::Alive);
     let out = compiled.apply(candidates, &state.geo).await;
 
     let (body, content_type) = encode(&out, OutputFormat::UriList);
@@ -649,6 +654,7 @@ mod tests {
             &state.pool,
             source_id,
             entries,
+            &[],
             fumox_core::models::now_ts(),
         )
         .await
@@ -919,11 +925,27 @@ mod tests {
     async fn src_endpoint_serves_single_source() {
         let state = test_state().await;
         make_source(&state, "srcA0000000").await;
-        ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("a", "h1.example.com", 443),
+                entry("u", "h2.example.com", 443),
+            ],
+        )
+        .await;
+        // Only the first proxy passed the health check; the second stays
+        // unknown (never probed).
+        sqlx::query("UPDATE proxies SET status = 'alive' WHERE host = 'h1.example.com'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
 
         let (status, _, body) = get(router(state.clone()), "/src/srcA0000000").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("h1.example.com"));
+        // alive-only endpoint: untested proxies are not served.
+        assert!(!body.contains("h2.example.com"));
 
         let (status, _, _) = get(router(state), "/src/missing00000").await;
         assert_eq!(status, StatusCode::NOT_FOUND);

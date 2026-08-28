@@ -5,6 +5,7 @@
 //! real tunnel. Proxy names are `fumox-{id}` so results map back to DB rows
 //! unambiguously.
 
+use fumox_core::formats::clash::entry_to_clash_named;
 use fumox_core::models::Scheme;
 use fumox_core::repo::proxies::ProxyRow;
 use serde_norway::Value;
@@ -36,8 +37,10 @@ fn num(value: i64) -> Value {
 /// Generate the full Clash config for one T2 batch.
 ///
 /// Listener ports are disabled (`0`): meow-rs only needs the proxy
-/// definitions to run delay tests. `skip-cert-verify` is set wherever TLS
-/// is involved — health checks are not a trust boundary.
+/// definitions to run delay tests. Proxy definitions come from the shared
+/// core mapping (the same one serving Clash subscriptions); the T2 policy
+/// on top is: deterministic `fumox-{id}` names and `skip-cert-verify`
+/// always true — health checks are not a trust boundary.
 pub fn generate(rows: &[ProxyRow]) -> serde_norway::Result<String> {
     let proxies: Vec<Value> = rows.iter().filter_map(proxy_to_value).collect();
 
@@ -58,105 +61,14 @@ pub fn generate(rows: &[ProxyRow]) -> serde_norway::Result<String> {
 /// unsupported schemes (they are skipped, never fatal — log+skip policy).
 fn proxy_to_value(row: &ProxyRow) -> Option<Value> {
     let entry = row.to_entry().ok()?;
-    let mut m = serde_norway::Mapping::new();
-    let mut put = |key: &str, value: Value| {
-        m.insert(Value::String(key.into()), value);
-    };
-
-    put("name", Value::String(proxy_name(row.id)));
-    put("server", Value::String(entry.host.clone()));
-    put("port", num(i64::from(entry.port)));
-
-    match entry.scheme {
-        Scheme::Vless => {
-            put("type", Value::String("vless".into()));
-            put("uuid", Value::String(entry.credential.clone()));
-            copy_param(&entry, "flow", "flow", &mut put);
-            copy_param(&entry, "sni", "sni", &mut put);
-            copy_param(&entry, "fp", "fingerprint", &mut put);
-            copy_param(&entry, "pbk", "public-key", &mut put);
-            copy_param(&entry, "sid", "short-id", &mut put);
-            copy_param(&entry, "network", "network", &mut put);
-            copy_param(&entry, "path", "ws-path", &mut put);
-            copy_param(&entry, "serviceName", "grpc-service-name", &mut put);
-            put("skip-cert-verify", Value::Bool(true));
-        }
-        Scheme::Vmess => {
-            put("type", Value::String("vmess".into()));
-            put("uuid", Value::String(entry.credential.clone()));
-            let alter_id = entry
-                .param("aid")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            put("alterId", num(alter_id));
-            put(
-                "cipher",
-                Value::String(entry.param("scy").unwrap_or("auto").to_string()),
-            );
-            if entry.param("security").unwrap_or_default() == "tls" {
-                put("tls", Value::Bool(true));
-                if let Some(sni) = entry.param("sni") {
-                    put("servername", Value::String(sni.to_string()));
-                }
-                put("skip-cert-verify", Value::Bool(true));
-            }
-            copy_param(&entry, "network", "network", &mut put);
-            copy_param(&entry, "path", "ws-path", &mut put);
-        }
-        Scheme::Trojan => {
-            put("type", Value::String("trojan".into()));
-            put("password", Value::String(entry.credential.clone()));
-            copy_param(&entry, "sni", "sni", &mut put);
-            put("skip-cert-verify", Value::Bool(true));
-        }
-        Scheme::Ss => {
-            put("type", Value::String("ss".into()));
-            // Credential is stored as "method:password".
-            let (cipher, password) = entry
-                .credential
-                .split_once(':')
-                .unwrap_or(("chacha20-ietf-poly1305", &entry.credential));
-            put("cipher", Value::String(cipher.to_string()));
-            put("password", Value::String(password.to_string()));
-        }
-        Scheme::Hysteria2 => {
-            put("type", Value::String("hysteria2".into()));
-            put("password", Value::String(entry.credential.clone()));
-            copy_param(&entry, "sni", "sni", &mut put);
-            put("skip-cert-verify", Value::Bool(true));
-        }
-        Scheme::Socks5 => {
-            put("type", Value::String("socks5".into()));
-            // Credential is stored as "user:pass"; both parts are optional.
-            if let Some((user, password)) = entry.credential.split_once(':') {
-                if !user.is_empty() {
-                    put("username", Value::String(user.to_string()));
-                }
-                if !password.is_empty() {
-                    put("password", Value::String(password.to_string()));
-                }
-            }
-        }
-        // Unsupported at T2 — filtered by is_supported, guard anyway.
-        Scheme::Naive | Scheme::Tuic | Scheme::Mieru => return None,
+    if !is_supported(entry.scheme) {
+        return None;
     }
-
-    Some(Value::Mapping(m))
-}
-
-/// Copy a recognized parameter onto the Clash mapping under a (possibly
-/// different) destination key when present and non-empty.
-fn copy_param(
-    entry: &fumox_core::models::ProxyEntry,
-    src: &str,
-    dst: &str,
-    put: &mut impl FnMut(&str, Value),
-) {
-    if let Some(value) = entry.param(src)
-        && !value.is_empty()
-    {
-        put(dst, Value::String(value.to_string()));
+    let mut proxy = entry_to_clash_named(&entry, &proxy_name(row.id))?;
+    if let Some(map) = proxy.as_mapping_mut() {
+        map.insert(Value::String("skip-cert-verify".into()), Value::Bool(true));
     }
+    Some(proxy)
 }
 
 #[cfg(test)]
@@ -236,7 +148,11 @@ mod tests {
             row_from_entry(2, entry(Scheme::Ss, "aes-256-gcm:secret", &[])),
             row_from_entry(
                 3,
-                entry(Scheme::Trojan, "pass", &[("sni", "t.example.com")]),
+                entry(
+                    Scheme::Trojan,
+                    "pass",
+                    &[("sni", "t.example.com"), ("type", "ws"), ("path", "/ws")],
+                ),
             ),
             row_from_entry(4, entry(Scheme::Hysteria2, "hy-pass", &[])),
             row_from_entry(5, entry(Scheme::Socks5, "user:pw", &[])),
@@ -259,8 +175,8 @@ mod tests {
         assert_eq!(vless["name"].as_str(), Some("fumox-1"));
         assert_eq!(vless["type"].as_str(), Some("vless"));
         assert_eq!(vless["uuid"].as_str(), Some("uuid-1"));
-        assert_eq!(vless["sni"].as_str(), Some("s.example.com"));
-        assert_eq!(vless["public-key"].as_str(), Some("key"));
+        assert_eq!(vless["servername"].as_str(), Some("s.example.com"));
+        assert_eq!(vless["reality-opts"]["public-key"].as_str(), Some("key"));
         assert_eq!(vless["skip-cert-verify"].as_bool(), Some(true));
 
         let ss = &proxies[1];
@@ -271,6 +187,8 @@ mod tests {
         let trojan = &proxies[2];
         assert_eq!(trojan["type"].as_str(), Some("trojan"));
         assert_eq!(trojan["password"].as_str(), Some("pass"));
+        assert_eq!(trojan["network"].as_str(), Some("ws"));
+        assert_eq!(trojan["ws-opts"]["path"].as_str(), Some("/ws"));
 
         let hy2 = &proxies[3];
         assert_eq!(hy2["type"].as_str(), Some("hysteria2"));

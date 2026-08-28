@@ -1,0 +1,27 @@
+# VCS / CI — not needed inside the build context
+.git
+.github
+
+# Local build artifacts and databases
+target
+*.db
+*.db-wal
+*.db-shm
+
+# Docs and the 1.1 MB parser fixture — irrelevant to the build
+docs
+test.txt
+*.md
+
+# Local runtime config: GeoLite2 binaries are gitignored large files and
+# app.toml may carry secrets. Mount them into /app/config at run time instead.
+config
+
+# Editor / OS noise
+.DS_Store
+.idea
+.vscode
+
+# Docker files themselves
+Dockerfile
+.dockerignore

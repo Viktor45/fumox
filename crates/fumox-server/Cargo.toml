@@ -1,0 +1,39 @@
+[package]
+name = "fumox-server"
+description = "Fumox HTTP server: source fetching, pipeline, subscription endpoints, admin UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fumox-core = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+sqlx = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+base64 = { workspace = true }
+moka = { workspace = true }
+regex = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+askama = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+percent-encoding = { workspace = true }
+time = { workspace = true }
+async-stream = { workspace = true }
+futures-util = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+serde_norway = { workspace = true }

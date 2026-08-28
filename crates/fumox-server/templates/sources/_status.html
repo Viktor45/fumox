@@ -1,0 +1,29 @@
+{#- Fragment: the "Refresh now" status. While the job is in flight the
+    fragment polls itself every 2 seconds (no-JS/SSE fallback) and also
+    listens for the fumox:refresh event re-broadcast by the SSE handler in
+    base.html on fetch.done/fetch.failed; when finished it shows the result. -#}
+{% if busy %}
+<span id="refresh-status" data-busy="1"
+      hx-get="/admin/sources/{{ source_id }}/refresh-status"
+      hx-trigger="every 2s, fumox:refresh" hx-swap="outerHTML">
+  <span class="badge neutral">{{ self.t("common.refreshing") }}</span>
+</span>
+{% else %}
+<span id="refresh-status">
+  {% if ok %}
+    <span class="badge on">
+      {% match done_message %}
+        {% when Some with (message) %}{{ message }}
+        {% when None %}{{ self.t("common.done") }}
+      {% endmatch %}
+    </span>
+  {% else %}
+    <span class="badge error">
+      {% match done_message %}
+        {% when Some with (message) %}{{ message }}
+        {% when None %}{{ self.t("common.error") }}
+      {% endmatch %}
+    </span>
+  {% endif %}
+</span>
+{% endif %}

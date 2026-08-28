@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("nav.sources") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("nav.sources") }}</h1>
+  <a class="btn primary" href="/admin/sources/new">{{ self.t("src.add") }}</a>
+</div>
+
+<form class="filters panel" method="get" action="/admin/sources">
+  <div class="field">
+    <label>{{ self.t("common.state") }}</label>
+    <select name="enabled">
+      <option value="">{{ self.t("common.all") }}</option>
+      <option value="on" {% if f_enabled == "on" %}selected{% endif %}>{{ self.t("common.enabled") }}</option>
+      <option value="off" {% if f_enabled == "off" %}selected{% endif %}>{{ self.t("common.disabled") }}</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>{{ self.t("src.errors_label") }}</label>
+    <span class="check-row">
+      <input type="checkbox" name="err" value="1" {% if f_error %}checked{% endif %}>
+      <label>{{ self.t("src.only_with_errors") }}</label>
+    </span>
+  </div>
+  <div class="field">
+    <label>{{ self.t("src.tag") }}</label>
+    <select name="tag">
+      <option value="">{{ self.t("common.all") }}</option>
+      {% for tag in tags %}
+        <option value="{{ tag }}" {% if self.tag_selected(tag) %}selected{% endif %}>{{ tag }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label>{{ self.t("common.search") }}</label>
+    <input type="text" name="q" value="{{ f_q }}" placeholder="{{ self.t("src.search_placeholder") }}">
+  </div>
+  <button class="btn" type="submit">{{ self.t("common.apply") }}</button>
+</form>
+
+<div class="panel">
+  {% if rows.is_empty() %}
+    <p class="muted">{{ self.t("src.empty") }}</p>
+  {% else %}
+    <table class="data">
+      <thead>
+        <tr>
+          <th>{{ self.t("common.name") }}</th>
+          <th>Slug</th>
+          <th>URL</th>
+          <th>{{ self.t("nav.proxies") }}</th>
+          <th>{{ self.t("src.ttl_column") }}</th>
+          <th>{{ self.t("dash.last_fetch") }}</th>
+          <th>{{ self.t("common.state") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td><a href="/admin/sources/{{ row.id }}">{{ row.name }}</a></td>
+          <td class="mono small">
+            {% match row.slug %}
+              {% when Some with (slug) %}{{ slug }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+          <td class="small truncate">{{ row.url }}</td>
+          <td class="num">{{ row.proxies_count }}</td>
+          <td class="num">{{ row.cache_ttl_seconds }}</td>
+          <td class="small muted">{{ self.ts(row.last_fetched_at) }}</td>
+          <td>
+            {% if row.enabled %}
+              <span class="badge on">{{ self.t("common.on") }}</span>
+            {% else %}
+              <span class="badge off">{{ self.t("common.off") }}</span>
+            {% endif %}
+            {% match row.error_class %}
+              {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+              {% when None %}
+            {% endmatch %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+{% endblock %}

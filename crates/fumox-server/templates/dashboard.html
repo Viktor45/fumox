@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("nav.dashboard") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("nav.dashboard") }}</h1>
+</div>
+
+<div class="grid cols-4">
+  <div class="panel stat-card">
+    <div class="num">{{ sources_enabled }} / {{ sources_total }}</div>
+    <div class="label">{{ self.t("dash.sources_enabled") }}</div>
+    {% if sources_with_errors > 0 %}
+      <div class="sub">{{ self.t("dash.with_errors").replace("{}", &sources_with_errors.to_string()) }}</div>
+    {% else %}
+      <div class="sub">{{ self.t("dash.no_errors") }}</div>
+    {% endif %}
+  </div>
+  <div class="panel stat-card">
+    <div class="num">{{ profiles_total }}</div>
+    <div class="label">{{ self.t("dash.profiles") }}</div>
+  </div>
+  <div class="panel stat-card">
+    <div class="num">{{ self.proxy_total() }}</div>
+    <div class="label">{{ self.t("dash.proxies_total") }}</div>
+    <div class="sub">
+      {% for (status, count) in proxy_counts %}
+        <span class="badge {{ status }}">{{ status }}: {{ count }}</span>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="panel stat-card">
+    <div class="num">{{ fetch_ok_24h }} / {{ fetch_total_24h }}</div>
+    <div class="label">{{ self.t("dash.fetches_24h") }}</div>
+  </div>
+</div>
+
+<div class="grid cols-2">
+  <div class="panel">
+    <h2>{{ self.t("dash.sources_with_errors") }}</h2>
+    {% if recent_errors.is_empty() %}
+      <p class="muted">{{ self.t("dash.no_source_errors") }}</p>
+    {% else %}
+      <table class="data">
+        <thead>
+          <tr><th>{{ self.t("common.source") }}</th><th>{{ self.t("dash.error_class") }}</th><th>{{ self.t("common.error") }}</th><th>{{ self.t("dash.last_fetch") }}</th></tr>
+        </thead>
+        <tbody>
+          {% for row in recent_errors %}
+          <tr>
+            <td><a href="/admin/sources/{{ row.id }}">{{ row.name }}</a></td>
+            <td>
+              {% match row.error_class %}
+                {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+            <td class="small">
+              {% match row.last_error %}
+                {% when Some with (message) %}{{ message }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+            <td class="small muted">{{ self.opt_ts(&row.last_fetched_at) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("dash.recent_fetches") }}</h2>
+    {% if recent_fetches.is_empty() %}
+      <p class="muted">{{ self.t("dash.no_fetches") }}</p>
+    {% else %}
+      <table class="data">
+        <thead>
+          <tr><th>{{ self.t("common.time") }}</th><th>{{ self.t("common.source") }}</th><th>{{ self.t("common.result") }}</th><th>HTTP</th><th>{{ self.t("common.size") }}</th><th>{{ self.t("nav.proxies") }}</th></tr>
+        </thead>
+        <tbody>
+          {% for row in recent_fetches %}
+          <tr>
+            <td class="small muted">{{ self.ts(row.fetched_at) }}</td>
+            <td>
+              {% match row.source_name %}
+                {% when Some with (name) %}<a href="/admin/sources/{{ row.source_id }}">{{ name }}</a>
+                {% when None %}<span class="muted">{{ row.source_id }}</span>
+              {% endmatch %}
+            </td>
+            <td>
+              {% if row.ok == 1 %}
+                <span class="badge alive">{{ self.t("common.ok") }}</span>
+              {% else %}
+                {% match row.error_class %}
+                  {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+                  {% when None %}<span class="badge error">{{ self.t("common.error") }}</span>
+                {% endmatch %}
+              {% endif %}
+            </td>
+            <td class="small">
+              {% match row.http_status %}
+                {% when Some with (status) %}{{ status }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+            <td class="small">{{ self.bytes(&row.bytes) }}</td>
+            <td class="small">
+              {% match row.proxies_found %}
+                {% when Some with (count) %}{{ count }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="small"><a href="/admin/logs/fetch">{{ self.t("dash.full_journal") }}</a></p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

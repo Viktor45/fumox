@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+
+{% block title %}{% if form_id.is_some() %}{{ self.t("prof.edit_title") }}{% else %}{{ self.t("prof.new_title") }}{% endif %}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{% if form_id.is_some() %}{{ self.t("prof.edit_title") }}{% else %}{{ self.t("prof.new_title") }}{% endif %}</h1>
+</div>
+
+<form method="post" action="{{ action }}">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+
+  <div class="panel">
+    <h2>{{ self.t("src.general") }}</h2>
+
+    <div class="field">
+      <label>{{ self.t("common.name") }} *</label>
+      <input type="text" name="name" value="{{ values.name }}" maxlength="200" required>
+      {% match self.error_for("name") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label>Slug</label>
+      <input type="text" name="slug" value="{{ values.slug }}" maxlength="64">
+      <div class="hint">{{ self.t("prof.slug_hint") }}</div>
+      {% match self.error_for("slug") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label>{{ self.t("prof.token_label") }}</label>
+      <input type="text" name="access_token" value="{{ values.access_token }}">
+      <div class="hint">{{ self.t("prof.token_hint") }}</div>
+      {% if token_masked_note %}
+        <div class="hint">{{ self.t("prof.token_masked_note") }}</div>
+      {% endif %}
+      {% match self.error_for("access_token") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label>{{ self.t("prof.output_format") }}</label>
+      <select name="output_format">
+        {% for option in formats %}
+          <option value="{{ option.value }}" {% if !option.available %}disabled{% endif %} {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+      {% match self.error_for("output_format") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <span class="check-row">
+        <input type="checkbox" name="enabled" value="1" id="profile-enabled" {% if values.enabled %}checked{% endif %}>
+        <label for="profile-enabled">{{ self.t("prof.enabled_label") }}</label>
+      </span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("prof.composition_title") }}</h2>
+    <div class="hint">{{ self.t("prof.composition_hint") }}</div>
+    {% if source_picks.is_empty() %}
+      <p class="muted">{{ self.t("prof.no_sources") }}</p>
+    {% else %}
+      <table class="data">
+        <thead>
+          <tr><th></th><th>{{ self.t("common.source") }}</th><th>{{ self.t("prof.order_column") }}</th></tr>
+        </thead>
+        <tbody>
+          {% for pick in source_picks %}
+          <tr>
+            <td><input type="checkbox" name="sources" value="{{ pick.id }}" id="pick-{{ pick.id }}" {% if pick.checked %}checked{% endif %}></td>
+            <td>
+              <label for="pick-{{ pick.id }}">{{ pick.name }}</label>
+              {% if !pick.enabled %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+            </td>
+            <td><input type="number" name="pos_{{ pick.id }}" value="{{ pick.position }}" min="0" style="width: 80px;"></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% match self.error_for("sources") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("prof.pipeline_title") }}</h2>
+    <div class="field">
+      <label>JSON pipeline v1</label>
+      <textarea class="mono" name="pipeline" rows="8" placeholder='{ "version": 1, … }'>{{ values.pipeline }}</textarea>
+      <div class="hint">{{ self.t("prof.pipeline_hint") }}</div>
+      {% match self.error_for("pipeline") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+  </div>
+
+  <div class="form-actions">
+    <button class="btn primary" type="submit">{{ self.t("common.save") }}</button>
+    <a class="btn" href="{% match form_id %}{% when Some with (id) %}/admin/profiles/{{ id }}{% when None %}/admin/profiles{% endmatch %}">{{ self.t("common.cancel") }}</a>
+  </div>
+</form>
+{% endblock %}

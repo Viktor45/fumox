@@ -1,0 +1,79 @@
+# Fumox + meow-rs — one-command deployment (SPEC §8.2).
+#
+# Quick start:
+#   cp .env.example .env        # then set a real FUMOX_ADMIN__TOKEN
+#   docker compose up -d --build
+#   open http://127.0.0.1:8081/admin   # admin panel (login with the token)
+#
+# Services:
+#   server  fumox-server — public /sub + /src on :8080, admin panel on :8081
+#   probe   fumox-probe  — health-check daemon (T1 TCP/TLS + T2 tunnel checks)
+#   meow    meow-rs      — mihomo-compatible kernel the probe drives for T2
+#
+# How the probe ↔ meow wiring works:
+#   - probe reaches the meow-rs REST API at meow:9090 (FUMOX_MEOW__API_ADDR);
+#   - probe renders the T2 batch to /shared/meow.yaml and calls PUT /configs
+#     with that exact path, so BOTH containers mount the meow-shared volume
+#     at the same location (FUMOX_MEOW__CONFIG_PATH=/shared/meow.yaml);
+#   - meow's external-controller (9090) is only reachable from the probe over
+#     the internal network; it is deliberately not published to the host.
+#
+# Volumes:
+#   fumox-data   SQLite database, shared by server and probe -> /app/data
+#   meow-shared  generated Clash config exchange             -> /shared
+#   ./config     app.toml + GeoLite2 .mmdb files (read-only) -> /app/config
+#                Drop GeoLite2-Country.mmdb (or City/ASN) into ./config to
+#                enable geo enrichment; it is gitignored and not bundled.
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fumox:local
+    command: ["fumox-server"]
+    environment:
+      FUMOX_ADMIN__TOKEN: ${FUMOX_ADMIN__TOKEN:?set FUMOX_ADMIN__TOKEN in .env}
+      FUMOX_GEO__DB_DIR: /app/config
+      # SSRF guard: set true in .env only for trusted local test setups
+      # (source URLs may then point at private/loopback addresses).
+      FUMOX_ADMIN__ALLOW_PRIVATE_URLS: ${FUMOX_ADMIN__ALLOW_PRIVATE_URLS:-false}
+    volumes:
+      - fumox-data:/app/data
+      - ./config:/app/config:ro
+    ports:
+      - "8080:8080"            # public subscription endpoints
+      - "127.0.0.1:8081:8081"  # admin panel: loopback-only by default; put a
+                               # reverse proxy / SSH tunnel in front to expose it
+    restart: unless-stopped
+
+  probe:
+    image: fumox:local         # same image as server, different entrypoint
+    command: ["fumox-probe"]
+    depends_on:
+      - server                 # let the server create/migrate the DB first
+      - meow                   # probe seeds /shared through the meow image
+    environment:
+      FUMOX_GEO__DB_DIR: /app/config
+      FUMOX_MEOW__API_ADDR: meow:9090
+      FUMOX_MEOW__CONFIG_PATH: /shared/meow.yaml
+      # Override in .env if the default test URL is blocked in your region.
+      FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-http://www.gstatic.com/generate_204}
+    volumes:
+      - fumox-data:/app/data
+      - ./config:/app/config:ro
+      - meow-shared:/shared
+    restart: unless-stopped
+
+  meow:
+    build:
+      context: ./docker/meow
+      dockerfile: Dockerfile
+    image: fumox-meow:local
+    volumes:
+      - meow-shared:/shared
+    restart: unless-stopped
+
+volumes:
+  fumox-data:
+  meow-shared:

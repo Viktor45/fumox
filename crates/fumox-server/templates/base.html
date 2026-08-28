@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="{{ self.lang_code() }}" data-theme="{{ theme.as_str() }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ self.t("common.admin") }}{% endblock %} — Fumox</title>
+  <link rel="stylesheet" href="/admin/static/app.css">
+  <script src="/admin/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <div class="topbar">
+    <span class="brand">Fumox</span>
+    <nav>
+      <a href="/admin" {% if active == "dashboard" %}class="active"{% endif %}>{{ self.t("nav.dashboard") }}</a>
+      <a href="/admin/sources" {% if active == "sources" %}class="active"{% endif %}>{{ self.t("nav.sources") }}</a>
+      <a href="/admin/profiles" {% if active == "profiles" %}class="active"{% endif %}>{{ self.t("nav.profiles") }}</a>
+      <a href="/admin/proxies" {% if active == "proxies" %}class="active"{% endif %}>{{ self.t("nav.proxies") }}</a>
+      <a href="/admin/probe" {% if active == "probe" %}class="active"{% endif %}>{{ self.t("nav.probe") }}</a>
+      <a href="/admin/logs/fetch" {% if active == "logs" %}class="active"{% endif %}>{{ self.t("nav.logs") }}</a>
+      <a href="/admin/import" {% if active == "import" %}class="active"{% endif %}>{{ self.t("nav.import") }}</a>
+    </nav>
+    <span class="spacer"></span>
+    {# Theme switcher (day/night): the choice is stored in the fumox_theme
+       cookie and rendered server-side as data-theme on <html>, so it works
+       without JavaScript. The onclick appends the current path as `next`,
+       same as the language switcher below. #}
+    <span class="lang-switch theme-switch">
+      <a href="/admin/set-theme?theme=light"
+         onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
+         {% if theme.is_light() %}class="active"{% endif %}>{{ self.t("theme.light") }}</a>
+      <a href="/admin/set-theme?theme=dark"
+         onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
+         {% if theme.is_dark() %}class="active"{% endif %}>{{ self.t("theme.dark") }}</a>
+    </span>
+    {# Language switcher: iterates every loaded catalog (`langs`), so new
+       languages appear automatically. The onclick appends the current path
+       as `next` so the user lands back on the same page; without JS the
+       redirect falls back to the dashboard. #}
+    <span class="lang-switch">
+      {% for (code, _label) in langs %}
+      <a href="/admin/set-lang?lang={{ code }}"
+         onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
+         {% if self.lang_code() == code.as_str() %}class="active"{% endif %}>{{ code | upper }}</a>
+      {% endfor %}
+    </span>
+    <form method="post" action="/admin/logout" class="inline">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button class="btn small" type="submit">{{ self.t("nav.logout") }}</button>
+    </form>
+  </div>
+  <div class="container">
+    {% block content %}{% endblock %}
+  </div>
+  <div class="toast-wrap" id="toast-wrap"></div>
+  <script>
+    // Flash/toast: handlers send HX-Trigger: {"toast": {"message": ..., "level": ...}}
+    document.body.addEventListener('toast', function (e) {
+      var wrap = document.getElementById('toast-wrap');
+      if (!wrap) return;
+      var detail = e.detail || {};
+      var div = document.createElement('div');
+      div.className = 'toast' + (detail.level === 'error' ? ' error' : '');
+      div.textContent = detail.message || String(e.detail);
+      wrap.appendChild(div);
+      setTimeout(function () { div.remove(); }, 4000);
+    });
+
+    // SSE (ADMIN_PLAN §9): push updates from the server. Each event is
+    // re-broadcast on <body> as a namespaced DOM event so HTMX fragments
+    // can react with hx-trigger="fumox:*". Polling fragments remain the
+    // no-JS fallback — SSE is a pure enhancement.
+    (function () {
+      if (!window.EventSource) return;
+      var es = new EventSource('/admin/events');
+      ['fetch.started', 'fetch.done', 'fetch.failed', 'probe.stats', 'heartbeat']
+        .forEach(function (name) {
+          es.addEventListener(name, function (e) {
+            var data = {};
+            try { data = JSON.parse(e.data); } catch (_) {}
+            document.body.dispatchEvent(new CustomEvent('fumox:' + name, { detail: data }));
+          });
+        });
+      // When any fetch finishes, refresh the in-flight status fragment if it
+      // is present on the page (source card "refresh now").
+      document.body.addEventListener('fumox:fetch.done', function () {
+        var el = document.getElementById('refresh-status');
+        if (el && window.htmx) window.htmx.trigger(el, 'fumox:refresh');
+      });
+      document.body.addEventListener('fumox:fetch.failed', function () {
+        var el = document.getElementById('refresh-status');
+        if (el && window.htmx) window.htmx.trigger(el, 'fumox:refresh');
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -13,9 +13,27 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# MaxMind GeoLite2 databases (large binaries, download separately)
+config/*.mmdb
+
+# Runtime-generated meow-rs config (written by fumox-probe)
+config/meow.yaml
+
+# Local runtime data
+*.db
+*.db-wal
+*.db-shm
+
+# Local environment (docker compose) — may carry the admin token
+.env
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+.idea/
+.vscode/
+.zcode/
+test.txt
+.DS_Store

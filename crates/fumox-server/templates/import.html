@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("io.title") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("io.title") }}</h1>
+</div>
+
+{% if !errors.is_empty() %}
+<div class="panel">
+  <h2>{{ self.t("io.errors_title") }}</h2>
+  <ul class="error-list">
+    {% for e in errors %}
+    <li class="error-text">{{ e }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% match summary %}
+  {% when Some with (s) %}
+  <div class="panel">
+    <h2>{{ self.t("io.summary_title") }}</h2>
+    <p>{{ self.t("io.sources_created") }} <strong>{{ s.sources_created }}</strong></p>
+    <p>{{ self.t("io.profiles_created") }} <strong>{{ s.profiles_created }}</strong></p>
+    {% if !s.warnings.is_empty() %}
+    <h3>{{ self.t("io.warnings_title") }}</h3>
+    <ul>
+      {% for w in s.warnings %}
+      <li class="muted">{{ w }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+  {% when None %}
+{% endmatch %}
+
+<div class="panel">
+  <h2>{{ self.t("io.export_title") }}</h2>
+  <div class="hint">{{ self.t("io.export_hint") }}</div>
+  <p><a class="btn" href="/admin/export">{{ self.t("io.export_btn") }}</a></p>
+</div>
+
+<div class="panel">
+  <h2>{{ self.t("io.import_title") }}</h2>
+  <div class="hint">{{ self.t("io.import_hint") }}</div>
+  <form method="post" action="/admin/import">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <div class="field">
+      <label>{{ self.t("io.payload_label") }}</label>
+      <textarea class="mono" name="payload" rows="12" placeholder='{ "version": 1, … }'></textarea>
+      <div class="hint">{{ self.t("io.payload_hint") }}</div>
+    </div>
+    <div class="field">
+      <input type="file" id="io-file" accept=".json,application/json">
+      <label for="io-file" class="hint">{{ self.t("io.file_hint") }}</label>
+    </div>
+    <div class="form-actions">
+      <button class="btn primary" type="submit">{{ self.t("io.submit") }}</button>
+    </div>
+  </form>
+</div>
+
+<script>
+  // Load a chosen JSON file into the payload textarea (FileReader). The
+  // textarea also accepts a manual paste, so the flow works without JS.
+  (function () {
+    var input = document.getElementById('io-file');
+    if (!input || !window.FileReader) return;
+    input.addEventListener('change', function () {
+      var file = input.files && input.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        var area = document.querySelector('textarea[name="payload"]');
+        if (area) area.value = reader.result;
+      };
+      reader.readAsText(file);
+    });
+  })();
+</script>
+{% endblock %}

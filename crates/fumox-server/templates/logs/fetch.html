@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("log.title") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("log.title") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
+</div>
+
+<form class="filters panel" method="get" action="/admin/logs/fetch">
+  <div class="field">
+    <label>{{ self.t("log.result_label") }}</label>
+    <select name="result">
+      <option value="">{{ self.t("common.all") }}</option>
+      <option value="ok" {% if f_result == "ok" %}selected{% endif %}>{{ self.t("common.success") }}</option>
+      <option value="error" {% if f_result == "error" %}selected{% endif %}>{{ self.t("common.error") }}</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>{{ self.t("log.error_class_label") }}</label>
+    <select name="class">
+      <option value="">{{ self.t("common.all") }}</option>
+      <option value="network" {% if f_class == "network" %}selected{% endif %}>network</option>
+      <option value="http_server" {% if f_class == "http_server" %}selected{% endif %}>http_server</option>
+      <option value="http_client" {% if f_class == "http_client" %}selected{% endif %}>http_client</option>
+      <option value="parse_error" {% if f_class == "parse_error" %}selected{% endif %}>parse_error</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>{{ self.t("common.source") }}</label>
+    <select name="source">
+      <option value="">{{ self.t("common.all") }}</option>
+      {% for (id, name, _) in sources %}
+        <option value="{{ id }}" {% if self.source_selected(id) %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <button class="btn" type="submit">{{ self.t("common.apply") }}</button>
+</form>
+
+<div class="panel">
+  {% if rows.is_empty() %}
+    <p class="muted">{{ self.t("log.no_entries") }}</p>
+  {% else %}
+    <table class="data">
+      <thead>
+        <tr>
+          <th>{{ self.t("common.time") }}</th>
+          <th>{{ self.t("common.source") }}</th>
+          <th>{{ self.t("common.result") }}</th>
+          <th>HTTP</th>
+          <th>{{ self.t("common.size") }}</th>
+          <th>{{ self.t("nav.proxies") }}</th>
+          <th>{{ self.t("common.error") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td class="small muted">{{ self.ts(row.fetched_at) }}</td>
+          <td>
+            {% match row.source_name %}
+              {% when Some with (name) %}<a href="/admin/sources/{{ row.source_id }}">{{ name }}</a>
+              {% when None %}<span class="muted">{{ row.source_id }}</span>
+            {% endmatch %}
+          </td>
+          <td>
+            {% if row.ok == 1 %}
+              <span class="badge alive">{{ self.t("common.ok") }}</span>
+            {% else %}
+              {% match row.error_class %}
+                {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+                {% when None %}<span class="badge error">{{ self.t("common.error") }}</span>
+              {% endmatch %}
+            {% endif %}
+          </td>
+          <td class="small">
+            {% match row.http_status %}
+              {% when Some with (status) %}{{ status }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+          <td class="small">{{ self.bytes(&row.bytes) }}</td>
+          <td class="num">
+            {% match row.proxies_found %}
+              {% when Some with (count) %}{{ count }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+          <td class="small">
+            {% match row.error %}
+              {% when Some with (message) %}{{ message }}
+              {% when None %}
+            {% endmatch %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% if pages.len() > 1 %}
+      <div class="pagination">
+        {% for (p, current) in pages %}
+          {% if current %}
+            <span class="page current">{{ p }}</span>
+          {% else %}
+            <a class="page" href="/admin/logs/fetch?page={{ p }}&amp;per_page={{ per_page }}{{ self.query_suffix() }}">{{ p }}</a>
+          {% endif %}
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

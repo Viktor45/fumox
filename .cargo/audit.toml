@@ -1,0 +1,17 @@
+# cargo-audit configuration.
+#
+# cargo-audit scans Cargo.lock, which is feature-independent: it lists every
+# optional dependency of every crate in the graph even when the corresponding
+# feature is never enabled. Advisories on such never-compiled crates are
+# ignored here with a justification; do not add ignores for crates that are
+# actually built.
+
+[advisories]
+ignore = [
+    # Marvin Attack (RSA PKCS#1 v1.5 timing side channel). rsa is pulled in
+    # by sqlx-mysql, an OPTIONAL driver of sqlx; Fumox enables only the
+    # sqlite feature, so sqlx-mysql (and rsa) are never compiled into
+    # fumox-server or fumox-probe (verified with `cargo tree --target all`).
+    # No fixed rsa release exists; the advisory is unreachable for us.
+    "RUSTSEC-2023-0071",
+]

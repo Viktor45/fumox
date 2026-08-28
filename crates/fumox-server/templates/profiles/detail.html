@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+
+{% block title %}{{ profile.name }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ profile.name }}</h1>
+  <span id="enabled-badge">
+    {% if profile.enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+  </span>
+  <span class="spacer"></span>
+  <div class="row-actions">
+    <a class="btn" href="/admin/profiles/{{ profile.id }}/edit">{{ self.t("common.edit") }}</a>
+    <form method="post" action="/admin/profiles/{{ profile.id }}/toggle"
+          hx-post="/admin/profiles/{{ profile.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button class="btn" type="submit">{% if profile.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
+    </form>
+    <button class="btn danger" type="button" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
+  </div>
+</div>
+
+<div class="grid cols-2">
+  <div class="panel">
+    <h2>{{ self.t("src.params_title") }}</h2>
+    <table class="kv">
+      <tr><th>Slug</th><td class="mono">
+        {% match profile.slug %}
+          {% when Some with (slug) %}{{ slug }}
+          {% when None %}<span class="muted">—</span>
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("prof.endpoint") }}</th><td class="mono small"><a href="{{ serve_path }}">{{ serve_path }}</a></td></tr>
+      <tr><th>{{ self.t("prof.token_label") }}</th><td class="mono small">{{ token_display }}</td></tr>
+      <tr><th>{{ self.t("prof.output_format") }}</th><td class="mono small">{{ profile.output_format.as_str() }}</td></tr>
+      <tr><th>{{ self.t("common.created") }}</th><td class="small">{{ self.ts(profile.created_at) }}</td></tr>
+      <tr><th>{{ self.t("common.updated") }}</th><td class="small">{{ self.ts(profile.updated_at) }}</td></tr>
+    </table>
+
+    {% if !pipeline_display.is_empty() %}
+      <h3>{{ self.t("prof.pipeline_of_profile") }}</h3>
+      <pre class="mono small">{{ pipeline_display }}</pre>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("prof.composition_title") }}</h2>
+    {% if composition.is_empty() %}
+      <p class="muted">{{ self.t("prof.no_sources_attached") }}</p>
+    {% else %}
+      <table class="data">
+        <thead>
+          <tr><th>{{ self.t("prof.order_column") }}</th><th>{{ self.t("common.source") }}</th><th>{{ self.t("common.state") }}</th></tr>
+        </thead>
+        <tbody>
+          {% for member in composition %}
+          <tr>
+            <td class="num">{{ member.position }}</td>
+            <td>
+              {% match member.name %}
+                {% when Some with (name) %}<a href="/admin/sources/{{ member.source_id }}">{{ name }}</a>
+                {% when None %}<span class="muted">{{ member.source_id }} {{ self.t("prof.source_deleted") }}</span>
+              {% endmatch %}
+            </td>
+            <td>
+              {% match member.enabled %}
+                {% when Some with (enabled) %}
+                  {% if enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+
+    <h3>{{ self.t("prof.dedup_title") }}</h3>
+    <p class="small">
+      {{ self.t("prof.stats_total") }} <b>{{ stats_total }}</b>,
+      {{ self.t("prof.stats_unique") }} <b>{{ stats_unique }}</b>,
+      {{ self.t("prof.stats_dupes") }} <b>{{ stats_dupes }}</b>
+    </p>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>{{ self.t("prof.preview_prefix") }} {{ preview.len() }} {{ self.t("prof.preview_suffix") }}</h2>
+  {% match preview_note %}
+    {% when Some with (note) %}<p class="muted">{{ note }}</p>
+    {% when None %}
+  {% endmatch %}
+  {% if !preview.is_empty() %}
+    <pre class="mono small">{{ preview.join("\n") }}</pre>
+  {% endif %}
+</div>
+
+<dialog id="delete-dialog">
+  <form method="post" action="/admin/profiles/{{ profile.id }}/delete">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <p>{{ self.t("prof.delete_confirm") }} <b>{{ profile.name }}</b>?</p>
+    <p class="muted small">{{ self.t("prof.delete_note_prefix") }} <span class="mono">{{ serve_path }}</span> {{ self.t("prof.delete_note_suffix") }}</p>
+    <div class="form-actions">
+      <button class="btn danger" type="submit">{{ self.t("common.delete") }}</button>
+      <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
+    </div>
+  </form>
+</dialog>
+{% endblock %}

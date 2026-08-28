@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="{{ self.lang_code() }}" data-theme="{{ theme.as_str() }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ self.t("login.title") }} — Fumox</title>
+  <link rel="stylesheet" href="/admin/static/app.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="panel login-box">
+      {# Language and theme are chosen here and persisted in the
+         fumox_lang / fumox_theme cookies; the same switchers also live in
+         the topbar after login. The language list is dynamic: every
+         catalog loaded from the locales directory is offered with its
+         native name. #}
+      <div class="login-prefs">
+        <span class="lang-switch login-lang">
+          {% for (code, label) in langs %}
+          <a href="/admin/login?lang={{ code }}"
+             {% if self.lang_code() == code.as_str() %}class="active"{% endif %}>{{ label }}</a>
+          {% endfor %}
+        </span>
+        <span class="lang-switch login-lang theme-switch">
+          <a href="/admin/set-theme?theme=light&next=/admin/login"
+             {% if theme.is_light() %}class="active"{% endif %}>{{ self.t("theme.light") }}</a>
+          <a href="/admin/set-theme?theme=dark&next=/admin/login"
+             {% if theme.is_dark() %}class="active"{% endif %}>{{ self.t("theme.dark") }}</a>
+        </span>
+      </div>
+      <h2 style="margin-top:0">{{ self.t("login.heading") }}</h2>
+      {% match error %}
+        {% when Some with (message) %}
+          <div class="flash error">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+      <form method="post" action="/admin/login" class="stack">
+        <div class="field">
+          <label for="token">{{ self.t("login.token_label") }}</label>
+          <input type="password" id="token" name="token" autofocus required>
+          <div class="hint">{{ self.t("login.token_hint") }}</div>
+        </div>
+        <div class="form-actions">
+          <button class="btn primary" type="submit">{{ self.t("login.submit") }}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

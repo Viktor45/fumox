@@ -1,0 +1,32 @@
+{#- Fragment: dry-run result of a source fetch (ADMIN_PLAN §13.11). -#}
+<div class="panel" id="dryrun-result">
+  {% if ok %}
+    <p><span class="badge alive">{{ self.t("common.success") }}</span> {{ message }}</p>
+  {% else %}
+    <p><span class="badge error">{{ self.t("common.error") }}</span> {{ message }}</p>
+  {% endif %}
+  <table class="data kv">
+    <tbody>
+      {% match http_status %}
+        {% when Some with (status) %}
+          <tr><td>{{ self.t("src.dryrun_http_status") }}</td><td>{{ status }}</td></tr>
+        {% when None %}
+      {% endmatch %}
+      <tr><td>{{ self.t("common.size") }}</td><td>{{ self.fmt_bytes(bytes) }}</td></tr>
+      {% match proxies_found %}
+        {% when Some with (count) %}
+          <tr><td>{{ self.t("src.dryrun_recognized") }}</td><td>{{ count }}</td></tr>
+        {% when None %}
+      {% endmatch %}
+    </tbody>
+  </table>
+  {% if !sample.is_empty() %}
+    <h3>{{ self.t("src.dryrun_sample_title") }}</h3>
+    <ul class="small mono">
+      {% for line in sample %}
+        <li>{{ line }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+  <p class="small muted">{{ self.t("src.dryrun_note") }}</p>
+</div>

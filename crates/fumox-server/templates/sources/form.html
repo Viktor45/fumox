@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+
+{% block title %}{% if form_id.is_some() %}{{ self.t("src.edit_title") }}{% else %}{{ self.t("src.new_title") }}{% endif %}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{% if form_id.is_some() %}{{ self.t("src.edit_title") }}{% else %}{{ self.t("src.new_title") }}{% endif %}</h1>
+</div>
+
+<form method="post" action="{{ action }}">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+
+  <div class="panel">
+    <h2>{{ self.t("src.general") }}</h2>
+
+    <div class="field">
+      <label>{{ self.t("common.name") }} *</label>
+      <input type="text" name="name" value="{{ values.name }}" maxlength="200" required>
+      {% match self.error_for("name") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label>Slug</label>
+      <input type="text" name="slug" value="{{ values.slug }}" maxlength="64">
+      <div class="hint">{{ self.t("src.slug_hint") }}</div>
+      {% match self.error_for("slug") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label>{{ self.t("src.url_label") }}</label>
+      <input type="url" name="url" value="{{ values.url }}" required>
+      <div class="hint">{{ self.t("src.url_hint") }}</div>
+      {% match self.error_for("url") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <span class="check-row">
+        <input type="checkbox" name="enabled" value="1" id="src-enabled" {% if values.enabled %}checked{% endif %}>
+        <label for="src-enabled">{{ self.t("src.enabled_label") }}</label>
+      </span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("src.fetch_parse") }}</h2>
+
+    <div class="field">
+      <label>{{ self.t("src.encoding_label") }}</label>
+      <select name="encoding">
+        <option value="auto" {% if values.encoding == "auto" %}selected{% endif %}>{{ self.t("src.detect_auto") }}</option>
+        <option value="plain" {% if values.encoding == "plain" %}selected{% endif %}>plain</option>
+        <option value="base64" {% if values.encoding == "base64" %}selected{% endif %}>base64</option>
+      </select>
+      {% match self.error_for("encoding") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label>{{ self.t("src.input_format_label") }}</label>
+      <select name="input_format">
+        <option value="" {% if values.input_format.is_empty() %}selected{% endif %}>{{ self.t("src.detect_auto") }}</option>
+        <option value="uri_list" {% if values.input_format == "uri_list" %}selected{% endif %}>{{ self.t("src.uri_list") }}</option>
+        <option value="clash_yaml" {% if values.input_format == "clash_yaml" %}selected{% endif %}>Clash YAML</option>
+        <option value="sing_box_json" {% if values.input_format == "sing_box_json" %}selected{% endif %}>sing-box JSON</option>
+      </select>
+      {% match self.error_for("input_format") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label>{{ self.t("src.protocols_label") }}</label>
+      <div class="hint">{{ self.t("src.protocols_hint") }}</div>
+      {% for (protocol, selected) in all_protocols %}
+        <span class="check-row">
+          <input type="checkbox" name="protocols" value="{{ protocol }}" id="proto-{{ protocol }}" {% if selected %}checked{% endif %}>
+          <label for="proto-{{ protocol }}">{{ protocol }}</label>
+        </span>
+      {% endfor %}
+      {% match self.error_for("protocols") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label>{{ self.t("src.ttl_label") }}</label>
+      <input type="number" name="cache_ttl_seconds" value="{{ values.cache_ttl_seconds }}" min="60" max="86400">
+      <div class="hint">{{ self.t("src.ttl_hint") }}</div>
+      {% match self.error_for("cache_ttl_seconds") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label>{{ self.t("src.tags_label") }}</label>
+      <input type="text" name="tags" value="{{ values.tags }}">
+      <div class="hint">{{ self.t("src.tags_hint") }}</div>
+    </div>
+
+    <div class="field">
+      <label>{{ self.t("src.headers_label") }}</label>
+      <textarea class="mono" name="headers" rows="3" placeholder="User-Agent: …
+Authorization: Bearer …">{{ values.headers }}</textarea>
+      <div class="hint">{{ self.t("src.headers_hint") }}</div>
+      {% if headers_masked_note %}
+        <div class="hint">{{ self.t("src.headers_masked_note") }}</div>
+      {% endif %}
+      {% match self.error_for("headers") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("src.pipeline_title") }}</h2>
+    <div class="field">
+      <label>JSON pipeline v1</label>
+      <textarea class="mono" name="pipeline" rows="8" placeholder='{ "version": 1, … }'>{{ values.pipeline }}</textarea>
+      <div class="hint">{{ self.t("src.pipeline_hint") }}</div>
+      {% match self.error_for("pipeline") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+  </div>
+
+  <div class="form-actions">
+    <button class="btn primary" type="submit">{{ self.t("common.save") }}</button>
+    <a class="btn" href="{% match form_id %}{% when Some with (id) %}/admin/sources/{{ id }}{% when None %}/admin/sources{% endmatch %}">{{ self.t("common.cancel") }}</a>
+  </div>
+</form>
+{% endblock %}

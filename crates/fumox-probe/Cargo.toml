@@ -1,0 +1,25 @@
+[package]
+name = "fumox-probe"
+description = "Fumox health-check daemon: T1/T2 probes, quarantine and second-chance lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fumox-core = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_norway = { workspace = true }
+reqwest = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

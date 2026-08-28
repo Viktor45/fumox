@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("nav.probe") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("nav.probe") }}</h1>
+</div>
+
+<div class="grid cols-4">
+  <div class="panel stat-card">
+    <div class="num">{{ self.proxy_total() }}</div>
+    <div class="label">{{ self.t("dash.proxies_total") }}</div>
+    <div class="sub">
+      {% for (status, count) in proxy_counts %}
+        <span class="badge {{ status }}">{{ status }}: {{ count }}</span>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="panel stat-card">
+    {% match heartbeat %}
+      {% when Some with (hb) %}
+        {% if hb.alive %}
+          <div class="num"><span class="badge alive">{{ self.t("probe.alive") }}</span></div>
+        {% else %}
+          <div class="num"><span class="badge error">{{ self.t("probe.dead") }}</span></div>
+        {% endif %}
+        <div class="label">{{ self.t("probe.daemon") }}</div>
+        <div class="sub">heartbeat: {{ self.ts(hb.ts) }} · pid {{ hb.pid }} · v{{ hb.version }}</div>
+      {% when None %}
+        <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>
+        <div class="label">{{ self.t("probe.daemon") }}</div>
+        <div class="sub">{{ self.t("probe.no_heartbeat") }}</div>
+    {% endmatch %}
+  </div>
+  <div class="panel stat-card">
+    {% match meow_last_ok %}
+      {% when Some with (ts) %}
+        <div class="num"><span class="badge alive">{{ self.t("probe.available") }}</span></div>
+        <div class="label">meow-rs (T2)</div>
+        <div class="sub">{{ self.t("probe.last_contact").replace("{}", &self.ts(ts)) }}</div>
+      {% when None %}
+        <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>
+        <div class="label">meow-rs (T2)</div>
+        <div class="sub">{{ self.t("probe.no_contacts") }}</div>
+    {% endmatch %}
+  </div>
+  <div class="panel stat-card">
+    <div class="num">{{ queue.len() }}</div>
+    <div class="label">{{ self.t("probe.quarantine_queue_card") }}</div>
+    <div class="sub">{{ self.t("probe.queue_nearest").replace("{}", &queue.len().to_string()) }}</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>{{ self.t("probe.queue_title") }}</h2>
+  {% if queue.is_empty() %}
+    <p class="muted">{{ self.t("probe.queue_empty") }}</p>
+  {% else %}
+    <table class="data">
+      <thead>
+        <tr>
+          <th>{{ self.t("nav.proxies") }}</th><th>{{ self.t("probe.scheme") }}</th><th>{{ self.t("px.quarantined_since") }}</th>
+          <th>{{ self.t("px.second_chance") }}</th><th>{{ self.t("probe.col_15m") }}</th><th>{{ self.t("probe.col_30m") }}</th><th>{{ self.t("probe.col_1h") }}</th><th>{{ self.t("probe.next_check") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in queue %}
+        <tr>
+          <td><a href="/admin/proxies/{{ row.id }}">{{ row.name }}</a>
+              <span class="small muted">{{ row.host }}:{{ row.port }}</span></td>
+          <td class="mono small">{{ row.scheme }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.quarantined_at) }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.second_chance_at) }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.recheck_15m_at) }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.recheck_30m_at) }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.recheck_1h_at) }}</td>
+          <td class="small">{{ self.next_check(&row) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+
+<div class="grid cols-2">
+  <div class="panel">
+    <h2>{{ self.t("probe.cycle_settings") }}</h2>
+    <table class="data kv">
+      <tbody>
+        <tr><td>{{ self.t("probe.cycle_period") }}</td><td>{{ state.probe.cycle_interval_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("probe.sample_per_cycle") }}</td><td>{{ state.probe.sample_size }}</td></tr>
+        <tr><td>{{ self.t("probe.fail_limit") }}</td><td>{{ state.probe.fail_limit }}</td></tr>
+        <tr><td>{{ self.t("probe.tcp_timeout") }}</td><td>{{ state.probe.connect_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("probe.tls_timeout") }}</td><td>{{ state.probe.tls_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("probe.concurrency") }}</td><td>{{ state.probe.concurrency }}</td></tr>
+        <tr><td>{{ self.t("probe.second_chance_window") }}</td><td>{{ state.probe.second_chance_min_hours }} {{ self.t("probe.hours_short") }} + U(0..{{ state.probe.second_chance_spread_hours }} {{ self.t("probe.hours_short") }})</td></tr>
+        <tr><td>Heartbeat</td><td>{{ self.t("probe.every_n_sec").replace("{}", &state.probe.heartbeat_interval_secs.to_string()) }}</td></tr>
+        <tr><td>{{ self.t("probe.history_rotation") }}</td><td>{{ self.t("probe.every_n_sec").replace("{}", &state.probe.retention_interval_secs.to_string()) }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <h2>{{ self.t("probe.meow_title") }}</h2>
+    <table class="data kv">
+      <tbody>
+        <tr><td>REST API</td><td class="mono small">{{ state.meow.api_addr }}</td></tr>
+        <tr><td>{{ self.t("probe.clash_config") }}</td><td class="mono small">{{ state.meow.config_path.display() }}</td></tr>
+        <tr><td>{{ self.t("probe.test_url") }}</td><td class="mono small">{{ state.meow.test_url }}</td></tr>
+        <tr><td>{{ self.t("probe.check_timeout") }}</td><td>{{ state.meow.timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("probe.retention_probe") }}</td><td>{{ state.retention.probe_results_days }} {{ self.t("probe.days_short") }}</td></tr>
+        <tr><td>{{ self.t("probe.retention_fetch") }}</td><td>{{ state.retention.fetch_log_days }} {{ self.t("probe.days_short") }}</td></tr>
+      </tbody>
+    </table>
+    <p class="small muted">{{ self.t("probe.settings_note") }}</p>
+  </div>
+</div>
+{% endblock %}

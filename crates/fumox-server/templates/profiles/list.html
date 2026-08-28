@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("nav.profiles") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("nav.profiles") }}</h1>
+  <a class="btn primary" href="/admin/profiles/new">{{ self.t("prof.add") }}</a>
+</div>
+
+<div class="panel">
+  {% if rows.is_empty() %}
+    <p class="muted">{{ self.t("prof.empty") }}</p>
+  {% else %}
+    <table class="data">
+      <thead>
+        <tr>
+          <th>{{ self.t("common.name") }}</th>
+          <th>Slug</th>
+          <th>{{ self.t("prof.format_column") }}</th>
+          <th>{{ self.t("prof.access_column") }}</th>
+          <th>{{ self.t("prof.sources_column") }}</th>
+          <th>{{ self.t("common.state") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td><a href="/admin/profiles/{{ row.id }}">{{ row.name }}</a></td>
+          <td class="mono small">
+            {% match row.slug %}
+              {% when Some with (slug) %}{{ slug }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+          <td class="mono small">{{ row.output_format }}</td>
+          <td>
+            {% if row.protected %}
+              <span class="badge neutral">{{ self.t("prof.token_protected") }}</span>
+            {% else %}
+              <span class="muted small">{{ self.t("prof.public") }}</span>
+            {% endif %}
+          </td>
+          <td class="num">{{ row.sources_count }}</td>
+          <td>
+            {% if row.enabled %}
+              <span class="badge on">{{ self.t("common.on") }}</span>
+            {% else %}
+              <span class="badge off">{{ self.t("common.off") }}</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+{% endblock %}

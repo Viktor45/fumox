@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("nav.proxies") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("nav.proxies") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
+  <span class="spacer"></span>
+  <div class="row-actions">
+    <button class="btn danger" type="button" onclick="document.getElementById('purge-dialog').showModal()">{{ self.t("px.purge_button") }}</button>
+  </div>
+</div>
+
+<dialog id="purge-dialog">
+  <form method="post" action="/admin/proxies/purge-removed">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <p>{{ self.t("px.purge_confirm") }}</p>
+    <p class="muted small">{{ self.t("px.purge_note") }}</p>
+    <div class="form-actions">
+      <button class="btn danger" type="submit">{{ self.t("common.delete") }}</button>
+      <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
+    </div>
+  </form>
+</dialog>
+
+<form class="filters panel" method="get" action="/admin/proxies">
+  <div class="field">
+    <label>{{ self.t("common.status") }}</label>
+    {% for (status, checked) in all_statuses %}
+      <span class="check-row">
+        <input type="checkbox" name="status" value="{{ status }}" id="st-{{ status }}" {% if checked %}checked{% endif %}>
+        <label for="st-{{ status }}">{{ status }}</label>
+      </span>
+    {% endfor %}
+  </div>
+  <div class="field">
+    <label>{{ self.t("common.protocol") }}</label>
+    <select name="scheme">
+      <option value="">{{ self.t("common.all") }}</option>
+      {% for (scheme, selected) in all_schemes %}
+        <option value="{{ scheme }}" {% if selected %}selected{% endif %}>{{ scheme }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label>{{ self.t("common.country") }}</label>
+    <select name="country">
+      <option value="">{{ self.t("common.all") }}</option>
+      {% for country in countries %}
+        <option value="{{ country }}" {% if self.country_selected(country) %}selected{% endif %}>{{ country }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label>{{ self.t("common.source") }}</label>
+    <select name="source">
+      <option value="">{{ self.t("common.all") }}</option>
+      {% for (id, name, _) in sources %}
+        <option value="{{ id }}" {% if self.source_selected(id) %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label>{{ self.t("common.search") }}</label>
+    <input type="text" name="q" value="{{ f_q }}" placeholder="{{ self.t("px.search_placeholder") }}">
+  </div>
+  <div class="field">
+    <label>{{ self.t("px.sort_label") }}</label>
+    <select name="sort">
+      <option value="updated" {% if f_sort == "updated" %}selected{% endif %}>{{ self.t("px.sort_updated") }}</option>
+      <option value="latency" {% if f_sort == "latency" %}selected{% endif %}>{{ self.t("px.sort_latency") }}</option>
+      <option value="name" {% if f_sort == "name" %}selected{% endif %}>{{ self.t("px.sort_name") }}</option>
+    </select>
+  </div>
+  <button class="btn" type="submit">{{ self.t("common.apply") }}</button>
+</form>
+
+<div class="panel">
+  {% if rows.is_empty() %}
+    <p class="muted">{{ self.t("px.nothing_found") }}</p>
+  {% else %}
+    <table class="data">
+      <thead>
+        <tr>
+          <th>{{ self.t("common.status") }}</th>
+          <th>{{ self.t("common.protocol") }}</th>
+          <th>{{ self.t("px.address") }}</th>
+          <th>{{ self.t("common.country") }}</th>
+          <th>{{ self.t("common.name") }}</th>
+          <th>{{ self.t("common.latency") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td><span class="badge {{ row.status }}">{{ row.status }}</span></td>
+          <td class="mono small">
+            {{ row.scheme }}
+            {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">unprobeable</span>{% endif %}
+          </td>
+          <td class="mono small">{{ row.host }}:{{ row.port }}</td>
+          <td class="small">{{ self.flag(row.geo_country) }}
+            {% match row.geo_country %}
+              {% when Some with (country) %}{{ country }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+          <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(row.name) }}</a></td>
+          <td class="num small">
+            {% match row.latency_ms %}
+              {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% if pages.len() > 1 %}
+      <div class="pagination">
+        {% for (p, current) in pages %}
+          {% if current %}
+            <span class="page current">{{ p }}</span>
+          {% else %}
+            <a class="page" href="/admin/proxies?page={{ p }}&amp;per_page={{ per_page }}{{ self.query_suffix() }}">{{ p }}</a>
+          {% endif %}
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

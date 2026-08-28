@@ -1,0 +1,22 @@
+# meow-rs bootstrap configuration for Fumox T2 health checks.
+#
+# meow-rs runs headless here: fumox-probe generates the real proxy list,
+# writes it to /shared/meow.yaml, and hot-reloads it via `PUT /configs`.
+# This file only needs to bring up the external-controller REST API that the
+# probe talks to. No inbound listeners are required for delay tests, and the
+# external-controller is not hot-swappable on reload, so it stays up across
+# every probe-driven config reload.
+
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+
+# Clash external-controller REST API. fumox-probe connects to meow:9090 over
+# the compose network. Keep the secret empty: the probe sends no
+# Authorization header.
+external-controller: 0.0.0.0:9090
+secret: ""
+
+proxies: []
+rules: []

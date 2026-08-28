@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = ["crates/fumox-core", "crates/fumox-server", "crates/fumox-probe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+fumox-core = { path = "crates/fumox-core" }
+
+# Async runtime / HTTP
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "json",
+] }
+# T1 TLS handshakes in the probe daemon (health checks, not a trust boundary).
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+# preserve_order keeps JSON object key order (vmess round-trip fidelity).
+serde_json = { version = "1", features = ["preserve_order"] }
+# YAML (Clash input/output). serde_yaml is deprecated, serde_yml turned out
+# unsound+unmaintained (RUSTSEC-2025-0068); serde_norway is the maintained
+# fork recommended by RustSec, API-compatible with serde_yaml 0.9.
+serde_norway = "0.9"
+figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Caching / geo
+moka = { version = "0.12", features = ["future"] }
+maxminddb = "0.27"
+
+# Utilities
+nanoid = "0.4"
+regex = "1"
+base64 = "0.22"
+url = "2"
+percent-encoding = "2"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.9"
+time = { version = "0.3", features = ["macros", "formatting"] }
+thiserror = "2"
+anyhow = "1"
+async-stream = "0.3"
+futures-util = "0.3"
+
+# Admin UI (SSR templates)
+askama = "0.15"
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,1396 @@
+//! Admin panel: SSR (askama) + HTMX, served on a dedicated loopback
+//! listener (ADMIN_PLAN §2). Multilingual UI (Russian default, English and
+//! any number of extra languages from external TOML catalogs, switchable on
+//! the login screen) with day/night themes, no frontend build step, static
+//! assets vendored into the binary.
+
+pub mod auth;
+mod handlers;
+pub mod i18n;
+pub mod security;
+pub mod theme;
+
+use crate::cache::Caches;
+use crate::events::EventBus;
+use crate::fetcher::Fetcher;
+use crate::scheduler::SchedulerState;
+use askama::Template;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Redirect, Response};
+use fumox_core::config::{AdminConfig, MeowConfig, ProbeConfig, RetentionConfig};
+use fumox_core::db::DbPool;
+use fumox_core::geo::GeoResolver;
+use i18n::Lang;
+use std::sync::Arc;
+
+/// Shared state for every admin handler.
+#[derive(Clone)]
+pub struct AdminState {
+    pub pool: DbPool,
+    pub caches: Caches,
+    pub geo: Arc<GeoResolver>,
+    /// Immediate-refresh channel into the scheduler (source ids).
+    pub refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Scheduler handle: in-flight status for "обновить сейчас" fragments.
+    pub scheduler: SchedulerState,
+    /// Event bus feeding the SSE endpoint (`/admin/events`).
+    pub events: EventBus,
+    /// HTTP fetcher shared with the scheduler; reused by dry-run so the
+    /// SSRF vetting is exactly the same code path (ADMIN_PLAN §13.11).
+    pub fetcher: Fetcher,
+    /// The `[admin]` configuration block (token, rate limits, TTL).
+    pub admin: AdminConfig,
+    /// Read-only probe/meow/retention settings shown on `/admin/probe`
+    /// (ADMIN_PLAN §4.5).
+    pub probe: ProbeConfig,
+    pub meow: MeowConfig,
+    pub retention: RetentionConfig,
+    /// HMAC key for session cookies, derived from the admin token so that
+    /// rotating the token revokes every existing session (ADMIN_PLAN §13.1).
+    pub session_key: Vec<u8>,
+    /// HMAC key for CSRF tokens (independent from the session key).
+    pub csrf_key: Vec<u8>,
+    /// Per-IP rate limiter for `POST /admin/login`.
+    pub login_limiter: Arc<auth::RateLimiter>,
+    /// Per-IP rate limiter for the rest of `/admin/*`.
+    pub admin_limiter: Arc<auth::RateLimiter>,
+    /// UI message catalogs, loaded once at startup from `[admin].locales_dir`
+    /// with the shipped ru/en catalogs embedded as fallback.
+    pub locales: Arc<i18n::Locales>,
+}
+
+impl AdminState {
+    // Aggregates every shared dependency of the admin handlers; the breadth
+    // is inherent to a constructor wired once at startup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pool: DbPool,
+        caches: Caches,
+        geo: Arc<GeoResolver>,
+        refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        scheduler: SchedulerState,
+        events: EventBus,
+        fetcher: Fetcher,
+        config: fumox_core::AppConfig,
+    ) -> Self {
+        let session_key = auth::derive_key(b"fumox-admin-session", &config.admin.token);
+        let csrf_key = auth::derive_key(b"fumox-admin-csrf", &config.admin.token);
+        let login_limiter = Arc::new(auth::RateLimiter::new(
+            u64::from(config.admin.login_rate_limit.limit),
+            config.admin.login_rate_limit.window,
+        ));
+        let admin_limiter = Arc::new(auth::RateLimiter::new(
+            u64::from(config.admin.rate_limit.limit),
+            config.admin.rate_limit.window,
+        ));
+        let locales = Arc::new(i18n::Locales::load(std::path::Path::new(
+            &config.admin.locales_dir,
+        )));
+        Self {
+            pool,
+            caches,
+            geo,
+            refresh_tx,
+            scheduler,
+            events,
+            fetcher,
+            admin: config.admin.clone(),
+            probe: config.probe.clone(),
+            meow: config.meow.clone(),
+            retention: config.retention.clone(),
+            session_key,
+            csrf_key,
+            login_limiter,
+            admin_limiter,
+            locales,
+        }
+    }
+
+    /// Session TTL as a duration.
+    fn session_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.admin.session_ttl_hours) * 3600)
+    }
+
+    /// CSRF token for the current session cookie (empty when no session).
+    fn csrf_for(&self, headers: &axum::http::HeaderMap) -> String {
+        let session = auth::session_cookie_value(headers).unwrap_or_default();
+        auth::csrf_token(&self.csrf_key, &session)
+    }
+}
+
+/// Build the admin router. Mounted only when the panel is active
+/// (enabled + non-empty token); otherwise the listener serves 404.
+pub fn router(state: AdminState) -> axum::Router {
+    use axum::routing::{get, post};
+
+    // Middleware execution is outside-in: `require_auth` (added last) runs
+    // first, then CSRF, then the handler.
+    let protected = axum::Router::new()
+        .route("/", get(handlers::dashboard))
+        .route("/sources", get(handlers::sources_list))
+        .route(
+            "/sources/new",
+            get(handlers::source_form).post(handlers::source_create),
+        )
+        .route("/sources/{id}", get(handlers::source_detail))
+        .route(
+            "/sources/{id}/edit",
+            get(handlers::source_edit_form).post(handlers::source_update),
+        )
+        .route("/sources/{id}/toggle", post(handlers::source_toggle))
+        .route("/sources/{id}/refresh", post(handlers::source_refresh))
+        .route(
+            "/sources/{id}/refresh-status",
+            get(handlers::source_refresh_status),
+        )
+        .route("/sources/{id}/delete", post(handlers::source_delete))
+        .route("/sources/{id}/log", get(handlers::source_log))
+        .route("/sources/{id}/dry-run", post(handlers::source_dry_run))
+        .route("/profiles", get(handlers::profiles_list))
+        .route(
+            "/profiles/new",
+            get(handlers::profile_form).post(handlers::profile_create),
+        )
+        .route("/profiles/{id}", get(handlers::profile_detail))
+        .route(
+            "/profiles/{id}/edit",
+            get(handlers::profile_edit_form).post(handlers::profile_update),
+        )
+        .route("/profiles/{id}/toggle", post(handlers::profile_toggle))
+        .route("/profiles/{id}/delete", post(handlers::profile_delete))
+        .route("/proxies", get(handlers::proxies_list))
+        .route(
+            "/proxies/purge-removed",
+            post(handlers::proxies_purge_removed),
+        )
+        .route("/proxies/{id}", get(handlers::proxy_detail))
+        .route("/proxies/{id}/reset", post(handlers::proxy_reset))
+        .route(
+            "/proxies/{id}/probe-history",
+            get(handlers::proxy_probe_history),
+        )
+        .route("/logs/fetch", get(handlers::fetch_logs))
+        .route("/probe", get(handlers::probe_overview))
+        .route("/export", get(handlers::export_config))
+        .route(
+            "/import",
+            get(handlers::import_form).post(handlers::import_submit),
+        )
+        .route("/events", get(handlers::events_stream))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::csrf_protect,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
+    // axum's nesting matches `/admin` but not `/admin/`; the trailing-slash
+    // variant is a plain redirect to the canonical entry point.
+    axum::Router::new()
+        .nest("/admin", protected)
+        .route("/admin/", get(|| async { Redirect::to("/admin") }))
+        .route(
+            "/admin/login",
+            get(auth::login_form).post(auth::login_submit),
+        )
+        .route("/admin/logout", post(auth::logout))
+        .route("/admin/set-lang", get(auth::set_lang))
+        .route("/admin/set-theme", get(theme::set_theme))
+        .route("/admin/static/app.css", get(static_css))
+        .route("/admin/static/htmx.min.js", get(static_htmx))
+        .layer(axum::middleware::from_fn(security::headers))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::rate_limit,
+        ))
+        .with_state(state)
+}
+
+/// Render an askama template into an HTML response; template errors are a
+/// server bug and become a logged 500.
+pub fn render_html(lang: Lang, template: &impl Template, status: StatusCode) -> Response {
+    match template.render() {
+        Ok(html) => (
+            status,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html,
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "template rendering failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                format!("<h1>500</h1><p>{}</p>", lang.t("err.render_failed")),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Vendored stylesheet (ADMIN_PLAN §11, §13.13).
+async fn static_css() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../../static/app.css"),
+    )
+}
+
+/// Vendored htmx (fixed version, no CDN — works offline).
+async fn static_htmx() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../../static/htmx.min.js"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode, header};
+    use http_body_util::BodyExt;
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "test-admin-token";
+
+    fn admin_config(admin_limit: u32) -> fumox_core::config::AdminConfig {
+        fumox_core::config::AdminConfig {
+            enabled: true,
+            token: TOKEN.to_string(),
+            // Skip DNS vetting of source URLs in tests (no network needed);
+            // static URL validation still runs.
+            allow_private_urls: true,
+            rate_limit: fumox_core::config::RateLimit::new(
+                admin_limit,
+                std::time::Duration::from_secs(60),
+            ),
+            login_rate_limit: fumox_core::config::RateLimit::new(
+                100,
+                std::time::Duration::from_secs(60),
+            ),
+            ..Default::default()
+        }
+    }
+
+    async fn test_state(admin_limit: u32) -> AdminState {
+        let dir =
+            std::env::temp_dir().join(format!("fumox-admin-test-{}", fumox_core::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = fumox_core::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        };
+        let pool = fumox_core::db::connect_pool(&cfg).await.unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(refresh_rx); // keep the channel open for sends
+        let geo_cfg = fumox_core::config::GeoConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let config = fumox_core::AppConfig {
+            admin: admin_config(admin_limit),
+            ..Default::default()
+        };
+        let fetcher = Fetcher::new(config.fetch.clone(), config.admin.allow_private_urls);
+        AdminState::new(
+            pool,
+            crate::cache::Caches::new(),
+            Arc::new(GeoResolver::new(&geo_cfg)),
+            refresh_tx,
+            SchedulerState::new(1),
+            EventBus::new(),
+            fetcher,
+            config,
+        )
+    }
+
+    /// Build a request with the ConnectInfo extension the rate limiter
+    /// needs; a real listener attaches it via
+    /// `into_make_service_with_connect_info`.
+    fn request(method: &str, uri: &str, body: &str, cookie: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .extension(ConnectInfo::<SocketAddr>(
+                "127.0.0.1:41000".parse().unwrap(),
+            ));
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    async fn login(app: &axum::Router) -> String {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.starts_with(&format!("{}=", auth::SESSION_COOKIE)));
+        assert!(set_cookie.contains("HttpOnly"));
+        // The cookie value is everything up to the first ';'.
+        set_cookie.split(';').next().unwrap().to_string()
+    }
+
+    fn csrf_for(state: &AdminState, cookie: &str) -> String {
+        let session = cookie
+            .split_once('=')
+            .map(|(_, value)| value.to_string())
+            .unwrap_or_default();
+        auth::csrf_token(&state.csrf_key, &session)
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_browsers_are_redirected_to_login() {
+        let state = test_state(1000).await;
+        let app = router(state);
+        let response = app
+            .oneshot(request("GET", "/admin", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/login"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_htmx_gets_hx_redirect() {
+        let state = test_state(1000).await;
+        let app = router(state);
+        let mut req = request("GET", "/admin/sources", "", None);
+        req.headers_mut()
+            .insert("HX-Request", "true".parse().unwrap());
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get("HX-Redirect").unwrap(),
+            "/admin/login"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_flow_grants_access_and_wrong_token_does_not() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+
+        // Wrong token: re-render the form with 422, no session.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/login", "token=nope", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+
+        // Correct token: session cookie and access to the dashboard.
+        let cookie = login(&app).await;
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("Дашборд"));
+
+        // Security headers are present on every admin response.
+        let response = app
+            .oneshot(request("GET", "/admin/login", "", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_without_csrf_is_rejected() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+
+        let source = fumox_core::models::Source {
+            id: "srcA0000000".into(),
+            slug: None,
+            name: "s".into(),
+            url: "https://example.com".into(),
+            enabled: true,
+            encoding: Default::default(),
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 3600,
+            tags: None,
+            pipeline: None,
+            headers: None,
+            created_at: 1,
+            updated_at: 1,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        };
+        fumox_core::repo::sources::create(&pool, &source)
+            .await
+            .unwrap();
+
+        // No _csrf field at all.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/sources/srcA0000000/toggle",
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // A forged token does not pass either.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/sources/srcA0000000/toggle",
+                "_csrf=forged",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The genuine token (derived from the session cookie) passes.
+        let csrf = csrf_for(&state, &cookie);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/sources/srcA0000000/toggle",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let reloaded = fumox_core::repo::sources::get(&pool, "srcA0000000")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!reloaded.enabled); // was true, toggled to false
+    }
+
+    #[tokio::test]
+    async fn rate_limit_kicks_in_past_the_soft_limit() {
+        let state = test_state(3).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(request("GET", "/admin", "", Some(&cookie)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = app
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn list_screens_render_for_an_authenticated_session() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        for path in [
+            "/admin/sources",
+            "/admin/sources/new",
+            "/admin/profiles",
+            "/admin/profiles/new",
+            "/admin/proxies",
+            "/admin/logs/fetch",
+            "/admin/import",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request("GET", path, "", Some(&cookie)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "path {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn source_form_validation_rejects_bad_input() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // Missing name and url, bad slug and TTL.
+        let body = format!("_csrf={csrf}&slug=-bad&url=ftp://x&cache_ttl_seconds=5");
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("обязательное поле"));
+        assert!(
+            fumox_core::repo::sources::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A valid submission creates the source and redirects to the card.
+        let body = format!(
+            "_csrf={csrf}&name=Test&slug=test&url=https%3A%2F%2Fexample.com%2Fsub&cache_ttl_seconds=3600&enabled=1"
+        );
+        let response = app
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let created = fumox_core::repo::sources::get_by_slug(&state.pool, "test")
+            .await
+            .unwrap();
+        assert!(created.is_some());
+    }
+
+    #[tokio::test]
+    async fn unknown_entities_are_404() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        for path in [
+            "/admin/sources/doesnotexist",
+            "/admin/profiles/doesnotexist",
+            "/admin/proxies/42",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request("GET", path, "", Some(&cookie)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "path {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        // Daemon heartbeat and meow contact stamps from meta.
+        fumox_core::repo::meta_set(
+            &pool,
+            "probe_heartbeat",
+            &format!(r#"{{"ts":{now},"pid":4242,"version":"0.1.0"}}"#),
+        )
+        .await
+        .unwrap();
+        fumox_core::repo::meta_set(&pool, "meow_last_ok", &now.to_string())
+            .await
+            .unwrap();
+
+        // One quarantined proxy with a scheduled second chance.
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
+                                  quarantined_at, second_chance_at, created_at, updated_at)
+             VALUES ('fp-q1', 'vless', 'sick-proxy', 'q.example.com', 443, 'c', 'quarantine',
+                     ?, ?, 1, 1)",
+        )
+        .bind(now - 3600)
+        .bind(now + 86_400)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let response = app
+            .oneshot(request("GET", "/admin/probe", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("Probe"));
+        assert!(html.contains("4242")); // pid from the heartbeat
+        assert!(html.contains("sick-proxy")); // quarantine queue row
+        assert!(html.contains("q.example.com"));
+    }
+
+    #[tokio::test]
+    async fn purge_removed_deletes_only_removed_proxies() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        for (fp, status) in [("fp-dead", "removed"), ("fp-live", "alive")] {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+                 VALUES (?, 'vless', 'n', 'h.example.com', 443, 'c', ?, 1, 1)",
+            )
+            .bind(fp)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/proxies/purge-removed",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let remaining: Vec<(String,)> =
+            sqlx::query_as("SELECT fingerprint FROM proxies ORDER BY fingerprint")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec![("fp-live".to_string(),)]);
+    }
+
+    #[tokio::test]
+    async fn dry_run_parses_source_without_writing_anything() {
+        use axum::routing::get;
+
+        // Mock subscription endpoint.
+        let mock = axum::Router::new().route(
+            "/sub",
+            get(|| async { "vless://uuid@1.2.3.4:443?security=reality#A\ntrojan://pw@h:443#B\n" }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+        let source = fumox_core::models::Source {
+            id: "srcD0000000".into(),
+            slug: None,
+            name: "dry".into(),
+            url: format!("http://{addr}/sub"),
+            enabled: true,
+            encoding: Default::default(),
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 3600,
+            tags: None,
+            pipeline: None,
+            headers: None,
+            created_at: now,
+            updated_at: now,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        };
+        fumox_core::repo::sources::create(&pool, &source)
+            .await
+            .unwrap();
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/sources/srcD0000000/dry-run",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("успех"));
+        assert!(html.contains("1.2.3.4")); // sample line preview
+
+        // Nothing was written: no proxies, no fetch_log entries.
+        let (proxy_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(proxy_count, 0);
+        let (log_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fetch_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(log_count, 0);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_emits_stats_and_fetch_events() {
+        let state = test_state(1000).await;
+        let events = state.events.clone();
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+
+        let response = app
+            .oneshot(request("GET", "/admin/events", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}"
+        );
+
+        let mut body = response.into_body();
+        let mut buf = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // The initial probe.stats snapshot arrives immediately.
+        loop {
+            let frame = tokio::time::timeout_at(deadline, body.frame())
+                .await
+                .expect("timed out waiting for the initial SSE frame")
+                .unwrap()
+                .unwrap();
+            if let Some(chunk) = frame.data_ref() {
+                buf.extend_from_slice(chunk);
+            }
+            if String::from_utf8_lossy(&buf).contains("probe.stats") {
+                break;
+            }
+        }
+
+        // A published fetch event reaches the same open stream.
+        events.publish(
+            "fetch.done",
+            serde_json::json!({"source_id": "srcA0000000", "ok": true}),
+        );
+        loop {
+            let frame = tokio::time::timeout_at(deadline, body.frame())
+                .await
+                .expect("timed out waiting for the fetch.done frame")
+                .unwrap()
+                .unwrap();
+            if let Some(chunk) = frame.data_ref() {
+                buf.extend_from_slice(chunk);
+            }
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if text.contains("fetch.done") && text.contains("srcA0000000") {
+                break;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Interface language (i18n)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dashboard_defaults_to_russian_and_follows_the_language_cookie() {
+        let state = test_state(1000).await;
+        let app = router(state);
+        let cookie = login(&app).await;
+
+        // No language cookie: Russian, the default.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("lang=\"ru\""));
+        assert!(html.contains("Дашборд"));
+
+        // With fumox_lang=en the same page renders in English.
+        let response = app
+            .oneshot(request(
+                "GET",
+                "/admin",
+                "",
+                Some(&format!("{cookie}; fumox_lang=en")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("lang=\"en\""));
+        assert!(html.contains("Dashboard"));
+        assert!(!html.contains("Дашборд"));
+    }
+
+    #[tokio::test]
+    async fn login_screen_language_selection_sets_the_cookie() {
+        let state = test_state(1000).await;
+        let app = router(state);
+
+        // ?lang=en renders English and persists the choice.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/login?lang=en", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("language cookie is set")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.starts_with("fumox_lang=en;"));
+        assert!(set_cookie.contains("HttpOnly"));
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("lang=\"en\""));
+        assert!(html.contains("Access token"));
+
+        // ?lang=ru switches back to Russian.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/login?lang=ru", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.starts_with("fumox_lang=ru;"));
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("Токен доступа"));
+
+        // Without a parameter or cookie the screen stays Russian and sets
+        // no language cookie.
+        let response = app
+            .oneshot(request("GET", "/admin/login", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("lang=\"ru\""));
+    }
+
+    #[tokio::test]
+    async fn set_lang_redirects_with_cookie_and_guards_the_next_param() {
+        let state = test_state(1000).await;
+        let app = router(state);
+
+        // Valid next: back to the requested admin page with the new cookie.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin/set-lang?lang=en&next=/admin/proxies",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/proxies"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("fumox_lang=en;")
+        );
+
+        // External next values are dropped: the redirect stays inside /admin.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin/set-lang?lang=ru&next=https://evil.example.com",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
+
+        // Unknown language values fall back to Russian.
+        let response = app
+            .oneshot(request("GET", "/admin/set-lang?lang=fr", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("fumox_lang=ru;")
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Interface theme (day/night)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pages_default_to_light_and_follow_the_theme_cookie() {
+        let state = test_state(1000).await;
+        let app = router(state);
+        let cookie = login(&app).await;
+
+        // No theme cookie: the day theme.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("data-theme=\"light\""));
+
+        // With fumox_theme=dark the same page renders the night theme.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin",
+                "",
+                Some(&format!("{cookie}; fumox_theme=dark")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("data-theme=\"dark\""));
+
+        // The login screen honors the same cookie.
+        let response = app
+            .oneshot(request("GET", "/admin/login", "", Some("fumox_theme=dark")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("data-theme=\"dark\""));
+    }
+
+    #[tokio::test]
+    async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
+        let state = test_state(1000).await;
+        let app = router(state);
+
+        // Valid next: back to the requested admin page with the new cookie.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin/set-theme?theme=dark&next=/admin/proxies",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/proxies"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("fumox_theme=dark;")
+        );
+
+        // External next values are dropped: the redirect stays inside /admin.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin/set-theme?theme=light&next=https://evil.example.com",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
+
+        // Unknown theme values fall back to the light theme.
+        let response = app
+            .oneshot(request("GET", "/admin/set-theme?theme=neon", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("fumox_theme=light;")
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Configuration import/export (Phase 4)
+    // -----------------------------------------------------------------
+
+    /// URL-encode `(key, value)` pairs into a form body.
+    fn urlencoded(pairs: &[(&str, &str)]) -> String {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    percent_encoding::utf8_percent_encode(k, percent_encoding::NON_ALPHANUMERIC),
+                    percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    /// One source + one profile that references it (both with slugs).
+    async fn io_fixture(state: &AdminState) {
+        let now = fumox_core::models::now_ts();
+        let source = fumox_core::models::Source {
+            id: "srcX0000000".into(),
+            slug: Some("exp-src".into()),
+            name: "export source".into(),
+            url: "https://example.com/sub".into(),
+            enabled: true,
+            encoding: Default::default(),
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 3600,
+            tags: Some(vec!["tag1".into()]),
+            pipeline: None,
+            headers: None,
+            created_at: now,
+            updated_at: now,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        };
+        fumox_core::repo::sources::create(&state.pool, &source)
+            .await
+            .unwrap();
+        let profile = fumox_core::models::Profile {
+            id: "profX0000000".into(),
+            slug: Some("exp-prof".into()),
+            access_token: Some("tok".into()),
+            name: "export profile".into(),
+            output_format: fumox_core::models::OutputFormat::Clash,
+            pipeline: None,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        fumox_core::repo::profiles::create(&state.pool, &profile)
+            .await
+            .unwrap();
+        fumox_core::repo::profiles::set_sources(
+            &state.pool,
+            "profX0000000",
+            &[("srcX0000000".into(), 0)],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn export_body(app: &axum::Router, cookie: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/export", "", Some(cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn export_downloads_configuration_as_attachment() {
+        let state = test_state(1000).await;
+        io_fixture(&state).await;
+        let app = router(state);
+        let cookie = login(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/export", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "{content_type}"
+        );
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            disposition.starts_with("attachment; filename=\"fumox-config-"),
+            "{disposition}"
+        );
+
+        let payload = export_body(&app, &cookie).await;
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["version"], 1);
+        assert_eq!(parsed["sources"][0]["ref"], "srcX0000000");
+        assert_eq!(parsed["sources"][0]["slug"], "exp-src");
+        assert_eq!(parsed["profiles"][0]["slug"], "exp-prof");
+        assert_eq!(parsed["profiles"][0]["output_format"], "clash");
+        assert_eq!(parsed["profiles"][0]["access_token"], "tok");
+        assert_eq!(
+            parsed["profiles"][0]["sources"],
+            serde_json::json!(["srcX0000000"])
+        );
+    }
+
+    #[tokio::test]
+    async fn import_creates_new_objects_and_remaps_composition() {
+        // Export from one database…
+        let exporter = test_state(1000).await;
+        io_fixture(&exporter).await;
+        let export_app = router(exporter);
+        let export_cookie = login(&export_app).await;
+        let payload = export_body(&export_app, &export_cookie).await;
+
+        // …and import it into a fresh one.
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let body = urlencoded(&[("_csrf", &csrf), ("payload", &payload)]);
+        let response = app
+            .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("Импорт завершён"), "{html}");
+
+        // Fresh ids, slugs preserved (clean DB), composition remapped.
+        let sources = fumox_core::repo::sources::list(&pool, false).await.unwrap();
+        assert_eq!(sources.len(), 1);
+        let new_source = &sources[0];
+        assert_ne!(new_source.id, "srcX0000000");
+        assert_eq!(new_source.slug.as_deref(), Some("exp-src"));
+        assert_eq!(new_source.tags.as_deref(), Some(&["tag1".to_string()][..]));
+
+        let profiles = fumox_core::repo::profiles::list(&pool, false)
+            .await
+            .unwrap();
+        assert_eq!(profiles.len(), 1);
+        let new_profile = &profiles[0];
+        assert_ne!(new_profile.id, "profX0000000");
+        assert_eq!(new_profile.slug.as_deref(), Some("exp-prof"));
+        assert_eq!(new_profile.access_token.as_deref(), Some("tok"));
+        let composition = fumox_core::repo::profiles::get_sources(&pool, &new_profile.id)
+            .await
+            .unwrap();
+        assert_eq!(composition, vec![(new_source.id.clone(), 0)]);
+    }
+
+    #[tokio::test]
+    async fn import_slug_collision_creates_objects_without_slug() {
+        let state = test_state(1000).await;
+        io_fixture(&state).await; // occupies exp-src / exp-prof
+        let pool = state.pool.clone();
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let payload = export_body(&app, &cookie).await;
+
+        let csrf = csrf_for(&state, &cookie);
+        let body = urlencoded(&[("_csrf", &csrf), ("payload", &payload)]);
+        let response = app
+            .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("Предупреждения"), "{html}");
+
+        // Two sources now; the imported one lost its slug to the collision.
+        let sources = fumox_core::repo::sources::list(&pool, false).await.unwrap();
+        assert_eq!(sources.len(), 2);
+        let imported = sources.iter().find(|s| s.id != "srcX0000000").unwrap();
+        assert_eq!(imported.slug, None);
+        let profiles = fumox_core::repo::profiles::list(&pool, false)
+            .await
+            .unwrap();
+        assert_eq!(profiles.len(), 2);
+        let imported_profile = profiles.iter().find(|p| p.id != "profX0000000").unwrap();
+        assert_eq!(imported_profile.slug, None);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_bad_version_and_invalid_fields_without_writes() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // Unsupported version → 422.
+        let v2 = r#"{"version":2,"exported_at":0,"sources":[],"profiles":[]}"#;
+        let body = urlencoded(&[("_csrf", &csrf), ("payload", v2)]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Non-http(s) URL → 422.
+        let bad_url = r#"{"version":1,"exported_at":0,"sources":[{"ref":"r1","name":"s","url":"ftp://x","enabled":true,"encoding":"auto","cache_ttl_seconds":3600}],"profiles":[]}"#;
+        let body = urlencoded(&[("_csrf", &csrf), ("payload", bad_url)]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // TTL out of range → 422.
+        let bad_ttl = r#"{"version":1,"exported_at":0,"sources":[{"ref":"r1","name":"s","url":"https://example.com","enabled":true,"encoding":"auto","cache_ttl_seconds":5}],"profiles":[]}"#;
+        let body = urlencoded(&[("_csrf", &csrf), ("payload", bad_ttl)]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // All-or-nothing: nothing was written by any of the attempts.
+        assert!(
+            fumox_core::repo::sources::list(&pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fumox_core::repo::profiles::list(&pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn import_requires_auth_and_csrf() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let payload = r#"{"version":1,"exported_at":0,"sources":[],"profiles":[]}"#;
+        let body = urlencoded(&[("payload", payload)]);
+
+        // Missing CSRF token → 403.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Unauthenticated browser POST → redirected to the login screen.
+        let response = app
+            .oneshot(request("POST", "/admin/import", &body, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/login"
+        );
+    }
+}

@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+
+{% block title %}{{ source.name }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ source.name }}</h1>
+  <span id="enabled-badge">
+    {% if source.enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+  </span>
+  {% match source.error_class %}
+    {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+    {% when None %}
+  {% endmatch %}
+  <span id="refresh-status"></span>
+  <span class="spacer"></span>
+  <div class="row-actions">
+    <a class="btn" href="/admin/sources/{{ source.id }}/edit">{{ self.t("common.edit") }}</a>
+    <form method="post" action="/admin/sources/{{ source.id }}/toggle"
+          hx-post="/admin/sources/{{ source.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button class="btn" type="submit">{% if source.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
+    </form>
+    <form method="post" action="/admin/sources/{{ source.id }}/refresh"
+          hx-post="/admin/sources/{{ source.id }}/refresh" hx-target="#refresh-status" hx-swap="outerHTML">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button class="btn" type="submit">{{ self.t("src.refresh_now") }}</button>
+    </form>
+    <form method="post" action="/admin/sources/{{ source.id }}/dry-run"
+          hx-post="/admin/sources/{{ source.id }}/dry-run" hx-target="#dryrun-target" hx-swap="innerHTML">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button class="btn" type="submit">{{ self.t("src.dry_run") }}</button>
+    </form>
+    <button class="btn danger" type="button" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
+  </div>
+</div>
+
+<div id="dryrun-target"></div>
+
+<div class="grid cols-2">
+  <div class="panel">
+    <h2>{{ self.t("src.params_title") }}</h2>
+    <table class="kv">
+      <tr><th>URL</th><td class="small mono">{{ url_display }}</td></tr>
+      <tr><th>Slug</th><td class="mono">
+        {% match source.slug %}
+          {% when Some with (slug) %}{{ slug }}
+          {% when None %}<span class="muted">—</span>
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("src.endpoint") }}</th><td class="mono small"><a href="{{ serve_path }}">{{ serve_path }}</a></td></tr>
+      <tr><th>{{ self.t("src.encoding") }}</th><td>{{ source.encoding.as_str() }}</td></tr>
+      <tr><th>{{ self.t("src.input_format") }}</th><td>
+        {% match source.input_format %}
+          {% when Some with (format) %}{{ format.as_str() }}
+          {% when None %}{{ self.t("src.auto") }}
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("src.protocols_label") }}</th><td>{{ protocols_display }}</td></tr>
+      <tr><th>{{ self.t("src.refresh_interval") }}</th><td>{{ source.cache_ttl_seconds }} {{ self.t("common.sec") }}</td></tr>
+      <tr><th>{{ self.t("src.tags_label") }}</th><td>
+        {% match source.tags %}
+          {% when Some with (tags) %}{{ tags.join(", ") }}
+          {% when None %}<span class="muted">—</span>
+        {% endmatch %}
+      </td></tr>
+      <tr><th>{{ self.t("common.created") }}</th><td class="small">{{ self.ts(source.created_at) }}</td></tr>
+      <tr><th>{{ self.t("common.updated") }}</th><td class="small">{{ self.ts(source.updated_at) }}</td></tr>
+      <tr><th>{{ self.t("dash.last_fetch") }}</th><td class="small">{{ self.opt_ts(source.last_fetched_at) }}</td></tr>
+      <tr><th>{{ self.t("src.last_error") }}</th><td class="small">
+        {% match source.last_error %}
+          {% when Some with (message) %}{{ message }}
+          {% when None %}<span class="muted">—</span>
+        {% endmatch %}
+      </td></tr>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("src.proxies_by_status") }}</h2>
+    {% if counts.is_empty() %}
+      <p class="muted">{{ self.t("src.no_proxies_yet") }}</p>
+    {% else %}
+      <p>
+        {% for (status, count) in counts %}
+          <span class="badge {{ status }}">{{ status }}: {{ count }}</span>
+        {% endfor %}
+      </p>
+    {% endif %}
+
+    {% if !headers_display.is_empty() %}
+      <h3>{{ self.t("src.headers_masked_title") }}</h3>
+      <table class="kv">
+        {% for (key, value) in headers_display %}
+          <tr><th>{{ key }}</th><td class="mono small">{{ value }}</td></tr>
+        {% endfor %}
+      </table>
+    {% endif %}
+
+    {% if !pipeline_display.is_empty() %}
+      <h3>Pipeline</h3>
+      <pre class="mono small">{{ pipeline_display }}</pre>
+    {% endif %}
+  </div>
+</div>
+
+<div class="panel">
+  <h2>{{ self.t("src.fetch_log_title") }}</h2>
+  <div id="log-wrap">
+    {% if log.is_empty() %}
+      <p class="muted">{{ self.t("dash.no_fetches") }}</p>
+    {% else %}
+      <table class="data">
+        <thead>
+          <tr><th>{{ self.t("common.time") }}</th><th>{{ self.t("common.result") }}</th><th>HTTP</th><th>{{ self.t("common.size") }}</th><th>{{ self.t("src.proxies_found") }}</th><th>{{ self.t("common.error") }}</th></tr>
+        </thead>
+        <tbody>
+          {% for row in log %}
+          <tr>
+            <td class="small muted">{{ self.ts(row.fetched_at) }}</td>
+            <td>
+              {% if row.ok == 1 %}
+                <span class="badge alive">{{ self.t("common.ok") }}</span>
+              {% else %}
+                {% match row.error_class %}
+                  {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+                  {% when None %}<span class="badge error">{{ self.t("common.error") }}</span>
+                {% endmatch %}
+              {% endif %}
+            </td>
+            <td class="small">
+              {% match row.http_status %}
+                {% when Some with (status) %}{{ status }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+            <td class="small">{{ self.bytes(row.bytes) }}</td>
+            <td class="num">
+              {% match row.proxies_found %}
+                {% when Some with (count) %}{{ count }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+            <td class="small">
+              {% match row.error %}
+                {% when Some with (message) %}{{ message }}
+                {% when None %}
+              {% endmatch %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if pages.len() > 1 %}
+        <div class="pagination">
+          {% for (p, current) in pages %}
+            {% if current %}
+              <span class="page current">{{ p }}</span>
+            {% else %}
+              <a class="page" href="/admin/sources/{{ source.id }}?page={{ p }}">{{ p }}</a>
+            {% endif %}
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endif %}
+  </div>
+</div>
+
+<dialog id="delete-dialog">
+  <form method="post" action="/admin/sources/{{ source.id }}/delete">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <p>{{ self.t("src.delete_confirm") }} <b>{{ source.name }}</b>?</p>
+    <p class="muted small">{{ self.t("src.delete_note") }}</p>
+    <div class="form-actions">
+      <button class="btn danger" type="submit">{{ self.t("common.delete") }}</button>
+      <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
+    </div>
+  </form>
+</dialog>
+{% endblock %}

@@ -69,6 +69,11 @@ services:
     build:
       context: ./docker/meow
       dockerfile: Dockerfile
+      args:
+        # "latest" (default) resolves the newest meow-rs release at build
+        # time via the GitHub API. Set MEOW_VERSION in .env to a tag
+        # (e.g. v0.21.2) to pin a specific release instead.
+        MEOW_VERSION: ${MEOW_VERSION:-latest}
     image: fumox-meow:local
     volumes:
       - meow-shared:/shared

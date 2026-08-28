@@ -26,6 +26,7 @@ config/meow.yaml
 
 # Local environment (docker compose) — may carry the admin token
 .env
+.DS_Store
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
@@ -35,5 +36,9 @@ config/meow.yaml
 .idea/
 .vscode/
 .zcode/
+.agents/
+# Debug-only parser fixture: may contain non-public confidential data —
+# never commit it. Recreate locally from public subscriptions if needed;
+# fixture tests skip themselves when the file is absent.
 test.txt
-.DS_Store
+

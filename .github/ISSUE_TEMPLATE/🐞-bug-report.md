@@ -1,27 +1,27 @@
 ---
-name: "\U0001F41E Сообщить об ошибке"
-about: Создайте отчёт, чтобы помочь нам улучшить проект
-title: "\U0001F41E [ОШИБКА] - <краткое описание>"
+name: "\U0001F41E Bug Report"
+about: Create a report to help us improve the project
+title: "\U0001F41E [BUG] - <brief description>"
 labels: bug
 assignees: Viktor45
 ---
 
-**Описание ошибки**  
-Четкое и краткое описание того, в чём заключается проблема.
+**Describe the bug**  
+A clear and concise description of what the bug is.
 
-**Как воспроизвести**  
-Шаги для воспроизведения ошибки:
+**To Reproduce**  
+Steps to reproduce the behavior:
 
-1. Перейдите в «...»
-2. Нажмите на «...»
-3. Прокрутите до «...»
-4. Наблюдается ошибка
+1. Go to '...'
+2. Click on '...'
+3. Scroll down to '...'
+4. See error
 
-**Ожидаемое поведение**  
-Четкое и краткое описание того, что должно происходить в нормальной ситуации.
+**Expected behavior**  
+A clear and concise description of what you expected to happen.
 
-**Скриншоты**  
-При необходимости добавьте скриншоты для наглядности.
+**Screenshots**  
+If applicable, add screenshots to help explain your problem.
 
-**Дополнительный контекст**  
-Любая дополнительная информация: версия ПО, операционная система, логи, сетевые условия и т.д.
+**Additional context**  
+Any other context: software version, operating system, logs, network conditions, etc.

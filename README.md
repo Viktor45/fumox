@@ -48,7 +48,7 @@ cp .env.example .env   # set FUMOX_ADMIN__TOKEN
 docker compose up -d --build
 ```
 
-See [`docs/USAGE.md`](./docs/USAGE.md#docker-compose-server--probe--meow-rs)
+See [`USERGUIDE.md`](./USERGUIDE.md)
 for the details.
 
 Configuration lives in [`config/app.toml`](./config/app.toml); every key has a
@@ -68,3 +68,12 @@ them into `config/` separately:
 Without a database file, geo enrichment disables itself automatically (a
 warning is logged) and the server keeps running. MaxMind databases are updated
 weekly.
+
+---
+
+## 📖 Documentation
+
+The **[User Guide](./USERGUIDE.md)** is the place to start: what Fumox is,
+how it works, deployment (Docker Compose / image / source), the full
+configuration reference, and day-to-day usage. Russian version:
+[USERGUIDE.ru.md](./USERGUIDE.ru.md).

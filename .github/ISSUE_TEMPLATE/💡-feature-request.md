@@ -1,19 +1,19 @@
 ---
-name: "\U0001F4A1 Запрос на улучшение"
-about: Предложите идею для этого проекта
-title: "\U0001F4A1 [УЛУЧШЕНИЕ] - <краткое название>"
+name: "\U0001F4A1 Feature Request"
+about: Suggest an idea for this project
+title: "\U0001F4A1 [ENHANCEMENT] - <brief title>"
 labels: enhancement
 assignees: Viktor45
 ---
 
-**Связана ли ваша идея с какой-либо проблемой? Опишите её.**  
-Четкое и краткое описание проблемы. Например: «Меня раздражает, когда [...]».
+**Is your feature request related to a problem? Please describe.**  
+A clear and concise description of the problem. For example: "I'm frustrated when [...]"
 
-**Опишите желаемое решение**  
-Четкое и краткое описание того, как должна работать новая функция или улучшение.
+**Describe the solution you'd like**  
+A clear and concise description of what you want to happen.
 
-**Какие альтернативы вы рассматривали?**  
-Опишите другие возможные решения или обходные пути, которые вы уже пробовали или оценивали.
+**Describe alternatives you've considered**  
+A description of any alternative solutions or workarounds you've already tried or evaluated.
 
-**Дополнительный контекст**  
-Любая дополнительная информация: примеры использования, ссылки на похожие проекты, скриншоты и т.д.
+**Additional context**  
+Any additional context: use cases, links to similar projects, screenshots, etc.

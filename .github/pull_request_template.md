@@ -1,25 +1,25 @@
-## Описание изменений
+## Description of Changes
 
-<!-- Опишите внесённые изменения и цель их внесения -->
+<!-- Describe the changes made and the purpose behind them -->
 
-## Тип изменений
+## Type of Changes
 
-<!-- Отметьте все подходящие пункты -->
+<!-- Check all that apply -->
 
-- [ ] Исправление ошибки (bug fix)
-- [ ] Новая функция (new feature)
-- [ ] Улучшение документации
-- [ ] Оптимизация производительности
-- [ ] Другое: <!-- укажите тип -->
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Documentation improvement
+- [ ] Performance optimization
+- [ ] Other: <!-- specify type -->
 
-## Связанные задачи
+## Related Issues
 
-<!-- Укажите номера связанных issue, если есть -->
+<!-- Reference related issue numbers, if any -->
 
 Fixes #
 
-## Контрольный список
+## Checklist
 
-- [ ] Я провёл(а) самостоятельный код-ревью своего кода
-- [ ] Я внес(ла) соответствующие изменения в документацию (при необходимости)
-- [ ] Я протестировал(а) предлагаемые изменения локально или в другом подтверждённом окружении
+- [ ] I have performed a self-code review of my changes
+- [ ] I have updated the documentation accordingly (where applicable)
+- [ ] I have tested the proposed changes locally or in another verified environment

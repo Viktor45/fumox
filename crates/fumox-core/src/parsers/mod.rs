@@ -336,6 +336,8 @@ mod tests {
 
     // ─────────────────────────────────────────────────────────────────────
     // Fixture-driven tests against the real 1.1 MB subscription sample.
+    // The fixture is gitignored (it may contain non-public data) and is
+    // never committed; these tests skip themselves when it is absent.
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -345,7 +347,11 @@ mod tests {
         // byte-for-byte. vmess/ss are excluded — they normalize their
         // transport encoding by design (see module docs).
         let mut checked = 0usize;
-        for line in fixture_lines() {
+        let Some(lines) = fixture_lines() else {
+            eprintln!("skipped: test.txt fixture is absent (gitignored debug file)");
+            return;
+        };
+        for line in lines {
             let line = line.trim().to_string();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -372,12 +378,12 @@ mod tests {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test.txt")
     }
 
-    fn fixture_lines() -> Vec<String> {
+    /// The fixture is a gitignored debug-only file and is not part of the
+    /// repository; `None` tells the fixture tests to skip themselves.
+    fn fixture_lines() -> Option<Vec<String>> {
         std::fs::read_to_string(fixture_path())
-            .expect("test.txt fixture must exist at the repo root")
-            .lines()
-            .map(str::to_string)
-            .collect()
+            .ok()
+            .map(|content| content.lines().map(str::to_string).collect())
     }
 
     #[test]
@@ -385,7 +391,11 @@ mod tests {
         let mut parsed = 0usize;
         let mut discarded = 0usize;
         let mut unrecognized: Vec<String> = Vec::new();
-        for line in fixture_lines() {
+        let Some(lines) = fixture_lines() else {
+            eprintln!("skipped: test.txt fixture is absent (gitignored debug file)");
+            return;
+        };
+        for line in lines {
             let line = line.trim().to_string();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -417,7 +427,11 @@ mod tests {
     #[test]
     fn fixture_semantic_round_trip_for_every_line() {
         let mut checked = 0usize;
-        for line in fixture_lines() {
+        let Some(lines) = fixture_lines() else {
+            eprintln!("skipped: test.txt fixture is absent (gitignored debug file)");
+            return;
+        };
+        for line in lines {
             let line = line.trim().to_string();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -452,7 +466,11 @@ mod tests {
         // make sure the overall rate does not regress silently.
         let mut exact = 0usize;
         let mut total = 0usize;
-        for line in fixture_lines() {
+        let Some(lines) = fixture_lines() else {
+            eprintln!("skipped: test.txt fixture is absent (gitignored debug file)");
+            return;
+        };
+        for line in lines {
             let line = line.trim().to_string();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -478,7 +496,11 @@ mod tests {
         use std::collections::HashSet;
         let mut fingerprints = HashSet::new();
         let mut parsed = 0usize;
-        for line in fixture_lines() {
+        let Some(lines) = fixture_lines() else {
+            eprintln!("skipped: test.txt fixture is absent (gitignored debug file)");
+            return;
+        };
+        for line in lines {
             let line = line.trim().to_string();
             if line.is_empty() || line.starts_with('#') {
                 continue;

@@ -1,0 +1,31 @@
+# fumox-server — public /sub + /src on :8080 (published by the pod) and the
+# admin panel on :8081 (loopback-only). Default CMD of the image is already
+# fumox-server, so no Exec= override is needed.
+#
+# Quadlet does not build images — build before first start:
+#   podman build -t localhost/fumox:local .
+
+[Unit]
+Description=Fumox server (subscription endpoints + admin panel)
+
+[Container]
+Image=localhost/fumox:local
+ContainerName=fumox-server
+Pod=fumox.pod
+
+# .env equivalent (see fumox.env.example); must exist before first start.
+EnvironmentFile=%h/.config/fumox/fumox.env
+
+Environment=FUMOX_GEO__DB_DIR=/app/data
+
+# Left side: a directory with app.toml (and optional GeoLite2-*.mmdb).
+# %h expands to your home dir; point it at the repo's config/ if you prefer.
+Volume=%h/fumox/config:/app/config:ro,Z
+Volume=fumox-data.volume:/app/data
+
+[Service]
+# systemd equivalent of compose "restart: unless-stopped".
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

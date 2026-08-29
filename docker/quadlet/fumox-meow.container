@@ -1,0 +1,22 @@
+# meow-rs — mihomo-compatible kernel the probe drives for T2 checks
+# (image built from docker/meow/, CMD "meow -f /etc/meow/config.yaml").
+#
+# The bootstrap config baked into the image binds the Clash
+# external-controller to 0.0.0.0:9090 *inside the pod* and disables inbound
+# listeners (allow-lan: false). Nothing is published to the host; only the
+# probe reaches it, over pod loopback at 127.0.0.1:9090.
+
+[Unit]
+Description=meow-rs kernel for T2 checks (REST API 9090, pod-internal)
+
+[Container]
+Image=localhost/fumox-meow:local
+ContainerName=fumox-meow
+Pod=fumox.pod
+Volume=fumox-shared.volume:/shared
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -152,7 +152,9 @@ IDs and endpoint tokens are `nanoid(12)` strings over the alphabet
 
 Three ways to run Fumox. **Docker Compose is the recommended path**: one
 command gives you the server, the probe daemon and the meow-rs kernel wired
-together.
+together. On Podman instead of Docker? The same stack deploys as a
+systemd-managed podman pod via quadlet units — see
+[`docker/README.md`](./docker/README.md).
 
 ### Option A — Docker Compose (recommended)
 

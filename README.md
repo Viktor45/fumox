@@ -48,6 +48,10 @@ cp .env.example .env   # set FUMOX_ADMIN__TOKEN
 docker compose up -d --build
 ```
 
+On Podman instead of Docker? [`docker/README.md`](./docker/README.md) deploys
+the same stack as a systemd-managed podman pod (quadlet units or a kube-play
+manifest).
+
 See [`USERGUIDE.md`](./USERGUIDE.md)
 for the details.
 

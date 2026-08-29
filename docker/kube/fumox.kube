@@ -1,0 +1,29 @@
+# Fumox via `podman kube play` — the alternative quadlet form: one .kube
+# unit plus a Kubernetes pod manifest (fumox-pod.yaml, same directory)
+# describing the same pod as docker-compose.yml (server + probe + meow).
+#
+# Generated service: fumox.service.
+#
+# Keep this unit and the YAML together when installing — Yaml= is resolved
+# relative to the unit file's directory:
+#   cp docker/kube/fumox.kube docker/kube/fumox-pod.yaml \
+#      ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user start fumox.service
+
+[Unit]
+Description=Fumox pod via kube play (server + probe + meow)
+After=network-online.target
+Wants=network-online.target
+
+[Kube]
+Yaml=fumox-pod.yaml
+# On stop, remove the created pod and containers too (fresh start next time),
+# mirroring `docker compose down` + `up` semantics across restarts.
+KubeDownForce=true
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

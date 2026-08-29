@@ -1,0 +1,10 @@
+# Clash-config exchange between fumox-probe and meow-rs (compose named
+# volume "meow-shared"): the probe renders the T2 batch to /shared/meow.yaml
+# and hot-reloads meow through its REST API.
+# Referenced from the .container units as: Volume=fumox-shared.volume:/shared
+
+[Unit]
+Description=Fumox T2 config exchange volume (probe <-> meow)
+
+[Volume]
+VolumeName=meow-shared

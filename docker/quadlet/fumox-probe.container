@@ -1,0 +1,33 @@
+# fumox-probe — health-check daemon (T1 TCP/TLS sample + T2 tunnel checks
+# driven through the meow-rs REST API). Overrides the image CMD the same way
+# compose `command: ["fumox-probe"]` does; tini stays as the entrypoint.
+
+[Unit]
+Description=Fumox probe (health checks: T1 TCP/TLS + T2 via meow)
+# compose depends_on: the server creates/migrates the DB first.
+Wants=fumox-server.service
+After=fumox-server.service
+
+[Container]
+Image=localhost/fumox:local
+ContainerName=fumox-probe
+Pod=fumox.pod
+Exec=fumox-probe
+
+EnvironmentFile=%h/.config/fumox/fumox.env
+
+# One network namespace inside the pod: meow is reached on loopback, not by
+# the compose DNS name "meow" (9090 is not published to the host).
+Environment=FUMOX_GEO__DB_DIR=/app/data
+Environment=FUMOX_MEOW__API_ADDR=127.0.0.1:9090
+Environment=FUMOX_MEOW__CONFIG_PATH=/shared/meow.yaml
+
+Volume=%h/fumox/config:/app/config:ro,Z
+Volume=fumox-data.volume:/app/data
+Volume=fumox-shared.volume:/shared
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

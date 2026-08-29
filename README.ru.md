@@ -48,6 +48,10 @@ cp .env.example .env   # задайте FUMOX_ADMIN__TOKEN
 docker compose up -d --build
 ```
 
+Используете Podman вместо Docker? [`docker/README.ru.md`](./docker/README.ru.md)
+разворачивает тот же стек как podman-под под управлением systemd (quadlet-юниты
+или kube-play манифест).
+
 Подробности — в [`USERGUIDE.ru.md`](./USERGUIDE.ru.md).
 
 Конфигурация — [`config/app.toml`](./config/app.toml); все ключи имеют

@@ -154,6 +154,9 @@ flowchart LR
 
 Три способа запустить Fumox. **Рекомендуемый — Docker Compose**: одна команда
 поднимает сервер, probe-демон и ядро meow-rs, уже связанные между собой.
+Используете Podman вместо Docker? Тот же стек разворачивается как podman-под
+под управлением systemd через quadlet-юниты — см.
+[`docker/README.ru.md`](./docker/README.ru.md).
 
 ### Вариант A — Docker Compose (рекомендуется)
 

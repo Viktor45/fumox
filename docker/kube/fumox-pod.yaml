@@ -1,0 +1,98 @@
+# Fumox pod manifest for `podman kube play` — the .kube quadlet alternative
+# to docker-compose.yml. One pod (shared network namespace): fumox-server,
+# fumox-probe and the meow-rs kernel wired over loopback instead of compose
+# service DNS (FUMOX_MEOW__API_ADDR=127.0.0.1:9090).
+#
+# Before first start:
+#   1. Build both images (quadlet/.kube do not build):
+#        podman build -t localhost/fumox:local .
+#        podman build -t localhost/fumox-meow:local docker/meow
+#   2. Adjust the hostPath "config" below: a directory with app.toml (and
+#      optional GeoLite2-*.mmdb files).
+#   3. Create the env secret (envFrom on server and probe):
+#        printf 'FUMOX_ADMIN__TOKEN=change-me\n' | podman secret create fumox-env -
+#      Append FUMOX_MEOW__TEST_URL / FUMOX_ADMIN__ALLOW_PRIVATE_URLS lines
+#      to override those defaults.
+#   4. The PVCs fumox-data / meow-shared are backed by podman named volumes
+#      created automatically on first start (`podman volume ls`).
+#
+# Verify the loopback admin binding after start: `podman port fumox` — if
+# your podman ignores hostIP (old versions), 8081 lands on all interfaces;
+# restrict it with a firewall or upgrade podman.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fumox
+  labels:
+    app: fumox
+spec:
+  containers:
+    # Public /sub + /src on :8080; admin panel on :8081. Default CMD of the
+    # image (fumox-server behind tini) is exactly what compose runs.
+    - name: server
+      image: localhost/fumox:local
+      env:
+        - name: FUMOX_GEO__DB_DIR
+          value: /app/data
+      envFrom:
+        - secretRef:
+            name: fumox-env
+      ports:
+        - containerPort: 8080
+          hostPort: 8080
+          protocol: TCP
+        - containerPort: 8081
+          hostPort: 8081
+          hostIP: "127.0.0.1" # loopback-only admin, like the compose mapping
+          protocol: TCP
+      volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: data
+          mountPath: /app/data
+
+    # args: (not command:) keeps tini as the entrypoint, mirroring compose
+    # `command: ["fumox-probe"]`.
+    - name: probe
+      image: localhost/fumox:local
+      args: ["fumox-probe"]
+      env:
+        - name: FUMOX_GEO__DB_DIR
+          value: /app/data
+        - name: FUMOX_MEOW__API_ADDR
+          value: "127.0.0.1:9090"
+        - name: FUMOX_MEOW__CONFIG_PATH
+          value: /shared/meow.yaml
+      envFrom:
+        - secretRef:
+            name: fumox-env
+      volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: data
+          mountPath: /app/data
+        - name: shared
+          mountPath: /shared
+
+    # meow-rs kernel: bootstrap config.yaml is baked into the image and binds
+    # the external-controller to 0.0.0.0:9090 inside the pod (allow-lan:
+    # false). Nothing here is published to the host.
+    - name: meow
+      image: localhost/fumox-meow:local
+      volumeMounts:
+        - name: shared
+          mountPath: /shared
+
+  volumes:
+    - name: config
+      hostPath:
+        path: /opt/fumox/config # <-- adjust: must contain app.toml (+ mmdb)
+        type: Directory
+    - name: data
+      persistentVolumeClaim:
+        claimName: fumox-data
+    - name: shared
+      persistentVolumeClaim:
+        claimName: meow-shared

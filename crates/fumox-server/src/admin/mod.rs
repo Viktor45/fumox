@@ -189,6 +189,7 @@ pub fn router(state: AdminState) -> axum::Router {
             "/import",
             get(handlers::import_form).post(handlers::import_submit),
         )
+        .route("/import/alive-token", post(handlers::rotate_alive_token))
         .route("/events", get(handlers::events_stream))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -763,6 +764,52 @@ mod tests {
             created.unwrap().ip_family,
             Some(fumox_core::models::IpFamily::Ipv6)
         );
+    }
+
+    #[tokio::test]
+    async fn import_page_shows_alive_link_and_rotation_replaces_it() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // The export screen displays the absolute alive-export link with
+        // its (first-visit generated) token.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/import", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html).into_owned();
+        let token = html
+            .split("/export/alive/")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("the page must show the alive export link")
+            .to_string();
+        assert_eq!(token.len(), 12, "nanoid token, got {token:?}");
+
+        // Rotation issues a fresh token and returns to the screen.
+        let body = format!("_csrf={csrf}");
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/import/alive-token",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let stored: Option<String> =
+            fumox_core::repo::meta_get(&state.pool, crate::alive_export::TOKEN_KEY)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref().map(str::len), Some(12));
+        assert_ne!(stored.as_deref(), Some(token.as_str()));
     }
 
     #[tokio::test]

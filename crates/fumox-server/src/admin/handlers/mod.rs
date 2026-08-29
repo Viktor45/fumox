@@ -254,8 +254,27 @@ pub fn not_found(lang: Lang, what_key: &str) -> Response {
         .into_response()
 }
 
+/// Percent-encode a string into unreserved ASCII so it can travel inside a
+/// response header. Header bytes are decoded by the browser as Latin-1
+/// (isomorphic decode), so raw UTF-8 — e.g. a Russian toast message — would
+/// arrive as mojibake; percent-encoded UTF-8 survives the wire intact and is
+/// restored client-side with `decodeURIComponent`.
+fn header_safe(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 /// Response for a mutating action: HTMX callers receive the fragment plus
-/// a toast event; plain browsers are redirected back.
+/// a toast event; plain browsers are redirected back. The toast message
+/// rides in the `HX-Trigger` header percent-encoded ([`header_safe`]).
 pub fn action_response(
     is_htmx: bool,
     redirect_to: &str,
@@ -269,12 +288,14 @@ pub fn action_response(
             fragment_html,
         )
             .into_response();
-        if let Ok(value) = HeaderValue::from_str(&format!(
+        let payload = format!(
             "{{\"toast\": {{\"message\": \"{}\", \"level\": \"ok\"}}}}",
-            toast.replace('"', "'")
-        )) {
-            response.headers_mut().insert("HX-Trigger", value);
-        }
+            header_safe(toast)
+        );
+        response.headers_mut().insert(
+            "HX-Trigger",
+            HeaderValue::from_str(&payload).expect("header_safe output is visible ASCII"),
+        );
         response
     } else {
         Redirect::to(redirect_to).into_response()
@@ -314,4 +335,52 @@ pub async fn all_sources_for_selects(
         .into_iter()
         .map(|s| (s.id.clone(), s.name.clone(), s.enabled))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toast_header_is_ascii_and_decodes_to_the_message() {
+        // Russian text (raw UTF-8 would mojibake in a Latin-1 header) plus
+        // JSON-breaking characters.
+        let message = "источник включён — \"quote\" \\ backslash";
+        let response = action_response(true, "/admin/sources/x", String::new(), message);
+
+        let header = response
+            .headers()
+            .get("HX-Trigger")
+            .expect("HX-Trigger must be set")
+            .to_str()
+            .expect("header must be visible ASCII")
+            .to_string();
+
+        // Undo the percent-encoding exactly like the admin JS does.
+        let bytes: Vec<u8> = {
+            let mut out = Vec::new();
+            let mut rest = header.as_bytes();
+            while !rest.is_empty() {
+                if rest[0] == b'%' && rest.len() >= 3 {
+                    out.push(
+                        u8::from_str_radix(std::str::from_utf8(&rest[1..3]).unwrap(), 16).unwrap(),
+                    );
+                    rest = &rest[3..];
+                } else {
+                    out.push(rest[0]);
+                    rest = &rest[1..];
+                }
+            }
+            out
+        };
+        let decoded = String::from_utf8(bytes).unwrap();
+        assert!(decoded.contains(&format!("\"message\": \"{message}\"")));
+    }
+
+    #[test]
+    fn plain_browser_gets_a_redirect_without_toast_header() {
+        let response = action_response(false, "/admin/sources", String::new(), "готово");
+        assert!(response.headers().get("HX-Trigger").is_none());
+        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    }
 }

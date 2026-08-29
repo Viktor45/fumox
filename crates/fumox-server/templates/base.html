@@ -53,14 +53,18 @@
   </div>
   <div class="toast-wrap" id="toast-wrap"></div>
   <script>
-    // Flash/toast: handlers send HX-Trigger: {"toast": {"message": ..., "level": ...}}
+    // Flash/toast: handlers send HX-Trigger: {"toast": {"message": ..., "level": ...}}.
+    // The message travels percent-encoded — header bytes are Latin-1 on the
+    // wire, raw UTF-8 would arrive as mojibake.
     document.body.addEventListener('toast', function (e) {
       var wrap = document.getElementById('toast-wrap');
       if (!wrap) return;
       var detail = e.detail || {};
       var div = document.createElement('div');
       div.className = 'toast' + (detail.level === 'error' ? ' error' : '');
-      div.textContent = detail.message || String(e.detail);
+      var message = detail.message || '';
+      try { message = decodeURIComponent(message); } catch (_) {}
+      div.textContent = message || String(e.detail);
       wrap.appendChild(div);
       setTimeout(function () { div.remove(); }, 4000);
     });

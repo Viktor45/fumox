@@ -431,6 +431,35 @@ pub async fn list_with_source(
     Ok(query.fetch_all(pool).await?)
 }
 
+/// Every currently-`alive` proxy still linked to at least one source, in
+/// stable id order — the backing query of the public «all alive» export
+/// link (SPEC §10.4). Fingerprints are unique in the table, so the set is
+/// already deduplicated; unlinked rows are excluded just like everywhere
+/// else proxies are served.
+pub async fn list_alive(pool: &DbPool) -> crate::Result<Vec<ProxyRow>> {
+    let rows: Vec<ProxyRow> = sqlx::query_as(
+        "SELECT p.* FROM proxies p
+         WHERE p.status = 'alive'
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
+         ORDER BY p.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Number of proxies [`list_alive`] would return (admin screen badge).
+pub async fn count_alive(pool: &DbPool) -> crate::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM proxies p
+         WHERE p.status = 'alive'
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
 /// Manual "re-check as new" action from the admin panel (ADMIN_PLAN §8):
 /// reset the lifecycle to a pristine `unknown`, clearing the fail counter
 /// and every quarantine / second-chance / recheck timestamp. The probe
@@ -1250,6 +1279,60 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_alive_and_count_cover_linked_alive_only() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let alive = entry("alive", "h1.example.com", 443);
+        let never_checked = entry("never", "h2.example.com", 443);
+        let quarantined = entry("quar", "h3.example.com", 443);
+        let removed = entry("gone", "h4.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            &[
+                alive.clone(),
+                never_checked.clone(),
+                quarantined.clone(),
+                removed.clone(),
+            ],
+            &[],
+            1000,
+        )
+        .await
+        .unwrap();
+        for (proxy, status) in [
+            (&alive, "alive"),
+            (&quarantined, "quarantine"),
+            (&removed, "removed"),
+        ] {
+            sqlx::query("UPDATE proxies SET status = ? WHERE fingerprint = ?")
+                .bind(status)
+                .bind(proxy.fingerprint())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(count_alive(&pool).await.unwrap(), 1);
+        let hosts: Vec<String> = list_alive(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.host)
+            .collect();
+        assert_eq!(hosts, vec!["h1.example.com".to_string()]);
+
+        // Losing the last source link takes even an alive row out of the
+        // export, exactly like every other serving path.
+        sqlx::query("DELETE FROM proxy_source_links")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count_alive(&pool).await.unwrap(), 0);
+        assert!(list_alive(&pool).await.unwrap().is_empty());
     }
 
     // ------------------------------------------------------------------

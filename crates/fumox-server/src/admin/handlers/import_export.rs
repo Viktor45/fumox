@@ -16,14 +16,15 @@ use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
+use crate::alive_export::{self, export_date};
 use crate::fetcher;
 use crate::pipeline::CompiledPipeline;
 use askama::Template;
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::models::{self, Encoding, InputFormat, IpFamily, OutputFormat, Scheme};
-use fumox_core::repo::{profiles, sources};
+use fumox_core::repo::{profiles, proxies, sources};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -184,15 +185,6 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
     response
 }
 
-/// UTC calendar date for the export file name.
-fn export_date() -> String {
-    const FMT: &[time::format_description::FormatItem<'static>] =
-        time::macros::format_description!("[year]-[month]-[day]");
-    time::OffsetDateTime::now_utc()
-        .format(FMT)
-        .unwrap_or_else(|_| "export".to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Import
 // ---------------------------------------------------------------------------
@@ -217,14 +209,36 @@ struct ImportTemplate {
     errors: Vec<String>,
     /// Present only after a successful import.
     summary: Option<ImportSummary>,
+    /// Absolute public URL of the «all alive» export link, token included.
+    alive_url: String,
+    /// Alive+linked proxy count right now (button context).
+    alive_count: i64,
 }
 
 impl_i18n!(ImportTemplate);
 
-/// `GET /admin/import` — the import/export screen.
-pub async fn import_form(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    let lang = state.locales.lang_from_headers(&headers);
-    let theme = theme::from_headers(&headers);
+/// Render the import/export screen, filling in the alive-export link data
+/// shared by every entry point (fresh page, validation errors, import
+/// summary). The token is generated on first visit if startup has not
+/// already created it.
+async fn render_page(
+    state: &AdminState,
+    lang: Lang,
+    theme: Theme,
+    headers: &HeaderMap,
+    status: StatusCode,
+    errors: Vec<String>,
+    summary: Option<ImportSummary>,
+) -> Response {
+    let token = match alive_export::ensure_token(&state.pool).await {
+        Ok(token) => token,
+        Err(err) => return super::server_error(lang, &err),
+    };
+    let alive_count = match proxies::count_alive(&state.pool).await {
+        Ok(count) => count,
+        Err(err) => return super::server_error(lang, &err),
+    };
+    let alive_url = format!("{}/export/alive/{}", state.serve_base(headers), token);
     render_html(
         lang.clone(),
         &ImportTemplate {
@@ -232,12 +246,30 @@ pub async fn import_form(State(state): State<AdminState>, headers: HeaderMap) ->
             langs: state.locales.choices().to_vec(),
             theme,
             active: "import",
-            csrf: state.csrf_for(&headers),
-            errors: Vec::new(),
-            summary: None,
+            csrf: state.csrf_for(headers),
+            errors,
+            summary,
+            alive_url,
+            alive_count,
         },
-        StatusCode::OK,
+        status,
     )
+}
+
+/// `GET /admin/import` — the import/export screen.
+pub async fn import_form(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let lang = state.locales.lang_from_headers(&headers);
+    let theme = theme::from_headers(&headers);
+    render_page(
+        &state,
+        lang,
+        theme,
+        &headers,
+        StatusCode::OK,
+        Vec::new(),
+        None,
+    )
+    .await
 }
 
 /// `POST /admin/import` — validate then create-new.
@@ -259,7 +291,16 @@ pub async fn import_submit(
         Ok(file) => file,
         Err(err) => {
             let errors = vec![lang.t("io.err_parse").replace("{}", &err.to_string())];
-            return error_response(&state, lang, theme, &headers, errors);
+            return render_page(
+                &state,
+                lang,
+                theme,
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                errors,
+                None,
+            )
+            .await;
         }
     };
     if file.version != SUPPORTED_VERSION {
@@ -267,13 +308,31 @@ pub async fn import_submit(
             lang.t("io.err_version")
                 .replace("{}", &file.version.to_string()),
         ];
-        return error_response(&state, lang, theme, &headers, errors);
+        return render_page(
+            &state,
+            lang,
+            theme,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            errors,
+            None,
+        )
+        .await;
     }
 
     // All-or-nothing validation pass.
     let errors = validate_import(&state, &lang, &file).await;
     if !errors.is_empty() {
-        return error_response(&state, lang, theme, &headers, errors);
+        return render_page(
+            &state,
+            lang,
+            theme,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            errors,
+            None,
+        )
+        .await;
     }
 
     match apply_import(&state, &lang, file).await {
@@ -283,44 +342,29 @@ pub async fn import_submit(
                 profiles = summary.profiles_created,
                 "configuration imported"
             );
-            render_html(
-                lang.clone(),
-                &ImportTemplate {
-                    lang,
-                    langs: state.locales.choices().to_vec(),
-                    theme,
-                    active: "import",
-                    csrf: state.csrf_for(&headers),
-                    errors: Vec::new(),
-                    summary: Some(summary),
-                },
+            render_page(
+                &state,
+                lang,
+                theme,
+                &headers,
                 StatusCode::OK,
+                Vec::new(),
+                Some(summary),
             )
+            .await
         }
         Err(err) => super::server_error(lang, &err),
     }
 }
 
-fn error_response(
-    state: &AdminState,
-    lang: Lang,
-    theme: Theme,
-    headers: &HeaderMap,
-    errors: Vec<String>,
-) -> Response {
-    render_html(
-        lang.clone(),
-        &ImportTemplate {
-            lang,
-            langs: state.locales.choices().to_vec(),
-            theme,
-            active: "import",
-            csrf: state.csrf_for(headers),
-            errors,
-            summary: None,
-        },
-        StatusCode::UNPROCESSABLE_ENTITY,
-    )
+/// `POST /admin/import/alive-token` — issue a fresh token for the «all
+/// alive» export link; the previous link stops working immediately.
+pub async fn rotate_alive_token(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let lang = state.locales.lang_from_headers(&headers);
+    match alive_export::rotate_token(&state.pool).await {
+        Ok(_) => Redirect::to("/admin/import").into_response(),
+        Err(err) => super::server_error(lang, &err),
+    }
 }
 
 /// Validate every imported object with the same rules as the forms. Returns

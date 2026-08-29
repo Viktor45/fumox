@@ -40,6 +40,18 @@
   <h2>{{ self.t("io.export_title") }}</h2>
   <div class="hint">{{ self.t("io.export_hint") }}</div>
   <p><a class="btn" href="/admin/export">{{ self.t("io.export_btn") }}</a></p>
+
+  <h3>{{ self.t("io.alive_title") }}</h3>
+  <div class="hint">{{ self.t("io.alive_hint") }}</div>
+  <p class="mono small"><a href="{{ alive_url }}">{{ alive_url }}</a></p>
+  <p class="small">{{ self.t("io.alive_count") }} <strong>{{ alive_count }}</strong></p>
+  <div class="row-actions">
+    <a class="btn" href="{{ alive_url }}?download=1">{{ self.t("io.alive_download") }}</a>
+    <form method="post" action="/admin/import/alive-token">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <button class="btn" type="submit">{{ self.t("io.alive_rotate") }}</button>
+    </form>
+  </div>
 </div>
 
 <div class="panel">

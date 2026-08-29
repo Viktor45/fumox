@@ -6,6 +6,7 @@
 //! and shuts down gracefully on SIGINT/SIGTERM.
 
 mod admin;
+mod alive_export;
 mod cache;
 mod events;
 mod fetcher;
@@ -44,6 +45,11 @@ async fn main() -> anyhow::Result<()> {
     let pool = fumox_core::db::connect_pool(&config.database).await?;
     fumox_core::db::migrate(&pool).await?;
 
+    // The public «all alive» export link (SPEC §10.4): generate the
+    // capability token on first startup; it persists in `meta`, so the
+    // link is stable across restarts until rotated from the admin panel.
+    alive_export::ensure_token(&pool).await?;
+
     // Best-effort GeoLite2 database download into [geo].db_dir: fetch what
     // is missing, broken or older than a month. Runs before the geo
     // resolver opens the files; failures never block startup (SPEC §6).
@@ -80,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         refresh_rx,
     ));
 
-    // Public listener: /sub/{id} and /src/{id}.
+    // Public listener: /sub/{id}, /src/{id} and /export/alive/{token}.
     let state = serve::AppState {
         pool: pool.clone(),
         caches: caches.clone(),

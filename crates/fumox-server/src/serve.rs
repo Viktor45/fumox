@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/sub/{id}", get(serve_sub))
         .route("/src/{id}", get(serve_src))
+        .route("/export/alive/{token}", get(crate::alive_export::serve))
         .with_state(state)
 }
 
@@ -565,7 +566,7 @@ fn to_response(rendered: &Rendered) -> Response {
     response
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -1046,6 +1047,75 @@ mod tests {
 
         let (status, _, _) = get(router(state), "/src/missing00000").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn alive_export_is_404_before_initialization() {
+        let state = test_state().await;
+        let (status, _, _) = get(router(state), "/export/alive/anything0000").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn alive_export_link_serves_only_alive_proxies() {
+        let state = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("a", "h1.example.com", 443),
+                entry("q", "h2.example.com", 443),
+                entry("u", "h3.example.com", 443),
+            ],
+        )
+        .await;
+        sqlx::query("UPDATE proxies SET status = 'alive' WHERE host = 'h1.example.com'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET status = 'quarantine' WHERE host = 'h2.example.com'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let token = crate::alive_export::ensure_token(&state.pool)
+            .await
+            .unwrap();
+        let (status, _, body) = get(router(state.clone()), &format!("/export/alive/{token}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("h1.example.com"), "{body:?}");
+        // Quarantined and never-probed proxies stay out.
+        assert!(!body.contains("h2.example.com"), "{body:?}");
+        assert!(!body.contains("h3.example.com"), "{body:?}");
+
+        // An unknown token is an ordinary 404: the endpoint does not
+        // disclose whether the link ever existed.
+        let (status, _, _) = get(router(state.clone()), "/export/alive/zzzzzzzzzzzz").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The download variant attaches a dated file name.
+        let (_, headers, _) = get(
+            router(state.clone()),
+            &format!("/export/alive/{token}?download=1"),
+        )
+        .await;
+        let disposition = header_str(&headers, "content-disposition").unwrap_or_default();
+        assert!(
+            disposition.starts_with("attachment; filename=\"fumox-alive-"),
+            "{disposition}"
+        );
+
+        // Rotating the token kills the old link immediately.
+        let fresh = crate::alive_export::rotate_token(&state.pool)
+            .await
+            .unwrap();
+        assert_ne!(fresh, token);
+        let (status, _, _) = get(router(state.clone()), &format!("/export/alive/{token}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, body) = get(router(state), &format!("/export/alive/{fresh}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("h1.example.com"), "{body:?}");
     }
 
     #[tokio::test]

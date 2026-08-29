@@ -430,6 +430,13 @@ and access tokens) as a versioned JSON file. *Import* recreates them with
 - validation is all-or-nothing: any invalid object aborts the whole import
   (`422` with a list of problems, nothing written).
 
+The same screen offers an **alive proxies download**: a public link that
+always returns every currently-alive proxy as a plain `url_list` — paste it
+into a client or use it as an upstream source. The link carries a random
+token generated on first startup; `Download url_list` saves it as a file,
+and *Regenerate link* replaces the token if the link leaks (the old link
+stops working immediately).
+
 ### Languages and themes
 
 The interface is multilingual: Russian (default) and English ship with the

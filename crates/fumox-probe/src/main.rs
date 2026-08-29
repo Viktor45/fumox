@@ -34,6 +34,9 @@ use tokio::sync::Semaphore;
 const MEOW_BACKOFF_INITIAL_SECS: i64 = 60;
 const MEOW_BACKOFF_MAX_SECS: i64 = 15 * 60;
 
+/// `probe_results.probe_kind` of the tunnel check (DATABASE.md).
+const T2_KIND: &str = "t2";
+
 #[derive(Parser)]
 #[command(name = "fumox-probe", version, about = "Fumox health-check daemon")]
 struct Cli {
@@ -235,7 +238,20 @@ async fn perform_t1_check(ctx: &Context, id: i64, host: &str, port: u16, kind: t
                 },
             )
             .await;
-            if let Err(error) = proxies::check_succeeded(&ctx.pool, id, now, Some(latency)).await {
+            // Strict T2 priority (owner decision 2026-08-29, SPEC §8.3): a
+            // T1 success must not wipe the fail counter accumulated from T2
+            // tunnel failures — the counter clears only via a T2 success or
+            // the quarantine ladder. Conservative on lookup errors: keep it.
+            let reset = match probe_repo::last_failed_kind(&ctx.pool, id).await {
+                Ok(kind) => kind.as_deref() != Some(T2_KIND),
+                Err(error) => {
+                    tracing::warn!(id, %error, "last-failure lookup failed; keeping fail counter");
+                    false
+                }
+            };
+            if let Err(error) =
+                proxies::check_succeeded(&ctx.pool, id, now, Some(latency), reset).await
+            {
                 tracing::warn!(id, %error, "failed to record T1 success");
             }
         }
@@ -343,7 +359,7 @@ async fn perform_quarantine_check(
                 },
             )
             .await;
-            match proxies::check_succeeded(&ctx.pool, id, now, Some(latency)).await {
+            match proxies::check_succeeded(&ctx.pool, id, now, Some(latency), true).await {
                 Ok(_) => tracing::info!(id, ?stage, "quarantined proxy revived"),
                 Err(error) => tracing::warn!(id, %error, "failed to record quarantine success"),
             }
@@ -448,12 +464,12 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                             ok: true,
                             latency_ms: Some(latency),
                             error: None,
-                            probe_kind: "t2",
+                            probe_kind: T2_KIND,
                         },
                     )
                     .await;
                     if let Err(error) =
-                        proxies::check_succeeded(&ctx.pool, row.id, now, Some(latency)).await
+                        proxies::check_succeeded(&ctx.pool, row.id, now, Some(latency), true).await
                     {
                         tracing::warn!(id = row.id, %error, "failed to record T2 success");
                     }
@@ -467,7 +483,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                             ok: false,
                             latency_ms: None,
                             error: Some(&message),
-                            probe_kind: "t2",
+                            probe_kind: T2_KIND,
                         },
                     )
                     .await;
@@ -875,6 +891,83 @@ mod tests {
             .await
             .unwrap();
         assert!(stamp.is_some());
+    }
+
+    /// Strict T2 priority (owner decision 2026-08-29): a tunnel-dead proxy
+    /// that keeps passing T1 must still reach quarantine — the T1 success of
+    /// every cycle must not wipe the fail counter accumulated by T2.
+    #[tokio::test]
+    async fn t1_success_cannot_rescue_proxies_failing_t2() {
+        let pool = temp_pool().await;
+
+        // meow-rs mock: EVERY delay check fails with a credential error.
+        let app = Router::new()
+            .route(
+                "/version",
+                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+            )
+            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/proxies/{name}/delay",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"message":"invalid credential"})),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let meow_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // The proxy passes T1 (open port) but fails T2 every cycle.
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match tcp.accept().await {
+                    Ok(ok) => ok,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        let bad = seed_proxy(&pool, "vless", "127.0.0.1", tcp_port, "alive").await;
+
+        let config_path = std::env::temp_dir().join(format!(
+            "fumox-probe-test-{}.yaml",
+            fumox_core::models::new_id()
+        ));
+        let config = test_config(3, &meow_addr, config_path.clone());
+        let ctx = Arc::new(Context::new(config, pool.clone()));
+
+        // Cycle 1: T1 success (no failures yet — counter resets), T2 fail → 1.
+        // Cycle 2: T1 success must NOT touch the T2 counter, T2 fail → 2.
+        for cycle in 1..=2i64 {
+            run_cycle(ctx.clone()).await.unwrap();
+            let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
+            assert_eq!(row.status, "alive");
+            assert_eq!(row.fail_count, cycle);
+        }
+
+        // Cycle 3: the third T2 failure reaches the limit → quarantine.
+        run_cycle(ctx.clone()).await.unwrap();
+        let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
+        assert_eq!(row.status, "quarantine");
+        assert_eq!(row.fail_count, 3);
+        assert!(row.second_chance_at.is_some());
+
+        // Quarantined rows are sampled by nothing (T1 takes unknown/alive,
+        // T2 takes alive; the second chance is ~24h out): further cycles
+        // leave the proxy alone — no T1 success can revive it.
+        run_cycle(ctx).await.unwrap();
+        let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
+        assert_eq!(row.status, "quarantine");
     }
 
     #[tokio::test]

@@ -713,21 +713,33 @@ pub async fn select_due_quarantine(
     Ok(rows)
 }
 
-/// Apply a successful check: the proxy is `alive` with a clean slate —
-/// fail counter zeroed, every quarantine/recheck timestamp cleared,
-/// `last_alive_at` stamped and the measured latency stored. Covers
-/// `unknown → alive` (first success, SPEC §8.4) and quarantine revival
-/// (SPEC §8.3a step 3/4) alike.
+/// Apply a successful check: the proxy is `alive`, every
+/// quarantine/recheck timestamp cleared, `last_alive_at` stamped and the
+/// measured latency stored. Covers `unknown → alive` (first success,
+/// SPEC §8.4) and quarantine revival (SPEC §8.3a step 3/4) alike.
+///
+/// `reset_fail_count` implements the strict T2 priority (owner decision
+/// 2026-08-29, SPEC §8.3): a T1 success must not wipe the fail counter
+/// accumulated from T2 failures — the tunnel verdict stands until T2 itself
+/// confirms the proxy or the quarantine ladder takes over. T2 successes and
+/// second-chance revivals reset the counter unconditionally; a T1 success
+/// resets it only when the last failed attempt was not a T2 one (the caller
+/// asks [`crate::repo::probe::last_failed_kind`]).
+///
+/// `status != 'removed'` keeps a success from reviving a proxy the server
+/// has already reconciled away: `removed` is terminal until some source
+/// re-ingests the proxy (resurrection belongs to reconciliation only).
 pub async fn check_succeeded(
     pool: &DbPool,
     id: i64,
     now: i64,
     latency_ms: Option<i64>,
+    reset_fail_count: bool,
 ) -> crate::Result<Transition> {
     let result = sqlx::query(
         "UPDATE proxies SET
              status = 'alive',
-             fail_count = 0,
+             fail_count = CASE WHEN ? THEN 0 ELSE fail_count END,
              last_checked_at = ?,
              last_alive_at = ?,
              latency_ms = COALESCE(?, latency_ms),
@@ -737,8 +749,9 @@ pub async fn check_succeeded(
              recheck_30m_at = NULL,
              recheck_1h_at = NULL,
              updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND status != 'removed'",
     )
+    .bind(reset_fail_count)
     .bind(now)
     .bind(now)
     .bind(latency_ms)
@@ -1374,7 +1387,9 @@ mod tests {
         let pool = temp_pool().await;
         let id = seed_proxy(&pool, "vless", "h1.example.com").await;
 
-        let transition = check_succeeded(&pool, id, 5000, Some(42)).await.unwrap();
+        let transition = check_succeeded(&pool, id, 5000, Some(42), true)
+            .await
+            .unwrap();
         assert_eq!(transition, Transition::Revived);
 
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
@@ -1383,6 +1398,57 @@ mod tests {
         assert_eq!(row.last_alive_at, Some(5000));
         assert_eq!(row.last_checked_at, Some(5000));
         assert_eq!(row.latency_ms, Some(42));
+    }
+
+    #[tokio::test]
+    async fn success_without_reset_keeps_fail_count_and_removed_stays_removed() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let e = entry("t2-failed", "h1.example.com", 443);
+        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
+            .await
+            .unwrap();
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM proxies WHERE fingerprint = ?")
+            .bind(e.fingerprint())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // Failures already accumulated — e.g. two failed tunnel checks.
+        sqlx::query("UPDATE proxies SET status = 'alive', fail_count = 2 WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A T1-style success WITHOUT reset keeps the T2-accumulated counter
+        // (strict T2 priority) and keeps the proxy alive.
+        let transition = check_succeeded(&pool, id, 2000, Some(30), false)
+            .await
+            .unwrap();
+        assert_eq!(transition, Transition::Revived);
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "alive");
+        assert_eq!(row.fail_count, 2);
+
+        // With reset the counter is wiped.
+        check_succeeded(&pool, id, 3000, Some(31), true)
+            .await
+            .unwrap();
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.fail_count, 0);
+
+        // A removed proxy is terminal: a success cannot revive it.
+        sqlx::query("UPDATE proxies SET status = 'removed', fail_count = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let transition = check_succeeded(&pool, id, 4000, Some(32), true)
+            .await
+            .unwrap();
+        assert_eq!(transition, Transition::Unchanged);
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "removed");
     }
 
     #[tokio::test]
@@ -1442,7 +1508,9 @@ mod tests {
             "quarantine"
         );
 
-        let transition = check_succeeded(&pool, id, 90_000, Some(10)).await.unwrap();
+        let transition = check_succeeded(&pool, id, 90_000, Some(10), true)
+            .await
+            .unwrap();
         assert_eq!(transition, Transition::Revived);
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "alive");
@@ -1512,7 +1580,7 @@ mod tests {
             .unwrap();
 
         // The 15-minute recheck succeeds → alive again.
-        let transition = check_succeeded(&pool, id, 90_000 + RECHECK_15M_SECS, None)
+        let transition = check_succeeded(&pool, id, 90_000 + RECHECK_15M_SECS, None, true)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Revived);

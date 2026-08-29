@@ -49,6 +49,23 @@ pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
     Ok(affected)
 }
 
+/// The `probe_kind` of the most recent failed attempt for a proxy, or `None`
+/// when it has no failed attempts. Newest first via the
+/// `idx_probe_proxy_time` index. Feeds the strict T2-priority rule
+/// (SPEC §8.3): a T1 success must not wipe the fail counter accumulated by
+/// T2 failures, so the caller needs to know what the last failure was.
+pub async fn last_failed_kind(pool: &DbPool, proxy_id: i64) -> crate::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT probe_kind FROM probe_results
+         WHERE proxy_id = ? AND ok = 0
+         ORDER BY checked_at DESC LIMIT 1",
+    )
+    .bind(proxy_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(kind,)| kind))
+}
+
 // ---------------------------------------------------------------------------
 // Priority queue (`probe_requests`, SPEC §8.3)
 // ---------------------------------------------------------------------------
@@ -225,6 +242,83 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn last_failed_kind_returns_the_newest_failure() {
+        let pool = temp_pool().await;
+        let id = insert_proxy(&pool, "fp-kind", "vless", "alive", true).await;
+
+        // No failed attempts yet.
+        assert_eq!(last_failed_kind(&pool, id).await.unwrap(), None);
+
+        insert(
+            &pool,
+            &ProbeResultEntry {
+                proxy_id: id,
+                checked_at: 1000,
+                ok: false,
+                latency_ms: None,
+                error: Some("timeout"),
+                probe_kind: "tcp",
+            },
+        )
+        .await
+        .unwrap();
+        // A success in between does not hide the failure.
+        insert(
+            &pool,
+            &ProbeResultEntry {
+                proxy_id: id,
+                checked_at: 1100,
+                ok: true,
+                latency_ms: Some(30),
+                error: None,
+                probe_kind: "tcp",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            last_failed_kind(&pool, id).await.unwrap().as_deref(),
+            Some("tcp")
+        );
+
+        // The newest failure wins, whatever kinds are mixed.
+        insert(
+            &pool,
+            &ProbeResultEntry {
+                proxy_id: id,
+                checked_at: 2000,
+                ok: false,
+                latency_ms: None,
+                error: Some("invalid credential"),
+                probe_kind: "t2",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            last_failed_kind(&pool, id).await.unwrap().as_deref(),
+            Some("t2")
+        );
+        insert(
+            &pool,
+            &ProbeResultEntry {
+                proxy_id: id,
+                checked_at: 3000,
+                ok: false,
+                latency_ms: None,
+                error: Some("timeout"),
+                probe_kind: "tls",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            last_failed_kind(&pool, id).await.unwrap().as_deref(),
+            Some("tls")
+        );
     }
 
     /// Minimal proxies fixture: rows are linked to a source unless

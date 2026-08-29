@@ -645,8 +645,12 @@ stateDiagram-v2
 
 The rules in plain language:
 
-- **Success always wins.** Any successful check makes the proxy `alive` and
-  clears all failure counters and schedules.
+- **Success makes the proxy `alive`; T2 verdicts have priority.** Any
+  successful check makes the proxy `alive` and clears schedules. A T2 success
+  and a second-chance revival also clear the failure counter; a T1 success
+  clears it only when the last failure was a T1 one. A proxy with a dead
+  tunnel (something only T2 can see) keeps accumulating failures until it
+  reaches `fail_limit`, even though every T1 check passes.
 - **Quarantine.** `fail_limit` (default 3) consecutive failures move an
   `unknown`/`alive` proxy to `quarantine`. It disappears from subscriptions
   immediately.

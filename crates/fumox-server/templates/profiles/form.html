@@ -59,6 +59,16 @@
     </div>
 
     <div class="field">
+      <label>{{ self.t("prof.countries_label") }}</label>
+      <input type="text" name="countries" value="{{ values.countries }}" placeholder="DE, US">
+      <div class="hint">{{ self.t("prof.countries_hint") }}</div>
+      {% match self.error_for("countries") %}
+        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
       <span class="check-row">
         <input type="checkbox" name="enabled" value="1" id="profile-enabled" {% if values.enabled %}checked{% endif %}>
         <label for="profile-enabled">{{ self.t("prof.enabled_label") }}</label>

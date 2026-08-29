@@ -743,6 +743,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_form_persists_and_validates_country_filter() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // "XX1" is not a 2-letter ISO code: the form re-renders with 422
+        // and nothing is written.
+        let body = format!("_csrf={csrf}&name=Countries&countries=DE%2C%20XX1");
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/profiles/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("XX1"), "bad code must be reported: {html:?}");
+        assert!(
+            fumox_core::repo::profiles::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A valid submission normalizes case and drops duplicates.
+        let body = format!(
+            "_csrf={csrf}&name=Countries&output_format=uri_list&countries=de%2C%20US%2C%20de&enabled=1"
+        );
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/profiles/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let profiles = fumox_core::repo::profiles::list(&state.pool, false)
+            .await
+            .unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].countries,
+            vec!["DE".to_string(), "US".to_string()]
+        );
+
+        // The card lists the active allowlist.
+        let response = app
+            .oneshot(request(
+                "GET",
+                &format!("/admin/profiles/{}", profiles[0].id),
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("DE, US"), "card shows the filter: {html:?}");
+    }
+
+    #[tokio::test]
     async fn unknown_entities_are_404() {
         let state = test_state(1000).await;
         let app = router(state.clone());
@@ -1302,6 +1363,7 @@ mod tests {
             name: "export profile".into(),
             output_format: fumox_core::models::OutputFormat::Clash,
             pipeline: None,
+            countries: Vec::new(),
             enabled: true,
             created_at: now,
             updated_at: now,

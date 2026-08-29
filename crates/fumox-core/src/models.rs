@@ -326,6 +326,10 @@ pub struct Profile {
     pub output_format: OutputFormat,
     /// Pipeline overrides applied on top of the source pipelines.
     pub pipeline: Option<serde_json::Value>,
+    /// Country allowlist for `/sub`: ISO 3166-1 alpha-2 codes, uppercase.
+    /// Empty = every country; while set, proxies with no determined country
+    /// stay out — the filter passes confirmed geo facts only.
+    pub countries: Vec<String>,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,

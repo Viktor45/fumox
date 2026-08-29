@@ -86,6 +86,9 @@ struct ExportProfile {
     output_format: OutputFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pipeline: Option<serde_json::Value>,
+    /// ISO 3166-1 alpha-2 allowlist; empty = no filtering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    countries: Vec<String>,
     #[serde(default)]
     enabled: bool,
     /// Member sources, referenced by their original id, in profile order.
@@ -142,6 +145,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
             name: p.name.clone(),
             output_format: p.output_format,
             pipeline: p.pipeline.clone(),
+            countries: p.countries.clone(),
             enabled: p.enabled,
             source_refs: ordered.into_iter().map(|(id, _)| id).collect(),
         });
@@ -375,6 +379,15 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
                 errors.push(format!("{ctx}: {message}"));
             }
         }
+        for code in &p.countries {
+            let upper = code.trim().to_ascii_uppercase();
+            if upper.len() != 2 || !upper.chars().all(|c| c.is_ascii_alphabetic()) {
+                errors.push(format!(
+                    "{ctx}: {}",
+                    lang.t("val.country_format").replace("{}", code)
+                ));
+            }
+        }
     }
 
     errors
@@ -459,6 +472,7 @@ async fn apply_import(
             name: p.name,
             output_format: p.output_format,
             pipeline: p.pipeline,
+            countries: p.countries,
             enabled: p.enabled,
             created_at: now,
             updated_at: now,
@@ -521,6 +535,7 @@ mod tests {
             name: name.into(),
             output_format: OutputFormat::UriList,
             pipeline: None,
+            countries: Vec::new(),
             enabled: true,
             source_refs: source_refs.iter().map(|s| s.to_string()).collect(),
         }
@@ -534,14 +549,28 @@ mod tests {
             sources: vec![source("srcA0000000", "s1", Some("slug-a"))],
             profiles: vec![profile("p1", Some("prof-a"), &["srcA0000000"])],
         };
+        // A country allowlist rides along and survives the round trip;
+        // an empty list is omitted from the file entirely.
+        let mut p1 = profile("p2", None, &["srcA0000000"]);
+        p1.countries = vec!["DE".into(), "US".into()];
+        let file = ConfigExport {
+            profiles: vec![file.profiles.into_iter().next().unwrap(), p1],
+            ..file
+        };
         let json = serde_json::to_string(&file).unwrap();
         // The ref key (not "reference") is what lands in the file.
         assert!(json.contains("\"ref\":\"srcA0000000\""));
+        assert!(json.contains("\"countries\":[\"DE\",\"US\"]"));
         let back: ConfigExport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.version, 1);
         assert_eq!(back.sources.len(), 1);
         assert_eq!(back.sources[0].reference, "srcA0000000");
         assert_eq!(back.profiles[0].source_refs, vec!["srcA0000000"]);
+        assert!(back.profiles[0].countries.is_empty());
+        assert_eq!(
+            back.profiles[1].countries,
+            vec!["DE".to_string(), "US".to_string()]
+        );
     }
 
     #[test]

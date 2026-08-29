@@ -12,6 +12,7 @@ struct ProfileRow {
     name: String,
     output_format: String,
     pipeline: Option<String>,
+    countries: Option<String>,
     enabled: i64,
     created_at: i64,
     updated_at: i64,
@@ -31,6 +32,19 @@ impl TryFrom<ProfileRow> for Profile {
                 .pipeline
                 .map(|text| super::text_to_json(&text, "profiles.pipeline"))
                 .transpose()?,
+            countries: row
+                .countries
+                .map(|text| {
+                    super::text_to_json(&text, "profiles.countries")
+                        .and_then(|value| {
+                            serde_json::from_value::<Vec<String>>(value).map_err(|e| {
+                                crate::Error::Parse(format!("corrupt profiles.countries JSON: {e}"))
+                            })
+                        })
+                        .map(normalize_countries)
+                })
+                .transpose()?
+                .unwrap_or_default(),
             enabled: row.enabled != 0,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -38,13 +52,32 @@ impl TryFrom<ProfileRow> for Profile {
     }
 }
 
-const COLUMNS: &str =
-    "id, slug, access_token, name, output_format, pipeline, enabled, created_at, updated_at";
+/// Trim, uppercase, drop blanks and duplicates (order-preserving).
+fn normalize_countries(list: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    list.into_iter()
+        .map(|code| code.trim().to_ascii_uppercase())
+        .filter(|code| !code.is_empty())
+        .filter(|code| seen.insert(code.clone()))
+        .collect()
+}
+
+/// `Vec<String>` → stored TEXT: `None` when empty, else a JSON array.
+fn countries_to_text(list: &[String]) -> crate::Result<Option<String>> {
+    if list.is_empty() {
+        return Ok(None);
+    }
+    let value = serde_json::to_value(list)
+        .map_err(|e| crate::Error::Parse(format!("cannot serialize profiles.countries: {e}")))?;
+    Ok(Some(super::json_to_text(&value)?))
+}
+
+const COLUMNS: &str = "id, slug, access_token, name, output_format, pipeline, countries, enabled, created_at, updated_at";
 
 /// Insert a new profile. The caller assigns `id` (see [`crate::models::new_id`]).
 pub async fn create(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
     sqlx::query(&format!(
-        "INSERT INTO profiles ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO profiles ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ))
     .bind(&profile.id)
     .bind(&profile.slug)
@@ -58,6 +91,7 @@ pub async fn create(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
             .map(super::json_to_text)
             .transpose()?,
     )
+    .bind(countries_to_text(&profile.countries)?)
     .bind(profile.enabled)
     .bind(profile.created_at)
     .bind(profile.updated_at)
@@ -71,7 +105,7 @@ pub async fn update(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
     let affected = sqlx::query(
         "UPDATE profiles SET
             slug = ?, access_token = ?, name = ?, output_format = ?, pipeline = ?,
-            enabled = ?, updated_at = ?
+            countries = ?, enabled = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(&profile.slug)
@@ -85,6 +119,7 @@ pub async fn update(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
             .map(super::json_to_text)
             .transpose()?,
     )
+    .bind(countries_to_text(&profile.countries)?)
     .bind(profile.enabled)
     .bind(profile.updated_at)
     .bind(&profile.id)
@@ -200,6 +235,7 @@ mod tests {
             name: "Main profile".into(),
             output_format: OutputFormat::Base64,
             pipeline: Some(serde_json::json!({"version": 1, "steps": []})),
+            countries: Vec::new(),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -247,11 +283,20 @@ mod tests {
         profile.name = "Renamed".into();
         profile.output_format = OutputFormat::UriList;
         profile.access_token = None;
+        // Mixed case, blanks and duplicates normalize on the way out;
+        // clearing the list stores NULL (= no filter).
+        profile.countries = vec!["us".into(), " DE ".into(), "US".into(), "de".into()];
         update(&pool, &profile).await.unwrap();
         let loaded = get(&pool, "prf1aaaaaaa").await.unwrap().unwrap();
         assert_eq!(loaded.name, "Renamed");
         assert_eq!(loaded.output_format, OutputFormat::UriList);
         assert_eq!(loaded.access_token, None);
+        assert_eq!(loaded.countries, vec!["US".to_string(), "DE".to_string()]);
+
+        profile.countries = Vec::new();
+        update(&pool, &profile).await.unwrap();
+        let loaded = get(&pool, "prf1aaaaaaa").await.unwrap().unwrap();
+        assert!(loaded.countries.is_empty());
 
         assert!(delete(&pool, "prf1aaaaaaa").await.unwrap());
         assert!(get(&pool, "prf1aaaaaaa").await.unwrap().is_none());

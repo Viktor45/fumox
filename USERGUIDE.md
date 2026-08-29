@@ -24,6 +24,7 @@ If you only have five minutes, read sections [1](#1-what-is-fumox),
   - [6. Subscription endpoints](#6-subscription-endpoints)
     - [Access tokens](#access-tokens)
     - [Output formats](#output-formats)
+    - [Country filter](#country-filter)
     - [Response behavior (what your client sees)](#response-behavior-what-your-client-sees)
   - [7. The admin panel](#7-the-admin-panel)
     - [Signing in](#signing-in)
@@ -286,7 +287,9 @@ A five-minute walkthrough, assuming the stack is running
    - `sing_box` — sing-box JSON config.
 
    Optionally set a **slug** (then the endpoint is `/sub/your-slug`) and an
-   **access token** (then clients must present it — see below).
+   **access token** (then clients must present it — see below). You can also
+   list **countries** (e.g. `DE, US`) to serve only proxies resolved to those
+   countries — see [Country filter](#country-filter).
 
 4. **Copy the URL.** The profile card shows the subscription URL, e.g.
    `http://<host>:8080/sub/nNqRYHbOSqM5` (or with `?token=…` if you set an
@@ -347,6 +350,20 @@ Clash and sing-box output can only represent vless, vmess, trojan, ss,
 hysteria2 and socks5; proxies of other protocols (tuic, mieru, naive) are
 skipped with a log entry, not an error. Duplicate display names get automatic
 suffixes: `Name`, `Name (2)`, `Name (3)`…
+
+### Country filter
+
+A profile can restrict its output to specific countries: list ISO 3166-1
+alpha-2 codes in the profile form's **Countries** field (e.g. `DE, US` —
+order and case don't matter). While the list is non-empty, `/sub` serves
+only proxies whose country was resolved from the GeoIP database; the facts
+are stored at ingestion time and backfilled at startup.
+
+Proxies whose country could **not** be determined are excluded while the
+filter is active — "only these countries" means confirmed facts, not
+everything-not-foreign. An empty list turns the filter off. Changing the
+list takes effect immediately: the very next client refresh gets the new
+selection.
 
 ### Response behavior (what your client sees)
 

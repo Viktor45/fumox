@@ -93,6 +93,7 @@ struct ProfileFormValues {
     access_token: String,
     output_format: String,
     pipeline: String,
+    countries: String,
     enabled: bool,
 }
 
@@ -264,6 +265,7 @@ pub async fn profile_edit_form(
             .as_ref()
             .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
             .unwrap_or_default(),
+        countries: profile.countries.join(", "),
         enabled: profile.enabled,
     };
     let formats = format_options(&format, &lang);
@@ -408,6 +410,28 @@ async fn build_profile_from_form(
         }
     };
 
+    // Country allowlist: comma-separated ISO 3166-1 alpha-2 codes; empty
+    // means no filtering. Validated per code, normalized to uppercase.
+    let countries_raw = get("countries");
+    let mut countries: Vec<String> = Vec::new();
+    for code in countries_raw.split(',') {
+        let code = code.trim();
+        if code.is_empty() {
+            continue;
+        }
+        let upper = code.to_ascii_uppercase();
+        if upper.len() != 2 || !upper.chars().all(|c| c.is_ascii_alphabetic()) {
+            errors.push((
+                "countries".into(),
+                lang.t("val.country_format").replace("{}", code),
+            ));
+            continue;
+        }
+        if !countries.contains(&upper) {
+            countries.push(upper);
+        }
+    }
+
     // Every selected source must exist (guards against stale form posts).
     let composition = composition_from_form(form);
     for (source_id, _) in &composition {
@@ -438,6 +462,7 @@ async fn build_profile_from_form(
         name,
         output_format,
         pipeline,
+        countries,
         enabled: form.iter().any(|(k, _)| k == "enabled"),
         created_at: existing.map(|p| p.created_at).unwrap_or(now),
         updated_at: now,
@@ -458,6 +483,7 @@ fn form_values_from(form: &[(String, String)]) -> ProfileFormValues {
         access_token: get("access_token"),
         output_format: get("output_format"),
         pipeline: get("pipeline"),
+        countries: get("countries"),
         enabled: form.iter().any(|(k, _)| k == "enabled"),
     }
 }
@@ -571,6 +597,7 @@ struct ProfileDetailTemplate {
     serve_path: String,
     serve_url: String,
     token_display: String,
+    countries_display: String,
     pipeline_display: String,
     composition: Vec<CompositionRow>,
     stats_total: i64,
@@ -664,6 +691,11 @@ pub async fn profile_detail(
         .as_deref()
         .map(mask_secret)
         .unwrap_or_else(|| lang.t("prof.token_public").to_string());
+    let countries_display = if profile.countries.is_empty() {
+        lang.t("prof.countries_none").to_string()
+    } else {
+        profile.countries.join(", ")
+    };
     render_html(
         lang.clone(),
         &ProfileDetailTemplate {
@@ -675,6 +707,7 @@ pub async fn profile_detail(
             serve_path,
             serve_url,
             token_display,
+            countries_display,
             pipeline_display: profile
                 .pipeline
                 .as_ref()

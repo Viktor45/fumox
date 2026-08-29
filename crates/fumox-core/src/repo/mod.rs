@@ -128,7 +128,7 @@ mod tests {
 
         // Schema version is stamped into meta by db::migrate.
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("2"));
+        assert_eq!(version.as_deref(), Some("3"));
 
         // WAL is active on the connection.
         let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")

@@ -269,6 +269,24 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
             .push(linked.proxy);
     }
 
+    // Profile-level country allowlist (SPEC §10.1): when the profile lists
+    // countries, only proxies whose stored geo fact matches are served.
+    // Proxies without a determined country stay out while the filter is
+    // active — "only these countries" means confirmed facts, not guesses.
+    let allowed_countries: Option<std::collections::HashSet<String>> =
+        if profile.countries.is_empty() {
+            None
+        } else {
+            Some(
+                profile
+                    .countries
+                    .iter()
+                    .map(|code| code.trim().to_ascii_uppercase())
+                    .filter(|code| !code.is_empty())
+                    .collect(),
+            )
+        };
+
     let mut all: Vec<Candidate> = Vec::new();
     let mut loaded_statuses: Vec<ProxyStatus> = Vec::new();
     let mut any_stale = false;
@@ -282,7 +300,14 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
             Some(ErrorClass::HttpClient) => unreachable!("handled above"),
         }
         let rows = by_source.remove(&source.id).unwrap_or_default();
-        let candidates = rows_to_candidates(rows, position as i64);
+        let mut candidates = rows_to_candidates(rows, position as i64);
+        if let Some(allowed) = &allowed_countries {
+            candidates.retain(|c| {
+                c.geo_country
+                    .as_deref()
+                    .is_some_and(|code| allowed.contains(&code.to_ascii_uppercase()))
+            });
+        }
         loaded_statuses.extend(candidates.iter().map(|c| c.status));
         all.extend(compiled.apply_per_source(candidates, &state.geo).await);
     }
@@ -633,6 +658,7 @@ mod tests {
             name: format!("Profile {id}"),
             output_format: Default::default(),
             pipeline: None,
+            countries: Vec::new(),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -720,6 +746,76 @@ mod tests {
         // last-writer-wins for the name, and serving emits it exactly once.
         let dup_count = body.matches("h1.example.com:443").count();
         assert_eq!(dup_count, 1, "duplicate must appear once: {body:?}");
+    }
+
+    #[tokio::test]
+    async fn profile_country_filter_follows_stored_geo_facts() {
+        let state = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        // Three proxies: confirmed US, confirmed DE, and one whose country
+        // was never determined (no geo stamp at all).
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("us", "us1.example.com", 443),
+                entry("de", "de1.example.com", 443),
+                entry("geoless", "xx.example.com", 443),
+            ],
+        )
+        .await;
+        for (host, country) in [
+            ("us1.example.com", Some("US")),
+            ("de1.example.com", Some("DE")),
+            ("xx.example.com", None),
+        ] {
+            sqlx::query("UPDATE proxies SET status = 'alive', geo_country = ? WHERE host = ?")
+                .bind(country)
+                .bind(host)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+
+        // No allowlist: every proxy passes, including the geoless one.
+        let (status, _, body) = get(router(state.clone()), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        for host in ["us1", "de1", "xx"] {
+            assert!(
+                body.contains(&format!("{host}.example.com:443")),
+                "{body:?}"
+            );
+        }
+
+        // Only the confirmed US fact matches; the geoless proxy is not a
+        // "US" proxy, so it stays out too.
+        let mut profile = profiles::get(&state.pool, "profA0000000")
+            .await
+            .unwrap()
+            .unwrap();
+        profile.countries = vec!["US".into()];
+        profile.updated_at = fumox_core::models::now_ts();
+        profiles::update(&state.pool, &profile).await.unwrap();
+        // Saved means immediately effective: the admin invalidates the /sub
+        // cache on every profile save (ADMIN_PLAN §7).
+        state.caches.invalidate_profile(&profile.id).await;
+        let (status, _, body) = get(router(state.clone()), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("us1.example.com:443"), "{body:?}");
+        assert!(!body.contains("de1.example.com"), "{body:?}");
+        assert!(!body.contains("xx.example.com"), "{body:?}");
+
+        // Changing the list changes the output — codes are case-insensitive.
+        profile.countries = vec!["de".into()];
+        profile.updated_at = fumox_core::models::now_ts();
+        profiles::update(&state.pool, &profile).await.unwrap();
+        state.caches.invalidate_profile(&profile.id).await;
+        let (status, _, body) = get(router(state), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("de1.example.com:443"), "{body:?}");
+        assert!(!body.contains("us1.example.com"), "{body:?}");
+        assert!(!body.contains("xx.example.com"), "{body:?}");
     }
 
     #[tokio::test]

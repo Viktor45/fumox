@@ -8,11 +8,12 @@
 use std::time::Duration;
 
 use fumox_core::config::MeowConfig;
+use rand::seq::IndexedRandom;
 
 pub struct MeowClient {
     http: reqwest::Client,
     base_url: String,
-    test_url: String,
+    test_urls: Vec<String>,
     timeout: Duration,
 }
 
@@ -33,9 +34,18 @@ impl MeowClient {
         Self {
             http: reqwest::Client::new(),
             base_url: format!("http://{}", config.api_addr),
-            test_url: config.test_url.clone(),
+            test_urls: config.test_url.clone(),
             timeout: Duration::from_secs(config.timeout_secs.max(1)),
         }
+    }
+
+    /// Random test URL for one delay check: with several configured, the
+    /// checks rotate across the list instead of hammering one endpoint
+    /// (one URL may be blocked or degraded in a given region).
+    fn pick_test_url<'a>(&'a self, rng: &mut impl rand::Rng) -> &'a str {
+        self.test_urls
+            .choose(rng)
+            .expect("meow.test_url is never empty (guaranteed by the config deserializer)")
     }
 
     /// `GET /version` — cheap liveness probe of the REST API.
@@ -88,13 +98,11 @@ impl MeowClient {
     pub async fn check_delay(&self, name: &str) -> DelayOutcome {
         let url = format!("{}/proxies/{name}/delay", self.base_url);
         let timeout_ms = self.timeout.as_millis().to_string();
+        let test_url = self.pick_test_url(&mut rand::rng());
         let response = match self
             .http
             .get(&url)
-            .query(&[
-                ("url", self.test_url.as_str()),
-                ("timeout", timeout_ms.as_str()),
-            ])
+            .query(&[("url", test_url), ("timeout", timeout_ms.as_str())])
             .timeout(self.timeout + Duration::from_secs(5))
             .send()
             .await
@@ -134,14 +142,24 @@ impl MeowClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::Path;
+    use axum::extract::{Path, Query};
     use axum::routing::{get, put};
     use axum::{Json, Router};
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Stand up a mock meow-rs REST API on an ephemeral port.
-    async fn mock_api(reloads: Arc<AtomicUsize>) -> (String, fumox_core::config::MeowConfig) {
+    /// Stand up a mock meow-rs REST API on an ephemeral port. Captures the
+    /// `url` query parameter of every delay request for rotation asserts.
+    async fn mock_api(
+        reloads: Arc<AtomicUsize>,
+    ) -> (
+        String,
+        fumox_core::config::MeowConfig,
+        Arc<std::sync::Mutex<HashSet<String>>>,
+    ) {
+        let seen_test_urls: Arc<std::sync::Mutex<HashSet<String>>> = Arc::default();
+        let capture = seen_test_urls.clone();
         let app = Router::new()
             .route(
                 "/version",
@@ -159,22 +177,31 @@ mod tests {
             )
             .route(
                 "/proxies/{name}/delay",
-                get(|Path(name): Path<String>| async move {
-                    match name.as_str() {
-                        "fumox-1" => (
-                            axum::http::StatusCode::OK,
-                            Json(serde_json::json!({"delay": 42})),
-                        ),
-                        "fumox-2" => (
-                            axum::http::StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({"message":"dial tcp: i/o timeout"})),
-                        ),
-                        _ => (
-                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({"message":"proxy not found"})),
-                        ),
-                    }
-                }),
+                get(
+                    move |Path(name): Path<String>,
+                          Query(query): Query<HashMap<String, String>>| {
+                        let capture = capture.clone();
+                        async move {
+                            if let Some(url) = query.get("url") {
+                                capture.lock().unwrap().insert(url.clone());
+                            }
+                            match name.as_str() {
+                                "fumox-1" => (
+                                    axum::http::StatusCode::OK,
+                                    Json(serde_json::json!({"delay": 42})),
+                                ),
+                                "fumox-2" => (
+                                    axum::http::StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({"message":"dial tcp: i/o timeout"})),
+                                ),
+                                _ => (
+                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(serde_json::json!({"message":"proxy not found"})),
+                                ),
+                            }
+                        }
+                    },
+                ),
             );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -186,16 +213,16 @@ mod tests {
         let config = MeowConfig {
             api_addr: addr.to_string(),
             config_path: std::env::temp_dir().join("fumox-meow-test.yaml"),
-            test_url: "http://cp.cloudflare.com".into(),
+            test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 5,
         };
-        (addr.to_string(), config)
+        (addr.to_string(), config, seen_test_urls)
     }
 
     #[tokio::test]
     async fn ping_reload_and_delay_outcomes() {
         let reloads = Arc::new(AtomicUsize::new(0));
-        let (_addr, config) = mock_api(reloads.clone()).await;
+        let (_addr, config, _seen) = mock_api(reloads.clone()).await;
         let client = MeowClient::new(&config);
 
         assert_eq!(client.ping().await.unwrap(), "mock-0.20");
@@ -223,7 +250,7 @@ mod tests {
             // Nothing listens here.
             api_addr: "127.0.0.1:1".into(),
             config_path: std::env::temp_dir().join("fumox-meow-test.yaml"),
-            test_url: "http://cp.cloudflare.com".into(),
+            test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 2,
         };
         let client = MeowClient::new(&config);
@@ -233,5 +260,44 @@ mod tests {
             client.check_delay("fumox-1").await,
             DelayOutcome::ServiceUnavailable(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn delay_requests_rotate_the_configured_test_urls() {
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let (_addr, mut config, seen) = mock_api(reloads.clone()).await;
+        config.test_url = vec!["http://a.example/204".into(), "http://b.example/204".into()];
+        let client = MeowClient::new(&config);
+
+        // 40 draws over two URLs: the odds of never seeing one are ~10^-12.
+        for _ in 0..40 {
+            assert!(matches!(
+                client.check_delay("fumox-1").await,
+                DelayOutcome::Ok(_)
+            ));
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            HashSet::from([
+                "http://a.example/204".to_string(),
+                "http://b.example/204".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn pick_test_url_covers_the_whole_list() {
+        let config = MeowConfig {
+            test_url: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
+        };
+        let client = MeowClient::new(&config);
+        // Seeded: the assertion is deterministic for this fixed sequence.
+        let mut rng = {
+            use rand::SeedableRng;
+            rand::rngs::StdRng::seed_from_u64(7)
+        };
+        let picked: HashSet<&str> = (0..100).map(|_| client.pick_test_url(&mut rng)).collect();
+        assert_eq!(picked, HashSet::from(["a", "b", "c"]));
     }
 }

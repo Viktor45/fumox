@@ -693,7 +693,7 @@ mod tests {
             meow: fumox_core::config::MeowConfig {
                 api_addr: meow_addr.into(),
                 config_path: meow_config,
-                test_url: "http://cp.cloudflare.com".into(),
+                test_url: vec!["http://cp.cloudflare.com".to_string()],
                 timeout_secs: 3,
             },
             ..Default::default()

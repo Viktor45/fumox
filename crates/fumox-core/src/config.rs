@@ -360,10 +360,12 @@ pub struct MeowConfig {
     /// `PUT /configs`.
     #[serde(default = "defaults::meow_config_path")]
     pub config_path: PathBuf,
-    /// Test URL for delay/healthcheck requests (configurable because the
-    /// default may be blocked in some regions).
-    #[serde(default = "defaults::meow_test_url")]
-    pub test_url: String,
+    /// Test URL(s) for delay/healthcheck requests (configurable because the
+    /// defaults may be blocked in some regions). Accepts a single URL, a
+    /// TOML array, or a comma-separated string; the probe picks one at
+    /// random for every T2 check.
+    #[serde(default = "defaults::meow_test_url", deserialize_with = "de_test_urls")]
+    pub test_url: Vec<String>,
     /// Per-check timeout.
     #[serde(default = "defaults::meow_timeout_secs")]
     pub timeout_secs: u64,
@@ -400,6 +402,59 @@ impl Default for RetentionConfig {
             fetch_log_days: defaults::fetch_log_days(),
         }
     }
+}
+
+/// `[meow].test_url`: a single URL, a comma-separated string, or a sequence
+/// of URLs. Blank entries are dropped, and the list must not end up empty —
+/// the T2 check has nothing to fetch otherwise.
+fn de_test_urls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a URL or a list of URLs")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            finish(split_urls(value).collect())
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut urls = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                urls.extend(split_urls(&item));
+            }
+            finish(urls)
+        }
+    }
+
+    // Comma-splitting applies to array items too, so `FUMOX_MEOW__TEST_URL`
+    // overrides stay possible with several endpoints (env values are strings).
+    fn split_urls(value: &str) -> impl Iterator<Item = String> + '_ {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+    }
+
+    fn finish<E: serde::de::Error>(urls: Vec<String>) -> Result<Vec<String>, E> {
+        if urls.is_empty() {
+            Err(E::custom("meow.test_url must contain at least one URL"))
+        } else {
+            Ok(urls)
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
 }
 
 /// A rate limit expressed as a number of requests per time window.
@@ -595,8 +650,20 @@ mod defaults {
     pub fn meow_config_path() -> PathBuf {
         PathBuf::from("config/meow.yaml")
     }
-    pub fn meow_test_url() -> String {
-        "http://www.gstatic.com/generate_204".to_string()
+    pub fn meow_test_url() -> Vec<String> {
+        // Google's connectivity-check endpoints, verified to answer 204
+        // (checked live 2026-08-29). Plain http on purpose: the delay test
+        // goes through the tunnel, and skipping TLS keeps the measurement
+        // about the tunnel, not about a possibly-broken handshake.
+        vec![
+            "http://www.gstatic.com/generate_204".to_string(),
+            "http://connectivitycheck.gstatic.com/generate_204".to_string(),
+            "http://www.google.com/generate_204".to_string(),
+            "http://www.googleapis.com/generate_204".to_string(),
+            "http://play.googleapis.com/generate_204".to_string(),
+            "http://connectivitycheck.android.com/generate_204".to_string(),
+            "http://clients3.google.com/generate_204".to_string(),
+        ]
     }
     pub const fn meow_timeout_secs() -> u64 {
         10
@@ -655,6 +722,57 @@ mod tests {
         assert_eq!(from_str, RateLimit::new(5, Duration::from_secs(60)));
         let from_int: RateLimit = serde_json::from_str("42").unwrap();
         assert_eq!(from_int, RateLimit::new(42, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn meow_test_url_accepts_string_array_and_csv() {
+        let single: MeowConfig =
+            serde_json::from_str(r#"{"test_url": "http://www.gstatic.com/generate_204"}"#).unwrap();
+        assert_eq!(single.test_url, ["http://www.gstatic.com/generate_204"]);
+
+        // A plain string may carry several URLs comma-separated — this is how
+        // the FUMOX_MEOW__TEST_URL env override can configure rotation.
+        let csv: MeowConfig =
+            serde_json::from_str(r#"{"test_url": "http://a/204, http://b/204 , ,http://c/204"}"#)
+                .unwrap();
+        assert_eq!(
+            csv.test_url,
+            ["http://a/204", "http://b/204", "http://c/204"]
+        );
+
+        let array: MeowConfig =
+            serde_json::from_str(r#"{"test_url": ["http://a/204", "http://b/204"]}"#).unwrap();
+        assert_eq!(array.test_url, ["http://a/204", "http://b/204"]);
+
+        // Items of an array may also be comma-separated.
+        let mixed: MeowConfig =
+            serde_json::from_str(r#"{"test_url": ["http://a/204", "http://b/204, http://c/204"]}"#)
+                .unwrap();
+        assert_eq!(
+            mixed.test_url,
+            ["http://a/204", "http://b/204", "http://c/204"]
+        );
+
+        let defaults: MeowConfig = serde_json::from_str("{}").unwrap();
+        assert!(defaults.test_url.len() > 1);
+        assert!(
+            defaults
+                .test_url
+                .iter()
+                .all(|url| url.ends_with("/generate_204"))
+        );
+
+        for empty in [
+            "{\"test_url\": \"\"}",
+            "{\"test_url\": []}",
+            "{\"test_url\": \" , \"}",
+        ] {
+            let err = serde_json::from_str::<MeowConfig>(empty).unwrap_err();
+            assert!(
+                err.to_string().contains("at least one URL"),
+                "{empty}: {err}"
+            );
+        }
     }
 
     #[test]

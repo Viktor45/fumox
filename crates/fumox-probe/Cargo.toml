@@ -20,6 +20,7 @@ serde_norway = { workspace = true }
 reqwest = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

@@ -533,7 +533,7 @@ form.
 | -------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `api_addr`     | `"127.0.0.1:9090"`                      | meow-rs REST API address (its external-controller)                                                                           |
 | `config_path`  | `"config/meow.yaml"`                    | Where the probe writes the generated Clash config. **Must be a path meow-rs itself can read** (in Docker: the shared volume) |
-| `test_url`     | `"http://www.gstatic.com/generate_204"` | URL fetched through the proxy for delay tests. May be blocked in some regions — change it if T2 fails everywhere             |
+| `test_url`     | Rotation over the Google Android `generate_204` endpoints (7 URLs, verified 2026-08-29) | URL(s) fetched through the proxy for delay tests: one URL, a TOML array, or a comma-separated string. The probe picks one at random per check, so a blocked endpoint no longer breaks T2 everywhere. iOS/Apple check URLs (`captive.apple.com/...`) answer 200, not 204 — usable, but only if your client accepts non-204 answers |
 | `timeout_secs` | `10`                                    | Per-check timeout                                                                                                            |
 
 ### `[retention]` — history rotation
@@ -600,7 +600,8 @@ cycle in four passes:
 4. **T2** — real tunnel checks for `alive` proxies through meow-rs: the probe
    writes a Clash config with the batch, hot-reloads meow-rs via
    `PUT /configs`, then measures delay via `GET /proxies/{name}/delay` against
-   `[meow].test_url`.
+   a randomly picked URL from `[meow].test_url` (the checks rotate across the
+   configured list).
 
 The priority queue gives brand-new proxies a first check within one cycle of
 the source refresh instead of waiting out the random sample — with large

@@ -106,7 +106,7 @@
       <tbody>
         <tr><td>REST API</td><td class="mono small">{{ state.meow.api_addr }}</td></tr>
         <tr><td>{{ self.t("probe.clash_config") }}</td><td class="mono small">{{ state.meow.config_path.display() }}</td></tr>
-        <tr><td>{{ self.t("probe.test_url") }}</td><td class="mono small">{{ state.meow.test_url }}</td></tr>
+        <tr><td>{{ self.t("probe.test_url") }}</td><td class="mono small">{{ state.meow.test_url.join(", ") }}</td></tr>
         <tr><td>{{ self.t("probe.check_timeout") }}</td><td>{{ state.meow.timeout_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><td>{{ self.t("probe.retention_probe") }}</td><td>{{ state.retention.probe_results_days }} {{ self.t("probe.days_short") }}</td></tr>
         <tr><td>{{ self.t("probe.retention_fetch") }}</td><td>{{ state.retention.fetch_log_days }} {{ self.t("probe.days_short") }}</td></tr>

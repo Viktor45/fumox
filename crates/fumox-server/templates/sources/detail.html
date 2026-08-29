@@ -56,6 +56,12 @@
           {% when None %}{{ self.t("src.auto") }}
         {% endmatch %}
       </td></tr>
+      <tr><th>{{ self.t("src.ip_family_label") }}</th><td>
+        {% match source.ip_family %}
+          {% when Some with (family) %}{{ family.as_str() }}
+          {% when None %}{{ self.t("src.ip_family_inherit") }}
+        {% endmatch %}
+      </td></tr>
       <tr><th>{{ self.t("src.protocols_label") }}</th><td>{{ protocols_display }}</td></tr>
       <tr><th>{{ self.t("src.refresh_interval") }}</th><td>{{ source.cache_ttl_seconds }} {{ self.t("common.sec") }}</td></tr>
       <tr><th>{{ self.t("src.tags_label") }}</th><td>

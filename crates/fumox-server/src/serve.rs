@@ -639,6 +639,7 @@ mod tests {
             tags: None,
             pipeline: None,
             headers: None,
+            ip_family: None,
             created_at: now,
             updated_at: now,
             last_fetched_at: None,

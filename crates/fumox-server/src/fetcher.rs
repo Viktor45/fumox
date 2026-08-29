@@ -8,7 +8,7 @@
 //! cannot help.
 
 use fumox_core::config::FetchConfig;
-use fumox_core::models::ErrorClass;
+use fumox_core::models::{ErrorClass, IpFamily};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use url::Url;
@@ -94,6 +94,12 @@ impl Fetcher {
         }
     }
 
+    /// Deployment-wide default family a source without its own `ip_family`
+    /// resolves to (`[fetch] ip_family`).
+    pub fn default_family(&self) -> IpFamily {
+        self.config.ip_family
+    }
+
     /// Build a one-shot client for a single fetch.
     ///
     /// reqwest exposes DNS override only on `ClientBuilder`, so the client
@@ -120,15 +126,20 @@ impl Fetcher {
     /// Fetch a URL with retries for recoverable failures.
     ///
     /// `headers` are extra request headers from the source configuration
-    /// (they may override the default User-Agent).
+    /// (they may override the default User-Agent). `family` is the source's
+    /// preferred IP family; `None` inherits the deployment default from
+    /// `[fetch] ip_family`. The family is strict: when the host has no
+    /// address of that family the fetch fails with a client error.
     pub async fn fetch(
         &self,
         url: &str,
         headers: &std::collections::BTreeMap<String, String>,
+        family: Option<IpFamily>,
     ) -> Result<FetchedPayload, FetchFailure> {
+        let family = family.unwrap_or(self.config.ip_family);
         let mut attempt = 0u32;
         loop {
-            match self.fetch_once(url, headers).await {
+            match self.fetch_once(url, headers, family).await {
                 Ok(payload) => return Ok(payload),
                 Err(failure) => {
                     if attempt >= self.config.max_retries || !failure.is_recoverable() {
@@ -152,6 +163,7 @@ impl Fetcher {
         &self,
         url: &str,
         headers: &std::collections::BTreeMap<String, String>,
+        family: IpFamily,
     ) -> Result<FetchedPayload, FetchFailure> {
         // Redirects are followed manually (up to MAX_REDIRECTS hops) because
         // every hop must pass the full SSRF vetting again — an automatic
@@ -180,7 +192,7 @@ impl Fetcher {
             let host = parsed.host_str().ok_or_else(|| FetchFailure::Network {
                 message: "URL has no host".to_string(),
             })?;
-            let pinned = self.resolve_and_vet(host).await.map_err(|e| {
+            let pinned = self.resolve_and_vet(host, family).await.map_err(|e| {
                 tracing::warn!(url = %current, reason = %e, "SSRF protection blocked the fetch");
                 FetchFailure::HttpClient { status: 403 }
             })?;
@@ -248,17 +260,66 @@ impl Fetcher {
     }
 
     /// Resolve a host and vet all addresses. Returns the address to connect
-    /// to (first IPv4 when available). IP literals skip DNS.
-    async fn resolve_and_vet(&self, host: &str) -> Result<IpAddr, SsrfRejection> {
-        vet_host(host, self.allow_private_urls).await
+    /// to, constrained to `family` (first IPv4 when available for `Any`).
+    /// IP literals skip DNS.
+    async fn resolve_and_vet(&self, host: &str, family: IpFamily) -> Result<IpAddr, SsrfRejection> {
+        vet_host(host, self.allow_private_urls, family).await
     }
 }
 
-/// Resolve a host and vet every address against the SSRF policy. Returns
-/// the address to connect to (first IPv4 when available). Shared by the
-/// fetch path and the save-time check ([`vet_url`]).
-pub async fn vet_host(host: &str, allow_private_urls: bool) -> Result<IpAddr, SsrfRejection> {
+/// Whether `ip` belongs to the requested family (`Any` matches both).
+fn family_matches(ip: IpAddr, family: IpFamily) -> bool {
+    match family {
+        IpFamily::Any => true,
+        IpFamily::Ipv4 => ip.is_ipv4(),
+        IpFamily::Ipv6 => ip.is_ipv6(),
+    }
+}
+
+/// Human-readable family name for error messages.
+fn family_label(family: IpFamily) -> &'static str {
+    match family {
+        IpFamily::Any => "IPv4/IPv6",
+        IpFamily::Ipv4 => "IPv4",
+        IpFamily::Ipv6 => "IPv6",
+    }
+}
+
+/// Pick the connect address from an already-vetted list: first IPv4 with an
+/// IPv6 fallback for `Any` (the historical behavior), otherwise the first
+/// address of the requested family. `None` = no usable address.
+fn pick_address(addrs: &[IpAddr], family: IpFamily) -> Option<IpAddr> {
+    match family {
+        IpFamily::Any => addrs
+            .iter()
+            .find(|ip| ip.is_ipv4())
+            .or_else(|| addrs.first())
+            .copied(),
+        IpFamily::Ipv4 => addrs.iter().copied().find(|ip| ip.is_ipv4()),
+        IpFamily::Ipv6 => addrs.iter().copied().find(|ip| ip.is_ipv6()),
+    }
+}
+
+/// Resolve a host and vet every address against the SSRF policy, then pick
+/// the connect address constrained to `family`. Shared by the fetch path
+/// and the save-time check ([`vet_url`]).
+pub async fn vet_host(
+    host: &str,
+    allow_private_urls: bool,
+    family: IpFamily,
+) -> Result<IpAddr, SsrfRejection> {
     let addrs: Vec<IpAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        // The literal fixes the family; a source pinned to the other one
+        // can never reach it.
+        if !family_matches(ip, family) {
+            return Err(SsrfRejection {
+                reason: format!(
+                    "{host} is a {} address but the source requires {}",
+                    if ip.is_ipv4() { "IPv4" } else { "IPv6" },
+                    family_label(family)
+                ),
+            });
+        }
         vec![ip]
     } else {
         let lookup = tokio::net::lookup_host((host, 0))
@@ -266,10 +327,13 @@ pub async fn vet_host(host: &str, allow_private_urls: bool) -> Result<IpAddr, Ss
             .map_err(|e| SsrfRejection {
                 reason: format!("DNS resolution failed for {host}: {e}"),
             })?;
-        let addrs: Vec<IpAddr> = lookup.map(|addr| addr.ip()).collect();
+        let addrs: Vec<IpAddr> = lookup
+            .map(|addr| addr.ip())
+            .filter(|ip| family_matches(*ip, family))
+            .collect();
         if addrs.is_empty() {
             return Err(SsrfRejection {
-                reason: format!("no addresses for {host}"),
+                reason: format!("no {} addresses for {host}", family_label(family)),
             });
         }
         addrs
@@ -279,11 +343,9 @@ pub async fn vet_host(host: &str, allow_private_urls: bool) -> Result<IpAddr, Ss
             reason: format!("{host} -> {ip}: {reason}"),
         })?;
     }
-    Ok(addrs
-        .iter()
-        .find(|ip| ip.is_ipv4())
-        .copied()
-        .unwrap_or(addrs[0]))
+    pick_address(&addrs, family).ok_or_else(|| SsrfRejection {
+        reason: format!("no {} addresses for {host}", family_label(family)),
+    })
 }
 
 /// Static URL validation applied when a source is saved (ADMIN_PLAN §3).
@@ -310,8 +372,10 @@ pub fn validate_url(url: &str) -> Result<(), String> {
 /// resolution and address vetting. The fetch path re-vets on every request
 /// to defend against DNS rebinding, so a failure here is fast feedback for
 /// the form, not the last line of defense. Skips DNS when private URLs are
-/// allowed (nothing to reject).
-pub async fn vet_url(url: &str, allow_private_urls: bool) -> Result<(), String> {
+/// allowed (nothing to reject). `family` is the source's effective IP
+/// family (after resolving `None` against `[fetch] ip_family`), so the form
+/// flags hosts that can never be reached under the strict constraint.
+pub async fn vet_url(url: &str, allow_private_urls: bool, family: IpFamily) -> Result<(), String> {
     validate_url(url)?;
     if allow_private_urls {
         return Ok(());
@@ -320,7 +384,7 @@ pub async fn vet_url(url: &str, allow_private_urls: bool) -> Result<(), String> 
     let host = parsed
         .host_str()
         .ok_or_else(|| "у URL нет хоста".to_string())?;
-    vet_host(host, false)
+    vet_host(host, false, family)
         .await
         .map_err(|e| format!("SSRF-защита: {e}"))?;
     Ok(())
@@ -496,5 +560,93 @@ mod tests {
         assert!(Ipv4Addr::new(127, 0, 0, 1).is_loopback());
         assert!(Ipv4Addr::new(169, 254, 169, 254).is_link_local());
         assert!(Ipv6Addr::LOCALHOST.is_loopback());
+    }
+
+    #[test]
+    fn pick_address_matrix() {
+        let both = [ip("203.0.113.10"), ip("2001:db8::1")];
+        let v4_only = [ip("203.0.113.10")];
+        let v6_only = [ip("2001:db8::1")];
+
+        // Any: first IPv4 wins, IPv6 fallback (historical behavior).
+        assert_eq!(pick_address(&both, IpFamily::Any), Some(ip("203.0.113.10")));
+        assert_eq!(
+            pick_address(&v6_only, IpFamily::Any),
+            Some(ip("2001:db8::1"))
+        );
+        // Strict families pick their own address and never the other one.
+        assert_eq!(
+            pick_address(&both, IpFamily::Ipv4),
+            Some(ip("203.0.113.10"))
+        );
+        assert_eq!(pick_address(&both, IpFamily::Ipv6), Some(ip("2001:db8::1")));
+        assert_eq!(pick_address(&v6_only, IpFamily::Ipv4), None);
+        assert_eq!(pick_address(&v4_only, IpFamily::Ipv6), None);
+        assert_eq!(pick_address(&[], IpFamily::Any), None);
+    }
+
+    #[tokio::test]
+    async fn literal_ip_of_the_wrong_family_is_rejected() {
+        // A private URL would normally be vetted with allow_private=false,
+        // but the family check fires before the private-range check either
+        // way; use public test-net addresses to exercise both orders.
+        let v4 = vet_host("203.0.113.10", true, IpFamily::Ipv6)
+            .await
+            .unwrap_err();
+        assert!(v4.reason.contains("IPv4"), "{}", v4.reason);
+        let v6 = vet_host("2001:db8::1", true, IpFamily::Ipv4)
+            .await
+            .unwrap_err();
+        assert!(v6.reason.contains("IPv6"), "{}", v6.reason);
+        // The matching family passes.
+        assert!(vet_host("2001:db8::1", true, IpFamily::Ipv6).await.is_ok());
+    }
+
+    /// Minimal HTTP/1.1 responder on 127.0.0.1; serves any number of
+    /// requests while the test runtime lives.
+    async fn spawn_v4_listener() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn fetch_respects_the_ip_family_constraint() {
+        let addr = spawn_v4_listener().await;
+        let fetcher = Fetcher::new(FetchConfig::default(), true);
+        let url = format!("http://{addr}/sub");
+
+        // Default (Any) reaches the IPv4-only endpoint...
+        let payload = fetcher
+            .fetch(&url, &Default::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(payload.body, b"ok");
+        // ...and an explicit source family that matches works too.
+        assert!(
+            fetcher
+                .fetch(&url, &Default::default(), Some(IpFamily::Ipv4))
+                .await
+                .is_ok()
+        );
+
+        // Strict IPv6 against an IPv4-only endpoint: rejected before any
+        // connection, classified as a client error (no retries).
+        let err = fetcher
+            .fetch(&url, &Default::default(), Some(IpFamily::Ipv6))
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_class(), ErrorClass::HttpClient);
+        assert!(!err.is_recoverable());
     }
 }

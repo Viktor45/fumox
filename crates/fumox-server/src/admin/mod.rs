@@ -603,6 +603,7 @@ mod tests {
             tags: None,
             pipeline: None,
             headers: None,
+            ip_family: None,
             created_at: 1,
             updated_at: 1,
             last_fetched_at: None,
@@ -727,9 +728,27 @@ mod tests {
                 .is_empty()
         );
 
-        // A valid submission creates the source and redirects to the card.
+        // An unknown IP family is rejected as well.
         let body = format!(
-            "_csrf={csrf}&name=Test&slug=test&url=https%3A%2F%2Fexample.com%2Fsub&cache_ttl_seconds=3600&enabled=1"
+            "_csrf={csrf}&name=Family&url=https%3A%2F%2Fexample.com%2Fsub&ip_family=ipx6&cache_ttl_seconds=3600"
+        );
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            fumox_core::repo::sources::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A valid submission creates the source and redirects to the card;
+        // the pinned IP family is persisted.
+        let body = format!(
+            "_csrf={csrf}&name=Test&slug=test&url=https%3A%2F%2Fexample.com%2Fsub&ip_family=ipv6&cache_ttl_seconds=3600&enabled=1"
         );
         let response = app
             .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
@@ -740,6 +759,10 @@ mod tests {
             .await
             .unwrap();
         assert!(created.is_some());
+        assert_eq!(
+            created.unwrap().ip_family,
+            Some(fumox_core::models::IpFamily::Ipv6)
+        );
     }
 
     #[tokio::test]
@@ -937,6 +960,7 @@ mod tests {
             tags: None,
             pipeline: None,
             headers: None,
+            ip_family: None,
             created_at: now,
             updated_at: now,
             last_fetched_at: None,
@@ -1347,6 +1371,7 @@ mod tests {
             tags: Some(vec!["tag1".into()]),
             pipeline: None,
             headers: None,
+            ip_family: None,
             created_at: now,
             updated_at: now,
             last_fetched_at: None,

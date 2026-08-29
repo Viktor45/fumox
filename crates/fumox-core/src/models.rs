@@ -306,12 +306,57 @@ pub struct Source {
     pub pipeline: Option<serde_json::Value>,
     /// Extra HTTP headers sent with the fetch request.
     pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// Preferred IP protocol family for fetching the URL (SPEC §10.1).
+    /// `None` inherits the deployment default (`[fetch] ip_family`); a set
+    /// family is strict — without an address of that family the fetch fails.
+    pub ip_family: Option<IpFamily>,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_fetched_at: Option<i64>,
     pub last_error: Option<String>,
     /// Class of the last fetch error; `None` means the last fetch succeeded.
     pub error_class: Option<ErrorClass>,
+}
+
+/// IP protocol family used to reach a source URL (`sources.ip_family`,
+/// `[fetch] ip_family`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpFamily {
+    /// Dual-stack: pick the first IPv4 address, fall back to IPv6 (the
+    /// historical behavior).
+    #[default]
+    Any,
+    /// Connect via IPv4 addresses only.
+    Ipv4,
+    /// Connect via IPv6 addresses only.
+    Ipv6,
+}
+
+impl IpFamily {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            IpFamily::Any => "any",
+            IpFamily::Ipv4 => "ipv4",
+            IpFamily::Ipv6 => "ipv6",
+        }
+    }
+}
+
+impl FromStr for IpFamily {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let family = match s {
+            "any" => IpFamily::Any,
+            "ipv4" => IpFamily::Ipv4,
+            "ipv6" => IpFamily::Ipv6,
+            other => {
+                return Err(crate::Error::Parse(format!("unknown IP family: {other:?}")));
+            }
+        };
+        Ok(family)
+    }
 }
 
 /// Profile — a named combination of sources plus output rules (`profiles`).

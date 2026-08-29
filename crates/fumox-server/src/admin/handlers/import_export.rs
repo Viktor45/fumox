@@ -22,7 +22,7 @@ use askama::Template;
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use fumox_core::models::{self, Encoding, InputFormat, OutputFormat, Scheme};
+use fumox_core::models::{self, Encoding, InputFormat, IpFamily, OutputFormat, Scheme};
 use fumox_core::repo::{profiles, sources};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -73,6 +73,10 @@ struct ExportSource {
     pipeline: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     headers: Option<BTreeMap<String, String>>,
+    /// Preferred IP protocol family for fetching; `None` inherits the
+    /// deployment default (`[fetch] ip_family`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ip_family: Option<IpFamily>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,6 +132,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
             tags: s.tags.clone(),
             pipeline: s.pipeline.clone(),
             headers: s.headers.clone(),
+            ip_family: s.ip_family,
         });
     }
 
@@ -333,7 +338,13 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         }
         if s.url.trim().is_empty() {
             errors.push(format!("{ctx}: {}", lang.t("val.required")));
-        } else if let Err(message) = fetcher::vet_url(&s.url, state.admin.allow_private_urls).await
+        } else if let Err(message) = fetcher::vet_url(
+            &s.url,
+            state.admin.allow_private_urls,
+            s.ip_family
+                .unwrap_or_else(|| state.fetcher.default_family()),
+        )
+        .await
         {
             errors.push(format!("{ctx}: {message}"));
         }
@@ -436,6 +447,7 @@ async fn apply_import(
             tags: s.tags,
             pipeline: s.pipeline,
             headers: s.headers,
+            ip_family: s.ip_family,
             created_at: now,
             updated_at: now,
             last_fetched_at: None,
@@ -525,6 +537,7 @@ mod tests {
             tags: None,
             pipeline: None,
             headers: None,
+            ip_family: None,
         }
     }
 
@@ -543,10 +556,13 @@ mod tests {
 
     #[test]
     fn export_file_round_trips_through_json() {
+        let mut s1 = source("srcA0000000", "s1", Some("slug-a"));
+        // A pinned IP family rides along and survives the round trip.
+        s1.ip_family = Some(IpFamily::Ipv4);
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
             exported_at: 1_700_000_000,
-            sources: vec![source("srcA0000000", "s1", Some("slug-a"))],
+            sources: vec![s1],
             profiles: vec![profile("p1", Some("prof-a"), &["srcA0000000"])],
         };
         // A country allowlist rides along and survives the round trip;
@@ -561,10 +577,12 @@ mod tests {
         // The ref key (not "reference") is what lands in the file.
         assert!(json.contains("\"ref\":\"srcA0000000\""));
         assert!(json.contains("\"countries\":[\"DE\",\"US\"]"));
+        assert!(json.contains("\"ip_family\":\"ipv4\""));
         let back: ConfigExport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.version, 1);
         assert_eq!(back.sources.len(), 1);
         assert_eq!(back.sources[0].reference, "srcA0000000");
+        assert_eq!(back.sources[0].ip_family, Some(IpFamily::Ipv4));
         assert_eq!(back.profiles[0].source_refs, vec!["srcA0000000"]);
         assert!(back.profiles[0].countries.is_empty());
         assert_eq!(

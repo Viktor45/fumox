@@ -78,7 +78,11 @@ pub async fn ingest_source(
     }
 
     let payload = match fetcher
-        .fetch(&source.url, &source.headers.clone().unwrap_or_default())
+        .fetch(
+            &source.url,
+            &source.headers.clone().unwrap_or_default(),
+            source.ip_family,
+        )
         .await
     {
         Ok(payload) => payload,
@@ -141,7 +145,11 @@ pub enum DryRunOutcome {
 /// Fetch and parse a source without touching the database (dry run).
 pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome {
     let payload = match fetcher
-        .fetch(&source.url, &source.headers.clone().unwrap_or_default())
+        .fetch(
+            &source.url,
+            &source.headers.clone().unwrap_or_default(),
+            source.ip_family,
+        )
         .await
     {
         Ok(payload) => payload,
@@ -376,6 +384,7 @@ mod tests {
             tags: None,
             pipeline: None,
             headers: None,
+            ip_family: None,
             created_at: now,
             updated_at: now,
             last_fetched_at: None,

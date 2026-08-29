@@ -278,8 +278,10 @@ A five-minute walkthrough, assuming the stack is running
 2. **Add a source.** *Sources → New*. Paste the subscription URL, give it a
    name. Everything else has sensible defaults: encoding `auto` (base64 is
    detected automatically), input format auto-detect (URI list / Clash YAML),
-   cache TTL 1 hour. Save. The source is fetched immediately — you should see
-   how many proxies were found.
+   cache TTL 1 hour. If the host is only reachable over one IP family, set
+   **IP family** (`ipv4`/`ipv6`) on the form — otherwise leave it on
+   *default* to follow the `[fetch] ip_family` setting. Save. The source is
+   fetched immediately — you should see how many proxies were found.
 
 3. **Create a profile.** *Profiles → New*. Name it, tick the sources it should
    contain, pick the output format:
@@ -487,6 +489,7 @@ form.
 | `max_retries`           | `2`                 | Retries, only for recoverable errors (`network`, `http_server`) |
 | `retry_base_backoff_ms` | `500`               | Exponential backoff base between retries                        |
 | `user_agent`            | `"fumox/<version>"` | User-Agent header; per-source `headers` override it             |
+| `ip_family`             | `any`               | Default IP family for fetching source URLs: `any` (dual-stack: first IPv4 wins, IPv6 fallback), `ipv4` or `ipv6`. A source without its own IP family inherits this; a set family is strict — no address of that family means a fetch error |
 
 ### `[geo]` — geo enrichment
 

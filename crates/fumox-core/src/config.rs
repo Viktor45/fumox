@@ -18,6 +18,8 @@ use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::models::IpFamily;
+
 /// Default location of the TOML config file, resolved against the CWD.
 pub const DEFAULT_CONFIG_PATH: &str = "config/app.toml";
 
@@ -154,6 +156,12 @@ pub struct FetchConfig {
     /// Default `User-Agent` unless a source overrides it via `headers`.
     #[serde(default = "defaults::user_agent")]
     pub user_agent: String,
+    /// Default IP protocol family for fetching source URLs. A source
+    /// without its own `ip_family` inherits this. `any` = dual-stack (first
+    /// IPv4 wins, IPv6 fallback); `ipv4` / `ipv6` are strict — no address of
+    /// that family means the fetch fails (SPEC §10.1, §16).
+    #[serde(default)]
+    pub ip_family: IpFamily,
 }
 
 impl Default for FetchConfig {
@@ -166,6 +174,7 @@ impl Default for FetchConfig {
             max_retries: defaults::max_retries(),
             retry_base_backoff_ms: defaults::retry_base_backoff_ms(),
             user_agent: defaults::user_agent(),
+            ip_family: IpFamily::default(),
         }
     }
 }

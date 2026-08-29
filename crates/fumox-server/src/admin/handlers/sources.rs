@@ -16,7 +16,7 @@ use askama::Template;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use fumox_core::models::{Encoding, InputFormat, Scheme, Source, new_id, now_ts};
+use fumox_core::models::{Encoding, InputFormat, IpFamily, Scheme, Source, new_id, now_ts};
 use fumox_core::repo::{proxies, sources};
 use std::str::FromStr;
 
@@ -150,6 +150,7 @@ struct SourceFormValues {
     enabled: bool,
     encoding: String,
     input_format: String,
+    ip_family: String,
     protocols: Vec<String>,
     cache_ttl_seconds: String,
     tags: String,
@@ -244,6 +245,10 @@ pub async fn source_edit_form(
         encoding: source.encoding.as_str().to_string(),
         input_format: source
             .input_format
+            .map(|f| f.as_str().to_string())
+            .unwrap_or_default(),
+        ip_family: source
+            .ip_family
             .map(|f| f.as_str().to_string())
             .unwrap_or_default(),
         protocols: source
@@ -346,10 +351,31 @@ async fn build_source_from_form(
         Some(slug_raw)
     };
 
+    // The preferred family is parsed before the URL so the save-time SSRF
+    // check can vet the host under the source's own constraint.
+    let ip_family_raw = get("ip_family");
+    let ip_family = if ip_family_raw.is_empty() {
+        None
+    } else {
+        match IpFamily::from_str(&ip_family_raw) {
+            Ok(family) => Some(family),
+            Err(_) => {
+                errors.push(("ip_family".into(), lang.t("val.unknown_value").into()));
+                None
+            }
+        }
+    };
+
     let url = get("url");
     if url.is_empty() {
         errors.push(("url".into(), lang.t("val.required").into()));
-    } else if let Err(message) = fetcher::vet_url(&url, state.admin.allow_private_urls).await {
+    } else if let Err(message) = fetcher::vet_url(
+        &url,
+        state.admin.allow_private_urls,
+        ip_family.unwrap_or_else(|| state.fetcher.default_family()),
+    )
+    .await
+    {
         errors.push(("url".into(), message));
     }
 
@@ -509,6 +535,7 @@ async fn build_source_from_form(
         } else {
             Some(headers_map)
         },
+        ip_family,
         created_at: existing.as_ref().map(|s| s.created_at).unwrap_or(now),
         updated_at: now,
         last_fetched_at: existing.as_ref().and_then(|s| s.last_fetched_at),
@@ -532,6 +559,7 @@ fn form_values_from(form: &[(String, String)]) -> SourceFormValues {
         enabled: form.iter().any(|(k, _)| k == "enabled"),
         encoding: get("encoding"),
         input_format: get("input_format"),
+        ip_family: get("ip_family"),
         protocols: form
             .iter()
             .filter(|(k, _)| k == "protocols")

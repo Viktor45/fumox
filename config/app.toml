@@ -36,6 +36,16 @@ max_concurrency = 4             # семафор параллельных заг
 max_retries = 2
 retry_base_backoff_ms = 500     # экспоненциальный backoff от этой базы / exponential backoff base for retries
 # user_agent = "fumox/0.1"     # переопределяется headers конкретного источника / overridden by per-source headers
+# Семейство протоколов по умолчанию для загрузки источников: any | ipv4 | ipv6.
+# Источник без своего ip_family наследует это значение. any — dual-stack:
+# первый IPv4-адрес, иначе IPv6. Выбранное семейство строгое: нет адреса
+# нужного семейства — загрузка с ошибкой. Переопределение:
+# FUMOX_FETCH__IP_FAMILY.
+# Default IP protocol family for source fetching: any | ipv4 | ipv6. Sources
+# without their own ip_family inherit this. any = dual-stack (first IPv4
+# address wins, IPv6 fallback). The family is strict: no address of that
+# family means a fetch error. Env override: FUMOX_FETCH__IP_FAMILY.
+ip_family = "any"
 
 [geo]
 # Гео-обогащение MaxMind GeoLite2 (SPEC §6). Файлы .mmdb не коммитятся; при

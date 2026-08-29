@@ -1,7 +1,7 @@
 //! CRUD for the `sources` table.
 
 use crate::db::DbPool;
-use crate::models::{ErrorClass, InputFormat, Scheme, Source};
+use crate::models::{ErrorClass, InputFormat, IpFamily, Scheme, Source};
 use sqlx::FromRow;
 
 #[derive(FromRow)]
@@ -18,6 +18,7 @@ struct SourceRow {
     tags: Option<String>,
     pipeline: Option<String>,
     headers: Option<String>,
+    ip_family: Option<String>,
     created_at: i64,
     updated_at: i64,
     last_fetched_at: Option<i64>,
@@ -69,6 +70,11 @@ impl TryFrom<SourceRow> for Source {
                     })
                 })
                 .transpose()?,
+            ip_family: row
+                .ip_family
+                .filter(|v| !v.is_empty())
+                .map(|v| v.parse())
+                .transpose()?,
             created_at: row.created_at,
             updated_at: row.updated_at,
             last_fetched_at: row.last_fetched_at,
@@ -98,14 +104,14 @@ fn headers_json(
 }
 
 const COLUMNS: &str = "id, slug, name, url, enabled, encoding, input_format, protocols,
-    cache_ttl_seconds, tags, pipeline, headers, created_at, updated_at,
+    cache_ttl_seconds, tags, pipeline, headers, ip_family, created_at, updated_at,
     last_fetched_at, last_error, error_class";
 
 /// Insert a new source. The caller assigns `id` (see [`crate::models::new_id`]).
 pub async fn create(pool: &DbPool, source: &Source) -> crate::Result<()> {
     sqlx::query(&format!(
         "INSERT INTO sources ({COLUMNS})
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ))
     .bind(&source.id)
     .bind(&source.slug)
@@ -131,6 +137,7 @@ pub async fn create(pool: &DbPool, source: &Source) -> crate::Result<()> {
             .transpose()?,
     )
     .bind(headers_json(&source.headers)?)
+    .bind(source.ip_family.map(IpFamily::as_str))
     .bind(source.created_at)
     .bind(source.updated_at)
     .bind(source.last_fetched_at)
@@ -148,7 +155,7 @@ pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
         "UPDATE sources SET
             slug = ?, name = ?, url = ?, enabled = ?, encoding = ?, input_format = ?,
             protocols = ?, cache_ttl_seconds = ?, tags = ?, pipeline = ?, headers = ?,
-            updated_at = ?, last_fetched_at = ?, last_error = ?, error_class = ?
+            ip_family = ?, updated_at = ?, last_fetched_at = ?, last_error = ?, error_class = ?
          WHERE id = ?",
     )
     .bind(&source.slug)
@@ -174,6 +181,7 @@ pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
             .transpose()?,
     )
     .bind(headers_json(&source.headers)?)
+    .bind(source.ip_family.map(IpFamily::as_str))
     .bind(source.updated_at)
     .bind(source.last_fetched_at)
     .bind(&source.last_error)
@@ -306,6 +314,7 @@ mod tests {
             tags: Some(vec!["paid".into(), "eu".into()]),
             pipeline: Some(serde_json::json!({"version": 1})),
             headers: Some(BTreeMap::from([("User-Agent".into(), "Fumox".into())])),
+            ip_family: None,
             created_at: now,
             updated_at: now,
             last_fetched_at: None,
@@ -344,11 +353,19 @@ mod tests {
 
         source.name = "Renamed".into();
         source.cache_ttl_seconds = 600;
+        // NULL (inherit) → explicit family → back to NULL round trip.
+        source.ip_family = Some(IpFamily::Ipv6);
         source.updated_at += 10;
         update(&pool, &source).await.unwrap();
         let loaded = get(&pool, "src1aaaaaaaa").await.unwrap().unwrap();
         assert_eq!(loaded.name, "Renamed");
         assert_eq!(loaded.cache_ttl_seconds, 600);
+        assert_eq!(loaded.ip_family, Some(IpFamily::Ipv6));
+
+        source.ip_family = None;
+        update(&pool, &source).await.unwrap();
+        let loaded = get(&pool, "src1aaaaaaaa").await.unwrap().unwrap();
+        assert_eq!(loaded.ip_family, None);
 
         assert!(delete(&pool, "src1aaaaaaaa").await.unwrap());
         assert!(get(&pool, "src1aaaaaaaa").await.unwrap().is_none());

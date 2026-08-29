@@ -298,6 +298,11 @@ pub struct ProbeConfig {
     /// Random sample size per cycle (spreads load, avoids bursts).
     #[serde(default = "defaults::sample_size")]
     pub sample_size: u32,
+    /// How many newly ingested `unknown` proxies of one source refresh are
+    /// enqueued for priority checking (0 disables the queue). The probe
+    /// drains the queue before the random sample, newest first.
+    #[serde(default = "defaults::refresh_check_limit")]
+    pub refresh_check_limit: u32,
     /// Consecutive failures before quarantine.
     #[serde(default = "defaults::fail_limit")]
     pub fail_limit: u32,
@@ -330,6 +335,7 @@ impl Default for ProbeConfig {
         Self {
             cycle_interval_secs: defaults::cycle_interval_secs(),
             sample_size: defaults::sample_size(),
+            refresh_check_limit: defaults::refresh_check_limit(),
             fail_limit: defaults::fail_limit(),
             connect_timeout_secs: defaults::probe_connect_timeout_secs(),
             tls_timeout_secs: defaults::probe_tls_timeout_secs(),
@@ -554,6 +560,9 @@ mod defaults {
         60
     }
     pub const fn sample_size() -> u32 {
+        50
+    }
+    pub const fn refresh_check_limit() -> u32 {
         50
     }
     pub const fn fail_limit() -> u32 {

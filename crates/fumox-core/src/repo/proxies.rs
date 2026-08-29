@@ -57,6 +57,10 @@ pub struct ReconciliationStats {
     pub resurrected: usize,
     pub unlinked: usize,
     pub removed: usize,
+    /// Ids of the rows inserted by this pass (a superset of what the caller
+    /// may enqueue for priority probing — SPEC §8.3); unsorted, chunked
+    /// consumers must not rely on order.
+    pub inserted_ids: Vec<i64>,
 }
 
 /// Full `proxies` row for reads (admin browser, probe, serving).
@@ -233,6 +237,7 @@ pub async fn reconcile_source(
             stats.updated += 1;
         } else {
             stats.inserted += 1;
+            stats.inserted_ids.push(id);
         }
     }
     stats.resurrected = existing
@@ -587,28 +592,37 @@ pub enum Transition {
     Removed,
 }
 
+/// Schemes the T1 connectivity check cannot judge (SPEC §8.5): a TCP/TLS
+/// connect to a UDP-only port would quarantine healthy proxies. Shared by
+/// the random sample and the priority queue; tuic/mieru are additionally
+/// absent from T2 (meow-rs cannot tunnel them).
+pub const T1_EXCLUDED_SCHEMES: &[&str] = &["hysteria2", "tuic", "mieru"];
+
 /// Random sample of probeable proxies for one T1 cycle (SPEC §8.3: random
 /// sampling spreads load and avoids bursts).
 ///
 /// Eligible: `unknown` or `alive` (quarantine rows follow their own
 /// schedule; `removed` is terminal), still linked to at least one source,
-/// and not one of the unprobeable schemes (SPEC §8.5 — a TCP connect to a
-/// UDP-only port would quarantine healthy proxies). `ORDER BY RANDOM()`
-/// keeps the sample unbiased without client-side shuffling.
+/// and not one of the unprobeable schemes ([`T1_EXCLUDED_SCHEMES`]).
+/// `ORDER BY RANDOM()` keeps the sample unbiased without client-side
+/// shuffling.
 pub async fn select_t1_candidates(pool: &DbPool, limit: u32) -> crate::Result<Vec<T1Candidate>> {
-    let rows: Vec<T1Candidate> = sqlx::query_as(
+    let excluded = vec!["?"; T1_EXCLUDED_SCHEMES.len()].join(", ");
+    let sql = format!(
         "SELECT p.id, p.scheme, p.host, p.port, p.params
          FROM proxies p
          WHERE p.status IN ('unknown', 'alive')
-           AND p.scheme NOT IN ('hysteria2', 'tuic', 'mieru')
+           AND p.scheme NOT IN ({excluded})
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
          ORDER BY RANDOM()
-         LIMIT ?",
-    )
-    .bind(i64::from(limit))
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+         LIMIT ?"
+    );
+    let mut query = sqlx::query_as::<_, T1Candidate>(&sql);
+    for scheme in T1_EXCLUDED_SCHEMES {
+        query = query.bind(scheme);
+    }
+    query = query.bind(i64::from(limit));
+    Ok(query.fetch_all(pool).await?)
 }
 
 /// Random sample of `alive` proxies eligible for a T2 tunnel check through
@@ -929,10 +943,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stats.inserted, 2);
+        assert_eq!(stats.inserted_ids.len(), 2);
         assert_eq!(stats.updated, 0);
         for e in &entries {
             assert_eq!(status_of(&pool, e).await, ("unknown".into(), 0));
         }
+
+        // A refetch updates instead of inserting — no new ids are reported.
+        let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 2000)
+            .await
+            .unwrap();
+        assert_eq!(stats.updated, 2);
+        assert!(stats.inserted_ids.is_empty());
     }
 
     #[tokio::test]
@@ -1527,6 +1549,49 @@ mod tests {
         let due = select_due_quarantine(&pool, next, 100).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].stage(), QuarantineStage::Recheck15m);
+    }
+
+    #[tokio::test]
+    async fn t2_sample_offers_only_t1_passed_proxies() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let alive = entry("alive", "h1.example.com", 443);
+        let never_checked = entry("never", "h2.example.com", 443);
+        let quarantined = entry("quar", "h3.example.com", 443);
+        let removed = entry("gone", "h4.example.com", 443);
+        // tuic cannot pass T1 by design — even an "alive" one must not be
+        // offered to T2 (meow-rs cannot tunnel it, SPEC §8.5).
+        let mut alive_unprobeable = entry("tuic", "h5.example.com", 443);
+        alive_unprobeable.scheme = Scheme::Tuic;
+        let all = vec![
+            alive.clone(),
+            never_checked.clone(),
+            quarantined.clone(),
+            removed.clone(),
+            alive_unprobeable.clone(),
+        ];
+        reconcile_source(&pool, "srcA0000000", &all, &[], 1000)
+            .await
+            .unwrap();
+
+        for (proxy, status) in [
+            (&alive, "alive"),
+            (&never_checked, "unknown"),
+            (&quarantined, "quarantine"),
+            (&removed, "removed"),
+            (&alive_unprobeable, "alive"),
+        ] {
+            sqlx::query("UPDATE proxies SET status = ? WHERE fingerprint = ?")
+                .bind(status)
+                .bind(proxy.fingerprint())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let candidates = select_t2_candidates(&pool, 100).await.unwrap();
+        let hosts: Vec<&str> = candidates.iter().map(|row| row.host.as_str()).collect();
+        assert_eq!(hosts, vec!["h1.example.com"]);
     }
 
     #[tokio::test]

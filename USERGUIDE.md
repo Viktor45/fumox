@@ -498,6 +498,7 @@ form.
 | ---------------------------- | ------- | ----------------------------------------------------------------------------- |
 | `cycle_interval_secs`        | `60`    | Scheduling cycle period                                                       |
 | `sample_size`                | `50`    | Random sample of proxies checked per cycle (spreads load, no bursts)          |
+| `refresh_check_limit`        | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue) |
 | `fail_limit`                 | `3`     | Consecutive failures before quarantine                                        |
 | `connect_timeout_secs`       | `10`    | T1 TCP-connect timeout                                                        |
 | `tls_timeout_secs`           | `10`    | T1 TLS-handshake timeout                                                      |
@@ -568,16 +569,25 @@ The pipeline runs in a fixed order:
 ## 10. Health checks and proxy lifecycle
 
 The `fumox-probe` daemon runs an endless cycle (default: every 60 s), each
-cycle in three passes:
+cycle in four passes:
 
 1. **Quarantine dues** — second chances and recheck-ladder steps whose moment
    has arrived;
-2. **T1** — a random sample of direct TCP-connect (plus TLS handshake where
+2. **Priority queue** — freshly inserted proxies the server queued at source
+   refresh time (up to `[probe].refresh_check_limit` per refresh), drained
+   newest first, then removed from the queue before the checks run;
+3. **T1** — a random sample of direct TCP-connect (plus TLS handshake where
    the protocol implies TLS) checks over `unknown`/`alive` proxies;
-3. **T2** — real tunnel checks for `alive` proxies through meow-rs: the probe
+4. **T2** — real tunnel checks for `alive` proxies through meow-rs: the probe
    writes a Clash config with the batch, hot-reloads meow-rs via
    `PUT /configs`, then measures delay via `GET /proxies/{name}/delay` against
    `[meow].test_url`.
+
+The priority queue gives brand-new proxies a first check within one cycle of
+the source refresh instead of waiting out the random sample — with large
+pools that wait can otherwise stretch to hours or days. Unprobeable schemes
+are never queued (they could not be checked anyway), and a proxy that leaves
+`unknown` through the random path simply drops out of the queue.
 
 | Level            | What it proves                                               | Applies to                                  |
 | ---------------- | ------------------------------------------------------------ | ------------------------------------------- |

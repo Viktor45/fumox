@@ -130,14 +130,17 @@ async fn run(ctx: Arc<Context>) -> anyhow::Result<()> {
 }
 
 /// One scheduling cycle: quarantine dues first (they are time-sensitive),
-/// then the T1 sample, then the T2 batch.
+/// then the priority queue (fresh proxies, SPEC §8.3), then the T1 sample
+/// and the T2 batch.
 async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
     let now = now_ts();
     let quarantine = probe_due_quarantine(ctx.clone(), now).await?;
+    let queued_checked = probe_queued_checks(ctx.clone()).await?;
     let t1_checked = probe_t1_sample(ctx.clone()).await?;
     let t2_checked = probe_t2_batch(ctx).await?;
     tracing::info!(
         quarantine_checked = quarantine,
+        queued_checked,
         t1_checked,
         t2_checked,
         "probe cycle done"
@@ -149,13 +152,38 @@ async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
 // T1: random connectivity sample
 // ---------------------------------------------------------------------------
 
+/// Priority lane (SPEC §8.3): T1 checks the server enqueued at source
+/// refresh time for freshly inserted proxies. Drained newest first, capped
+/// by the same per-cycle quota as the random sample. Requests are claimed
+/// (deleted) up-front, so a mid-batch crash cannot turn them into an
+/// endless retry loop; anything not yet covered falls back to the random
+/// sample below.
+async fn probe_queued_checks(ctx: Arc<Context>) -> anyhow::Result<usize> {
+    let candidates =
+        probe_repo::select_queued_checks(&ctx.pool, ctx.config.probe.sample_size).await?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+    probe_repo::claim_checks(&ctx.pool, &ids).await?;
+    run_t1_checks(ctx, candidates).await
+}
+
 /// Probe a random sample of `unknown`/`alive` proxies (SPEC §8.3).
 async fn probe_t1_sample(ctx: Arc<Context>) -> anyhow::Result<usize> {
     let candidates = proxies::select_t1_candidates(&ctx.pool, ctx.config.probe.sample_size).await?;
     if candidates.is_empty() {
         return Ok(0);
     }
+    run_t1_checks(ctx, candidates).await
+}
 
+/// Run concurrent T1 checks for the candidates and apply each outcome to
+/// the lifecycle.
+async fn run_t1_checks(
+    ctx: Arc<Context>,
+    candidates: Vec<proxies::T1Candidate>,
+) -> anyhow::Result<usize> {
     let semaphore = Arc::new(Semaphore::new(ctx.config.probe.concurrency.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     for candidate in candidates {
@@ -527,6 +555,19 @@ async fn run_retention(ctx: &Context) {
         Ok(deleted) => tracing::info!(deleted, "rotated fetch_log"),
         Err(error) => tracing::warn!(%error, "fetch_log rotation failed"),
     }
+    // Priority queue housekeeping (SPEC §8.3): requests whose proxy already
+    // left `unknown`, and week-old leftovers from an offline probe.
+    match probe_repo::purge_settled_checks(&ctx.pool).await {
+        Ok(0) => {}
+        Ok(deleted) => tracing::debug!(deleted, "dropped settled probe_requests"),
+        Err(error) => tracing::warn!(%error, "probe_requests cleanup failed"),
+    }
+    let queue_cutoff = now - 7 * 86_400;
+    match probe_repo::purge_requests_before(&ctx.pool, queue_cutoff).await {
+        Ok(0) => {}
+        Ok(deleted) => tracing::info!(deleted, "rotated stale probe_requests"),
+        Err(error) => tracing::warn!(%error, "probe_requests rotation failed"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +679,7 @@ mod tests {
             probe: fumox_core::config::ProbeConfig {
                 cycle_interval_secs: 60,
                 sample_size: 50,
+                refresh_check_limit: 50,
                 fail_limit,
                 connect_timeout_secs: 2,
                 tls_timeout_secs: 2,

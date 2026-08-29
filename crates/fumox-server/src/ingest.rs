@@ -13,7 +13,7 @@ use crate::fetcher::{FetchFailure, FetchedPayload, Fetcher};
 use fumox_core::db::DbPool;
 use fumox_core::geo::GeoResolver;
 use fumox_core::models::{ProxyEntry, Source};
-use fumox_core::repo::{fetch_log, proxies, sources};
+use fumox_core::repo::{fetch_log, probe, proxies, sources};
 
 /// Outcome of one ingestion pass, for callers (scheduler, admin "refresh").
 #[derive(Debug)]
@@ -49,11 +49,17 @@ impl IngestOutcome {
 /// `proxies.geo_*` columns during reconciliation, so the admin panel's
 /// country filter and geo card work without waiting for a subscription
 /// render (SPEC §6).
+///
+/// Freshly inserted proxies are enqueued for priority probing (up to
+/// `refresh_check_limit`, SPEC §8.3): the probe drains the queue at the
+/// start of its next cycle, newest first, so new servers get verified
+/// instead of waiting out the random sample.
 pub async fn ingest_source(
     pool: &DbPool,
     fetcher: &Fetcher,
     caches: &Caches,
     geo: &GeoResolver,
+    refresh_check_limit: u32,
     source: &Source,
     force: bool,
 ) -> IngestOutcome {
@@ -90,6 +96,7 @@ pub async fn ingest_source(
             match proxies::reconcile_source(pool, &source.id, &entries, &geo_stamps, now).await {
                 Ok(stats) => {
                     journal_success(pool, source, &payload, found, now).await;
+                    enqueue_probe_requests(pool, &stats, refresh_check_limit, now).await;
                     IngestOutcome::Ok {
                         proxies_found: found,
                         stats,
@@ -167,6 +174,30 @@ pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome
             http_status: payload.http_status,
             message,
         },
+    }
+}
+
+/// Priority-check handoff (SPEC §8.3): enqueue up to `limit` of the pass's
+/// newly inserted proxies (repo-side filtering keeps only T1-probeable
+/// `unknown` rows). A failure is logged and never fails the ingest — the
+/// random sample covers those proxies anyway.
+async fn enqueue_probe_requests(
+    pool: &DbPool,
+    stats: &proxies::ReconciliationStats,
+    limit: u32,
+    now: i64,
+) {
+    if limit == 0 || stats.inserted_ids.is_empty() {
+        return;
+    }
+    match probe::enqueue_checks(pool, &stats.inserted_ids, limit, now).await {
+        Ok(0) => {}
+        Ok(queued) => {
+            tracing::debug!(queued, "new proxies queued for priority probing");
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to queue new proxies for probing");
+        }
     }
 }
 

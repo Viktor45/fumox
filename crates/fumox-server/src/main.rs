@@ -68,10 +68,13 @@ async fn main() -> anyhow::Result<()> {
     // the scheduler loop.
     let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tokio::spawn(scheduler::run(
-        pool.clone(),
-        fetcher.clone(),
-        caches.clone(),
-        geo.clone(),
+        scheduler::IngestEnv {
+            pool: pool.clone(),
+            fetcher: fetcher.clone(),
+            caches: caches.clone(),
+            geo: geo.clone(),
+            refresh_check_limit: config.probe.refresh_check_limit,
+        },
         scheduler_state.clone(),
         events.clone(),
         refresh_rx,

@@ -71,6 +71,7 @@ locales_dir = "locales"
 # Health-check daemon (SPEC §8).
 cycle_interval_secs = 600      # период цикла планирования / scheduling cycle period
 sample_size = 50              # случайная выборка прокси за цикл (без всплесков) / random proxy sample per cycle (no bursts)
+refresh_check_limit = 50      # новых unknown-прокси за обновление источника в приоритет-очередь (0 = выкл) / newly inserted unknown proxies per source refresh queued for priority checking (0 = off)
 fail_limit = 3                # неудач подряд до карантина / consecutive failures before quarantine
 connect_timeout_secs = 10     # T1: TCP-connect
 tls_timeout_secs = 10         # T1: TLS-handshake

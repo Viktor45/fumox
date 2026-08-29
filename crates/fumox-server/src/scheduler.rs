@@ -58,11 +58,14 @@ impl SchedulerState {
 
 /// Shared resources every ingestion task needs; cheap to clone per task.
 #[derive(Clone)]
-struct IngestEnv {
-    pool: DbPool,
-    fetcher: Fetcher,
-    caches: Caches,
-    geo: Arc<GeoResolver>,
+pub struct IngestEnv {
+    pub pool: DbPool,
+    pub fetcher: Fetcher,
+    pub caches: Caches,
+    pub geo: Arc<GeoResolver>,
+    /// `[probe].refresh_check_limit`: how many newly inserted proxies per
+    /// refresh are enqueued for priority probing (0 disables the queue).
+    pub refresh_check_limit: u32,
 }
 
 /// Run the scheduler until the process shuts down.
@@ -70,20 +73,11 @@ struct IngestEnv {
 /// `refresh_rx` carries source ids that must be refreshed immediately
 /// ("обновить сейчас" from the admin panel).
 pub async fn run(
-    pool: DbPool,
-    fetcher: Fetcher,
-    caches: Caches,
-    geo: Arc<GeoResolver>,
+    env: IngestEnv,
     state: SchedulerState,
     events: EventBus,
     mut refresh_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
-    let env = IngestEnv {
-        pool,
-        fetcher,
-        caches,
-        geo,
-    };
     let mut tick = tokio::time::interval(SWEEP_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -159,6 +153,7 @@ fn spawn_ingest(
             fetcher,
             caches,
             geo,
+            refresh_check_limit,
         } = env;
         if !state.acquire_source(&source_id).await {
             tracing::debug!(source = %source_id, "source already fetching; skipping");
@@ -172,7 +167,16 @@ fn spawn_ingest(
             Ok(permit) => permit,
             Err(_) => return, // semaphore closed during shutdown
         };
-        let outcome = ingest::ingest_source(&pool, &fetcher, &caches, &geo, &source, force).await;
+        let outcome = ingest::ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &geo,
+            refresh_check_limit,
+            &source,
+            force,
+        )
+        .await;
         drop(permit);
         state.release_source(&source_id).await;
         match outcome {

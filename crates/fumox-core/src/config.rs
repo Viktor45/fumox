@@ -828,4 +828,66 @@ probe_results_days = 7
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// The shipped `config/app.toml` is the full reference of every available
+    /// key at its default value (owner request 2026-08-30). Guard it against
+    /// rot: whenever a config struct gains a field, the file must gain the
+    /// key too, or this test fails. Values are intentionally not compared —
+    /// the file doubles as a working deployment config and may override them.
+    #[test]
+    fn shipped_app_toml_covers_every_key() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/app.toml");
+        if !path.is_file() {
+            return; // the reference file is not part of a sparse checkout
+        }
+
+        // Parsed standalone (no built-in defaults, no env) the file must
+        // deserialize into AppConfig on its own: `deny_unknown_fields`
+        // rejects typos here, missing keys would silently fall back.
+        let file = Figment::from(Toml::file(&path))
+            .extract::<AppConfig>()
+            .expect("config/app.toml must deserialize into AppConfig");
+
+        let mut file_keys = std::collections::BTreeSet::new();
+        leaf_paths("", &serde_json::to_value(&file).unwrap(), &mut file_keys);
+        let mut default_keys = std::collections::BTreeSet::new();
+        leaf_paths(
+            "",
+            &serde_json::to_value(AppConfig::default()).unwrap(),
+            &mut default_keys,
+        );
+
+        let missing: Vec<_> = default_keys.difference(&file_keys).collect();
+        assert!(
+            missing.is_empty(),
+            "config/app.toml is missing keys (add them at their default values): {missing:?}"
+        );
+    }
+
+    /// Flatten a JSON value into dotted leaf paths (`admin.rate_limit` etc.);
+    /// arrays count as one leaf so `meow.test_url` stays a single key.
+    fn leaf_paths(
+        prefix: &str,
+        value: &serde_json::Value,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.is_empty() {
+                    out.insert(prefix.to_string());
+                }
+                for (key, nested) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    leaf_paths(&path, nested, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
 }

@@ -1,12 +1,14 @@
 # Fumox — конфигурация приложения (SPEC §12, ADMIN_PLAN §2).
-# Все ключи имеют дефолты: файл можно урезать до нужных секций или вовсе
-# не создавать — сервис запустится «из коробки».
+# Файл перечисляет ВСЕ доступные ключи со значениями по умолчанию — правьте
+# только то, что нужно изменить. Каждый ключ имеет дефолт: файл можно урезать
+# до нужных секций или вовсе не создавать — сервис запустится «из коробки».
 # Переопределение через окружение: FUMOX_СЕКЦИЯ__КЛЮЧ, например
 # FUMOX_ADMIN__TOKEN=secret (двойное подчёркивание разделяет секции).
 #
 # Fumox — application configuration (SPEC §12, ADMIN_PLAN §2).
-# Every key has a default: the file may be trimmed down to the sections you
-# need or omitted entirely — the service runs out of the box.
+# The file lists EVERY available key at its default value — change only what
+# you need. Every key has a default: the file may be trimmed down to the
+# sections you need or omitted entirely — the service runs out of the box.
 # Environment overrides: FUMOX_SECTION__KEY, e.g. FUMOX_ADMIN__TOKEN=secret
 # (a double underscore separates the section from the key).
 
@@ -35,7 +37,12 @@ max_concurrency = 4             # семафор параллельных заг
 # retries apply only to recoverable error classes (network, http_server)
 max_retries = 2
 retry_base_backoff_ms = 500     # экспоненциальный backoff от этой базы / exponential backoff base for retries
-# user_agent = "fumox/0.1"     # переопределяется headers конкретного источника / overridden by per-source headers
+# Встроенный дефолт генерируется из версии бинарника (сейчас fumox/0.1.0):
+# удалите строку — подставится актуальная версия при сборке. headers
+# конкретного источника важнее этого значения.
+# The built-in default is derived from the binary version (fumox/0.1.0 now):
+# remove the line to inherit it at compile time. Per-source headers win.
+user_agent = "fumox/0.1.0"
 # Семейство протоколов по умолчанию для загрузки источников: any | ipv4 | ipv6.
 # Источник без своего ip_family наследует это значение. any — dual-stack:
 # первый IPv4-адрес, иначе IPv6. Выбранное семейство строгое: нет адреса
@@ -56,7 +63,7 @@ ip_family = "any"
 # db_dir on its own, provided the directory is writable.
 enabled = true
 db = "country"                # country | city | asn (по умолчанию Country / Country by default)
-db_dir = "data"             # каталог с GeoLite2-{Country,City,ASN}.mmdb / directory holding GeoLite2-{Country,City,ASN}.mmdb
+db_dir = "config"           # каталог с GeoLite2-{Country,City,ASN}.mmdb / directory holding GeoLite2-{Country,City,ASN}.mmdb
 cache_max_entries = 16384     # кэш host→geo (moka) / host→geo cache (moka)
 dns_timeout_secs = 5
 
@@ -79,7 +86,7 @@ locales_dir = "locales"
 [probe]
 # Демон проверки живучести (SPEC §8).
 # Health-check daemon (SPEC §8).
-cycle_interval_secs = 600      # период цикла планирования / scheduling cycle period
+cycle_interval_secs = 60       # период цикла планирования / scheduling cycle period
 sample_size = 50              # случайная выборка прокси за цикл (без всплесков) / random proxy sample per cycle (no bursts)
 refresh_check_limit = 50      # новых unknown-прокси за обновление источника в приоритет-очередь (0 = выкл) / newly inserted unknown proxies per source refresh queued for priority checking (0 = off)
 fail_limit = 3                # неудач подряд до карантина / consecutive failures before quarantine

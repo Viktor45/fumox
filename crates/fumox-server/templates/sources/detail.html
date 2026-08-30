@@ -70,9 +70,9 @@
           {% when None %}<span class="muted">—</span>
         {% endmatch %}
       </td></tr>
-      <tr><th>{{ self.t("common.created") }}</th><td class="small">{{ self.ts(source.created_at) }}</td></tr>
-      <tr><th>{{ self.t("common.updated") }}</th><td class="small">{{ self.ts(source.updated_at) }}</td></tr>
-      <tr><th>{{ self.t("dash.last_fetch") }}</th><td class="small">{{ self.opt_ts(source.last_fetched_at) }}</td></tr>
+      <tr><th>{{ self.t("common.created") }}</th><td class="small">{{ self.ts(source.created_at) | safe }}</td></tr>
+      <tr><th>{{ self.t("common.updated") }}</th><td class="small">{{ self.ts(source.updated_at) | safe }}</td></tr>
+      <tr><th>{{ self.t("dash.last_fetch") }}</th><td class="small">{{ self.opt_ts(source.last_fetched_at) | safe }}</td></tr>
       <tr><th>{{ self.t("src.last_error") }}</th><td class="small">
         {% match source.last_error %}
           {% when Some with (message) %}{{ message }}
@@ -123,7 +123,7 @@
         <tbody>
           {% for row in log %}
           <tr>
-            <td class="small muted">{{ self.ts(row.fetched_at) }}</td>
+            <td class="small muted">{{ self.ts(row.fetched_at) | safe }}</td>
             <td>
               {% if row.ok == 1 %}
                 <span class="badge alive">{{ self.t("common.ok") }}</span>

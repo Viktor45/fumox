@@ -1,6 +1,6 @@
 //! Probe overview screen and the SSE event stream (ADMIN_PLAN §4.5, §9).
 
-use super::{fmt_ts, server_error};
+use super::{fmt_opt_ts_element, fmt_ts_element, server_error};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::render_html;
@@ -65,10 +65,10 @@ struct ProbeTemplate {
 
 impl ProbeTemplate {
     fn ts(&self, ts: &i64) -> String {
-        fmt_ts(*ts)
+        fmt_ts_element(*ts)
     }
     fn opt_ts(&self, ts: &Option<i64>) -> String {
-        ts.map(fmt_ts).unwrap_or_else(|| "—".into())
+        fmt_opt_ts_element(*ts)
     }
     fn proxy_total(&self) -> i64 {
         self.proxy_counts.iter().map(|(_, count)| count).sum()
@@ -81,7 +81,7 @@ impl ProbeTemplate {
             .or(row.recheck_30m_at)
             .or(row.recheck_1h_at)
             .or(row.second_chance_at);
-        next.map(fmt_ts).unwrap_or_else(|| "—".into())
+        fmt_opt_ts_element(next)
     }
 }
 

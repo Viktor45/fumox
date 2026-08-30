@@ -69,7 +69,7 @@
           <td class="small truncate">{{ row.url }}</td>
           <td class="num">{{ row.proxies_count }}</td>
           <td class="num">{{ row.cache_ttl_seconds }}</td>
-          <td class="small muted">{{ self.ts(row.last_fetched_at) }}</td>
+          <td class="small muted">{{ self.ts(row.last_fetched_at) | safe }}</td>
           <td>
             {% if row.enabled %}
               <span class="badge on">{{ self.t("common.on") }}</span>

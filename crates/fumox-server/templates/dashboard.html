@@ -62,7 +62,7 @@
                 {% when None %}<span class="muted">—</span>
               {% endmatch %}
             </td>
-            <td class="small muted">{{ self.opt_ts(&row.last_fetched_at) }}</td>
+            <td class="small muted">{{ self.opt_ts(&row.last_fetched_at) | safe }}</td>
           </tr>
           {% endfor %}
         </tbody>
@@ -82,7 +82,7 @@
         <tbody>
           {% for row in recent_fetches %}
           <tr>
-            <td class="small muted">{{ self.ts(row.fetched_at) }}</td>
+            <td class="small muted">{{ self.ts(row.fetched_at) | safe }}</td>
             <td>
               {% match row.source_name %}
                 {% when Some with (name) %}<a href="/admin/sources/{{ row.source_id }}">{{ name }}</a>

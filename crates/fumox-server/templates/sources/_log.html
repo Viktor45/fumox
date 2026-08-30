@@ -9,7 +9,7 @@
     <tbody>
       {% for row in log %}
       <tr>
-        <td class="small muted">{{ self.ts(row.fetched_at) }}</td>
+        <td class="small muted">{{ self.ts(row.fetched_at) | safe }}</td>
         <td>
           {% if row.ok == 1 %}
             <span class="badge alive">{{ self.t("common.ok") }}</span>

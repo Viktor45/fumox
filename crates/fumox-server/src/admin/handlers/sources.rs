@@ -3,8 +3,8 @@
 //! toggle / "обновить сейчас" / delete actions.
 
 use super::{
-    FormMap, action_response, clamp_limit, fmt_bytes, fmt_ts, is_htmx, mask_secret, not_found,
-    pagination_pages, server_error,
+    FormMap, action_response, clamp_limit, fmt_bytes, fmt_opt_ts_element, fmt_ts_element, is_htmx,
+    mask_secret, not_found, pagination_pages, server_error,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -942,8 +942,19 @@ struct RefreshStatusFragment {
     lang: Lang,
     source_id: String,
     busy: bool,
-    done_message: Option<String>,
+    /// Unix timestamp of the completed fetch, rendered by the template as a
+    /// `<time>` element next to the `src.refresh_done` label; `None` while
+    /// busy or on error.
+    done_at: Option<i64>,
+    /// Escaped human-readable fetch error; `None` while busy or on success.
+    error_message: Option<String>,
     ok: bool,
+}
+
+impl RefreshStatusFragment {
+    fn ts(&self, ts: &i64) -> String {
+        fmt_ts_element(*ts)
+    }
 }
 
 impl_i18n!(RefreshStatusFragment);
@@ -955,19 +966,16 @@ pub async fn source_refresh_status(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let busy = state.scheduler.is_in_flight(&id).await;
-    let (done_message, ok) = if busy {
-        (None, true)
+    let (done_at, error_message, ok) = if busy {
+        (None, None, true)
     } else {
         let source = sources::get(&state.pool, &id).await.ok().flatten();
         match source {
-            Some(s) if s.error_class.is_none() && s.last_fetched_at.is_some() => (
-                Some(
-                    lang.t("src.refresh_done")
-                        .replace("{}", &fmt_ts(s.last_fetched_at.unwrap_or_default())),
-                ),
-                true,
-            ),
+            Some(s) if s.error_class.is_none() && s.last_fetched_at.is_some() => {
+                (s.last_fetched_at, None, true)
+            }
             Some(s) => (
+                None,
                 Some(
                     lang.t("src.refresh_error").replace(
                         "{}",
@@ -978,7 +986,7 @@ pub async fn source_refresh_status(
                 ),
                 false,
             ),
-            None => (Some(lang.t("err.source_not_found").into()), false),
+            None => (None, Some(lang.t("err.source_not_found").into()), false),
         }
     };
     render_html(
@@ -987,7 +995,8 @@ pub async fn source_refresh_status(
             lang,
             source_id: id,
             busy,
-            done_message,
+            done_at,
+            error_message,
             ok,
         },
         StatusCode::OK,
@@ -1006,7 +1015,8 @@ pub async fn source_delete(
         Err(err) => return server_error(lang, &err),
     }
     // Orphaned proxies (no remaining links) transition to `removed`;
-    // they resurrect automatically if seen again (ADMIN_PLAN §13.1 п.9).
+    // reconciliation never resets it — a proxy that reappears in a fetch
+    // keeps its state (ADMIN_PLAN §13.1, decisions 9 and 23).
     match proxies::mark_orphans_removed(&state.pool).await {
         Ok(orphans) if orphans > 0 => {
             tracing::info!(orphans, "orphaned proxies marked removed");
@@ -1115,7 +1125,7 @@ pub async fn source_dry_run(
 // askama passes call arguments by reference, so every helper takes &T.
 impl SourcesListTemplate {
     fn ts(&self, ts: &Option<i64>) -> String {
-        ts.map(fmt_ts).unwrap_or_else(|| "—".into())
+        fmt_opt_ts_element(*ts)
     }
     fn tag_selected(&self, tag: &str) -> bool {
         self.f_tag == tag
@@ -1124,10 +1134,10 @@ impl SourcesListTemplate {
 
 impl SourceDetailTemplate {
     fn ts(&self, ts: &i64) -> String {
-        fmt_ts(*ts)
+        fmt_ts_element(*ts)
     }
     fn opt_ts(&self, ts: &Option<i64>) -> String {
-        ts.map(fmt_ts).unwrap_or_else(|| "—".into())
+        fmt_opt_ts_element(*ts)
     }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|n| fmt_bytes(&self.lang, n))
@@ -1137,7 +1147,7 @@ impl SourceDetailTemplate {
 
 impl SourceLogFragment {
     fn ts(&self, ts: &i64) -> String {
-        fmt_ts(*ts)
+        fmt_ts_element(*ts)
     }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|n| fmt_bytes(&self.lang, n))

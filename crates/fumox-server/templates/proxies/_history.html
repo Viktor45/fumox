@@ -10,7 +10,7 @@
     <tbody>
       {% for probe in probes %}
       <tr>
-        <td class="small muted">{{ self.ts(probe.checked_at) }}</td>
+        <td class="small muted">{{ self.ts(probe.checked_at) | safe }}</td>
         <td>
           {% if probe.ok == 1 %}<span class="badge alive">{{ self.t("common.ok") }}</span>{% else %}<span class="badge error">{{ self.t("common.fail") }}</span>{% endif %}
         </td>

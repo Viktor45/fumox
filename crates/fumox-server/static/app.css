@@ -218,6 +218,10 @@ table.data tr:hover td { background: var(--row-hover); }
 table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Local-time timestamps (base.html rewrites <time class="ts"> into the
+   user's timezone): keep date and time on one line, never mid-cell wrap. */
+time.ts { white-space: nowrap; }
+
 /* ---------- badges ---------- */
 
 .badge {

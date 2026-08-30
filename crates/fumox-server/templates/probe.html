@@ -26,7 +26,7 @@
           <div class="num"><span class="badge error">{{ self.t("probe.dead") }}</span></div>
         {% endif %}
         <div class="label">{{ self.t("probe.daemon") }}</div>
-        <div class="sub">heartbeat: {{ self.ts(hb.ts) }} · pid {{ hb.pid }} · v{{ hb.version }}</div>
+        <div class="sub">heartbeat: {{ self.ts(hb.ts) | safe }} · pid {{ hb.pid }} · v{{ hb.version }}</div>
       {% when None %}
         <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>
         <div class="label">{{ self.t("probe.daemon") }}</div>
@@ -38,7 +38,7 @@
       {% when Some with (ts) %}
         <div class="num"><span class="badge alive">{{ self.t("probe.available") }}</span></div>
         <div class="label">meow-rs (T2)</div>
-        <div class="sub">{{ self.t("probe.last_contact").replace("{}", &self.ts(ts)) }}</div>
+        <div class="sub">{{ self.t("probe.last_contact") }} {{ self.ts(ts) | safe }}</div>
       {% when None %}
         <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>
         <div class="label">meow-rs (T2)</div>
@@ -70,12 +70,12 @@
           <td><a href="/admin/proxies/{{ row.id }}">{{ row.name }}</a>
               <span class="small muted">{{ row.host }}:{{ row.port }}</span></td>
           <td class="mono small">{{ row.scheme }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.quarantined_at) }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.second_chance_at) }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.recheck_15m_at) }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.recheck_30m_at) }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.recheck_1h_at) }}</td>
-          <td class="small">{{ self.next_check(&row) }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.quarantined_at) | safe }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.second_chance_at) | safe }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.recheck_15m_at) | safe }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.recheck_30m_at) | safe }}</td>
+          <td class="small muted">{{ self.opt_ts(&row.recheck_1h_at) | safe }}</td>
+          <td class="small">{{ self.next_check(&row) | safe }}</td>
         </tr>
         {% endfor %}
       </tbody>

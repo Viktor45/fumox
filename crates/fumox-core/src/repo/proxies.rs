@@ -3,13 +3,14 @@
 //! Reconciliation runs after every successful source fetch (DATABASE.md
 //! «Reconciliation»):
 //!
-//! 1. every parsed entry is upserted by `fingerprint` — existing rows keep
-//!    their probe state, mutable fields (name, params, raw_line) refresh;
-//! 2. a proxy previously `removed` or `quarantine` that reappears in a live
-//!    source is **resurrected**: `status='unknown'`, `fail_count=0`, all
-//!    quarantine fields and `removed_at` cleared;
-//! 3. `proxy_source_links.seen_at` is stamped for every proxy still present;
-//! 4. links of this source not stamped by the fetch are deleted; a proxy
+//! 1. every parsed entry is upserted by `fingerprint` — mutable fields (name,
+//!    params, raw_line, geo) refresh, but the lifecycle state is never
+//!    touched: `status`, `fail_count` and the quarantine fields are owned by
+//!    the probe state machine, and a reappearing `removed`/`quarantine`
+//!    proxy keeps them (owner decision 2026-08-31, superseding the DATABASE
+//!    v0.4 resurrection rule);
+//! 2. `proxy_source_links.seen_at` is stamped for every proxy still present;
+//! 3. links of this source not stamped by the fetch are deleted; a proxy
 //!    with no remaining links is marked `removed`.
 
 use crate::db::DbPool;
@@ -54,7 +55,6 @@ impl GeoStamp {
 pub struct ReconciliationStats {
     pub inserted: usize,
     pub updated: usize,
-    pub resurrected: usize,
     pub unlinked: usize,
     pub removed: usize,
     /// Ids of the rows inserted by this pass (a superset of what the caller
@@ -148,25 +148,24 @@ pub async fn reconcile_source(
     let mut stats = ReconciliationStats::default();
     let mut tx = pool.begin().await?;
 
-    // Pre-existing fingerprints with their current status, for stats and
-    // resurrection accounting.
+    // Pre-existing fingerprints, for insert/update accounting.
     let fingerprints: Vec<String> = entries.iter().map(ProxyEntry::fingerprint).collect();
-    let mut existing: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
     for chunk in fingerprints.chunks(500) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
-        let sql = format!(
-            "SELECT fingerprint, status FROM proxies WHERE fingerprint IN ({placeholders})"
-        );
-        let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+        let sql = format!("SELECT fingerprint FROM proxies WHERE fingerprint IN ({placeholders})");
+        let mut query = sqlx::query_as::<_, (String,)>(&sql);
         for fp in chunk {
             query = query.bind(fp);
         }
-        let rows: Vec<(String, String)> = query.fetch_all(&mut *tx).await?;
-        existing.extend(rows);
+        let rows: Vec<(String,)> = query.fetch_all(&mut *tx).await?;
+        existing.extend(rows.into_iter().map(|(fp,)| fp));
     }
 
-    // Upsert each entry; the ON CONFLICT branch implements the resurrection
-    // rule atomically with the refresh of mutable fields.
+    // Upsert each entry; the ON CONFLICT branch refreshes the mutable
+    // identity fields only. Lifecycle fields (status, fail_count, quarantine
+    // schedules, removed_at) are deliberately absent: the probe state
+    // machine is their sole owner, and a reappearing proxy keeps its state.
     let mut proxy_ids: Vec<i64> = Vec::with_capacity(entries.len());
     let mut seen_in_batch: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (idx, (entry, fingerprint)) in entries.iter().zip(&fingerprints).enumerate() {
@@ -193,23 +192,7 @@ pub async fn reconcile_source(
                 geo_country = COALESCE(excluded.geo_country, proxies.geo_country),
                 geo_city = COALESCE(excluded.geo_city, proxies.geo_city),
                 geo_asn = COALESCE(excluded.geo_asn, proxies.geo_asn),
-                updated_at = excluded.updated_at,
-                status = CASE WHEN proxies.status IN ('removed', 'quarantine')
-                              THEN 'unknown' ELSE proxies.status END,
-                fail_count = CASE WHEN proxies.status IN ('removed', 'quarantine')
-                                  THEN 0 ELSE proxies.fail_count END,
-                quarantined_at = CASE WHEN proxies.status IN ('removed', 'quarantine')
-                                      THEN NULL ELSE proxies.quarantined_at END,
-                second_chance_at = CASE WHEN proxies.status IN ('removed', 'quarantine')
-                                        THEN NULL ELSE proxies.second_chance_at END,
-                recheck_15m_at = CASE WHEN proxies.status IN ('removed', 'quarantine')
-                                      THEN NULL ELSE proxies.recheck_15m_at END,
-                recheck_30m_at = CASE WHEN proxies.status IN ('removed', 'quarantine')
-                                      THEN NULL ELSE proxies.recheck_30m_at END,
-                recheck_1h_at = CASE WHEN proxies.status IN ('removed', 'quarantine')
-                                     THEN NULL ELSE proxies.recheck_1h_at END,
-                removed_at = CASE WHEN proxies.status IN ('removed', 'quarantine')
-                                  THEN NULL ELSE proxies.removed_at END
+                updated_at = excluded.updated_at
              RETURNING id",
         )
         .bind(fingerprint)
@@ -231,19 +214,13 @@ pub async fn reconcile_source(
         proxy_ids.push(id);
         // A fingerprint already in the DB, or already upserted earlier in
         // this same batch, counts as an update.
-        if existing.contains_key(fingerprint.as_str())
-            || !seen_in_batch.insert(fingerprint.as_str())
-        {
+        if existing.contains(fingerprint.as_str()) || !seen_in_batch.insert(fingerprint.as_str()) {
             stats.updated += 1;
         } else {
             stats.inserted += 1;
             stats.inserted_ids.push(id);
         }
     }
-    stats.resurrected = existing
-        .values()
-        .filter(|status| status.as_str() == "removed" || status.as_str() == "quarantine")
-        .count();
 
     // Stamp the links of everything still present in this source.
     for id in &proxy_ids {
@@ -517,8 +494,10 @@ pub async fn count_by_status_for_source(
 
 /// Mark proxies that lost their last source link as `removed`
 /// (ADMIN_PLAN §13.1 decision 9: deleting a source is soft — orphaned
-/// proxies are not physically deleted, they transition to `removed` and can
-/// be resurrected if they reappear in another fetch). Returns how many
+/// proxies are not physically deleted, they transition to `removed`.
+/// `removed` is terminal for reconciliation: a proxy that reappears in a
+/// fetch keeps its state — the ways back are the admin "reset status"
+/// action or purge removed followed by a re-insert). Returns how many
 /// proxies were affected.
 pub async fn mark_orphans_removed(pool: &DbPool) -> crate::Result<u64> {
     let result = sqlx::query(
@@ -726,9 +705,9 @@ pub async fn select_due_quarantine(
 /// resets it only when the last failed attempt was not a T2 one (the caller
 /// asks [`crate::repo::probe::last_failed_kind`]).
 ///
-/// `status != 'removed'` keeps a success from reviving a proxy the server
-/// has already reconciled away: `removed` is terminal until some source
-/// re-ingests the proxy (resurrection belongs to reconciliation only).
+/// `status != 'removed'` keeps a success from reviving a removed proxy:
+/// `removed` is terminal — only the admin "reset status" action (or purge
+/// removed followed by a re-insert from a fetch) returns a proxy to service.
 pub async fn check_succeeded(
     pool: &DbPool,
     id: i64,
@@ -1073,7 +1052,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resurrection_from_removed() {
+    async fn reappearing_removed_proxy_stays_removed() {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("x", "h1.example.com", 443);
@@ -1085,24 +1064,26 @@ mod tests {
             .unwrap();
         assert_eq!(status_of(&pool, &e).await.0, "removed");
 
-        // Reappearing in a live source resets the lifecycle.
+        // Reappearing in a live source does NOT reset the lifecycle
+        // (owner decision 2026-08-31): `removed` is terminal for
+        // reconciliation; only mutable fields refresh.
         let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 3000)
             .await
             .unwrap();
-        assert_eq!(stats.resurrected, 1);
+        assert_eq!(stats.updated, 1);
         let (status, fail_count) = status_of(&pool, &e).await;
-        assert_eq!(status, "unknown");
+        assert_eq!(status, "removed");
         assert_eq!(fail_count, 0);
         let row = get_by_fingerprint(&pool, &e.fingerprint())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.removed_at, None);
+        assert_eq!(row.removed_at, Some(2000));
         assert_eq!(row.quarantined_at, None);
     }
 
     #[tokio::test]
-    async fn resurrection_from_quarantine_clears_ladder() {
+    async fn reappearing_quarantined_proxy_keeps_ladder() {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("x", "h1.example.com", 443);
@@ -1122,18 +1103,19 @@ mod tests {
         .await
         .unwrap();
 
-        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 2000)
+        // Reappearance must not touch the state machine: the quarantine
+        // ladder keeps running on its stored schedule.
+        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 2000)
             .await
             .unwrap();
-        assert_eq!(stats.resurrected, 1);
         let row = get_by_fingerprint(&pool, &fp).await.unwrap().unwrap();
-        assert_eq!(row.status, "unknown");
-        assert_eq!(row.fail_count, 0);
-        assert_eq!(row.quarantined_at, None);
-        assert_eq!(row.second_chance_at, None);
-        assert_eq!(row.recheck_15m_at, None);
-        assert_eq!(row.recheck_30m_at, None);
-        assert_eq!(row.recheck_1h_at, None);
+        assert_eq!(row.status, "quarantine");
+        assert_eq!(row.fail_count, 3);
+        assert_eq!(row.quarantined_at, Some(1500));
+        assert_eq!(row.second_chance_at, Some(9000));
+        assert_eq!(row.recheck_15m_at, Some(2400));
+        assert_eq!(row.recheck_30m_at, Some(3300));
+        assert_eq!(row.recheck_1h_at, Some(5100));
     }
 
     #[tokio::test]

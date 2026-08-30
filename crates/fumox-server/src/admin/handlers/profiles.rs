@@ -609,7 +609,7 @@ struct ProfileDetailTemplate {
 
 impl ProfileDetailTemplate {
     fn ts(&self, ts: &i64) -> String {
-        super::fmt_ts(*ts)
+        super::fmt_ts_element(*ts)
     }
 }
 

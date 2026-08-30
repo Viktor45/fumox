@@ -4,8 +4,8 @@
 //! manual "reset status" action (ADMIN_PLAN §8).
 
 use super::{
-    FormMap, action_response, clamp_limit, flag_for, fmt_ts, is_htmx, mask_secret, not_found,
-    pagination_pages, server_error,
+    FormMap, action_response, clamp_limit, flag_for, fmt_opt_ts_element, fmt_ts_element, is_htmx,
+    mask_secret, not_found, pagination_pages, server_error,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -321,7 +321,7 @@ struct ProxyDetailTemplate {
 
 impl ProxyDetailTemplate {
     fn ts(&self, ts: &i64) -> String {
-        fmt_ts(*ts)
+        fmt_ts_element(*ts)
     }
     fn flag(&self, country: &Option<String>) -> String {
         flag_for(country)
@@ -368,63 +368,51 @@ pub async fn proxy_detail(
         mask_secret(&proxy.credential)
     };
 
+    // Every value is server-generated (statuses, counters, timestamps,
+    // numbers) — the template renders them with askama's `| safe` so the
+    // timestamp entries can carry their `<time>` elements.
     let lifecycle: Vec<(String, String)> = vec![
         (lang.t("common.status").into(), proxy.status.clone()),
         (lang.t("px.fail_count").into(), proxy.fail_count.to_string()),
-        (lang.t("common.created").into(), fmt_ts(proxy.created_at)),
-        (lang.t("common.updated").into(), fmt_ts(proxy.updated_at)),
+        (
+            lang.t("common.created").into(),
+            fmt_ts_element(proxy.created_at),
+        ),
+        (
+            lang.t("common.updated").into(),
+            fmt_ts_element(proxy.updated_at),
+        ),
         (
             lang.t("px.last_check").into(),
-            proxy
-                .last_checked_at
-                .map(fmt_ts)
-                .unwrap_or_else(|| "—".into()),
+            fmt_opt_ts_element(proxy.last_checked_at),
         ),
         (
             lang.t("px.last_success").into(),
-            proxy
-                .last_alive_at
-                .map(fmt_ts)
-                .unwrap_or_else(|| "—".into()),
+            fmt_opt_ts_element(proxy.last_alive_at),
         ),
         (
             lang.t("px.quarantined_since").into(),
-            proxy
-                .quarantined_at
-                .map(fmt_ts)
-                .unwrap_or_else(|| "—".into()),
+            fmt_opt_ts_element(proxy.quarantined_at),
         ),
         (
             lang.t("px.second_chance").into(),
-            proxy
-                .second_chance_at
-                .map(fmt_ts)
-                .unwrap_or_else(|| "—".into()),
+            fmt_opt_ts_element(proxy.second_chance_at),
         ),
         (
             lang.t("px.recheck_15m").into(),
-            proxy
-                .recheck_15m_at
-                .map(fmt_ts)
-                .unwrap_or_else(|| "—".into()),
+            fmt_opt_ts_element(proxy.recheck_15m_at),
         ),
         (
             lang.t("px.recheck_30m").into(),
-            proxy
-                .recheck_30m_at
-                .map(fmt_ts)
-                .unwrap_or_else(|| "—".into()),
+            fmt_opt_ts_element(proxy.recheck_30m_at),
         ),
         (
             lang.t("px.recheck_1h").into(),
-            proxy
-                .recheck_1h_at
-                .map(fmt_ts)
-                .unwrap_or_else(|| "—".into()),
+            fmt_opt_ts_element(proxy.recheck_1h_at),
         ),
         (
             lang.t("px.removed").into(),
-            proxy.removed_at.map(fmt_ts).unwrap_or_else(|| "—".into()),
+            fmt_opt_ts_element(proxy.removed_at),
         ),
         (
             lang.t("common.latency").into(),
@@ -504,7 +492,7 @@ struct ProbeHistoryFragment {
 
 impl ProbeHistoryFragment {
     fn ts(&self, ts: &i64) -> String {
-        fmt_ts(*ts)
+        fmt_ts_element(*ts)
     }
 }
 

@@ -29,6 +29,7 @@ If you only have five minutes, read sections [1](#1-what-is-fumox),
   - [7. The admin panel](#7-the-admin-panel)
     - [Signing in](#signing-in)
     - [What's inside](#whats-inside)
+    - [Times and timezones](#times-and-timezones)
     - [Import and export](#import-and-export)
     - [Languages and themes](#languages-and-themes)
   - [8. Configuration reference](#8-configuration-reference)
@@ -121,8 +122,9 @@ background (stale-while-revalidate).
 
 **The background loop.** Independently of requests, `fumox-server` runs a
 scheduler that periodically re-fetches every enabled source, reconciles the
-parsed proxies with the database (new → insert, gone → mark removed, reappeared
-→ resurrect), and journals every fetch. Meanwhile `fumox-probe` samples proxies
+parsed proxies with the database (new → insert, gone → mark removed,
+reappeared → refresh identity fields only), and journals every fetch.
+Meanwhile `fumox-probe` samples proxies
 and updates their health status, which the health filter then uses.
 
 Two network listeners are involved, on purpose separated:
@@ -431,6 +433,15 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 | **Probe**           | Health-check daemon status: heartbeat, meow-rs status, quarantine queue with scheduled second chances                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
 
+### Times and timezones
+
+Every timestamp shown in the panel — fetch log, probe history, proxy
+lifecycle, quarantine queue — is rendered in **your browser's timezone**,
+formatted according to the interface language. Hover over a timestamp to see
+the original UTC instant and the timezone name. With JavaScript disabled the
+UTC text (`YYYY-MM-DD HH:MM:SS`) is displayed instead. Stored data, exports
+and server logs always remain UTC.
+
 ### Import and export
 
 *Export* downloads all sources and profiles (with profile composition, headers
@@ -666,7 +677,6 @@ stateDiagram-v2
     alive --> quarantine : fail_limit consecutive failures
     quarantine --> alive : second chance succeeds
     quarantine --> removed : second chance fails, then 3 rechecks fail
-    removed --> unknown : proxy reappears in a source (resurrection)
 ```
 
 The rules in plain language:
@@ -687,8 +697,10 @@ The rules in plain language:
   +15 min, +30 min and +1 hour. Any success → `alive`. All three fail →
   `removed`.
 - **Removed is not deleted.** Removed proxies stay in the database (purge them
-  from the admin panel if you want). If a removed proxy shows up in a source
-  again, it is resurrected with status `unknown` and a clean slate.
+  from the admin panel if you want). A removed proxy is terminal: if a source
+  lists it again, its state is *not* reset — reconciliation never touches the
+  state machine (only the probe does). Ways back: *Reset status* on the proxy
+  card, or *Purge removed* followed by the next fetch inserting it as new.
 
 If meow-rs is down, T2 doesn't spam it: the probe backs off exponentially
 (60 s → doubling → capped at 15 min), and proxy statuses are left untouched —
@@ -766,7 +778,8 @@ stored.
   removed* in the admin panel.
 - **Configuration backup.** Use the admin panel's *Export* — it captures all
   sources and profiles in a JSON file you can import on another instance.
-- **Timestamps** everywhere are Unix epoch seconds, UTC.
+- **Timestamps** everywhere are Unix epoch seconds, UTC; the admin panel
+  displays them in your browser's timezone (see *Times and timezones*).
 
 ## 13. Running in production — checklist
 

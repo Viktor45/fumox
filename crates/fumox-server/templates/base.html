@@ -95,6 +95,44 @@
         if (el && window.htmx) window.htmx.trigger(el, 'fumox:refresh');
       });
     })();
+
+    // Local time (ADMIN_PLAN §13.1, decision 22): the server emits every
+    // timestamp as <time class="ts" datetime="RFC3339 UTC">UTC text</time>.
+    // The browser rewrites the text into the user's timezone, formatted in
+    // the panel language (<html lang>) — without JS the UTC text stays.
+    // Re-run after every HTMX swap: fragments carry <time> elements too.
+    // Idempotent: the text is always rebuilt from the datetime attribute.
+    (function () {
+      function localize(root) {
+        if (!root.querySelectorAll) return;
+        var lang = document.documentElement.lang || undefined;
+        var fmt;
+        try {
+          fmt = new Intl.DateTimeFormat(lang, {
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit'
+          });
+        } catch (_) { return; }
+        var zone = '';
+        try {
+          zone = ' (' + (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC') + ')';
+        } catch (_) {}
+        root.querySelectorAll('time.ts').forEach(function (el) {
+          var attr = el.getAttribute('datetime');
+          if (!attr) return;
+          var stamp = new Date(attr);
+          if (isNaN(stamp)) return;
+          var local = fmt.format(stamp);
+          el.textContent = local;
+          // Language-neutral tooltip: the original UTC instant and the zone used.
+          el.title = attr + ' → ' + local + zone;
+        });
+      }
+      localize(document);
+      document.body.addEventListener('htmx:afterSettle', function () {
+        localize(document);
+      });
+    })();
   </script>
 </body>
 </html>

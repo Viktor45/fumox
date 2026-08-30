@@ -15,7 +15,11 @@
   {% else %}
     <span class="badge error">{{ self.t("common.error") }}</span>
   {% endif %}
-  {% match done_message %}
+  {% match done_at %}
+    {% when Some with (ts) %} <span class="small">{{ self.t("src.refresh_done") }} {{ self.ts(&ts) | safe }}</span>
+    {% when None %}
+  {% endmatch %}
+  {% match error_message %}
     {% when Some with (message) %} <span class="small">{{ message }}</span>
     {% when None %}
   {% endmatch %}

@@ -73,10 +73,10 @@ struct RecentFetch {
 // call arguments by reference, so every helper takes &T.
 impl DashboardTemplate {
     fn ts(&self, ts: &i64) -> String {
-        fmt_ts(*ts)
+        fmt_ts_element(*ts)
     }
     fn opt_ts(&self, ts: &Option<i64>) -> String {
-        ts.map(fmt_ts).unwrap_or_else(|| "—".into())
+        fmt_opt_ts_element(*ts)
     }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|n| fmt_bytes(&self.lang, n))
@@ -181,7 +181,8 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (ADMIN_PLAN §13.17).
+/// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (ADMIN_PLAN §13.1,
+/// decision 17). This text is the no-JS fallback inside [`fmt_ts_element`].
 pub fn fmt_ts(ts: i64) -> String {
     const FMT: &[time::format_description::FormatItem<'static>] =
         time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
@@ -189,6 +190,38 @@ pub fn fmt_ts(ts: i64) -> String {
         Ok(dt) => dt.format(FMT).unwrap_or_else(|_| ts.to_string()),
         Err(_) => ts.to_string(),
     }
+}
+
+/// RFC 3339 UTC form for the `datetime` attribute of a `<time>` element.
+fn fmt_ts_attr(ts: i64) -> String {
+    const FMT: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+    match time::OffsetDateTime::from_unix_timestamp(ts) {
+        Ok(dt) => dt.format(FMT).unwrap_or_else(|_| ts.to_string()),
+        Err(_) => ts.to_string(),
+    }
+}
+
+/// Render a Unix timestamp as a `<time class="ts">` element (ADMIN_PLAN
+/// §13.1, decision 22): the `datetime` attribute carries the UTC instant in
+/// RFC 3339 form, the text keeps the UTC `YYYY-MM-DD HH:MM:SS` fallback. The
+/// admin JS (base.html) rewrites the text into the user's timezone and
+/// re-runs after every HTMX swap; without JS the UTC text stays readable.
+/// The output is HTML — templates must render it through askama's `| safe`.
+/// Only server-generated digits and punctuation are interpolated, so it is
+/// safe to trust.
+pub fn fmt_ts_element(ts: i64) -> String {
+    format!(
+        "<time class=\"ts\" datetime=\"{}\">{}</time>",
+        fmt_ts_attr(ts),
+        fmt_ts(ts)
+    )
+}
+
+/// [`fmt_ts_element`] for optional timestamps; `None` renders the em dash
+/// used across the admin tables (plain text, no element).
+pub fn fmt_opt_ts_element(ts: Option<i64>) -> String {
+    ts.map(fmt_ts_element).unwrap_or_else(|| "—".into())
 }
 
 /// Human-readable byte size for fetch logs (units follow the UI language).
@@ -340,6 +373,28 @@ pub async fn all_sources_for_selects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_ts_element_carries_utc_datetime_and_fallback_text() {
+        // 1_700_000_000 == 2023-11-14 22:13:20 UTC.
+        let html = fmt_ts_element(1_700_000_000);
+        assert_eq!(
+            html,
+            "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
+        );
+
+        assert_eq!(fmt_opt_ts_element(None), "—");
+        assert_eq!(
+            fmt_opt_ts_element(Some(1_700_000_000)),
+            "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
+        );
+
+        // Out-of-range timestamps fall back to the raw number in both forms.
+        assert_eq!(
+            fmt_ts_element(i64::MAX),
+            format!("<time class=\"ts\" datetime=\"{0}\">{0}</time>", i64::MAX)
+        );
+    }
 
     #[test]
     fn toast_header_is_ascii_and_decodes_to_the_message() {

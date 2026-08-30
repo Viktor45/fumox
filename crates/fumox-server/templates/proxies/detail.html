@@ -69,8 +69,10 @@
   <div class="panel">
     <h2>{{ self.t("px.lifecycle") }}</h2>
     <table class="kv">
+      {#- Every lifecycle value is server-generated (statuses, counters,
+          `<time>` timestamps, numbers) — hence `| safe`. -#}
       {% for (label, value) in lifecycle %}
-        <tr><th>{{ label }}</th><td class="small">{{ value }}</td></tr>
+        <tr><th>{{ label }}</th><td class="small">{{ value | safe }}</td></tr>
       {% endfor %}
     </table>
   </div>
@@ -112,7 +114,7 @@
                 {% when None %}<span class="muted">{{ link.source_id }}</span>
               {% endmatch %}
             </td>
-            <td class="small muted">{{ self.ts(link.seen_at) }}</td>
+            <td class="small muted">{{ self.ts(link.seen_at) | safe }}</td>
           </tr>
           {% endfor %}
         </tbody>

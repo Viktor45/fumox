@@ -936,6 +936,12 @@ mod tests {
         assert!(html.contains("4242")); // pid from the heartbeat
         assert!(html.contains("sick-proxy")); // quarantine queue row
         assert!(html.contains("q.example.com"));
+        // Every timestamp renders as a <time> element: RFC 3339 UTC in the
+        // datetime attribute, the UTC text as the no-JS fallback (the admin
+        // JS in base.html rewrites it into the user's timezone).
+        assert!(html.contains("<time class=\"ts\" datetime=\""), "{html}");
+        assert!(html.contains("Z\">"), "{html}");
+        assert!(html.contains("</time>"), "{html}");
     }
 
     #[tokio::test]

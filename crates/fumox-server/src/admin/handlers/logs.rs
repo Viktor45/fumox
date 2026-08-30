@@ -3,7 +3,7 @@
 //! Probe history intentionally has no page of its own — it lives on the
 //! proxy card.
 
-use super::{FormMap, clamp_limit, fmt_bytes, fmt_ts, pagination_pages, server_error};
+use super::{FormMap, clamp_limit, fmt_bytes, fmt_ts_element, pagination_pages, server_error};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::render_html;
@@ -46,7 +46,7 @@ struct FetchLogsTemplate {
 
 impl FetchLogsTemplate {
     fn ts(&self, ts: &i64) -> String {
-        fmt_ts(*ts)
+        fmt_ts_element(*ts)
     }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|bytes| fmt_bytes(&self.lang, bytes))

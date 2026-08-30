@@ -34,8 +34,8 @@
       <tr><th>{{ self.t("prof.token_label") }}</th><td class="mono small">{{ token_display }}</td></tr>
       <tr><th>{{ self.t("prof.output_format") }}</th><td class="mono small">{{ profile.output_format.as_str() }}</td></tr>
       <tr><th>{{ self.t("prof.countries_label") }}</th><td class="mono small">{{ countries_display }}</td></tr>
-      <tr><th>{{ self.t("common.created") }}</th><td class="small">{{ self.ts(profile.created_at) }}</td></tr>
-      <tr><th>{{ self.t("common.updated") }}</th><td class="small">{{ self.ts(profile.updated_at) }}</td></tr>
+      <tr><th>{{ self.t("common.created") }}</th><td class="small">{{ self.ts(profile.created_at) | safe }}</td></tr>
+      <tr><th>{{ self.t("common.updated") }}</th><td class="small">{{ self.ts(profile.updated_at) | safe }}</td></tr>
     </table>
 
     {% if !pipeline_display.is_empty() %}

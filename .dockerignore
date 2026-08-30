@@ -1,6 +1,16 @@
-# VCS / CI — not needed inside the build context
+# VCS / CI / deployment plumbing — not needed inside the build context
 .git
 .github
+.dockerignore
+Dockerfile
+docker
+scripts
+
+# Local secrets and agent workspace notes
+.env
+.env.example
+.agents
+.zcode
 
 # Local build artifacts and databases
 target
@@ -21,7 +31,3 @@ config
 .DS_Store
 .idea
 .vscode
-
-# Docker files themselves
-Dockerfile
-.dockerignore

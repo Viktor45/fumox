@@ -34,17 +34,22 @@ services:
     command: ["fumox-server"]
     environment:
       FUMOX_ADMIN__TOKEN: ${FUMOX_ADMIN__TOKEN:?set FUMOX_ADMIN__TOKEN in .env}
-      FUMOX_GEO__DB_DIR: /app/data
+      FUMOX_GEO__DB_DIR: /shared
       # SSRF guard: set true in .env only for trusted local test setups
       # (source URLs may then point at private/loopback addresses).
       FUMOX_ADMIN__ALLOW_PRIVATE_URLS: ${FUMOX_ADMIN__ALLOW_PRIVATE_URLS:-false}
     volumes:
-      - fumox-data:/app/data
       - ./config:/app/config:ro
+      - fumox-data:/app/data
+      - meow-shared:/shared
     ports:
-      - "8080:8080"            # public subscription endpoints
-      - "127.0.0.1:8081:8081"  # admin panel: loopback-only by default; put a
-                               # reverse proxy / SSH tunnel in front to expose it
+      # Host ports are parameterized so a second, isolated stand (the smoke
+      # scripts in scripts/) can run alongside the main one:
+      # FUMOX_PUBLIC_PORT / FUMOX_ADMIN_BIND / FUMOX_ADMIN_PORT, defaults keep 8080/8081.
+      - "${FUMOX_PUBLIC_PORT:-8080}:8080"            # public subscription endpoints
+      - "${FUMOX_ADMIN_BIND:-127.0.0.1}:${FUMOX_ADMIN_PORT:-8081}:8081"   # admin panel: loopback-only by
+      # default; put a reverse proxy / SSH tunnel in
+      # front to expose it
     restart: unless-stopped
 
   probe:
@@ -54,14 +59,14 @@ services:
       - server                 # let the server create/migrate the DB first
       - meow                   # probe seeds /shared through the meow image
     environment:
-      FUMOX_GEO__DB_DIR: /app/data
+      FUMOX_GEO__DB_DIR: /shared
       FUMOX_MEOW__API_ADDR: meow:9090
       FUMOX_MEOW__CONFIG_PATH: /shared/meow.yaml
       # Override in .env if the default test URL is blocked in your region.
       FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-http://www.gstatic.com/generate_204}
     volumes:
-      - fumox-data:/app/data
       - ./config:/app/config:ro
+      - fumox-data:/app/data
       - meow-shared:/shared
     restart: unless-stopped
 

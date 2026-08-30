@@ -33,7 +33,7 @@ spec:
       image: localhost/fumox:local
       env:
         - name: FUMOX_GEO__DB_DIR
-          value: /app/data
+          value: /shared
       envFrom:
         - secretRef:
             name: fumox-env
@@ -51,6 +51,8 @@ spec:
           readOnly: true
         - name: data
           mountPath: /app/data
+        - name: shared
+          mountPath: /shared
 
     # args: (not command:) keeps tini as the entrypoint, mirroring compose
     # `command: ["fumox-probe"]`.
@@ -59,7 +61,7 @@ spec:
       args: ["fumox-probe"]
       env:
         - name: FUMOX_GEO__DB_DIR
-          value: /app/data
+          value: /shared
         - name: FUMOX_MEOW__API_ADDR
           value: "127.0.0.1:9090"
         - name: FUMOX_MEOW__CONFIG_PATH

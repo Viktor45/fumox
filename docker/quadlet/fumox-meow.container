@@ -1,5 +1,5 @@
 # meow-rs — mihomo-compatible kernel the probe drives for T2 checks
-# (image built from docker/meow/, CMD "meow -f /etc/meow/config.yaml").
+# (image built from docker/meow/, CMD "meow -f /etc/meow/config.yaml -d /shared").
 #
 # The bootstrap config baked into the image binds the Clash
 # external-controller to 0.0.0.0:9090 *inside the pod* and disables inbound

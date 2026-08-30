@@ -15,6 +15,6 @@ pub mod models;
 pub mod parsers;
 pub mod repo;
 
-pub use config::AppConfig;
+pub use config::{AppConfig, DEFAULT_CONFIG_PATH};
 pub use error::{Error, Result};
 pub use models::{ProxyEntry, Scheme};

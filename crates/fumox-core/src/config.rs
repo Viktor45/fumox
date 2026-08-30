@@ -43,6 +43,8 @@ pub struct AppConfig {
     pub meow: MeowConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
 impl AppConfig {
@@ -69,12 +71,10 @@ impl AppConfig {
                 let default_path = Path::new(DEFAULT_CONFIG_PATH);
                 if default_path.is_file() {
                     figment = figment.merge(Toml::file(default_path));
-                } else {
-                    tracing::info!(
-                        path = DEFAULT_CONFIG_PATH,
-                        "config file not found, using built-in defaults"
-                    );
                 }
+                // A missing default file is not logged here: the subscriber
+                // is not installed yet (the level itself comes from this
+                // config). The binaries report it after `init_tracing`.
             }
         }
 
@@ -413,6 +413,45 @@ impl Default for RetentionConfig {
     }
 }
 
+/// Console log level (`[log]` section). `RUST_LOG` with full `EnvFilter`
+/// directives still wins when set (see `logging::init_tracing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
+/// Per-binary console levels. Both processes read the same `app.toml`, so
+/// each takes its own key: `server` for fumox-server, `probe` for
+/// fumox-probe.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    /// Console level of `fumox-server`.
+    #[serde(default)]
+    pub server: LogLevel,
+    /// Console level of `fumox-probe`.
+    #[serde(default)]
+    pub probe: LogLevel,
+}
+
 /// `[meow].test_url`: a single URL, a comma-separated string, or a sequence
 /// of URLs. Blank entries are dropped, and the list must not end up empty —
 /// the T2 check has nothing to fetch otherwise.
@@ -696,8 +735,35 @@ mod tests {
         assert_eq!(cfg.database.busy_timeout_ms, 5000);
         assert_eq!(cfg.retention.probe_results_days, 14);
         assert_eq!(cfg.retention.fetch_log_days, 30);
+        assert_eq!(cfg.log.server, LogLevel::Info);
+        assert_eq!(cfg.log.probe, LogLevel::Info);
         assert!(cfg.admin.is_active());
         assert_eq!(cfg.geo.db_path(), Path::new("config/GeoLite2-Country.mmdb"));
+    }
+
+    #[test]
+    fn log_levels_are_per_binary_and_validated() {
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.toml");
+        std::fs::write(&file, "[log]\nserver = \"warn\"\nprobe = \"debug\"\n").unwrap();
+
+        let cfg = AppConfig::load(Some(&file)).expect("log levels must load");
+        assert_eq!(cfg.log.server, LogLevel::Warn);
+        assert_eq!(cfg.log.probe, LogLevel::Debug);
+
+        std::fs::write(&file, "[log]\nserver = \"loud\"\n").unwrap();
+        let err = AppConfig::load(Some(&file)).unwrap_err();
+        assert!(matches!(err, crate::Error::Config(_)));
+
+        std::fs::write(&file, "[log]\nlevel = \"warn\"\n").unwrap();
+        let err = AppConfig::load(Some(&file)).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Config(_)),
+            "unknown key rejected"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

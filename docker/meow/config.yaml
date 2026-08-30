@@ -10,7 +10,13 @@
 mixed-port: 7890
 allow-lan: false
 mode: rule
-log-level: info
+log-level: silent
+
+# Setup path for shared GeoIP2 databases
+geodata:
+  mmdb-path: /shared/GeoLite2-Country.mmdb
+  asn-path: /shared/GeoLite2-ASN.mmdb
+  auto-update: false
 
 # Clash external-controller REST API. fumox-probe connects to meow:9090 over
 # the compose network. Keep the secret empty: the probe sends no

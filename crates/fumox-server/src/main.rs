@@ -39,9 +39,13 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    fumox_core::logging::init_tracing();
-
     let config = fumox_core::AppConfig::load(cli.config.as_deref())?;
+    fumox_core::logging::init_tracing(config.log.server);
+
+    if cli.config.is_none() && !std::path::Path::new(fumox_core::DEFAULT_CONFIG_PATH).is_file() {
+        tracing::info!("config file not found, using built-in defaults");
+    }
+
     let pool = fumox_core::db::connect_pool(&config.database).await?;
     fumox_core::db::migrate(&pool).await?;
 

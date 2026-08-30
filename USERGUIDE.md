@@ -41,6 +41,7 @@ If you only have five minutes, read sections [1](#1-what-is-fumox),
     - [`[probe]` — health-check daemon](#probe--health-check-daemon)
     - [`[meow]` — meow-rs integration (T2)](#meow--meow-rs-integration-t2)
     - [`[retention]` — history rotation](#retention--history-rotation)
+    - [`[log]` — console log levels](#log--console-log-levels)
   - [9. The processing pipeline](#9-the-processing-pipeline)
   - [10. Health checks and proxy lifecycle](#10-health-checks-and-proxy-lifecycle)
     - [The status state machine](#the-status-state-machine)
@@ -182,6 +183,8 @@ Useful `.env` variables (all except the token are optional):
 | Variable                          | Default                               | Purpose                                                                                                                                                          |
 | --------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `FUMOX_ADMIN__TOKEN`              | — (**required**)                      | Admin panel login token. The panel is disabled without it.                                                                                                       |
+| `FUMOX_PUBLIC_PORT`               | `8080`                                | Host port for the public listeners; shift it to run a second, isolated stand next to the main one.                                                               |
+| `FUMOX_ADMIN_PORT`                | `8081`                                | Host port for the admin panel (always published to loopback only or `FUMOX_ADMIN_BIND` ).                                                                        |
 | `FUMOX_MEOW__TEST_URL`            | `http://www.gstatic.com/generate_204` | URL used for T2 delay tests. Override if it is blocked in your region (e.g. `http://cp.cloudflare.com`).                                                         |
 | `FUMOX_ADMIN__ALLOW_PRIVATE_URLS` | `false`                               | Allow source URLs pointing at private/loopback addresses (disables the SSRF guard). Local testing only.                                                          |
 | `MEOW_VERSION`                    | `latest`                              | The meow-rs release the wrapper image builds from. `latest` resolves the newest release at build time via the GitHub API; set a tag (e.g. `v0.21.2`) to pin one. |
@@ -196,6 +199,17 @@ Notes:
 - meow-rs publishes no official Docker image, so the stack builds a small
   wrapper (`docker/meow/Dockerfile`) around the release binary. Its REST API
   (port 9090) is only reachable from the probe over the internal network.
+- **Disposable smoke stand:** `scripts/smoke-up.sh` brings the same stack up
+  as a second, isolated compose project (`fumox-smoke`) on shifted ports
+  (18080 public / 18081 admin; override with `SMOKE_PUBLIC_PORT` /
+  `SMOKE_BIND` and `SMOKE_ADMIN_PORT`), generates its own admin token, waits for startup and
+  runs basic checks (`/healthz`, the admin login page, a 404 from a wrong
+  alive-export token, all three containers settling into `running` without
+  restarts — a check independent of the configured log levels).
+  `scripts/smoke-down.sh` tears
+  it down (volumes deleted unless `--keep-data`). The main stack is never
+  touched; both stands share the `fumox:local` image tag, so the smoke build
+  doubles as the main-stack rebuild.
 
 ### Option B — Pre-built container image
 
@@ -312,11 +326,11 @@ automatically; nothing else needs your attention.
 
 All public endpoints live on the public listener (default port **8080**).
 
-| Endpoint        | Description                                                                  |
-| --------------- | ---------------------------------------------------------------------------- |
-| `GET /sub/{id}` | Merged subscription for a **profile**. `{id}` is the profile id or its slug. |
+| Endpoint        | Description                                                                                                                                      |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /sub/{id}` | Merged subscription for a **profile**. `{id}` is the profile id or its slug.                                                                     |
 | `GET /src/{id}` | Parsed proxies of a **single source**, alive-only (never-probed, quarantined and removed proxies are excluded). `{id}` is the source id or slug. |
-| `GET /healthz`  | Liveness probe, returns `ok`.                                                |
+| `GET /healthz`  | Liveness probe, returns `ok`.                                                                                                                    |
 
 ### Access tokens
 
@@ -487,15 +501,15 @@ form.
 
 ### `[fetch]` — source fetching
 
-| Key                     | Default             | Meaning                                                         |
-| ----------------------- | ------------------- | --------------------------------------------------------------- |
-| `connect_timeout_secs`  | `10`                | TCP connect timeout                                             |
-| `read_timeout_secs`     | `30`                | Response read timeout                                           |
-| `max_response_bytes`    | `10485760` (10 MiB) | Response size cap (decompression-bomb guard)                    |
-| `max_concurrency`       | `4`                 | How many sources are fetched in parallel                        |
-| `max_retries`           | `2`                 | Retries, only for recoverable errors (`network`, `http_server`) |
-| `retry_base_backoff_ms` | `500`               | Exponential backoff base between retries                        |
-| `user_agent`            | `"fumox/<version>"` | User-Agent header; per-source `headers` override it             |
+| Key                     | Default             | Meaning                                                                                                                                                                                                                                    |
+| ----------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `connect_timeout_secs`  | `10`                | TCP connect timeout                                                                                                                                                                                                                        |
+| `read_timeout_secs`     | `30`                | Response read timeout                                                                                                                                                                                                                      |
+| `max_response_bytes`    | `10485760` (10 MiB) | Response size cap (decompression-bomb guard)                                                                                                                                                                                               |
+| `max_concurrency`       | `4`                 | How many sources are fetched in parallel                                                                                                                                                                                                   |
+| `max_retries`           | `2`                 | Retries, only for recoverable errors (`network`, `http_server`)                                                                                                                                                                            |
+| `retry_base_backoff_ms` | `500`               | Exponential backoff base between retries                                                                                                                                                                                                   |
+| `user_agent`            | `"fumox/<version>"` | User-Agent header; per-source `headers` override it                                                                                                                                                                                        |
 | `ip_family`             | `any`               | Default IP family for fetching source URLs: `any` (dual-stack: first IPv4 wins, IPv6 fallback), `ipv4` or `ipv6`. A source without its own IP family inherits this; a set family is strict — no address of that family means a fetch error |
 
 ### `[geo]` — geo enrichment
@@ -523,28 +537,28 @@ form.
 
 ### `[probe]` — health-check daemon
 
-| Key                          | Default | Meaning                                                                       |
-| ---------------------------- | ------- | ----------------------------------------------------------------------------- |
-| `cycle_interval_secs`        | `60`    | Scheduling cycle period                                                       |
-| `sample_size`                | `50`    | Random sample of proxies checked per cycle (spreads load, no bursts)          |
+| Key                          | Default | Meaning                                                                                                 |
+| ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
+| `cycle_interval_secs`        | `60`    | Scheduling cycle period                                                                                 |
+| `sample_size`                | `50`    | Random sample of proxies checked per cycle (spreads load, no bursts)                                    |
 | `refresh_check_limit`        | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue) |
-| `fail_limit`                 | `3`     | Consecutive failures before quarantine                                        |
-| `connect_timeout_secs`       | `10`    | T1 TCP-connect timeout                                                        |
-| `tls_timeout_secs`           | `10`    | T1 TLS-handshake timeout                                                      |
-| `concurrency`                | `8`     | Parallel checks                                                               |
-| `heartbeat_interval_secs`    | `30`    | How often the daemon writes its heartbeat (shown in the admin panel)          |
-| `second_chance_min_hours`    | `24`    | Second-chance window start, hours after quarantine                            |
-| `second_chance_spread_hours` | `24`    | Window width: the check happens at `+24h + U(0..24h)`, i.e. within [24h, 48h) |
-| `retention_interval_secs`    | `86400` | How often old history is purged                                               |
+| `fail_limit`                 | `3`     | Consecutive failures before quarantine                                                                  |
+| `connect_timeout_secs`       | `10`    | T1 TCP-connect timeout                                                                                  |
+| `tls_timeout_secs`           | `10`    | T1 TLS-handshake timeout                                                                                |
+| `concurrency`                | `8`     | Parallel checks                                                                                         |
+| `heartbeat_interval_secs`    | `30`    | How often the daemon writes its heartbeat (shown in the admin panel)                                    |
+| `second_chance_min_hours`    | `24`    | Second-chance window start, hours after quarantine                                                      |
+| `second_chance_spread_hours` | `24`    | Window width: the check happens at `+24h + U(0..24h)`, i.e. within [24h, 48h)                           |
+| `retention_interval_secs`    | `86400` | How often old history is purged                                                                         |
 
 ### `[meow]` — meow-rs integration (T2)
 
-| Key            | Default                                 | Meaning                                                                                                                      |
-| -------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `api_addr`     | `"127.0.0.1:9090"`                      | meow-rs REST API address (its external-controller)                                                                           |
-| `config_path`  | `"config/meow.yaml"`                    | Where the probe writes the generated Clash config. **Must be a path meow-rs itself can read** (in Docker: the shared volume) |
+| Key            | Default                                                                                 | Meaning                                                                                                                                                                                                                                                                                                                           |
+| -------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `api_addr`     | `"127.0.0.1:9090"`                                                                      | meow-rs REST API address (its external-controller)                                                                                                                                                                                                                                                                                |
+| `config_path`  | `"config/meow.yaml"`                                                                    | Where the probe writes the generated Clash config. **Must be a path meow-rs itself can read** (in Docker: the shared volume)                                                                                                                                                                                                      |
 | `test_url`     | Rotation over the Google Android `generate_204` endpoints (7 URLs, verified 2026-08-29) | URL(s) fetched through the proxy for delay tests: one URL, a TOML array, or a comma-separated string. The probe picks one at random per check, so a blocked endpoint no longer breaks T2 everywhere. iOS/Apple check URLs (`captive.apple.com/...`) answer 200, not 204 — usable, but only if your client accepts non-204 answers |
-| `timeout_secs` | `10`                                    | Per-check timeout                                                                                                            |
+| `timeout_secs` | `10`                                                                                    | Per-check timeout                                                                                                                                                                                                                                                                                                                 |
 
 ### `[retention]` — history rotation
 
@@ -552,6 +566,18 @@ form.
 | -------------------- | ------- | --------------------------------- |
 | `probe_results_days` | `14`    | Keep probe history for N days     |
 | `fetch_log_days`     | `30`    | Keep the fetch journal for N days |
+
+### `[log]` — console log levels
+
+Both processes read the same file, so each has its own key. A level is one of
+`error`, `warn`, `info`, `debug`, `trace`. `RUST_LOG` with full `EnvFilter`
+directives (e.g. `RUST_LOG=fumox_core=debug,info`) takes precedence over the
+config when set; `FUMOX_LOG__SERVER` / `FUMOX_LOG__PROBE` work as usual.
+
+| Key      | Default | Meaning                                                                               |
+| -------- | ------- | ------------------------------------------------------------------------------------- |
+| `server` | `info`  | Console level of `fumox-server`                                                       |
+| `probe`  | `info`  | Console level of `fumox-probe`; `warn` silences the per-cycle «probe cycle done» line |
 
 ## 9. The processing pipeline
 

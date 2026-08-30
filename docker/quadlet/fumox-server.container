@@ -16,12 +16,13 @@ Pod=fumox.pod
 # .env equivalent (see fumox.env.example); must exist before first start.
 EnvironmentFile=%h/.config/fumox/fumox.env
 
-Environment=FUMOX_GEO__DB_DIR=/app/data
+Environment=FUMOX_GEO__DB_DIR=/shared
 
 # Left side: a directory with app.toml (and optional GeoLite2-*.mmdb).
 # %h expands to your home dir; point it at the repo's config/ if you prefer.
 Volume=%h/fumox/config:/app/config:ro,Z
 Volume=fumox-data.volume:/app/data
+Volume=fumox-shared.volume:/shared
 
 [Service]
 # systemd equivalent of compose "restart: unless-stopped".

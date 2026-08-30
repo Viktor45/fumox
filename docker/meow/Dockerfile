@@ -70,4 +70,4 @@ USER meow
 EXPOSE 9090
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["meow", "-f", "/etc/meow/config.yaml"]
+CMD ["meow", "-f", "/etc/meow/config.yaml", "-d", "/shared"]

@@ -108,15 +108,10 @@
 
   <div class="panel">
     <h2>{{ self.t("prof.pipeline_title") }}</h2>
-    <div class="field">
-      <label>JSON pipeline v1</label>
-      <textarea class="mono" name="pipeline" rows="8" placeholder='{ "version": 1, … }'>{{ values.pipeline }}</textarea>
-      <div class="hint">{{ self.t("prof.pipeline_hint") }}</div>
-      {% match self.error_for("pipeline") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
-        {% when None %}
-      {% endmatch %}
-    </div>
+    <div class="hint">{{ self.t("ped.tri_state_hint") }}</div>
+    {# Pipeline widget (PIPELINE.md), profile flavor: tri-state section
+       controls (inherit / defaults / set). #}
+    <div id="ped-widget">{{ widget_html | safe }}</div>
   </div>
 
   <div class="form-actions">

@@ -350,7 +350,11 @@ or as a header:
 Authorization: Bearer <access_token>
 ```
 
-Missing or wrong token → `403 Forbidden`.
+Missing or wrong token → `403 Forbidden`. Failed token checks are rate
+limited per IP: after too many failures within a minute
+(`auth_fail_rate_limit`, default `30/min`) the endpoint answers
+`429 Too Many Requests` for a while. All public requests are also subject to
+a generous per-IP ceiling (`rate_limit`, default `300/min`) against scraping.
 
 ### Output formats
 
@@ -395,6 +399,7 @@ selection.
 | All proxies of the profile are quarantined/removed                                                   | `200` + a valid **empty** config + header `X-Fumox-Warning: all-proxies-quarantined`                                                                                                                                          |
 | A source is permanently broken (`http_client`: 400/403/404/410)                                      | The upstream status code is passed through; not cached                                                                                                                                                                        |
 | Profile doesn't exist / disabled                                                                     | `404`                                                                                                                                                                                                                         |
+| Too many requests from one IP (rate limit or exhausted failure window)                               | `429 Too Many Requests` — slow down                                                                                                                                                                                           |
 | Fumox itself is broken (DB down, bad config)                                                         | `500`                                                                                                                                                                                                                         |
 
 Proxies in `quarantine` or `removed` state never appear in output. Proxies
@@ -418,7 +423,8 @@ panel entirely — every `/admin/*` route answers 404.
 
 Built-in protections: CSRF tokens on every form, per-IP rate limiting
 (`120/min` general, `5/min` on login), security response headers
-(`X-Frame-Options: DENY` etc.), proxy credentials masked in all lists
+(`X-Frame-Options: DENY`, `Content-Security-Policy`, `nosniff`,
+`no-referrer`), proxy credentials masked in all lists
 (full value only on the proxy detail page, on explicit request).
 
 ### What's inside
@@ -498,9 +504,11 @@ form.
 
 ### `[server]` — public listener
 
-| Key    | Default          | Meaning                                                     |
-| ------ | ---------------- | ----------------------------------------------------------- |
-| `bind` | `"0.0.0.0:8080"` | Address of the public listener (`/sub`, `/src`, `/healthz`) |
+| Key                  | Default          | Meaning                                                                                          |
+| -------------------- | ---------------- | ------------------------------------------------------------------------------------------------ |
+| `bind`               | `"0.0.0.0:8080"` | Address of the public listener (`/sub`, `/src`, `/healthz`)                                      |
+| `rate_limit`         | `"300/min"`      | Per-IP ceiling for all public requests                                                           |
+| `auth_fail_rate_limit` | `"30/min"`     | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets      |
 
 ### `[database]` — SQLite
 
@@ -538,12 +546,13 @@ form.
 | Key                  | Default            | Meaning                                                                                                                                                 |
 | -------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `enabled`            | `true`             | Master switch                                                                                                                                           |
-| `token`              | `"change-me"`      | Login secret. **Change it.** Empty value disables the panel (404)                                                                                       |
+| `token`              | `"change-me"`      | Login secret. **Change it.** Empty value disables the panel (404); the default logs a warning at startup                                                |
 | `bind`               | `"127.0.0.1:8081"` | Admin listener address. Keep it on loopback; expose only via reverse proxy/SSH tunnel                                                                   |
 | `session_ttl_hours`  | `168`              | Session cookie lifetime (7 days)                                                                                                                        |
 | `allow_private_urls` | `false`            | SSRF guard: when false, source URLs may not resolve to loopback, RFC1918, link-local or cloud-metadata addresses (checked at save *and* at every fetch) |
 | `rate_limit`         | `"120/min"`        | Per-IP limit for admin routes                                                                                                                           |
 | `login_rate_limit`   | `"5/min"`          | Per-IP limit for the login form                                                                                                                         |
+| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie — enable when the panel is reached through an HTTPS reverse proxy                                                  |
 | `locales_dir`        | `"locales"`        | Directory with UI translation catalogs (`<code>.toml`)                                                                                                  |
 
 ### `[probe]` — health-check daemon
@@ -783,7 +792,8 @@ stored.
 
 ## 13. Running in production — checklist
 
-- [ ] Strong `[admin].token` set (the shipped `change-me` is a placeholder).
+- [ ] Strong `[admin].token` set (the shipped `change-me` is a placeholder and
+      logs a warning at startup); `secure_cookies = true` when behind HTTPS.
 - [ ] Admin listener stays on loopback; external access only through a TLS
       reverse proxy or SSH tunnel.
 - [ ] `allow_private_urls` left `false` (SSRF protection), unless you have a

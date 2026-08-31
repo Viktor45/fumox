@@ -5,6 +5,7 @@
 use super::{action_response, is_htmx, mask_secret, not_found, server_error};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
+use crate::admin::pipeline_editor::{BuilderState, widget_from_posted, widget_from_stored};
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
 use crate::pipeline::CompiledPipeline;
@@ -85,14 +86,14 @@ pub async fn profiles_list(State(state): State<AdminState>, headers: HeaderMap) 
 // Form (create / edit)
 // ---------------------------------------------------------------------------
 
-/// Display/edit values of the profile form (all as strings, as typed).
+/// Display/edit values of the profile form (all as strings, as typed). The
+/// pipeline is carried by the widget HTML, not by these values.
 #[derive(Debug, Clone, Default)]
 struct ProfileFormValues {
     name: String,
     slug: String,
     access_token: String,
     output_format: String,
-    pipeline: String,
     countries: String,
     enabled: bool,
 }
@@ -131,6 +132,9 @@ struct ProfileFormTemplate {
     formats: Vec<FormatOption>,
     source_picks: Vec<SourcePick>,
     token_masked_note: bool,
+    /// Pipeline widget HTML (builder ⇄ raw, PIPELINE.md §3): the profile
+    /// flavor with tri-state section controls (inherit / defaults / set).
+    widget_html: String,
 }
 
 impl ProfileFormTemplate {
@@ -209,7 +213,7 @@ pub async fn profile_form(State(state): State<AdminState>, headers: HeaderMap) -
     render_html(
         lang.clone(),
         &ProfileFormTemplate {
-            lang,
+            lang: lang.clone(),
             langs: state.locales.choices().to_vec(),
             theme,
             active: "profiles",
@@ -225,6 +229,14 @@ pub async fn profile_form(State(state): State<AdminState>, headers: HeaderMap) -
             formats,
             source_picks: picks,
             token_masked_note: false,
+            // New profile: nothing stored yet — an empty builder widget.
+            widget_html: widget_from_stored(
+                lang,
+                &state.csrf_for(&headers),
+                None,
+                String::new(),
+                true,
+            ),
         },
         StatusCode::OK,
     )
@@ -251,6 +263,18 @@ pub async fn profile_edit_form(
         Err(err) => return server_error(lang, &err),
     };
     let format = profile.output_format.as_str().to_string();
+    let raw_value = profile
+        .pipeline
+        .as_ref()
+        .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+        .unwrap_or_default();
+    let widget_html = widget_from_stored(
+        lang.clone(),
+        &state.csrf_for(&headers),
+        profile.pipeline.as_ref(),
+        raw_value,
+        true,
+    );
     let values = ProfileFormValues {
         name: profile.name.clone(),
         slug: profile.slug.clone().unwrap_or_default(),
@@ -260,11 +284,6 @@ pub async fn profile_edit_form(
             .map(mask_secret)
             .unwrap_or_default(),
         output_format: format.clone(),
-        pipeline: profile
-            .pipeline
-            .as_ref()
-            .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
-            .unwrap_or_default(),
         countries: profile.countries.join(", "),
         enabled: profile.enabled,
     };
@@ -284,6 +303,7 @@ pub async fn profile_edit_form(
             formats,
             source_picks: picks,
             token_masked_note: profile.access_token.is_some(),
+            widget_html,
         },
         StatusCode::OK,
     )
@@ -386,26 +406,47 @@ async fn build_profile_from_form(
         }
     };
 
-    let pipeline_raw = get("pipeline");
-    let pipeline = if pipeline_raw.trim().is_empty() {
-        None
-    } else {
-        match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {
-            Ok(value) => match CompiledPipeline::from_json(Some(&value)) {
+    // Pipeline (PIPELINE.md §3, §6): in builder mode the JSON is generated
+    // from the widget fields server-side (a stale `pipeline` textarea, if
+    // any, is ignored); in raw mode the textarea is the input, as before.
+    // The tri-state radios let a profile explicitly reset a source's
+    // section to the SPEC defaults by emitting an empty section.
+    let pipeline = if get("pipeline_mode") == "builder" {
+        let generated = BuilderState::from_form(form).emit();
+        match generated {
+            None => None,
+            Some(value) => match CompiledPipeline::from_json(Some(&value)) {
                 Ok(_) => Some(value),
-                Err(messages) => {
-                    for message in messages {
-                        errors.push(("pipeline".into(), message));
+                Err(issues) => {
+                    for issue in issues {
+                        errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
                     }
                     None
                 }
             },
-            Err(err) => {
-                errors.push((
-                    "pipeline".into(),
-                    lang.t("val.invalid_json").replace("{}", &err.to_string()),
-                ));
-                None
+        }
+    } else {
+        let pipeline_raw = get("pipeline");
+        if pipeline_raw.trim().is_empty() {
+            None
+        } else {
+            match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {
+                Ok(value) => match CompiledPipeline::from_json(Some(&value)) {
+                    Ok(_) => Some(value),
+                    Err(issues) => {
+                        for issue in issues {
+                            errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
+                        }
+                        None
+                    }
+                },
+                Err(err) => {
+                    errors.push((
+                        "pipeline".into(),
+                        lang.t("val.invalid_json").replace("{}", &err.to_string()),
+                    ));
+                    None
+                }
             }
         }
     };
@@ -482,7 +523,6 @@ fn form_values_from(form: &[(String, String)]) -> ProfileFormValues {
         slug: get("slug"),
         access_token: get("access_token"),
         output_format: get("output_format"),
-        pipeline: get("pipeline"),
         countries: get("countries"),
         enabled: form.iter().any(|(k, _)| k == "enabled"),
     }
@@ -501,6 +541,17 @@ async fn form_error_response(
     let composition = composition_from_form(form);
     let picks = source_picks(state, &composition).await.unwrap_or_default();
     let formats = format_options(&values.output_format, &lang);
+    let pipeline_error = errors
+        .iter()
+        .find(|(field, _)| field == "pipeline")
+        .map(|(_, message)| message.clone());
+    let widget_html = widget_from_posted(
+        lang.clone(),
+        &state.csrf_for(headers),
+        form,
+        true,
+        pipeline_error,
+    );
     render_html(
         lang.clone(),
         &ProfileFormTemplate {
@@ -519,6 +570,7 @@ async fn form_error_response(
             values,
             errors,
             source_picks: picks,
+            widget_html,
         },
         StatusCode::UNPROCESSABLE_ENTITY,
     )
@@ -665,6 +717,9 @@ pub async fn profile_detail(
         caches: state.caches.clone(),
         geo: state.geo.clone(),
         refresh_tx: state.refresh_tx.clone(),
+        // The preview renders in-process and never crosses the public
+        // rate-limit middleware; fresh counters here are never consulted.
+        limits: crate::serve::PublicRateLimits::unlimited(),
     };
     let (preview, preview_note) =
         match crate::serve::preview_sub(&app_state, &profile, PREVIEW_LINES).await {

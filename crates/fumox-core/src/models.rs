@@ -105,6 +105,15 @@ pub enum ProxyStatus {
 }
 
 impl ProxyStatus {
+    /// Every status in schema order — the source for admin UI option lists
+    /// (pipeline editor health filter, PIPELINE.md §5).
+    pub const ALL: [ProxyStatus; 4] = [
+        ProxyStatus::Unknown,
+        ProxyStatus::Alive,
+        ProxyStatus::Quarantine,
+        ProxyStatus::Removed,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             ProxyStatus::Unknown => "unknown",

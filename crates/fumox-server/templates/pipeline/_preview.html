@@ -1,0 +1,18 @@
+{# Pipeline builder preview (PIPELINE.md §3): the target of
+   POST /admin/pipeline/preview. Shows the generated JSON and the verdict of
+   the same validator the save path uses. #}
+{% match json %}
+  {% when Some with (value) %}
+  <label>{{ self.t("ped.preview_title") }}</label>
+  <pre class="mono ped-preview-json">{{ value }}</pre>
+  {% if valid %}
+    <span class="badge on">{{ self.t("ped.preview_ok") }}</span>
+  {% else %}
+    <span class="badge off">{{ self.t("ped.preview_invalid") }}</span>
+    {% for error in errors %}
+    <div class="error-text">{{ error }}</div>
+    {% endfor %}
+  {% endif %}
+  {% when None %}
+  <div class="hint">{{ self.t("ped.preview_empty") }}</div>
+{% endmatch %}

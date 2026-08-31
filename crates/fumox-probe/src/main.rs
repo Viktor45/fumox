@@ -525,6 +525,13 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
 // Background maintenance
 // ---------------------------------------------------------------------------
 
+/// Cutoff timestamp for a retention window of `days`. A zero window would
+/// wipe the whole history on every cycle, so it is clamped to one day
+/// (security audit, 2026-08-30).
+fn retention_cutoff(now: i64, days: u32) -> i64 {
+    now - i64::from(days.max(1)) * 86_400
+}
+
 /// Periodically upsert `probe_heartbeat` into `meta` so the admin panel can
 /// tell the daemon is alive (ADMIN_PLAN §4.5).
 async fn heartbeat_loop(ctx: Arc<Context>) {
@@ -561,8 +568,8 @@ async fn retention_loop(ctx: Arc<Context>) {
 
 async fn run_retention(ctx: &Context) {
     let now = now_ts();
-    let probe_cutoff = now - i64::from(ctx.config.retention.probe_results_days) * 86_400;
-    let fetch_cutoff = now - i64::from(ctx.config.retention.fetch_log_days) * 86_400;
+    let probe_cutoff = retention_cutoff(now, ctx.config.retention.probe_results_days);
+    let fetch_cutoff = retention_cutoff(now, ctx.config.retention.fetch_log_days);
 
     match probe_repo::purge_before(&ctx.pool, probe_cutoff).await {
         Ok(0) => {}
@@ -646,6 +653,12 @@ mod tests {
     use axum::extract::Path;
     use axum::routing::{get, put};
     use axum::{Json, Router};
+
+    #[test]
+    fn zero_retention_window_is_clamped_to_one_day() {
+        assert_eq!(retention_cutoff(100_000, 0), 100_000 - 86_400);
+        assert_eq!(retention_cutoff(100_000, 7), 100_000 - 7 * 86_400);
+    }
 
     /// Fresh migrated SQLite in a temp directory.
     async fn temp_pool() -> DbPool {

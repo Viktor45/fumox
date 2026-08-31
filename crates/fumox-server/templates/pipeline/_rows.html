@@ -1,0 +1,20 @@
+{# Rename lines of the pipeline builder (PIPELINE.md §3). Rendered inline by
+   the form (initial state) and by POST /admin/pipeline/rows after add/drop;
+   both hosts expose `builder` (BuilderView) and the i18n helper, so the
+   markup lives here exactly once. #}
+{% for row in builder.state.rename %}
+  <div class="ped-row">
+    <input type="text" name="ped_rename_{{ loop.index0 }}_match" value="{{ row.match_pattern }}"
+           placeholder="{{ self.t("ped.rename_match") }}" aria-label="{{ self.t("ped.rename_match") }}">
+    <span class="ped-arrow">→</span>
+    <input type="text" name="ped_rename_{{ loop.index0 }}_replace" value="{{ row.replace }}"
+           placeholder="{{ self.t("ped.rename_replace") }}" aria-label="{{ self.t("ped.rename_replace") }}">
+    <input type="text" class="mono" name="ped_rename_{{ loop.index0 }}_flags" value="{{ row.flags }}" maxlength="3"
+           placeholder="{{ self.t("ped.rename_flags") }}" aria-label="{{ self.t("ped.rename_flags") }}">
+    <button class="btn small" type="button"
+            hx-post="/admin/pipeline/rows?drop={{ loop.index0 }}"
+            hx-target="#ped-rows" hx-swap="innerHTML"
+            hx-include="[name^='ped_'], [name='_csrf']"
+            title="{{ self.t("ped.rename_remove") }}">✕</button>
+  </div>
+{% endfor %}

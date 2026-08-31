@@ -408,3 +408,55 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 
 .htmx-indicator { display: none; }
 .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline-block; }
+
+/* Pipeline builder widget (PIPELINE.md §3). */
+.ped-columns {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+  margin: 6px 0;
+}
+.ped-columns > div { min-width: 180px; }
+.ped-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.ped-row input[type="text"]:not(.mono) { flex: 1 1 160px; }
+.ped-row input.mono { flex: 0 0 70px; }
+.ped-arrow { color: var(--muted, #888); }
+.ped-preview-json {
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--panel-alt, rgba(127, 127, 127, 0.08));
+  overflow-x: auto;
+  max-height: 320px;
+}
+
+/* Pipeline widget modes, presets and tri-state rows (PIPELINE.md §6). */
+.ped-modes {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.ped-modes .ped-active {
+  border-color: var(--accent, #4a7dff);
+  font-weight: 600;
+}
+.ped-presets {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.ped-modes3 {
+  display: flex;
+  gap: 18px;
+  margin: 4px 0 8px;
+  flex-wrap: wrap;
+}

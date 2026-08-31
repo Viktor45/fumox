@@ -64,26 +64,34 @@ pub async fn serve(
     if params.contains_key("format") {
         return serve::error_response(
             StatusCode::BAD_REQUEST,
-            "параметр ?format= не поддерживается: выгрузка всегда в url_list",
+            "the ?format= parameter is not supported: the export is always a plain url_list",
         );
     }
     let expected = match repo::meta_get(&state.pool, TOKEN_KEY).await {
         Ok(Some(expected)) => expected,
-        Ok(None) => return serve::error_response(StatusCode::NOT_FOUND, "ссылка не найдена"),
+        Ok(None) => return serve::error_response(StatusCode::NOT_FOUND, "link not found"),
         Err(err) => {
             tracing::error!(error = %err, "alive export token lookup failed");
-            return serve::error_response(StatusCode::INTERNAL_SERVER_ERROR, "внутренняя ошибка");
+            return serve::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error",
+            );
         }
     };
-    if expected != token {
-        return serve::error_response(StatusCode::NOT_FOUND, "ссылка не найдена");
+    // Constant-time comparison: the token is a public capability link
+    // (security audit, 2026-08-30).
+    if !crate::admin::auth::ct_eq(&expected, &token) {
+        return serve::error_response(StatusCode::NOT_FOUND, "link not found");
     }
 
     let rows = match proxies::list_alive(&state.pool).await {
         Ok(rows) => rows,
         Err(err) => {
             tracing::error!(error = %err, "alive export query failed");
-            return serve::error_response(StatusCode::INTERNAL_SERVER_ERROR, "внутренняя ошибка");
+            return serve::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error",
+            );
         }
     };
     let mut lines: Vec<String> = Vec::with_capacity(rows.len());

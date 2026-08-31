@@ -230,6 +230,19 @@ impl Lang {
     pub fn t<'a>(&'a self, key: &'a str) -> &'a str {
         self.messages.get(key).map(String::as_str).unwrap_or(key)
     }
+
+    /// Translate a message key and substitute positional arguments `{0}`,
+    /// `{1}`… Used for dynamic validation errors produced outside the admin
+    /// layer (pipeline, fetcher): they carry a catalog key plus arguments
+    /// instead of pre-rendered text. A missing catalog entry renders as the
+    /// key itself (like [`Lang::t`]), with the arguments substituted in.
+    pub fn t_args(&self, key: &str, args: &[String]) -> String {
+        let mut text = self.t(key).to_string();
+        for (idx, arg) in args.iter().enumerate() {
+            text = text.replace(&format!("{{{idx}}}"), arg);
+        }
+        text
+    }
 }
 
 /// `Set-Cookie` header value persisting the language choice.
@@ -322,6 +335,32 @@ mod tests {
         assert_eq!(locales.resolve("fr").t("nav.dashboard"), "Дашборд");
         // Unknown keys echo themselves.
         assert_eq!(locales.resolve("en").t("no.such.key"), "no.such.key");
+    }
+
+    #[test]
+    fn t_args_substitutes_positional_arguments() {
+        let locales = Locales::load(Path::new("/nonexistent-locales-dir"));
+        let args = vec!["rename[0]".to_string(), "z".to_string()];
+        assert_eq!(
+            locales.resolve("ru").t_args("pipeline.unknown_flag", &args),
+            "rename[0].flags: неизвестный флаг «z»"
+        );
+        assert_eq!(
+            locales.resolve("en").t_args("pipeline.unknown_flag", &args),
+            "rename[0].flags: unknown flag 'z'"
+        );
+        // A placeholder without its argument stays visible.
+        assert_eq!(
+            locales
+                .resolve("en")
+                .t_args("pipeline.bad_regex", &args[..1]),
+            "rename[0].match: invalid regex: {1}"
+        );
+        // Unknown keys echo themselves, arguments still substituted.
+        assert_eq!(
+            locales.resolve("en").t_args("no.such.key", &args),
+            "no.such.key"
+        );
     }
 
     #[test]

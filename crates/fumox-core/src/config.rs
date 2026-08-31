@@ -93,12 +93,23 @@ pub struct ServerConfig {
     /// Socket for the public subscription endpoints.
     #[serde(default = "defaults::server_bind")]
     pub bind: SocketAddr,
+    /// Per-IP fixed-window limit for every public request (`/sub`, `/src`,
+    /// `/export/alive`) — a generous ceiling against scraping and floods.
+    #[serde(default = "defaults::public_rate_limit")]
+    pub rate_limit: RateLimit,
+    /// Per-IP limit fed by failed access-token checks (HTTP 403 on `/sub`) —
+    /// the brute-force signal for protected profiles (security audit,
+    /// 2026-08-30).
+    #[serde(default = "defaults::auth_fail_rate_limit")]
+    pub auth_fail_rate_limit: RateLimit,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: defaults::server_bind(),
+            rate_limit: defaults::public_rate_limit(),
+            auth_fail_rate_limit: defaults::auth_fail_rate_limit(),
         }
     }
 }
@@ -243,6 +254,10 @@ impl GeoDbKind {
 
 /// Admin panel settings (ADMIN_PLAN §2–3). An empty `token` disables the
 /// admin listener entirely (it answers 404).
+/// Built-in default of `[admin].token`; fumox-server logs a warning at
+/// startup when the panel is active with it (security audit, 2026-08-30).
+pub const DEFAULT_ADMIN_TOKEN: &str = "change-me";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
@@ -268,6 +283,11 @@ pub struct AdminConfig {
     /// Hard limit for `POST /admin/login` (per IP).
     #[serde(default = "defaults::login_rate_limit")]
     pub login_rate_limit: RateLimit,
+    /// Add `; Secure` to the admin session cookie. Enable when the panel is
+    /// reached through an HTTPS front (reverse proxy); a plain-HTTP
+    /// deployment must keep it off, or browsers will drop the cookie.
+    #[serde(default)]
+    pub secure_cookies: bool,
     /// Directory with UI translation catalogs (`<code>.toml`); relative to
     /// the working directory. Missing directory falls back to the catalogs
     /// embedded in the binary.
@@ -285,6 +305,7 @@ impl Default for AdminConfig {
             allow_private_urls: false,
             rate_limit: defaults::admin_rate_limit(),
             login_rate_limit: defaults::login_rate_limit(),
+            secure_cookies: false,
             locales_dir: defaults::admin_locales_dir(),
         }
     }
@@ -642,7 +663,7 @@ mod defaults {
         true
     }
     pub fn admin_token() -> String {
-        "change-me".to_string()
+        DEFAULT_ADMIN_TOKEN.to_string()
     }
     pub fn admin_bind() -> SocketAddr {
         "127.0.0.1:8081".parse().expect("valid socket address")
@@ -655,6 +676,12 @@ mod defaults {
     }
     pub fn login_rate_limit() -> RateLimit {
         RateLimit::new(5, Duration::from_secs(60))
+    }
+    pub fn public_rate_limit() -> RateLimit {
+        RateLimit::new(300, Duration::from_secs(60))
+    }
+    pub fn auth_fail_rate_limit() -> RateLimit {
+        RateLimit::new(30, Duration::from_secs(60))
     }
     pub fn admin_locales_dir() -> String {
         "locales".to_string()

@@ -382,7 +382,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         }
         if s.url.trim().is_empty() {
             errors.push(format!("{ctx}: {}", lang.t("val.required")));
-        } else if let Err(message) = fetcher::vet_url(
+        } else if let Err(issue) = fetcher::vet_url(
             &s.url,
             state.admin.allow_private_urls,
             s.ip_family
@@ -390,7 +390,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         )
         .await
         {
-            errors.push(format!("{ctx}: {message}"));
+            errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
         }
         if let Some(slug) = s.slug.as_deref()
             && !slug.is_empty()
@@ -401,13 +401,25 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         if !(60..=86_400).contains(&s.cache_ttl_seconds) {
             errors.push(format!("{ctx}: {}", lang.t("val.ttl_range")));
         }
+        if let Some(map) = s.headers.as_ref() {
+            for (key, value) in map {
+                if axum::http::HeaderName::try_from(key.as_str()).is_err()
+                    || axum::http::HeaderValue::try_from(value.as_str()).is_err()
+                {
+                    errors.push(format!(
+                        "{ctx}: {}",
+                        lang.t("val.header_invalid").replace("{}", key)
+                    ));
+                }
+            }
+        }
         if let Some(pipeline) = s.pipeline.as_ref() {
-            for message in CompiledPipeline::from_json(Some(pipeline))
+            for issue in CompiledPipeline::from_json(Some(pipeline))
                 .err()
                 .into_iter()
                 .flatten()
             {
-                errors.push(format!("{ctx}: {message}"));
+                errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
             }
         }
     }
@@ -426,12 +438,12 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             errors.push(format!("{ctx}: {}", lang.t("val.slug_format")));
         }
         if let Some(pipeline) = p.pipeline.as_ref() {
-            for message in CompiledPipeline::from_json(Some(pipeline))
+            for issue in CompiledPipeline::from_json(Some(pipeline))
                 .err()
                 .into_iter()
                 .flatten()
             {
-                errors.push(format!("{ctx}: {message}"));
+                errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
             }
         }
         for code in &p.countries {

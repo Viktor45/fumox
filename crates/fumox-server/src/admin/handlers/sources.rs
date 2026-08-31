@@ -8,6 +8,7 @@ use super::{
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
+use crate::admin::pipeline_editor::{BuilderState, widget_from_posted, widget_from_stored};
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
 use crate::fetcher;
@@ -141,7 +142,8 @@ pub async fn sources_list(
 // Form (create / edit)
 // ---------------------------------------------------------------------------
 
-/// Display/edit values of the source form (all as strings, as typed).
+/// Display/edit values of the source form (all as strings, as typed). The
+/// pipeline is carried by the widget HTML, not by these values.
 #[derive(Debug, Clone, Default)]
 struct SourceFormValues {
     name: String,
@@ -155,7 +157,6 @@ struct SourceFormValues {
     cache_ttl_seconds: String,
     tags: String,
     headers: String,
-    pipeline: String,
 }
 
 #[derive(Template)]
@@ -172,6 +173,10 @@ struct SourceFormTemplate {
     errors: Vec<(String, String)>,
     all_protocols: Vec<(String, bool)>,
     headers_masked_note: bool,
+    /// Pipeline widget HTML (builder ⇄ raw, PIPELINE.md §3), rendered by the
+    /// editor module; prefilled from the stored pipeline on GET, from the
+    /// posted fields on validation errors.
+    widget_html: String,
 }
 
 impl SourceFormTemplate {
@@ -206,6 +211,14 @@ pub async fn source_form(State(state): State<AdminState>, headers: HeaderMap) ->
         cache_ttl_seconds: "3600".into(),
         ..Default::default()
     };
+    // New source: nothing stored yet — an empty builder widget.
+    let widget_html = widget_from_stored(
+        lang.clone(),
+        &state.csrf_for(&headers),
+        None,
+        String::new(),
+        false,
+    );
     render_html(
         lang.clone(),
         &SourceFormTemplate {
@@ -220,6 +233,7 @@ pub async fn source_form(State(state): State<AdminState>, headers: HeaderMap) ->
             errors: Vec::new(),
             all_protocols: all_protocols_with_selection(&[]),
             headers_masked_note: false,
+            widget_html,
         },
         StatusCode::OK,
     )
@@ -237,6 +251,21 @@ pub async fn source_edit_form(
         Ok(None) => return not_found(lang, "err.source_not_found"),
         Err(err) => return server_error(lang, &err),
     };
+    // The widget is prefilled from the stored pipeline when the builder can
+    // represent it; otherwise it opens in raw mode with the stored JSON and
+    // the raw-mode warning (PIPELINE.md §2.2).
+    let raw_value = source
+        .pipeline
+        .as_ref()
+        .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+        .unwrap_or_default();
+    let widget_html = widget_from_stored(
+        lang.clone(),
+        &state.csrf_for(&headers),
+        source.pipeline.as_ref(),
+        raw_value.clone(),
+        false,
+    );
     let values = SourceFormValues {
         name: source.name.clone(),
         slug: source.slug.clone().unwrap_or_default(),
@@ -272,11 +301,6 @@ pub async fn source_edit_form(
                     .join("\n")
             })
             .unwrap_or_default(),
-        pipeline: source
-            .pipeline
-            .as_ref()
-            .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
-            .unwrap_or_default(),
     };
     render_html(
         lang.clone(),
@@ -292,6 +316,7 @@ pub async fn source_edit_form(
             errors: Vec::new(),
             all_protocols: all_protocols_with_selection(&values_for_select(&source)),
             headers_masked_note: source.headers.as_ref().is_some_and(|map| !map.is_empty()),
+            widget_html,
         },
         StatusCode::OK,
     )
@@ -369,14 +394,14 @@ async fn build_source_from_form(
     let url = get("url");
     if url.is_empty() {
         errors.push(("url".into(), lang.t("val.required").into()));
-    } else if let Err(message) = fetcher::vet_url(
+    } else if let Err(issue) = fetcher::vet_url(
         &url,
         state.admin.allow_private_urls,
         ip_family.unwrap_or_else(|| state.fetcher.default_family()),
     )
     .await
     {
-        errors.push(("url".into(), message));
+        errors.push(("url".into(), lang.t_args(issue.key, &issue.args)));
     }
 
     let encoding_raw = get("encoding");
@@ -467,29 +492,61 @@ async fn build_source_from_form(
             errors.push(("headers".into(), lang.t("val.header_empty_key").into()));
             continue;
         }
-        headers_map.insert(key, value.trim().to_string());
+        let value = value.trim().to_string();
+        // Reject names/values the HTTP layer would refuse, so a bad line
+        // fails the form now instead of every future fetch (security audit,
+        // 2026-08-30).
+        if axum::http::HeaderName::try_from(key.as_str()).is_err()
+            || axum::http::HeaderValue::try_from(value.as_str()).is_err()
+        {
+            errors.push((
+                "headers".into(),
+                lang.t("val.header_invalid").replace("{}", line),
+            ));
+            continue;
+        }
+        headers_map.insert(key, value);
     }
 
-    let pipeline_raw = get("pipeline");
-    let pipeline = if pipeline_raw.trim().is_empty() {
-        None
-    } else {
-        match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {
-            Ok(value) => match CompiledPipeline::from_json(Some(&value)) {
+    // Pipeline (PIPELINE.md §3): in builder mode the JSON is generated from
+    // the widget fields server-side (a stale `pipeline` textarea, if any,
+    // is ignored); in raw mode the textarea is the input, as before.
+    let pipeline = if get("pipeline_mode") == "builder" {
+        let generated = BuilderState::from_form(form).emit();
+        match generated {
+            None => None,
+            Some(value) => match CompiledPipeline::from_json(Some(&value)) {
                 Ok(_) => Some(value),
-                Err(messages) => {
-                    for message in messages {
-                        errors.push(("pipeline".into(), message));
+                Err(issues) => {
+                    for issue in issues {
+                        errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
                     }
                     None
                 }
             },
-            Err(err) => {
-                errors.push((
-                    "pipeline".into(),
-                    lang.t("val.invalid_json").replace("{}", &err.to_string()),
-                ));
-                None
+        }
+    } else {
+        let pipeline_raw = get("pipeline");
+        if pipeline_raw.trim().is_empty() {
+            None
+        } else {
+            match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {
+                Ok(value) => match CompiledPipeline::from_json(Some(&value)) {
+                    Ok(_) => Some(value),
+                    Err(issues) => {
+                        for issue in issues {
+                            errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
+                        }
+                        None
+                    }
+                },
+                Err(err) => {
+                    errors.push((
+                        "pipeline".into(),
+                        lang.t("val.invalid_json").replace("{}", &err.to_string()),
+                    ));
+                    None
+                }
             }
         }
     };
@@ -568,7 +625,6 @@ fn form_values_from(form: &[(String, String)]) -> SourceFormValues {
         cache_ttl_seconds: get("cache_ttl_seconds"),
         tags: get("tags"),
         headers: get("headers"),
-        pipeline: get("pipeline"),
     }
 }
 
@@ -582,6 +638,17 @@ pub async fn source_create(
     let source = match build_source_from_form(&state, &lang, &form, None).await {
         Ok(source) => source,
         Err(errors) => {
+            let pipeline_error = errors
+                .iter()
+                .find(|(field, _)| field == "pipeline")
+                .map(|(_, message)| message.clone());
+            let widget_html = widget_from_posted(
+                lang.clone(),
+                &state.csrf_for(&headers),
+                &form,
+                false,
+                pipeline_error,
+            );
             return render_html(
                 lang.clone(),
                 &SourceFormTemplate {
@@ -596,6 +663,7 @@ pub async fn source_create(
                     values: form_values_from(&form),
                     errors,
                     headers_masked_note: false,
+                    widget_html,
                 },
                 StatusCode::UNPROCESSABLE_ENTITY,
             );
@@ -620,6 +688,17 @@ pub async fn source_update(
         Ok(source) => source,
         Err(errors) => {
             let action = format!("/admin/sources/{id}/edit");
+            let pipeline_error = errors
+                .iter()
+                .find(|(field, _)| field == "pipeline")
+                .map(|(_, message)| message.clone());
+            let widget_html = widget_from_posted(
+                lang.clone(),
+                &state.csrf_for(&headers),
+                &form,
+                false,
+                pipeline_error,
+            );
             return render_html(
                 lang.clone(),
                 &SourceFormTemplate {
@@ -634,6 +713,7 @@ pub async fn source_update(
                     values: form_values_from(&form),
                     errors,
                     headers_masked_note: true,
+                    widget_html,
                 },
                 StatusCode::UNPROCESSABLE_ENTITY,
             );

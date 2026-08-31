@@ -20,38 +20,40 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 /// Default geo name template (SPEC §5.1).
-const DEFAULT_GEO_TEMPLATE: &str = "{flag} {country} · {name}";
+pub(crate) const DEFAULT_GEO_TEMPLATE: &str = "{flag} {country} · {name}";
 
 /// Raw pipeline configuration, deserialized with `deny_unknown_fields` at
-/// every level so unknown keys fail validation.
+/// every level so unknown keys fail validation. `pub(crate)` so the admin
+/// pipeline editor's ingest parses JSON with the exact same definitions
+/// (PIPELINE.md §4) instead of mirroring them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PipelineConfig {
+pub(crate) struct PipelineConfig {
     /// Schema version; must be `1`.
-    version: u8,
+    pub(crate) version: u8,
     #[serde(default)]
-    filter: Option<FilterConfig>,
+    pub(crate) filter: Option<FilterConfig>,
     #[serde(default)]
-    rename: Option<Vec<RenameRule>>,
+    pub(crate) rename: Option<Vec<RenameRule>>,
     #[serde(default)]
-    geo: Option<GeoStepConfig>,
+    pub(crate) geo: Option<GeoStepConfig>,
     #[serde(default)]
-    health: Option<HealthConfig>,
+    pub(crate) health: Option<HealthConfig>,
     #[serde(default)]
-    dedup: Option<DedupConfig>,
+    pub(crate) dedup: Option<DedupConfig>,
     #[serde(default)]
-    sort: Option<SortConfig>,
+    pub(crate) sort: Option<SortConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FilterConfig {
+pub(crate) struct FilterConfig {
     #[serde(default)]
-    protocols: Option<Vec<String>>,
+    pub(crate) protocols: Option<Vec<String>>,
     #[serde(default)]
-    exclude_protocols: Option<Vec<String>>,
+    pub(crate) exclude_protocols: Option<Vec<String>>,
     #[serde(default = "default_true")]
-    normalize_params: bool,
+    pub(crate) normalize_params: bool,
 }
 
 const fn default_true() -> bool {
@@ -60,21 +62,21 @@ const fn default_true() -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RenameRule {
+pub(crate) struct RenameRule {
     #[serde(rename = "match")]
-    match_pattern: String,
-    replace: String,
+    pub(crate) match_pattern: String,
+    pub(crate) replace: String,
     #[serde(default)]
-    flags: String,
+    pub(crate) flags: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GeoStepConfig {
+pub(crate) struct GeoStepConfig {
     #[serde(default = "default_true")]
-    enabled: bool,
+    pub(crate) enabled: bool,
     #[serde(default = "default_geo_template")]
-    template: String,
+    pub(crate) template: String,
 }
 
 fn default_geo_template() -> String {
@@ -83,38 +85,59 @@ fn default_geo_template() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HealthConfig {
+pub(crate) struct HealthConfig {
     #[serde(default = "default_exclude_statuses")]
-    exclude_statuses: Vec<String>,
+    pub(crate) exclude_statuses: Vec<String>,
 }
 
-fn default_exclude_statuses() -> Vec<String> {
+/// Default health exclusion (SPEC §8): quarantine and removed are hidden
+/// from subscriptions unless the pipeline says otherwise.
+pub(crate) fn default_exclude_statuses() -> Vec<String> {
     vec!["quarantine".to_string(), "removed".to_string()]
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DedupConfig {
+pub(crate) struct DedupConfig {
     #[serde(rename = "by")]
-    by: String,
+    pub(crate) by: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum SortBy {
+pub(crate) enum SortBy {
     Source,
     Name,
     Country,
     Latency,
 }
 
+impl SortBy {
+    /// Every sort key, in schema order (pipeline editor select options).
+    pub(crate) const ALL: [SortBy; 4] = [
+        SortBy::Source,
+        SortBy::Name,
+        SortBy::Country,
+        SortBy::Latency,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SortBy::Source => "source",
+            SortBy::Name => "name",
+            SortBy::Country => "country",
+            SortBy::Latency => "latency",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SortConfig {
+pub(crate) struct SortConfig {
     #[serde(default = "default_sort_by")]
-    by: SortBy,
+    pub(crate) by: SortBy,
     #[serde(default)]
-    desc: bool,
+    pub(crate) desc: bool,
 }
 
 const fn default_sort_by() -> SortBy {
@@ -165,12 +188,26 @@ impl Default for CompiledPipeline {
     }
 }
 
+/// One pipeline validation problem: a catalog key plus positional `{0}`,
+/// `{1}`… arguments. The admin layer renders it with `Lang::t_args` in the
+/// panel language (form errors, import validation); the serving layer only
+/// logs issues in their debug form.
+#[derive(Debug, Clone)]
+pub struct PipelineIssue {
+    /// Catalog key (`pipeline.*` section of `locales/*.toml`).
+    pub key: &'static str,
+    /// Positional arguments: field names and offending values. Embedded
+    /// diagnostics (serde/regex details) stay technical English — only the
+    /// sentence around them is localized.
+    pub args: Vec<String>,
+}
+
 impl CompiledPipeline {
     /// Compile a pipeline JSON value, collecting every validation error
-    /// (field-level messages for the admin form, ADMIN_PLAN §6).
+    /// (field-level issues for the admin form, ADMIN_PLAN §6).
     ///
     /// `NULL` and `{}` mean pass-through with defaults (SPEC §5.1).
-    pub fn from_json(value: Option<&serde_json::Value>) -> Result<Self, Vec<String>> {
+    pub fn from_json(value: Option<&serde_json::Value>) -> Result<Self, Vec<PipelineIssue>> {
         let Some(value) = value else {
             return Ok(Self::default());
         };
@@ -183,14 +220,19 @@ impl CompiledPipeline {
         let mut errors = Vec::new();
         let config: PipelineConfig = match serde_json::from_value(value.clone()) {
             Ok(config) => config,
-            Err(err) => return Err(vec![format!("pipeline: {err}")]),
+            Err(err) => {
+                return Err(vec![PipelineIssue {
+                    key: "pipeline.invalid",
+                    args: vec![err.to_string()],
+                }]);
+            }
         };
 
         if config.version != 1 {
-            errors.push(format!(
-                "pipeline.version: ожидается 1, получено {}",
-                config.version
-            ));
+            errors.push(PipelineIssue {
+                key: "pipeline.version",
+                args: vec![config.version.to_string()],
+            });
         }
 
         let mut compiled = Self::default();
@@ -222,7 +264,10 @@ impl CompiledPipeline {
                             builder.dot_matches_new_line(true);
                         }
                         other => {
-                            errors.push(format!("{field}.flags: неизвестный флаг «{other}»"));
+                            errors.push(PipelineIssue {
+                                key: "pipeline.unknown_flag",
+                                args: vec![field.clone(), other.to_string()],
+                            });
                         }
                     }
                 }
@@ -231,7 +276,10 @@ impl CompiledPipeline {
                         regex,
                         replace: rule.replace.clone(),
                     }),
-                    Err(err) => errors.push(format!("{field}.match: некорректный regex: {err}")),
+                    Err(err) => errors.push(PipelineIssue {
+                        key: "pipeline.bad_regex",
+                        args: vec![field, err.to_string()],
+                    }),
                 }
             }
         }
@@ -239,7 +287,10 @@ impl CompiledPipeline {
         if let Some(geo) = config.geo {
             compiled.geo_enabled = geo.enabled;
             if geo.template.trim().is_empty() {
-                errors.push("geo.template: шаблон не может быть пустым".to_string());
+                errors.push(PipelineIssue {
+                    key: "pipeline.empty_template",
+                    args: Vec::new(),
+                });
             } else {
                 compiled.geo_template = geo.template;
             }
@@ -250,9 +301,10 @@ impl CompiledPipeline {
             for raw in &health.exclude_statuses {
                 match ProxyStatus::from_str(raw) {
                     Ok(status) => statuses.push(status),
-                    Err(_) => errors.push(format!(
-                        "health.exclude_statuses: неизвестный статус «{raw}»"
-                    )),
+                    Err(_) => errors.push(PipelineIssue {
+                        key: "pipeline.unknown_status",
+                        args: vec![raw.clone()],
+                    }),
                 }
             }
             compiled.exclude_statuses = statuses;
@@ -261,10 +313,10 @@ impl CompiledPipeline {
         if let Some(dedup) = config.dedup
             && dedup.by != "fingerprint"
         {
-            errors.push(format!(
-                "dedup.by: в версии 1 поддерживается только «fingerprint», получено «{}»",
-                dedup.by
-            ));
+            errors.push(PipelineIssue {
+                key: "pipeline.dedup_by",
+                args: vec![dedup.by],
+            });
         }
 
         if let Some(sort) = config.sort {
@@ -419,7 +471,7 @@ pub fn merge_configs(
 fn parse_scheme_list(
     raw: &Option<Vec<String>>,
     field: &str,
-    errors: &mut Vec<String>,
+    errors: &mut Vec<PipelineIssue>,
 ) -> Option<Vec<Scheme>> {
     let Some(raw) = raw else {
         return None;
@@ -428,7 +480,10 @@ fn parse_scheme_list(
     for name in raw {
         match Scheme::from_str(name) {
             Ok(scheme) => schemes.push(scheme),
-            Err(_) => errors.push(format!("{field}: неизвестный протокол «{name}»")),
+            Err(_) => errors.push(PipelineIssue {
+                key: "pipeline.unknown_protocol",
+                args: vec![field.to_string(), name.clone()],
+            }),
         }
     }
     Some(schemes)
@@ -551,13 +606,15 @@ mod tests {
             "bogus": true
         })))
         .unwrap_err();
-        assert!(err[0].contains("bogus"), "{err:?}");
+        assert_eq!(err[0].key, "pipeline.invalid");
+        assert!(err[0].args[0].contains("bogus"), "{err:?}");
     }
 
     #[test]
     fn wrong_version_is_rejected() {
         let err = CompiledPipeline::from_json(Some(&json!({ "version": 2 }))).unwrap_err();
-        assert!(err[0].contains("version"));
+        assert_eq!(err[0].key, "pipeline.version");
+        assert_eq!(err[0].args, vec!["2"]);
     }
 
     #[test]
@@ -568,8 +625,13 @@ mod tests {
             "health": { "exclude_statuses": ["sleeping"] }
         })))
         .unwrap_err();
-        assert!(err.iter().any(|e| e.contains("quantum")));
-        assert!(err.iter().any(|e| e.contains("sleeping")));
+        assert!(err
+            .iter()
+            .any(|e| e.key == "pipeline.unknown_protocol" && e.args.contains(&"quantum".into())));
+        assert!(
+            err.iter()
+                .any(|e| e.key == "pipeline.unknown_status" && e.args.contains(&"sleeping".into()))
+        );
     }
 
     #[test]
@@ -579,14 +641,17 @@ mod tests {
             "rename": [{ "match": "(", "replace": "" }]
         })))
         .unwrap_err();
-        assert!(err[0].contains("rename[0]"));
+        assert_eq!(err[0].key, "pipeline.bad_regex");
+        assert_eq!(err[0].args[0], "rename[0]");
 
         let err = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [{ "match": "a", "replace": "", "flags": "z" }]
         })))
         .unwrap_err();
-        assert!(err[0].contains("флаг"));
+        assert_eq!(err[0].key, "pipeline.unknown_flag");
+        assert_eq!(err[0].args[0], "rename[0]");
+        assert_eq!(err[0].args[1], "z");
     }
 
     #[test]
@@ -596,7 +661,8 @@ mod tests {
             "dedup": { "by": "name" }
         })))
         .unwrap_err();
-        assert!(err[0].contains("fingerprint"));
+        assert_eq!(err[0].key, "pipeline.dedup_by");
+        assert_eq!(err[0].args, vec!["name"]);
     }
 
     #[tokio::test]

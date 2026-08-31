@@ -143,15 +143,10 @@ Authorization: Bearer …">{{ values.headers }}</textarea>
 
   <div class="panel">
     <h2>{{ self.t("src.pipeline_title") }}</h2>
-    <div class="field">
-      <label>JSON pipeline v1</label>
-      <textarea class="mono" name="pipeline" rows="8" placeholder='{ "version": 1, … }'>{{ values.pipeline }}</textarea>
-      <div class="hint">{{ self.t("src.pipeline_hint") }}</div>
-      {% match self.error_for("pipeline") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
-        {% when None %}
-      {% endmatch %}
-    </div>
+    <div class="hint">{{ self.t("ped.pipeline_hint") }}</div>
+    {# Pipeline widget (PIPELINE.md): builder ⇄ raw, presets, live preview.
+       The whole block is server-rendered and swapped by its own endpoints. #}
+    <div id="ped-widget">{{ widget_html | safe }}</div>
   </div>
 
   <div class="form-actions">

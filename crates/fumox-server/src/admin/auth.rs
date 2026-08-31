@@ -48,8 +48,10 @@ fn mac_hex(key: &[u8], message: &str) -> String {
     out
 }
 
-/// Constant-time string equality (cookie/CSRF comparison).
-fn ct_eq(a: &str, b: &str) -> bool {
+/// Constant-time string equality (cookie/CSRF comparison). Also used for
+/// the public capability-token checks (`/sub` access token, alive-export
+/// link) so every secret comparison goes through one implementation.
+pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
     let (ab, bb) = (a.as_bytes(), b.as_bytes());
     if ab.len() != bb.len() {
         return false;
@@ -258,10 +260,13 @@ pub async fn login_submit(
     if !state.admin.token.is_empty() && ct_eq(&form.token, &state.admin.token) {
         let ttl = state.session_ttl();
         let value = issue_session(&state.session_key, ttl);
-        let cookie = format!(
+        let mut cookie = format!(
             "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
             ttl.as_secs()
         );
+        if state.admin.secure_cookies {
+            cookie.push_str("; Secure");
+        }
         tracing::info!("admin logged in");
         return (
             StatusCode::SEE_OTHER,

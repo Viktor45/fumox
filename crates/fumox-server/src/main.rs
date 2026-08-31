@@ -42,6 +42,15 @@ async fn main() -> anyhow::Result<()> {
     let config = fumox_core::AppConfig::load(cli.config.as_deref())?;
     fumox_core::logging::init_tracing(config.log.server);
 
+    // Security audit (2026-08-30): running the panel with the built-in
+    // default token is almost certainly a misconfiguration — say so loudly.
+    if config.admin.is_active() && config.admin.token == fumox_core::config::DEFAULT_ADMIN_TOKEN {
+        tracing::warn!(
+            "admin token equals the built-in default; \
+             set [admin].token (or FUMOX_ADMIN__TOKEN) before exposing the panel"
+        );
+    }
+
     if cli.config.is_none() && !std::path::Path::new(fumox_core::DEFAULT_CONFIG_PATH).is_file() {
         tracing::info!("config file not found, using built-in defaults");
     }
@@ -96,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         caches: caches.clone(),
         geo: geo.clone(),
         refresh_tx: refresh_tx.clone(),
+        limits: serve::PublicRateLimits::from_config(&config.server),
     };
     let app = serve::router(state).route("/healthz", get(|| async { "ok\n" }));
 
@@ -124,9 +134,12 @@ async fn main() -> anyhow::Result<()> {
     let admin_listener = tokio::net::TcpListener::bind(config.admin.bind).await?;
     tracing::info!(bind = %config.server.bind, "fumox-server listening");
 
-    // The rate limiter keys requests by peer address, so the admin service
-    // must expose ConnectInfo<SocketAddr> to its middleware.
-    let public_server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    // The public rate limiter also keys requests by peer address.
+    let public_server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal());
     let admin_server = axum::serve(
         admin_listener,
         admin_router.into_make_service_with_connect_info::<SocketAddr>(),

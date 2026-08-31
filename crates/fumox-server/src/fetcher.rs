@@ -17,6 +17,10 @@ use url::Url;
 const MAX_URL_LEN: usize = 2048;
 /// Upper bound on followed redirects.
 const MAX_REDIRECTS: usize = 5;
+/// Hard ceiling for one retry backoff: a misconfigured `[fetch].max_retries`
+/// must neither overflow the exponential multiply nor park a fetch task for
+/// hours (security audit, 2026-08-30).
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
 /// A successfully downloaded payload.
 #[derive(Debug, Clone)]
@@ -145,18 +149,29 @@ impl Fetcher {
                     if attempt >= self.config.max_retries || !failure.is_recoverable() {
                         return Err(failure);
                     }
-                    let backoff = self.config.retry_base_backoff_ms * 2u64.pow(attempt);
+                    let delay = self.backoff_delay(attempt);
                     tracing::warn!(
                         attempt = attempt + 1,
-                        backoff_ms = backoff,
+                        backoff_ms = %delay.as_millis(),
                         error = %failure,
                         "fetch failed, retrying"
                     );
-                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
             }
         }
+    }
+
+    /// Exponential backoff before retry `attempt` (0-based), hard-capped at
+    /// [`MAX_RETRY_BACKOFF`].
+    fn backoff_delay(&self, attempt: u32) -> Duration {
+        Duration::from_millis(
+            self.config
+                .retry_base_backoff_ms
+                .saturating_mul(2u64.saturating_pow(attempt)),
+        )
+        .min(MAX_RETRY_BACKOFF)
     }
 
     async fn fetch_once(
@@ -193,7 +208,8 @@ impl Fetcher {
                 message: "URL has no host".to_string(),
             })?;
             let pinned = self.resolve_and_vet(host, family).await.map_err(|e| {
-                tracing::warn!(url = %current, reason = %e, "SSRF protection blocked the fetch");
+                // The URL may carry userinfo credentials — never log it raw.
+                tracing::warn!(url = %redact_url(&current), reason = %e, "SSRF protection blocked the fetch");
                 FetchFailure::HttpClient { status: 403 }
             })?;
             let port = parsed
@@ -203,7 +219,7 @@ impl Fetcher {
             let client = self
                 .build_client(host, SocketAddr::new(pinned, port))
                 .map_err(|e| FetchFailure::Network {
-                    message: e.to_string(),
+                    message: redacted_request_error(&e),
                 })?;
             let mut request = client.get(parsed.clone());
             for (name, value) in headers {
@@ -211,7 +227,7 @@ impl Fetcher {
             }
 
             let response = request.send().await.map_err(|e| FetchFailure::Network {
-                message: e.to_string(),
+                message: redacted_request_error(&e),
             })?;
             let status = response.status().as_u16();
 
@@ -240,7 +256,7 @@ impl Fetcher {
             let mut body: Vec<u8> = Vec::new();
             let mut stream = response;
             while let Some(chunk) = stream.chunk().await.map_err(|e| FetchFailure::Network {
-                message: e.to_string(),
+                message: redacted_request_error(&e),
             })? {
                 if body.len() as u64 + chunk.len() as u64 > limit {
                     return Err(FetchFailure::ResponseTooLarge { limit });
@@ -264,6 +280,32 @@ impl Fetcher {
     /// IP literals skip DNS.
     async fn resolve_and_vet(&self, host: &str, family: IpFamily) -> Result<IpAddr, SsrfRejection> {
         vet_host(host, self.allow_private_urls, family).await
+    }
+}
+
+/// Strip userinfo (`user:pass@`) from a URL string. Applied on every path
+/// where a URL — or an error text embedding one — reaches the tracing log,
+/// `fetch_log` or `sources.last_error` (security audit, 2026-08-30).
+fn redact_url(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        // Not a URL (the error text embedded something else) — nothing to leak.
+        Err(_) => url.to_string(),
+    }
+}
+
+/// Display text of a reqwest error with the embedded URL redacted:
+/// reqwest appends ` for url (<url>)`, userinfo included.
+fn redacted_request_error(error: &reqwest::Error) -> String {
+    match error.url() {
+        Some(url) => error
+            .to_string()
+            .replace(url.as_str(), &redact_url(url.as_str())),
+        None => error.to_string(),
     }
 }
 
@@ -348,22 +390,49 @@ pub async fn vet_host(
     })
 }
 
+/// A static URL-validation problem: a catalog key plus positional `{0}`,
+/// `{1}`… arguments. The admin layer renders it with `Lang::t_args` in the
+/// panel language; embedded diagnostics (URL-parser and SSRF-rejection
+/// details) stay technical English — only the sentence around them is
+/// localized.
+#[derive(Debug, Clone)]
+pub struct UrlIssue {
+    /// Catalog key (`val.url_*` section of `locales/*.toml`).
+    pub key: &'static str,
+    /// Positional arguments: limits, offending values, technical details.
+    pub args: Vec<String>,
+}
+
 /// Static URL validation applied when a source is saved (ADMIN_PLAN §3).
 ///
 /// The DNS-level SSRF vetting happens at fetch time (addresses can change
 /// between save and fetch), but scheme, length and host shape are checked
 /// up front so that obviously bad URLs never reach the scheduler.
-pub fn validate_url(url: &str) -> Result<(), String> {
+pub fn validate_url(url: &str) -> Result<(), UrlIssue> {
     if url.len() > MAX_URL_LEN {
-        return Err(format!("URL длиннее {MAX_URL_LEN} символов"));
+        return Err(UrlIssue {
+            key: "val.url_too_long",
+            args: vec![MAX_URL_LEN.to_string()],
+        });
     }
-    let parsed = Url::parse(url).map_err(|e| format!("некорректный URL: {e}"))?;
+    let parsed = Url::parse(url).map_err(|e| UrlIssue {
+        key: "val.url_invalid",
+        args: vec![e.to_string()],
+    })?;
     match parsed.scheme() {
         "http" | "https" => {}
-        other => return Err(format!("поддерживаются только http/https, не «{other}»")),
+        other => {
+            return Err(UrlIssue {
+                key: "val.url_scheme",
+                args: vec![other.to_string()],
+            });
+        }
     }
     if parsed.host_str().is_none() {
-        return Err("у URL нет хоста".to_string());
+        return Err(UrlIssue {
+            key: "val.url_no_host",
+            args: Vec::new(),
+        });
     }
     Ok(())
 }
@@ -375,19 +444,30 @@ pub fn validate_url(url: &str) -> Result<(), String> {
 /// allowed (nothing to reject). `family` is the source's effective IP
 /// family (after resolving `None` against `[fetch] ip_family`), so the form
 /// flags hosts that can never be reached under the strict constraint.
-pub async fn vet_url(url: &str, allow_private_urls: bool, family: IpFamily) -> Result<(), String> {
+pub async fn vet_url(
+    url: &str,
+    allow_private_urls: bool,
+    family: IpFamily,
+) -> Result<(), UrlIssue> {
     validate_url(url)?;
     if allow_private_urls {
         return Ok(());
     }
-    let parsed = Url::parse(url).map_err(|e| format!("некорректный URL: {e}"))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "у URL нет хоста".to_string())?;
+    let parsed = Url::parse(url).map_err(|e| UrlIssue {
+        key: "val.url_invalid",
+        args: vec![e.to_string()],
+    })?;
+    let host = parsed.host_str().ok_or(UrlIssue {
+        key: "val.url_no_host",
+        args: Vec::new(),
+    })?;
     vet_host(host, false, family)
         .await
-        .map_err(|e| format!("SSRF-защита: {e}"))?;
-    Ok(())
+        .map(|_| ())
+        .map_err(|e| UrlIssue {
+            key: "val.url_ssrf",
+            args: vec![e.reason],
+        })
 }
 
 /// Vet a single IP address against the SSRF policy.
@@ -460,6 +540,38 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo() {
+        assert_eq!(
+            redact_url("https://user:pass@example.com/sub?a=1"),
+            "https://example.com/sub?a=1"
+        );
+        assert_eq!(
+            redact_url("http://user@example.com/"),
+            "http://example.com/"
+        );
+        // Without userinfo the URL is untouched; non-URLs pass through.
+        assert_eq!(redact_url("https://example.com/"), "https://example.com/");
+        assert_eq!(redact_url("not a url"), "not a url");
+    }
+
+    #[test]
+    fn backoff_delay_is_capped_and_never_overflows() {
+        let fetcher = Fetcher::new(FetchConfig::default(), true);
+        assert_eq!(fetcher.backoff_delay(0), Duration::from_millis(500));
+        assert_eq!(fetcher.backoff_delay(1), Duration::from_millis(1000));
+        // An absurd max_retries must saturate into the cap, not overflow
+        // (debug builds would panic on the raw 2u64.pow).
+        assert_eq!(fetcher.backoff_delay(100), Duration::from_secs(60));
+
+        let huge = FetchConfig {
+            retry_base_backoff_ms: u64::MAX,
+            ..FetchConfig::default()
+        };
+        let fetcher = Fetcher::new(huge, true);
+        assert_eq!(fetcher.backoff_delay(0), Duration::from_secs(60));
     }
 
     #[test]

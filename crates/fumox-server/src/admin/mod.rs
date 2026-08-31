@@ -7,6 +7,7 @@
 pub mod auth;
 mod handlers;
 pub mod i18n;
+pub(crate) mod pipeline_editor;
 pub mod security;
 pub mod theme;
 
@@ -184,6 +185,12 @@ pub fn router(state: AdminState) -> axum::Router {
         )
         .route("/logs/fetch", get(handlers::fetch_logs))
         .route("/probe", get(handlers::probe_overview))
+        // Pipeline builder widget (PIPELINE.md §3): server-side generation
+        // and validation inside the same auth+CSRF envelope as every POST.
+        .route("/pipeline/preview", post(handlers::pipeline_preview))
+        .route("/pipeline/mode", post(handlers::pipeline_mode))
+        .route("/pipeline/preset", post(handlers::pipeline_preset))
+        .route("/pipeline/rows", post(handlers::pipeline_rows))
         .route("/export", get(handlers::export_config))
         .route(
             "/import",
@@ -428,6 +435,10 @@ mod tests {
     }
 
     async fn test_state(admin_limit: u32) -> AdminState {
+        test_state_with_admin(admin_config(admin_limit)).await
+    }
+
+    async fn test_state_with_admin(admin: AdminConfig) -> AdminState {
         let dir =
             std::env::temp_dir().join(format!("fumox-admin-test-{}", fumox_core::models::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -444,7 +455,7 @@ mod tests {
             ..Default::default()
         };
         let config = fumox_core::AppConfig {
-            admin: admin_config(admin_limit),
+            admin,
             ..Default::default()
         };
         let fetcher = Fetcher::new(config.fetch.clone(), config.admin.allow_private_urls);
@@ -582,6 +593,39 @@ mod tests {
                 .unwrap(),
             "nosniff"
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap(),
+            security::CONTENT_SECURITY_POLICY
+        );
+    }
+
+    #[tokio::test]
+    async fn secure_cookies_flag_adds_secure_to_session_cookie() {
+        let mut admin = admin_config(100);
+        admin.secure_cookies = true;
+        let state = test_state_with_admin(admin).await;
+        let app = router(state);
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("HttpOnly"), "cookie: {cookie}");
+        assert!(cookie.ends_with("; Secure"), "cookie: {cookie}");
     }
 
     #[tokio::test]
@@ -705,6 +749,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_headers_with_control_characters_are_rejected() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // A control byte inside a header value is refused by the HTTP layer;
+        // the form must reject it up front (security audit, 2026-08-30).
+        let body = format!(
+            "_csrf={csrf}&name=Hdr&url=https%3A%2F%2Fexample.com%2Fsub&cache_ttl_seconds=3600&headers=X-Token%3A%20abc%0Ddef"
+        );
+        let response = app
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            fumox_core::repo::sources::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn source_form_validation_rejects_bad_input() {
         let state = test_state(1000).await;
         let app = router(state.clone());
@@ -763,6 +832,56 @@ mod tests {
         assert_eq!(
             created.unwrap().ip_family,
             Some(fumox_core::models::IpFamily::Ipv6)
+        );
+    }
+
+    #[tokio::test]
+    async fn url_validation_errors_follow_the_panel_language() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let body = format!("_csrf={csrf}&name=Bad&url=ftp://x&cache_ttl_seconds=3600");
+
+        // Default UI language: the localized sentence wraps the offending
+        // scheme as a technical payload.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(html.contains("поддерживаются только http/https"), "{html}");
+
+        // Same submission with the panel switched to English via the
+        // language cookie.
+        let en_cookie = format!("{cookie}; {}=en", i18n::LANG_COOKIE);
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/sources/new",
+                &body,
+                Some(&en_cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(
+            html.contains("only http/https URLs are supported"),
+            "{html}"
+        );
+        assert!(!html.contains("поддерживаются только"), "{html}");
+        assert!(
+            fumox_core::repo::sources::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -1393,6 +1512,31 @@ mod tests {
     // Configuration import/export (Phase 4)
     // -----------------------------------------------------------------
 
+    /// A minimal enabled source fixture for repo writes.
+    fn test_source(id: &str, slug: &str) -> fumox_core::models::Source {
+        let now = fumox_core::models::now_ts();
+        fumox_core::models::Source {
+            id: id.into(),
+            slug: Some(slug.into()),
+            name: format!("source {slug}"),
+            url: "https://example.com/sub".into(),
+            enabled: true,
+            encoding: Default::default(),
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 3600,
+            tags: None,
+            pipeline: None,
+            headers: None,
+            ip_family: None,
+            created_at: now,
+            updated_at: now,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        }
+    }
+
     /// URL-encode `(key, value)` pairs into a form body.
     fn urlencoded(pairs: &[(&str, &str)]) -> String {
         pairs
@@ -1678,5 +1822,634 @@ mod tests {
             response.headers().get(header::LOCATION).unwrap(),
             "/admin/login"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Pipeline builder (PIPELINE.md, ADMIN_PLAN §13.1 decision 26)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_builder_endpoints_require_auth_and_csrf() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let body = urlencoded(&[("ped_sort", "1"), ("ped_sort_by", "name")]);
+
+        for uri in [
+            "/admin/pipeline/preview",
+            "/admin/pipeline/mode",
+            "/admin/pipeline/preset",
+            "/admin/pipeline/rows",
+        ] {
+            // Missing CSRF token → 403.
+            let response = app
+                .clone()
+                .oneshot(request("POST", uri, &body, Some(&cookie)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+
+            // Unauthenticated browser POST → redirected to the login screen.
+            let response = app
+                .clone()
+                .oneshot(request("POST", uri, &body, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_preview_generates_and_validates_json() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // A valid configuration: the fragment carries the generated JSON and
+        // the ok badge.
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("ped_filter", "1"),
+            ("ped_filter_protocols", "vless"),
+            ("ped_filter_protocols", "trojan"),
+            ("ped_normalize", "1"),
+            ("ped_sort", "1"),
+            ("ped_sort_by", "latency"),
+            ("ped_sort_desc", "1"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/preview",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("&#34;version&#34;: 1"), "{html}");
+        assert!(html.contains("&#34;filter&#34;"), "{html}");
+        assert!(html.contains("&#34;latency&#34;"), "{html}");
+        assert!(html.contains("JSON валиден"), "{html}");
+
+        // A bad regex: the error is localized (default language is Russian).
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("ped_rename_0_match", "("),
+            ("ped_rename_0_replace", "x"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/preview",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("некорректный regex"), "{html}");
+        assert!(!html.contains("JSON валиден"), "{html}");
+
+        // The English panel gets English text.
+        let en_cookie = format!("{cookie}; {}=en", i18n::LANG_COOKIE);
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/preview",
+                &body,
+                Some(&en_cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("invalid regex"), "{html}");
+        assert!(!html.contains("некорректный"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn pipeline_preview_shows_the_empty_state() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let body = urlencoded(&[("_csrf", &csrf)]);
+
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/preview",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("pipeline останется NULL"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn pipeline_mode_switches_between_builder_and_raw() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // Builder → raw: the generated JSON lands in the textarea; the mode
+        // field flips to "raw" so the save reads the textarea.
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("ped_filter", "1"),
+            ("ped_filter_protocols", "vless"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/mode?to=raw",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains(r#"name="pipeline_mode" value="raw""#),
+            "{html}"
+        );
+        assert!(html.contains("id=\"pipeline-field\""), "{html}");
+        assert!(html.contains("&#34;filter&#34;"), "{html}");
+        assert!(!html.contains("ped_filter_protocols"), "{html}");
+
+        // Raw → builder with a representable JSON: prefilled fields, no
+        // warning.
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            (
+                "pipeline",
+                "{ \"version\": 1, \"sort\": { \"by\": \"name\" } }",
+            ),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/mode?to=builder",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains(r#"name="pipeline_mode" value="builder""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"<option value="name" selected>"#), "{html}");
+        assert!(!html.contains("конструктор не представляет"), "{html}");
+
+        // Raw → builder with an unparseable JSON: stays raw with the warning.
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("pipeline", "{ \"version\": 1, \"bogus\": true }"),
+        ]);
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/mode?to=builder",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains(r#"name="pipeline_mode" value="raw""#),
+            "{html}"
+        );
+        assert!(html.contains("конструктор не представляет"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn pipeline_preset_renders_the_ready_made_state() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let body = urlencoded(&[("_csrf", &csrf)]);
+
+        // "Only verified": unknown excluded, builder mode with a valid
+        // preview of the preset.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/preset?name=workers",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains(r#"value="builder""#), "{html}");
+        assert!(
+            html.contains(r#"id="ped-status-unknown" checked"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"id="ped-status-quarantine" checked"#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"id="ped-status-alive" checked"#), "{html}");
+        assert!(html.contains("JSON валиден"), "{html}");
+
+        // "Blank": nothing checked, the NULL preview.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/preset?name=blank",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("pipeline останется NULL"), "{html}");
+
+        // The profile flavor keeps the tri-state radios.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/preset?name=workers&profile=1",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains(r#"name="ped_health" value="set""#), "{html}");
+        assert!(html.contains("наследовать"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn pipeline_rows_add_and_drop_keep_the_other_lines() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // A fresh widget shows one empty typing line.
+        let body = urlencoded(&[("_csrf", &csrf)]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/rows",
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("ped_rename_0_match"), "{html}");
+
+        // Adding a line re-renders both; dropping the first renumbers the
+        // second to index 0 with its value intact.
+        let two_rows = urlencoded(&[
+            ("_csrf", &csrf),
+            ("ped_rename_0_match", "first"),
+            ("ped_rename_1_match", "second"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/rows",
+                &two_rows,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("ped_rename_0_match"), "{html}");
+        assert!(html.contains("ped_rename_1_match"), "{html}");
+
+        // Dropping the first line renumbers the second to index 0 with its
+        // value intact; `drop` travels in the query string exactly like the
+        // htmx button's hx-post URL.
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/rows?drop=0",
+                &two_rows,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("ped_rename_0_match"), "{html}");
+        assert!(!html.contains("ped_rename_1_"), "{html}");
+        assert!(html.contains(r#"value="second""#), "{html}");
+    }
+
+    #[tokio::test]
+    async fn source_form_saves_the_builder_state_as_pipeline_json() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // Builder mode on the source form: the JSON is generated from the
+        // widget fields server-side; a stale `pipeline` field is ignored.
+        // `ped_normalize`/`ped_geo_enabled` ride along exactly as a browser
+        // submits the rendered widget (every checkbox present).
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "Builder"),
+            ("url", "https://example.com/sub"),
+            ("cache_ttl_seconds", "3600"),
+            ("pipeline_mode", "builder"),
+            ("ped_filter", "1"),
+            ("ped_filter_protocols", "vless"),
+            ("ped_normalize", "1"),
+            ("ped_geo_enabled", "1"),
+            ("ped_sort", "1"),
+            ("ped_sort_by", "name"),
+            ("pipeline", "{ \"version\": 1, \"bogus\": true }"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{cookie}");
+        let sources = fumox_core::repo::sources::list(&state.pool, false)
+            .await
+            .unwrap();
+        let created = sources
+            .iter()
+            .find(|s| s.name == "Builder")
+            .expect("source created");
+        assert_eq!(
+            created.pipeline.as_ref().unwrap(),
+            &serde_json::json!({
+                "version": 1,
+                "filter": { "protocols": ["vless"] },
+                "sort": { "by": "name" }
+            })
+        );
+
+        // Builder mode with nothing configured → NULL (not `{}`).
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "Empty builder"),
+            ("url", "https://example.com/sub"),
+            ("cache_ttl_seconds", "3600"),
+            ("pipeline_mode", "builder"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let sources = fumox_core::repo::sources::list(&state.pool, false)
+            .await
+            .unwrap();
+        let created = sources
+            .iter()
+            .find(|s| s.name == "Empty builder")
+            .expect("source created");
+        assert!(created.pipeline.is_none());
+
+        // Builder mode with a bad field: 422 with the localized error and
+        // the widget reopened in builder mode with the typed values.
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "Bad builder"),
+            ("url", "https://example.com/sub"),
+            ("cache_ttl_seconds", "3600"),
+            ("pipeline_mode", "builder"),
+            ("ped_filter", "1"),
+            ("ped_filter_protocols", "quantum"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("неизвестный протокол"), "{html}");
+        assert!(
+            html.contains(r#"name="pipeline_mode" value="builder""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"value="quantum" id="ped-proto-quantum" checked"#),
+            "{html}"
+        );
+        assert!(!sources.iter().any(|s| s.name == "Bad builder"));
+    }
+
+    #[tokio::test]
+    async fn profile_form_saves_tri_state_sections() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // Profile flavor of the widget: "set" on health with its values,
+        // "defaults" on geo (an explicit reset), everything else inherited.
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "TriState"),
+            ("output_format", "uri_list"),
+            ("pipeline_mode", "builder"),
+            ("ped_health", "set"),
+            ("ped_health_exclude", "alive"),
+            ("ped_health_exclude", "unknown"),
+            ("ped_geo", "defaults"),
+            ("ped_sort", "skip"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/profiles/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let profiles = fumox_core::repo::profiles::list(&state.pool, false)
+            .await
+            .unwrap();
+        let created = profiles
+            .iter()
+            .find(|p| p.name == "TriState")
+            .expect("profile created");
+        assert_eq!(
+            created.pipeline.as_ref().unwrap(),
+            &serde_json::json!({
+                "version": 1,
+                "geo": {},
+                "health": { "exclude_statuses": ["alive", "unknown"] }
+            })
+        );
+
+        // The tri-state survives a reopen: the edit form carries the radios
+        // in their saved positions.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/admin/profiles/{}/edit", created.id),
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains(r#"id="ped-geo-defaults" checked"#), "{html}");
+        assert!(html.contains(r#"id="ped-health-set" checked"#), "{html}");
+        assert!(html.contains(r#"id="ped-status-alive" checked"#), "{html}");
+        assert!(
+            html.contains(r#"id="ped-status-unknown" checked"#),
+            "{html}"
+        );
+        assert!(html.contains("переопределяет разделы"), "{html}");
+
+        // Rename "defaults" is the explicit `[]` reset.
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "Rename reset"),
+            ("output_format", "uri_list"),
+            ("pipeline_mode", "builder"),
+            ("ped_rename", "defaults"),
+            ("ped_rename_0_match", "typed but skipped"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/profiles/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let profiles = fumox_core::repo::profiles::list(&state.pool, false)
+            .await
+            .unwrap();
+        let created = profiles
+            .iter()
+            .find(|p| p.name == "Rename reset")
+            .expect("profile created");
+        assert_eq!(
+            created.pipeline.as_ref().unwrap(),
+            &serde_json::json!({ "version": 1, "rename": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn source_edit_form_prefills_the_builder_from_the_pipeline() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+
+        // A source whose pipeline the builder fully understands.
+        let source = fumox_core::models::Source {
+            pipeline: Some(serde_json::json!({
+                "version": 1,
+                "filter": { "protocols": ["vless"] },
+                "sort": { "by": "name", "desc": true }
+            })),
+            ..test_source("srcBuilder0001", "builder-ok")
+        };
+        fumox_core::repo::sources::create(&state.pool, &source)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/admin/sources/{}/edit", source.id),
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        // Builder mode by default, filter section set, vless selected (but
+        // not trojan), sort by name descending.
+        assert!(
+            html.contains(r#"name="pipeline_mode" value="builder""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"name="ped_filter" value="1" id="ped-filter" checked"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"name="ped_filter_protocols" value="vless" id="ped-proto-vless" checked"#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("ped-proto-trojan\" checked"), "{html}");
+        assert!(html.contains(r#"<option value="name" selected>"#), "{html}");
+        assert!(html.contains(r#"id="ped-sort-desc" checked"#), "{html}");
+        // No raw-mode warning: the pipeline is fully representable.
+        assert!(!html.contains("конструктор не представляет"), "{html}");
+
+        // A pipeline the builder cannot represent: raw-mode warning instead
+        // of a prefill, the JSON itself kept in the textarea.
+        let source = fumox_core::models::Source {
+            pipeline: Some(serde_json::json!({ "version": 1, "bogus": true })),
+            ..test_source("srcBuilder0002", "builder-raw")
+        };
+        fumox_core::repo::sources::create(&state.pool, &source)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(request(
+                "GET",
+                &format!("/admin/sources/{}/edit", source.id),
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("конструктор не представляет"), "{html}");
+        assert!(
+            html.contains(r#"name="pipeline_mode" value="raw""#),
+            "{html}"
+        );
+        assert!(html.contains("&#34;bogus&#34;"), "{html}");
     }
 }

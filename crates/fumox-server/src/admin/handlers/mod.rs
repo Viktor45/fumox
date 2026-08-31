@@ -4,6 +4,7 @@
 
 mod import_export;
 mod logs;
+mod pipeline;
 mod probe;
 mod profiles;
 mod proxies;
@@ -11,6 +12,7 @@ mod sources;
 
 pub use import_export::*;
 pub use logs::*;
+pub use pipeline::*;
 pub use probe::*;
 pub use profiles::*;
 pub use proxies::*;

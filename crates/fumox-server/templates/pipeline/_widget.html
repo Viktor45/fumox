@@ -1,0 +1,247 @@
+{# Pipeline widget (PIPELINE.md §3): the mode switch (builder ⇄ raw), the
+   presets, the builder fields with their live preview — or the raw JSON
+   textarea. Rendered by the editor module into the source/profile forms and
+   swapped by POST /admin/pipeline/mode and /admin/pipeline/preset (htmx
+   targets #ped-widget in the forms). All generation and validation happen
+   on the server (solution 13); without JS the widget stays in its rendered
+   mode and still submits everything the form needs (pipeline_mode). #}
+<div class="ped-modes">
+  <button type="button" class="btn small{% if mode == "builder" %} ped-active{% endif %}"
+          hx-post="/admin/pipeline/mode?to=builder{% if profile %}&amp;profile=1{% endif %}"
+          hx-target="#ped-widget" hx-swap="innerHTML"
+          hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']">{{ self.t("ped.mode_builder") }}</button>
+  <button type="button" class="btn small{% if mode == "raw" %} ped-active{% endif %}"
+          hx-post="/admin/pipeline/mode?to=raw{% if profile %}&amp;profile=1{% endif %}"
+          hx-target="#ped-widget" hx-swap="innerHTML"
+          hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']">{{ self.t("ped.mode_json") }}</button>
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="pipeline_mode" value="{{ mode }}">
+</div>
+
+{% if mode == "raw" %}
+<div class="field">
+  {% if raw_warning %}
+  <div class="hint error-text">{{ self.t("ped.raw_mode") }}</div>
+  {% endif %}
+  <label>JSON pipeline v1</label>
+  <textarea class="mono" id="pipeline-field" name="pipeline" rows="8" placeholder='{ "version": 1, … }'>{{ pipeline_value }}</textarea>
+  <div class="hint">{{ self.t("ped.pipeline_hint") }}</div>
+  {% match error %}
+    {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+    {% when None %}
+  {% endmatch %}
+</div>
+{% else %}
+<div class="ped-presets">
+  <span class="hint">{{ self.t("ped.presets") }}</span>
+  <button type="button" class="btn small"
+          hx-post="/admin/pipeline/preset?name=workers{% if profile %}&amp;profile=1{% endif %}"
+          hx-target="#ped-widget" hx-swap="innerHTML"
+          hx-include="[name='_csrf']">{{ self.t("ped.preset_workers") }}</button>
+  <button type="button" class="btn small"
+          hx-post="/admin/pipeline/preset?name=country{% if profile %}&amp;profile=1{% endif %}"
+          hx-target="#ped-widget" hx-swap="innerHTML"
+          hx-include="[name='_csrf']">{{ self.t("ped.preset_country") }}</button>
+  <button type="button" class="btn small"
+          hx-post="/admin/pipeline/preset?name=clean{% if profile %}&amp;profile=1{% endif %}"
+          hx-target="#ped-widget" hx-swap="innerHTML"
+          hx-include="[name='_csrf']">{{ self.t("ped.preset_clean") }}</button>
+  <button type="button" class="btn small"
+          hx-post="/admin/pipeline/preset?name=blank{% if profile %}&amp;profile=1{% endif %}"
+          hx-target="#ped-widget" hx-swap="innerHTML"
+          hx-include="[name='_csrf']">{{ self.t("ped.preset_blank") }}</button>
+</div>
+{% if profile %}
+<div class="hint">{{ self.t("ped.tri_state_hint") }}</div>
+{% endif %}
+{% match error %}
+  {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+  {% when None %}
+{% endmatch %}
+
+<div id="ped-builder"
+     hx-post="/admin/pipeline/preview"
+     hx-trigger="change delay:300ms"
+     hx-target="#ped-preview"
+     hx-swap="innerHTML"
+     hx-include="[name^='ped_'], [name='_csrf']">
+
+  <div class="field">
+    {% if profile %}
+    <label>{{ self.t("ped.section_filter") }}</label>
+    <div class="ped-modes3">
+      <span class="check-row">
+        <input type="radio" name="ped_filter" value="skip" id="ped-filter-skip" {% if !builder.state.filter_set && !builder.state.filter_defaults %}checked{% endif %}>
+        <label for="ped-filter-skip">{{ self.t("ped.mode_skip") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_filter" value="defaults" id="ped-filter-defaults" {% if builder.state.filter_defaults %}checked{% endif %}>
+        <label for="ped-filter-defaults">{{ self.t("ped.mode_defaults") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_filter" value="set" id="ped-filter-set" {% if builder.state.filter_set %}checked{% endif %}>
+        <label for="ped-filter-set">{{ self.t("ped.mode_set") }}</label>
+      </span>
+    </div>
+    {% else %}
+    <span class="check-row">
+      <input type="checkbox" name="ped_filter" value="1" id="ped-filter" {% if builder.state.filter_set %}checked{% endif %}>
+      <label for="ped-filter">{{ self.t("ped.section_filter") }}</label>
+    </span>
+    {% endif %}
+    <div class="ped-columns">
+      <div>
+        <div class="hint">{{ self.t("ped.protocols_include") }}</div>
+        {% for (protocol, selected) in builder.protocols %}
+        <span class="check-row">
+          <input type="checkbox" name="ped_filter_protocols" value="{{ protocol }}" id="ped-proto-{{ protocol }}" {% if selected %}checked{% endif %}>
+          <label for="ped-proto-{{ protocol }}">{{ protocol }}</label>
+        </span>
+        {% endfor %}
+      </div>
+      <div>
+        <div class="hint">{{ self.t("ped.protocols_exclude") }}</div>
+        {% for (protocol, selected) in builder.protocols %}
+        <span class="check-row">
+          <input type="checkbox" name="ped_filter_exclude" value="{{ protocol }}" id="ped-excl-{{ protocol }}" {% if selected %}checked{% endif %}>
+          <label for="ped-excl-{{ protocol }}">{{ protocol }}</label>
+        </span>
+        {% endfor %}
+      </div>
+    </div>
+    <span class="check-row">
+      <input type="checkbox" name="ped_normalize" value="1" id="ped-normalize" {% if builder.state.normalize_params %}checked{% endif %}>
+      <label for="ped-normalize">{{ self.t("ped.normalize_params") }}</label>
+    </span>
+  </div>
+
+  <div class="field">
+    <label>{{ self.t("ped.section_rename") }}</label>
+    {% if profile %}
+    <div class="ped-modes3">
+      <span class="check-row">
+        <input type="radio" name="ped_rename" value="skip" id="ped-rename-skip" {% if builder.state.rename_skip && !builder.state.rename_defaults %}checked{% endif %}>
+        <label for="ped-rename-skip">{{ self.t("ped.mode_skip") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_rename" value="defaults" id="ped-rename-defaults" {% if builder.state.rename_defaults %}checked{% endif %}>
+        <label for="ped-rename-defaults">{{ self.t("ped.mode_defaults") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_rename" value="set" id="ped-rename-set" {% if !builder.state.rename_skip && !builder.state.rename_defaults %}checked{% endif %}>
+        <label for="ped-rename-set">{{ self.t("ped.mode_set") }}</label>
+      </span>
+    </div>
+    {% endif %}
+    <div id="ped-rows">
+      {% include "pipeline/_rows.html" %}
+    </div>
+    <button class="btn small" type="button"
+            hx-post="/admin/pipeline/rows"
+            hx-target="#ped-rows" hx-swap="innerHTML"
+            hx-include="[name^='ped_'], [name='_csrf']">{{ self.t("ped.rename_add") }}</button>
+  </div>
+
+  <div class="field">
+    {% if profile %}
+    <label>{{ self.t("ped.section_geo") }}</label>
+    <div class="ped-modes3">
+      <span class="check-row">
+        <input type="radio" name="ped_geo" value="skip" id="ped-geo-skip" {% if !builder.state.geo_set && !builder.state.geo_defaults %}checked{% endif %}>
+        <label for="ped-geo-skip">{{ self.t("ped.mode_skip") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_geo" value="defaults" id="ped-geo-defaults" {% if builder.state.geo_defaults %}checked{% endif %}>
+        <label for="ped-geo-defaults">{{ self.t("ped.mode_defaults") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_geo" value="set" id="ped-geo-set" {% if builder.state.geo_set %}checked{% endif %}>
+        <label for="ped-geo-set">{{ self.t("ped.mode_set") }}</label>
+      </span>
+    </div>
+    {% else %}
+    <span class="check-row">
+      <input type="checkbox" name="ped_geo" value="1" id="ped-geo" {% if builder.state.geo_set %}checked{% endif %}>
+      <label for="ped-geo">{{ self.t("ped.section_geo") }}</label>
+    </span>
+    {% endif %}
+    <span class="check-row">
+      <input type="checkbox" name="ped_geo_enabled" value="1" id="ped-geo-enabled" {% if builder.state.geo_enabled %}checked{% endif %}>
+      <label for="ped-geo-enabled">{{ self.t("ped.geo_enabled") }}</label>
+    </span>
+    <label for="ped-geo-template">{{ self.t("ped.geo_template") }}</label>
+    <input type="text" class="mono" name="ped_geo_template" id="ped-geo-template" value="{{ builder.state.geo_template }}"
+           placeholder="{{ builder.default_geo_template() }}">
+    <div class="hint">{{ self.t("ped.geo_placeholders") }} {{ builder.geo_placeholders() }}</div>
+  </div>
+
+  <div class="field">
+    {% if profile %}
+    <label>{{ self.t("ped.section_health") }}</label>
+    <div class="ped-modes3">
+      <span class="check-row">
+        <input type="radio" name="ped_health" value="skip" id="ped-health-skip" {% if !builder.state.health_set && !builder.state.health_defaults %}checked{% endif %}>
+        <label for="ped-health-skip">{{ self.t("ped.mode_skip") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_health" value="defaults" id="ped-health-defaults" {% if builder.state.health_defaults %}checked{% endif %}>
+        <label for="ped-health-defaults">{{ self.t("ped.mode_defaults") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_health" value="set" id="ped-health-set" {% if builder.state.health_set %}checked{% endif %}>
+        <label for="ped-health-set">{{ self.t("ped.mode_set") }}</label>
+      </span>
+    </div>
+    {% else %}
+    <span class="check-row">
+      <input type="checkbox" name="ped_health" value="1" id="ped-health" {% if builder.state.health_set %}checked{% endif %}>
+      <label for="ped-health">{{ self.t("ped.section_health") }}</label>
+    </span>
+    {% endif %}
+    <div class="hint">{{ self.t("ped.health_exclude") }}</div>
+    {% for (status, selected) in builder.statuses %}
+    <span class="check-row">
+      <input type="checkbox" name="ped_health_exclude" value="{{ status }}" id="ped-status-{{ status }}" {% if selected %}checked{% endif %}>
+      <label for="ped-status-{{ status }}">{{ status }}</label>
+    </span>
+    {% endfor %}
+  </div>
+
+  <div class="field">
+    {% if profile %}
+    <label>{{ self.t("ped.section_sort") }}</label>
+    <div class="ped-modes3">
+      <span class="check-row">
+        <input type="radio" name="ped_sort" value="skip" id="ped-sort-skip" {% if !builder.state.sort_set && !builder.state.sort_defaults %}checked{% endif %}>
+        <label for="ped-sort-skip">{{ self.t("ped.mode_skip") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_sort" value="defaults" id="ped-sort-defaults" {% if builder.state.sort_defaults %}checked{% endif %}>
+        <label for="ped-sort-defaults">{{ self.t("ped.mode_defaults") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_sort" value="set" id="ped-sort-set" {% if builder.state.sort_set %}checked{% endif %}>
+        <label for="ped-sort-set">{{ self.t("ped.mode_set") }}</label>
+      </span>
+    </div>
+    {% else %}
+    <span class="check-row">
+      <input type="checkbox" name="ped_sort" value="1" id="ped-sort" {% if builder.state.sort_set %}checked{% endif %}>
+      <label for="ped-sort">{{ self.t("ped.section_sort") }}</label>
+    </span>
+    {% endif %}
+    <label for="ped-sort-by">{{ self.t("ped.sort_by") }}</label>
+    <select name="ped_sort_by" id="ped-sort-by">
+      {% for (option, selected) in builder.sort_options %}
+      <option value="{{ option }}" {% if selected %}selected{% endif %}>{{ option }}</option>
+      {% endfor %}
+    </select>
+    <span class="check-row">
+      <input type="checkbox" name="ped_sort_desc" value="1" id="ped-sort-desc" {% if builder.state.sort_desc %}checked{% endif %}>
+      <label for="ped-sort-desc">{{ self.t("ped.sort_desc") }}</label>
+    </span>
+  </div>
+</div>
+
+<div id="ped-preview">{{ preview_html | safe }}</div>
+{% endif %}

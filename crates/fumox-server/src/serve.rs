@@ -13,12 +13,14 @@
 //! - every proxy quarantined/removed → empty valid output +
 //!   `X-Fumox-Warning: all-proxies-quarantined`.
 
+use crate::admin::auth::RateLimiter;
 use crate::cache::{Caches, Rendered};
-use crate::pipeline::{self, Candidate, CompiledPipeline};
+use crate::pipeline::{self, Candidate, CompiledPipeline, PipelineIssue};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use base64::Engine;
@@ -28,7 +30,9 @@ use fumox_core::models::{ErrorClass, OutputFormat, Profile, ProxyStatus, Source}
 use fumox_core::repo::{fetch_log, profiles, proxies, sources};
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Shared state of the public listener.
 #[derive(Clone)]
@@ -40,6 +44,48 @@ pub struct AppState {
     /// admin "обновить сейчас" handler posts here (Phase 2.5).
     #[allow(dead_code)]
     pub refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Public-listener rate limiters (`[server].rate_limit` /
+    /// `[server].auth_fail_rate_limit`; security audit, 2026-08-30).
+    pub limits: PublicRateLimits,
+}
+
+/// Per-IP rate limiters of the public listener: a generous ceiling for
+/// every request and a strict one for failed access-token checks (HTTP
+/// 403) — the brute-force signal for protected profiles.
+#[derive(Clone)]
+pub struct PublicRateLimits {
+    all: Arc<RateLimiter>,
+    auth_failures: Arc<RateLimiter>,
+}
+
+impl PublicRateLimits {
+    pub(crate) fn new(all: u64, auth_failures: u64) -> Self {
+        let window = Duration::from_secs(60);
+        Self {
+            all: Arc::new(RateLimiter::new(all, window)),
+            auth_failures: Arc::new(RateLimiter::new(auth_failures, window)),
+        }
+    }
+
+    /// Build from the `[server]` configuration block.
+    pub fn from_config(config: &fumox_core::config::ServerConfig) -> Self {
+        Self {
+            all: Arc::new(RateLimiter::new(
+                u64::from(config.rate_limit.limit),
+                config.rate_limit.window,
+            )),
+            auth_failures: Arc::new(RateLimiter::new(
+                u64::from(config.auth_fail_rate_limit.limit),
+                config.auth_fail_rate_limit.window,
+            )),
+        }
+    }
+
+    /// For paths that never cross the middleware (in-process previews):
+    /// counters that can never trip.
+    pub fn unlimited() -> Self {
+        Self::new(u64::MAX, u64::MAX)
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -47,7 +93,41 @@ pub fn router(state: AppState) -> Router {
         .route("/sub/{id}", get(serve_sub))
         .route("/src/{id}", get(serve_src))
         .route("/export/alive/{token}", get(crate::alive_export::serve))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            public_rate_limit,
+        ))
         .with_state(state)
+}
+
+/// Per-IP rate limiting for the public listener (security audit,
+/// 2026-08-30): every request counts against the generous
+/// `[server].rate_limit`; a 403 (failed access-token check) additionally
+/// counts against the strict `[server].auth_fail_rate_limit`, and once that
+/// window is exhausted the endpoint answers 429 instead. Requests without
+/// connect info (unit tests, embedded runtimes) pass through uncounted.
+async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(ip) = req
+        .extensions()
+        .get::<SocketAddr>()
+        .map(|addr| addr.ip().to_string())
+    else {
+        return next.run(req).await;
+    };
+    if !state.limits.all.allow(&ip).await {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many requests, try again later",
+        );
+    }
+    let response = next.run(req).await;
+    if response.status() == StatusCode::FORBIDDEN && !state.limits.auth_failures.allow(&ip).await {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed access attempts, try again later",
+        );
+    }
+    response
 }
 
 /// Non-cacheable error reply bubbling up from rendering.
@@ -62,17 +142,17 @@ impl ErrorReply {
         tracing::error!(error = %err, "serving failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "внутренняя ошибка".to_string(),
+            message: "internal server error".to_string(),
         }
     }
 
     /// A corrupted pipeline config should be impossible (validated at save
     /// time); if it happens anyway, report it as a server error.
-    fn corrupted_pipeline(target: &str, errors: &[String]) -> Self {
+    fn corrupted_pipeline(target: &str, errors: &[PipelineIssue]) -> Self {
         tracing::error!(target, errors = ?errors, "stored pipeline config failed validation");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "внутренняя ошибка".to_string(),
+            message: "internal server error".to_string(),
         }
     }
 }
@@ -86,19 +166,19 @@ async fn serve_sub(
     if params.contains_key("format") {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "параметр ?format= не поддерживается: формат задаётся профилем",
+            "the ?format= parameter is not supported: the output format is fixed by the profile",
         );
     }
     let profile = match profiles::resolve_token(&state.pool, &id).await {
         Ok(Some(profile)) => profile,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "профиль не найден"),
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "profile not found"),
         Err(err) => {
             tracing::error!(error = %err, "profile lookup failed");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "внутренняя ошибка");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
         }
     };
     if !profile.enabled {
-        return error_response(StatusCode::NOT_FOUND, "профиль не найден");
+        return error_response(StatusCode::NOT_FOUND, "profile not found");
     }
     // Optional per-profile access token (SPEC §10.1): query parameter or
     // Authorization: Bearer. NULL means the endpoint is public.
@@ -107,11 +187,13 @@ async fn serve_sub(
             .get("token")
             .cloned()
             .or_else(|| bearer_token(&headers));
-        if provided.as_deref() != Some(required.as_str()) {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "токен доступа отсутствует или неверен",
-            );
+        // Constant-time comparison: the token is a secret checked on the
+        // public listener (security audit, 2026-08-30).
+        let ok = provided
+            .as_deref()
+            .is_some_and(|provided| crate::admin::auth::ct_eq(provided, required));
+        if !ok {
+            return error_response(StatusCode::FORBIDDEN, "access token is missing or invalid");
         }
     }
 
@@ -134,19 +216,19 @@ async fn serve_src(
     if params.contains_key("format") {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "параметр ?format= не поддерживается",
+            "the ?format= parameter is not supported",
         );
     }
     let source = match sources::resolve_token(&state.pool, &id).await {
         Ok(Some(source)) => source,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "источник не найден"),
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "source not found"),
         Err(err) => {
             tracing::error!(error = %err, "source lookup failed");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "внутренняя ошибка");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
         }
     };
     if !source.enabled {
-        return error_response(StatusCode::NOT_FOUND, "источник не найден");
+        return error_response(StatusCode::NOT_FOUND, "source not found");
     }
 
     let key = format!("src:{}", source.id);
@@ -242,12 +324,9 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
             return Err(ErrorReply {
                 status: StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY),
                 message: format!(
-                    "источник «{}» недоступен: {}",
+                    "source \"{}\" unavailable: {}",
                     source.name,
-                    source
-                        .last_error
-                        .as_deref()
-                        .unwrap_or("HTTP-ошибка клиента")
+                    source.last_error.as_deref().unwrap_or("HTTP client error")
                 ),
             });
         }
@@ -376,12 +455,9 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
         return Err(ErrorReply {
             status: StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY),
             message: format!(
-                "источник «{}» недоступен: {}",
+                "source \"{}\" unavailable: {}",
                 source.name,
-                source
-                    .last_error
-                    .as_deref()
-                    .unwrap_or("HTTP-ошибка клиента")
+                source.last_error.as_deref().unwrap_or("HTTP client error")
             ),
         });
     }
@@ -585,6 +661,11 @@ mod tests {
     use tower::ServiceExt;
 
     async fn test_state() -> AppState {
+        state_with_limits(PublicRateLimits::unlimited()).await
+    }
+
+    /// A state whose public rate limiters use the given window sizes.
+    async fn state_with_limits(limits: PublicRateLimits) -> AppState {
         let dir =
             std::env::temp_dir().join(format!("fumox-serve-test-{}", fumox_core::models::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -605,7 +686,78 @@ mod tests {
             caches: Caches::new(),
             geo: Arc::new(GeoResolver::new(&geo_cfg)),
             refresh_tx,
+            limits,
         }
+    }
+
+    /// Perform one GET carrying a peer-address extension — the public
+    /// rate-limit middleware keys on it.
+    async fn get_with_ip(app: Router, uri: &str, ip: &str) -> StatusCode {
+        let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(format!("{ip}:1").parse::<SocketAddr>().unwrap());
+        app.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn public_rate_limit_caps_requests_per_ip() {
+        let state = state_with_limits(PublicRateLimits::new(2, 1_000_000)).await;
+        let app = router(state);
+        assert_eq!(
+            get_with_ip(app.clone(), "/sub/missing", "10.0.0.1").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_with_ip(app.clone(), "/sub/missing", "10.0.0.1").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_with_ip(app.clone(), "/sub/missing", "10.0.0.1").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Another IP has its own window.
+        assert_eq!(
+            get_with_ip(app, "/sub/missing", "10.0.0.2").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_access_token_checks_are_limited() {
+        let state = state_with_limits(PublicRateLimits::new(1_000_000, 2)).await;
+        let profile = make_profile(&state, "profLim000000", &[]).await;
+        sqlx::query("UPDATE profiles SET access_token = 'secret' WHERE id = ?")
+            .bind(&profile.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = router(state);
+
+        let uri = format!("/sub/{}?token=wrong", profile.id);
+        assert_eq!(
+            get_with_ip(app.clone(), &uri, "10.1.1.1").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_with_ip(app.clone(), &uri, "10.1.1.1").await,
+            StatusCode::FORBIDDEN
+        );
+        // The failure window is exhausted: 429 instead of another 403.
+        assert_eq!(
+            get_with_ip(app.clone(), &uri, "10.1.1.1").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // A correct token is not a failure and still serves.
+        assert_eq!(
+            get_with_ip(
+                app,
+                &format!("/sub/{}?token=secret", profile.id),
+                "10.1.1.2"
+            )
+            .await,
+            StatusCode::OK
+        );
     }
 
     fn entry(name: &str, host: &str, port: u16) -> ProxyEntry {

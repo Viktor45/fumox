@@ -141,6 +141,10 @@ Authorization: Bearer …">{{ values.headers }}</textarea>
     </div>
   </div>
 
+  {# Pipeline section. The hints (src.pipeline_hint, ped.*) describe the
+     schema in user-facing words only; the authoritative reference lives in
+     the code comments (pipeline.rs — SPEC §5.1) and must not leak into
+     admin-visible text. #}
   <div class="panel">
     <h2>{{ self.t("src.pipeline_title") }}</h2>
     <div class="hint">{{ self.t("ped.pipeline_hint") }}</div>

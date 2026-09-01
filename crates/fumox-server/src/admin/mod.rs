@@ -1955,7 +1955,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        assert!(html.contains("pipeline останется NULL"), "{html}");
+        assert!(html.contains("pipeline останется пустым"), "{html}");
     }
 
     #[tokio::test]
@@ -2094,7 +2094,7 @@ mod tests {
             .unwrap();
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        assert!(html.contains("pipeline останется NULL"), "{html}");
+        assert!(html.contains("pipeline останется пустым"), "{html}");
 
         // The profile flavor keeps the tri-state radios.
         let response = app

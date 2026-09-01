@@ -14,5 +14,7 @@
     {% endfor %}
   {% endif %}
   {% when None %}
+  {# "Empty" is the pass-through config: the stored field stays NULL and the
+     default rules (SPEC §5.1) apply. #}
   <div class="hint">{{ self.t("ped.preview_empty") }}</div>
 {% endmatch %}

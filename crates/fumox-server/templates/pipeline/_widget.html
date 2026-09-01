@@ -52,6 +52,10 @@
           hx-include="[name='_csrf']">{{ self.t("ped.preset_blank") }}</button>
 </div>
 {% if profile %}
+{# The tri-state hint (ped.tri_state_hint) explains section override
+   semantics in user-facing words; the merge rule itself is
+   `pipeline::merge_configs` — top-level sections replace the source's
+   (SPEC §5.1). #}
 <div class="hint">{{ self.t("ped.tri_state_hint") }}</div>
 {% endif %}
 {% match error %}

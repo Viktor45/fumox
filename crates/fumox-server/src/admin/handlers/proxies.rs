@@ -449,6 +449,9 @@ pub async fn proxy_detail(
         Err(err) => return server_error(lang, &err),
     };
 
+    // Unprobeable badge (SPEC §8.5): the schemes the daemon cannot check
+    // stay `unknown`; the tooltip text itself is the px.unprobeable_title
+    // catalog entry (admin-facing text must not reference design docs).
     let unprobeable = proxy
         .scheme
         .parse::<Scheme>()

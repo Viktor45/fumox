@@ -82,23 +82,25 @@
     {% if source_picks.is_empty() %}
       <p class="muted">{{ self.t("prof.no_sources") }}</p>
     {% else %}
-      <table class="data">
-        <thead>
-          <tr><th></th><th>{{ self.t("common.source") }}</th><th>{{ self.t("prof.order_column") }}</th></tr>
-        </thead>
-        <tbody>
-          {% for pick in source_picks %}
-          <tr>
-            <td><input type="checkbox" name="sources" value="{{ pick.id }}" id="pick-{{ pick.id }}" {% if pick.checked %}checked{% endif %}></td>
-            <td>
-              <label for="pick-{{ pick.id }}">{{ pick.name }}</label>
-              {% if !pick.enabled %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
-            </td>
-            <td><input type="number" name="pos_{{ pick.id }}" value="{{ pick.position }}" min="0" style="width: 80px;"></td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+      <div class="table-scroll">
+        <table class="data">
+          <thead>
+            <tr><th></th><th>{{ self.t("common.source") }}</th><th>{{ self.t("prof.order_column") }}</th></tr>
+          </thead>
+          <tbody>
+            {% for pick in source_picks %}
+            <tr>
+              <td><input type="checkbox" name="sources" value="{{ pick.id }}" id="pick-{{ pick.id }}" {% if pick.checked %}checked{% endif %}></td>
+              <td>
+                <label for="pick-{{ pick.id }}">{{ pick.name }}</label>
+                {% if !pick.enabled %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+              </td>
+              <td><input type="number" name="pos_{{ pick.id }}" value="{{ pick.position }}" min="0" style="width: 80px;"></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
       {% match self.error_for("sources") %}
         {% when Some with (message) %}<div class="error-text">{{ message }}</div>
         {% when None %}

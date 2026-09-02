@@ -49,39 +49,41 @@
   {% if sources.is_empty() %}
     <p class="muted">{{ self.t("stats.no_sources") }}</p>
   {% else %}
-    <table class="data">
-      <thead>
-        <tr>
-          <th>{{ self.t("common.source") }}</th>
-          <th class="num">{{ self.t("common.status_alive") }}</th>
-          <th class="num">{{ self.t("common.status_quarantine") }}</th>
-          <th class="num">{{ self.t("common.status_unknown") }}</th>
-          <th class="num">{{ self.t("common.status_removed") }}</th>
-          <th class="num">{{ self.t("common.total") }}</th>
-          <th class="num">{{ self.t("stats.oldest_alive") }}</th>
-          <th class="num">{{ self.t("stats.schemes_count") }}</th>
-          <th class="num">{{ self.t("stats.countries_count") }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in sources %}
-        <tr>
-          <td>
-            <a href="/admin/sources/{{ row.id }}">{{ row.name }}</a>
-            {% if row.enabled == 0 %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
-          </td>
-          <td class="num">{% if row.alive > 0 %}<a href="/admin/proxies?status=alive&amp;source={{ row.id }}">{{ row.alive }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
-          <td class="num">{% if row.quarantine > 0 %}<a href="/admin/proxies?status=quarantine&amp;source={{ row.id }}">{{ row.quarantine }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
-          <td class="num">{% if row.unknown > 0 %}<a href="/admin/proxies?status=unknown&amp;source={{ row.id }}">{{ row.unknown }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
-          <td class="num">{% if row.removed > 0 %}<a href="/admin/proxies?status=removed&amp;source={{ row.id }}">{{ row.removed }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
-          <td class="num">{{ row.total }}</td>
-          <td class="small">{{ self.opt_ts(row.oldest_alive_at) | safe }}</td>
-          <td class="num">{{ row.schemes }}</td>
-          <td class="num">{{ row.countries }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>{{ self.t("common.source") }}</th>
+            <th class="num">{{ self.t("common.status_alive") }}</th>
+            <th class="num">{{ self.t("common.status_quarantine") }}</th>
+            <th class="num">{{ self.t("common.status_unknown") }}</th>
+            <th class="num">{{ self.t("common.status_removed") }}</th>
+            <th class="num">{{ self.t("common.total") }}</th>
+            <th class="num col-optional">{{ self.t("stats.oldest_alive") }}</th>
+            <th class="num col-optional">{{ self.t("stats.schemes_count") }}</th>
+            <th class="num col-optional">{{ self.t("stats.countries_count") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in sources %}
+          <tr>
+            <td>
+              <a href="/admin/sources/{{ row.id }}">{{ row.name }}</a>
+              {% if row.enabled == 0 %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+            </td>
+            <td class="num">{% if row.alive > 0 %}<a href="/admin/proxies?status=alive&amp;source={{ row.id }}">{{ row.alive }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+            <td class="num">{% if row.quarantine > 0 %}<a href="/admin/proxies?status=quarantine&amp;source={{ row.id }}">{{ row.quarantine }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+            <td class="num">{% if row.unknown > 0 %}<a href="/admin/proxies?status=unknown&amp;source={{ row.id }}">{{ row.unknown }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+            <td class="num">{% if row.removed > 0 %}<a href="/admin/proxies?status=removed&amp;source={{ row.id }}">{{ row.removed }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+            <td class="num">{{ row.total }}</td>
+            <td class="small col-optional">{{ self.opt_ts(row.oldest_alive_at) | safe }}</td>
+            <td class="num col-optional">{{ row.schemes }}</td>
+            <td class="num col-optional">{{ row.countries }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% endif %}
 </div>
 
@@ -111,44 +113,46 @@
   {% if top_alive.is_empty() %}
     <p class="muted">{{ self.t("stats.no_alive") }}</p>
   {% else %}
-    <table class="data">
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>{{ self.t("common.protocol") }}</th>
-          <th>{{ self.t("px.address") }}</th>
-          <th>{{ self.t("common.country") }}</th>
-          <th>{{ self.t("common.name") }}</th>
-          <th>{{ self.t("stats.in_base_since") }}</th>
-          <th>{{ self.t("common.latency") }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in top_alive %}
-        <tr>
-          <td class="muted">{{ loop.index }}</td>
-          <td class="mono small">{{ row.scheme }}</td>
-          <td class="mono small addr">{{ row.host }}:{{ row.port }}</td>
-          <td class="small">{{ self.flag(row.geo_country) }}
-            {% match row.geo_country %}
-              {% when Some with (country) %}{{ country }}
-              {% when None %}<span class="muted">—</span>
-            {% endmatch %}
-          </td>
-          <td class="small truncate" title="{{ row.source_names }}">
-            <a href="/admin/proxies/{{ row.id }}">{{ self.short_name(row.name) }}</a>
-          </td>
-          <td class="small">{{ self.ts(row.created_at) | safe }}</td>
-          <td class="num small">
-            {% match row.latency_ms %}
-              {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
-              {% when None %}<span class="muted">—</span>
-            {% endmatch %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>{{ self.t("common.protocol") }}</th>
+            <th>{{ self.t("px.address") }}</th>
+            <th>{{ self.t("common.country") }}</th>
+            <th>{{ self.t("common.name") }}</th>
+            <th>{{ self.t("stats.in_base_since") }}</th>
+            <th>{{ self.t("common.latency") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in top_alive %}
+          <tr>
+            <td class="muted">{{ loop.index }}</td>
+            <td class="mono small">{{ row.scheme }}</td>
+            <td class="mono small addr">{{ row.host }}:{{ row.port }}</td>
+            <td class="small">{{ self.flag(row.geo_country) }}
+              {% match row.geo_country %}
+                {% when Some with (country) %}{{ country }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+            <td class="small truncate" title="{{ row.source_names }}">
+              <a href="/admin/proxies/{{ row.id }}">{{ self.short_name(row.name) }}</a>
+            </td>
+            <td class="small">{{ self.ts(row.created_at) | safe }}</td>
+            <td class="num small">
+              {% match row.latency_ms %}
+                {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% endif %}
 </div>
 

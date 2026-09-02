@@ -21,7 +21,7 @@
              {% if self.lang_code() == code.as_str() %}class="active"{% endif %}>{{ label }}</a>
           {% endfor %}
         </span>
-        <span class="lang-switch login-lang theme-switch">
+        <span class="lang-switch login-lang">
           <a href="/admin/set-theme?theme=light&next=/admin/login"
              {% if theme.is_light() %}class="active"{% endif %}>{{ self.t("theme.light") }}</a>
           <a href="/admin/set-theme?theme=dark&next=/admin/login"

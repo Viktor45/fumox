@@ -112,64 +112,26 @@
 
 <div class="panel">
   <h2>{{ self.t("src.fetch_log_title") }}</h2>
-  <div id="log-wrap">
-    {% if log.is_empty() %}
-      <p class="muted">{{ self.t("dash.no_fetches") }}</p>
-    {% else %}
-      <table class="data">
-        <thead>
-          <tr><th>{{ self.t("common.time") }}</th><th>{{ self.t("common.result") }}</th><th>HTTP</th><th>{{ self.t("common.size") }}</th><th>{{ self.t("src.proxies_found") }}</th><th>{{ self.t("common.error") }}</th></tr>
-        </thead>
-        <tbody>
-          {% for row in log %}
-          <tr>
-            <td class="small muted">{{ self.ts(row.fetched_at) | safe }}</td>
-            <td>
-              {% if row.ok == 1 %}
-                <span class="badge alive">{{ self.t("common.ok") }}</span>
-              {% else %}
-                {% match row.error_class %}
-                  {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
-                  {% when None %}<span class="badge error">{{ self.t("common.error") }}</span>
-                {% endmatch %}
-              {% endif %}
-            </td>
-            <td class="small">
-              {% match row.http_status %}
-                {% when Some with (status) %}{{ status }}
-                {% when None %}<span class="muted">—</span>
-              {% endmatch %}
-            </td>
-            <td class="small">{{ self.bytes(row.bytes) }}</td>
-            <td class="num">
-              {% match row.proxies_found %}
-                {% when Some with (count) %}{{ count }}
-                {% when None %}<span class="muted">—</span>
-              {% endmatch %}
-            </td>
-            <td class="small">
-              {% match row.error %}
-                {% when Some with (message) %}{{ message }}
-                {% when None %}
-              {% endmatch %}
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% if pages.len() > 1 %}
-        <div class="pagination">
-          {% for (p, current) in pages %}
-            {% if current %}
-              <span class="page current">{{ p }}</span>
-            {% else %}
-              <a class="page" href="/admin/sources/{{ source.id }}?page={{ p }}">{{ p }}</a>
-            {% endif %}
-          {% endfor %}
-        </div>
-      {% endif %}
-    {% endif %}
+  {#- Live refresh: the same fragment the source card renders inline is
+      re-fetched every 15 s and on the SSE fetch.done/fetch.failed events
+      (base.html re-broadcasts them as fumox:refresh) — the same pattern as
+      the probe history on the proxy card. -#}
+  <div id="log-live"
+       hx-get="/admin/sources/{{ source.id }}/log"
+       hx-trigger="every 15s, fumox:refresh" hx-swap="innerHTML">
+    {% include "sources/_log.html" %}
   </div>
+  {% if pages.len() > 1 %}
+    <div class="pagination">
+      {% for (p, current) in pages %}
+        {% if current %}
+          <span class="page current">{{ p }}</span>
+        {% else %}
+          <a class="page" href="/admin/sources/{{ source.id }}?page={{ p }}">{{ p }}</a>
+        {% endif %}
+      {% endfor %}
+    </div>
+  {% endif %}
 </div>
 
 <dialog id="delete-dialog">

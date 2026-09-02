@@ -44,47 +44,49 @@
   {% if rows.is_empty() %}
     <p class="muted">{{ self.t("src.empty") }}</p>
   {% else %}
-    <table class="data">
-      <thead>
-        <tr>
-          <th>{{ self.t("common.name") }}</th>
-          <th>Slug</th>
-          <th>URL</th>
-          <th>{{ self.t("nav.proxies") }}</th>
-          <th>{{ self.t("src.ttl_column") }}</th>
-          <th>{{ self.t("dash.last_fetch") }}</th>
-          <th>{{ self.t("common.state") }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in rows %}
-        <tr>
-          <td><a href="/admin/sources/{{ row.id }}">{{ row.name }}</a></td>
-          <td class="mono small">
-            {% match row.slug %}
-              {% when Some with (slug) %}{{ slug }}
-              {% when None %}<span class="muted">—</span>
-            {% endmatch %}
-          </td>
-          <td class="small truncate">{{ row.url }}</td>
-          <td class="num">{{ row.proxies_count }}</td>
-          <td class="num">{{ row.cache_ttl_seconds }}</td>
-          <td class="small muted">{{ self.ts(row.last_fetched_at) | safe }}</td>
-          <td>
-            {% if row.enabled %}
-              <span class="badge on">{{ self.t("common.on") }}</span>
-            {% else %}
-              <span class="badge off">{{ self.t("common.off") }}</span>
-            {% endif %}
-            {% match row.error_class %}
-              {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
-              {% when None %}
-            {% endmatch %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>{{ self.t("common.name") }}</th>
+            <th class="col-optional">Slug</th>
+            <th class="col-optional">URL</th>
+            <th>{{ self.t("nav.proxies") }}</th>
+            <th>{{ self.t("src.ttl_column") }}</th>
+            <th>{{ self.t("dash.last_fetch") }}</th>
+            <th>{{ self.t("common.state") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr>
+            <td><a href="/admin/sources/{{ row.id }}">{{ row.name }}</a></td>
+            <td class="mono small col-optional">
+              {% match row.slug %}
+                {% when Some with (slug) %}{{ slug }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+            <td class="small truncate col-optional">{{ row.url }}</td>
+            <td class="num">{{ row.proxies_count }}</td>
+            <td class="num">{{ row.cache_ttl_seconds }}</td>
+            <td class="small muted">{{ self.ts(row.last_fetched_at) | safe }}</td>
+            <td>
+              {% if row.enabled %}
+                <span class="badge on">{{ self.t("common.on") }}</span>
+              {% else %}
+                <span class="badge off">{{ self.t("common.off") }}</span>
+              {% endif %}
+              {% match row.error_class %}
+                {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+                {% when None %}
+              {% endmatch %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% endif %}
 </div>
 {% endblock %}

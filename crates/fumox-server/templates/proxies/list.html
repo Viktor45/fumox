@@ -5,7 +5,6 @@
 {% block content %}
 <div class="page-head">
   <h1>{{ self.t("nav.proxies") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
-  <span class="spacer"></span>
   <div class="row-actions">
     <button class="btn danger" type="button" onclick="document.getElementById('purge-dialog').showModal()">{{ self.t("px.purge_button") }}</button>
   </div>
@@ -79,43 +78,45 @@
   {% if rows.is_empty() %}
     <p class="muted">{{ self.t("px.nothing_found") }}</p>
   {% else %}
-    <table class="data">
-      <thead>
-        <tr>
-          <th>{{ self.t("common.status") }}</th>
-          <th>{{ self.t("common.protocol") }}</th>
-          <th>{{ self.t("px.address") }}</th>
-          <th>{{ self.t("common.country") }}</th>
-          <th>{{ self.t("common.name") }}</th>
-          <th>{{ self.t("common.latency") }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in rows %}
-        <tr>
-          <td><span class="badge {{ row.status }}">{{ row.status }}</span></td>
-          <td class="mono small">
-            {{ row.scheme }}
-            {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">unprobeable</span>{% endif %}
-          </td>
-          <td class="mono small addr">{{ row.host }}:{{ row.port }}</td>
-          <td class="small">{{ self.flag(row.geo_country) }}
-            {% match row.geo_country %}
-              {% when Some with (country) %}{{ country }}
-              {% when None %}<span class="muted">—</span>
-            {% endmatch %}
-          </td>
-          <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(row.name) }}</a></td>
-          <td class="num small">
-            {% match row.latency_ms %}
-              {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
-              {% when None %}<span class="muted">—</span>
-            {% endmatch %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>{{ self.t("common.status") }}</th>
+            <th>{{ self.t("common.protocol") }}</th>
+            <th>{{ self.t("px.address") }}</th>
+            <th>{{ self.t("common.country") }}</th>
+            <th>{{ self.t("common.name") }}</th>
+            <th>{{ self.t("common.latency") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr>
+            <td><span class="badge {{ row.status }}">{{ row.status }}</span></td>
+            <td class="mono small">
+              {{ row.scheme }}
+              {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">unprobeable</span>{% endif %}
+            </td>
+            <td class="mono small addr">{{ row.host }}:{{ row.port }}</td>
+            <td class="small">{{ self.flag(row.geo_country) }}
+              {% match row.geo_country %}
+                {% when Some with (country) %}{{ country }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+            <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(row.name) }}</a></td>
+            <td class="num small">
+              {% match row.latency_ms %}
+                {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
+                {% when None %}<span class="muted">—</span>
+              {% endmatch %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
 
     {% if pages.len() > 1 %}
       <div class="pagination">

@@ -2725,4 +2725,107 @@ mod tests {
         );
         assert!(html.contains("&#34;bogus&#34;"), "{html}");
     }
+
+    /// The fetch journal tables (full page, source-card fragment and the
+    /// dashboard's recent fetches) carry the `journal` class: their columns
+    /// stay single-line while the error column keeps wrapping via
+    /// `.cell-wrap` (a long error message must not re-flow the row).
+    #[tokio::test]
+    async fn fetch_journal_tables_keep_columns_single_line() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let source = test_source("srcJournal000", "journal");
+        fumox_core::repo::sources::create(&pool, &source)
+            .await
+            .unwrap();
+        let now = fumox_core::models::now_ts();
+        for entry in [
+            fumox_core::repo::fetch_log::FetchLogEntry {
+                source_id: &source.id,
+                fetched_at: now,
+                ok: true,
+                http_status: Some(200),
+                bytes: Some(1024),
+                proxies_found: Some(42),
+                error: None,
+                error_class: None,
+            },
+            fumox_core::repo::fetch_log::FetchLogEntry {
+                source_id: &source.id,
+                fetched_at: now - 60,
+                ok: false,
+                http_status: None,
+                bytes: None,
+                proxies_found: None,
+                error: Some(
+                    "error sending request for url (https://example.com/sub/): \
+                     operation timed out waiting on connection \
+                     operation timed out waiting on connection",
+                ),
+                error_class: Some(fumox_core::models::ErrorClass::Network),
+            },
+        ] {
+            fumox_core::repo::fetch_log::insert(&pool, &entry)
+                .await
+                .unwrap();
+        }
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        // The dashboard's recent-fetches table has no error column at all,
+        // so the wrapping cell is only asserted where the column exists.
+        // The source card renders the same _log fragment inline, so it
+        // carries the journal table too.
+        for (path, check_error_cell) in [
+            ("/admin/logs/fetch", true),
+            (&format!("/admin/sources/{}/log", source.id), true),
+            (&format!("/admin/sources/{}", source.id), true),
+            ("/admin", false),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request("GET", path, "", Some(&cookie)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "path {path}");
+            let html = response.into_body().collect().await.unwrap().to_bytes();
+            let html = String::from_utf8_lossy(&html);
+            assert!(
+                html.contains(r#"<table class="data journal">"#),
+                "journal table missing on {path}"
+            );
+            // Every data table sits in a horizontal scroll container so a
+            // narrow viewport scrolls the table, never the page.
+            assert!(
+                html.contains(r#"<div class="table-scroll">"#),
+                "table-scroll wrapper missing on {path}"
+            );
+            // The error column keeps its wrapping cell; other columns are
+            // single-line through the table class.
+            if check_error_cell {
+                assert!(
+                    html.contains(r#"<span class="cell-wrap">"#),
+                    "wrapping error cell missing on {path}"
+                );
+            }
+        }
+
+        // The source card's log is live: it polls the same fragment the
+        // page renders inline and refreshes on fetch.done/fetch.failed.
+        let response = app
+            .oneshot(request(
+                "GET",
+                &format!("/admin/sources/{}", source.id),
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains(&format!(r#"hx-get="/admin/sources/{}/log""#, source.id)),
+            "log-live polling missing on the source card"
+        );
+    }
 }

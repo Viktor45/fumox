@@ -5,7 +5,7 @@
   {% else %}
     <p><span class="badge error">{{ self.t("common.error") }}</span> {{ message }}</p>
   {% endif %}
-  <table class="data kv">
+  <table class="kv">
     <tbody>
       {% match http_status %}
         {% when Some with (status) %}

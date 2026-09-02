@@ -1,47 +1,52 @@
-{#- Fragment: recent fetches of one source (refreshed after "Refresh now"). -#}
+{#- Fragment: recent fetches of one source. Rendered standalone for the
+    live hx-get refresh of #log-live (source card) and included by
+    sources/detail.html for the initial server render — the markup lives
+    here exactly once. -#}
 {% if log.is_empty() %}
   <p class="muted">{{ self.t("dash.no_fetches") }}</p>
 {% else %}
-  <table class="data">
-    <thead>
-      <tr><th>{{ self.t("common.time") }}</th><th>{{ self.t("common.result") }}</th><th>HTTP</th><th>{{ self.t("common.size") }}</th><th>{{ self.t("src.proxies_found") }}</th><th>{{ self.t("common.error") }}</th></tr>
-    </thead>
-    <tbody>
-      {% for row in log %}
-      <tr>
-        <td class="small muted">{{ self.ts(row.fetched_at) | safe }}</td>
-        <td>
-          {% if row.ok == 1 %}
-            <span class="badge alive">{{ self.t("common.ok") }}</span>
-          {% else %}
-            {% match row.error_class %}
-              {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
-              {% when None %}<span class="badge error">{{ self.t("common.error") }}</span>
+  <div class="table-scroll">
+    <table class="data journal">
+      <thead>
+        <tr><th>{{ self.t("common.time") }}</th><th>{{ self.t("common.result") }}</th><th>HTTP</th><th class="col-optional">{{ self.t("common.size") }}</th><th>{{ self.t("src.proxies_found") }}</th><th>{{ self.t("common.error") }}</th></tr>
+      </thead>
+      <tbody>
+        {% for row in log %}
+        <tr>
+          <td class="small muted">{{ self.ts(row.fetched_at) | safe }}</td>
+          <td>
+            {% if row.ok == 1 %}
+              <span class="badge alive">{{ self.t("common.ok") }}</span>
+            {% else %}
+              {% match row.error_class %}
+                {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+                {% when None %}<span class="badge error">{{ self.t("common.error") }}</span>
+              {% endmatch %}
+            {% endif %}
+          </td>
+          <td class="small">
+            {% match row.http_status %}
+              {% when Some with (status) %}{{ status }}
+              {% when None %}<span class="muted">—</span>
             {% endmatch %}
-          {% endif %}
-        </td>
-        <td class="small">
-          {% match row.http_status %}
-            {% when Some with (status) %}{{ status }}
-            {% when None %}<span class="muted">—</span>
-          {% endmatch %}
-        </td>
-        <td class="small">{{ self.bytes(row.bytes) }}</td>
-        <td class="num">
-          {% match row.proxies_found %}
-            {% when Some with (count) %}{{ count }}
-            {% when None %}<span class="muted">—</span>
-          {% endmatch %}
-        </td>
-        <td class="small">
-          {% match row.error %}
-            {% when Some with (message) %}
-              <span class="cell-wrap">{{ message }}</span>
-            {% when None %}
-          {% endmatch %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+          </td>
+          <td class="small col-optional">{{ self.bytes(row.bytes) }}</td>
+          <td class="num">
+            {% match row.proxies_found %}
+              {% when Some with (count) %}{{ count }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+          <td class="small">
+            {% match row.error %}
+              {% when Some with (message) %}
+                <span class="cell-wrap">{{ message }}</span>
+              {% when None %}
+            {% endmatch %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 {% endif %}

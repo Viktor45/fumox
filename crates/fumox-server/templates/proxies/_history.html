@@ -3,32 +3,34 @@
 {% if probes.is_empty() %}
   <p class="muted">{{ self.t("px.no_probes") }}</p>
 {% else %}
-  <table class="data">
-    <thead>
-      <tr><th>{{ self.t("common.time") }}</th><th>{{ self.t("common.result") }}</th><th>{{ self.t("common.latency") }}</th><th>{{ self.t("px.probe_kind") }}</th><th>{{ self.t("common.error") }}</th></tr>
-    </thead>
-    <tbody>
-      {% for probe in probes %}
-      <tr>
-        <td class="small muted">{{ self.ts(probe.checked_at) | safe }}</td>
-        <td>
-          {% if probe.ok == 1 %}<span class="badge alive">{{ self.t("common.ok") }}</span>{% else %}<span class="badge error">{{ self.t("common.fail") }}</span>{% endif %}
-        </td>
-        <td class="num small">
-          {% match probe.latency_ms %}
-            {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
-            {% when None %}<span class="muted">—</span>
-          {% endmatch %}
-        </td>
-        <td class="mono small">{{ probe.probe_kind }}</td>
-        <td class="small">
-          {% match probe.error %}
-            {% when Some with (message) %}{{ message }}
-            {% when None %}
-          {% endmatch %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="table-scroll">
+    <table class="data">
+      <thead>
+        <tr><th>{{ self.t("common.time") }}</th><th>{{ self.t("common.result") }}</th><th>{{ self.t("common.latency") }}</th><th>{{ self.t("px.probe_kind") }}</th><th>{{ self.t("common.error") }}</th></tr>
+      </thead>
+      <tbody>
+        {% for probe in probes %}
+        <tr>
+          <td class="small muted">{{ self.ts(probe.checked_at) | safe }}</td>
+          <td>
+            {% if probe.ok == 1 %}<span class="badge alive">{{ self.t("common.ok") }}</span>{% else %}<span class="badge error">{{ self.t("common.fail") }}</span>{% endif %}
+          </td>
+          <td class="num small">
+            {% match probe.latency_ms %}
+              {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+          <td class="mono small">{{ probe.probe_kind }}</td>
+          <td class="small">
+            {% match probe.error %}
+              {% when Some with (message) %}{{ message }}
+              {% when None %}
+            {% endmatch %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 {% endif %}

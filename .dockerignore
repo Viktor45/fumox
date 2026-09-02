@@ -18,9 +18,9 @@ target
 *.db-wal
 *.db-shm
 
-# Docs and the 1.1 MB parser fixture — irrelevant to the build
+# Docs and parser fixtures (may contain non-public data) — irrelevant to the build
 docs
-test.txt
+test*.txt
 *.md
 
 # Local runtime config: GeoLite2 binaries are gitignored large files and

@@ -57,36 +57,38 @@
   {% if queue.is_empty() %}
     <p class="muted">{{ self.t("probe.queue_empty") }}</p>
   {% else %}
-    <table class="data">
-      <thead>
-        <tr>
-          <th>{{ self.t("nav.proxies") }}</th><th>{{ self.t("probe.scheme") }}</th><th>{{ self.t("px.quarantined_since") }}</th>
-          <th>{{ self.t("px.second_chance") }}</th><th>{{ self.t("probe.col_15m") }}</th><th>{{ self.t("probe.col_30m") }}</th><th>{{ self.t("probe.col_1h") }}</th><th>{{ self.t("probe.next_check") }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in queue %}
-        <tr>
-          <td><a href="/admin/proxies/{{ row.id }}">{{ row.name }}</a>
-              <span class="small muted">{{ row.host }}:{{ row.port }}</span></td>
-          <td class="mono small">{{ row.scheme }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.quarantined_at) | safe }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.second_chance_at) | safe }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.recheck_15m_at) | safe }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.recheck_30m_at) | safe }}</td>
-          <td class="small muted">{{ self.opt_ts(&row.recheck_1h_at) | safe }}</td>
-          <td class="small">{{ self.next_check(&row) | safe }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>{{ self.t("nav.proxies") }}</th><th>{{ self.t("probe.scheme") }}</th><th>{{ self.t("px.quarantined_since") }}</th>
+            <th>{{ self.t("px.second_chance") }}</th><th class="col-optional">{{ self.t("probe.col_15m") }}</th><th class="col-optional">{{ self.t("probe.col_30m") }}</th><th class="col-optional">{{ self.t("probe.col_1h") }}</th><th>{{ self.t("probe.next_check") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in queue %}
+          <tr>
+            <td><a href="/admin/proxies/{{ row.id }}">{{ row.name }}</a>
+                <span class="small muted">{{ row.host }}:{{ row.port }}</span></td>
+            <td class="mono small">{{ row.scheme }}</td>
+            <td class="small muted">{{ self.opt_ts(&row.quarantined_at) | safe }}</td>
+            <td class="small muted">{{ self.opt_ts(&row.second_chance_at) | safe }}</td>
+            <td class="small muted col-optional">{{ self.opt_ts(&row.recheck_15m_at) | safe }}</td>
+            <td class="small muted col-optional">{{ self.opt_ts(&row.recheck_30m_at) | safe }}</td>
+            <td class="small muted col-optional">{{ self.opt_ts(&row.recheck_1h_at) | safe }}</td>
+            <td class="small">{{ self.next_check(&row) | safe }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% endif %}
 </div>
 
 <div class="grid cols-2">
   <div class="panel">
     <h2>{{ self.t("probe.cycle_settings") }}</h2>
-    <table class="data kv">
+    <table class="kv">
       <tbody>
         <tr><td>{{ self.t("probe.cycle_period") }}</td><td>{{ state.probe.cycle_interval_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><td>{{ self.t("probe.sample_per_cycle") }}</td><td>{{ state.probe.sample_size }}</td></tr>
@@ -102,7 +104,7 @@
   </div>
   <div class="panel">
     <h2>{{ self.t("probe.meow_title") }}</h2>
-    <table class="data kv">
+    <table class="kv">
       <tbody>
         <tr><td>REST API</td><td class="mono small">{{ state.meow.api_addr }}</td></tr>
         <tr><td>{{ self.t("probe.clash_config") }}</td><td class="mono small">{{ state.meow.config_path.display() }}</td></tr>

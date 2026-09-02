@@ -104,22 +104,24 @@
     {% if links.is_empty() %}
       <p class="muted">{{ self.t("px.no_links") }}</p>
     {% else %}
-      <table class="data">
-        <thead><tr><th>{{ self.t("common.source") }}</th><th>{{ self.t("px.last_seen") }}</th></tr></thead>
-        <tbody>
-          {% for link in links %}
-          <tr>
-            <td>
-              {% match link.name %}
-                {% when Some with (name) %}<a href="/admin/sources/{{ link.source_id }}">{{ name }}</a>
-                {% when None %}<span class="muted">{{ link.source_id }}</span>
-              {% endmatch %}
-            </td>
-            <td class="small muted">{{ self.ts(link.seen_at) | safe }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+      <div class="table-scroll">
+        <table class="data">
+          <thead><tr><th>{{ self.t("common.source") }}</th><th>{{ self.t("px.last_seen") }}</th></tr></thead>
+          <tbody>
+            {% for link in links %}
+            <tr>
+              <td>
+                {% match link.name %}
+                  {% when Some with (name) %}<a href="/admin/sources/{{ link.source_id }}">{{ name }}</a>
+                  {% when None %}<span class="muted">{{ link.source_id }}</span>
+                {% endmatch %}
+              </td>
+              <td class="small muted">{{ self.ts(link.seen_at) | safe }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
     {% endif %}
   </div>
 </div>

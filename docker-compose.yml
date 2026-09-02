@@ -30,6 +30,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # `mounts` builds through persistent BuildKit cache mounts: rebuilds
+      # after a source change recompile only the workspace crates (~1 min
+      # instead of ~7.5). Set FUMOX_BUILD_CACHE=layers in .env on builders
+      # without cache-mount support (e.g. podman-compose) — that path uses
+      # the classic cargo-chef image layers. See the Dockerfile header.
+      args:
+        BUILD_CACHE: ${FUMOX_BUILD_CACHE:-mounts}
     image: fumox:local
     command: ["fumox-server"]
     environment:

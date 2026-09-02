@@ -25,7 +25,7 @@
        cookie and rendered server-side as data-theme on <html>, so it works
        without JavaScript. The onclick appends the current path as `next`,
        same as the language switcher below. #}
-    <span class="lang-switch theme-switch">
+    <span class="lang-switch">
       <a href="/admin/set-theme?theme=light"
          onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
          {% if theme.is_light() %}class="active"{% endif %}>{{ self.t("theme.light") }}</a>
@@ -85,16 +85,17 @@
             document.body.dispatchEvent(new CustomEvent('fumox:' + name, { detail: data }));
           });
         });
-      // When any fetch finishes, refresh the in-flight status fragment if it
-      // is present on the page (source card "refresh now").
-      document.body.addEventListener('fumox:fetch.done', function () {
-        var el = document.getElementById('refresh-status');
-        if (el && window.htmx) window.htmx.trigger(el, 'fumox:refresh');
-      });
-      document.body.addEventListener('fumox:fetch.failed', function () {
-        var el = document.getElementById('refresh-status');
-        if (el && window.htmx) window.htmx.trigger(el, 'fumox:refresh');
-      });
+      // When any fetch finishes, refresh the in-flight status fragment and
+      // the source fetch-log if either is present on the page.
+      function refreshAfterFetch() {
+        if (!window.htmx) return;
+        ['refresh-status', 'log-live'].forEach(function (id) {
+          var el = document.getElementById(id);
+          if (el) window.htmx.trigger(el, 'fumox:refresh');
+        });
+      }
+      document.body.addEventListener('fumox:fetch.done', refreshAfterFetch);
+      document.body.addEventListener('fumox:fetch.failed', refreshAfterFetch);
     })();
 
     // Local time (ADMIN_PLAN §13.1, decision 22): the server emits every

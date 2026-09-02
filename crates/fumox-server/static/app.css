@@ -105,7 +105,12 @@ a:hover { text-decoration: underline; }
 
 /* ---------- layout ---------- */
 
+/* Sticky: the nav stays reachable while a long table is scrolled.
+   z-index below the toast layer (50); dialogs live in the top layer. */
 .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
   background: var(--topbar-bg);
   color: var(--topbar-text);
   padding: 0 20px;
@@ -212,19 +217,51 @@ table.data th {
   text-transform: uppercase;
   letter-spacing: 0.03em;
   color: var(--muted);
+  /* Single-line headers: `overflow-wrap: anywhere` on body would otherwise
+     let a squeezed column break its header letter-by-letter. With nowrap
+     the table keeps natural column widths and scrolls inside
+     .table-scroll instead. */
+  white-space: nowrap;
 }
 table.data tr:last-child td { border-bottom: none; }
 table.data tr:hover td { background: var(--row-hover); }
 table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Truncated source link inside a table cell (dashboard, fetch journal):
+   same effect as .truncate, but as a class instead of an inline style. */
+.cell-link {
+  display: inline-block;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+/* Horizontal scroll container for wide tables (mobile adaptation): the
+   table keeps its column widths, the page never scrolls sideways. */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
 /* Wrapping cell for long error messages / URLs: the text flows onto as
    many lines as it needs (breaking anywhere, URLs have no spaces), so the
-   column never stretches the table — it just grows downward. */
+   column never stretches the table — it just grows downward. inline-block
+   makes the width caps actually apply (they are ignored on plain inline
+   spans). */
 .cell-wrap {
+  display: inline-block;
+  vertical-align: top;
   max-width: 360px;
   overflow-wrap: anywhere;
   white-space: normal;
 }
+/* Fetch journal tables (logs page, source card, dashboard): every column
+   is one line — source, result, HTTP, size and proxy counts must never
+   wrap mid-cell when a long error message squeezes the other columns.
+   The error column itself keeps wrapping via .cell-wrap below. */
+table.data.journal td { white-space: nowrap; }
+table.data.journal td .cell-wrap { white-space: normal; }
+
 /* Short mono identifiers (protocol names, probe kinds, output formats)
    never break across lines: `overflow-wrap: anywhere` on body would
    otherwise hyphenate `hysteria2` inside narrow table columns (probe
@@ -267,8 +304,10 @@ time.ts { white-space: nowrap; }
 form.stack { max-width: 760px; }
 .field { margin-bottom: 14px; }
 .field label { display: block; font-weight: 600; margin-bottom: 4px; font-size: 14px; }
-.field .hint { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
-.field .error-text { color: var(--danger); font-size: 13px; margin-top: 3px; }
+/* Standalone classes: hints and error texts also appear outside .field
+   (import page, pipeline widget preview) and must keep their look there. */
+.hint { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+.error-text { color: var(--danger); font-size: 13px; margin-top: 3px; }
 .field input[type="text"], .field input[type="number"], .field input[type="password"],
 .field input[type="url"], .field select, .field textarea {
   width: 100%;
@@ -299,7 +338,7 @@ fieldset {
 }
 legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
 
-.form-actions { display: flex; gap: 10px; margin-top: 18px; align-items: center; }
+.form-actions { display: flex; gap: 10px; margin-top: 18px; align-items: center; flex-wrap: wrap; }
 
 /* ---------- buttons ---------- */
 
@@ -340,7 +379,8 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
   border-radius: 8px;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
   animation: toast-in 0.18s ease-out;
-  max-width: 380px;
+  /* Never wider than the viewport minus the wrap's offsets. */
+  max-width: min(380px, calc(100vw - 40px));
 }
 .toast.error { background: var(--danger); color: #fff; }
 @keyframes toast-in {
@@ -351,6 +391,11 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
 .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; font-weight: 500; }
 .flash.ok { background: var(--ok-bg); color: var(--ok); }
 .flash.error { background: var(--danger-bg); color: var(--danger); }
+
+/* Import errors list (import.html): compact, danger-colored via .error-text
+   on the items themselves. */
+.error-list { margin: 0; padding-left: 20px; }
+.error-list li { margin-bottom: 4px; }
 
 /* ---------- misc ---------- */
 
@@ -408,7 +453,8 @@ dialog {
   border-radius: var(--radius);
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
   padding: 22px;
-  max-width: 460px;
+  /* Keeps a margin from the screen edges on phones. */
+  max-width: min(460px, calc(100vw - 32px));
   background: var(--panel);
   color: var(--text);
 }
@@ -422,7 +468,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   align-items: center;
   justify-content: center;
 }
-.login-box { width: 340px; }
+.login-box { width: min(340px, calc(100vw - 32px)); }
 
 .htmx-indicator { display: none; }
 .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline-block; }
@@ -562,4 +608,80 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   gap: 18px;
   margin: 4px 0 8px;
   flex-wrap: wrap;
+}
+
+/* ---------- mobile adaptation ---------- */
+
+/* One breakpoint below the existing 900px grid collapse. Everything here
+   must degrade gracefully without JavaScript. */
+@media (max-width: 700px) {
+  .container { padding: 16px 12px 48px; }
+  .panel { padding: 14px; }
+
+  /* Topbar wraps into two rows: brand + switchers + logout on the first
+     line, the nav as a horizontally scrollable strip below (no burger
+     menu — the panel must keep working without JS). */
+  .topbar {
+    flex-wrap: wrap;
+    height: auto;
+    row-gap: 2px;
+    padding: 8px 12px;
+  }
+  .topbar .brand { font-size: 16px; }
+  .topbar .spacer { min-width: 8px; }
+  .topbar nav {
+    order: 10;
+    flex-basis: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    margin: 0 -4px;
+    padding: 2px 4px;
+  }
+  .topbar nav::-webkit-scrollbar { display: none; }
+  .topbar nav a { white-space: nowrap; padding: 8px 12px; }
+
+  /* iOS Safari zooms the page on focus for any input with font-size
+     below 16px — keep form controls at 16px. The selectors mirror the
+     base rules so specificity does not let `font: inherit` win. */
+  .field input[type="text"], .field input[type="number"],
+  .field input[type="password"], .field input[type="url"],
+  .field select, .field textarea,
+  .filters .field input, .filters .field select { font-size: 16px; }
+
+  /* Comfortable touch targets for small controls. */
+  .btn.small { padding: 8px 12px; }
+  .check-row input { width: 18px; height: 18px; }
+  .pagination a, .pagination span.page { padding: 8px 13px; }
+
+  /* Narrower truncation caps: more columns fit before the scroll
+     container kicks in. */
+  .truncate { max-width: 180px; }
+  .cell-link { max-width: 160px; }
+  /* Readable floors for the columns that are allowed to shrink
+     (`overflow-wrap: anywhere` would otherwise squeeze them to a few
+     characters per line under table width pressure): the wrapping error
+     cell keeps a 200px floor, a host:port cell 150px, kv labels 110px. */
+  .cell-wrap { max-width: 240px; min-width: 200px; }
+  table.data td.addr { min-width: 150px; }
+  .kv th { width: auto; min-width: 110px; }
+
+  /* Distribution rows (stats): counters drop onto their own line
+     instead of squeezing the bar. */
+  .stat-split-row { flex-wrap: wrap; }
+
+  /* Ingest chart: the label is a column-flex child sized to its content
+     (up to the 64px cap), so on a narrow screen the seven 64px labels
+     overlap each other — cap them at the bar width instead. */
+  .stat-bar-label { max-width: 100%; }
+
+  /* Toasts span the viewport instead of hanging off its right edge. */
+  .toast-wrap { left: 12px; right: 12px; bottom: 12px; }
+  .toast { max-width: none; }
+
+  dialog { padding: 16px; }
+
+  /* Secondary columns of the widest tables — hidden, the scroll
+     container covers the rest. */
+  .col-optional { display: none; }
 }

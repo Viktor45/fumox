@@ -217,15 +217,13 @@ table.data tr:last-child td { border-bottom: none; }
 table.data tr:hover td { background: var(--row-hover); }
 table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* One-line cell with ellipsis and the full text in the title tooltip:
-   long error messages / URLs must not stretch (or re-flow) the columns. */
-.cell-truncate {
-  display: inline-block;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  vertical-align: bottom;
+/* Wrapping cell for long error messages / URLs: the text flows onto as
+   many lines as it needs (breaking anywhere, URLs have no spaces), so the
+   column never stretches the table — it just grows downward. */
+.cell-wrap {
+  max-width: 360px;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 /* Short mono identifiers (protocol names, probe kinds, output formats)
    never break across lines: `overflow-wrap: anywhere` on body would

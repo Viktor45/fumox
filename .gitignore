@@ -44,3 +44,4 @@ config/meow.yaml
 # fixture tests skip themselves when the file is absent.
 test.txt
 
+test2.txt

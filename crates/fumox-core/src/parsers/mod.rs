@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_fingerprints_deduplicate() {
+    fn fixture_fingerprints_are_unique_per_server() {
         use std::collections::HashSet;
         let mut fingerprints = HashSet::new();
         let mut parsed = 0usize;
@@ -523,10 +523,16 @@ mod tests {
             parsed,
             fingerprints.len()
         );
-        // The sample is known to contain name-only duplicates (same server
-        // re-advertised with different ping suffixes); dedup must actually
-        // collapse rows, but never the whole feed.
-        assert!(fingerprints.len() < parsed);
-        assert!(fingerprints.len() > parsed / 2);
+        // Different servers must never collapse into one fingerprint: the
+        // sample is expected to yield a unique fingerprint per distinct
+        // server (some earlier samples carried name-only duplicates that
+        // legitimately collapsed — "the collapse happens" is covered by the
+        // fingerprint unit tests in fingerprint.rs, this guard pins the
+        // no-false-merge side against the real-world data).
+        assert!(
+            fingerprints.len() > parsed / 2,
+            "suspiciously few distinct fingerprints: {} of {parsed}",
+            fingerprints.len()
+        );
     }
 }

@@ -90,7 +90,7 @@
           <td class="small">
             {% match row.error %}
               {% when Some with (message) %}
-                <span class="cell-truncate" title="{{ message }}">{{ message }}</span>
+                <span class="cell-wrap">{{ message }}</span>
               {% when None %}
             {% endmatch %}
           </td>

@@ -315,8 +315,6 @@ struct ProxyDetailTemplate {
     probes: Vec<ProbeHistoryRow>,
     links: Vec<LinkRow>,
     unprobeable: bool,
-    /// Whether any GeoLite2 database is open for the resolve action.
-    geo_available: bool,
 }
 
 impl ProxyDetailTemplate {
@@ -352,11 +350,15 @@ pub async fn proxy_detail(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
-    let proxy = match proxies::get_by_id(&state.pool, id).await {
+    let mut proxy = match proxies::get_by_id(&state.pool, id).await {
         Ok(Some(proxy)) => proxy,
         Ok(None) => return not_found(lang, "err.proxy_not_found"),
         Err(err) => return server_error(lang, &err),
     };
+
+    // Opening the card refreshes the geo facts from every available
+    // GeoLite2 database (City/ASN included) — no button to click.
+    refresh_geo(&state, &mut proxy).await;
 
     // Every value is server-generated (statuses, counters, timestamps,
     // numbers) — the template renders them with askama's `| safe` so the
@@ -462,7 +464,6 @@ pub async fn proxy_detail(
             probes,
             links,
             unprobeable,
-            geo_available: state.geo_full.is_active(),
         },
         StatusCode::OK,
     )
@@ -583,104 +584,27 @@ pub async fn proxy_reset(
     )
 }
 
-// ---------------------------------------------------------------------------
-// On-demand geo enrichment (proxy card)
-// ---------------------------------------------------------------------------
-
-/// Standalone fragment for the geography block of the proxy card: the same
-/// markup is `{% include %}`d into the full card, so the initial render and
-/// every HTMX swap stay byte-identical.
-#[derive(Template)]
-#[template(path = "proxies/_geo.html")]
-struct GeoFragment {
-    lang: Lang,
-    csrf: String,
-    proxy: proxies::ProxyRow,
-    geo_available: bool,
-}
-
-impl GeoFragment {
-    fn flag(&self, country: &Option<String>) -> String {
-        flag_for(country)
-    }
-}
-
-impl_i18n!(GeoFragment);
-
-/// Enrich one proxy with City/ASN facts from the GeoLite2 databases in
-/// `[geo].db_dir` (all three, not just the pipeline's `[geo].db`): resolve
-/// the host, merge the facts and store them together with the resolved IP.
-pub async fn proxy_resolve_geo(
-    State(state): State<AdminState>,
-    Path(id): Path<i64>,
-    headers: HeaderMap,
-) -> Response {
-    let lang = state.locales.lang_from_headers(&headers);
-    let Some(proxy) = proxies::get_by_id(&state.pool, id).await.unwrap_or(None) else {
-        return not_found(lang, "err.proxy_not_found");
-    };
-
-    // Nothing to resolve with: report it instead of pretending success.
+/// Refresh the geo facts of one proxy from every GeoLite2 database in
+/// `[geo].db_dir` (Country, City, ASN — the card shows all of them, not
+/// just the pipeline's `[geo].db`). Called while rendering the card, so
+/// opening the page is enough and no button is needed. A host that does
+/// not resolve keeps its stored facts — an empty stamp must never wipe
+/// them; the resolver's DNS+lookup cache makes repeat opens cheap.
+async fn refresh_geo(state: &AdminState, proxy: &mut proxies::ProxyRow) {
     if !state.geo_full.is_active() {
-        let fragment = GeoFragment {
-            lang: lang.clone(),
-            csrf: state.csrf_for(&headers),
-            proxy,
-            geo_available: false,
-        };
-        let mut response = render_html(lang.clone(), &fragment, StatusCode::OK);
-        if is_htmx(&headers) {
-            let payload = format!(
-                "{{\"toast\": {{\"message\": \"{}\", \"level\": \"error\"}}}}",
-                super::header_safe(lang.t("px.geo_unavailable"))
-            );
-            if let Ok(value) = axum::http::HeaderValue::from_str(&payload) {
-                response.headers_mut().insert("HX-Trigger", value);
-            }
-        }
-        return response;
+        return;
     }
-
-    let (stamp, resolved_ip) = match state.geo_full.resolve(&proxy.host).await {
-        Some(info) => (proxies::GeoStamp::from_info(&info), info.ip),
-        // Host unresolvable or unknown to the databases: keep the row as
-        // is and tell the user — an empty stamp must not wipe stored facts.
-        None => (
-            proxies::GeoStamp {
-                country: proxy.geo_country.clone(),
-                city: proxy.geo_city.clone(),
-                asn: proxy.geo_asn.clone(),
-            },
-            proxy.resolved_ip.clone().unwrap_or_default(),
-        ),
+    let Some(info) = state.geo_full.resolve(&proxy.host).await else {
+        return;
     };
-    if let Err(err) = proxies::update_geo_full(&state.pool, id, &stamp, &resolved_ip).await {
-        return server_error(lang, &err);
+    let stamp = proxies::GeoStamp::from_info(&info);
+    if let Err(err) = proxies::update_geo_full(&state.pool, proxy.id, &stamp, &info.ip).await {
+        tracing::warn!(proxy_id = proxy.id, error = %err, "card geo refresh failed");
+        return;
     }
-
-    tracing::info!(proxy_id = id, host = %proxy.host, "on-demand geo resolve");
-    // Re-render the fragment from the updated row so the card reflects
-    // exactly what is now stored.
-    let updated = proxies::get_by_id(&state.pool, id)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(proxy);
-    let fragment = GeoFragment {
-        lang: lang.clone(),
-        csrf: state.csrf_for(&headers),
-        proxy: updated,
-        geo_available: true,
-    };
-    let mut response = render_html(lang.clone(), &fragment, StatusCode::OK);
-    if is_htmx(&headers) {
-        let payload = format!(
-            "{{\"toast\": {{\"message\": \"{}\", \"level\": \"ok\"}}}}",
-            super::header_safe(lang.t("px.geo_resolved_toast"))
-        );
-        if let Ok(value) = axum::http::HeaderValue::from_str(&payload) {
-            response.headers_mut().insert("HX-Trigger", value);
-        }
-    }
-    response
+    tracing::debug!(proxy_id = proxy.id, host = %proxy.host, "card geo refreshed");
+    proxy.geo_country = stamp.country;
+    proxy.geo_city = stamp.city;
+    proxy.geo_asn = stamp.asn;
+    proxy.resolved_ip = Some(info.ip);
 }

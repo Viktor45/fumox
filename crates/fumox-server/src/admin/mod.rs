@@ -186,10 +186,6 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/proxies/{id}", get(handlers::proxy_detail))
         .route("/proxies/{id}/reset", post(handlers::proxy_reset))
         .route(
-            "/proxies/{id}/resolve-geo",
-            post(handlers::proxy_resolve_geo),
-        )
-        .route(
             "/proxies/{id}/probe-history",
             get(handlers::proxy_probe_history),
         )
@@ -1224,13 +1220,13 @@ mod tests {
         assert!(html.contains("avg: 52"), "{html}");
     }
 
-    /// Proxy-card geo resolve action (SPEC §6, on-demand City/ASN): with the
-    /// GeoLite2 databases in the workspace `config/` the POST stores the
-    /// country/city/ASN facts and the resolved IP; without them the action
-    /// degrades to a disabled button and never wipes stored facts. Skipped
-    /// in CI (no .mmdb files there).
+    /// Proxy-card geo refresh (SPEC §6, on-demand City/ASN): opening the
+    /// card resolves the host against every GeoLite2 database in the
+    /// workspace `config/` and stores the country/city/ASN facts plus the
+    /// resolved IP; without them the card renders the stored facts as-is
+    /// (and never wipes them). Skipped in CI (no .mmdb files there).
     #[tokio::test]
-    async fn proxy_geo_resolve_fills_city_and_asn_from_databases() {
+    async fn proxy_card_refreshes_geo_facts_on_open() {
         // The workspace config/ directory with the gitignored .mmdb files;
         // when absent (CI) the test exercises the no-databases degradation.
         let db_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1293,12 +1289,9 @@ mod tests {
             .await
             .unwrap();
 
-        let app = router(state.clone());
+        // Opening the card is the whole interaction — no button, no POST.
+        let app = router(state);
         let cookie = login(&app).await;
-        let csrf = csrf_for(&state, &cookie);
-
-        // The card carries the resolve button (disabled without the
-        // databases — the default test config points at a db_dir with none).
         let response = app
             .clone()
             .oneshot(request(
@@ -1312,30 +1305,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html).into_owned();
-        assert!(html.contains("resolve-geo"), "{html}");
+        // The geography block renders (the card, not a swap fragment).
+        assert!(
+            html.contains("px.geography") || html.contains("География"),
+            "{html}"
+        );
+        assert!(!html.contains("resolve-geo"), "the button is gone: {html}");
 
-        let response = app
-            .clone()
-            .oneshot(request(
-                "POST",
-                &format!("/admin/proxies/{id}/resolve-geo"),
-                &format!("_csrf={csrf}"),
-                Some(&cookie),
-            ))
+        let row = fumox_core::repo::proxies::get_by_id(&pool, id)
             .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let html = response.into_body().collect().await.unwrap().to_bytes();
-        let html = String::from_utf8_lossy(&html).into_owned();
-        assert!(html.contains("id=\"geo-card\""), "{html}");
-
+            .unwrap()
+            .expect("proxy row");
         if has_dbs {
-            // The resolver had the databases: the row now carries country,
-            // the resolved IP and (City/ASN being present) city/ASN facts.
-            let row = fumox_core::repo::proxies::get_by_id(&pool, id)
-                .await
-                .unwrap()
-                .expect("proxy row");
+            // The resolver had the databases: the row now carries the
+            // country, the resolved IP and ASN facts, and the card shows
+            // them.
             assert_eq!(row.geo_country.as_deref(), Some("US"));
             assert_eq!(row.resolved_ip.as_deref(), Some("8.8.8.8"));
             let asn = row
@@ -1343,18 +1327,12 @@ mod tests {
                 .clone()
                 .expect("ASN database present — ASN expected");
             assert!(asn.starts_with("AS"), "asn format: {asn}");
-            assert!(row.geo_city.is_some() || row.geo_asn.is_some());
-            // The fragment rendered the refreshed values.
-            assert!(html.contains("AS"), "{html}");
+            assert!(html.contains("AS"), "card shows the ASN: {html}");
+            assert!(html.contains("8.8.8.8"), "card shows the IP: {html}");
         } else {
-            // Without the databases the action must not wipe anything and
-            // the fragment explains that geo is unavailable.
-            let row = fumox_core::repo::proxies::get_by_id(&pool, id)
-                .await
-                .unwrap()
-                .expect("proxy row");
+            // Without the databases the card renders the stored facts
+            // (none here) and never wipes anything.
             assert_eq!(row.geo_country, None);
-            assert!(html.contains("disabled"), "{html}");
         }
     }
 

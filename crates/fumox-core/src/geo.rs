@@ -202,46 +202,143 @@ impl GeoResolver {
             .await
             .ok()?
             .ok()?;
-        let mut addrs = lookup.map(|addr| addr.ip());
-        let first = addrs.next()?;
-        Some(addrs.find(IpAddr::is_ipv4).unwrap_or(first))
+        first_ip(lookup)
     }
 }
 
-fn lookup(backend: &Backend, ip: IpAddr) -> Option<GeoInfo> {
+/// Pick the address to geo-resolve: the first IPv4 answer, falling back to
+/// whatever came first (proxy servers are overwhelmingly IPv4-reachable).
+fn first_ip(lookup: impl Iterator<Item = std::net::SocketAddr>) -> Option<IpAddr> {
+    let mut addrs = lookup.map(|addr| addr.ip());
+    let first = addrs.next()?;
+    Some(addrs.find(IpAddr::is_ipv4).unwrap_or(first))
+}
+
+/// On-demand enrichment over **every** GeoLite2 database found in
+/// `[geo].db_dir` — not just the one `[geo].db` selects for the pipeline
+/// (admin proxy-card "resolve City/ASN" action). The three readers are
+/// opened lazily on first use and kept for the process lifetime; databases
+/// missing from the directory simply contribute no facts.
+pub struct FullResolver {
+    country: Option<Reader<Vec<u8>>>,
+    city: Option<Reader<Vec<u8>>>,
+    asn: Option<Reader<Vec<u8>>>,
+    dns_timeout: Duration,
+}
+
+impl FullResolver {
+    /// Open every database present in `db_dir`. Missing files are skipped
+    /// silently: the caller decides what to report when nothing resolved.
+    pub fn from_dir(cfg: &GeoConfig) -> Self {
+        let open = |kind: GeoDbKind| {
+            let path = cfg.db_dir.join(kind.file_name());
+            Reader::open_readfile(&path).ok()
+        };
+        Self {
+            country: open(GeoDbKind::Country),
+            city: open(GeoDbKind::City),
+            asn: open(GeoDbKind::Asn),
+            dns_timeout: Duration::from_secs(cfg.dns_timeout_secs),
+        }
+    }
+
+    /// Whether any database loaded at all — `false` means there is nothing
+    /// to enrich with and the UI should not offer the action.
+    pub fn is_active(&self) -> bool {
+        self.country.is_some() || self.city.is_some() || self.asn.is_some()
+    }
+
+    /// Resolve a host against every loaded database and merge the facts:
+    /// Country/City contribute the country (+ city for City), ASN the
+    /// autonomous system. `None` when the host does not resolve to an IP
+    /// or no database knows the address.
+    pub async fn resolve(&self, host: &str) -> Option<GeoInfo> {
+        let ip = match host.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => {
+                let lookup =
+                    tokio::time::timeout(self.dns_timeout, tokio::net::lookup_host((host, 0)))
+                        .await
+                        .ok()?
+                        .ok()?;
+                first_ip(lookup)?
+            }
+        };
+        let mut info = GeoInfo {
+            ip: ip.to_string(),
+            ..Default::default()
+        };
+        let mut any = false;
+        if let Some(reader) = &self.city {
+            if let Some(city) = lookup_city(reader, ip) {
+                info.country_code = info.country_code.or(city.country_code);
+                info.country_name = info.country_name.or(city.country_name);
+                info.city_name = info.city_name.or(city.city_name);
+                any = true;
+            }
+        }
+        if info.country_code.is_none() {
+            if let Some(reader) = &self.country {
+                if let Some(country) = lookup_country(reader, ip) {
+                    info.country_code = info.country_code.or(country.country_code);
+                    info.country_name = info.country_name.or(country.country_name);
+                    any = true;
+                }
+            }
+        }
+        if let Some(reader) = &self.asn {
+            if let Some(asn) = lookup_asn(reader, ip) {
+                info.asn = asn.asn;
+                info.asn_org = asn.asn_org;
+                any = true;
+            }
+        }
+        any.then_some(info)
+    }
+}
+
+fn lookup_country(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<GeoInfo> {
     use maxminddb::geoip2;
+    let record: geoip2::Country = reader.lookup(ip).ok()?.decode().ok().flatten()?;
+    if record.country.is_empty() {
+        return None;
+    }
+    Some(GeoInfo {
+        country_code: record.country.iso_code.map(str::to_string),
+        country_name: english_name(&record.country.names),
+        ..Default::default()
+    })
+}
+
+fn lookup_city(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<GeoInfo> {
+    use maxminddb::geoip2;
+    let record: geoip2::City = reader.lookup(ip).ok()?.decode().ok().flatten()?;
+    if record.country.is_empty() {
+        return None;
+    }
+    Some(GeoInfo {
+        country_code: record.country.iso_code.map(str::to_string),
+        country_name: english_name(&record.country.names),
+        city_name: english_name(&record.city.names),
+        ..Default::default()
+    })
+}
+
+fn lookup_asn(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<GeoInfo> {
+    use maxminddb::geoip2;
+    let record: geoip2::Asn = reader.lookup(ip).ok()?.decode().ok().flatten()?;
+    Some(GeoInfo {
+        asn: record.autonomous_system_number,
+        asn_org: record.autonomous_system_organization.map(str::to_string),
+        ..Default::default()
+    })
+}
+
+fn lookup(backend: &Backend, ip: IpAddr) -> Option<GeoInfo> {
     match backend {
-        Backend::Country(reader) => {
-            let record: geoip2::Country = reader.lookup(ip).ok()?.decode().ok().flatten()?;
-            if record.country.is_empty() {
-                return None;
-            }
-            Some(GeoInfo {
-                country_code: record.country.iso_code.map(str::to_string),
-                country_name: english_name(&record.country.names),
-                ..Default::default()
-            })
-        }
-        Backend::City(reader) => {
-            let record: geoip2::City = reader.lookup(ip).ok()?.decode().ok().flatten()?;
-            if record.country.is_empty() {
-                return None;
-            }
-            Some(GeoInfo {
-                country_code: record.country.iso_code.map(str::to_string),
-                country_name: english_name(&record.country.names),
-                city_name: english_name(&record.city.names),
-                ..Default::default()
-            })
-        }
-        Backend::Asn(reader) => {
-            let record: geoip2::Asn = reader.lookup(ip).ok()?.decode().ok().flatten()?;
-            Some(GeoInfo {
-                asn: record.autonomous_system_number,
-                asn_org: record.autonomous_system_organization.map(str::to_string),
-                ..Default::default()
-            })
-        }
+        Backend::Country(reader) => lookup_country(reader, ip),
+        Backend::City(reader) => lookup_city(reader, ip),
+        Backend::Asn(reader) => lookup_asn(reader, ip),
     }
 }
 
@@ -264,6 +361,93 @@ fn english_name(names: &maxminddb::geoip2::Names<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GeoConfig;
+
+    /// The workspace `config/` directory with the gitignored GeoLite2 files
+    /// (tests skip themselves when it is empty — CI runs without them).
+    fn workspace_db_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let has_any = [GeoDbKind::Country, GeoDbKind::City, GeoDbKind::Asn]
+            .iter()
+            .any(|kind| dir.join(kind.file_name()).is_file());
+        has_any.then(|| dir.canonicalize().unwrap())
+    }
+
+    fn full_resolver() -> Option<FullResolver> {
+        let dir = workspace_db_dir()?;
+        let resolver = FullResolver::from_dir(&GeoConfig {
+            db_dir: dir,
+            ..Default::default()
+        });
+        resolver.is_active().then_some(resolver)
+    }
+
+    /// All databases found in the directory answer at once: the merged facts
+    /// carry country, city and ASN for a known address. Skipped without the
+    /// .mmdb files.
+    #[tokio::test]
+    async fn full_resolver_merges_city_and_asn_facts() {
+        let Some(resolver) = full_resolver() else {
+            eprintln!("skipping: no GeoLite2 databases in workspace config/");
+            return;
+        };
+        let info = resolver.resolve("8.8.8.8").await.expect("8.8.8.8 is known");
+        assert_eq!(info.country_code.as_deref(), Some("US"));
+        assert_eq!(info.ip, "8.8.8.8");
+        // Whichever of City/ASN loaded contributes its fact. 8.8.8.8 is anycast
+        // Google DNS — the City database legitimately has no city for it, so
+        // the ASN database is the one carrying a fact here.
+        if workspace_db_dir()
+            .unwrap()
+            .join(GeoDbKind::Asn.file_name())
+            .is_file()
+        {
+            assert_eq!(info.asn, Some(15169), "Google ASN expected: {info:?}");
+            assert_eq!(info.asn_org.as_deref(), Some("Google LLC"));
+        }
+        // A residential-looking address the City database does know: the
+        // merge must pick the city up alongside the country.
+        if let Some(info) = resolver.resolve("81.19.44.10").await {
+            if info.country_code.is_some() {
+                // only assert the shape — the specific city varies by build
+                assert!(info.city_name.is_some() || info.asn.is_some());
+            }
+        }
+    }
+
+    /// A literal-IP host needs no DNS; a bogus host resolves to nothing
+    /// rather than panicking.
+    #[tokio::test]
+    async fn full_resolver_without_databases_is_inactive() {
+        let resolver = FullResolver::from_dir(&GeoConfig {
+            db_dir: std::path::PathBuf::from("/nonexistent-geo-dir"),
+            ..Default::default()
+        });
+        assert!(!resolver.is_active());
+        assert!(resolver.resolve("8.8.8.8").await.is_none());
+    }
+
+    /// The pipeline resolver keeps working on its single configured database
+    /// regardless of the others (regression guard for the refactor that
+    /// extracted the per-kind lookup helpers). Skipped without the files.
+    #[tokio::test]
+    async fn pipeline_resolver_still_resolves_its_configured_database() {
+        let Some(dir) = workspace_db_dir() else {
+            eprintln!("skipping: no GeoLite2 databases in workspace config/");
+            return;
+        };
+        let resolver = GeoResolver::new(&GeoConfig {
+            enabled: true,
+            db_dir: dir,
+            ..Default::default()
+        });
+        if !resolver.is_active() {
+            eprintln!("skipping: configured database (Country) not present");
+            return;
+        }
+        let info = resolver.resolve("8.8.8.8").await.expect("8.8.8.8 known");
+        assert_eq!(info.country_code.as_deref(), Some("US"));
+    }
 
     #[test]
     fn flag_emoji_from_iso_codes() {

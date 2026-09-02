@@ -31,6 +31,10 @@ pub struct AdminState {
     pub pool: DbPool,
     pub caches: Caches,
     pub geo: Arc<GeoResolver>,
+    /// On-demand enrichment over every GeoLite2 database in `[geo].db_dir`
+    /// (admin proxy-card "resolve City/ASN" action). Opened lazily on first
+    /// use — the files are large and the action is rare.
+    pub geo_full: Arc<fumox_core::geo::FullResolver>,
     /// Immediate-refresh channel into the scheduler (source ids).
     pub refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Scheduler handle: in-flight status for "обновить сейчас" fragments.
@@ -91,10 +95,12 @@ impl AdminState {
         let locales = Arc::new(i18n::Locales::load(std::path::Path::new(
             &config.admin.locales_dir,
         )));
+        let geo_full = Arc::new(fumox_core::geo::FullResolver::from_dir(&config.geo));
         Self {
             pool,
             caches,
             geo,
+            geo_full,
             refresh_tx,
             scheduler,
             events,
@@ -180,11 +186,16 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/proxies/{id}", get(handlers::proxy_detail))
         .route("/proxies/{id}/reset", post(handlers::proxy_reset))
         .route(
+            "/proxies/{id}/resolve-geo",
+            post(handlers::proxy_resolve_geo),
+        )
+        .route(
             "/proxies/{id}/probe-history",
             get(handlers::proxy_probe_history),
         )
         .route("/logs/fetch", get(handlers::fetch_logs))
         .route("/probe", get(handlers::probe_overview))
+        .route("/stats", get(handlers::stats))
         // Pipeline builder widget (PIPELINE.md §3): server-side generation
         // and validation inside the same auth+CSRF envelope as every POST.
         .route("/pipeline/preview", post(handlers::pipeline_preview))
@@ -738,6 +749,7 @@ mod tests {
             "/admin/proxies",
             "/admin/logs/fetch",
             "/admin/import",
+            "/admin/stats",
         ] {
             let response = app
                 .clone()
@@ -1061,6 +1073,289 @@ mod tests {
         assert!(html.contains("<time class=\"ts\" datetime=\""), "{html}");
         assert!(html.contains("Z\">"), "{html}");
         assert!(html.contains("</time>"), "{html}");
+    }
+
+    /// Two sources with proxies in every status plus probe history; the
+    /// stats screen must render the per-source health counters, the
+    /// longest-living top and the 24h probe success rate.
+    #[tokio::test]
+    async fn stats_screen_aggregates_per_source_and_top_alive() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+        for id in ["srcS0000001", "srcS0000002"] {
+            let source = fumox_core::models::Source {
+                id: id.into(),
+                slug: None,
+                name: format!("source {id}"),
+                url: "https://example.com/sub".into(),
+                enabled: true,
+                encoding: Default::default(),
+                input_format: None,
+                protocols: None,
+                cache_ttl_seconds: 3600,
+                tags: None,
+                pipeline: None,
+                headers: None,
+                ip_family: None,
+                created_at: now,
+                updated_at: now,
+                last_fetched_at: None,
+                last_error: None,
+                error_class: None,
+            };
+            fumox_core::repo::sources::create(&pool, &source)
+                .await
+                .unwrap();
+        }
+
+        // (fingerprint, source, status, age seconds, latency, country)
+        let rows = [
+            (
+                "fp-veteran",
+                "srcS0000001",
+                "alive",
+                500_000,
+                Some(90),
+                Some("DE"),
+            ),
+            (
+                "fp-fast",
+                "srcS0000001",
+                "alive",
+                4_000,
+                Some(15),
+                Some("DE"),
+            ),
+            (
+                "fp-sick",
+                "srcS0000001",
+                "quarantine",
+                100_000,
+                None,
+                Some("US"),
+            ),
+            ("fp-new", "srcS0000001", "unknown", 600, None, None),
+            (
+                "fp-dead",
+                "srcS0000001",
+                "removed",
+                900_000,
+                None,
+                Some("US"),
+            ),
+            ("fp-tuic", "srcS0000002", "unknown", 50_000, None, None),
+        ];
+        for (fp, source, status, age, latency, country) in rows {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
+                                      status, latency_ms, geo_country, created_at, updated_at)
+                 VALUES (?, ?, ?, 'h.example.com', 443, 'c', ?, ?, ?, ?, ?)",
+            )
+            .bind(fp)
+            .bind(if fp == "fp-tuic" { "tuic" } else { "vless" })
+            .bind(fp)
+            .bind(status)
+            .bind(latency)
+            .bind(country)
+            .bind(now - age)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
+                 SELECT id, ?, ? FROM proxies WHERE fingerprint = ?",
+            )
+            .bind(source)
+            .bind(now)
+            .bind(fp)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Probe history: 2 ok + 1 fail over the last hour.
+        for (ok, latency) in [(1, Some(90)), (1, Some(120)), (0, None)] {
+            let proxy_id: i64 =
+                sqlx::query_scalar("SELECT id FROM proxies WHERE fingerprint = 'fp-veteran'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            sqlx::query(
+                "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, probe_kind)
+                 VALUES (?, ?, ?, ?, 'tcp')",
+            )
+            .bind(proxy_id)
+            .bind(now - 600)
+            .bind(ok)
+            .bind(latency)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/stats", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html).into_owned();
+
+        // The page and its panels render.
+        assert!(html.contains("Статистика"), "{html}");
+        assert!(html.contains("Прокси по источникам"), "{html}");
+        assert!(html.contains("Топ-10 самых живых прокси"), "{html}");
+        // Per-source counters: source 1 has 2 alive, source 2 has 1 unknown.
+        assert!(html.contains("source srcS0000001"), "{html}");
+        assert!(html.contains("source srcS0000002"), "{html}");
+        // Probe success rate: 2/3.
+        assert!(html.contains("2 / 3"), "{html}");
+        // The veteran (oldest alive) tops the longevity list.
+        assert!(html.contains("fp-veteran"), "{html}");
+        // Unprobeable counter includes the tuic proxy.
+        assert!(html.contains("непроверяемых (tuic/mieru): 1"), "{html}");
+        // Both latencies feed the min/avg card.
+        assert!(html.contains("min: 15"), "{html}");
+        assert!(html.contains("avg: 52"), "{html}");
+    }
+
+    /// Proxy-card geo resolve action (SPEC §6, on-demand City/ASN): with the
+    /// GeoLite2 databases in the workspace `config/` the POST stores the
+    /// country/city/ASN facts and the resolved IP; without them the action
+    /// degrades to a disabled button and never wipes stored facts. Skipped
+    /// in CI (no .mmdb files there).
+    #[tokio::test]
+    async fn proxy_geo_resolve_fills_city_and_asn_from_databases() {
+        // The workspace config/ directory with the gitignored .mmdb files;
+        // when absent (CI) the test exercises the no-databases degradation.
+        let db_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config")
+            .canonicalize()
+            .unwrap();
+        let geo_cfg = fumox_core::config::GeoConfig {
+            enabled: false, // pipeline resolver stays inactive — irrelevant here
+            db_dir: db_dir.clone(),
+            ..Default::default()
+        };
+
+        // Build the state directly (test_state pins db_dir to "config"
+        // relative to the crate working directory).
+        let dir =
+            std::env::temp_dir().join(format!("fumox-admin-geo-{}", fumox_core::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_cfg = fumox_core::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        };
+        let pool = fumox_core::db::connect_pool(&db_cfg).await.unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(refresh_rx);
+        let config = fumox_core::AppConfig {
+            admin: admin_config(1000),
+            geo: geo_cfg,
+            ..Default::default()
+        };
+        let fetcher = Fetcher::new(config.fetch.clone(), config.admin.allow_private_urls);
+        let state = AdminState::new(
+            pool.clone(),
+            crate::cache::Caches::new(),
+            Arc::new(GeoResolver::new(&fumox_core::config::GeoConfig {
+                enabled: false,
+                ..Default::default()
+            })),
+            refresh_tx,
+            SchedulerState::new(1),
+            EventBus::new(),
+            fetcher,
+            config,
+        );
+        let has_dbs = state.geo_full.is_active();
+
+        let now = fumox_core::models::now_ts();
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
+                                  status, created_at, updated_at)
+             VALUES ('fp-geo-8.8.8.8', 'vless', 'geo-test', '8.8.8.8', 443, 'c', 'unknown', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM proxies WHERE host = '8.8.8.8'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // The card carries the resolve button (disabled without the
+        // databases — the default test config points at a db_dir with none).
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/admin/proxies/{id}"),
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html).into_owned();
+        assert!(html.contains("resolve-geo"), "{html}");
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!("/admin/proxies/{id}/resolve-geo"),
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html).into_owned();
+        assert!(html.contains("id=\"geo-card\""), "{html}");
+
+        if has_dbs {
+            // The resolver had the databases: the row now carries country,
+            // the resolved IP and (City/ASN being present) city/ASN facts.
+            let row = fumox_core::repo::proxies::get_by_id(&pool, id)
+                .await
+                .unwrap()
+                .expect("proxy row");
+            assert_eq!(row.geo_country.as_deref(), Some("US"));
+            assert_eq!(row.resolved_ip.as_deref(), Some("8.8.8.8"));
+            let asn = row
+                .geo_asn
+                .clone()
+                .expect("ASN database present — ASN expected");
+            assert!(asn.starts_with("AS"), "asn format: {asn}");
+            assert!(row.geo_city.is_some() || row.geo_asn.is_some());
+            // The fragment rendered the refreshed values.
+            assert!(html.contains("AS"), "{html}");
+        } else {
+            // Without the databases the action must not wipe anything and
+            // the fragment explains that geo is unavailable.
+            let row = fumox_core::repo::proxies::get_by_id(&pool, id)
+                .await
+                .unwrap()
+                .expect("proxy row");
+            assert_eq!(row.geo_country, None);
+            assert!(html.contains("disabled"), "{html}");
+        }
     }
 
     #[tokio::test]

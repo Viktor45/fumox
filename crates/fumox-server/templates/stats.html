@@ -1,0 +1,245 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("nav.stats") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("nav.stats") }}</h1>
+</div>
+
+{# Probe summary: quick health counters at the top. #}
+<div class="grid cols-4">
+  <div class="panel stat-card">
+    <div class="num">{{ probes_ok_24h }} / {{ probes_total_24h }}</div>
+    <div class="label">{{ self.t("stats.probes_24h") }}</div>
+    {% if probes_total_24h > 0 %}
+      <div class="sub">{{ self.pct(probes_ok_24h, probes_total_24h) }}% {{ self.t("stats.success_rate") }}</div>
+    {% endif %}
+  </div>
+  <div class="panel stat-card">
+    <div class="num">
+      {% match latency_median %}
+        {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
+        {% when None %}<span class="muted">—</span>
+      {% endmatch %}
+    </div>
+    <div class="label">{{ self.t("stats.latency_median") }}</div>
+    <div class="sub">
+      {% match latency_min %}
+        {% when Some with (ms) %}min: {{ ms }} {{ self.t("common.ms") }} · {% when None %}{% endmatch %}
+      {% match latency_avg %}
+        {% when Some with (ms) %}avg: {{ ms }} {{ self.t("common.ms") }}{% when None %}{% endmatch %}
+    </div>
+  </div>
+  <div class="panel stat-card">
+    <div class="num">{{ in_quarantine }}</div>
+    <div class="label">{{ self.t("stats.in_quarantine") }}</div>
+    <div class="sub">{{ self.t("stats.awaiting_second_chance").replace("{}", &quarantine_second_chance.to_string()) }}</div>
+  </div>
+  <div class="panel stat-card">
+    <div class="num">{{ never_checked }}</div>
+    <div class="label">{{ self.t("stats.never_checked") }}</div>
+    <div class="sub">{{ self.t("stats.unprobeable_count").replace("{}", &unprobeable.to_string()) }}</div>
+  </div>
+</div>
+
+{# Per-source health: alive / quarantined / unknown / removed for every source. #}
+<div class="panel">
+  <h2>{{ self.t("stats.by_source") }}</h2>
+  {% if sources.is_empty() %}
+    <p class="muted">{{ self.t("stats.no_sources") }}</p>
+  {% else %}
+    <table class="data">
+      <thead>
+        <tr>
+          <th>{{ self.t("common.source") }}</th>
+          <th class="num">{{ self.t("common.status_alive") }}</th>
+          <th class="num">{{ self.t("common.status_quarantine") }}</th>
+          <th class="num">{{ self.t("common.status_unknown") }}</th>
+          <th class="num">{{ self.t("common.status_removed") }}</th>
+          <th class="num">{{ self.t("common.total") }}</th>
+          <th class="num">{{ self.t("stats.oldest_alive") }}</th>
+          <th class="num">{{ self.t("stats.schemes_count") }}</th>
+          <th class="num">{{ self.t("stats.countries_count") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in sources %}
+        <tr>
+          <td>
+            <a href="/admin/sources/{{ row.id }}">{{ row.name }}</a>
+            {% if row.enabled == 0 %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+          </td>
+          <td class="num">{% if row.alive > 0 %}<a href="/admin/proxies?status=alive&amp;source={{ row.id }}">{{ row.alive }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+          <td class="num">{% if row.quarantine > 0 %}<a href="/admin/proxies?status=quarantine&amp;source={{ row.id }}">{{ row.quarantine }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+          <td class="num">{% if row.unknown > 0 %}<a href="/admin/proxies?status=unknown&amp;source={{ row.id }}">{{ row.unknown }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+          <td class="num">{% if row.removed > 0 %}<a href="/admin/proxies?status=removed&amp;source={{ row.id }}">{{ row.removed }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+          <td class="num">{{ row.total }}</td>
+          <td class="small">{{ self.opt_ts(row.oldest_alive_at) | safe }}</td>
+          <td class="num">{{ row.schemes }}</td>
+          <td class="num">{{ row.countries }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+
+{# Ingest dynamics: new proxies per day over the last 7 days. #}
+<div class="panel">
+  <h2>{{ self.t("stats.ingest_week") }}</h2>
+  {% if ingest_max == 0 %}
+    <p class="muted">{{ self.t("stats.no_ingest_data") }}</p>
+  {% else %}
+    <div class="stat-bars">
+      {% for (day, created) in ingest_days %}
+      <div class="stat-bar" title="{{ created }}">
+        <div class="stat-bar-col">
+          <div class="stat-bar-fill" style="height: {{ self.bar_width(created, ingest_max) }}%"></div>
+        </div>
+        <div class="stat-bar-num">{{ created }}</div>
+        <div class="stat-bar-label">{{ self.ts(day) | safe }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>
+
+{# Top-10 longest-living alive proxies. #}
+<div class="panel">
+  <h2>{{ self.t("stats.top_alive") }}</h2>
+  {% if top_alive.is_empty() %}
+    <p class="muted">{{ self.t("stats.no_alive") }}</p>
+  {% else %}
+    <table class="data">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>{{ self.t("common.protocol") }}</th>
+          <th>{{ self.t("px.address") }}</th>
+          <th>{{ self.t("common.country") }}</th>
+          <th>{{ self.t("common.name") }}</th>
+          <th>{{ self.t("stats.in_base_since") }}</th>
+          <th>{{ self.t("common.latency") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in top_alive %}
+        <tr>
+          <td class="muted">{{ loop.index }}</td>
+          <td class="mono small">{{ row.scheme }}</td>
+          <td class="mono small addr">{{ row.host }}:{{ row.port }}</td>
+          <td class="small">{{ self.flag(row.geo_country) }}
+            {% match row.geo_country %}
+              {% when Some with (country) %}{{ country }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+          <td class="small truncate" title="{{ row.source_names }}">
+            <a href="/admin/proxies/{{ row.id }}">{{ self.short_name(row.name) }}</a>
+          </td>
+          <td class="small">{{ self.ts(row.created_at) | safe }}</td>
+          <td class="num small">
+            {% match row.latency_ms %}
+              {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
+              {% when None %}<span class="muted">—</span>
+            {% endmatch %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+
+<div class="grid cols-2">
+  {# Protocol distribution with health split per scheme. #}
+  <div class="panel">
+    <h2>{{ self.t("stats.by_scheme") }}</h2>
+    {% if schemes.is_empty() %}
+      <p class="muted">{{ self.t("stats.no_proxies") }}</p>
+    {% else %}
+      <div class="stat-split">
+        {% for row in schemes %}
+        <div class="stat-split-row">
+          <div class="stat-split-name mono">{{ row.value }}</div>
+          <div class="stat-split-bar">
+            {% if row.alive > 0 %}
+              <span class="stat-split-seg alive" style="--w: {{ self.bar_width(row.alive, row.total) }}%"></span>
+            {% endif %}
+            {% if row.quarantine > 0 %}
+              <span class="stat-split-seg quarantine" style="--w: {{ self.bar_width(row.quarantine, row.total) }}%"></span>
+            {% endif %}
+            {% if row.unknown > 0 %}
+              <span class="stat-split-seg unknown" style="--w: {{ self.bar_width(row.unknown, row.total) }}%"></span>
+            {% endif %}
+            {% if row.removed > 0 %}
+              <span class="stat-split-seg removed" style="--w: {{ self.bar_width(row.removed, row.total) }}%"></span>
+            {% endif %}
+          </div>
+          <div class="stat-split-counts">
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=alive" class="badge alive" title="{{ self.t("common.status_alive") }}">{{ row.alive }}</a>
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=quarantine" class="badge quarantine" title="{{ self.t("common.status_quarantine") }}">{{ row.quarantine }}</a>
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=unknown" class="badge unknown" title="{{ self.t("common.status_unknown") }}">{{ row.unknown }}</a>
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=removed" class="badge removed" title="{{ self.t("common.status_removed") }}">{{ row.removed }}</a>
+            <span class="badge neutral" title="{{ self.t("common.total") }}">{{ row.total }}</span>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+
+  {# Country distribution (top 15) with health split per country. #}
+  <div class="panel">
+    <h2>{{ self.t("stats.by_country") }}</h2>
+    {% if countries.is_empty() %}
+      <p class="muted">{{ self.t("stats.no_proxies") }}</p>
+    {% else %}
+      <div class="stat-split">
+        {% for row in countries %}
+        {% if loop.index <= 15 %}
+        <div class="stat-split-row">
+          <div class="stat-split-name">{{ self.flag(row.value) }}
+            {% match row.value %}
+              {% when Some with (country) %}{{ country }}
+              {% when None %}<span class="muted">{{ self.t("stats.no_country") }}</span>
+            {% endmatch %}
+          </div>
+          <div class="stat-split-bar">
+            {% if row.alive > 0 %}
+              <span class="stat-split-seg alive" style="--w: {{ self.bar_width(row.alive, row.total) }}%"></span>
+            {% endif %}
+            {% if row.quarantine > 0 %}
+              <span class="stat-split-seg quarantine" style="--w: {{ self.bar_width(row.quarantine, row.total) }}%"></span>
+            {% endif %}
+            {% if row.unknown > 0 %}
+              <span class="stat-split-seg unknown" style="--w: {{ self.bar_width(row.unknown, row.total) }}%"></span>
+            {% endif %}
+            {% if row.removed > 0 %}
+              <span class="stat-split-seg removed" style="--w: {{ self.bar_width(row.removed, row.total) }}%"></span>
+            {% endif %}
+          </div>
+          <div class="stat-split-counts">
+            {% match row.value %}
+              {% when Some with (country) %}
+                <a href="/admin/proxies?country={{ country }}&amp;status=alive" class="badge alive" title="{{ self.t("common.status_alive") }}">{{ row.alive }}</a>
+                <a href="/admin/proxies?country={{ country }}&amp;status=quarantine" class="badge quarantine" title="{{ self.t("common.status_quarantine") }}">{{ row.quarantine }}</a>
+                <a href="/admin/proxies?country={{ country }}&amp;status=unknown" class="badge unknown" title="{{ self.t("common.status_unknown") }}">{{ row.unknown }}</a>
+                <a href="/admin/proxies?country={{ country }}&amp;status=removed" class="badge removed" title="{{ self.t("common.status_removed") }}">{{ row.removed }}</a>
+              {% when None %}
+                <span class="badge alive">{{ row.alive }}</span>
+                <span class="badge quarantine">{{ row.quarantine }}</span>
+                <span class="badge unknown">{{ row.unknown }}</span>
+                <span class="badge removed">{{ row.removed }}</span>
+            {% endmatch %}
+            <span class="badge neutral" title="{{ self.t("common.total") }}">{{ row.total }}</span>
+          </div>
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

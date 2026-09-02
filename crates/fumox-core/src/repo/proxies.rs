@@ -146,7 +146,14 @@ pub async fn reconcile_source(
     now: i64,
 ) -> crate::Result<ReconciliationStats> {
     let mut stats = ReconciliationStats::default();
-    let mut tx = pool.begin().await?;
+    // BEGIN IMMEDIATE: the first statement grabs the WAL write lock up
+    // front instead of upgrading a read transaction mid-flight. A deferred
+    // read→write upgrade fails with SQLITE_BUSY_SNAPSHOT (code 517) when
+    // another process (probe daemon) committed since our snapshot was
+    // taken — busy_timeout does not apply to that upgrade, so it surfaced
+    // as "database is locked" on source refreshes. With IMMEDIATE the
+    // whole critical section waits inside busy_timeout instead.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     // Pre-existing fingerprints, for insert/update accounting.
     let fingerprints: Vec<String> = entries.iter().map(ProxyEntry::fingerprint).collect();
@@ -291,6 +298,28 @@ pub async fn update_geo(pool: &DbPool, id: i64, geo: &GeoStamp) -> crate::Result
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Store the full outcome of an on-demand geo resolution: the facts plus
+/// the IP they were resolved from (admin proxy-card action).
+pub async fn update_geo_full(
+    pool: &DbPool,
+    id: i64,
+    geo: &GeoStamp,
+    resolved_ip: &str,
+) -> crate::Result<()> {
+    sqlx::query(
+        "UPDATE proxies SET geo_country = ?, geo_city = ?, geo_asn = ?, resolved_ip = ?
+         WHERE id = ?",
+    )
+    .bind(&geo.country)
+    .bind(&geo.city)
+    .bind(&geo.asn)
+    .bind(resolved_ip)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

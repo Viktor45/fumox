@@ -217,6 +217,26 @@ table.data tr:last-child td { border-bottom: none; }
 table.data tr:hover td { background: var(--row-hover); }
 table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* One-line cell with ellipsis and the full text in the title tooltip:
+   long error messages / URLs must not stretch (or re-flow) the columns. */
+.cell-truncate {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+/* Short mono identifiers (protocol names, probe kinds, output formats)
+   never break across lines: `overflow-wrap: anywhere` on body would
+   otherwise hyphenate `hysteria2` inside narrow table columns (probe
+   quarantine queue, stats). Host:port addresses keep wrapping — a long
+   hostname must not stretch the column. */
+table.data td.mono { white-space: nowrap; }
+table.data td.addr { overflow-wrap: anywhere; white-space: normal; }
+/* Status and error-class badges never break across lines — a wrapped
+   "http_server" would change the row height and shift the table. */
+table.data .badge { white-space: nowrap; }
 
 /* Local-time timestamps (base.html rewrites <time class="ts"> into the
    user's timezone): keep date and time on one line, never mid-cell wrap. */
@@ -408,6 +428,91 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 
 .htmx-indicator { display: none; }
 .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline-block; }
+
+/* ---------- statistics screen ---------- */
+
+/* Ingest chart: one column per day; the count rides above the bar and the
+   day label below (the <time> element is rewritten into the local zone by
+   the admin JS). Heights are server-computed percents, set inline. */
+.stat-bars {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding-top: 8px;
+}
+.stat-bar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+.stat-bar-col {
+  width: 100%;
+  max-width: 64px;
+  height: 120px;
+  display: flex;
+  align-items: flex-end;
+  border-radius: 6px 6px 0 0;
+  background: var(--th-bg);
+  overflow: hidden;
+}
+.stat-bar-fill {
+  width: 100%;
+  min-height: 0;
+  border-radius: 6px 6px 0 0;
+  background: var(--accent);
+}
+.stat-bar-num { font-size: 12px; font-variant-numeric: tabular-nums; }
+.stat-bar-label {
+  font-size: 10.5px;
+  color: var(--muted);
+  max-width: 64px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Scheme/country distribution: one row per bucket — name, stacked health
+   segments (widths via the inline --w custom property) and clickable
+   per-status counters. */
+.stat-split { display: flex; flex-direction: column; gap: 8px; }
+.stat-split-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.stat-split-name {
+  flex: 0 0 108px;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stat-split-bar {
+  flex: 1 1 120px;
+  display: flex;
+  gap: 1px;
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--badge-neutral-bg);
+}
+.stat-split-seg { height: 100%; width: var(--w, 0%); }
+.stat-split-seg.alive { background: var(--ok); }
+.stat-split-seg.quarantine { background: var(--warn); }
+.stat-split-seg.unknown { background: var(--accent); }
+.stat-split-seg.removed { background: var(--danger); }
+.stat-split-counts {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.stat-split-counts a.badge:hover { text-decoration: none; filter: brightness(0.92); }
 
 /* Pipeline builder widget (PIPELINE.md §3). */
 .ped-columns {

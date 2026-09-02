@@ -60,7 +60,7 @@
           <td class="small muted">{{ self.ts(row.fetched_at) | safe }}</td>
           <td>
             {% match row.source_name %}
-              {% when Some with (name) %}<a href="/admin/sources/{{ row.source_id }}">{{ name }}</a>
+              {% when Some with (name) %}<a class="truncate" style="display: inline-block; max-width: 220px;" href="/admin/sources/{{ row.source_id }}">{{ name }}</a>
               {% when None %}<span class="muted">{{ row.source_id }}</span>
             {% endmatch %}
           </td>
@@ -89,7 +89,8 @@
           </td>
           <td class="small">
             {% match row.error %}
-              {% when Some with (message) %}{{ message }}
+              {% when Some with (message) %}
+                <span class="cell-truncate" title="{{ message }}">{{ message }}</span>
               {% when None %}
             {% endmatch %}
           </td>

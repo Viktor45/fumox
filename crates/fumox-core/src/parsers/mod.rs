@@ -335,9 +335,11 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Fixture-driven tests against the real 1.1 MB subscription sample.
-    // The fixture is gitignored (it may contain non-public data) and is
-    // never committed; these tests skip themselves when it is absent.
+    // Fixture-driven tests against the real subscription sample in
+    // `test.txt`. The fixture is gitignored (it may contain non-public
+    // data) and is never committed; these tests skip themselves when it
+    // is absent. Thresholds below are calibrated for a ~390-line sample
+    // (Sept 2026); they guard against regressions, not exact sizes.
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -371,7 +373,7 @@ mod tests {
             assert_eq!(ser_prefix, orig_prefix, "authority/query round-trip broken");
             checked += 1;
         }
-        assert!(checked > 1900, "suspiciously few checked lines: {checked}");
+        assert!(checked > 300, "suspiciously few checked lines: {checked}");
     }
 
     fn fixture_path() -> std::path::PathBuf {
@@ -414,14 +416,16 @@ mod tests {
         for line in &unrecognized[..unrecognized.len().min(5)] {
             eprintln!("  unrecognized: {line}");
         }
-        // Goal (TODO 1.2): at least 99% of lines recognized. The sample is
-        // expected to parse at 100% minus the deliberately discarded happ://.
+        // Goal (TODO 1.2): at least 99% of lines recognized. The current
+        // sample (Sept 2026) parses at 100% minus one ss2022 line whose
+        // userinfo is plain text rather than base64 (SIP002 requires base64);
+        // happ:// lines, when present, are deliberately discarded.
         assert!(
             parsed + discarded >= (total * 99).div_ceil(100),
             "recognition rate below 99%: {parsed}+{discarded} of {total}"
         );
-        assert!(parsed > 2000, "suspiciously few parsed lines: {parsed}");
-        assert_eq!(discarded, 1, "exactly one happ:// line expected");
+        assert!(parsed > 350, "suspiciously few parsed lines: {parsed}");
+        assert!(discarded <= 1, "unexpected discards: {discarded}");
     }
 
     #[test]
@@ -447,7 +451,7 @@ mod tests {
             checked += 1;
         }
         assert!(
-            checked > 2000,
+            checked > 350,
             "suspiciously few round-tripped lines: {checked}"
         );
     }
@@ -488,7 +492,11 @@ mod tests {
             "fixture byte round-trip: {exact}/{total} = {:.1}%",
             rate * 100.0
         );
-        assert!(rate >= 0.40, "byte round-trip rate regressed: {rate:.3}");
+        // Floor for the current sample: 51/387 ≈ 13% — it is dominated by
+        // raw-UTF-8 names and vmess/ss normalization (all semantically
+        // verified). Keep a margin: 0.10 for this sample shape, 0.40 held
+        // for the previous percent-encoded-heavy sample.
+        assert!(rate >= 0.10, "byte round-trip rate regressed: {rate:.3}");
     }
 
     #[test]
@@ -515,8 +523,9 @@ mod tests {
             parsed,
             fingerprints.len()
         );
-        // The sample is known to contain name-only duplicates; dedup must
-        // actually collapse rows, but never the whole feed.
+        // The sample is known to contain name-only duplicates (same server
+        // re-advertised with different ping suffixes); dedup must actually
+        // collapse rows, but never the whole feed.
         assert!(fingerprints.len() < parsed);
         assert!(fingerprints.len() > parsed / 2);
     }

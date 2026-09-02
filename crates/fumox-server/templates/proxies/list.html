@@ -98,7 +98,7 @@
             {{ row.scheme }}
             {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">unprobeable</span>{% endif %}
           </td>
-          <td class="mono small">{{ row.host }}:{{ row.port }}</td>
+          <td class="mono small addr">{{ row.host }}:{{ row.port }}</td>
           <td class="small">{{ self.flag(row.geo_country) }}
             {% match row.geo_country %}
               {% when Some with (country) %}{{ country }}

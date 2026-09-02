@@ -9,6 +9,7 @@ mod probe;
 mod profiles;
 mod proxies;
 mod sources;
+mod stats;
 
 pub use import_export::*;
 pub use logs::*;
@@ -17,6 +18,7 @@ pub use probe::*;
 pub use profiles::*;
 pub use proxies::*;
 pub use sources::*;
+pub use stats::*;
 
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -294,7 +296,7 @@ pub fn not_found(lang: Lang, what_key: &str) -> Response {
 /// (isomorphic decode), so raw UTF-8 — e.g. a Russian toast message — would
 /// arrive as mojibake; percent-encoded UTF-8 survives the wire intact and is
 /// restored client-side with `decodeURIComponent`.
-fn header_safe(value: &str) -> String {
+pub(super) fn header_safe(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {

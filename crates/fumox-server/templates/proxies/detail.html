@@ -28,44 +28,14 @@
       <tr><th>{{ self.t("common.name") }}</th><td class="small">{{ proxy.name }}</td></tr>
       <tr><th>{{ self.t("common.protocol") }}</th><td class="mono small">{{ proxy.scheme }}</td></tr>
       <tr><th>{{ self.t("px.address") }}</th><td class="mono small">{{ proxy.host }}:{{ proxy.port }}</td></tr>
-      <tr><th>{{ self.t("px.credential") }}</th><td class="mono small">
-        {{ credential_display }}
-        {% if revealed %}
-          <a class="small" href="/admin/proxies/{{ proxy.id }}">{{ self.t("px.hide") }}</a>
-        {% else %}
-          <a class="small" href="/admin/proxies/{{ proxy.id }}?reveal=1">{{ self.t("px.reveal") }}</a>
-        {% endif %}
-      </td></tr>
+      {# The credential is shown in the open: the card also renders the raw
+         subscription line and the parsed params JSON below, both of which
+         carry the same secret — masking just this row was a false comfort. #}
+      <tr><th>{{ self.t("px.credential") }}</th><td class="mono small">{{ proxy.credential }}</td></tr>
       <tr><th>{{ self.t("px.fingerprint") }}</th><td class="mono small">{{ proxy.fingerprint }}</td></tr>
     </table>
 
-    <h3>{{ self.t("px.geography") }}</h3>
-    <table class="kv">
-      <tr><th>{{ self.t("common.country") }}</th><td>{{ self.flag(proxy.geo_country) }}
-        {% match proxy.geo_country %}
-          {% when Some with (country) %}{{ country }}
-          {% when None %}<span class="muted">—</span>
-        {% endmatch %}
-      </td></tr>
-      <tr><th>{{ self.t("px.city") }}</th><td>
-        {% match proxy.geo_city %}
-          {% when Some with (city) %}{{ city }}
-          {% when None %}<span class="muted">—</span>
-        {% endmatch %}
-      </td></tr>
-      <tr><th>ASN</th><td>
-        {% match proxy.geo_asn %}
-          {% when Some with (asn) %}{{ asn }}
-          {% when None %}<span class="muted">—</span>
-        {% endmatch %}
-      </td></tr>
-      <tr><th>{{ self.t("px.resolved_ip") }}</th><td class="mono small">
-        {% match proxy.resolved_ip %}
-          {% when Some with (ip) %}{{ ip }}
-          {% when None %}<span class="muted">—</span>
-        {% endmatch %}
-      </td></tr>
-    </table>
+    {% include "_geo.html" %}
   </div>
 
   <div class="panel">

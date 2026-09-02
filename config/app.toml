@@ -152,5 +152,5 @@ fetch_log_days = 30
 # probe for fumox-probe (at info the probe prints a «probe cycle done» line
 # every cycle; warn silences it). Full EnvFilter directives in RUST_LOG take
 # precedence over the config (e.g. RUST_LOG=fumox_core=debug,info).
-server = "error"
-probe = "error"
+server = "info"
+probe = "info"

@@ -1,0 +1,44 @@
+{# Geography block of the proxy card, factored into a fragment so the
+   initial render and the HTMX swap after "resolve City/ASN" produce the
+   same markup. `geo_available` is false when no GeoLite2 database could
+   be opened at all — the button then explains why it is disabled. #}
+<h3>{{ self.t("px.geography") }}</h3>
+<table class="kv" id="geo-card">
+  <tr><th>{{ self.t("common.country") }}</th><td>{{ self.flag(proxy.geo_country) }}
+    {% match proxy.geo_country %}
+      {% when Some with (country) %}{{ country }}
+      {% when None %}<span class="muted">—</span>
+    {% endmatch %}
+  </td></tr>
+  <tr><th>{{ self.t("px.city") }}</th><td>
+    {% match proxy.geo_city %}
+      {% when Some with (city) %}{{ city }}
+      {% when None %}<span class="muted">—</span>
+    {% endmatch %}
+  </td></tr>
+  <tr><th>ASN</th><td>
+    {% match proxy.geo_asn %}
+      {% when Some with (asn) %}{{ asn }}
+      {% when None %}<span class="muted">—</span>
+    {% endmatch %}
+  </td></tr>
+  <tr><th>{{ self.t("px.resolved_ip") }}</th><td class="mono small">
+    {% match proxy.resolved_ip %}
+      {% when Some with (ip) %}{{ ip }}
+      {% when None %}<span class="muted">—</span>
+    {% endmatch %}
+  </td></tr>
+</table>
+<div class="form-actions">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  {% if geo_available %}
+  <button class="btn small" type="button"
+          hx-post="/admin/proxies/{{ proxy.id }}/resolve-geo"
+          hx-target="#geo-card" hx-swap="outerHTML"
+          hx-include="[name='_csrf']"
+          title="{{ self.t("px.geo_resolve_hint") }}">{{ self.t("px.geo_resolve") }}</button>
+  {% else %}
+  <button class="btn small" type="button" disabled
+          title="{{ self.t("px.geo_unavailable_hint") }}">{{ self.t("px.geo_resolve") }}</button>
+  {% endif %}
+</div>

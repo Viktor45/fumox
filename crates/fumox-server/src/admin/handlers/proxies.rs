@@ -1,11 +1,11 @@
 //! Proxy browser (ADMIN_PLAN §4.4): server-side filtered and paginated
-//! list (thousands of rows — never "show all"), detail card with masked
-//! credential, lifecycle timeline, probe history and source links, and the
-//! manual "reset status" action (ADMIN_PLAN §8).
+//! list (thousands of rows — never "show all"), detail card with lifecycle
+//! timeline, probe history and source links, and the manual "reset status"
+//! action (ADMIN_PLAN §8).
 
 use super::{
     FormMap, action_response, clamp_limit, flag_for, fmt_opt_ts_element, fmt_ts_element, is_htmx,
-    mask_secret, not_found, pagination_pages, server_error,
+    not_found, pagination_pages, server_error,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -309,14 +309,14 @@ struct ProxyDetailTemplate {
     active: &'static str,
     csrf: String,
     proxy: proxies::ProxyRow,
-    credential_display: String,
-    revealed: bool,
     params_display: String,
     unknown_params_display: String,
     lifecycle: Vec<(String, String)>,
     probes: Vec<ProbeHistoryRow>,
     links: Vec<LinkRow>,
     unprobeable: bool,
+    /// Whether any GeoLite2 database is open for the resolve action.
+    geo_available: bool,
 }
 
 impl ProxyDetailTemplate {
@@ -349,7 +349,6 @@ pub async fn proxy_detail(
     State(state): State<AdminState>,
     Path(id): Path<i64>,
     headers: HeaderMap,
-    Query(params): Query<FormMap>,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
@@ -357,15 +356,6 @@ pub async fn proxy_detail(
         Ok(Some(proxy)) => proxy,
         Ok(None) => return not_found(lang, "err.proxy_not_found"),
         Err(err) => return server_error(lang, &err),
-    };
-
-    // Credentials are masked everywhere except behind the explicit
-    // `?reveal=1` on this card (ADMIN_PLAN §3).
-    let revealed = params.get("reveal").map(|v| v == "1").unwrap_or(false);
-    let credential_display = if revealed {
-        proxy.credential.clone()
-    } else {
-        mask_secret(&proxy.credential)
     };
 
     // Every value is server-generated (statuses, counters, timestamps,
@@ -467,13 +457,12 @@ pub async fn proxy_detail(
             csrf: state.csrf_for(&headers),
             params_display: pretty_params(&proxy.params),
             unknown_params_display: pretty_params(&proxy.unknown_params),
-            credential_display,
-            revealed,
             proxy,
             lifecycle,
             probes,
             links,
             unprobeable,
+            geo_available: state.geo_full.is_active(),
         },
         StatusCode::OK,
     )
@@ -592,4 +581,106 @@ pub async fn proxy_reset(
         r#"<span class="badge unknown">unknown</span>"#.to_string(),
         lang.t("px.reset_toast"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// On-demand geo enrichment (proxy card)
+// ---------------------------------------------------------------------------
+
+/// Standalone fragment for the geography block of the proxy card: the same
+/// markup is `{% include %}`d into the full card, so the initial render and
+/// every HTMX swap stay byte-identical.
+#[derive(Template)]
+#[template(path = "proxies/_geo.html")]
+struct GeoFragment {
+    lang: Lang,
+    csrf: String,
+    proxy: proxies::ProxyRow,
+    geo_available: bool,
+}
+
+impl GeoFragment {
+    fn flag(&self, country: &Option<String>) -> String {
+        flag_for(country)
+    }
+}
+
+impl_i18n!(GeoFragment);
+
+/// Enrich one proxy with City/ASN facts from the GeoLite2 databases in
+/// `[geo].db_dir` (all three, not just the pipeline's `[geo].db`): resolve
+/// the host, merge the facts and store them together with the resolved IP.
+pub async fn proxy_resolve_geo(
+    State(state): State<AdminState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Response {
+    let lang = state.locales.lang_from_headers(&headers);
+    let Some(proxy) = proxies::get_by_id(&state.pool, id).await.unwrap_or(None) else {
+        return not_found(lang, "err.proxy_not_found");
+    };
+
+    // Nothing to resolve with: report it instead of pretending success.
+    if !state.geo_full.is_active() {
+        let fragment = GeoFragment {
+            lang: lang.clone(),
+            csrf: state.csrf_for(&headers),
+            proxy,
+            geo_available: false,
+        };
+        let mut response = render_html(lang.clone(), &fragment, StatusCode::OK);
+        if is_htmx(&headers) {
+            let payload = format!(
+                "{{\"toast\": {{\"message\": \"{}\", \"level\": \"error\"}}}}",
+                super::header_safe(lang.t("px.geo_unavailable"))
+            );
+            if let Ok(value) = axum::http::HeaderValue::from_str(&payload) {
+                response.headers_mut().insert("HX-Trigger", value);
+            }
+        }
+        return response;
+    }
+
+    let (stamp, resolved_ip) = match state.geo_full.resolve(&proxy.host).await {
+        Some(info) => (proxies::GeoStamp::from_info(&info), info.ip),
+        // Host unresolvable or unknown to the databases: keep the row as
+        // is and tell the user — an empty stamp must not wipe stored facts.
+        None => (
+            proxies::GeoStamp {
+                country: proxy.geo_country.clone(),
+                city: proxy.geo_city.clone(),
+                asn: proxy.geo_asn.clone(),
+            },
+            proxy.resolved_ip.clone().unwrap_or_default(),
+        ),
+    };
+    if let Err(err) = proxies::update_geo_full(&state.pool, id, &stamp, &resolved_ip).await {
+        return server_error(lang, &err);
+    }
+
+    tracing::info!(proxy_id = id, host = %proxy.host, "on-demand geo resolve");
+    // Re-render the fragment from the updated row so the card reflects
+    // exactly what is now stored.
+    let updated = proxies::get_by_id(&state.pool, id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(proxy);
+    let fragment = GeoFragment {
+        lang: lang.clone(),
+        csrf: state.csrf_for(&headers),
+        proxy: updated,
+        geo_available: true,
+    };
+    let mut response = render_html(lang.clone(), &fragment, StatusCode::OK);
+    if is_htmx(&headers) {
+        let payload = format!(
+            "{{\"toast\": {{\"message\": \"{}\", \"level\": \"ok\"}}}}",
+            super::header_safe(lang.t("px.geo_resolved_toast"))
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&payload) {
+            response.headers_mut().insert("HX-Trigger", value);
+        }
+    }
+    response
 }

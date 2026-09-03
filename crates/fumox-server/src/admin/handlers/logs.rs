@@ -125,7 +125,7 @@ pub async fn fetch_logs(
 
     let total: i64 = {
         let sql = format!("SELECT COUNT(*) FROM fetch_log f{where_sql}");
-        let mut query = sqlx::query_scalar(&sql);
+        let mut query = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()));
         for value in &binds {
             query = query.bind(value);
         }
@@ -144,7 +144,7 @@ pub async fn fetch_logs(
              ORDER BY f.fetched_at DESC, f.id DESC
              LIMIT ? OFFSET ?"
         );
-        let mut query = sqlx::query_as::<_, FetchLogListRow>(&sql);
+        let mut query = sqlx::query_as::<_, FetchLogListRow>(sqlx::AssertSqlSafe(sql.as_str()));
         for value in &binds {
             query = query.bind(value);
         }

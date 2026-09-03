@@ -161,7 +161,8 @@ pub async fn reconcile_source(
     for chunk in fingerprints.chunks(500) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!("SELECT fingerprint FROM proxies WHERE fingerprint IN ({placeholders})");
-        let mut query = sqlx::query_as::<_, (String,)>(&sql);
+        // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
+        let mut query = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(sql.as_str()));
         for fp in chunk {
             query = query.bind(fp);
         }
@@ -384,7 +385,8 @@ pub async fn list_for_sources(
          AND p.status NOT IN ({stat_ph})
          ORDER BY p.id"
     );
-    let mut query = sqlx::query_as::<_, ProxyRow>(&sql);
+    // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
+    let mut query = sqlx::query_as::<_, ProxyRow>(sqlx::AssertSqlSafe(sql.as_str()));
     for id in source_ids {
         query = query.bind(id);
     }
@@ -430,7 +432,7 @@ pub async fn list_with_source(
          WHERE l.source_id IN ({src_ph})
          ORDER BY p.id"
     );
-    let mut query = sqlx::query_as::<_, ProxyWithSource>(&sql);
+    let mut query = sqlx::query_as::<_, ProxyWithSource>(sqlx::AssertSqlSafe(sql.as_str()));
     for id in source_ids {
         query = query.bind(id);
     }
@@ -654,7 +656,7 @@ pub async fn select_t1_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
          ORDER BY RANDOM()
          LIMIT ?"
     );
-    let mut query = sqlx::query_as::<_, T1Candidate>(&sql);
+    let mut query = sqlx::query_as::<_, T1Candidate>(sqlx::AssertSqlSafe(sql.as_str()));
     for scheme in T1_EXCLUDED_SCHEMES {
         query = query.bind(scheme);
     }
@@ -789,7 +791,8 @@ pub async fn check_failed(
     second_chance_min_secs: i64,
     second_chance_spread_secs: i64,
 ) -> crate::Result<Transition> {
-    use rand::Rng;
+    // rand 0.10: `random_range` moved from `Rng` to `RngExt`.
+    use rand::RngExt;
 
     let row: Option<(i64,)> = sqlx::query_as(
         "SELECT fail_count FROM proxies WHERE id = ? AND status IN ('unknown', 'alive')",
@@ -910,7 +913,7 @@ pub async fn quarantine_check_failed(
              updated_at = ?
          WHERE id = ? AND status = 'quarantine'"
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(now)
         .bind(next_at)
         .bind(now)

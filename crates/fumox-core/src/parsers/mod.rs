@@ -173,12 +173,12 @@ fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<String> {
         }),
         Encoding::Auto => {
             let trimmed = payload.trim();
-            if !trimmed.is_empty() && !trimmed.contains("://") {
-                if let Some(decoded) = decode_base64_text(trimmed) {
-                    if decoded.contains("://") || decoded.contains("proxies:") {
-                        return Ok(decoded);
-                    }
-                }
+            if !trimmed.is_empty()
+                && !trimmed.contains("://")
+                && let Some(decoded) = decode_base64_text(trimmed)
+                && (decoded.contains("://") || decoded.contains("proxies:"))
+            {
+                return Ok(decoded);
             }
             Ok(payload.to_string())
         }

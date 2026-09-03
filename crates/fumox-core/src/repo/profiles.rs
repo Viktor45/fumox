@@ -76,9 +76,11 @@ const COLUMNS: &str = "id, slug, access_token, name, output_format, pipeline, co
 
 /// Insert a new profile. The caller assigns `id` (see [`crate::models::new_id`]).
 pub async fn create(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
-    sqlx::query(&format!(
+    // sqlx 0.9 SqlSafeStr: {COLUMNS} is a compile-time constant; all data
+    // flows through .bind().
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO profiles ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ))
+    )))
     .bind(&profile.id)
     .bind(&profile.slug)
     .bind(&profile.access_token)
@@ -133,28 +135,30 @@ pub async fn update(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
 }
 
 pub async fn get(pool: &DbPool, id: &str) -> crate::Result<Option<Profile>> {
-    let row: Option<ProfileRow> =
-        sqlx::query_as(&format!("SELECT {COLUMNS} FROM profiles WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<ProfileRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM profiles WHERE id = ?"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
     row.map(Profile::try_from).transpose()
 }
 
 pub async fn get_by_slug(pool: &DbPool, slug: &str) -> crate::Result<Option<Profile>> {
-    let row: Option<ProfileRow> =
-        sqlx::query_as(&format!("SELECT {COLUMNS} FROM profiles WHERE slug = ?"))
-            .bind(slug)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<ProfileRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM profiles WHERE slug = ?"
+    )))
+    .bind(slug)
+    .fetch_optional(pool)
+    .await?;
     row.map(Profile::try_from).transpose()
 }
 
 /// Resolve a `/sub/{token}` path segment: slug first, then raw id.
 pub async fn resolve_token(pool: &DbPool, token: &str) -> crate::Result<Option<Profile>> {
-    let row: Option<ProfileRow> = sqlx::query_as(&format!(
+    let row: Option<ProfileRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM profiles WHERE slug = ? OR id = ? ORDER BY slug IS NULL LIMIT 1"
-    ))
+    )))
     .bind(token)
     .bind(token)
     .fetch_optional(pool)
@@ -168,7 +172,9 @@ pub async fn list(pool: &DbPool, enabled_only: bool) -> crate::Result<Vec<Profil
     } else {
         format!("SELECT {COLUMNS} FROM profiles ORDER BY created_at")
     };
-    let rows: Vec<ProfileRow> = sqlx::query_as(&query).fetch_all(pool).await?;
+    let rows: Vec<ProfileRow> = sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
+        .fetch_all(pool)
+        .await?;
     rows.into_iter().map(Profile::try_from).collect()
 }
 

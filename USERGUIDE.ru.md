@@ -247,7 +247,7 @@ docker run -d --name fumox-probe \
 
 Требования:
 
-- Rust-тулчейн **≥ 1.85** (edition 2024).
+- Rust-тулчейн **≥ 1.94** (edition 2024).
 - Системный dev-пакет SQLite — sqlx линкует системную библиотеку, а не
   встроенную. Debian/Ubuntu: `sudo apt install libsqlite3-dev pkg-config`.
 - OpenSSL не нужен (rustls), фронтенд-сборки нет.

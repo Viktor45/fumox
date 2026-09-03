@@ -109,10 +109,12 @@ const COLUMNS: &str = "id, slug, name, url, enabled, encoding, input_format, pro
 
 /// Insert a new source. The caller assigns `id` (see [`crate::models::new_id`]).
 pub async fn create(pool: &DbPool, source: &Source) -> crate::Result<()> {
-    sqlx::query(&format!(
+    // sqlx 0.9 SqlSafeStr: {COLUMNS} is a compile-time constant; all data
+    // flows through .bind().
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO sources ({COLUMNS})
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ))
+    )))
     .bind(&source.id)
     .bind(&source.slug)
     .bind(&source.name)
@@ -197,28 +199,30 @@ pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
 }
 
 pub async fn get(pool: &DbPool, id: &str) -> crate::Result<Option<Source>> {
-    let row: Option<SourceRow> =
-        sqlx::query_as(&format!("SELECT {COLUMNS} FROM sources WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM sources WHERE id = ?"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
     row.map(Source::try_from).transpose()
 }
 
 pub async fn get_by_slug(pool: &DbPool, slug: &str) -> crate::Result<Option<Source>> {
-    let row: Option<SourceRow> =
-        sqlx::query_as(&format!("SELECT {COLUMNS} FROM sources WHERE slug = ?"))
-            .bind(slug)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM sources WHERE slug = ?"
+    )))
+    .bind(slug)
+    .fetch_optional(pool)
+    .await?;
     row.map(Source::try_from).transpose()
 }
 
 /// Resolve a `/src/{token}` path segment: slug first, then raw id.
 pub async fn resolve_token(pool: &DbPool, token: &str) -> crate::Result<Option<Source>> {
-    let row: Option<SourceRow> = sqlx::query_as(&format!(
+    let row: Option<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM sources WHERE slug = ? OR id = ? ORDER BY slug IS NULL LIMIT 1"
-    ))
+    )))
     .bind(token)
     .bind(token)
     .fetch_optional(pool)
@@ -232,7 +236,9 @@ pub async fn list(pool: &DbPool, enabled_only: bool) -> crate::Result<Vec<Source
     } else {
         format!("SELECT {COLUMNS} FROM sources ORDER BY created_at")
     };
-    let rows: Vec<SourceRow> = sqlx::query_as(&query).fetch_all(pool).await?;
+    let rows: Vec<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
+        .fetch_all(pool)
+        .await?;
     rows.into_iter().map(Source::try_from).collect()
 }
 

@@ -203,7 +203,7 @@ pub async fn proxies_list(
 
     let total: i64 = {
         let sql = format!("SELECT COUNT(*) FROM proxies p{where_sql}");
-        let mut query = sqlx::query_scalar(&sql);
+        let mut query = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()));
         for value in &binds {
             query = query.bind(value);
         }
@@ -220,7 +220,7 @@ pub async fn proxies_list(
              ORDER BY {order}
              LIMIT ? OFFSET ?"
         );
-        let mut query = sqlx::query_as::<_, ProxyListRow>(&sql);
+        let mut query = sqlx::query_as::<_, ProxyListRow>(sqlx::AssertSqlSafe(sql.as_str()));
         for value in &binds {
             query = query.bind(value);
         }

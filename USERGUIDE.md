@@ -245,7 +245,7 @@ contains no shell or HTTP client — point orchestrator health probes at
 
 Requirements:
 
-- Rust toolchain **≥ 1.85** (edition 2024).
+- Rust toolchain **≥ 1.94** (edition 2024).
 - System SQLite development package — sqlx links the system library, it is not
   bundled. On Debian/Ubuntu: `sudo apt install libsqlite3-dev pkg-config`.
 - No OpenSSL needed (rustls), no frontend build step.

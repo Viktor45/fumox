@@ -269,29 +269,28 @@ impl FullResolver {
             ..Default::default()
         };
         let mut any = false;
-        if let Some(reader) = &self.city {
-            if let Some(city) = lookup_city(reader, ip) {
-                info.country_code = info.country_code.or(city.country_code);
-                info.country_name = info.country_name.or(city.country_name);
-                info.city_name = info.city_name.or(city.city_name);
-                any = true;
-            }
+        if let Some(reader) = &self.city
+            && let Some(city) = lookup_city(reader, ip)
+        {
+            info.country_code = info.country_code.or(city.country_code);
+            info.country_name = info.country_name.or(city.country_name);
+            info.city_name = info.city_name.or(city.city_name);
+            any = true;
         }
-        if info.country_code.is_none() {
-            if let Some(reader) = &self.country {
-                if let Some(country) = lookup_country(reader, ip) {
-                    info.country_code = info.country_code.or(country.country_code);
-                    info.country_name = info.country_name.or(country.country_name);
-                    any = true;
-                }
-            }
+        if info.country_code.is_none()
+            && let Some(reader) = &self.country
+            && let Some(country) = lookup_country(reader, ip)
+        {
+            info.country_code = info.country_code.or(country.country_code);
+            info.country_name = info.country_name.or(country.country_name);
+            any = true;
         }
-        if let Some(reader) = &self.asn {
-            if let Some(asn) = lookup_asn(reader, ip) {
-                info.asn = asn.asn;
-                info.asn_org = asn.asn_org;
-                any = true;
-            }
+        if let Some(reader) = &self.asn
+            && let Some(asn) = lookup_asn(reader, ip)
+        {
+            info.asn = asn.asn;
+            info.asn_org = asn.asn_org;
+            any = true;
         }
         any.then_some(info)
     }
@@ -407,11 +406,11 @@ mod tests {
         }
         // A residential-looking address the City database does know: the
         // merge must pick the city up alongside the country.
-        if let Some(info) = resolver.resolve("81.19.44.10").await {
-            if info.country_code.is_some() {
-                // only assert the shape — the specific city varies by build
-                assert!(info.city_name.is_some() || info.asn.is_some());
-            }
+        if let Some(info) = resolver.resolve("81.19.44.10").await
+            && info.country_code.is_some()
+        {
+            // only assert the shape — the specific city varies by build
+            assert!(info.city_name.is_some() || info.asn.is_some());
         }
     }
 

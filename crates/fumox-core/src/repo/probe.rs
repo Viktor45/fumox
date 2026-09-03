@@ -99,7 +99,9 @@ pub async fn enqueue_checks(
                AND p.scheme NOT IN ({excluded})
              ORDER BY p.id DESC LIMIT ?"
         );
-        let mut query = sqlx::query(&sql).bind(now);
+        // sqlx 0.9 SqlSafeStr: the format! only expands `?` placeholder
+        // lists — all data flows through .bind().
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(now);
         for id in chunk {
             query = query.bind(id);
         }
@@ -130,7 +132,7 @@ pub async fn select_queued_checks(pool: &DbPool, limit: u32) -> crate::Result<Ve
          ORDER BY q.requested_at DESC, q.proxy_id DESC
          LIMIT ?"
     );
-    let mut query = sqlx::query_as::<_, T1Candidate>(&sql);
+    let mut query = sqlx::query_as::<_, T1Candidate>(sqlx::AssertSqlSafe(sql.as_str()));
     for scheme in T1_EXCLUDED_SCHEMES {
         query = query.bind(scheme);
     }
@@ -146,7 +148,7 @@ pub async fn claim_checks(pool: &DbPool, proxy_ids: &[i64]) -> crate::Result<u64
     for chunk in proxy_ids.chunks(500) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!("DELETE FROM probe_requests WHERE proxy_id IN ({placeholders})");
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in chunk {
             query = query.bind(id);
         }

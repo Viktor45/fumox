@@ -277,7 +277,7 @@ pub async fn stats(State(state): State<AdminState>, headers: HeaderMap) -> Respo
     let placeholders = vec!["?"; unprobeable_schemes.len()].join(", ");
     let unprobeable_sql = format!("SELECT COUNT(*) FROM proxies WHERE scheme IN ({placeholders})");
     let unprobeable = {
-        let mut query = sqlx::query_scalar::<_, i64>(&unprobeable_sql);
+        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(unprobeable_sql.as_str()));
         for scheme in &unprobeable_schemes {
             query = query.bind(scheme);
         }

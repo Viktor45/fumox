@@ -13,7 +13,7 @@ use axum::extract::{ConnectInfo, Form, Query, Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use moka::future::Cache;
 use sha2::Sha256;
 use std::collections::HashMap;

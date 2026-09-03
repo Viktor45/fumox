@@ -103,7 +103,7 @@ pub async fn sources_list(
     }
     sql.push_str(" ORDER BY s.created_at DESC");
 
-    let mut query = sqlx::query_as::<_, SourceListRow>(&sql);
+    let mut query = sqlx::query_as::<_, SourceListRow>(sqlx::AssertSqlSafe(sql.as_str()));
     for value in &binds {
         query = query.bind(value);
     }

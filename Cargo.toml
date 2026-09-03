@@ -5,7 +5,7 @@ members = ["crates/fumox-core", "crates/fumox-server", "crates/fumox-probe"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.94"
 license = "MIT"
 
 [workspace.dependencies]
@@ -15,11 +15,17 @@ fumox-core = { path = "crates/fumox-core" }
 # Async runtime / HTTP
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
+# reqwest 0.13: rustls is the default TLS backend and `rustls-tls` became
+# `rustls`. The provider is aws-lc by default; we stay on ring to match the
+# `rustls` crate's provider above (one crypto provider in the process).
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "rustls-no-provider",
     "gzip",
     "brotli",
     "json",
+    # RequestBuilder::query() is a feature since reqwest 0.13 (meow T2 calls).
+    "query",
 ] }
 # T1 TLS handshakes in the probe daemon (health checks, not a trust boundary).
 tokio-rustls = "0.26"
@@ -38,10 +44,12 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # fork recommended by RustSec, API-compatible with serde_yaml 0.9.
 serde_norway = "0.9"
 figment = { version = "0.10", features = ["toml", "env"] }
-toml = "0.8"
+toml = "1"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
+# sqlx 0.9: query*() takes `impl SqlSafeStr` — `&'static str` directly,
+# dynamic SQL wrapped in `sqlx::AssertSqlSafe`.
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
 
 # Observability
 tracing = "0.1"
@@ -52,17 +60,17 @@ clap = { version = "4", features = ["derive"] }
 
 # Caching / geo
 moka = { version = "0.12", features = ["future"] }
-maxminddb = "0.27"
+maxminddb = "0.30"
 
 # Utilities
-nanoid = "0.4"
+nanoid = "0.5"
 regex = "1"
-base64 = "0.22"
+base64 = "0.23"
 url = "2"
 percent-encoding = "2"
-sha2 = "0.10"
-hmac = "0.12"
-rand = "0.9"
+sha2 = "0.11"
+hmac = "0.13"
+rand = "0.10"
 time = { version = "0.3", features = ["macros", "formatting"] }
 thiserror = "2"
 anyhow = "1"
@@ -70,7 +78,7 @@ async-stream = "0.3"
 futures-util = "0.3"
 
 # Admin UI (SSR templates)
-askama = "0.15"
+askama = "0.16"
 
 [profile.release]
 lto = "thin"

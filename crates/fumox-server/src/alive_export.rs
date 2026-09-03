@@ -104,7 +104,12 @@ pub async fn serve(
         }
     }
 
-    let mut response = (StatusCode::OK, lines.join("\n")).into_response();
+    // Same url_list metadata comments as /sub and /src (they document the
+    // file when the HTTP headers are lost to a copy-paste). The export has
+    // no fetch TTL to derive an interval from, so it advertises the
+    // shortest sensible one: 1 hour.
+    let header = serve::url_list_header_block("export/alive", 1, lines.len());
+    let mut response = (StatusCode::OK, format!("{header}{}", lines.join("\n"))).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("text/plain; charset=utf-8"),

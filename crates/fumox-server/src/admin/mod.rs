@@ -1216,8 +1216,8 @@ mod tests {
         // Unprobeable counter includes the tuic proxy.
         assert!(html.contains("непроверяемых (tuic/mieru): 1"), "{html}");
         // Both latencies feed the min/avg card.
-        assert!(html.contains("min: 15"), "{html}");
-        assert!(html.contains("avg: 52"), "{html}");
+        assert!(html.contains("мин: 15"), "{html}");
+        assert!(html.contains("ср: 52"), "{html}");
     }
 
     /// Proxy-card geo refresh (SPEC §6, on-demand City/ASN): opening the

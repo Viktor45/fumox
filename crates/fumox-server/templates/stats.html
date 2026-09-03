@@ -26,9 +26,9 @@
     <div class="label">{{ self.t("stats.latency_median") }}</div>
     <div class="sub">
       {% match latency_min %}
-        {% when Some with (ms) %}min: {{ ms }} {{ self.t("common.ms") }} · {% when None %}{% endmatch %}
+        {% when Some with (ms) %}{{ self.t("stats.latency_min") }} {{ ms }} {{ self.t("common.ms") }} · {% when None %}{% endmatch %}
       {% match latency_avg %}
-        {% when Some with (ms) %}avg: {{ ms }} {{ self.t("common.ms") }}{% when None %}{% endmatch %}
+        {% when Some with (ms) %}{{ self.t("stats.latency_avg") }} {{ ms }} {{ self.t("common.ms") }}{% when None %}{% endmatch %}
     </div>
   </div>
   <div class="panel stat-card">

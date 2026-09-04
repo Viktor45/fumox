@@ -138,12 +138,21 @@ impl ProxyRow {
 /// `geo` runs parallel to `entries` (indexed access; a shorter slice or a
 /// `None` element means "no fresh geo facts" — the COALESCE upsert branch
 /// then keeps whatever is already stored).
+///
+/// `keep_alive_linger` (SPEC §8.1): when the source has no `drop` rules,
+/// an `alive` proxy that vanished from the feed keeps its link — the probe
+/// stays the sole owner of its lifecycle, so a live node is not terminated
+/// by upstream churn. The next refresh to see it back re-stamps the link.
+/// `unknown`/`quarantine`/`removed` proxies are unlinked exactly as before:
+/// an unverified or dying lingerer would accumulate zombie rows. The
+/// admin's source deletion path (`mark_orphans_removed`) ignores linger.
 pub async fn reconcile_source(
     pool: &DbPool,
     source_id: &str,
     entries: &[ProxyEntry],
     geo: &[Option<GeoStamp>],
     now: i64,
+    keep_alive_linger: bool,
 ) -> crate::Result<ReconciliationStats> {
     let mut stats = ReconciliationStats::default();
     // BEGIN IMMEDIATE: the first statement grabs the WAL write lock up
@@ -246,13 +255,23 @@ pub async fn reconcile_source(
 
     // Drop links this fetch no longer saw, then mark orphaned proxies
     // removed (idempotent: proxies already removed keep their removed_at).
-    stats.unlinked =
-        sqlx::query("DELETE FROM proxy_source_links WHERE source_id = ? AND seen_at < ?")
-            .bind(source_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected() as usize;
+    // With `keep_alive_linger` an alive proxy keeps a link the fetch did
+    // not re-stamp — it stays linked to the source and keeps running the
+    // probe cycle; only the probe's own verdict can end it.
+    let unlinked_sql = if keep_alive_linger {
+        "DELETE FROM proxy_source_links
+         WHERE source_id = ?
+           AND seen_at < ?
+           AND proxy_id NOT IN (SELECT id FROM proxies WHERE status = 'alive')"
+    } else {
+        "DELETE FROM proxy_source_links WHERE source_id = ? AND seen_at < ?"
+    };
+    stats.unlinked = sqlx::query(sqlx::AssertSqlSafe(unlinked_sql))
+        .bind(source_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() as usize;
 
     stats.removed = sqlx::query(
         "UPDATE proxies
@@ -993,7 +1012,7 @@ mod tests {
             entry("one", "h1.example.com", 443),
             entry("two", "h2.example.com", 8443),
         ];
-        let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 1000)
+        let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
             .await
             .unwrap();
         assert_eq!(stats.inserted, 2);
@@ -1004,7 +1023,7 @@ mod tests {
         }
 
         // A refetch updates instead of inserting — no new ids are reported.
-        let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 2000)
+        let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 2000, false)
             .await
             .unwrap();
         assert_eq!(stats.updated, 2);
@@ -1022,6 +1041,7 @@ mod tests {
             std::slice::from_ref(&original),
             &[],
             1000,
+            false,
         )
         .await
         .unwrap();
@@ -1041,6 +1061,7 @@ mod tests {
             std::slice::from_ref(&renamed),
             &[],
             2000,
+            false,
         )
         .await
         .unwrap();
@@ -1065,13 +1086,21 @@ mod tests {
             &[kept.clone(), gone.clone()],
             &[],
             1000,
+            false,
         )
         .await
         .unwrap();
 
-        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&kept), &[], 2000)
-            .await
-            .unwrap();
+        let stats = reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&kept),
+            &[],
+            2000,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.unlinked, 1);
         assert_eq!(stats.removed, 1);
         assert_eq!(status_of(&pool, &gone).await.0, "removed");
@@ -1084,14 +1113,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alive_linger_keeps_link_and_serves_while_alive() {
+        // SPEC §8.1: a probe-verified proxy that vanished from the feed
+        // keeps its link — the probe alone decides when it leaves.
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let e = entry("linger", "h1.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            true,
+        )
+        .await
+        .unwrap();
+        // Probe confirms it alive.
+        sqlx::query("UPDATE proxies SET status = 'alive', fail_count = 0 WHERE fingerprint = ?")
+            .bind(e.fingerprint())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The feed no longer carries it; linger keeps the link.
+        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
+            .await
+            .unwrap();
+        assert_eq!(stats.unlinked, 0, "the alive proxy keeps its link");
+        assert_eq!(stats.removed, 0);
+        assert_eq!(status_of(&pool, &e).await.0, "alive");
+
+        // Still served: the link survives, so list_with_source finds it.
+        let rows = list_with_source(&pool, &["srcA0000000".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Reappearance is seamless: the link is re-stamped, status kept.
+        let stats = reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            3000,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.updated, 1);
+        assert_eq!(status_of(&pool, &e).await.0, "alive");
+    }
+
+    #[tokio::test]
+    async fn quarantined_linger_leaves_on_next_refresh() {
+        // Only `alive` lingers: once the probe quarantines the node, the
+        // next refresh unlinks it and the orphan is removed — a dying
+        // lingerer does not occupy the recheck ladder.
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let e = entry("dying", "h1.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            true,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE proxies SET status = 'quarantine', quarantined_at = 1500 WHERE fingerprint = ?",
+        )
+        .bind(e.fingerprint())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
+            .await
+            .unwrap();
+        assert_eq!(stats.unlinked, 1, "quarantine does not linger");
+        assert_eq!(stats.removed, 1);
+        assert_eq!(status_of(&pool, &e).await.0, "removed");
+    }
+
+    #[tokio::test]
+    async fn linger_is_per_proxy_not_per_batch() {
+        // One alive, one dead-by-probe (quarantined) row vanish together:
+        // only the alive one keeps its link in the same reconcile pass.
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let alive = entry("alive", "h1.example.com", 443);
+        let dying = entry("dying", "h2.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            &[alive.clone(), dying.clone()],
+            &[],
+            1000,
+            true,
+        )
+        .await
+        .unwrap();
+        for (e, status) in [(&alive, "alive"), (&dying, "quarantine")] {
+            sqlx::query("UPDATE proxies SET status = ? WHERE fingerprint = ?")
+                .bind(status)
+                .bind(e.fingerprint())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
+            .await
+            .unwrap();
+        assert_eq!(stats.unlinked, 1);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(status_of(&pool, &alive).await.0, "alive");
+        assert_eq!(status_of(&pool, &dying).await.0, "removed");
+    }
+
+    #[tokio::test]
+    async fn multi_source_linger_stays_linked_to_the_other_source() {
+        // A lingering proxy is per-source: it stays while linked anywhere.
+        // (Both sources linger here; the point is removal needs ALL links
+        // gone — dropping one source's link must not remove the row.)
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        make_source(&pool, "srcB0000000").await;
+        let e = entry("shared", "h1.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            false,
+        )
+        .await
+        .unwrap();
+        reconcile_source(
+            &pool,
+            "srcB0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE proxies SET status = 'alive' WHERE fingerprint = ?")
+            .bind(e.fingerprint())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Source B drops it, source B does not linger (drop-rules gate):
+        // the row stays alive thanks to A's link.
+        reconcile_source(&pool, "srcB0000000", &[], &[], 2000, false)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, &e).await.0, "alive");
+    }
+
+    #[tokio::test]
     async fn reappearing_removed_proxy_stays_removed() {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("x", "h1.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
-            .await
-            .unwrap();
-        reconcile_source(&pool, "srcA0000000", &[], &[], 2000)
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            false,
+        )
+        .await
+        .unwrap();
+        reconcile_source(&pool, "srcA0000000", &[], &[], 2000, false)
             .await
             .unwrap();
         assert_eq!(status_of(&pool, &e).await.0, "removed");
@@ -1099,9 +1301,16 @@ mod tests {
         // Reappearing in a live source does NOT reset the lifecycle
         // (owner decision 2026-08-31): `removed` is terminal for
         // reconciliation; only mutable fields refresh.
-        let stats = reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 3000)
-            .await
-            .unwrap();
+        let stats = reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            3000,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.updated, 1);
         let (status, fail_count) = status_of(&pool, &e).await;
         assert_eq!(status, "removed");
@@ -1119,9 +1328,16 @@ mod tests {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("x", "h1.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            false,
+        )
+        .await
+        .unwrap();
 
         let fp = e.fingerprint();
         sqlx::query(
@@ -1137,9 +1353,16 @@ mod tests {
 
         // Reappearance must not touch the state machine: the quarantine
         // ladder keeps running on its stored schedule.
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 2000)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            2000,
+            false,
+        )
+        .await
+        .unwrap();
         let row = get_by_fingerprint(&pool, &fp).await.unwrap().unwrap();
         assert_eq!(row.status, "quarantine");
         assert_eq!(row.fail_count, 3);
@@ -1163,6 +1386,7 @@ mod tests {
             std::slice::from_ref(&shared),
             &[],
             1000,
+            false,
         )
         .await
         .unwrap();
@@ -1172,6 +1396,7 @@ mod tests {
             std::slice::from_ref(&shared),
             &[],
             1100,
+            false,
         )
         .await
         .unwrap();
@@ -1189,7 +1414,7 @@ mod tests {
         assert_eq!(links.len(), 2);
 
         // Dropping from source A only: still linked via B.
-        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000)
+        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, false)
             .await
             .unwrap();
         assert_eq!(stats.unlinked, 1);
@@ -1197,7 +1422,7 @@ mod tests {
         assert_eq!(status_of(&pool, &shared).await.0, "unknown");
 
         // Dropping from B as well: now it is removed.
-        let stats = reconcile_source(&pool, "srcB0000000", &[], &[], 3000)
+        let stats = reconcile_source(&pool, "srcB0000000", &[], &[], 3000, false)
             .await
             .unwrap();
         assert_eq!(stats.removed, 1);
@@ -1210,7 +1435,7 @@ mod tests {
         make_source(&pool, "srcA0000000").await;
         let a = entry("name-A", "h1.example.com", 443);
         let b = entry("name-B", "h1.example.com", 443); // same fingerprint
-        let stats = reconcile_source(&pool, "srcA0000000", &[a, b], &[], 1000)
+        let stats = reconcile_source(&pool, "srcA0000000", &[a, b], &[], 1000, false)
             .await
             .unwrap();
         assert_eq!(stats.inserted, 1);
@@ -1227,9 +1452,16 @@ mod tests {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("conv", "h1.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            false,
+        )
+        .await
+        .unwrap();
         let row = get_by_fingerprint(&pool, &e.fingerprint())
             .await
             .unwrap()
@@ -1262,6 +1494,7 @@ mod tests {
             &[shared.clone(), only_a.clone(), quarantined.clone()],
             &[],
             1000,
+            false,
         )
         .await
         .unwrap();
@@ -1271,6 +1504,7 @@ mod tests {
             std::slice::from_ref(&shared),
             &[],
             1100,
+            false,
         )
         .await
         .unwrap();
@@ -1327,6 +1561,7 @@ mod tests {
             ],
             &[],
             1000,
+            false,
         )
         .await
         .unwrap();
@@ -1419,9 +1654,16 @@ mod tests {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("t2-failed", "h1.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            false,
+        )
+        .await
+        .unwrap();
         let (id,): (i64,) = sqlx::query_as("SELECT id FROM proxies WHERE fingerprint = ?")
             .bind(e.fingerprint())
             .fetch_one(&pool)
@@ -1736,7 +1978,7 @@ mod tests {
             removed.clone(),
             alive_unprobeable.clone(),
         ];
-        reconcile_source(&pool, "srcA0000000", &all, &[], 1000)
+        reconcile_source(&pool, "srcA0000000", &all, &[], 1000, false)
             .await
             .unwrap();
 
@@ -1776,6 +2018,7 @@ mod tests {
             std::slice::from_ref(&e),
             &[Some(stamp)],
             1000,
+            false,
         )
         .await
         .unwrap();
@@ -1789,9 +2032,16 @@ mod tests {
 
         // Refetch with an inactive resolver (all-None stamps): stored facts
         // are preserved, never wiped by a missing lookup.
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 2000)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            2000,
+            false,
+        )
+        .await
+        .unwrap();
         let row = get_by_fingerprint(&pool, &e.fingerprint())
             .await
             .unwrap()
@@ -1806,9 +2056,16 @@ mod tests {
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("geo", "h1.example.com", 443);
-        reconcile_source(&pool, "srcA0000000", std::slice::from_ref(&e), &[], 1000)
-            .await
-            .unwrap();
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            false,
+        )
+        .await
+        .unwrap();
 
         let missing = list_missing_geo(&pool, 0, 500).await.unwrap();
         let id = missing

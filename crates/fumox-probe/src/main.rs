@@ -711,7 +711,6 @@ mod tests {
             probe: fumox_core::config::ProbeConfig {
                 cycle_interval_secs: 60,
                 sample_size: 50,
-                refresh_check_limit: 50,
                 fail_limit,
                 connect_timeout_secs: 2,
                 tls_timeout_secs: 2,

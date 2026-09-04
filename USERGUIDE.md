@@ -37,6 +37,7 @@ If you only have five minutes, read sections [1](#1-what-is-fumox),
     - [`[server]` — public listener](#server--public-listener)
     - [`[database]` — SQLite](#database--sqlite)
     - [`[fetch]` — source fetching](#fetch--source-fetching)
+    - [`[ingest]` — source ingestion](#ingest--source-ingestion)
     - [`[geo]` — geo enrichment](#geo--geo-enrichment)
     - [`[admin]` — admin panel](#admin--admin-panel)
     - [`[probe]` — health-check daemon](#probe--health-check-daemon)
@@ -122,10 +123,12 @@ background (stale-while-revalidate).
 
 **The background loop.** Independently of requests, `fumox-server` runs a
 scheduler that periodically re-fetches every enabled source, reconciles the
-parsed proxies with the database (new → insert, gone → mark removed,
-reappeared → refresh identity fields only), and journals every fetch.
-Meanwhile `fumox-probe` samples proxies
-and updates their health status, which the health filter then uses.
+parsed proxies with the database (new → insert, gone → unlink; an `alive`
+proxy stays linked while the probe confirms it — see alive-linger in
+[section 10](#10-health-checks-and-proxy-lifecycle), reappeared → refresh
+identity fields only), and journals every fetch. Meanwhile `fumox-probe`
+samples proxies and updates their health status, which the health filter
+then uses.
 
 Two network listeners are involved, on purpose separated:
 
@@ -553,6 +556,13 @@ form.
 | `user_agent`            | `"fumox/<version>"` | User-Agent header; per-source `headers` override it                                                                                                                                                                                        |
 | `ip_family`             | `any`               | Default IP family for fetching source URLs: `any` (dual-stack: first IPv4 wins, IPv6 fallback), `ipv4` or `ipv6`. A source without its own IP family inherits this; a set family is strict — no address of that family means a fetch error |
 
+### `[ingest]` — source ingestion
+
+| Key                   | Default | Meaning                                                                                                                                           |
+| --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `refresh_check_limit` | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue)                                            |
+| `drop_gate`           | `false` | Drop-rules gate on the alive-linger: `true` — an alive proxy of a source with `drop` rules leaves on the next refresh once a rule catches it; `false` — every source lingers, the probe alone retires proxies |
+
 ### `[geo]` — geo enrichment
 
 | Key                 | Default     | Meaning                                                    |
@@ -583,7 +593,6 @@ form.
 | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
 | `cycle_interval_secs`        | `60`    | Scheduling cycle period                                                                                 |
 | `sample_size`                | `50`    | Random sample of proxies checked per cycle (spreads load, no bursts)                                    |
-| `refresh_check_limit`        | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue) |
 | `fail_limit`                 | `3`     | Consecutive failures before quarantine                                                                  |
 | `connect_timeout_secs`       | `10`    | T1 TCP-connect timeout                                                                                  |
 | `tls_timeout_secs`           | `10`    | T1 TLS-handshake timeout                                                                                |
@@ -714,7 +723,7 @@ cycle in four passes:
 1. **Quarantine dues** — second chances and recheck-ladder steps whose moment
    has arrived;
 2. **Priority queue** — freshly inserted proxies the server queued at source
-   refresh time (up to `[probe].refresh_check_limit` per refresh), drained
+   refresh time (up to `[ingest].refresh_check_limit` per refresh), drained
    newest first, then removed from the queue before the checks run;
 3. **T1** — a random sample of direct TCP-connect (plus TLS handshake where
    the protocol implies TLS) checks over `unknown`/`alive` proxies;
@@ -775,6 +784,17 @@ The rules in plain language:
   lists it again, its state is *not* reset — reconciliation never touches the
   state machine (only the probe does). Ways back: *Reset status* on the proxy
   card, or *Purge removed* followed by the next fetch inserting it as new.
+- **Disappearing from a source does not retire a live proxy (alive-linger).**
+  While the probe keeps confirming a proxy (`alive`), a source refresh that no
+  longer sees it keeps its link: the proxy continues its check cycle and stays
+  in that source's subscriptions. The probe alone decides when it leaves —
+  once it quarantines the node, the next refresh drops the link and the proxy
+  becomes `removed` as usual. This does not apply to `unknown` proxies
+  (never verified — unlinked on the next refresh) and to sources with
+  `drop` rules **when** `[ingest].drop_gate = true` in the config (then a
+  rule added later retires the already-stored rows on the next refresh;
+  with the default `false` every source lingers — drop rules only stop
+  new matches). Deleting a source from the admin panel never lingers.
 
 If meow-rs is down, T2 doesn't spam it: the probe backs off exponentially
 (60 s → doubling → capped at 15 min), and proxy statuses are left untouched —

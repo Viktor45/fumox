@@ -169,9 +169,16 @@ mod tests {
             .await
             .unwrap();
         let entries = vec![entry("8.8.8.8"), entry("8.8.4.4")];
-        proxies::reconcile_source(&pool, &src.id, &entries, &[], fumox_core::models::now_ts())
-            .await
-            .unwrap();
+        proxies::reconcile_source(
+            &pool,
+            &src.id,
+            &entries,
+            &[],
+            fumox_core::models::now_ts(),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(fetch_row(&pool, "8.8.8.8").await.geo_country, None);
 
         backfill_missing_geo(pool.clone(), geo.clone()).await;
@@ -194,9 +201,16 @@ mod tests {
             .await
             .unwrap();
         let entries = vec![entry("8.8.8.8")];
-        proxies::reconcile_source(&pool, &src.id, &entries, &[], fumox_core::models::now_ts())
-            .await
-            .unwrap();
+        proxies::reconcile_source(
+            &pool,
+            &src.id,
+            &entries,
+            &[],
+            fumox_core::models::now_ts(),
+            false,
+        )
+        .await
+        .unwrap();
         let inactive = Arc::new(GeoResolver::new(&GeoConfig {
             enabled: false,
             ..Default::default()

@@ -486,6 +486,15 @@ impl CompiledPipeline {
             .collect()
     }
 
+    /// Whether any `drop` rule is configured. Reconciliation asks before a
+    /// fetch (SPEC §8.1): a source with drop rules never keeps lingering
+    /// links, so a rule added later cannot be held off by still-alive rows —
+    /// serving-side drop hides them instantly, the next refresh unlinks
+    /// them for good.
+    pub fn has_drop_rules(&self) -> bool {
+        !self.drop.is_empty()
+    }
+
     /// Per-source steps (SPEC §5 steps 2–6): filter → normalize → rename →
     /// geo-enrich → health-filter. `/sub` runs this for every source with
     /// the merged (source + profile) pipeline, then calls [`Self::finalize`]

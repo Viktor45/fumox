@@ -1,11 +1,11 @@
-# Fumox — конфигурация приложения (SPEC §12, ADMIN_PLAN §2).
+# Fumox — конфигурация приложения.
 # Файл перечисляет ВСЕ доступные ключи со значениями по умолчанию — правьте
 # только то, что нужно изменить. Каждый ключ имеет дефолт: файл можно урезать
 # до нужных секций или вовсе не создавать — сервис запустится «из коробки».
 # Переопределение через окружение: FUMOX_СЕКЦИЯ__КЛЮЧ, например
 # FUMOX_ADMIN__TOKEN=secret (двойное подчёркивание разделяет секции).
 #
-# Fumox — application configuration (SPEC §12, ADMIN_PLAN §2).
+# Fumox — application configuration.
 # The file lists EVERY available key at its default value — change only what
 # you need. Every key has a default: the file may be trimmed down to the
 # sections you need or omitted entirely — the service runs out of the box.
@@ -27,8 +27,8 @@ busy_timeout_ms = 5000
 max_connections = 8
 
 [fetch]
-# Загрузка источников (PLAN, пробелы 4–5, 12).
-# Source fetching (PLAN, gaps 4–5, 12).
+# Загрузка источников по HTTP.
+# Source fetching over HTTP.
 connect_timeout_secs = 10
 read_timeout_secs = 30
 max_response_bytes = 10485760   # 10 МиБ; защита от decompression-bomb / 10 MiB; decompression-bomb guard
@@ -54,13 +54,34 @@ user_agent = "fumox/0.1.0"
 # family means a fetch error. Env override: FUMOX_FETCH__IP_FAMILY.
 ip_family = "any"
 
+[ingest]
+# Инжест источников планировщиком fumox-server: fetch → parse → reconcile.
+# Source ingestion by the fumox-server scheduler: fetch → parse → reconcile.
+# новых unknown-прокси за обновление источника в приоритет-очередь (0 = выкл)
+# newly inserted unknown proxies per source refresh queued for priority checking (0 = off)
+refresh_check_limit = 50
+# Как поступать с живым прокси, исчезнувшим из выдачи источника.
+# false (дефолт): прокси остаётся за источником, пока проверки подтверждают,
+# что он жив; как только проверки завалят его — прокси сам уйдёт из базы.
+# true: если у источника есть правила отбрасывания (drop) в pipeline, живой
+# прокси под таким правилом убирается уже на ближайшем обновлении.
+# What happens to an alive proxy that vanished from a source feed.
+# false (the default): the proxy stays linked to the source while checks
+# keep confirming it is alive; once the checks fail it, the proxy leaves
+# on its own. true: when the source has pipeline drop rules, an alive
+# proxy caught by a rule is removed on the very next refresh.
+drop_gate = false
+
 [geo]
-# Гео-обогащение MaxMind GeoLite2 (SPEC §6). Файлы .mmdb не коммитятся; при
-# старте сервер сам скачивает отсутствующие/устаревшие базы в db_dir, если
-# каталог доступен для записи.
-# MaxMind GeoLite2 geo enrichment (SPEC §6). The .mmdb files are never
-# committed; at startup the server downloads missing/stale databases into
-# db_dir on its own, provided the directory is writable.
+# Гео-обогащение MaxMind GeoLite2: по IP-адресу узла определяется страна
+# (и город/автономная система при выборе другой базы). Файлы .mmdb не
+# коммитятся; при старте сервер сам скачивает отсутствующие/устаревшие
+# базы в db_dir, если каталог доступен для записи.
+# MaxMind GeoLite2 geo enrichment: a node's IP resolves to its country
+# (or city / autonomous system with a different database choice). The
+# .mmdb files are never committed; at startup the server downloads
+# missing/stale databases into db_dir on its own, provided the directory
+# is writable.
 enabled = true
 db = "country"                # country | city | asn (по умолчанию Country / Country by default)
 db_dir = "config"           # каталог с GeoLite2-{Country,City,ASN}.mmdb / directory holding GeoLite2-{Country,City,ASN}.mmdb
@@ -68,8 +89,8 @@ cache_max_entries = 16384     # кэш host→geo (moka) / host→geo cache (mok
 dns_timeout_secs = 5
 
 [admin]
-# Админка (ADMIN_PLAN §2–3). Пустой token = админка отключена (отдаёт 404).
-# Admin panel (ADMIN_PLAN §2–3). An empty token disables the panel (it answers 404).
+# Админка. Пустой token = админка отключена (отдаёт 404).
+# Admin panel. An empty token disables the panel (it answers 404).
 enabled = true
 token = "change-me"
 # отдельный слушатель; наружу — reverse-proxy/SSH-туннель
@@ -84,29 +105,33 @@ login_rate_limit = "5/min"    # POST /admin/login
 locales_dir = "locales"
 
 [probe]
-# Демон проверки живучести (SPEC §8).
-# Health-check daemon (SPEC §8).
+# Демон проверки живучести прокси.
+# Proxy health-check daemon.
 cycle_interval_secs = 60       # период цикла планирования / scheduling cycle period
 sample_size = 50              # случайная выборка прокси за цикл (без всплесков) / random proxy sample per cycle (no bursts)
-refresh_check_limit = 50      # новых unknown-прокси за обновление источника в приоритет-очередь (0 = выкл) / newly inserted unknown proxies per source refresh queued for priority checking (0 = off)
 fail_limit = 3                # неудач подряд до карантина / consecutive failures before quarantine
 connect_timeout_secs = 10     # T1: TCP-connect
 tls_timeout_secs = 10         # T1: TLS-handshake
 concurrency = 8
 heartbeat_interval_secs = 30  # meta-ключ probe_heartbeat для админки / probe_heartbeat meta key consumed by the admin panel
-# Второй шанс: окно [24ч, 48ч) после карантина (SPEC §8.3a):
-# second_chance_at = quarantined_at + min + U(0..spread), UTC.
-# Second chance: a recheck window of [24h, 48h) after quarantine (SPEC §8.3a):
-# second_chance_at = quarantined_at + min + U(0..spread), UTC.
+# Второй шанс для прокси в карантине: повторная проверка в случайный момент
+# окна [24ч, 48ч) после карантина — окно задаётся как min + случайная
+# добавка от 0 до spread (UTC, момент фиксируется в базе на момент карантина).
+# A quarantined proxy's second chance: rechecked at a random moment of the
+# [24h, 48h) window after quarantine — the window is min plus a random
+# addition from 0 to spread (UTC, the moment is fixed in the database when
+# quarantined).
 second_chance_min_hours = 24
 second_chance_spread_hours = 24
 retention_interval_secs = 86400   # период ротации истории / history rotation period
 
 [meow]
-# meow-rs — отдельный системный сервис (SPEC §8.2); Fumox им не управляет,
-# только дёргает REST API и перезагружает конфиг через PUT /configs.
-# meow-rs runs as a separate system service (SPEC §8.2); Fumox does not manage
-# it — it only calls its REST API and reloads its config via PUT /configs.
+# meow-rs — движок реальных туннельных проверок. Живёт как отдельный
+# системный сервис: Fumox им не управляет, только дёргает его REST API
+# и перезагружает конфиг через PUT /configs.
+# meow-rs — the engine behind real tunnel checks. It runs as a separate
+# system service: Fumox does not manage it, it only calls its REST API
+# and reloads its config via PUT /configs.
 api_addr = "127.0.0.1:9090"
 config_path = "/shared/meow.yaml"  # Clash YAML, генерируется probe / Clash YAML generated by the probe
 # Адрес(а) T2-проверки задержки через туннель: probe случайно выбирает один

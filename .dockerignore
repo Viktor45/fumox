@@ -31,3 +31,5 @@ config
 .DS_Store
 .idea
 .vscode
+.zcode
+.mimosa

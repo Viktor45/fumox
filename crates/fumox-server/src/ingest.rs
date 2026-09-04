@@ -7,6 +7,10 @@
 //! Parse failures are soft: HTTP 200 with unrecognizable content is
 //! classified `parse_error` (SPEC §16.11) — including the "zero recognized
 //! lines" case — and never panics.
+//!
+//! Reconciliation keeps alive-linger links for sources without `drop`
+//! rules (SPEC §8.1): a probe-verified proxy missing from the feed stays
+//! linked until the probe itself retires it.
 
 use crate::cache::Caches;
 use crate::fetcher::{FetchFailure, FetchedPayload, Fetcher};
@@ -37,6 +41,18 @@ impl IngestOutcome {
     }
 }
 
+/// Fixed ingest settings from the config — everything not per-source.
+#[derive(Debug, Clone, Copy)]
+pub struct IngestSettings {
+    /// `[ingest].refresh_check_limit`: how many newly inserted unknown
+    /// proxies per refresh are enqueued for priority probing (0 disables
+    /// the queue; SPEC §8.3).
+    pub refresh_check_limit: u32,
+    /// `[ingest].drop_gate`: whether pipeline `drop` rules switch off the
+    /// alive-linger link policy for their source (see `reconcile_source`).
+    pub drop_gate: bool,
+}
+
 /// Fetch, parse and reconcile one source; journal the result.
 ///
 /// With `force = false` a still-fresh raw snapshot (younger than the
@@ -51,15 +67,15 @@ impl IngestOutcome {
 /// render (SPEC §6).
 ///
 /// Freshly inserted proxies are enqueued for priority probing (up to
-/// `refresh_check_limit`, SPEC §8.3): the probe drains the queue at the
-/// start of its next cycle, newest first, so new servers get verified
-/// instead of waiting out the random sample.
+/// `settings.refresh_check_limit`, SPEC §8.3): the probe drains the queue
+/// at the start of its next cycle, newest first, so new servers get
+/// verified instead of waiting out the random sample.
 pub async fn ingest_source(
     pool: &DbPool,
     fetcher: &Fetcher,
     caches: &Caches,
     geo: &GeoResolver,
-    refresh_check_limit: u32,
+    settings: IngestSettings,
     source: &Source,
     force: bool,
 ) -> IngestOutcome {
@@ -97,12 +113,25 @@ pub async fn ingest_source(
         Ok(filtered) => {
             let found = filtered.entries.len();
             let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
-            match proxies::reconcile_source(pool, &source.id, &filtered.entries, &geo_stamps, now)
-                .await
+            // Alive-linger (SPEC §8.1). `[ingest].drop_gate` decides whether
+            // a source's drop rules disable it: gated (true) — a rule added
+            // later reaches the already-stored rows on the very next
+            // refresh; ungated (false, the default) — the probe alone
+            // retires live proxies, drop rules only stop new matches.
+            let keep_alive_linger = !(settings.drop_gate && filtered.has_drop_rules);
+            match proxies::reconcile_source(
+                pool,
+                &source.id,
+                &filtered.entries,
+                &geo_stamps,
+                now,
+                keep_alive_linger,
+            )
+            .await
             {
                 Ok(stats) => {
                     journal_success(pool, source, &payload, found, now).await;
-                    enqueue_probe_requests(pool, &stats, refresh_check_limit, now).await;
+                    enqueue_probe_requests(pool, &stats, settings.refresh_check_limit, now).await;
                     IngestOutcome::Ok {
                         proxies_found: found,
                         stats,
@@ -237,14 +266,17 @@ async fn resolve_geo_stamps(
     stamps
 }
 
-/// What [`parse_payload`] produced: the surviving entries plus how many were
+/// What [`parse_payload`] produced: the surviving entries, how many were
 /// discarded by the source's own filters (protocol allowlist, pipeline
-/// `drop` rules) — the dry run shows the split so rules can be tuned before
-/// the first real fetch.
+/// `drop` rules — the dry run shows the split so rules can be tuned before
+/// the first real fetch) and whether the source has `drop` rules at all.
 #[derive(Debug)]
 struct FilteredPayload {
     entries: Vec<ProxyEntry>,
     dropped: usize,
+    /// Gates the alive-linger policy (SPEC §8.1): a source with drop rules
+    /// must not keep links its rules would have discarded.
+    has_drop_rules: bool,
 }
 
 /// Decode + parse the raw payload according to the source settings.
@@ -280,10 +312,14 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     // serving side: a config that cannot compile is a parse error, so
     // nothing slips past the rules (save-time validation should have
     // caught this already).
+    let mut has_drop_rules = false;
     let entries = match &source.pipeline {
         None => entries,
         Some(value) => match crate::pipeline::CompiledPipeline::from_json(Some(value)) {
-            Ok(compiled) => compiled.drop_entries(entries),
+            Ok(compiled) => {
+                has_drop_rules = compiled.has_drop_rules();
+                compiled.drop_entries(entries)
+            }
             Err(_) => {
                 return Err("pipeline config failed validation; refusing to ingest".to_string());
             }
@@ -294,6 +330,7 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     }
     Ok(FilteredPayload {
         dropped: recognized - entries.len(),
+        has_drop_rules,
         entries,
     })
 }
@@ -543,5 +580,59 @@ mod tests {
         assert_eq!(entries.len(), 2);
         // Rename is serving-side only — the stored entries keep their names.
         assert_eq!(entries[0].name, "A");
+    }
+
+    #[test]
+    fn drop_rules_gate_off_the_alive_linger() {
+        // SPEC §8.1 + `[ingest].drop_gate`: the linger decision is
+        // `!(drop_gate && has_drop_rules)` — has_drop_rules alone never
+        // disables linger when the config leaves the gate off (the
+        // default: the probe alone retires live proxies, drop rules only
+        // stop new matches).
+        let body = "vless://uuid@h.example.com:443#keep\n";
+        let linger =
+            |drop_gate: bool, filtered: &FilteredPayload| !(drop_gate && filtered.has_drop_rules);
+
+        // A drop section (even one that matches nothing) switches the gate…
+        let mut source = source_with(Encoding::Auto, None);
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "drop": [{ "match": "^zzz-nonexistent$" }]
+        }));
+        let filtered = parse_payload(&source, &payload(body)).unwrap();
+        assert!(filtered.has_drop_rules);
+        assert!(
+            !linger(true, &filtered),
+            "gated: alive leaves on next refresh"
+        );
+        assert!(linger(false, &filtered), "gate off: everyone lingers");
+
+        // …an empty drop section does not (it resets a profile override,
+        // not the source's own linger)…
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "drop": []
+        }));
+        let filtered = parse_payload(&source, &payload(body)).unwrap();
+        assert!(!filtered.has_drop_rules);
+        assert!(linger(true, &filtered));
+        assert!(linger(false, &filtered));
+
+        // …and neither does no pipeline or a pipeline without drop.
+        source.pipeline = None;
+        assert!(
+            !parse_payload(&source, &payload(body))
+                .unwrap()
+                .has_drop_rules
+        );
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "rename": [{ "match": "a", "replace": "b" }]
+        }));
+        assert!(
+            !parse_payload(&source, &payload(body))
+                .unwrap()
+                .has_drop_rules
+        );
     }
 }

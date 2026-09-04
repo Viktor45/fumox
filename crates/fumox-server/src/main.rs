@@ -92,7 +92,10 @@ async fn main() -> anyhow::Result<()> {
             fetcher: fetcher.clone(),
             caches: caches.clone(),
             geo: geo.clone(),
-            refresh_check_limit: config.probe.refresh_check_limit,
+            settings: ingest::IngestSettings {
+                refresh_check_limit: config.ingest.refresh_check_limit,
+                drop_gate: config.ingest.drop_gate,
+            },
         },
         scheduler_state.clone(),
         events.clone(),

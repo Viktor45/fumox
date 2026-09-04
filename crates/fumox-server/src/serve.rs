@@ -883,12 +883,14 @@ mod tests {
     }
 
     async fn ingest(state: &AppState, source_id: &str, entries: &[ProxyEntry]) {
+        // Test helper: no drop rules anywhere, linger allowed (SPEC §8.1).
         proxies::reconcile_source(
             &state.pool,
             source_id,
             entries,
             &[],
             fumox_core::models::now_ts(),
+            true,
         )
         .await
         .unwrap();

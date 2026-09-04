@@ -63,9 +63,9 @@ pub struct IngestEnv {
     pub fetcher: Fetcher,
     pub caches: Caches,
     pub geo: Arc<GeoResolver>,
-    /// `[probe].refresh_check_limit`: how many newly inserted proxies per
-    /// refresh are enqueued for priority probing (0 disables the queue).
-    pub refresh_check_limit: u32,
+    /// Fixed ingest settings (`[ingest].refresh_check_limit`,
+    /// `[ingest].drop_gate`).
+    pub settings: crate::ingest::IngestSettings,
 }
 
 /// Run the scheduler until the process shuts down.
@@ -153,7 +153,7 @@ fn spawn_ingest(
             fetcher,
             caches,
             geo,
-            refresh_check_limit,
+            settings,
         } = env;
         if !state.acquire_source(&source_id).await {
             tracing::debug!(source = %source_id, "source already fetching; skipping");
@@ -167,16 +167,8 @@ fn spawn_ingest(
             Ok(permit) => permit,
             Err(_) => return, // semaphore closed during shutdown
         };
-        let outcome = ingest::ingest_source(
-            &pool,
-            &fetcher,
-            &caches,
-            &geo,
-            refresh_check_limit,
-            &source,
-            force,
-        )
-        .await;
+        let outcome =
+            ingest::ingest_source(&pool, &fetcher, &caches, &geo, settings, &source, force).await;
         drop(permit);
         state.release_source(&source_id).await;
         match outcome {

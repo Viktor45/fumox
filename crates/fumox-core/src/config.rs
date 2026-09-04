@@ -34,6 +34,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub fetch: FetchConfig,
     #[serde(default)]
+    pub ingest: IngestConfig,
+    #[serde(default)]
     pub geo: GeoConfig,
     #[serde(default)]
     pub admin: AdminConfig,
@@ -110,6 +112,36 @@ impl Default for ServerConfig {
             bind: defaults::server_bind(),
             rate_limit: defaults::public_rate_limit(),
             auth_fail_rate_limit: defaults::auth_fail_rate_limit(),
+        }
+    }
+}
+
+/// Source ingestion of `fumox-server`'s scheduler (fetch → parse →
+/// reconcile; SPEC §8.1). Owns the knobs of the reconcile pass that are
+/// not per-source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestConfig {
+    /// How many newly inserted `unknown` proxies of one source refresh are
+    /// enqueued for priority checking (0 disables the queue). The probe
+    /// drains the queue at the start of its next cycle, newest first.
+    #[serde(default = "defaults::refresh_check_limit")]
+    pub refresh_check_limit: u32,
+    /// Whether pipeline `drop` rules switch off the alive-linger link
+    /// policy for their source (SPEC §8.1/§8.4). `true`: an alive proxy of
+    /// a source with drop rules leaves on the next refresh after the rule
+    /// catches it. `false` (the default): the probe alone retires proxies —
+    /// every source lingers, even ones with drop rules, so a rule added
+    /// later only stops new matches, never stored ones.
+    #[serde(default = "defaults::drop_gate")]
+    pub drop_gate: bool,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            refresh_check_limit: defaults::refresh_check_limit(),
+            drop_gate: defaults::drop_gate(),
         }
     }
 }
@@ -328,11 +360,6 @@ pub struct ProbeConfig {
     /// Random sample size per cycle (spreads load, avoids bursts).
     #[serde(default = "defaults::sample_size")]
     pub sample_size: u32,
-    /// How many newly ingested `unknown` proxies of one source refresh are
-    /// enqueued for priority checking (0 disables the queue). The probe
-    /// drains the queue before the random sample, newest first.
-    #[serde(default = "defaults::refresh_check_limit")]
-    pub refresh_check_limit: u32,
     /// Consecutive failures before quarantine.
     #[serde(default = "defaults::fail_limit")]
     pub fail_limit: u32,
@@ -365,7 +392,6 @@ impl Default for ProbeConfig {
         Self {
             cycle_interval_secs: defaults::cycle_interval_secs(),
             sample_size: defaults::sample_size(),
-            refresh_check_limit: defaults::refresh_check_limit(),
             fail_limit: defaults::fail_limit(),
             connect_timeout_secs: defaults::probe_connect_timeout_secs(),
             tls_timeout_secs: defaults::probe_tls_timeout_secs(),
@@ -617,6 +643,12 @@ mod defaults {
     pub fn server_bind() -> SocketAddr {
         "0.0.0.0:8080".parse().expect("valid socket address")
     }
+
+    /// Alive-linger for everyone by default — the probe is the sole owner
+    /// of a live proxy's lifecycle.
+    pub const fn drop_gate() -> bool {
+        false
+    }
     pub fn database_path() -> PathBuf {
         PathBuf::from("fumox.db")
     }
@@ -766,6 +798,33 @@ mod tests {
         assert_eq!(cfg.log.probe, LogLevel::Info);
         assert!(cfg.admin.is_active());
         assert_eq!(cfg.geo.db_path(), Path::new("config/GeoLite2-Country.mmdb"));
+        // Ingest defaults: alive-linger for everyone (the drop gate is
+        // opt-in) and the priority-probe queue enabled.
+        assert!(!cfg.ingest.drop_gate);
+        assert_eq!(cfg.ingest.refresh_check_limit, 50);
+    }
+
+    #[test]
+    fn ingest_section_owns_drop_gate_and_refresh_check_limit() {
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-ingest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.toml");
+        std::fs::write(
+            &file,
+            "[ingest]\ndrop_gate = true\nrefresh_check_limit = 10\n",
+        )
+        .unwrap();
+        let cfg = AppConfig::load(Some(&file)).expect("ingest section must load");
+        assert!(cfg.ingest.drop_gate);
+        assert_eq!(cfg.ingest.refresh_check_limit, 10);
+
+        // The keys moved house: the old spellings are rejected so nobody
+        // silently runs on defaults.
+        std::fs::write(&file, "[probe]\nrefresh_check_limit = 10\n").unwrap();
+        assert!(AppConfig::load(Some(&file)).is_err());
+        std::fs::write(&file, "[server]\ndrop_gate = true\n").unwrap();
+        assert!(AppConfig::load(Some(&file)).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

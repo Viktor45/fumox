@@ -34,9 +34,11 @@ pub async fn pipeline_preview(
         .into_response()
 }
 
-/// `#ped-rows` content: the rename lines after add/drop. The whole container
-/// is re-rendered from the posted fields, so nothing the administrator typed
-/// into the other lines is lost.
+/// `#ped-rows` content: the rule lines after add/remove. `section` picks
+/// the container (`rename` — default — or `drop`), `remove` carries the
+/// index of the line to delete; without `remove` a fresh empty line is
+/// appended. The whole container is re-rendered from the posted fields,
+/// so nothing the administrator typed into the other lines is lost.
 pub async fn pipeline_rows(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -45,21 +47,25 @@ pub async fn pipeline_rows(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let mut built = BuilderState::from_form(&form);
-    match params
-        .get("drop")
-        .and_then(|index| index.parse::<usize>().ok())
-    {
-        Some(index) => {
+    let index = params
+        .get("remove")
+        .and_then(|index| index.parse::<usize>().ok());
+    match (params.get("section").map(String::as_str), index) {
+        (Some("drop"), Some(index)) => {
+            if index < built.drop.len() {
+                built.drop.remove(index);
+            }
+        }
+        (Some("drop"), None) => built.drop.push(Default::default()),
+        (_, Some(index)) => {
             if index < built.rename.len() {
                 built.rename.remove(index);
             }
         }
-        None => built.rename.push(Default::default()),
+        (_, None) => built.rename.push(Default::default()),
     }
-    let fragment = RowsFragment {
-        lang: lang.clone(),
-        builder: BuilderView::new(&built),
-    };
+    let section = params.get("section").cloned().unwrap_or_default();
+    let fragment = RowsFragment::for_section(lang.clone(), BuilderView::new(&built), &section);
     render_html(lang, &fragment, StatusCode::OK)
 }
 

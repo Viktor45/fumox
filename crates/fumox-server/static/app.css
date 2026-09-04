@@ -575,6 +575,8 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 }
 .ped-row input[type="text"]:not(.mono) { flex: 1 1 160px; }
 .ped-row input.mono { flex: 0 0 70px; }
+.ped-row input[name$="_key"] { flex: 0 1 110px; }
+.ped-row select { flex: 0 0 auto; }
 .ped-arrow { color: var(--muted, #888); }
 .ped-preview-json {
   padding: 10px 12px;

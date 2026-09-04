@@ -94,10 +94,12 @@ pub async fn ingest_source(
     caches.raw_put(&source.id, payload.clone(), now).await;
 
     match parse_payload(source, &payload) {
-        Ok(entries) => {
-            let found = entries.len();
-            let geo_stamps = resolve_geo_stamps(geo, &entries).await;
-            match proxies::reconcile_source(pool, &source.id, &entries, &geo_stamps, now).await {
+        Ok(filtered) => {
+            let found = filtered.entries.len();
+            let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
+            match proxies::reconcile_source(pool, &source.id, &filtered.entries, &geo_stamps, now)
+                .await
+            {
                 Ok(stats) => {
                     journal_success(pool, source, &payload, found, now).await;
                     enqueue_probe_requests(pool, &stats, refresh_check_limit, now).await;
@@ -133,6 +135,9 @@ pub enum DryRunOutcome {
         http_status: u16,
         bytes: u64,
         proxies_found: usize,
+        /// How many recognized proxies the source's own filters threw away
+        /// (protocol allowlist, pipeline `drop` rules).
+        dropped: usize,
         /// First few recognized lines for the preview.
         sample: Vec<String>,
     },
@@ -156,8 +161,9 @@ pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome
         Err(failure) => return DryRunOutcome::FetchFailed { failure },
     };
     match parse_payload(source, &payload) {
-        Ok(entries) => {
-            let sample = entries
+        Ok(filtered) => {
+            let sample = filtered
+                .entries
                 .iter()
                 .take(10)
                 .map(|entry| {
@@ -174,7 +180,8 @@ pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome
             DryRunOutcome::Ok {
                 http_status: payload.http_status,
                 bytes: payload.bytes,
-                proxies_found: entries.len(),
+                proxies_found: filtered.entries.len(),
+                dropped: filtered.dropped,
                 sample,
             }
         }
@@ -230,9 +237,20 @@ async fn resolve_geo_stamps(
     stamps
 }
 
+/// What [`parse_payload`] produced: the surviving entries plus how many were
+/// discarded by the source's own filters (protocol allowlist, pipeline
+/// `drop` rules) — the dry run shows the split so rules can be tuned before
+/// the first real fetch.
+#[derive(Debug)]
+struct FilteredPayload {
+    entries: Vec<ProxyEntry>,
+    dropped: usize,
+}
+
 /// Decode + parse the raw payload according to the source settings.
-/// Returns the recognized entries, or an error message for `parse_error`.
-fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<Vec<ProxyEntry>, String> {
+/// Returns the recognized entries that survived the source's filters, or
+/// an error message for `parse_error`.
+fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPayload, String> {
     let text = std::str::from_utf8(&payload.body)
         .map_err(|e| format!("payload is not valid UTF-8: {e}"))?;
     let encoding = source.encoding;
@@ -245,6 +263,7 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<Vec<ProxyE
             parsed.discarded, parsed.unrecognized, parsed.clash_skipped
         ));
     }
+    let recognized = parsed.entries.len();
     // Optional per-source protocol allowlist.
     let entries = match &source.protocols {
         Some(allowed) => parsed
@@ -254,10 +273,29 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<Vec<ProxyE
             .collect(),
         None => parsed.entries,
     };
+    // Pipeline `drop` rules (SPEC §5 step 3): a matching proxy is never
+    // stored. Only the source's own pipeline runs here — profiles may
+    // override the section on serving, but they never take part in
+    // ingestion (one source feeds many profiles). Fail-closed like the
+    // serving side: a config that cannot compile is a parse error, so
+    // nothing slips past the rules (save-time validation should have
+    // caught this already).
+    let entries = match &source.pipeline {
+        None => entries,
+        Some(value) => match crate::pipeline::CompiledPipeline::from_json(Some(value)) {
+            Ok(compiled) => compiled.drop_entries(entries),
+            Err(_) => {
+                return Err("pipeline config failed validation; refusing to ingest".to_string());
+            }
+        },
+    };
     if entries.is_empty() {
-        return Err("no proxies left after the source protocol filter".to_string());
+        return Err("no proxies left after the protocol and drop filters".to_string());
     }
-    Ok(entries)
+    Ok(FilteredPayload {
+        dropped: recognized - entries.len(),
+        entries,
+    })
 }
 
 async fn journal_success(
@@ -405,7 +443,7 @@ mod tests {
     fn parses_plain_uri_list() {
         let source = source_with(Encoding::Auto, None);
         let body = "vless://uuid@1.2.3.4:443?security=reality#A\ntrojan://pw@h:443#B\n";
-        let entries = parse_payload(&source, &payload(body)).unwrap();
+        let entries = parse_payload(&source, &payload(body)).unwrap().entries;
         assert_eq!(entries.len(), 2);
     }
 
@@ -415,7 +453,7 @@ mod tests {
         let inner = "vless://uuid@1.2.3.4:443#A\n";
         let wrapped = base64::engine::general_purpose::STANDARD.encode(inner);
         let source = source_with(Encoding::Auto, None);
-        let entries = parse_payload(&source, &payload(&wrapped)).unwrap();
+        let entries = parse_payload(&source, &payload(&wrapped)).unwrap().entries;
         assert_eq!(entries.len(), 1);
     }
 
@@ -431,7 +469,7 @@ mod tests {
         let mut source = source_with(Encoding::Auto, None);
         source.protocols = Some(vec![fumox_core::models::Scheme::Trojan]);
         let body = "vless://uuid@1.2.3.4:443#A\ntrojan://pw@h:443#B\n";
-        let entries = parse_payload(&source, &payload(body)).unwrap();
+        let entries = parse_payload(&source, &payload(body)).unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].scheme, fumox_core::models::Scheme::Trojan);
 
@@ -449,5 +487,61 @@ mod tests {
             body: vec![0xff, 0xfe],
         };
         assert!(parse_payload(&source, &bad).is_err());
+    }
+
+    #[test]
+    fn pipeline_drop_rules_filter_entries_before_storage() {
+        let mut source = source_with(Encoding::Auto, None);
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "drop": [
+                { "match": "free", "flags": "i" },
+                { "match": "\\.cn$", "target": "host" }
+            ]
+        }));
+        let body = "vless://uuid@1.2.3.4:443#free node\nvless://uuid@h.cn:443#cn\nvless://uuid@h.example.com:443#keep\n";
+        let entries = parse_payload(&source, &payload(body)).unwrap().entries;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host, "h.example.com");
+    }
+
+    #[test]
+    fn pipeline_drop_of_everything_is_a_parse_error_not_a_silent_zero() {
+        // A mistyped `.*` must redden the source with a clear message, not
+        // silently empty it — and the database must stay untouched.
+        let mut source = source_with(Encoding::Auto, None);
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "drop": [{ "match": ".*", "target": "name" }]
+        }));
+        let body = "vless://uuid@1.2.3.4:443#A\nvless://uuid@h:443#B\n";
+        let err = parse_payload(&source, &payload(body)).unwrap_err();
+        assert!(err.contains("protocol and drop filters"), "{err}");
+    }
+
+    #[test]
+    fn corrupted_pipeline_config_fails_closed() {
+        // Cannot happen through the admin forms (save-time validation), but
+        // a hand-edited row must not let its proxies slip past the rules.
+        let mut source = source_with(Encoding::Auto, None);
+        source.pipeline = Some(serde_json::json!({ "version": 2 }));
+        let body = "vless://uuid@1.2.3.4:443#A\n";
+        let err = parse_payload(&source, &payload(body)).unwrap_err();
+        assert!(err.contains("failed validation"), "{err}");
+    }
+
+    #[test]
+    fn no_pipeline_section_means_no_drop() {
+        // A pipeline without a `drop` section changes nothing at ingestion.
+        let mut source = source_with(Encoding::Auto, None);
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "rename": [{ "match": "a", "replace": "b" }]
+        }));
+        let body = "vless://uuid@1.2.3.4:443#A\nvless://uuid@h:443#B\n";
+        let entries = parse_payload(&source, &payload(body)).unwrap().entries;
+        assert_eq!(entries.len(), 2);
+        // Rename is serving-side only — the stored entries keep their names.
+        assert_eq!(entries[0].name, "A");
     }
 }

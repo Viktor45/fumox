@@ -138,12 +138,40 @@
     </div>
     {% endif %}
     <div id="ped-rows">
-      {% include "pipeline/_rows.html" %}
+      {% include "pipeline/_rows_rename.html" %}
     </div>
     <button class="btn small" type="button"
             hx-post="/admin/pipeline/rows"
             hx-target="#ped-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']">{{ self.t("ped.rename_add") }}</button>
+  </div>
+
+  <div class="field">
+    <label>{{ self.t("ped.section_drop") }}</label>
+    {% if profile %}
+    <div class="ped-modes3">
+      <span class="check-row">
+        <input type="radio" name="ped_drop" value="skip" id="ped-drop-skip" {% if builder.state.drop_skip && !builder.state.drop_defaults %}checked{% endif %}>
+        <label for="ped-drop-skip">{{ self.t("ped.mode_skip") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_drop" value="defaults" id="ped-drop-defaults" {% if builder.state.drop_defaults %}checked{% endif %}>
+        <label for="ped-drop-defaults">{{ self.t("ped.mode_defaults") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_drop" value="set" id="ped-drop-set" {% if !builder.state.drop_skip && !builder.state.drop_defaults %}checked{% endif %}>
+        <label for="ped-drop-set">{{ self.t("ped.mode_set") }}</label>
+      </span>
+    </div>
+    {% endif %}
+    <div class="hint">{{ self.t("ped.drop_hint") }}</div>
+    <div id="ped-drop-rows">
+      {% include "pipeline/_rows_drop.html" %}
+    </div>
+    <button class="btn small" type="button"
+            hx-post="/admin/pipeline/rows?section=drop"
+            hx-target="#ped-drop-rows" hx-swap="innerHTML"
+            hx-include="[name^='ped_'], [name='_csrf']">{{ self.t("ped.drop_add") }}</button>
   </div>
 
   <div class="field">

@@ -2432,12 +2432,13 @@ mod tests {
         assert!(html.contains("ped_rename_1_match"), "{html}");
 
         // Dropping the first line renumbers the second to index 0 with its
-        // value intact; `drop` travels in the query string exactly like the
-        // htmx button's hx-post URL.
+        // value intact; `remove` travels in the query string exactly like
+        // the htmx button's hx-post URL.
         let response = app
+            .clone()
             .oneshot(request(
                 "POST",
-                "/admin/pipeline/rows?drop=0",
+                "/admin/pipeline/rows?remove=0",
                 &two_rows,
                 Some(&cookie),
             ))
@@ -2448,6 +2449,29 @@ mod tests {
         assert!(html.contains("ped_rename_0_match"), "{html}");
         assert!(!html.contains("ped_rename_1_"), "{html}");
         assert!(html.contains(r#"value="second""#), "{html}");
+
+        // The drop section has its own container: adding a discard line
+        // re-renders only `ped_drop_*` rows and never touches rename ones.
+        let drop_row = urlencoded(&[
+            ("_csrf", &csrf),
+            ("ped_rename_0_match", "keepme"),
+            ("ped_drop_0_match", "\\.cn$"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/rows?section=drop",
+                &drop_row,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains(r#"value="\.cn$""#), "{html}");
+        assert!(html.contains("section=drop&amp;remove=0"), "{html}");
+        assert!(!html.contains("ped_rename_"), "{html}");
     }
 
     #[tokio::test]

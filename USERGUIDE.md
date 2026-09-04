@@ -636,8 +636,17 @@ deduplicate by fingerprint". `"version": 1` is required.
     "exclude_protocols": ["naive"],
     "normalize_params": true
   },
+  "drop": [
+    { "match": "free|trial", "flags": "i" },
+    { "match": "\\.cn$", "target": "host" },
+    { "match": "^80$", "target": "port" },
+    { "match": "^chrome$", "target": "param:fp" }
+  ],
   "rename": [
-    { "match": "^(.*?)\\s*\\|", "replace": "$1", "flags": "i" }
+    { "match": "^(.*?)\\s*\\|", "replace": "$1", "flags": "i" },
+    { "match": "^chrome$", "replace": "firefox", "target": "param:fp" },
+    { "match": "server1\\.tr$", "replace": "invalid.tr", "target": "host" },
+    { "match": "^123$", "replace": "456", "target": "port" }
   ],
   "geo": { "enabled": true, "template": "{flag} {country} · {name}" },
   "health": { "exclude_statuses": ["quarantine", "removed"] },
@@ -649,7 +658,8 @@ deduplicate by fingerprint". `"version": 1` is required.
 | Section  | What it does                                                 | Fields and defaults                                                                                                              |
 | -------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
 | `filter` | Keep/drop protocols; normalize `insecure=1`-style parameters | `protocols` / `exclude_protocols`: lists or null (= all); `normalize_params`: default `true`                                     |
-| `rename` | Regex-based renaming, rules applied in order                 | `match` (regex), `replace`, `flags` (e.g. `"i"`); default `[]`                                                                   |
+| `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` — default, `host`, `port`, `param:KEY`); rules are OR-ed; default `[]`       |
+| `rename` | Regex-based rewriting, rules applied in order               | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` — default, `host`, `port`, `param:KEY`); default `[]` |
 | `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment)) |
 | `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`                                                                          |
 | `dedup`  | Deduplication                                                | `by`: only `"fingerprint"` in v1                                                                                                 |
@@ -660,8 +670,41 @@ value are rejected with a field error in the admin form — nothing is saved.
 This strictness is deliberate, so a future schema v2 can add fields without
 ambiguity.
 
+A rule's optional `target` picks what its regex rewrites — not just the display
+name. The default (`name`, also omitted in the JSON) is the classic renaming;
+`host` and `port` rewrite the proxy address, and `param:KEY` rewrites the
+first parameter with that key (case-insensitive: feeds mix `headerType` and
+`headertype`). Parameter values are matched and written in their raw,
+percent-encoded form — exactly as they appear in the URI — so `path=%2Fws` is
+rewritten through its encoded spelling. Host and port results are guarded on
+serving: an empty host, a host containing URI delimiters or a port outside
+0–65535 is skipped with a WARN log entry and the original value kept, so one
+broken rule cannot corrupt every line of the subscription. Note that
+rewriting `host`/`port`/`param` changes the proxy fingerprint at serving time:
+two nodes rewritten to the same address merge at the dedup step (which runs
+after renaming, first occurrence wins).
+
+The `drop` section works the other way around: instead of rewriting, a
+matching proxy is thrown away entirely — not just hidden from the
+subscription, but never written to the database in the first place. The
+rules use the same selectors as rename (`match`, `flags`, `target`; no
+`replace` — the strict schema rejects it) and are OR-ed: a single match
+discards the proxy. They are applied twice, always before `rename` so both
+sides see the original values: at ingestion by the source's own pipeline
+(a matching proxy is not stored, geo-resolved or queued for probing; a
+corrupted config fails closed as a parse error, and if every proxy matches,
+the fetch is recorded as a parse error — the database stays untouched) and
+on serving by the effective pipeline (so a profile's `drop` section works
+too, and a rule added later hides the already-stored rows immediately).
+Proxies stored before a rule was added leave through the normal lifecycle:
+the source's next refresh does not stamp their link, they are unlinked and,
+without any other source, marked `removed` by the probe state machine — no
+hard deletes. A proxy dropped by one source but still published by another
+stays in the database. The admin dry run shows how many proxies the source's
+filters discarded, so rules can be tuned before the first real fetch.
+
 The pipeline runs in a fixed order:
-**parse → filter → rename → geo → health-filter → merge + dedup → sort → encode.**
+**parse → filter → drop → rename → geo → health-filter → merge + dedup → sort → encode.**
 
 ## 10. Health checks and proxy lifecycle
 

@@ -1,0 +1,6 @@
+{# rename-section wrapper: sets the section variable for the shared rule
+   rows template, so the widget can include it without a `with` clause
+   (askama includes share the parent's context and cannot take extra
+   arguments). #}
+{% set section = "rename" %}
+{% include "pipeline/_rows.html" %}

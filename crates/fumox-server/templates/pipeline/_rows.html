@@ -1,8 +1,38 @@
-{# Rename lines of the pipeline builder (PIPELINE.md §3). Rendered inline by
-   the form (initial state) and by POST /admin/pipeline/rows after add/drop;
-   both hosts expose `builder` (BuilderView) and the i18n helper, so the
-   markup lives here exactly once. #}
-{% for row in builder.state.rename %}
+{# Rule lines of the pipeline builder (PIPELINE.md §3): one template for
+   both sections. The including wrapper (_rows_rename.html /
+   _rows_drop.html) sets `section` ("rename" | "drop"), which selects the
+   row set, the field prefix (`ped_rename_<i>_` / `ped_drop_<i>`) and the
+   add/remove endpoint's ?section=. The target selector markup is
+   duplicated across the two branches — askama macros cannot be shared
+   from an included file, and the block is small and stable. A drop line
+   has no `replace` field: a discard rule only selects, never rewrites. #}
+{% if section == "drop" %}
+  {% for row in builder.state.drop %}
+  <div class="ped-row">
+    <input type="text" name="ped_drop_{{ loop.index0 }}_match" value="{{ row.match_pattern }}"
+           placeholder="{{ self.t("ped.rename_match") }}" aria-label="{{ self.t("ped.rename_match") }}">
+    <input type="text" class="mono" name="ped_drop_{{ loop.index0 }}_flags" value="{{ row.flags }}" maxlength="3"
+           placeholder="{{ self.t("ped.rename_flags") }}" aria-label="{{ self.t("ped.rename_flags") }}">
+    <select name="ped_drop_{{ loop.index0 }}_target" aria-label="{{ self.t("ped.rename_target") }}">
+      <option value="name" {% if row.target == "name" || row.target == "" %}selected{% endif %}>{{ self.t("ped.target_name") }}</option>
+      <option value="host" {% if row.target == "host" %}selected{% endif %}>{{ self.t("ped.target_host") }}</option>
+      <option value="port" {% if row.target == "port" %}selected{% endif %}>{{ self.t("ped.target_port") }}</option>
+      <option value="param" {% if row.target == "param" %}selected{% endif %}>{{ self.t("ped.target_param") }}</option>
+      {% if row.target != "" && row.target != "name" && row.target != "host" && row.target != "port" && row.target != "param" %}
+      <option value="{{ row.target }}" selected>{{ row.target }}</option>
+      {% endif %}
+    </select>
+    <input type="text" class="mono" name="ped_drop_{{ loop.index0 }}_key" value="{{ row.param_key }}"
+           placeholder="{{ self.t("ped.target_param_key") }}" aria-label="{{ self.t("ped.target_param_key") }}">
+    <button class="btn small" type="button"
+            hx-post="/admin/pipeline/rows?section=drop&amp;remove={{ loop.index0 }}"
+            hx-target="#ped-drop-rows" hx-swap="innerHTML"
+            hx-include="[name^='ped_'], [name='_csrf']"
+            title="{{ self.t("ped.rename_remove") }}">✕</button>
+  </div>
+  {% endfor %}
+{% else %}
+  {% for row in builder.state.rename %}
   <div class="ped-row">
     <input type="text" name="ped_rename_{{ loop.index0 }}_match" value="{{ row.match_pattern }}"
            placeholder="{{ self.t("ped.rename_match") }}" aria-label="{{ self.t("ped.rename_match") }}">
@@ -11,10 +41,22 @@
            placeholder="{{ self.t("ped.rename_replace") }}" aria-label="{{ self.t("ped.rename_replace") }}">
     <input type="text" class="mono" name="ped_rename_{{ loop.index0 }}_flags" value="{{ row.flags }}" maxlength="3"
            placeholder="{{ self.t("ped.rename_flags") }}" aria-label="{{ self.t("ped.rename_flags") }}">
+    <select name="ped_rename_{{ loop.index0 }}_target" aria-label="{{ self.t("ped.rename_target") }}">
+      <option value="name" {% if row.target == "name" || row.target == "" %}selected{% endif %}>{{ self.t("ped.target_name") }}</option>
+      <option value="host" {% if row.target == "host" %}selected{% endif %}>{{ self.t("ped.target_host") }}</option>
+      <option value="port" {% if row.target == "port" %}selected{% endif %}>{{ self.t("ped.target_port") }}</option>
+      <option value="param" {% if row.target == "param" %}selected{% endif %}>{{ self.t("ped.target_param") }}</option>
+      {% if row.target != "" && row.target != "name" && row.target != "host" && row.target != "port" && row.target != "param" %}
+      <option value="{{ row.target }}" selected>{{ row.target }}</option>
+      {% endif %}
+    </select>
+    <input type="text" class="mono" name="ped_rename_{{ loop.index0 }}_key" value="{{ row.param_key }}"
+           placeholder="{{ self.t("ped.target_param_key") }}" aria-label="{{ self.t("ped.target_param_key") }}">
     <button class="btn small" type="button"
-            hx-post="/admin/pipeline/rows?drop={{ loop.index0 }}"
+            hx-post="/admin/pipeline/rows?remove={{ loop.index0 }}"
             hx-target="#ped-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
             title="{{ self.t("ped.rename_remove") }}">✕</button>
   </div>
-{% endfor %}
+  {% endfor %}
+{% endif %}

@@ -18,6 +18,11 @@
           <tr><td>{{ self.t("src.dryrun_recognized") }}</td><td>{{ count }}</td></tr>
         {% when None %}
       {% endmatch %}
+      {% match dropped %}
+        {% when Some with (count) %}
+          <tr><td>{{ self.t("src.dryrun_dropped") }}</td><td>{{ count }}</td></tr>
+        {% when None %}
+      {% endmatch %}
     </tbody>
   </table>
   {% if !sample.is_empty() %}

@@ -8,16 +8,62 @@
 //! preview) renders through [`WidgetFragment`] into the source/profile forms.
 
 use crate::admin::i18n::{Lang, impl_i18n};
-use crate::pipeline::{DEFAULT_GEO_TEMPLATE, PipelineConfig, RenameRule, SortBy};
+use crate::pipeline::{DEFAULT_GEO_TEMPLATE, DropRule, PipelineConfig, RenameRule, SortBy};
 use askama::Template;
 use fumox_core::models::{ProxyStatus, Scheme};
 
 /// One rename row of the builder (a `rename[]` entry).
+///
+/// `target` mirrors the rule's `target` field in the compact UI form:
+/// `"name"`/`"host"`/`"port"` or `"param:KEY"`. The `param` key part is a
+/// separate free-text field in the widget (`_rows.html`), so `target`
+/// holds `"param"` and `param_key` the key; [`emit_rename_rule`] recombines
+/// them. Keeping them split avoids a regex round-trip between the form and
+/// the state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RenameRow {
     pub match_pattern: String,
     pub replace: String,
     pub flags: String,
+    pub target: String,
+    pub param_key: String,
+}
+
+/// The rule's `target` JSON value: the compact UI form recombined. An
+/// unknown selector or an empty `param` key is emitted as-is (a `param:`
+/// with nothing after the colon) — the builder holds values the validator
+/// will flag in the preview, never silently dropping them (PIPELINE.md §4).
+/// `name` emits nothing: it is the schema default and stays implicit.
+pub(crate) fn emit_rename_target(row: &RenameRow) -> Option<String> {
+    match row.target.trim() {
+        "" | "name" => None,
+        "param" => Some(format!("param:{}", row.param_key.trim())),
+        other => Some(other.to_string()),
+    }
+}
+
+/// One drop row of the builder (a `drop[]` entry). The selector twin of a
+/// rename row minus the replacement: the same target select (`name`/
+/// `host`/`port`/`param` plus the key field), no `replace` — a discard
+/// rule only selects, never rewrites.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DropRow {
+    pub match_pattern: String,
+    pub flags: String,
+    pub target: String,
+    pub param_key: String,
+}
+
+impl DropRow {
+    /// The rule's `target` JSON value — the same recombination semantics
+    /// as [`emit_rename_target`].
+    fn target_value(&self) -> Option<String> {
+        match self.target.trim() {
+            "" | "name" => None,
+            "param" => Some(format!("param:{}", self.param_key.trim())),
+            other => Some(other.to_string()),
+        }
+    }
 }
 
 /// Values of the builder widget, exactly as the form fields carry them.
@@ -41,6 +87,10 @@ pub(crate) struct BuilderState {
     pub rename: Vec<RenameRow>,
     pub rename_skip: bool,
     pub rename_defaults: bool,
+    /// The `drop` section — the same tri-state as rename, over `DropRow`s.
+    pub drop: Vec<DropRow>,
+    pub drop_skip: bool,
+    pub drop_defaults: bool,
     pub geo_set: bool,
     pub geo_defaults: bool,
     pub geo_enabled: bool,
@@ -88,6 +138,7 @@ pub(crate) fn preset(name: &str) -> BuilderState {
                 match_pattern: r"^\s+|\s+$".into(),
                 replace: String::new(),
                 flags: String::new(),
+                ..RenameRow::default()
             }],
             ..BuilderState::new()
         },
@@ -108,8 +159,9 @@ impl BuilderState {
 
     /// Parse the builder fields out of a urlencoded form. Multi-value fields
     /// (`ped_filter_protocols`, `ped_filter_exclude`, `ped_health_exclude`)
-    /// repeat the name; rename rows carry their index:
-    /// `ped_rename_<i>_match|replace|flags`; section mode controls submit
+    /// repeat the name; rename/drop rows carry their index:
+    /// `ped_rename_<i>_match|replace|flags|target|key`,
+    /// `ped_drop_<i>_match|flags|target|key`; section mode controls submit
     /// `ped_<section>` = `1`/`skip`/`defaults`/`set`. Only `ped_*` fields are
     /// read, so the same form body can carry the rest of the source/profile
     /// form.
@@ -131,24 +183,44 @@ impl BuilderState {
 
         // Rows are collected through an index map, so gaps (a dropped row)
         // and out-of-order fields parse identically.
-        let mut rows: std::collections::BTreeMap<usize, RenameRow> =
+        let mut rename_rows: std::collections::BTreeMap<usize, RenameRow> =
+            std::collections::BTreeMap::new();
+        let mut drop_rows: std::collections::BTreeMap<usize, DropRow> =
             std::collections::BTreeMap::new();
         for (key, value) in form {
-            let Some(rest) = key.strip_prefix("ped_rename_") else {
+            let (prefix, rows): (&str, bool) = if key.starts_with("ped_rename_") {
+                ("ped_rename_", true)
+            } else if key.starts_with("ped_drop_") {
+                ("ped_drop_", false)
+            } else {
                 continue;
             };
-            let Some((index, field)) = rest.rsplit_once('_') else {
+            let Some((index, field)) = key[prefix.len()..].rsplit_once('_') else {
                 continue;
             };
             let Ok(index) = index.parse::<usize>() else {
                 continue;
             };
-            let row = rows.entry(index).or_default();
-            match field {
-                "match" => row.match_pattern = value.trim().to_string(),
-                "replace" => row.replace = value.trim().to_string(),
-                "flags" => row.flags = value.trim().to_string(),
-                _ => {}
+            let value = value.trim().to_string();
+            if rows {
+                let row = rename_rows.entry(index).or_default();
+                match field {
+                    "match" => row.match_pattern = value,
+                    "replace" => row.replace = value,
+                    "flags" => row.flags = value,
+                    "target" => row.target = value,
+                    "key" => row.param_key = value,
+                    _ => {}
+                }
+            } else {
+                let row = drop_rows.entry(index).or_default();
+                match field {
+                    "match" => row.match_pattern = value,
+                    "flags" => row.flags = value,
+                    "target" => row.target = value,
+                    "key" => row.param_key = value,
+                    _ => {}
+                }
             }
         }
 
@@ -157,6 +229,7 @@ impl BuilderState {
         let (health_set, health_defaults) = mode_flags(&get("ped_health"));
         let (sort_set, sort_defaults) = mode_flags(&get("ped_sort"));
         let rename_mode = get("ped_rename");
+        let drop_mode = get("ped_drop");
 
         Self {
             filter_set,
@@ -164,9 +237,12 @@ impl BuilderState {
             protocols: get_all("ped_filter_protocols"),
             exclude_protocols: get_all("ped_filter_exclude"),
             normalize_params: get("ped_normalize") == "1",
-            rename: rows.into_values().collect(),
+            rename: rename_rows.into_values().collect(),
             rename_skip: rename_mode == "skip",
             rename_defaults: rename_mode == "defaults",
+            drop: drop_rows.into_values().collect(),
+            drop_skip: drop_mode == "skip",
+            drop_defaults: drop_mode == "defaults",
             geo_set,
             geo_defaults,
             geo_enabled: get("ped_geo_enabled") == "1",
@@ -235,11 +311,44 @@ impl BuilderState {
                     if !row.flags.is_empty() {
                         rule.insert("flags".into(), serde_json::Value::from(row.flags.as_str()));
                     }
+                    if let Some(target) = emit_rename_target(row) {
+                        rule.insert("target".into(), serde_json::Value::from(target));
+                    }
                     serde_json::Value::Object(rule)
                 })
                 .collect();
             if !rules.is_empty() {
                 map.insert("rename".into(), serde_json::Value::Array(rules));
+            }
+        }
+
+        if self.drop_defaults {
+            // An explicit `[]`: a profile resets the source's drop rules.
+            map.insert("drop".into(), serde_json::Value::Array(Vec::new()));
+        } else if !self.drop_skip {
+            // Same work-in-progress contract as rename: empty `match` lines
+            // never reach the JSON.
+            let rules: Vec<serde_json::Value> = self
+                .drop
+                .iter()
+                .filter(|row| !row.match_pattern.is_empty())
+                .map(|row| {
+                    let mut rule = serde_json::Map::new();
+                    rule.insert(
+                        "match".into(),
+                        serde_json::Value::from(row.match_pattern.as_str()),
+                    );
+                    if !row.flags.is_empty() {
+                        rule.insert("flags".into(), serde_json::Value::from(row.flags.as_str()));
+                    }
+                    if let Some(target) = row.target_value() {
+                        rule.insert("target".into(), serde_json::Value::from(target));
+                    }
+                    serde_json::Value::Object(rule)
+                })
+                .collect();
+            if !rules.is_empty() {
+                map.insert("drop".into(), serde_json::Value::Array(rules));
             }
         }
 
@@ -373,6 +482,16 @@ impl BuilderState {
         {
             return Ingest::Raw;
         }
+        // Same raw-guard for drop: an empty `match` discards everything —
+        // a real rule the widget cannot express (its empty line means
+        // "not typed yet").
+        if config
+            .drop
+            .as_ref()
+            .is_some_and(|rules| rules.iter().any(|r| r.match_pattern.is_empty()))
+        {
+            return Ingest::Raw;
+        }
         let mut state = Self::new();
 
         if let Some(filter) = config.filter {
@@ -397,10 +516,49 @@ impl BuilderState {
             } else {
                 state.rename = rules
                     .into_iter()
-                    .map(|rule: RenameRule| RenameRow {
-                        match_pattern: rule.match_pattern,
-                        replace: rule.replace,
-                        flags: rule.flags,
+                    .map(|rule: RenameRule| {
+                        // Split the `param:KEY` form back into the select
+                        // value and the key field; `name` (or the absent
+                        // target) is the select's default.
+                        let (target, param_key) = match rule.target.as_deref() {
+                            None | Some("name") => (String::new(), String::new()),
+                            Some(raw) => match raw.strip_prefix("param:") {
+                                Some(key) => ("param".to_string(), key.to_string()),
+                                None => (raw.to_string(), String::new()),
+                            },
+                        };
+                        RenameRow {
+                            match_pattern: rule.match_pattern,
+                            replace: rule.replace,
+                            flags: rule.flags,
+                            target,
+                            param_key,
+                        }
+                    })
+                    .collect();
+            }
+        }
+        if let Some(rules) = config.drop {
+            if rules.is_empty() {
+                state.drop_defaults = true;
+            } else {
+                state.drop = rules
+                    .into_iter()
+                    .map(|rule: DropRule| {
+                        // The same target split as rename rows.
+                        let (target, param_key) = match rule.target.as_deref() {
+                            None | Some("name") => (String::new(), String::new()),
+                            Some(raw) => match raw.strip_prefix("param:") {
+                                Some(key) => ("param".to_string(), key.to_string()),
+                                None => (raw.to_string(), String::new()),
+                            },
+                        };
+                        DropRow {
+                            match_pattern: rule.match_pattern,
+                            flags: rule.flags,
+                            target,
+                            param_key,
+                        }
                     })
                     .collect();
             }
@@ -484,6 +642,7 @@ impl BuilderView {
                 .collect(),
             state: BuilderState {
                 rename: display_rows(&state.rename),
+                drop: display_rows(&state.drop),
                 ..state.clone()
             },
         }
@@ -518,10 +677,10 @@ fn append_outsiders(rows: &mut Vec<(String, bool)>, selected: &[String]) {
     }
 }
 
-/// Rename rows to display: at least one empty line.
-pub(crate) fn display_rows(rows: &[RenameRow]) -> Vec<RenameRow> {
+/// Rule rows to display: at least one empty line (rename and drop alike).
+pub(crate) fn display_rows<Row: Default + Clone>(rows: &[Row]) -> Vec<Row> {
     if rows.is_empty() {
-        vec![RenameRow::default()]
+        vec![Row::default()]
     } else {
         rows.to_vec()
     }
@@ -611,12 +770,30 @@ pub(crate) fn preview_body(lang: &Lang, built: &BuilderState) -> String {
     fragment.render().unwrap_or_default()
 }
 
-/// `#ped-rows` content: the rename lines after add/drop.
+/// `#ped-rows` / `#ped-drop-rows` content: the rule lines of one section
+/// after add/remove. `section` is `"rename"` or `"drop"` — the template
+/// picks the row set, the field prefix and the section's own container id.
 #[derive(Template)]
 #[template(path = "pipeline/_rows.html")]
 pub(crate) struct RowsFragment {
     pub lang: Lang,
     pub builder: BuilderView,
+    pub section: &'static str,
+}
+
+impl RowsFragment {
+    /// The fragment for a section name, clamped to the two known sections.
+    pub(crate) fn for_section(lang: Lang, builder: BuilderView, section: &str) -> Self {
+        let section = match section {
+            "drop" => "drop",
+            _ => "rename",
+        };
+        Self {
+            lang,
+            builder,
+            section,
+        }
+    }
 }
 
 impl_i18n!(RowsFragment);
@@ -811,6 +988,7 @@ mod tests {
                 match_pattern: "^free".into(),
                 replace: String::new(),
                 flags: "i".into(),
+                ..RenameRow::default()
             },
         ];
         assert_eq!(
@@ -821,6 +999,248 @@ mod tests {
                 "rename": [{ "match": "^free", "replace": "", "flags": "i" }]
             }))
         );
+    }
+
+    #[test]
+    fn emit_writes_the_target_and_ingest_splits_it_back() {
+        let mut s = state();
+        s.rename = vec![
+            // name stays implicit — the schema default, never emitted.
+            RenameRow {
+                match_pattern: "a".into(),
+                replace: "b".into(),
+                target: "name".into(),
+                param_key: String::new(),
+                flags: String::new(),
+            },
+            RenameRow {
+                match_pattern: "server1\\.tr$".into(),
+                replace: "invalid.tr".into(),
+                target: "host".into(),
+                param_key: String::new(),
+                flags: String::new(),
+            },
+            RenameRow {
+                match_pattern: "^chrome$".into(),
+                replace: "firefox".into(),
+                target: "param".into(),
+                param_key: "fp".into(),
+                flags: String::new(),
+            },
+        ];
+        assert_eq!(
+            s.emit(),
+            Some(json!({
+                "version": 1,
+                "rename": [
+                    { "match": "a", "replace": "b" },
+                    { "match": "server1\\.tr$", "replace": "invalid.tr", "target": "host" },
+                    { "match": "^chrome$", "replace": "firefox", "target": "param:fp" }
+                ]
+            }))
+        );
+        // …and the emitted JSON rebuilds the same split form — `name`, the
+        // schema default, comes back as the select's implicit value ("").
+        let Some(json) = s.emit() else {
+            panic!("must emit")
+        };
+        let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
+            panic!("must parse")
+        };
+        assert_eq!(
+            rebuilt.rename[0],
+            RenameRow {
+                match_pattern: "a".into(),
+                replace: "b".into(),
+                target: String::new(),
+                param_key: String::new(),
+                flags: String::new(),
+            }
+        );
+        assert_eq!(rebuilt.rename[1], s.rename[1]);
+        assert_eq!(rebuilt.rename[2], s.rename[2]);
+    }
+
+    #[test]
+    fn emit_holds_values_the_validator_flags() {
+        // A param row without a key and an unknown selector both emit as-is:
+        // the preview reports them, nothing is silently reinterpreted.
+        let mut s = state();
+        s.rename = vec![
+            RenameRow {
+                match_pattern: "a".into(),
+                replace: "b".into(),
+                target: "param".into(),
+                param_key: String::new(),
+                flags: String::new(),
+            },
+            RenameRow {
+                match_pattern: "c".into(),
+                replace: "d".into(),
+                target: "bogus".into(),
+                param_key: String::new(),
+                flags: String::new(),
+            },
+        ];
+        let json = s.emit().unwrap();
+        assert_eq!(json["rename"][0]["target"], json!("param:"));
+        assert_eq!(json["rename"][1]["target"], json!("bogus"));
+        assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_err());
+    }
+
+    #[test]
+    fn from_form_parses_the_target_fields() {
+        let form: Vec<(String, String)> = [
+            ("ped_rename_0_match".into(), "chrome".into()),
+            ("ped_rename_0_replace".into(), "firefox".into()),
+            ("ped_rename_0_target".into(), "param".into()),
+            ("ped_rename_0_key".into(), "fp".into()),
+            ("ped_rename_1_match".into(), "server1".into()),
+            ("ped_rename_1_replace".into(), "server2".into()),
+            ("ped_rename_1_target".into(), "host".into()),
+        ]
+        .into_iter()
+        .collect();
+        let s = BuilderState::from_form(&form);
+        assert_eq!(
+            s.rename,
+            vec![
+                RenameRow {
+                    match_pattern: "chrome".into(),
+                    replace: "firefox".into(),
+                    target: "param".into(),
+                    param_key: "fp".into(),
+                    flags: String::new(),
+                },
+                RenameRow {
+                    match_pattern: "server1".into(),
+                    replace: "server2".into(),
+                    target: "host".into(),
+                    param_key: String::new(),
+                    flags: String::new(),
+                },
+            ]
+        );
+        assert_eq!(
+            s.emit(),
+            Some(json!({
+                "version": 1,
+                "rename": [
+                    { "match": "chrome", "replace": "firefox", "target": "param:fp" },
+                    { "match": "server1", "replace": "server2", "target": "host" }
+                ]
+            }))
+        );
+    }
+
+    #[test]
+    fn drop_section_emits_and_ingests_back() {
+        let mut s = state();
+        s.drop = vec![
+            DropRow {
+                match_pattern: "free|trial".into(),
+                target: String::new(), // name — implicit
+                param_key: String::new(),
+                flags: "i".into(),
+            },
+            DropRow {
+                match_pattern: "\\.cn$".into(),
+                target: "host".into(),
+                param_key: String::new(),
+                flags: String::new(),
+            },
+        ];
+        assert_eq!(
+            s.emit(),
+            Some(json!({
+                "version": 1,
+                "drop": [
+                    { "match": "free|trial", "flags": "i" },
+                    { "match": "\\.cn$", "target": "host" }
+                ]
+            }))
+        );
+        let Some(json) = s.emit() else {
+            panic!("must emit")
+        };
+        let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
+            panic!("must parse");
+        };
+        assert_eq!(rebuilt.drop, s.drop);
+        assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_ok());
+    }
+
+    #[test]
+    fn drop_explicit_defaults_and_tri_state_round_trip() {
+        // `drop: []` in a profile resets the source's rules — the same
+        // profile semantics as rename.
+        let mut s = state();
+        s.drop_defaults = true;
+        let Some(json) = s.emit() else {
+            panic!("must emit")
+        };
+        assert_eq!(json["drop"], json!([]));
+        let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
+            panic!("must parse");
+        };
+        assert!(rebuilt.drop_defaults && rebuilt.drop.is_empty());
+
+        // The tri-state radios parse the same way as rename's.
+        let form = vec![("ped_drop".into(), "skip".into())];
+        let s = BuilderState::from_form(&form);
+        assert!(s.drop_skip && !s.drop_defaults);
+    }
+
+    #[test]
+    fn from_form_parses_drop_rows_with_gaps_and_unknown_selector() {
+        let form: Vec<(String, String)> = [
+            ("ped_drop_1_match".into(), "\\.cn$".into()),
+            ("ped_drop_1_target".into(), "host".into()),
+            ("ped_drop_0_match".into(), "free".into()),
+            ("ped_drop_0_flags".into(), "i".into()),
+            ("ped_drop_0_target".into(), "param".into()),
+            ("ped_drop_0_key".into(), "fp".into()),
+            ("ped_rename_0_match".into(), "unrelated".into()),
+        ]
+        .into_iter()
+        .collect();
+        let s = BuilderState::from_form(&form);
+        assert_eq!(
+            s.drop,
+            vec![
+                DropRow {
+                    match_pattern: "free".into(),
+                    flags: "i".into(),
+                    target: "param".into(),
+                    param_key: "fp".into(),
+                },
+                DropRow {
+                    match_pattern: "\\.cn$".into(),
+                    flags: String::new(),
+                    target: "host".into(),
+                    param_key: String::new(),
+                },
+            ]
+        );
+        // The rename rows are untouched by the drop fields.
+        assert_eq!(s.rename.len(), 1);
+        assert_eq!(s.rename[0].match_pattern, "unrelated");
+        let emitted = s.emit().unwrap();
+        assert_eq!(
+            emitted["drop"],
+            json!([
+                { "match": "free", "flags": "i", "target": "param:fp" },
+                { "match": "\\.cn$", "target": "host" }
+            ])
+        );
+    }
+
+    #[test]
+    fn ingest_sends_drop_rules_with_empty_match_to_raw_mode() {
+        // An empty `match` discards everything — a real config the widget
+        // cannot express; raw mode keeps it editable as JSON.
+        let json = json!({ "version": 1, "drop": [{ "match": "" }] });
+        assert_eq!(BuilderState::ingest(Some(&json)), Ingest::Raw);
     }
 
     #[test]
@@ -865,6 +1285,7 @@ mod tests {
             match_pattern: "x".into(),
             replace: "y".into(),
             flags: String::new(),
+            ..RenameRow::default()
         }];
         s.filter_set = true;
         s.protocols = vec!["vless".into()];
@@ -915,11 +1336,13 @@ mod tests {
                     match_pattern: "a".into(),
                     replace: String::new(),
                     flags: "i".into(),
+                    ..RenameRow::default()
                 },
                 RenameRow {
                     match_pattern: "b".into(),
                     replace: "B".into(),
                     flags: String::new(),
+                    ..RenameRow::default()
                 },
             ]
         );
@@ -1153,6 +1576,7 @@ mod tests {
             match_pattern: "^(.*?)\\s*\\|".into(),
             replace: "$1".into(),
             flags: "i".into(),
+            ..RenameRow::default()
         }];
         everything.geo_set = true;
         everything.geo_enabled = false;
@@ -1181,6 +1605,7 @@ mod tests {
             match_pattern: "free".into(),
             replace: "FREE".into(),
             flags: String::new(),
+            ..RenameRow::default()
         }];
         s.geo_set = true;
         s.geo_enabled = false;
@@ -1293,6 +1718,73 @@ mod tests {
             "only 'removed' selected"
         );
         assert_eq!(view.state.rename.len(), 1, "an empty typing line is shown");
+    }
+
+    #[test]
+    fn rows_render_the_target_selector() {
+        // A row with every target variant renders its select and the param
+        // key field; an unknown selector stays visible as its own option.
+        let lang = test_lang();
+        let s = BuilderState {
+            rename: vec![
+                RenameRow {
+                    match_pattern: "a".into(),
+                    replace: "b".into(),
+                    target: String::new(),
+                    param_key: String::new(),
+                    flags: String::new(),
+                },
+                RenameRow {
+                    match_pattern: "chrome".into(),
+                    replace: "firefox".into(),
+                    target: "param".into(),
+                    param_key: "fp".into(),
+                    flags: String::new(),
+                },
+                RenameRow {
+                    match_pattern: "x".into(),
+                    replace: "y".into(),
+                    target: "bogus".into(),
+                    param_key: String::new(),
+                    flags: String::new(),
+                },
+            ],
+            drop: vec![DropRow {
+                match_pattern: "\\.cn$".into(),
+                target: "host".into(),
+                param_key: String::new(),
+                flags: String::new(),
+            }],
+            ..BuilderState::new()
+        };
+        let html = RowsFragment::for_section(lang.clone(), BuilderView::new(&s), "rename")
+            .render()
+            .unwrap_or_default();
+
+        // Row 0: the implicit name default.
+        assert!(html.contains(r#"<option value="name" selected"#), "{html}");
+        // Row 1: param selected, its key carried in the adjacent field.
+        assert!(html.contains(r#"<option value="param" selected"#), "{html}");
+        assert!(html.contains(r#"value="fp""#), "{html}");
+        // Row 2: an unknown selector survives as a visible option.
+        assert!(html.contains(r#"<option value="bogus" selected"#), "{html}");
+        // The key fields submit under the row-indexed names.
+        assert!(html.contains(r#"name="ped_rename_0_target""#), "{html}");
+        assert!(html.contains(r#"name="ped_rename_1_key""#), "{html}");
+        assert!(html.contains(r#"name="ped_rename_2_target""#), "{html}");
+        // The rename fragment never carries drop fields.
+        assert!(!html.contains("ped_drop_"), "{html}");
+
+        // The drop fragment renders its own rows: no `replace` field, the
+        // drop-prefixed names, its own remove endpoint.
+        let html = RowsFragment::for_section(lang, BuilderView::new(&s), "drop")
+            .render()
+            .unwrap_or_default();
+        assert!(html.contains(r#"<option value="host" selected"#), "{html}");
+        assert!(html.contains(r#"name="ped_drop_0_match""#), "{html}");
+        assert!(html.contains("section=drop&amp;remove=0"), "{html}");
+        assert!(!html.contains("ped_rename_"), "{html}");
+        assert!(!html.contains("replace"), "{html}");
     }
 
     #[test]

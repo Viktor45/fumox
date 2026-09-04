@@ -1129,6 +1129,9 @@ struct DryRunFragment {
     http_status: Option<u16>,
     bytes: Option<u64>,
     proxies_found: Option<usize>,
+    /// Discarded by the source's own filters (allowlist, drop rules); shown
+    /// only when something was actually thrown away.
+    dropped: Option<usize>,
     sample: Vec<String>,
 }
 
@@ -1163,6 +1166,7 @@ pub async fn source_dry_run(
             http_status,
             bytes,
             proxies_found,
+            dropped,
             sample,
         } => DryRunFragment {
             ok: true,
@@ -1170,6 +1174,7 @@ pub async fn source_dry_run(
             http_status: Some(http_status),
             bytes: Some(bytes),
             proxies_found: Some(proxies_found),
+            dropped: (dropped > 0).then_some(dropped),
             sample,
             lang,
         },
@@ -1182,6 +1187,7 @@ pub async fn source_dry_run(
             http_status: failure.http_status(),
             bytes: None,
             proxies_found: None,
+            dropped: None,
             sample: Vec::new(),
             lang,
         },
@@ -1194,6 +1200,7 @@ pub async fn source_dry_run(
             http_status: Some(http_status),
             bytes: None,
             proxies_found: Some(0),
+            dropped: None,
             sample: Vec::new(),
             lang,
         },

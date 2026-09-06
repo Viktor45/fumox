@@ -123,7 +123,7 @@ jobs:
       # Attest this single-platform image by digest; the merge job only
       # stitches already-attested digests into the manifest list.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}

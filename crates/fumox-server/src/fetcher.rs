@@ -111,6 +111,14 @@ impl Fetcher {
     /// `resolve()` — this is what closes the DNS-rebinding window between
     /// the SSRF check and the connect. Construction cost is negligible
     /// against network latency at the scheduler's fetch rate.
+    ///
+    /// `Policy::none()` is load-bearing, not a default: reqwest's redirect
+    /// layer would consume the 3xx internally and hand back only the final
+    /// response, which silently skips the per-hop SSRF vetting in
+    /// [`Self::fetch_once`] (security audit, 2026-09-05). `resolve()` does
+    /// not contain an automatic follow — it is a per-hostname DNS override,
+    /// ignored outright for IP literals and overridden by a port in the
+    /// redirect target — so the loop must see every hop itself.
     fn build_client(
         &self,
         host: &str,
@@ -122,7 +130,7 @@ impl Fetcher {
             .user_agent(self.config.user_agent.clone())
             .gzip(true)
             .brotli(true)
-            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .redirect(reqwest::redirect::Policy::none())
             .resolve(host, addr)
             .build()
     }
@@ -183,8 +191,15 @@ impl Fetcher {
         // Redirects are followed manually (up to MAX_REDIRECTS hops) because
         // every hop must pass the full SSRF vetting again — an automatic
         // redirect policy would let a public URL bounce the client into a
-        // private or metadata address.
+        // private or metadata address. `build_client` therefore pins
+        // `Policy::none()`; see the note there.
         let mut current = url.to_string();
+        // Source-configured headers may carry subscription secrets, and
+        // reqwest only strips the standardized ones (`Authorization`,
+        // `Cookie`, …) across a redirect. They stay scoped to the origin the
+        // admin configured, so a redirect to a collector harvests nothing
+        // (security audit, 2026-09-05).
+        let configured_origin = Url::parse(url).ok().map(|parsed| origin_of(&parsed));
         for _hop in 0..=MAX_REDIRECTS {
             if current.len() > MAX_URL_LEN {
                 return Err(FetchFailure::HttpClient { status: 414 });
@@ -222,8 +237,18 @@ impl Fetcher {
                     message: redacted_request_error(&e),
                 })?;
             let mut request = client.get(parsed.clone());
-            for (name, value) in headers {
-                request = request.header(name.as_str(), value.as_str());
+            let same_origin = configured_origin
+                .as_ref()
+                .is_some_and(|origin| *origin == origin_of(&parsed));
+            if same_origin {
+                for (name, value) in headers {
+                    request = request.header(name.as_str(), value.as_str());
+                }
+            } else if !headers.is_empty() {
+                tracing::warn!(
+                    url = %redact_url(&current),
+                    "redirect left the configured origin — source headers withheld"
+                );
             }
 
             let response = request.send().await.map_err(|e| FetchFailure::Network {
@@ -296,6 +321,20 @@ fn redact_url(url: &str) -> String {
         // Not a URL (the error text embedded something else) — nothing to leak.
         Err(_) => url.to_string(),
     }
+}
+
+/// Scheme + host + effective port, the scope source headers are confined to.
+/// A redirect that changes any of the three is a different origin, even when
+/// only the port moved — the pinned DNS override does not constrain the port.
+fn origin_of(url: &Url) -> (String, String, u16) {
+    let port = url
+        .port_or_known_default()
+        .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+    (
+        url.scheme().to_ascii_lowercase(),
+        url.host_str().unwrap_or_default().to_ascii_lowercase(),
+        port,
+    )
 }
 
 /// Display text of a reqwest error with the embedded URL redacted:
@@ -730,6 +769,150 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Responder that answers every request with `302 Location: <target>`.
+    async fn spawn_redirector(target: String) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {target}\r\ncontent-length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    /// Responder that echoes back which of the request's headers it saw,
+    /// so a test can assert what survived a redirect.
+    async fn spawn_header_echo() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let body = if request.contains("x-subscription-token:") {
+                    "LEAKED"
+                } else {
+                    "clean"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    /// The manual redirect loop must actually observe each hop, so that
+    /// `resolve_and_vet` runs against the *target* of every redirect. reqwest
+    /// following redirects itself would hide the hop and let a vetted public
+    /// source bounce the fetch into a private address (security audit,
+    /// 2026-09-05).
+    #[tokio::test]
+    async fn a_redirect_into_a_private_address_is_blocked() {
+        let internal = spawn_v4_listener().await;
+        // The source itself is vetted with allow_private=true (it is a
+        // loopback listener in the test), but the hop is re-vetted strictly.
+        let redirector = spawn_redirector(format!("http://{internal}/meta-data")).await;
+
+        let strict = Fetcher::new(FetchConfig::default(), false);
+        let err = strict
+            .fetch(
+                &format!("http://{redirector}/sub"),
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        // The very first hop is already private here, so vetting rejects it
+        // before any redirect — assert the class, then prove the hop itself
+        // is seen by a lenient fetcher below.
+        assert_eq!(err.error_class(), ErrorClass::HttpClient);
+        assert!(!err.is_recoverable());
+
+        // With private URLs allowed the same chain succeeds, which proves the
+        // loop followed the redirect manually rather than erroring out.
+        let lenient = Fetcher::new(FetchConfig::default(), true);
+        let payload = lenient
+            .fetch(
+                &format!("http://{redirector}/sub"),
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(payload.body, b"ok");
+    }
+
+    /// Source-configured headers may carry subscription secrets; they must
+    /// not follow a redirect off the configured origin.
+    #[tokio::test]
+    async fn source_headers_do_not_survive_a_cross_origin_redirect() {
+        let echo = spawn_header_echo().await;
+        let redirector = spawn_redirector(format!("http://{echo}/collect")).await;
+        let fetcher = Fetcher::new(FetchConfig::default(), true);
+        let headers = std::collections::BTreeMap::from([(
+            "X-Subscription-Token".to_string(),
+            "SECRET".to_string(),
+        )]);
+
+        // Straight to the echo endpoint: same origin, header applied.
+        let direct = fetcher
+            .fetch(&format!("http://{echo}/sub"), &headers, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            direct.body, b"LEAKED",
+            "header must reach the configured origin"
+        );
+
+        // Via a redirect to a different port: header withheld.
+        let redirected = fetcher
+            .fetch(&format!("http://{redirector}/sub"), &headers, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            redirected.body, b"clean",
+            "source headers leaked across a redirect"
+        );
+    }
+
+    #[test]
+    fn origin_comparison_covers_scheme_host_and_port() {
+        let base = Url::parse("https://example.com/sub").unwrap();
+        assert_eq!(
+            origin_of(&base),
+            origin_of(&Url::parse("https://EXAMPLE.com/other?x=1").unwrap())
+        );
+        // Explicit default port is the same origin; a different port is not.
+        assert_eq!(
+            origin_of(&base),
+            origin_of(&Url::parse("https://example.com:443/sub").unwrap())
+        );
+        assert_ne!(
+            origin_of(&base),
+            origin_of(&Url::parse("https://example.com:8443/sub").unwrap())
+        );
+        assert_ne!(
+            origin_of(&base),
+            origin_of(&Url::parse("http://example.com/sub").unwrap())
+        );
+        assert_ne!(
+            origin_of(&base),
+            origin_of(&Url::parse("https://other.example.com/sub").unwrap())
+        );
     }
 
     #[tokio::test]

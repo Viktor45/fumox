@@ -34,7 +34,7 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, String> {
         parse_legacy(before_query)?
     };
 
-    let mut params = query.map(parse_query).unwrap_or_default();
+    let mut params = query.map(parse_query).transpose()?.unwrap_or_default();
     super::uri::mark_known(&mut params, &[]);
 
     Ok(ProxyEntry {
@@ -61,6 +61,9 @@ fn parse_sip002(before_query: &str) -> Result<(String, String, u16, String), Str
     if !credential.contains(':') {
         return Err("ss: userinfo is not method:password".to_string());
     }
+    // The blob is arbitrary bytes, so it can carry a line break that the
+    // serializer would emit verbatim (see `parsers::reject_line_breaks`).
+    super::reject_line_breaks("ss: credential", &credential)?;
     let (hostport, raw_path) = split_path(hostport_path);
     let (host, port) = parse_hostport(hostport)?;
     Ok((credential, host, port, raw_path.to_string()))
@@ -78,7 +81,9 @@ fn parse_legacy(before_query: &str) -> Result<(String, String, u16, String), Str
     if !credential.contains(':') {
         return Err("ss: legacy payload is not method:password@host:port".to_string());
     }
+    super::reject_line_breaks("ss: credential", credential)?;
     let (host, port) = parse_hostport(hostport)?;
+    super::reject_line_breaks("ss: host", &host)?;
     Ok((credential.to_string(), host, port, String::new()))
 }
 
@@ -191,5 +196,21 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse("not-base64!!!@host:80", "").is_err());
         assert!(parse("aG9zdA@host:80", "").is_err()); // decoded "host" has no ':'
+    }
+
+    /// The base64 blob is arbitrary bytes, so both forms can carry a line
+    /// break into fields the serializer emits verbatim (security audit,
+    /// 2026-09-05).
+    #[test]
+    fn rejects_line_breaks_smuggled_through_base64() {
+        let sip002 = base64::engine::general_purpose::STANDARD_NO_PAD
+            .encode(b"aes-256-gcm:pw\nvless://X@9.9.9.9:443#inj");
+        let line = format!("ss://{sip002}@h.example.com:8388#n");
+        assert!(parse(&line[5..], &line).is_err());
+
+        let legacy = base64::engine::general_purpose::STANDARD_NO_PAD
+            .encode(b"aes-256-gcm:pw\nsmuggled@9.9.9.9:8388");
+        let line = format!("ss://{legacy}#n");
+        assert!(parse(&line[5..], &line).is_err());
     }
 }

@@ -4,7 +4,7 @@
 
 use super::{
     FormMap, action_response, clamp_limit, fmt_bytes, fmt_opt_ts_element, fmt_ts_element, is_htmx,
-    mask_secret, not_found, pagination_pages, server_error,
+    mask_secret, not_found, page_offset, pagination_pages, server_error,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -807,7 +807,7 @@ pub async fn source_detail(
     )
     .bind(&id)
     .bind(per_page.min(20))
-    .bind((page - 1) * per_page.min(20))
+    .bind(page_offset(page, per_page.min(20)))
     .fetch_all(&state.pool)
     .await
     {

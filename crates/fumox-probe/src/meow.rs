@@ -31,11 +31,20 @@ pub enum DelayOutcome {
 
 impl MeowClient {
     pub fn new(config: &MeowConfig) -> Self {
+        let timeout = Duration::from_secs(config.timeout_secs.max(1));
         Self {
-            http: reqwest::Client::new(),
+            // Client-level timeouts as a floor: every call below also sets a
+            // per-request timeout (which takes precedence), but a future one
+            // that forgets to would otherwise hang forever (security audit,
+            // 2026-09-05).
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(timeout)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             base_url: format!("http://{}", config.api_addr),
             test_urls: config.test_url.clone(),
-            timeout: Duration::from_secs(config.timeout_secs.max(1)),
+            timeout,
         }
     }
 

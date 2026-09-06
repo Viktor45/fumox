@@ -46,3 +46,9 @@ config/meow.yaml
 test.txt
 
 test2.txt
+
+# Debug-only parser fixtures: may contain non-public confidential data —
+# never commit them. Recreate locally if needed; fixture tests skip
+# themselves when the files are absent.
+test-sing.txt
+test-sing2.txt

@@ -158,7 +158,7 @@ pub fn split_uri(rest: &str) -> Result<UriParts, String> {
         host,
         port,
         raw_path: raw_path.to_string(),
-        query_pairs: query.map(parse_query).unwrap_or_default(),
+        query_pairs: query.map(parse_query).transpose()?.unwrap_or_default(),
         fragment: fragment.map(str::to_string),
     })
 }
@@ -227,14 +227,35 @@ pub fn parse_hostport(s: &str) -> Result<(String, u16), String> {
     Ok((host, port))
 }
 
+/// Upper bound on query parameters per line.
+///
+/// One `Param` costs ~56 bytes plus two heap allocations, and a query is
+/// split on every `&`, so a single 10 MiB line of `?&&&&…` expanded into
+/// ~1 GB of resident memory — a process-wide OOM, not a per-task failure
+/// (security audit, 2026-09-05). Real feeds carry at most a dozen
+/// parameters; a line past this cap is malformed, and the caller's
+/// log-and-skip path drops it.
+pub const MAX_QUERY_PARAMS: usize = 256;
+
 /// Parse a raw query string into ordered parameters.
 ///
 /// Pairs are split on the first `=` only, so values may contain further `=`
 /// and `?`. Empty segments (a leading, trailing or doubled `&`) are kept as
 /// empty-key params so serialization can reproduce them byte-for-byte.
 /// Values keep their percent-encoding untouched.
-pub fn parse_query(query: &str) -> Vec<Param> {
-    query
+///
+/// Fails when the query exceeds [`MAX_QUERY_PARAMS`]; truncating instead
+/// would silently break the round-trip guarantee.
+pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
+    // Count before allocating: `split` is lazy, so this never materializes
+    // the oversized parameter list.
+    let count = query.split('&').count();
+    if count > MAX_QUERY_PARAMS {
+        return Err(format!(
+            "query has {count} parameters, over the {MAX_QUERY_PARAMS} cap"
+        ));
+    }
+    Ok(query
         .split('&')
         .map(|pair| match pair.split_once('=') {
             Some((key, value)) => Param {
@@ -248,7 +269,7 @@ pub fn parse_query(query: &str) -> Vec<Param> {
                 known: false,
             },
         })
-        .collect()
+        .collect())
 }
 
 /// Serialize ordered parameters back into a query string (`k=v&k=v`).
@@ -409,10 +430,29 @@ mod tests {
 
     #[test]
     fn empty_query_values_are_kept() {
-        let pairs = parse_query("security=&encryption=none&headerType=");
+        let pairs = parse_query("security=&encryption=none&headerType=").unwrap();
         assert_eq!(pairs.len(), 3);
         assert_eq!(pairs[0].value, "");
         assert_eq!(pairs[1].value, "none");
+    }
+
+    /// A 10 MiB line of `&` separators expanded into ~1 GB of `Param`s — a
+    /// process-wide OOM (security audit, 2026-09-05).
+    #[test]
+    fn oversized_query_is_rejected_not_truncated() {
+        let ok = "a=1&".repeat(MAX_QUERY_PARAMS - 1);
+        assert!(parse_query(ok.trim_end_matches('&')).is_ok());
+
+        let too_many = "&".repeat(MAX_QUERY_PARAMS);
+        let err = parse_query(&too_many).unwrap_err();
+        assert!(err.contains("over the"), "{err}");
+
+        // The whole line is skipped rather than silently shortened.
+        let line = format!("vless://u@h.example.com:443?{too_many}");
+        assert!(matches!(
+            super::super::parse_line(&line),
+            super::super::LineOutcome::Unrecognized
+        ));
     }
 
     #[test]

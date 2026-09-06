@@ -168,14 +168,50 @@ impl Caches {
 
     // ---- stale-while-revalidate coordination ----
 
-    /// Claim the background revalidation of a key. Returns `true` for the
-    /// caller that should perform the re-render.
-    pub async fn try_start_revalidate(&self, key: &str) -> bool {
-        self.revalidating.lock().await.insert(key.to_string())
+    /// Claim the background revalidation of a key. Returns a guard that
+    /// releases the claim on drop, or `None` when another task holds it.
+    ///
+    /// The guard releases through `Drop` because tokio mutexes do not poison:
+    /// a panic in the background re-render used to unwind past the explicit
+    /// release and pin the key in `revalidating` forever, so that endpoint
+    /// served its stale snapshot and never re-rendered again (security audit,
+    /// 2026-09-05).
+    pub async fn try_start_revalidate(&self, key: &str) -> Option<RevalidateGuard> {
+        let inserted = self.revalidating.lock().await.insert(key.to_string());
+        inserted.then(|| RevalidateGuard {
+            revalidating: self.revalidating.clone(),
+            key: key.to_string(),
+        })
     }
 
-    pub async fn finish_revalidate(&self, key: &str) {
-        self.revalidating.lock().await.remove(key);
+    /// Whether a background re-render is currently claimed for `key`.
+    #[cfg(test)]
+    pub async fn is_revalidating(&self, key: &str) -> bool {
+        self.revalidating.lock().await.contains(key)
+    }
+}
+
+/// Releases one revalidation claim when dropped, including while a panic
+/// unwinds the background render task.
+pub struct RevalidateGuard {
+    revalidating: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for RevalidateGuard {
+    fn drop(&mut self) {
+        // `Drop` cannot await; the lock is only ever held for a set
+        // insert/remove, so blocking on it here cannot deadlock.
+        let key = std::mem::take(&mut self.key);
+        if let Ok(mut guard) = self.revalidating.try_lock() {
+            guard.remove(&key);
+            return;
+        }
+        // Contended: hand the removal to the runtime rather than block.
+        let revalidating = self.revalidating.clone();
+        tokio::spawn(async move {
+            revalidating.lock().await.remove(&key);
+        });
     }
 }
 
@@ -286,10 +322,40 @@ mod tests {
     #[tokio::test]
     async fn revalidation_claim_is_exclusive() {
         let caches = Caches::new();
-        assert!(caches.try_start_revalidate("sub:p1").await);
-        assert!(!caches.try_start_revalidate("sub:p1").await);
-        caches.finish_revalidate("sub:p1").await;
-        assert!(caches.try_start_revalidate("sub:p1").await);
+        let first = caches.try_start_revalidate("sub:p1").await;
+        assert!(first.is_some());
+        assert!(caches.try_start_revalidate("sub:p1").await.is_none());
+        drop(first);
+        assert!(caches.try_start_revalidate("sub:p1").await.is_some());
+    }
+
+    /// A panic in the background re-render must release the claim, otherwise
+    /// the endpoint serves its stale snapshot forever (security audit,
+    /// 2026-09-05).
+    #[tokio::test]
+    async fn revalidation_claim_survives_a_panicking_task() {
+        let caches = Caches::new();
+        let task_caches = caches.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = task_caches
+                .try_start_revalidate("sub:p1")
+                .await
+                .expect("first claim succeeds");
+            panic!("render blew up");
+        });
+        assert!(handle.await.is_err(), "the task is expected to panic");
+
+        for _ in 0..10 {
+            if !caches.is_revalidating("sub:p1").await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !caches.is_revalidating("sub:p1").await,
+            "unwinding must release the revalidation claim"
+        );
+        assert!(caches.try_start_revalidate("sub:p1").await.is_some());
     }
 
     #[test]

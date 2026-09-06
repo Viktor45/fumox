@@ -88,6 +88,20 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, String> {
     if host.is_empty() {
         return Err("vmess: empty add".to_string());
     }
+    if params.len() > super::uri::MAX_QUERY_PARAMS {
+        return Err(format!(
+            "vmess: {} fields, over the {} cap",
+            params.len(),
+            super::uri::MAX_QUERY_PARAMS
+        ));
+    }
+    // JSON strings may contain `\n`, and the URI serializers emit these
+    // fields verbatim (see `parsers::reject_line_breaks`).
+    super::reject_line_breaks("vmess: add", &host)?;
+    super::reject_line_breaks("vmess: id", &credential)?;
+    for param in &params {
+        super::reject_line_breaks(&format!("vmess: field {:?}", param.key), &param.value)?;
+    }
 
     Ok(ProxyEntry {
         scheme: Scheme::Vmess,

@@ -40,19 +40,53 @@ impl SchedulerState {
         }
     }
 
-    /// Try to mark a source as in-flight; `false` when it already is.
-    async fn acquire_source(&self, source_id: &str) -> bool {
-        let mut guard = self.in_flight.lock().await;
-        guard.insert(source_id.to_string())
-    }
-
-    async fn release_source(&self, source_id: &str) {
-        self.in_flight.lock().await.remove(source_id);
+    /// Try to mark a source as in-flight, returning a guard that clears the
+    /// mark on drop; `None` when the source already is in flight.
+    ///
+    /// Releasing through `Drop` rather than an explicit call matters: tokio
+    /// mutexes do not poison, so a panic anywhere in `ingest_source` used to
+    /// unwind past the release and pin the id in `in_flight` forever — that
+    /// source could never be refreshed again until a restart, and the
+    /// `JoinSet` sweep swallows the `JoinError` silently (security audit,
+    /// 2026-09-05).
+    async fn acquire_source(&self, source_id: &str) -> Option<InFlightGuard> {
+        let inserted = {
+            let mut guard = self.in_flight.lock().await;
+            guard.insert(source_id.to_string())
+        };
+        inserted.then(|| InFlightGuard {
+            in_flight: self.in_flight.clone(),
+            source_id: source_id.to_string(),
+        })
     }
 
     /// Whether a source is currently being fetched (admin status fragment).
     pub async fn is_in_flight(&self, source_id: &str) -> bool {
         self.in_flight.lock().await.contains(source_id)
+    }
+}
+
+/// Clears the in-flight mark of one source when dropped, including while a
+/// panic unwinds the ingest task.
+struct InFlightGuard {
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    source_id: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // `Drop` cannot await; the lock is only ever held for a set
+        // insert/remove, so blocking on it here cannot deadlock.
+        let source_id = std::mem::take(&mut self.source_id);
+        if let Ok(mut guard) = self.in_flight.try_lock() {
+            guard.remove(&source_id);
+            return;
+        }
+        // Contended: hand the removal to the runtime rather than block.
+        let in_flight = self.in_flight.clone();
+        tokio::spawn(async move {
+            in_flight.lock().await.remove(&source_id);
+        });
     }
 }
 
@@ -155,10 +189,10 @@ fn spawn_ingest(
             geo,
             settings,
         } = env;
-        if !state.acquire_source(&source_id).await {
+        let Some(in_flight) = state.acquire_source(&source_id).await else {
             tracing::debug!(source = %source_id, "source already fetching; skipping");
             return;
-        }
+        };
         events.publish(
             "fetch.started",
             serde_json::json!({ "source_id": source_id }),
@@ -170,7 +204,7 @@ fn spawn_ingest(
         let outcome =
             ingest::ingest_source(&pool, &fetcher, &caches, &geo, settings, &source, force).await;
         drop(permit);
-        state.release_source(&source_id).await;
+        drop(in_flight);
         match outcome {
             ingest::IngestOutcome::Ok {
                 proxies_found,
@@ -235,10 +269,40 @@ mod tests {
     #[tokio::test]
     async fn in_flight_guard_is_exclusive() {
         let state = SchedulerState::new(4);
-        assert!(state.acquire_source("src1").await);
-        assert!(!state.acquire_source("src1").await);
-        assert!(state.acquire_source("src2").await);
-        state.release_source("src1").await;
-        assert!(state.acquire_source("src1").await);
+        let first = state.acquire_source("src1").await;
+        assert!(first.is_some());
+        assert!(state.acquire_source("src1").await.is_none());
+        assert!(state.acquire_source("src2").await.is_some());
+        drop(first);
+        assert!(state.acquire_source("src1").await.is_some());
+    }
+
+    /// A panic in the ingest task must not pin the source as in-flight
+    /// forever (security audit, 2026-09-05).
+    #[tokio::test]
+    async fn in_flight_guard_survives_a_panicking_task() {
+        let state = SchedulerState::new(4);
+        let task_state = state.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = task_state
+                .acquire_source("src1")
+                .await
+                .expect("first acquire succeeds");
+            panic!("ingest blew up");
+        });
+        assert!(handle.await.is_err(), "the task is expected to panic");
+
+        // The `Drop` path may hand the removal to the runtime, so yield.
+        for _ in 0..10 {
+            if !state.is_in_flight("src1").await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !state.is_in_flight("src1").await,
+            "unwinding must release the in-flight mark"
+        );
+        assert!(state.acquire_source("src1").await.is_some());
     }
 }

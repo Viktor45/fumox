@@ -176,6 +176,16 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
         .collect();
     let credential = credential_parts.join(":");
 
+    // A YAML scalar may legally contain a line break, but the URI
+    // serializers emit these two fields verbatim — one would split this proxy
+    // into several output lines and smuggle a foreign scheme past the
+    // source's protocol allowlist. Reject the item; the caller counts it.
+    // Parameter values are exempt: Clash keeps structured blocks (`ws-opts`,
+    // `reality-opts`, …) as multi-line YAML text, so they are sanitized at
+    // serialization time instead.
+    super::reject_line_breaks("clash: server", &host)?;
+    super::reject_line_breaks("clash: credential", &credential)?;
+
     // Everything not consumed structurally or as the credential is kept as
     // a pass-through parameter, so no Clash option is ever lost.
     let params: Vec<Param> = map
@@ -194,6 +204,13 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
             }
         })
         .collect();
+    if params.len() > super::uri::MAX_QUERY_PARAMS {
+        return Err(format!(
+            "clash: item has {} parameters, over the {} cap",
+            params.len(),
+            super::uri::MAX_QUERY_PARAMS
+        ));
+    }
 
     Ok(Some(ProxyEntry {
         scheme: spec.scheme,

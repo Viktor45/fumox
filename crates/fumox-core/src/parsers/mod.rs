@@ -6,7 +6,8 @@
 //!   never panics, unrecognized lines are reported, not fatal);
 //! * [`serialize`] — turn a [`ProxyEntry`] back into its canonical line;
 //! * [`parse_subscription`] — decode + auto-detect a whole payload
-//!   (URI list / Clash YAML / base64-wrapped) and parse every line.
+//!   (URI list / Clash YAML / sing-box JSON / base64-wrapped) and parse
+//!   every line.
 //!
 //! Round-trip guarantees: every parser has a serializer. URI schemes
 //! round-trip byte-for-byte whenever the original used percent-encoded
@@ -15,6 +16,7 @@
 //! equals the first parse). Unknown parameters always pass through untouched.
 
 pub mod clash;
+pub mod singbox;
 pub mod ss;
 pub mod uri;
 pub mod vmess;
@@ -70,6 +72,26 @@ fn parsed(result: Result<ProxyEntry, String>) -> LineOutcome {
     }
 }
 
+/// Reject a field value that would break the one-proxy-per-line contract.
+///
+/// The URI serializers emit `host`, `credential` and parameter values
+/// verbatim — only `name` goes through [`uri::encode_fragment`] — so a line
+/// break inside any of them splits one stored proxy into several output
+/// lines. A crafted Clash YAML or legacy-`ss` feed could smuggle a proxy of
+/// an entirely different scheme past a source's protocol allowlist that way,
+/// or forge `url_list` metadata comments (security audit, 2026-09-05).
+///
+/// URI-list input cannot reach this: `parse_uri_list` iterates over
+/// `str::lines`. The vectors are the formats whose fields are not
+/// line-delimited — Clash YAML scalars, vmess JSON `\n` escapes and the
+/// base64 blob of a legacy `ss` line.
+pub(crate) fn reject_line_breaks(field: &str, value: &str) -> Result<(), String> {
+    if value.contains(['\n', '\r']) {
+        return Err(format!("{field} contains a line break"));
+    }
+    Ok(())
+}
+
 /// `naive+https` / `naive+quic`: the transport suffix is scheme identity and
 /// is preserved as the synthetic `naive_transport` parameter so the
 /// serializer can rebuild the exact prefix.
@@ -97,7 +119,14 @@ fn parse_naive(transport: &str, rest: &str, line: &str) -> LineOutcome {
 }
 
 /// Serialize an entry back into a subscription line.
+///
+/// Guaranteed to return a single line: [`sanitize_for_output`] strips line
+/// breaks from the fields the serializers emit verbatim. Parsers reject such
+/// values up front, so this only catches rows that predate the check or were
+/// written directly into SQLite.
 pub fn serialize(entry: &ProxyEntry) -> String {
+    let sanitized = sanitize_for_output(entry);
+    let entry = sanitized.as_ref().unwrap_or(entry);
     match entry.scheme {
         Scheme::Vless => uri::serialize_with_spec(&uri::VLESS_SPEC, entry),
         Scheme::Trojan => uri::serialize_with_spec(&uri::TROJAN_SPEC, entry),
@@ -109,6 +138,38 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         Scheme::Ss => ss::serialize(entry),
         Scheme::Vmess => vmess::serialize(entry),
     }
+}
+
+/// Replace line breaks in `host`, `credential` and parameter values with a
+/// space, returning `None` when the entry is already clean (the overwhelming
+/// case, so no allocation happens). `name` needs no treatment: every
+/// serializer percent-encodes or JSON-escapes it.
+fn sanitize_for_output(entry: &ProxyEntry) -> Option<ProxyEntry> {
+    let dirty = |value: &str| value.contains(['\n', '\r']);
+    let needs_fix = dirty(&entry.host)
+        || dirty(&entry.credential)
+        || dirty(&entry.raw_path)
+        || entry
+            .params
+            .iter()
+            .any(|p| dirty(&p.key) || dirty(&p.value));
+    if !needs_fix {
+        return None;
+    }
+    tracing::warn!(
+        host = %entry.host.replace(['\n', '\r'], "\\n"),
+        "proxy entry carries line breaks — sanitizing before output"
+    );
+    let strip = |value: &str| value.replace(['\n', '\r'], " ");
+    let mut clean = entry.clone();
+    clean.host = strip(&entry.host);
+    clean.credential = strip(&entry.credential);
+    clean.raw_path = strip(&entry.raw_path);
+    for param in &mut clean.params {
+        param.key = param.key.replace(['\n', '\r'], " ");
+        param.value = param.value.replace(['\n', '\r'], " ");
+    }
+    Some(clean)
 }
 
 fn serialize_naive(entry: &ProxyEntry) -> String {
@@ -131,7 +192,8 @@ pub struct ParsedSubscription {
     pub discarded: usize,
     /// Unknown/malformed lines skipped.
     pub unrecognized: usize,
-    /// Clash items of unsupported types or malformed items.
+    /// Clash items of unsupported types or malformed items, and the same
+    /// for sing-box/Xray outbounds.
     pub clash_skipped: usize,
     /// The format the payload was detected (or pinned) as.
     pub format: InputFormat,
@@ -141,8 +203,8 @@ pub struct ParsedSubscription {
 ///
 /// `encoding` and `input_format` mirror the `sources` columns: explicit pins
 /// override auto-detection. Returns `Err` only when the payload as a whole
-/// is unusable (bad pinned base64, invalid YAML, unsupported sing-box JSON);
-/// individual bad lines are counted and skipped, never fatal.
+/// is unusable (bad pinned base64, invalid YAML/JSON); individual bad lines
+/// are counted and skipped, never fatal.
 pub fn parse_subscription(
     payload: &str,
     encoding: Encoding,
@@ -156,15 +218,14 @@ pub fn parse_subscription(
     match format {
         InputFormat::UriList => parse_uri_list(&text, format),
         InputFormat::ClashYaml => parse_clash_payload(&text),
-        InputFormat::SingBoxJson => Err(crate::Error::Parse(
-            "sing-box JSON input is not supported yet".to_string(),
-        )),
+        InputFormat::SingBoxJson => parse_singbox_payload(&text),
     }
 }
 
 /// Unwrap the transport encoding. `auto` base64-decodes only when the payload
 /// cannot already be a plain subscription (no `://` marker) and decodes to
-/// something that looks like one.
+/// something that looks like one: a URI list, Clash YAML, or a JSON config
+/// (object or array — the v2rayN share format).
 fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<String> {
     match encoding {
         Encoding::Plain => Ok(payload.to_string()),
@@ -176,9 +237,15 @@ fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<String> {
             if !trimmed.is_empty()
                 && !trimmed.contains("://")
                 && let Some(decoded) = decode_base64_text(trimmed)
-                && (decoded.contains("://") || decoded.contains("proxies:"))
             {
-                return Ok(decoded);
+                let head = decoded.trim_start();
+                if decoded.contains("://")
+                    || decoded.contains("proxies:")
+                    || head.starts_with('{')
+                    || head.starts_with('[')
+                {
+                    return Ok(decoded);
+                }
             }
             Ok(payload.to_string())
         }
@@ -192,11 +259,12 @@ fn decode_base64_text(input: &str) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-/// Heuristic format detection: JSON braces mean sing-box, a `proxies:` key
-/// means Clash YAML, everything else is treated as a URI list.
+/// Heuristic format detection: JSON (object or the v2rayN share array)
+/// means sing-box, a `proxies:` key means Clash YAML, everything else is
+/// treated as a URI list.
 fn detect_format(text: &str) -> InputFormat {
     let trimmed = text.trim_start();
-    if trimmed.starts_with('{') {
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
         return InputFormat::SingBoxJson;
     }
     let has_proxies_key = trimmed.starts_with("proxies:")
@@ -233,6 +301,16 @@ fn parse_clash_payload(text: &str) -> crate::Result<ParsedSubscription> {
         entries: clash_result.entries,
         clash_skipped: clash_result.unsupported + clash_result.invalid,
         format: InputFormat::ClashYaml,
+        ..Default::default()
+    })
+}
+
+fn parse_singbox_payload(text: &str) -> crate::Result<ParsedSubscription> {
+    let result = singbox::parse_payload(text).map_err(crate::Error::Parse)?;
+    Ok(ParsedSubscription {
+        entries: result.entries,
+        clash_skipped: result.unsupported + result.invalid,
+        format: InputFormat::SingBoxJson,
         ..Default::default()
     })
 }
@@ -278,6 +356,75 @@ mod tests {
         ));
     }
 
+    /// A line break in `host`/`credential`/params splits one stored proxy
+    /// into several output lines, which smuggles a proxy of a different
+    /// scheme past a source's protocol allowlist and forges `url_list`
+    /// metadata comments (security audit, 2026-09-05).
+    #[test]
+    fn line_breaks_are_rejected_at_parse_time() {
+        let clash = |body: &str| {
+            parse_subscription(body, Encoding::Plain, Some(InputFormat::ClashYaml)).unwrap()
+        };
+
+        // Credential: a trojan-only source would have served a vless node.
+        let smuggled = clash(concat!(
+            "proxies:\n",
+            "  - name: ok\n",
+            "    type: trojan\n",
+            "    server: good.example.com\n",
+            "    port: 443\n",
+            "    password: \"pw\\nvless://SMUGGLED@3.3.3.3:443#pwn\"\n",
+        ));
+        assert!(smuggled.entries.is_empty());
+        assert_eq!(smuggled.clash_skipped, 1);
+
+        // Host field.
+        let bad_host = clash(concat!(
+            "proxies:\n",
+            "  - name: ok\n",
+            "    type: trojan\n",
+            "    server: \"h.example.com\\nvless://X@9.9.9.9:443#inj\"\n",
+            "    port: 443\n",
+            "    password: pw\n",
+        ));
+        assert!(bad_host.entries.is_empty());
+        assert_eq!(bad_host.clash_skipped, 1);
+
+        // vmess JSON carries the same risk through `add` and `id`.
+        let json = r#"{"v":"2","ps":"x","add":"h.example.com","port":"443","id":"u\nvless://Y@8.8.8.8:443#inj"}"#;
+        let b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD_NO_PAD,
+            json.as_bytes(),
+        );
+        assert!(matches!(
+            parse_line(&format!("vmess://{b64}")),
+            LineOutcome::Unrecognized
+        ));
+    }
+
+    /// Defence in depth for rows that predate the parser check or were
+    /// written straight into SQLite: the serializer must still emit one line.
+    #[test]
+    fn serialize_sanitizes_line_breaks_it_is_handed() {
+        let entry = ProxyEntry {
+            scheme: Scheme::Trojan,
+            name: "n".into(),
+            host: "h.example.com\nvless://X@9.9.9.9:443#inj".into(),
+            port: 443,
+            credential: "pw\nsmuggled".into(),
+            params: vec![crate::models::Param {
+                key: "sni".into(),
+                value: "a\n# profile-title: FORGED".into(),
+                known: true,
+            }],
+            raw_path: String::new(),
+            raw_line: String::new(),
+        };
+        let line = serialize(&entry);
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        assert!(!line.contains('\n') && !line.contains('\r'));
+    }
+
     #[test]
     fn unknown_scheme_is_unrecognized() {
         assert!(matches!(
@@ -315,8 +462,32 @@ mod tests {
     }
 
     #[test]
-    fn sing_box_json_is_reported_unsupported() {
-        let err = parse_subscription(r#"{"outbounds": []}"#, Encoding::Auto, None).unwrap_err();
+    fn auto_detects_sing_box_json() {
+        let json = r#"{"outbounds":[{"type":"trojan","tag":"t","server":"h","server_port":443,"password":"p"}]}"#;
+        let result = parse_subscription(json, Encoding::Auto, None).unwrap();
+        assert_eq!(result.format, InputFormat::SingBoxJson);
+        assert_eq!(result.entries.len(), 1);
+
+        // The v2rayN share format is a bare array of configs.
+        let array = r#"[{"outbounds":[{"type":"trojan","tag":"t","server":"h","server_port":443,"password":"p"}]}]"#;
+        let result = parse_subscription(array, Encoding::Auto, None).unwrap();
+        assert_eq!(result.format, InputFormat::SingBoxJson);
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    #[test]
+    fn auto_detects_base64_wrapped_sing_box_json() {
+        use base64::Engine;
+        let inner = r#"{"outbounds":[{"type":"trojan","tag":"t","server":"h","server_port":443,"password":"p"}]}"#;
+        let wrapped = base64::engine::general_purpose::STANDARD.encode(inner);
+        let result = parse_subscription(&wrapped, Encoding::Auto, None).unwrap();
+        assert_eq!(result.format, InputFormat::SingBoxJson);
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    #[test]
+    fn sing_box_json_without_outbounds_is_an_error() {
+        let err = parse_subscription(r#"{"dns":{}}"#, Encoding::Auto, None).unwrap_err();
         assert!(matches!(err, crate::Error::Parse(_)));
     }
 

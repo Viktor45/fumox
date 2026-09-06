@@ -256,10 +256,12 @@ where
         if rendered.is_fresh(now) {
             return to_response(&rendered);
         }
-        if state.caches.try_start_revalidate(&key).await {
+        if let Some(claim) = state.caches.try_start_revalidate(&key).await {
             let state = state.clone();
             let key = key.clone();
             tokio::spawn(async move {
+                // The claim is released when `claim` drops, panic included.
+                let _claim = claim;
                 match make_render().await {
                     Ok(rendered) => {
                         state.caches.processed_put(&key, rendered).await;
@@ -270,7 +272,6 @@ where
                         tracing::warn!(key = %key, status = %err.status, "revalidation failed");
                     }
                 }
-                state.caches.finish_revalidate(&key).await;
             });
         }
         return to_response(&rendered);

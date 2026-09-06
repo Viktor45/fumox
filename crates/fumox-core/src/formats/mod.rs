@@ -8,21 +8,33 @@
 pub mod clash;
 pub mod singbox;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Resolve duplicate names by suffixing later occurrences with « (2)»,
 /// « (3)» and so on (PLAN gap 14). The first occurrence keeps its name
 /// unchanged; suffixes themselves are checked against the taken set, so a
 /// literal «name (2)» in the input cannot shadow a generated one.
+///
+/// The per-name counter is remembered across occurrences and never rewinds:
+/// restarting the probe at 1 for every entry made this O(k²) in the number of
+/// proxies sharing a name, and names come straight from an untrusted feed —
+/// 20 000 identical names cost 36 s of CPU inside a `/sub` render (security
+/// audit, 2026-09-05).
 pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut taken: HashSet<String> = HashSet::new();
+    let mut next_suffix: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<String> = Vec::new();
     for name in names {
         let mut candidate = name.to_string();
-        let mut n: usize = 1;
-        while taken.contains(&candidate) {
-            n += 1;
-            candidate = format!("{name} ({n})");
+        if taken.contains(&candidate) {
+            let n = next_suffix.entry(name.to_string()).or_insert(1);
+            loop {
+                *n += 1;
+                candidate = format!("{name} ({n})");
+                if !taken.contains(&candidate) {
+                    break;
+                }
+            }
         }
         taken.insert(candidate.clone());
         out.push(candidate);

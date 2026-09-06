@@ -39,8 +39,15 @@ fn num(value: i64) -> Value {
 /// Listener ports are disabled (`0`): meow-rs only needs the proxy
 /// definitions to run delay tests. Proxy definitions come from the shared
 /// core mapping (the same one serving Clash subscriptions); the T2 policy
-/// on top is: deterministic `fumox-{id}` names and `skip-cert-verify`
-/// always true — health checks are not a trust boundary.
+/// on top is deterministic `fumox-{id}` names.
+///
+/// Certificate verification is **not** forced off here. Unlike T1, which
+/// only times a handshake, T2 builds a real authenticated tunnel and the
+/// generated YAML carries the proxy's own credential (uuid / password /
+/// `method:password`), so an unverified connection lets an on-path attacker
+/// impersonate the server and harvest it. `skip-cert-verify` is therefore
+/// emitted by the core mapping only for entries whose own parameters ask for
+/// it (security audit, 2026-09-05).
 pub fn generate(rows: &[ProxyRow]) -> serde_norway::Result<String> {
     let proxies: Vec<Value> = rows.iter().filter_map(proxy_to_value).collect();
 
@@ -64,11 +71,7 @@ fn proxy_to_value(row: &ProxyRow) -> Option<Value> {
     if !is_supported(entry.scheme) {
         return None;
     }
-    let mut proxy = entry_to_clash_named(&entry, &proxy_name(row.id))?;
-    if let Some(map) = proxy.as_mapping_mut() {
-        map.insert(Value::String("skip-cert-verify".into()), Value::Bool(true));
-    }
-    Some(proxy)
+    entry_to_clash_named(&entry, &proxy_name(row.id))
 }
 
 #[cfg(test)]
@@ -177,7 +180,9 @@ mod tests {
         assert_eq!(vless["uuid"].as_str(), Some("uuid-1"));
         assert_eq!(vless["servername"].as_str(), Some("s.example.com"));
         assert_eq!(vless["reality-opts"]["public-key"].as_str(), Some("key"));
-        assert_eq!(vless["skip-cert-verify"].as_bool(), Some(true));
+        // No `insecure` parameter on the entry: verification stays on, since
+        // T2 sends the credential through the tunnel.
+        assert!(vless.get("skip-cert-verify").is_none());
 
         let ss = &proxies[1];
         assert_eq!(ss["type"].as_str(), Some("ss"));
@@ -223,5 +228,33 @@ mod tests {
         let yaml = generate(&rows).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert!(parsed["proxies"].as_sequence().unwrap().is_empty());
+    }
+
+    /// T2 tunnels carry the proxy credential, so certificate verification
+    /// follows the entry's own setting instead of being forced off
+    /// (security audit, 2026-09-05).
+    #[test]
+    fn skip_cert_verify_follows_the_entry_and_is_never_forced() {
+        let rows = vec![
+            row_from_entry(
+                1,
+                entry(Scheme::Trojan, "pass", &[("sni", "t.example.com")]),
+            ),
+            row_from_entry(2, entry(Scheme::Trojan, "pass", &[("insecure", "1")])),
+            row_from_entry(
+                3,
+                entry(Scheme::Trojan, "pass", &[("skip-cert-verify", "true")]),
+            ),
+        ];
+        let yaml = generate(&rows).unwrap();
+        let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+        let proxies = parsed["proxies"].as_sequence().unwrap();
+
+        assert!(
+            proxies[0].get("skip-cert-verify").is_none(),
+            "verification must stay on for an entry that did not ask to skip it"
+        );
+        assert_eq!(proxies[1]["skip-cert-verify"].as_bool(), Some(true));
+        assert_eq!(proxies[2]["skip-cert-verify"].as_bool(), Some(true));
     }
 }

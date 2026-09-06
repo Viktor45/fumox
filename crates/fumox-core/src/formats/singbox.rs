@@ -66,7 +66,10 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
                 .param("aid")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            m.insert("alter_id".into(), num(alter_id as u16));
+            // `as u16` silently truncated (aid=65536 became 0) while the
+            // Clash encoder parses the same field as i64, so the two outputs
+            // disagreed for one proxy (security audit, 2026-09-05).
+            m.insert("alter_id".into(), unsigned(alter_id));
             // vmess JSON spells TLS as `tls: "tls"`; Clash input uses the
             // boolean `tls: true`; some feeds spell it `security=tls`.
             let tls = super::param_value(entry, "tls")
@@ -332,6 +335,11 @@ fn num(value: u16) -> Value {
     Value::Number(u64::from(value).into())
 }
 
+/// Numeric field that is not a port and must not be narrowed to `u16`.
+fn unsigned(value: u64) -> Value {
+    Value::Number(value.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +456,31 @@ mod tests {
         assert_eq!(field(&v, "alter_id").and_then(Value::as_u64), Some(4));
         let tls = field(&v, "tls").unwrap();
         assert_eq!(str_field(tls, "server_name"), Some("s.example.com"));
+    }
+
+    /// `alter_id` used to go through `as u16`, so 65536 silently became 0
+    /// while the Clash encoder emitted 65536 for the same proxy (security
+    /// audit, 2026-09-05).
+    #[test]
+    fn alter_id_above_u16_is_not_truncated() {
+        for aid in ["65536", "65537", "4294967296"] {
+            let e = entry(Scheme::Vmess, "uuid", &[("aid", aid)]);
+            let v = entry_to_outbound(&e).unwrap();
+            assert_eq!(
+                field(&v, "alter_id").and_then(Value::as_u64),
+                Some(aid.parse::<u64>().unwrap()),
+                "aid={aid}"
+            );
+            // The Clash encoder must agree for the same entry.
+            let clash = crate::formats::clash::entry_to_clash(&e).unwrap();
+            assert_eq!(
+                clash
+                    .get(serde_norway::Value::from("alterId"))
+                    .and_then(serde_norway::Value::as_u64),
+                Some(aid.parse::<u64>().unwrap()),
+                "clash disagrees for aid={aid}"
+            );
+        }
     }
 
     /// Parse a raw subscription line into an entry (panics on failure).

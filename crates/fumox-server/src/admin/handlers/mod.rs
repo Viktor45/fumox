@@ -347,6 +347,29 @@ fn is_htmx(headers: &HeaderMap) -> bool {
 /// handlers that receive the raw body as a string map.
 pub type FormMap = std::collections::HashMap<String, String>;
 
+/// Query parameters that keep duplicates and their original order.
+///
+/// [`FormMap`] is a `HashMap`, so a repeating key silently collapses to the
+/// last value — which broke the proxy list's multi-select status filter
+/// (`?status=alive&status=quarantine` filtered on one status only; security
+/// audit, 2026-09-05). Screens with a multi-select filter extract this.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(transparent)]
+pub struct QueryPairs(Vec<(String, String)>);
+
+impl QueryPairs {
+    /// First value for `key`, matching `HashMap::get` for single-valued
+    /// parameters.
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// Every value for a repeating `key`, in query-string order.
+    pub fn all<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a String> + 'a {
+        self.0.iter().filter(move |(k, _)| k == key).map(|(_, v)| v)
+    }
+}
+
 /// Pagination window used across list screens.
 pub const PAGE_SIZE: i64 = 50;
 pub const MAX_PAGE_SIZE: i64 = 200;
@@ -354,6 +377,17 @@ pub const MAX_PAGE_SIZE: i64 = 200;
 /// Clamp a requested page size into the allowed range.
 pub fn clamp_limit(requested: Option<i64>) -> i64 {
     requested.unwrap_or(PAGE_SIZE).clamp(1, MAX_PAGE_SIZE)
+}
+
+/// SQL `OFFSET` for a 1-based page number.
+///
+/// `page` comes from the query string and is only clamped from below, so the
+/// plain `(page - 1) * per_page` overflowed on `?page=9223372036854775807`:
+/// a debug build panicked inside the handler, and release wrapped to a
+/// negative offset (security audit, 2026-09-05). Saturating instead yields an
+/// offset past the end, i.e. an empty page.
+pub fn page_offset(page: i64, per_page: i64) -> i64 {
+    page.saturating_sub(1).saturating_mul(per_page)
 }
 
 /// Build the pagination context: `(page number, is current)` pairs to
@@ -441,5 +475,39 @@ mod tests {
         let response = action_response(false, "/admin/sources", String::new(), "готово");
         assert!(response.headers().get("HX-Trigger").is_none());
         assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    }
+
+    /// `?page=i64::MAX` overflowed the offset multiply: a debug build panicked
+    /// inside the handler (security audit, 2026-09-05).
+    #[test]
+    fn page_offset_saturates_instead_of_overflowing() {
+        assert_eq!(page_offset(1, 50), 0);
+        assert_eq!(page_offset(3, 50), 100);
+        assert_eq!(page_offset(i64::MAX, MAX_PAGE_SIZE), i64::MAX);
+        assert_eq!(page_offset(i64::MIN, MAX_PAGE_SIZE), i64::MIN);
+    }
+
+    /// A `HashMap` keeps only the last value of a repeating key, which broke
+    /// the proxy list's multi-select status filter.
+    #[test]
+    fn query_pairs_keep_every_value_of_a_repeating_key() {
+        use axum::extract::Query;
+
+        let uri: axum::http::Uri =
+            "/admin/proxies?status=unknown&status=alive&page=2&status=quarantine"
+                .parse()
+                .expect("uri parses");
+        let Query(pairs) = Query::<QueryPairs>::try_from_uri(&uri).expect("query parses");
+        assert_eq!(
+            pairs.all("status").collect::<Vec<_>>(),
+            vec!["unknown", "alive", "quarantine"]
+        );
+        // Single-valued lookups keep HashMap-like semantics.
+        assert_eq!(pairs.get("page").map(String::as_str), Some("2"));
+        assert_eq!(pairs.get("missing"), None);
+
+        // The old FormMap behavior, for contrast: last value wins.
+        let Query(map) = Query::<FormMap>::try_from_uri(&uri).expect("query parses");
+        assert_eq!(map.get("status").map(String::as_str), Some("quarantine"));
     }
 }

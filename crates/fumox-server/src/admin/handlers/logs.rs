@@ -3,7 +3,9 @@
 //! Probe history intentionally has no page of its own — it lives on the
 //! proxy card.
 
-use super::{FormMap, clamp_limit, fmt_bytes, fmt_ts_element, pagination_pages, server_error};
+use super::{
+    FormMap, clamp_limit, fmt_bytes, fmt_ts_element, page_offset, pagination_pages, server_error,
+};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::render_html;
@@ -148,7 +150,7 @@ pub async fn fetch_logs(
         for value in &binds {
             query = query.bind(value);
         }
-        query = query.bind(per_page).bind((page - 1) * per_page);
+        query = query.bind(per_page).bind(page_offset(page, per_page));
         match query.fetch_all(&state.pool).await {
             Ok(rows) => rows,
             Err(err) => return server_error(lang, &err),

@@ -11,6 +11,7 @@ scripts
 .env.example
 .agents
 .zcode
+.mimosa
 
 # Local build artifacts and databases
 target
@@ -31,5 +32,3 @@ config
 .DS_Store
 .idea
 .vscode
-.zcode
-.mimosa

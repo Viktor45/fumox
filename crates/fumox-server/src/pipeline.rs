@@ -752,11 +752,14 @@ fn parse_scheme_list(
 /// present; all-falsy sets keep the first spelling and value.
 fn normalize_insecure_params(params: &mut Vec<fumox_core::models::Param>) {
     const ALIASES: [&str; 3] = ["insecure", "allowinsecure", "skip-cert-verify"];
+    fn is_alias(param: &fumox_core::models::Param) -> bool {
+        ALIASES.contains(&param.key.to_ascii_lowercase().as_str())
+    }
 
     let positions: Vec<usize> = params
         .iter()
         .enumerate()
-        .filter(|(_, p)| ALIASES.contains(&p.key.to_ascii_lowercase().as_str()))
+        .filter(|(_, p)| is_alias(p))
         .map(|(idx, _)| idx)
         .collect();
     if positions.len() <= 1 {
@@ -784,9 +787,11 @@ fn normalize_insecure_params(params: &mut Vec<fumox_core::models::Param>) {
         )
     };
     // Drop every alias occurrence, then re-insert the survivor in place.
-    for &idx in positions.iter().rev() {
-        params.remove(idx);
-    }
+    // `retain` rather than a reverse `remove` loop: a feed can supply
+    // thousands of alias spellings (the match is case-insensitive and
+    // `parse_query` keeps duplicates), and repeated `Vec::remove` made this
+    // O(k²) on untrusted input (security audit, 2026-09-05).
+    params.retain(|p| !is_alias(p));
     params.insert(
         keep.min(params.len()),
         fumox_core::models::Param { key, value, known },

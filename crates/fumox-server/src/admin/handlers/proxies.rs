@@ -4,8 +4,8 @@
 //! action (ADMIN_PLAN §8).
 
 use super::{
-    FormMap, action_response, clamp_limit, flag_for, fmt_opt_ts_element, fmt_ts_element, is_htmx,
-    not_found, pagination_pages, server_error,
+    QueryPairs, action_response, clamp_limit, flag_for, fmt_opt_ts_element, fmt_ts_element,
+    is_htmx, not_found, page_offset, pagination_pages, server_error,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -133,16 +133,16 @@ fn urlencoding(value: &str) -> String {
 pub async fn proxies_list(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    Query(params): Query<FormMap>,
+    Query(params): Query<QueryPairs>,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
-    // `status` may repeat (multi-select); the rest are single-valued.
+    // `status` may repeat (multi-select); the rest are single-valued. This
+    // needs QueryPairs — a HashMap would keep only the last value.
     let f_statuses: Vec<String> = params
-        .iter()
-        .filter(|(k, _)| k.as_str() == "status")
-        .map(|(_, v)| v.clone())
+        .all("status")
         .filter(|v| ["unknown", "alive", "quarantine", "removed"].contains(&v.as_str()))
+        .cloned()
         .collect();
     let f_scheme = params.get("scheme").cloned().unwrap_or_default();
     let f_country = params.get("country").cloned().unwrap_or_default();
@@ -224,7 +224,7 @@ pub async fn proxies_list(
         for value in &binds {
             query = query.bind(value);
         }
-        query = query.bind(per_page).bind((page - 1) * per_page);
+        query = query.bind(per_page).bind(page_offset(page, per_page));
         match query.fetch_all(&state.pool).await {
             Ok(rows) => rows,
             Err(err) => return server_error(lang, &err),

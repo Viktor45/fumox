@@ -3,7 +3,7 @@
 # Fumox container image.
 #
 # Ships both binaries: `fumox-server` (default CMD) and `fumox-probe`
-# (override the command: `docker run ghcr.io/<owner>/fumox fumox-probe`).
+# (override the command: `docker run ghcr.io/viktor45/fumox fumox-probe`).
 #
 # Runtime layout:
 #   /app/config  — mount point for app.toml and the GeoLite2 .mmdb files

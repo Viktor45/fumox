@@ -40,8 +40,8 @@ cargo run -p fumox-probe
 ```
 
 Предпочитаете контейнеры? [`docker-compose.yml`](./docker-compose.yml)
-собирает и запускает весь стек — `fumox-server`, `fumox-probe` и проверку
-туннелей `meow-rs` — одной командой:
+собирает и запускает весь стек — `fumox-server`, `fumox-probe` и как проверку
+туннелей [meow-rs](https://github.com/meow-rs/meow-rs) — одной командой:
 
 ```bash
 cp .env.example .env   # задайте FUMOX_ADMIN__TOKEN
@@ -86,6 +86,8 @@ Fumox, как он устроен, развёртывание (Docker Compose / 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
 All trademarks are the property of their respective owners.
+
+- [meow-rs](https://github.com/meow-rs/meow-rs) A high-performance Rust implementation of the mihomo (Clash Meta) proxy kernel.
 
 Database Copyright (c) [MaxMind](https://www.maxmind.com/), Inc.
 - [GeoLite2 End User License Agreement](https://www.maxmind.com/en/geolite2/eula)

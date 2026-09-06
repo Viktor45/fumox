@@ -1,36 +1,40 @@
-# Builds the Fumox image for linux/amd64 and linux/arm64 and pushes a
-# combined multi-arch manifest to GHCR (ghcr.io/viktor45/fumox).
+# Builds the fumox-meow image (docker/meow/Dockerfile — a thin wrapper around
+# a meow-rs release binary) for linux/amd64 and linux/arm64 and pushes a
+# combined multi-arch manifest to GHCR (ghcr.io/viktor45/fumox-meow).
 #
-# Strategy: each architecture is compiled NATIVELY on a matching GitHub
-# runner (no QEMU emulation, which is prohibitively slow for Rust), pushed
-# by digest, and a merge job stitches the digests into one manifest list.
-# Requires the `ubuntu-24.04-arm` runner (included for public repos;
-# available on paid plans for private repos).
+# MANUAL ONLY: this workflow never runs on push or tags — dispatch it from
+# the Actions tab (or `gh workflow run docker-meow.yml [-f meow_version=v0.21.2]`).
 #
-# Every single-platform image gets a GitHub build-provenance attestation
-# (actions/attest-build-provenance) pushed to the registry alongside the
-# digest, so the final manifest list is fully attested per platform.
+# The MEOW_VERSION input picks the packaged meow-rs release, exactly like the
+# MEOW_VERSION build arg of docker/meow/Dockerfile (and .env for local
+# builds): `latest` (default) resolves the newest upstream release at build
+# time through the GitHub API; a tag (e.g. v0.21.2) pins one. The input value
+# (whitespace-trimmed) is also applied as an image tag, so a pinned build is
+# addressable as ghcr.io/viktor45/fumox-meow:v0.21.2.
+#
+# Strategy: same as docker.yml — each architecture is built NATIVELY on a
+# matching GitHub runner (the fetch stage runs apt-get, which is painfully
+# slow under QEMU), pushed by digest, and attested per platform with
+# actions/attest-build-provenance; a merge job stitches the already-attested
+# digests into one manifest list.
 #
 # Resulting tags:
-#   push to main  -> main, sha-<shortsha>
-#   push v0.2.0   -> 0.2.0, 0.2, sha-<shortsha>, latest
+#   MEOW_VERSION=latest  -> latest, main, sha-<shortsha>
+#   MEOW_VERSION=v0.21.2 -> v0.21.2, main, sha-<shortsha>
 #
-# Run the image (see Dockerfile header for details; admin stays loopback-only
-# on the host, and the probe runs as the command argument — tini remains the
-# entrypoint):
-#   docker run -d --name fumox \
-#     -e FUMOX_ADMIN__TOKEN=secret \
-#     -v fumox-config:/app/config -v fumox-data:/app/data \
-#     -p 8080:8080 -p 127.0.0.1:8081:8081 ghcr.io/viktor45/fumox
-#   docker run -d --name fumox-probe ... ghcr.io/viktor45/fumox fumox-probe
+# The compose/quadlet stacks use the locally built `fumox-meow:local`; this
+# GHCR image exists for deployments that prefer to pull — point the compose
+# service's `image:` at it and drop its `build:` section.
 
-name: Docker
+name: Docker meow
 
 on:
-  push:
-    #    branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      meow_version:
+        description: "meow-rs release to package (tag like v0.21.2, or latest)"
+        required: false
+        default: "latest"
 
 permissions:
   contents: read
@@ -59,9 +63,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Prepare
+        env:
+          MEOW_INPUT: ${{ inputs.meow_version }}
         run: |
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+          echo "MEOW_VERSION=${MEOW_INPUT//[[:space:]]/}" >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,7 +76,7 @@ jobs:
       - name: Compute image name
         id: image
         run: |
-          echo "name=${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" \
+          echo "name=${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-meow" \
             >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -89,9 +96,8 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha
+            type=raw,value=${{ env.MEOW_VERSION }}
 
       # Push the single-platform image by digest only; tags are attached by
       # the merge job once both architectures exist.
@@ -99,12 +105,14 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./docker/meow
           platforms: ${{ matrix.platform }}
+          build-args: |
+            MEOW_VERSION=${{ env.MEOW_VERSION }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=fumox-${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,mode=max,scope=fumox-${{ env.PLATFORM_PAIR }}
+          cache-from: type=gha,scope=fumox-meow-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=fumox-meow-${{ env.PLATFORM_PAIR }}
 
       - name: Export digest
         run: |
@@ -140,6 +148,14 @@ jobs:
           pattern: digest-*
           merge-multiple: true
 
+      # GITHUB_ENV does not cross jobs — re-derive the trimmed input for the
+      # tag list (must match the build job's tags exactly).
+      - name: Prepare
+        env:
+          MEOW_INPUT: ${{ inputs.meow_version }}
+        run: |
+          echo "MEOW_VERSION=${MEOW_INPUT//[[:space:]]/}" >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -153,7 +169,7 @@ jobs:
       - name: Compute image name
         id: image
         run: |
-          echo "name=${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" \
+          echo "name=${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-meow" \
             >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
@@ -163,10 +179,8 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ env.MEOW_VERSION }}
 
       - name: Create manifest list and push
         working-directory: /tmp/digests

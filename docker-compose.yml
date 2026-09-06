@@ -38,7 +38,7 @@ services:
       # the classic cargo-chef image layers. See the Dockerfile header.
       args:
         BUILD_CACHE: ${FUMOX_BUILD_CACHE:-mounts}
-    image: fumox:local
+    image: ghcr.io/viktor45/fumox:latest
     command: ["fumox-server"]
     environment:
       FUMOX_ADMIN__TOKEN: ${FUMOX_ADMIN__TOKEN:?set FUMOX_ADMIN__TOKEN in .env}
@@ -61,7 +61,7 @@ services:
     restart: unless-stopped
 
   probe:
-    image: fumox:local         # same image as server, different command
+    image: ghcr.io/viktor45/fumox:latest         # same image as server, different command
     command: ["fumox-probe"]
     depends_on:
       - server                 # let the server create/migrate the DB first
@@ -79,6 +79,10 @@ services:
     restart: unless-stopped
 
   meow:
+    # Local build (fumox-meow:local). To pull a prebuilt image instead,
+    # replace this `build:` block with image: ghcr.io/viktor45/fumox-meow:<tag>
+    # — it is published manually via .github/workflows/docker-meow.yml
+    # (MEOW_VERSION below only affects local builds).
     build:
       context: ./docker/meow
       dockerfile: Dockerfile
@@ -87,7 +91,7 @@ services:
         # time via the GitHub API. Set MEOW_VERSION in .env to a tag
         # (e.g. v0.21.2) to pin a specific release instead.
         MEOW_VERSION: ${MEOW_VERSION:-latest}
-    image: fumox-meow:local
+    image: ghcr.io/viktor45/fumox-meow:latest
     volumes:
       - meow-shared:/shared
     restart: unless-stopped

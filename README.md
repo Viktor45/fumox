@@ -40,8 +40,7 @@ cargo run -p fumox-probe
 ```
 
 Prefer containers? A [`docker-compose.yml`](./docker-compose.yml) builds and
-runs the whole stack — `fumox-server`, `fumox-probe`, and a `meow-rs` tunnel
-checker — in one command:
+runs the whole stack — `fumox-server`, `fumox-probe`, and a [meow-rs](https://github.com/meow-rs/meow-rs) as tunnel checker — in one command:
 
 ```bash
 cp .env.example .env   # set FUMOX_ADMIN__TOKEN
@@ -87,6 +86,8 @@ configuration reference, and day-to-day usage. Russian version:
 This project is licensed under the MIT License - see the LICENSE file for details.
 
 All trademarks are the property of their respective owners.
+
+- [meow-rs](https://github.com/meow-rs/meow-rs) A high-performance Rust implementation of the mihomo (Clash Meta) proxy kernel.
 
 Database Copyright (c) [MaxMind](https://www.maxmind.com/), Inc.
 - [GeoLite2 End User License Agreement](https://www.maxmind.com/en/geolite2/eula)

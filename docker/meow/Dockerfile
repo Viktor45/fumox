@@ -15,6 +15,10 @@
 # to 0.0.0.0:9090 so fumox-probe can reach it over the compose network. It is
 # intentionally NOT published to the host.
 #
+# CI packages this image on demand: .github/workflows/docker-meow.yml
+# (workflow_dispatch only) pushes ghcr.io/viktor45/fumox-meow, attested per
+# platform.
+#
 # Multi-arch: BuildKit supplies TARGETARCH (linux/amd64, linux/arm64).
 
 ARG MEOW_VERSION=latest

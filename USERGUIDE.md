@@ -202,8 +202,9 @@ Notes:
 - The SQLite database lives in the `fumox-data` volume; `./config` is mounted
   read-only for `app.toml` and GeoLite2 files.
 - meow-rs publishes no official Docker image, so the stack builds a small
-  wrapper (`docker/meow/Dockerfile`) around the release binary. Its REST API
-  (port 9090) is only reachable from the probe over the internal network.
+  wrapper (`docker/meow/Dockerfile`) around the release binary — or pulls the
+  ready-made one from GHCR (see Option B). Its REST API (port 9090) is only
+  reachable from the probe over the internal network.
 - **Disposable smoke stand:** `scripts/smoke-up.sh` brings the same stack up
   as a second, isolated compose project (`fumox-smoke`) on shifted ports
   (18080 public / 18081 admin; override with `SMOKE_PUBLIC_PORT` /
@@ -213,14 +214,14 @@ Notes:
   restarts — a check independent of the configured log levels).
   `scripts/smoke-down.sh` tears
   it down (volumes deleted unless `--keep-data`). The main stack is never
-  touched; both stands share the `fumox:local` image tag, so the smoke build
-  doubles as the main-stack rebuild.
+  touched; both stands share the image tags (`ghcr.io/viktor45/fumox:latest`,
+  `fumox-meow:local`), so the smoke build doubles as the main-stack rebuild.
 
 ### Option B — Pre-built container image
 
 CI publishes a multi-arch image (`linux/amd64` + `linux/arm64`, each platform
 attested with build provenance) to GHCR on every push to `main` and on `v*`
-tags: `ghcr.io/<owner>/fumox`. Tags: a push to `main` — `main` and
+tags: `ghcr.io/viktor45/fumox`. Tags: a push to `main` — `main` and
 `sha-<short sha>`; a `v0.2.0` tag adds `0.2.0`, `0.2` and `latest`. The image
 ships **both** binaries; the server is the default command, the probe is a
 command override.
@@ -231,13 +232,13 @@ docker run -d --name fumox \
   -e FUMOX_ADMIN__TOKEN=<secret> \
   -v fumox-config:/app/config -v fumox-data:/app/data \
   -p 8080:8080 -p 127.0.0.1:8081:8081 \
-  ghcr.io/<owner>/fumox
+  ghcr.io/viktor45/fumox
 
 # Probe (same image, shares the same volumes; fumox-probe is the command
 # argument — tini stays the entrypoint)
 docker run -d --name fumox-probe \
   -v fumox-config:/app/config -v fumox-data:/app/data \
-  ghcr.io/<owner>/fumox fumox-probe
+  ghcr.io/viktor45/fumox fumox-probe
 ```
 
 Inside the image: config is read from `/app/config/app.toml` (if mounted), the
@@ -245,6 +246,17 @@ database is `/app/data/fumox.db`, and the admin listener is pre-set to
 `0.0.0.0:8081` (the compose file publishes it loopback-only). There is no
 HTTP client (curl/wget) in the image — point orchestrator health probes at
 `GET /healthz` on port 8080.
+
+The meow-rs wrapper (`docker/meow/Dockerfile`) is on GHCR too —
+`ghcr.io/viktor45/fumox-meow` — but it is published **manually only**: the
+`docker-meow.yml` workflow never runs on push or tags; dispatch it from the
+Actions tab (the `meow_version` input: `latest` — the freshest release at
+build time, or a tag like `v0.21.2`). Resulting tags — the `meow_version`
+value, `main` and `sha-<short sha>`; the attestation is the same, per
+platform. The Option A stack can use the ready-made image instead of the
+local build: replace the `meow` service's `build:` section with
+`image: ghcr.io/viktor45/fumox-meow:<tag>` (the `.env` `MEOW_VERSION`
+variable has no effect then — it only picks the release for local builds).
 
 ### Option C — Build from source
 
@@ -368,12 +380,12 @@ The format is a property of the profile — one profile, one format. The
 the same set of proxies in another format, create a second profile (it's
 cheap).
 
-| Format     | Content-Type       | Notes                                    |
-| ---------- | ------------------ | ---------------------------------------- |
+| Format     | Content-Type       | Notes                                          |
+| ---------- | ------------------ | ---------------------------------------------- |
 | `uri_list` | `text/plain`       | Metadata comments, then one proxy URI per line |
-| `base64`   | `text/plain`       | The URI list, base64-encoded             |
-| `clash`    | `text/yaml`        | Clash/Mihomo config, root key `proxies:` |
-| `sing_box` | `application/json` | sing-box config, root key `outbounds:`   |
+| `base64`   | `text/plain`       | The URI list, base64-encoded                   |
+| `clash`    | `text/yaml`        | Clash/Mihomo config, root key `proxies:`       |
+| `sing_box` | `application/json` | sing-box config, root key `outbounds:`         |
 
 Every plain `uri_list` output (`/sub` with the `uri_list` format, `/src`,
 and the alive export) starts with a small comment block that documents the
@@ -531,11 +543,11 @@ form.
 
 ### `[server]` — public listener
 
-| Key                  | Default          | Meaning                                                                                          |
-| -------------------- | ---------------- | ------------------------------------------------------------------------------------------------ |
-| `bind`               | `"0.0.0.0:8080"` | Address of the public listener (`/sub`, `/src`, `/healthz`)                                      |
-| `rate_limit`         | `"300/min"`      | Per-IP ceiling for all public requests                                                           |
-| `auth_fail_rate_limit` | `"30/min"`     | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets      |
+| Key                    | Default          | Meaning                                                                                     |
+| ---------------------- | ---------------- | ------------------------------------------------------------------------------------------- |
+| `bind`                 | `"0.0.0.0:8080"` | Address of the public listener (`/sub`, `/src`, `/healthz`)                                 |
+| `rate_limit`           | `"300/min"`      | Per-IP ceiling for all public requests                                                      |
+| `auth_fail_rate_limit` | `"30/min"`       | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets |
 
 ### `[database]` — SQLite
 
@@ -560,9 +572,9 @@ form.
 
 ### `[ingest]` — source ingestion
 
-| Key                   | Default | Meaning                                                                                                                                           |
-| --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `refresh_check_limit` | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue)                                            |
+| Key                   | Default | Meaning                                                                                                                                                                                                       |
+| --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `refresh_check_limit` | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue)                                                                                                       |
 | `drop_gate`           | `false` | Drop-rules gate on the alive-linger: `true` — an alive proxy of a source with `drop` rules leaves on the next refresh once a rule catches it; `false` — every source lingers, the probe alone retires proxies |
 
 ### `[geo]` — geo enrichment
@@ -591,31 +603,31 @@ form.
 
 ### `[probe]` — health-check daemon
 
-| Key                          | Default             | Meaning                                                                                                 |
-| ---------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------- |
-| `cycle_interval_secs`        | `60`                | Scheduling cycle period                                                                                 |
-| `sample_size`                | `50`                | Random sample of proxies checked per cycle (spreads load, no bursts)                                    |
-| `fail_limit`                 | `3`                 | Consecutive failures before quarantine (T1 and T2 share one counter)                                    |
-| `connect_timeout_secs`       | `10`                | T1 TCP-connect timeout                                                                                  |
-| `tls_timeout_secs`           | `10`                | T1 TLS-handshake timeout                                                                                |
-| `concurrency`                | `8`                 | Parallel checks                                                                                         |
-| `heartbeat_interval_secs`    | `30`                | How often the daemon writes its heartbeat (shown in the admin panel)                                    |
-| `second_chance_min_hours`    | `12`                | Second-chance window start, hours after quarantine                                                      |
-| `second_chance_spread_hours` | `4`                 | Window width: the check happens at `+12h + U(0..4h)`, i.e. within [12h, 16h)                            |
-| `recheck_delays_secs`        | `[900, 1800, 3600]` | Quarantine recheck ladder: 15 min → 30 min → 1 h (see section 10)                                       |
-| `queue_stale_days`           | `7`                 | Lifetime of priority-queue entries                                                                      |
-| `retention_interval_secs`    | `86400`             | How often old history is purged                                                                         |
+| Key                          | Default             | Meaning                                                                      |
+| ---------------------------- | ------------------- | ---------------------------------------------------------------------------- |
+| `cycle_interval_secs`        | `60`                | Scheduling cycle period                                                      |
+| `sample_size`                | `50`                | Random sample of proxies checked per cycle (spreads load, no bursts)         |
+| `fail_limit`                 | `3`                 | Consecutive failures before quarantine (T1 and T2 share one counter)         |
+| `connect_timeout_secs`       | `10`                | T1 TCP-connect timeout                                                       |
+| `tls_timeout_secs`           | `10`                | T1 TLS-handshake timeout                                                     |
+| `concurrency`                | `8`                 | Parallel checks                                                              |
+| `heartbeat_interval_secs`    | `30`                | How often the daemon writes its heartbeat (shown in the admin panel)         |
+| `second_chance_min_hours`    | `12`                | Second-chance window start, hours after quarantine                           |
+| `second_chance_spread_hours` | `4`                 | Window width: the check happens at `+12h + U(0..4h)`, i.e. within [12h, 16h) |
+| `recheck_delays_secs`        | `[900, 1800, 3600]` | Quarantine recheck ladder: 15 min → 30 min → 1 h (see section 10)            |
+| `queue_stale_days`           | `7`                 | Lifetime of priority-queue entries                                           |
+| `retention_interval_secs`    | `86400`             | How often old history is purged                                              |
 
 ### `[meow]` — meow-rs integration (T2)
 
-| Key            | Default                                                                                 | Meaning                                                                                                                                                                                                                                                                                                                           |
-| -------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `api_addr`     | `"127.0.0.1:9090"`                                                                      | meow-rs REST API address (its external-controller)                                                                                                                                                                                                                                                                                |
-| `config_path`  | `"config/meow.yaml"`                                                                    | Where the probe writes the generated Clash config. **Must be a path meow-rs itself can read** (in Docker: the shared volume)                                                                                                                                                                                                      |
-| `test_url`     | Rotation over the Google Android `generate_204` endpoints (7 URLs, verified 2026-08-29) | URL(s) fetched through the proxy for delay tests: one URL, a TOML array, or a comma-separated string. The probe picks one at random per check, so a blocked endpoint no longer breaks T2 everywhere. iOS/Apple check URLs (`captive.apple.com/...`) answer 200, not 204 — usable, but only if your client accepts non-204 answers |
-| `timeout_secs` | `10`                                                                                    | Per-check timeout                                                                                                                                                                                                                                                                                                                 |
-| `backoff_initial_secs` | `60`  | Initial T2 backoff while meow-rs is unavailable (doubles per consecutive failure) |
-| `backoff_max_secs` | `900` | T2 backoff ceiling (15 min) — a dead meow-rs is never mistaken for dead proxies |
+| Key                    | Default                                                                                 | Meaning                                                                                                                                                                                                                                                                                                                           |
+| ---------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `api_addr`             | `"127.0.0.1:9090"`                                                                      | meow-rs REST API address (its external-controller)                                                                                                                                                                                                                                                                                |
+| `config_path`          | `"config/meow.yaml"`                                                                    | Where the probe writes the generated Clash config. **Must be a path meow-rs itself can read** (in Docker: the shared volume)                                                                                                                                                                                                      |
+| `test_url`             | Rotation over the Google Android `generate_204` endpoints (7 URLs, verified 2026-08-29) | URL(s) fetched through the proxy for delay tests: one URL, a TOML array, or a comma-separated string. The probe picks one at random per check, so a blocked endpoint no longer breaks T2 everywhere. iOS/Apple check URLs (`captive.apple.com/...`) answer 200, not 204 — usable, but only if your client accepts non-204 answers |
+| `timeout_secs`         | `10`                                                                                    | Per-check timeout                                                                                                                                                                                                                                                                                                                 |
+| `backoff_initial_secs` | `60`                                                                                    | Initial T2 backoff while meow-rs is unavailable (doubles per consecutive failure)                                                                                                                                                                                                                                                 |
+| `backoff_max_secs`     | `900`                                                                                   | T2 backoff ceiling (15 min) — a dead meow-rs is never mistaken for dead proxies                                                                                                                                                                                                                                                   |
 
 ### `[retention]` — history rotation
 
@@ -670,15 +682,15 @@ deduplicate by fingerprint". `"version": 1` is required.
 }
 ```
 
-| Section  | What it does                                                 | Fields and defaults                                                                                                              |
-| -------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| `filter` | Keep/drop protocols; normalize `insecure=1`-style parameters | `protocols` / `exclude_protocols`: lists or null (= all); `normalize_params`: default `true`                                     |
-| `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` — default, `host`, `port`, `param:KEY`); rules are OR-ed; default `[]`       |
-| `rename` | Regex-based rewriting, rules applied in order               | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` — default, `host`, `port`, `param:KEY`); default `[]` |
-| `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment)) |
-| `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`                                                                          |
-| `dedup`  | Deduplication                                                | `by`: only `"fingerprint"` in v1                                                                                                 |
-| `sort`   | Output ordering                                              | `by`: `source` \| `name` \| `country` \| `latency` (null latencies go last); `desc`: default `false`                             |
+| Section  | What it does                                                 | Fields and defaults                                                                                                                |
+| -------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `filter` | Keep/drop protocols; normalize `insecure=1`-style parameters | `protocols` / `exclude_protocols`: lists or null (= all); `normalize_params`: default `true`                                       |
+| `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` — default, `host`, `port`, `param:KEY`); rules are OR-ed; default `[]`        |
+| `rename` | Regex-based rewriting, rules applied in order                | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` — default, `host`, `port`, `param:KEY`); default `[]` |
+| `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment))   |
+| `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`                                                                            |
+| `dedup`  | Deduplication                                                | `by`: only `"fingerprint"` in v1                                                                                                   |
+| `sort`   | Output ordering                                              | `by`: `source` \| `name` \| `country` \| `latency` (null latencies go last); `desc`: default `false`                               |
 
 Validation is strict: unknown keys, a non-compiling regex or an invalid enum
 value are rejected with a field error in the admin form — nothing is saved.
@@ -820,23 +832,23 @@ The rules in plain language:
 a restart of the owning process; the effective values are shown on the admin
 panel's *Settings* page.
 
-| Parameter | Default | What it controls |
-| --- | --- | --- |
-| `[probe].fail_limit` | `3` | Consecutive failed checks (T1 and T2 share one counter) before `quarantine` |
-| `[probe].second_chance_min_hours` | `12` | Second-chance window start, hours after `quarantined_at` |
-| `[probe].second_chance_spread_hours` | `4` | Second-chance window width: the check happens in `[min, min + spread)` |
-| `[probe].recheck_delays_secs` | `[900, 1800, 3600]` | Recheck ladder after a failed second chance: 15 min → 30 min → 1 h; up to 16 steps of ≤ 30 days, `[]` = remove right after the failed second chance |
-| `[probe].cycle_interval_secs` | `60` | How often quarantine dues run and T1/T2 samples are drawn |
-| `[probe].sample_size` | `50` | Random T1 sample size per cycle; the same limit caps quarantine checks per cycle |
-| `[probe].connect_timeout_secs` | `10` | T1 TCP-connect timeout (including quarantine checks) |
-| `[probe].tls_timeout_secs` | `10` | T1 TLS-handshake timeout |
-| `[probe].concurrency` | `8` | Parallelism of checks |
-| `[probe].queue_stale_days` | `7` | Lifetime of priority-queue entries (first check of new proxies) |
-| `[ingest].refresh_check_limit` | `50` | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables) |
-| `[ingest].drop_gate` | `false` | Whether `drop` rules unlink a live "lingerer" on the very next refresh |
-| `[meow].timeout_secs` | `10` | Per-check T2 delay-test timeout |
-| `[meow].backoff_initial_secs` | `60` | Initial T2 backoff while meow-rs is unavailable |
-| `[meow].backoff_max_secs` | `900` | T2 backoff ceiling (15 min) |
+| Parameter                            | Default             | What it controls                                                                                                                                    |
+| ------------------------------------ | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[probe].fail_limit`                 | `3`                 | Consecutive failed checks (T1 and T2 share one counter) before `quarantine`                                                                         |
+| `[probe].second_chance_min_hours`    | `12`                | Second-chance window start, hours after `quarantined_at`                                                                                            |
+| `[probe].second_chance_spread_hours` | `4`                 | Second-chance window width: the check happens in `[min, min + spread)`                                                                              |
+| `[probe].recheck_delays_secs`        | `[900, 1800, 3600]` | Recheck ladder after a failed second chance: 15 min → 30 min → 1 h; up to 16 steps of ≤ 30 days, `[]` = remove right after the failed second chance |
+| `[probe].cycle_interval_secs`        | `60`                | How often quarantine dues run and T1/T2 samples are drawn                                                                                           |
+| `[probe].sample_size`                | `50`                | Random T1 sample size per cycle; the same limit caps quarantine checks per cycle                                                                    |
+| `[probe].connect_timeout_secs`       | `10`                | T1 TCP-connect timeout (including quarantine checks)                                                                                                |
+| `[probe].tls_timeout_secs`           | `10`                | T1 TLS-handshake timeout                                                                                                                            |
+| `[probe].concurrency`                | `8`                 | Parallelism of checks                                                                                                                               |
+| `[probe].queue_stale_days`           | `7`                 | Lifetime of priority-queue entries (first check of new proxies)                                                                                     |
+| `[ingest].refresh_check_limit`       | `50`                | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables)                                                       |
+| `[ingest].drop_gate`                 | `false`             | Whether `drop` rules unlink a live "lingerer" on the very next refresh                                                                              |
+| `[meow].timeout_secs`                | `10`                | Per-check T2 delay-test timeout                                                                                                                     |
+| `[meow].backoff_initial_secs`        | `60`                | Initial T2 backoff while meow-rs is unavailable                                                                                                     |
+| `[meow].backoff_max_secs`            | `900`               | T2 backoff ceiling (15 min)                                                                                                                         |
 
 If meow-rs is down, T2 doesn't spam it: the probe backs off exponentially
 (60 s → doubling → capped at 15 min), and proxy statuses are left untouched —

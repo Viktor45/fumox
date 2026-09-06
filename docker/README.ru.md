@@ -14,7 +14,11 @@ compose. Два варианта на выбор:
 
 ## Подготовка (для обоих вариантов)
 
-Quadlet не собирает образы — соберите их один раз из корня репозитория:
+Quadlet не собирает образы — соберите их один раз из корня репозитория
+(или возьмите опубликованные в GHCR и перетегируйте в имена `localhost/…`
+из юнитов ниже: `ghcr.io/viktor45/fumox` CI публикует на каждый push в `main`
+и на теги `v*`, `ghcr.io/viktor45/fumox-meow` — только вручную, workflow'ом
+`docker-meow.yml`):
 
 ```sh
 podman build -t localhost/fumox:local .

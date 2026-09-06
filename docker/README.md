@@ -14,7 +14,11 @@ podman (recommended); rootful differences are at the end.
 
 ## Preparation (both variants)
 
-Quadlet does not build images — build them once from the repository root:
+Quadlet does not build images — build them once from the repository root
+(or pull the GHCR-published ones and `podman tag` them to the `localhost/…`
+names the units below reference: `ghcr.io/viktor45/fumox` is pushed by CI on
+every push to `main` and on `v*` tags, `ghcr.io/viktor45/fumox-meow` — only
+manually, via the `docker-meow.yml` workflow):
 
 ```sh
 podman build -t localhost/fumox:local .

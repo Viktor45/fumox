@@ -2,8 +2,9 @@
 # Bring up the disposable smoke stand: the full docker-compose stack (server +
 # probe + meow) under an isolated compose project, on shifted host ports, with
 # its own generated admin token and fresh volumes. The main stack (ports
-# 8080/8081, project "fumox") is never touched; both stands share the
-# fumox:local image tag, so the smoke build doubles as the main-stack rebuild.
+# 8080/8081, project "fumox") is never touched; both stands share the image
+# tags (ghcr.io/viktor45/fumox:latest, fumox-meow:local), so the smoke build
+# doubles as the main-stack rebuild.
 #
 # Usage:
 #   scripts/smoke-up.sh [--no-build]

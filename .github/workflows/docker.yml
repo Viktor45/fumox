@@ -12,8 +12,10 @@
 # digest, so the final manifest list is fully attested per platform.
 #
 # Resulting tags:
-#   push to main  -> main, sha-<shortsha>
+#   push to main  -> main, sha-<shortsha>, latest
 #   push v0.2.0   -> 0.2.0, 0.2, sha-<shortsha>, latest
+# (`latest` follows main builds and v* releases; a manual dispatch from
+# another branch does not move it.)
 #
 # Run the image (see Dockerfile header for details; admin stays loopback-only
 # on the host, and the probe runs as the command argument — tini remains the
@@ -166,7 +168,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Create manifest list and push
         working-directory: /tmp/digests

@@ -2,7 +2,7 @@
 # Tear the smoke stand down (the counterpart of scripts/smoke-up.sh).
 # The stand is disposable, so its volumes (the SQLite DB and the meow config
 # exchange) are deleted by default; pass --keep-data to preserve them.
-# Images are never removed: the fumox:local tag is shared with the main stack.
+# Images are never removed: their tags are shared with the main stack.
 #
 # Usage:
 #   scripts/smoke-down.sh [--keep-data]
@@ -31,4 +31,4 @@ fi
 
 echo ">> tearing down the smoke stand: project=$SMOKE_PROJECT"
 "${COMPOSE[@]}" -p "$SMOKE_PROJECT" down --remove-orphans "${VOLUME_FLAGS[@]}"
-echo ">> done (images kept: fumox:local, fumox-meow:local)"
+echo ">> done (images kept: ghcr.io/viktor45/fumox:latest, fumox-meow:local)"

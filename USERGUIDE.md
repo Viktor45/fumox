@@ -173,8 +173,14 @@ cd fumox
 cp .env.example .env
 # edit .env: set a real FUMOX_ADMIN__TOKEN (the admin panel login secret)
 
-docker compose up -d --build
+docker compose up -d          # prebuilt images from GHCR — the fastest path
+docker compose up -d --build  # ...or build server + the meow wrapper from source
 ```
+
+The first command pulls the published images (`ghcr.io/viktor45/fumox:latest`,
+`ghcr.io/viktor45/fumox-meow:latest`); with `--build` they are compiled
+locally (the root `Dockerfile` and `docker/meow/Dockerfile`) and tagged with
+the same names. To move to fresh images: `docker compose pull && docker compose up -d`.
 
 That's it. What you get:
 
@@ -192,7 +198,7 @@ Useful `.env` variables (all except the token are optional):
 | `FUMOX_ADMIN_PORT`                | `8081`                                | Host port for the admin panel (always published to loopback only or `FUMOX_ADMIN_BIND` ).                                                                        |
 | `FUMOX_MEOW__TEST_URL`            | `http://www.gstatic.com/generate_204` | URL used for T2 delay tests. Override if it is blocked in your region (e.g. `http://cp.cloudflare.com`).                                                         |
 | `FUMOX_ADMIN__ALLOW_PRIVATE_URLS` | `false`                               | Allow source URLs pointing at private/loopback addresses (disables the SSRF guard). Local testing only.                                                          |
-| `MEOW_VERSION`                    | `latest`                              | The meow-rs release the wrapper image builds from. `latest` resolves the newest release at build time via the GitHub API; set a tag (e.g. `v0.21.2`) to pin one. |
+| `MEOW_VERSION`                    | `latest`                              | The meow-rs release for **local builds** of the wrapper image (`--build` mode; no effect when pulling). `latest` resolves the newest release via the GitHub API; a tag (e.g. `v0.21.2`) pins one. |
 
 Notes:
 
@@ -201,10 +207,11 @@ Notes:
   reverse proxy in front.
 - The SQLite database lives in the `fumox-data` volume; `./config` is mounted
   read-only for `app.toml` and GeoLite2 files.
-- meow-rs publishes no official Docker image, so the stack builds a small
-  wrapper (`docker/meow/Dockerfile`) around the release binary — or pulls the
-  ready-made one from GHCR (see Option B). Its REST API (port 9090) is only
-  reachable from the probe over the internal network.
+- meow-rs publishes no official Docker image, so the small wrapper
+  (`docker/meow/Dockerfile`) around the release binary is either pulled
+  ready-made from GHCR or built in `--build` mode; it is published manually
+  by the `docker-meow.yml` workflow (see Option B). Its REST API (port 9090)
+  is only reachable from the probe over the internal network.
 - **Disposable smoke stand:** `scripts/smoke-up.sh` brings the same stack up
   as a second, isolated compose project (`fumox-smoke`) on shifted ports
   (18080 public / 18081 admin; override with `SMOKE_PUBLIC_PORT` /
@@ -215,7 +222,8 @@ Notes:
   `scripts/smoke-down.sh` tears
   it down (volumes deleted unless `--keep-data`). The main stack is never
   touched; both stands share the image tags (`ghcr.io/viktor45/fumox:latest`,
-  `fumox-meow:local`), so the smoke build doubles as the main-stack rebuild.
+  `ghcr.io/viktor45/fumox-meow:latest`), so the smoke build doubles as the
+  main-stack rebuild.
 
 ### Option B — Pre-built container image
 
@@ -253,10 +261,9 @@ The meow-rs wrapper (`docker/meow/Dockerfile`) is on GHCR too —
 Actions tab (the `meow_version` input: `latest` — the freshest release at
 build time, or a tag like `v0.21.2`). Resulting tags — the `meow_version`
 value, `main` and `sha-<short sha>`; the attestation is the same, per
-platform. The Option A stack can use the ready-made image instead of the
-local build: replace the `meow` service's `build:` section with
-`image: ghcr.io/viktor45/fumox-meow:<tag>` (the `.env` `MEOW_VERSION`
-variable has no effect then — it only picks the release for local builds).
+platform. The Option A stack already references this image: `docker compose
+up -d` pulls it, `--build` compiles the wrapper locally (the `.env`
+`MEOW_VERSION` variable picks the release in build mode only).
 
 ### Option C — Build from source
 
@@ -866,7 +873,7 @@ MaxMind GeoLite2 databases.
 
 **Setup:**
 
-Manual installation (e.g. with your own MaxMind license) works the same:
+Manual installation (e.g. with your own MaxMind license) goes like this:
 
 1. Register a free account at <https://www.maxmind.com/en/geolite2/signup>.
 2. Download the database you need via

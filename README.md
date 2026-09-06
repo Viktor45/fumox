@@ -27,24 +27,30 @@ The name **Fumox** represents an optimized, modern fusion of Eastern discipline 
 
 The project is in active development.
 
+**Fastest start — prebuilt images from GHCR** (multi-arch `linux/amd64` +
+`linux/arm64`, build-provenance attested; the meow-rs wrapper image is
+refreshed by a manual workflow):
+
 ```bash
-# Build and tests
-cargo build
-cargo test
-
-# Subscription server + admin panel (http://127.0.0.1:8081/admin)
-cargo run -p fumox-server
-
-# Proxy health-check daemon
-cargo run -p fumox-probe
+cp .env.example .env   # set a real FUMOX_ADMIN__TOKEN
+docker compose up -d   # pulls the images and starts the whole stack
 ```
 
-Prefer containers? A [`docker-compose.yml`](./docker-compose.yml) builds and
-runs the whole stack — `fumox-server`, `fumox-probe`, and a [meow-rs](https://github.com/meow-rs/meow-rs) as tunnel checker — in one command:
+Subscriptions: `http://<host>:8080/sub/{id}` · admin panel:
+<http://127.0.0.1:8081/admin> (log in with the token).
+
+**Build from source instead?** Add `--build` to compile the images locally:
 
 ```bash
-cp .env.example .env   # set FUMOX_ADMIN__TOKEN
 docker compose up -d --build
+```
+
+or run the binaries without containers:
+
+```bash
+cargo build                 # tests: cargo test
+cargo run -p fumox-server   # subscription server + admin panel (http://127.0.0.1:8081/admin)
+cargo run -p fumox-probe    # proxy health-check daemon
 ```
 
 On Podman instead of Docker? [`docker/README.md`](./docker/README.md) deploys

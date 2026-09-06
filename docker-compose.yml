@@ -3,7 +3,9 @@
 #
 # Quick start:
 #   cp .env.example .env        # then set a real FUMOX_ADMIN__TOKEN
+#   docker compose up -d        # pull the published images and start
 #   docker compose up -d --build
+#                               # ...or build server + meow locally from source
 #   open http://127.0.0.1:8081/admin   # admin panel (login with the token)
 #
 # Services:
@@ -79,10 +81,10 @@ services:
     restart: unless-stopped
 
   meow:
-    # Local build (fumox-meow:local). To pull a prebuilt image instead,
-    # replace this `build:` block with image: ghcr.io/viktor45/fumox-meow:<tag>
-    # — it is published manually via .github/workflows/docker-meow.yml
-    # (MEOW_VERSION below only affects local builds).
+    # Same pattern as server: `up` pulls the published image, `up --build`
+    # rebuilds it locally and retags. The GHCR image is published manually
+    # via .github/workflows/docker-meow.yml; MEOW_VERSION below only affects
+    # local builds.
     build:
       context: ./docker/meow
       dockerfile: Dockerfile

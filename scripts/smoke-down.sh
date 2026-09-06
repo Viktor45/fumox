@@ -31,4 +31,4 @@ fi
 
 echo ">> tearing down the smoke stand: project=$SMOKE_PROJECT"
 "${COMPOSE[@]}" -p "$SMOKE_PROJECT" down --remove-orphans "${VOLUME_FLAGS[@]}"
-echo ">> done (images kept: ghcr.io/viktor45/fumox:latest, fumox-meow:local)"
+echo ">> done (images kept: ghcr.io/viktor45/fumox:latest, ghcr.io/viktor45/fumox-meow:latest)"

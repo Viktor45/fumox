@@ -3,7 +3,7 @@
 # только то, что нужно изменить. Каждый ключ имеет дефолт: файл можно урезать
 # до нужных секций или вовсе не создавать — сервис запустится «из коробки».
 # Переопределение через окружение: FUMOX_СЕКЦИЯ__КЛЮЧ, например
-# FUMOX_ADMIN__TOKEN=secret (двойное подчёркивание разделяет секции).
+# FUMOX_ADMIN__TOKEN=secret (двойное подчеркивание разделяет секции).
 #
 # Fumox — application configuration.
 # The file lists EVERY available key at its default value — change only what
@@ -43,7 +43,7 @@ retry_base_backoff_ms = 500     # экспоненциальный backoff от 
 # The built-in default is derived from the binary version (fumox/0.1.0 now):
 # remove the line to inherit it at compile time. Per-source headers win.
 user_agent = "fumox/0.1.0"
-# Семейство протоколов по умолчанию для загрузки источников: any | ipv4 | ipv6.
+# Семейство IP-протоколов по умолчанию для загрузки источников: any | ipv4 | ipv6.
 # Источник без своего ip_family наследует это значение. any — dual-stack:
 # первый IPv4-адрес, иначе IPv6. Выбранное семейство строгое: нет адреса
 # нужного семейства — загрузка с ошибкой. Переопределение:
@@ -61,8 +61,8 @@ ip_family = "any"
 # newly inserted unknown proxies per source refresh queued for priority checking (0 = off)
 refresh_check_limit = 50
 # Как поступать с живым прокси, исчезнувшим из выдачи источника.
-# false (дефолт): прокси остаётся за источником, пока проверки подтверждают,
-# что он жив; как только проверки завалят его — прокси сам уйдёт из базы.
+# false (дефолт): прокси остается за источником, пока проверки подтверждают,
+# что он жив; как только проверки завалят его — прокси сам уйдет из базы.
 # true: если у источника есть правила отбрасывания (drop) в pipeline, живой
 # прокси под таким правилом убирается уже на ближайшем обновлении.
 # What happens to an alive proxy that vanished from a source feed.
@@ -89,7 +89,7 @@ cache_max_entries = 16384     # кэш host→geo (moka) / host→geo cache (mok
 dns_timeout_secs = 5
 
 [admin]
-# Админка. Пустой token = админка отключена (отдаёт 404).
+# Админка. Пустой token = админка отключена (отдает 404).
 # Admin panel. An empty token disables the panel (it answers 404).
 enabled = true
 token = "change-me"
@@ -111,7 +111,7 @@ cycle_interval_secs = 60       # период цикла планировани�
 sample_size = 50              # случайная выборка прокси за цикл (без всплесков) / random proxy sample per cycle (no bursts)
 # Неудачных проверок подряд до карантина. Для нового прокси это T1-проверки
 # (приоритетная очередь, затем случайная выборка); провалы T2 считают в тот же
-# счётчик. Уменьшите значение, чтобы не тратить время T1 на мёртвые прокси.
+# счетчик. Уменьшите значение, чтобы не тратить время T1 на мертвые прокси.
 # Consecutive failed checks before quarantine. For a fresh proxy these are
 # T1 checks (priority queue, then the random sample); T2 failures count in
 # the same counter. Lower it to stop spending T1 time on dead proxies.
@@ -121,8 +121,8 @@ tls_timeout_secs = 10         # T1: TLS-handshake
 concurrency = 8
 heartbeat_interval_secs = 30  # meta-ключ probe_heartbeat для админки / probe_heartbeat meta key consumed by the admin panel
 # Второй шанс для прокси в карантине: повторная проверка в случайный момент
-# окна [12ч, 16ч) после карантина — окно задаётся как min + случайная
-# добавка от 0 до spread (UTC, момент фиксируется в базе на момент карантина).
+# окна [12ч, 16ч) после карантина — окно задается как min + случайная
+# добавка от 0 до spread (UTC, момент фиксируется в базе при карантине).
 # A quarantined proxy's second chance: rechecked at a random moment of the
 # [12h, 16h) window after quarantine — the window is min plus a random
 # addition from 0 to spread (UTC, the moment is fixed in the database when
@@ -147,8 +147,8 @@ queue_stale_days = 7
 retention_interval_secs = 86400   # период ротации истории / history rotation period
 
 [meow]
-# meow-rs — движок реальных туннельных проверок. Живёт как отдельный
-# системный сервис: Fumox им не управляет, только дёргает его REST API
+# meow-rs — движок реальных туннельных проверок. Живет как отдельный
+# системный сервис: Fumox им не управляет, только дергает его REST API
 # и перезагружает конфиг через PUT /configs.
 # meow-rs — the engine behind real tunnel checks. It runs as a separate
 # system service: Fumox does not manage it, it only calls its REST API
@@ -197,7 +197,7 @@ fetch_log_days = 30
 # Уровень консольных логов каждого процесса: error | warn | info | debug | trace.
 # Оба процесса читают этот файл, поэтому ключ свой у каждого: server — для
 # fumox-server, probe — для fumox-probe (probe на info пишет строку «probe
-# cycle done» каждый цикл; warn её убирает). Полные директивы EnvFilter в
+# cycle done» каждый цикл; warn ее убирает). Полные директивы EnvFilter в
 # RUST_LOG имеют приоритет над конфигом (например RUST_LOG=fumox_core=debug,info).
 # Console log level per process: error | warn | info | debug | trace. Both
 # processes read this file, so each has its own key: server for fumox-server,

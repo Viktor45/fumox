@@ -1,4 +1,4 @@
-# Quadlet (podman/systemd) — развёртывание Fumox без docker compose
+# Quadlet (podman/systemd) — развертывание Fumox без docker compose
 
 Эквиваленты `docker-compose.yml` в виде quadlet-юнитов: systemd управляет
 подом с тремя контейнерами (fumox-server, fumox-probe, meow-rs), как делал
@@ -9,7 +9,7 @@ compose. Два варианта на выбор:
 | `quadlet/` | `fumox.pod` + три `.container` + два `.volume` | Нативный способ quadlet — оптимален: явные юниты, точечные volume-монты, `Restart` на каждый контейнер, статус каждого сервиса отдельно |
 | `kube/`    | `fumox.kube` + `fumox-pod.yaml`                | Один манифест, близкий к k8s; удобно, если YAML уже привычнее                                                                           |
 
-Нужен podman ≥ 4.4 (лучше 5.x). По умолчанию всё описано для **rootless**
+Нужен podman ≥ 4.4 (лучше 5.x). По умолчанию все описано для **rootless**
 (рекомендуется); отличия для root — в конце.
 
 ## Подготовка (для обоих вариантов)
@@ -54,8 +54,8 @@ cp config/GeoLite2-*.mmdb ~/fumox/config/   # опционально: гео-о�
    systemctl --user start fumox-pod.service
    ```
 
-   Старт пода тянет все три контейнера (server после него — probe ждёт
-   миграцию БД, как `depends_on` в compose).
+   Старт пода поднимает все три контейнера (probe стартует после server и
+   ждет, пока тот мигрирует БД, — аналог `depends_on` в compose).
 
 3. Автостарт без активной сессии: `loginctl enable-linger $USER`.
 
@@ -84,7 +84,7 @@ compose). Логи: `journalctl --user -u fumox-server -u fumox-probe -u fumox-m
    ```
 
 PVC `fumox-data` и `meow-shared` при первом старте podman автоматически
-создаёт как именованные volume-ы (см. `podman volume ls`). Админ-порт
+создает как именованные volume-ы (см. `podman volume ls`). Админ-порт
 объявлен с `hostIP: 127.0.0.1` — после старта проверьте `podman port fumox`;
 старые podman (без поддержки `hostIP`) опубликуют 8081 на все интерфейсы —
 закройте его фаерволом или обновитесь.
@@ -92,7 +92,7 @@ PVC `fumox-data` и `meow-shared` при первом старте podman авт
 ## Отличия от docker compose
 
 - `FUMOX_MEOW__API_ADDR: meow:9090` → `127.0.0.1:9090`: в поде общий сетевой
-  namespace, DNS-имён сервисов нет. 9090 наружу не публикуется, как и в compose.
+  namespace, DNS-имен сервисов нет. 9090 наружу не публикуется, как и в compose.
 - Сборка образов — вручную (`podman build`), а не `compose up --build`.
 - Именованные volume-ы podman (`fumox-data`, `meow-shared`) — не те же
   хранилища, что у docker. Перенос БД из compose:

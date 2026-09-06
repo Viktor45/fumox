@@ -18,7 +18,7 @@ use crate::scheduler::SchedulerState;
 use askama::Template;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use fumox_core::config::{AdminConfig, MeowConfig, ProbeConfig, RetentionConfig};
+use fumox_core::config::{AdminConfig, IngestConfig, MeowConfig, ProbeConfig, RetentionConfig};
 use fumox_core::db::DbPool;
 use fumox_core::geo::GeoResolver;
 use i18n::Lang;
@@ -49,11 +49,12 @@ pub struct AdminState {
     /// Public subscription listener (`[server].bind`); its port builds the
     /// serve links shown on the source/profile cards.
     pub server_bind: SocketAddr,
-    /// Read-only probe/meow/retention settings shown on `/admin/probe`
-    /// (ADMIN_PLAN §4.5).
+    /// Read-only probe/meow/retention/ingest settings shown on
+    /// `/admin/probe` and `/admin/settings` (ADMIN_PLAN §4.5, §4.7).
     pub probe: ProbeConfig,
     pub meow: MeowConfig,
     pub retention: RetentionConfig,
+    pub ingest: IngestConfig,
     /// HMAC key for session cookies, derived from the admin token so that
     /// rotating the token revokes every existing session (ADMIN_PLAN §13.1).
     pub session_key: Vec<u8>,
@@ -110,6 +111,7 @@ impl AdminState {
             probe: config.probe.clone(),
             meow: config.meow.clone(),
             retention: config.retention.clone(),
+            ingest: config.ingest,
             session_key,
             csrf_key,
             login_limiter,
@@ -191,6 +193,7 @@ pub fn router(state: AdminState) -> axum::Router {
         )
         .route("/logs/fetch", get(handlers::fetch_logs))
         .route("/probe", get(handlers::probe_overview))
+        .route("/settings", get(handlers::settings_overview))
         .route("/stats", get(handlers::stats))
         // Pipeline builder widget (PIPELINE.md §3): server-side generation
         // and validation inside the same auth+CSRF envelope as every POST.
@@ -1040,7 +1043,7 @@ mod tests {
         // One quarantined proxy with a scheduled second chance.
         sqlx::query(
             "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
-                                  quarantined_at, second_chance_at, created_at, updated_at)
+                                  quarantined_at, ladder_at, created_at, updated_at)
              VALUES ('fp-q1', 'vless', 'sick-proxy', 'q.example.com', 443, 'c', 'quarantine',
                      ?, ?, 1, 1)",
         )
@@ -1069,6 +1072,46 @@ mod tests {
         assert!(html.contains("<time class=\"ts\" datetime=\""), "{html}");
         assert!(html.contains("Z\">"), "{html}");
         assert!(html.contains("</time>"), "{html}");
+    }
+
+    /// The settings screen renders every state-machine section with the
+    /// configured values and the restart banner (ADMIN_PLAN §4.7).
+    #[tokio::test]
+    async fn settings_screen_shows_effective_config_sections() {
+        let state = test_state(1000).await;
+        let probe = state.probe.clone();
+        let ingest = state.ingest.clone();
+        let meow = state.meow.clone();
+        let retention = state.retention.clone();
+        let app = router(state);
+        let cookie = login(&app).await;
+        let response = app
+            .oneshot(request("GET", "/admin/settings", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        // Owner-process badges and the config-file banner.
+        assert!(html.contains("config/app.toml"), "{html}");
+        assert!(html.contains("probe"), "{html}");
+        assert!(html.contains("server"), "{html}");
+        // The configured ladder renders as the localized sentence (the
+        // default UI language is Russian), including the second chance, the
+        // first delay and the terminal removal step.
+        assert!(html.contains("Второй шанс"), "{html}");
+        assert!(html.contains("15 мин"), "{html}");
+        assert!(html.contains("удаление"), "{html}");
+        // Sections exist.
+        for key_value in [
+            probe.fail_limit.to_string(),
+            probe.sample_size.to_string(),
+            ingest.refresh_check_limit.to_string(),
+            meow.backoff_max_secs.to_string(),
+            retention.probe_results_days.to_string(),
+        ] {
+            assert!(html.contains(&key_value), "missing {key_value}: {html}");
+        }
     }
 
     /// Two sources with proxies in every status plus probe history; the

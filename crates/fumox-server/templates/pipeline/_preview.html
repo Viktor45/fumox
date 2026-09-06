@@ -1,4 +1,4 @@
-{# Pipeline builder preview (PIPELINE.md §3): the target of
+{# Pipeline builder preview: the target of
    POST /admin/pipeline/preview. Shows the generated JSON and the verdict of
    the same validator the save path uses. #}
 {% match json %}
@@ -15,6 +15,7 @@
   {% endif %}
   {% when None %}
   {# "Empty" is the pass-through config: the stored field stays NULL and the
-     default rules (SPEC §5.1) apply. #}
+     built-in defaults apply — all protocols kept, parameters normalized,
+     quarantined/removed excluded, dedup by fingerprint. #}
   <div class="hint">{{ self.t("ped.preview_empty") }}</div>
 {% endmatch %}

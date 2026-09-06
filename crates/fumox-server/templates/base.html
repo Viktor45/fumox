@@ -17,6 +17,7 @@
       <a href="/admin/proxies" {% if active == "proxies" %}class="active"{% endif %}>{{ self.t("nav.proxies") }}</a>
       <a href="/admin/stats" {% if active == "stats" %}class="active"{% endif %}>{{ self.t("nav.stats") }}</a>
       <a href="/admin/probe" {% if active == "probe" %}class="active"{% endif %}>{{ self.t("nav.probe") }}</a>
+      <a href="/admin/settings" {% if active == "settings" %}class="active"{% endif %}>{{ self.t("nav.settings") }}</a>
       <a href="/admin/logs/fetch" {% if active == "logs" %}class="active"{% endif %}>{{ self.t("nav.logs") }}</a>
       <a href="/admin/import" {% if active == "import" %}class="active"{% endif %}>{{ self.t("nav.import") }}</a>
     </nav>
@@ -70,7 +71,7 @@
       setTimeout(function () { div.remove(); }, 4000);
     });
 
-    // SSE (ADMIN_PLAN §9): push updates from the server. Each event is
+    // SSE: push updates from the server. Each event is
     // re-broadcast on <body> as a namespaced DOM event so HTMX fragments
     // can react with hx-trigger="fumox:*". Polling fragments remain the
     // no-JS fallback — SSE is a pure enhancement.
@@ -98,7 +99,7 @@
       document.body.addEventListener('fumox:fetch.failed', refreshAfterFetch);
     })();
 
-    // Local time (ADMIN_PLAN §13.1, decision 22): the server emits every
+    // Local time: the server emits every
     // timestamp as <time class="ts" datetime="RFC3339 UTC">UTC text</time>.
     // The browser rewrites the text into the user's timezone, formatted in
     // the panel language (<html lang>) — without JS the UTC text stays.

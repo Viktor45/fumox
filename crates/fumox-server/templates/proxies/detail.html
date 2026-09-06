@@ -7,7 +7,8 @@
   <h1 class="mono">{{ proxy.scheme }}:// {{ proxy.host }}:{{ proxy.port }}</h1>
   <span id="status-badge"><span class="badge {{ proxy.status }}">{{ proxy.status }}</span></span>
   {# Unprobeable: UDP-based schemes the probe daemon cannot health-check
-     (tuic, mieru — SPEC §8.5); they stay `unknown` permanently. #}
+     (tuic, mieru — meow-rs cannot tunnel through them); they stay `unknown`
+     permanently. #}
   {% if unprobeable %}
     <span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">unprobeable</span>
   {% endif %}

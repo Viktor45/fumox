@@ -1,4 +1,5 @@
-# Fumox + meow-rs — one-command deployment (SPEC §8.2).
+# Fumox + meow-rs — one-command deployment: three containers (server, probe,
+# meow) wired through shared volumes and env overrides.
 #
 # Quick start:
 #   cp .env.example .env        # then set a real FUMOX_ADMIN__TOKEN

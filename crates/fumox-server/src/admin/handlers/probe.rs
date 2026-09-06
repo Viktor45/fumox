@@ -34,10 +34,9 @@ struct QuarantineRow {
     port: i64,
     scheme: String,
     quarantined_at: Option<i64>,
-    second_chance_at: Option<i64>,
-    recheck_15m_at: Option<i64>,
-    recheck_30m_at: Option<i64>,
-    recheck_1h_at: Option<i64>,
+    /// Next scheduled ladder check (0 = second chance, 1.. = recheck N).
+    ladder_at: Option<i64>,
+    ladder_step: i64,
 }
 
 /// Parsed `probe_heartbeat` meta value.
@@ -73,15 +72,20 @@ impl ProbeTemplate {
     fn proxy_total(&self) -> i64 {
         self.proxy_counts.iter().map(|(_, count)| count).sum()
     }
-    /// The next scheduled check for a quarantined proxy (the one non-NULL
-    /// schedule column).
+    /// The next scheduled check for a quarantined proxy.
     fn next_check(&self, row: &QuarantineRow) -> String {
-        let next = row
-            .recheck_15m_at
-            .or(row.recheck_30m_at)
-            .or(row.recheck_1h_at)
-            .or(row.second_chance_at);
-        fmt_opt_ts_element(next)
+        fmt_opt_ts_element(row.ladder_at)
+    }
+
+    /// Ladder step label: «второй шанс» or «повтор N» / "second chance" or
+    /// "recheck N".
+    fn step_label(&self, row: &QuarantineRow) -> String {
+        if row.ladder_step < 1 {
+            self.lang.t("probe.step_second_chance").to_string()
+        } else {
+            self.lang
+                .t_args("probe.step_recheck", &[row.ladder_step.to_string()])
+        }
     }
 }
 
@@ -127,11 +131,10 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
 
     // The 50 quarantined proxies with the nearest upcoming check.
     let queue: Vec<QuarantineRow> = match sqlx::query_as(
-        "SELECT id, name, host, port, scheme, quarantined_at, second_chance_at,
-                recheck_15m_at, recheck_30m_at, recheck_1h_at
+        "SELECT id, name, host, port, scheme, quarantined_at, ladder_at, ladder_step
          FROM proxies
          WHERE status = 'quarantine'
-         ORDER BY COALESCE(recheck_15m_at, recheck_30m_at, recheck_1h_at, second_chance_at, 0) ASC
+         ORDER BY COALESCE(ladder_at, 0) ASC
          LIMIT 50",
     )
     .fetch_all(pool)

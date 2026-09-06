@@ -1,4 +1,5 @@
-{#- Fragment: dry-run result of a source fetch (ADMIN_PLAN §13.11). -#}
+{#- Fragment: dry-run result of a test fetch, swapped in by
+    POST /admin/sources/{id}/dry-run. -#}
 <div class="panel" id="dryrun-result">
   {% if ok %}
     <p><span class="badge alive">{{ self.t("common.success") }}</span> {{ message }}</p>

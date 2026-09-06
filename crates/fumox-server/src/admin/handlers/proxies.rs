@@ -387,20 +387,12 @@ pub async fn proxy_detail(
             fmt_opt_ts_element(proxy.quarantined_at),
         ),
         (
-            lang.t("px.second_chance").into(),
-            fmt_opt_ts_element(proxy.second_chance_at),
-        ),
-        (
-            lang.t("px.recheck_15m").into(),
-            fmt_opt_ts_element(proxy.recheck_15m_at),
-        ),
-        (
-            lang.t("px.recheck_30m").into(),
-            fmt_opt_ts_element(proxy.recheck_30m_at),
-        ),
-        (
-            lang.t("px.recheck_1h").into(),
-            fmt_opt_ts_element(proxy.recheck_1h_at),
+            if proxy.ladder_step < 1 {
+                lang.t("probe.step_second_chance").to_string()
+            } else {
+                lang.t_args("probe.step_recheck", &[proxy.ladder_step.to_string()])
+            },
+            fmt_opt_ts_element(proxy.ladder_at),
         ),
         (
             lang.t("px.removed").into(),

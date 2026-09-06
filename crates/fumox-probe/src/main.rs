@@ -30,10 +30,6 @@ use fumox_core::repo::{fetch_log, meta_set, probe as probe_repo, proxies};
 use meow::{DelayOutcome, MeowClient};
 use tokio::sync::Semaphore;
 
-/// Initial and capped backoff applied when meow-rs stops responding.
-const MEOW_BACKOFF_INITIAL_SECS: i64 = 60;
-const MEOW_BACKOFF_MAX_SECS: i64 = 15 * 60;
-
 /// `probe_results.probe_kind` of the tunnel check (DATABASE.md).
 const T2_KIND: &str = "t2";
 
@@ -60,19 +56,22 @@ struct Context {
 impl Context {
     fn new(config: AppConfig, pool: DbPool) -> Self {
         let meow = MeowClient::new(&config.meow);
+        let backoff_initial =
+            i64::try_from(config.meow.backoff_initial_secs.max(1)).unwrap_or(i64::MAX);
         Self {
             pool,
             config,
             meow,
             meow_retry_at: AtomicI64::new(0),
-            meow_backoff_secs: AtomicI64::new(MEOW_BACKOFF_INITIAL_SECS),
+            meow_backoff_secs: AtomicI64::new(backoff_initial),
         }
     }
 
     /// Push the next T2 retry further into the future (capped exponential).
     fn backoff_meow(&self) {
         let backoff = self.meow_backoff_secs.load(Ordering::Relaxed);
-        let next = (backoff * 2).min(MEOW_BACKOFF_MAX_SECS);
+        let max = i64::try_from(self.config.meow.backoff_max_secs).unwrap_or(i64::MAX);
+        let next = (backoff * 2).min(max);
         self.meow_backoff_secs.store(next, Ordering::Relaxed);
         self.meow_retry_at
             .store(now_ts() + backoff, Ordering::Relaxed);
@@ -80,8 +79,9 @@ impl Context {
 
     /// meow-rs answered — clear the backoff.
     fn meow_recovered(&self) {
-        self.meow_backoff_secs
-            .store(MEOW_BACKOFF_INITIAL_SECS, Ordering::Relaxed);
+        let initial =
+            i64::try_from(self.config.meow.backoff_initial_secs.max(1)).unwrap_or(i64::MAX);
+        self.meow_backoff_secs.store(initial, Ordering::Relaxed);
         self.meow_retry_at.store(0, Ordering::Relaxed);
     }
 }
@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
         sample_size = config.probe.sample_size,
         fail_limit = config.probe.fail_limit,
         concurrency = config.probe.concurrency,
+        recheck_delays_secs = ?config.probe.recheck_delays_secs,
         "fumox-probe started"
     );
 
@@ -317,30 +318,32 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
             );
             continue;
         };
-        let stage = row.stage();
+        let step = row.ladder_step;
         let kind = t1::check_kind(scheme, row.params.as_deref());
+        let delays = ctx.config.probe.recheck_delays_secs.clone();
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
         tasks.spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("semaphore never closed");
-            perform_quarantine_check(&ctx, row.id, &row.host, port, kind, stage).await;
+            perform_quarantine_check(&ctx, row.id, &row.host, port, kind, step, &delays).await;
         });
     }
     Ok(collect_tasks(&mut tasks).await)
 }
 
 /// One quarantine re-check: success revives the proxy with a clean slate;
-/// failure advances the ladder (+15m/+30m/+1h) or removes the proxy after
-/// the third failed recheck (SPEC §8.3a steps 3–5).
+/// failure advances the configured ladder or removes the proxy after the
+/// last configured recheck failed (SPEC §8.3a steps 3–5).
 async fn perform_quarantine_check(
     ctx: &Context,
     id: i64,
     host: &str,
     port: u16,
     kind: t1::CheckKind,
-    stage: proxies::QuarantineStage,
+    step: i64,
+    delays: &[i64],
 ) {
     let connect_timeout = Duration::from_secs(ctx.config.probe.connect_timeout_secs.max(1));
     let tls_timeout = Duration::from_secs(ctx.config.probe.tls_timeout_secs.max(1));
@@ -363,7 +366,7 @@ async fn perform_quarantine_check(
             )
             .await;
             match proxies::check_succeeded(&ctx.pool, id, now, Some(latency), true).await {
-                Ok(_) => tracing::info!(id, ?stage, "quarantined proxy revived"),
+                Ok(_) => tracing::info!(id, step, "quarantined proxy revived"),
                 Err(error) => tracing::warn!(id, %error, "failed to record quarantine success"),
             }
         }
@@ -380,11 +383,11 @@ async fn perform_quarantine_check(
                 },
             )
             .await;
-            match proxies::quarantine_check_failed(&ctx.pool, id, now, stage).await {
+            match proxies::quarantine_check_failed(&ctx.pool, id, now, step, delays).await {
                 Ok(proxies::Transition::Removed) => {
-                    tracing::info!(id, "proxy removed after three failed rechecks")
+                    tracing::info!(id, "proxy removed after the final failed recheck")
                 }
-                Ok(_) => tracing::debug!(id, ?stage, "quarantine recheck failed, ladder advanced"),
+                Ok(_) => tracing::debug!(id, step, "quarantine recheck failed, ladder advanced"),
                 Err(error) => tracing::warn!(id, %error, "failed to advance quarantine ladder"),
             }
         }
@@ -582,13 +585,14 @@ async fn run_retention(ctx: &Context) {
         Err(error) => tracing::warn!(%error, "fetch_log rotation failed"),
     }
     // Priority queue housekeeping (SPEC §8.3): requests whose proxy already
-    // left `unknown`, and week-old leftovers from an offline probe.
+    // left `unknown`, and stale leftovers from an offline probe.
     match probe_repo::purge_settled_checks(&ctx.pool).await {
         Ok(0) => {}
         Ok(deleted) => tracing::debug!(deleted, "dropped settled probe_requests"),
         Err(error) => tracing::warn!(%error, "probe_requests cleanup failed"),
     }
-    let queue_cutoff = now - 7 * 86_400;
+    let stale_days = ctx.config.probe.queue_stale_days.max(1) as i64;
+    let queue_cutoff = now - stale_days * 86_400;
     match probe_repo::purge_requests_before(&ctx.pool, queue_cutoff).await {
         Ok(0) => {}
         Ok(deleted) => tracing::info!(deleted, "rotated stale probe_requests"),
@@ -719,6 +723,9 @@ mod tests {
                 // Deterministic second chance: exactly +24h, no jitter.
                 second_chance_min_hours: 24,
                 second_chance_spread_hours: 0,
+                // Default ladder: +15m, +30m, +1h.
+                recheck_delays_secs: vec![900, 1800, 3600],
+                queue_stale_days: 7,
                 retention_interval_secs: 86400,
             },
             meow: fumox_core::config::MeowConfig {
@@ -726,6 +733,8 @@ mod tests {
                 config_path: meow_config,
                 test_url: vec!["http://cp.cloudflare.com".to_string()],
                 timeout_secs: 3,
+                backoff_initial_secs: 60,
+                backoff_max_secs: 900,
             },
             ..Default::default()
         }
@@ -781,7 +790,8 @@ mod tests {
         assert_eq!(row.status, "quarantine");
         assert_eq!(row.fail_count, 2);
         let quarantined_at = row.quarantined_at.unwrap();
-        assert_eq!(row.second_chance_at, Some(quarantined_at + 86_400));
+        assert_eq!(row.ladder_at, Some(quarantined_at + 86_400));
+        assert_eq!(row.ladder_step, 0);
 
         // The live proxy stayed alive through both cycles, and every attempt
         // was journaled.
@@ -975,7 +985,7 @@ mod tests {
         let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
         assert_eq!(row.status, "quarantine");
         assert_eq!(row.fail_count, 3);
-        assert!(row.second_chance_at.is_some());
+        assert!(row.ladder_at.is_some());
 
         // Quarantined rows are sampled by nothing (T1 takes unknown/alive,
         // T2 takes alive; the second chance is ~24h out): further cycles
@@ -996,7 +1006,7 @@ mod tests {
         let id = seed_proxy(&pool, "vless", "127.0.0.1", dead_port, "quarantine").await;
 
         // Second chance already due (in the past).
-        sqlx::query("UPDATE proxies SET quarantined_at = 100, second_chance_at = 200 WHERE id = ?")
+        sqlx::query("UPDATE proxies SET quarantined_at = 100, ladder_at = 200, ladder_step = 0 WHERE id = ?")
             .bind(id)
             .execute(&pool)
             .await
@@ -1014,8 +1024,9 @@ mod tests {
         run_cycle(ctx.clone()).await.unwrap();
         let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "quarantine");
-        assert!(row.recheck_15m_at.is_some());
-        sqlx::query("UPDATE proxies SET recheck_15m_at = 300 WHERE id = ?")
+        assert_eq!(row.ladder_step, 1);
+        assert!(row.ladder_at.is_some());
+        sqlx::query("UPDATE proxies SET ladder_at = 300 WHERE id = ?")
             .bind(id)
             .execute(&pool)
             .await
@@ -1023,8 +1034,8 @@ mod tests {
 
         run_cycle(ctx.clone()).await.unwrap();
         let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert!(row.recheck_30m_at.is_some());
-        sqlx::query("UPDATE proxies SET recheck_30m_at = 400 WHERE id = ?")
+        assert_eq!(row.ladder_step, 2);
+        sqlx::query("UPDATE proxies SET ladder_at = 400 WHERE id = ?")
             .bind(id)
             .execute(&pool)
             .await
@@ -1032,8 +1043,8 @@ mod tests {
 
         run_cycle(ctx.clone()).await.unwrap();
         let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert!(row.recheck_1h_at.is_some());
-        sqlx::query("UPDATE proxies SET recheck_1h_at = 500 WHERE id = ?")
+        assert_eq!(row.ladder_step, 3);
+        sqlx::query("UPDATE proxies SET ladder_at = 500 WHERE id = ?")
             .bind(id)
             .execute(&pool)
             .await

@@ -119,6 +119,7 @@ mod tests {
             "idx_probe_proxy_time",
             "idx_probe_time",
             "idx_probe_requests_time",
+            "idx_proxies_ladder",
             "idx_speed_proxy_time",
             "idx_fetch_source_time",
             "idx_fetch_time",
@@ -128,7 +129,7 @@ mod tests {
 
         // Schema version is stamped into meta by db::migrate.
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("4"));
+        assert_eq!(version.as_deref(), Some("5"));
 
         // WAL is active on the connection.
         let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")
@@ -136,5 +137,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journal_mode, "wal");
+    }
+
+    /// Migration 0005 must carry the old fixed-ladder schedule over to the
+    /// generic `ladder_at`/`ladder_step` columns: every quarantined row
+    /// keeps its scheduled moment and its ladder position, and the old
+    /// columns are gone afterwards.
+    #[tokio::test]
+    async fn migration_0005_preserves_quarantine_ladder_schedule() {
+        use sqlx::migrate::Migrator;
+        static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+        let dir = std::env::temp_dir().join(format!("fumox-mig-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        };
+        let pool = db::connect_pool(&cfg).await.unwrap();
+
+        // Apply the pre-ladder schema (0001..0004) by hand, without the
+        // migration stamping, so 0005 can be applied separately below.
+        for migration in MIGRATOR.migrations.iter().filter(|m| m.version <= 4) {
+            sqlx::raw_sql(migration.sql.clone())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // Quarantined rows on every old schedule column, plus an alive row
+        // without any schedule.
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, host, port, status,
+                                  quarantined_at, second_chance_at, created_at, updated_at)
+             VALUES ('fp-sc', 'vless', 'sc.example.com', 443, 'quarantine', 1500, 9000, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, host, port, status,
+                                  quarantined_at, recheck_15m_at, created_at, updated_at)
+             VALUES ('fp-r15', 'vless', 'r15.example.com', 443, 'quarantine', 1500, 2400, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, host, port, status,
+                                  quarantined_at, recheck_30m_at, created_at, updated_at)
+             VALUES ('fp-r30', 'vless', 'r30.example.com', 443, 'quarantine', 1500, 3300, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, host, port, status,
+                                  quarantined_at, recheck_1h_at, created_at, updated_at)
+             VALUES ('fp-r1h', 'vless', 'r1h.example.com', 443, 'quarantine', 1500, 5100, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, host, port, status, created_at, updated_at)
+             VALUES ('fp-alive', 'vless', 'alive.example.com', 443, 'alive', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fifth = MIGRATOR
+            .migrations
+            .iter()
+            .find(|m| m.version == 5)
+            .expect("migration 0005 missing");
+        sqlx::raw_sql(fifth.sql.clone())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT fingerprint, ladder_at, ladder_step FROM proxies ORDER BY fingerprint",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let by_fp: std::collections::HashMap<String, (Option<i64>, i64)> = rows
+            .into_iter()
+            .map(|(fp, at, step)| (fp, (at, step)))
+            .collect();
+        // second_chance_at → step 0; each recheck column → its step index.
+        assert_eq!(by_fp["fp-sc"], (Some(9000), 0));
+        assert_eq!(by_fp["fp-r15"], (Some(2400), 1));
+        assert_eq!(by_fp["fp-r30"], (Some(3300), 2));
+        assert_eq!(by_fp["fp-r1h"], (Some(5100), 3));
+        assert_eq!(by_fp["fp-alive"], (None, 0));
+
+        // The old columns are dropped.
+        assert!(
+            sqlx::query("SELECT second_chance_at FROM proxies")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

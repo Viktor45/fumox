@@ -1,4 +1,4 @@
-{# Pipeline widget (PIPELINE.md §3): the mode switch (builder ⇄ raw), the
+{# Pipeline widget: the mode switch (builder ⇄ raw), the
    presets, the builder fields with their live preview — or the raw JSON
    textarea. Rendered by the editor module into the source/profile forms and
    swapped by POST /admin/pipeline/mode and /admin/pipeline/preset (htmx
@@ -54,8 +54,8 @@
 {% if profile %}
 {# The tri-state hint (ped.tri_state_hint) explains section override
    semantics in user-facing words; the merge rule itself is
-   `pipeline::merge_configs` — top-level sections replace the source's
-   (SPEC §5.1). #}
+   `pipeline::merge_configs` — the profile's top-level sections replace the
+   source's, absent sections pass the source's rules through unchanged. #}
 <div class="hint">{{ self.t("ped.tri_state_hint") }}</div>
 {% endif %}
 {% match error %}

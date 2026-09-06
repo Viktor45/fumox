@@ -62,7 +62,7 @@
         <thead>
           <tr>
             <th>{{ self.t("nav.proxies") }}</th><th>{{ self.t("probe.scheme") }}</th><th>{{ self.t("px.quarantined_since") }}</th>
-            <th>{{ self.t("px.second_chance") }}</th><th class="col-optional">{{ self.t("probe.col_15m") }}</th><th class="col-optional">{{ self.t("probe.col_30m") }}</th><th class="col-optional">{{ self.t("probe.col_1h") }}</th><th>{{ self.t("probe.next_check") }}</th>
+            <th>{{ self.t("probe.ladder_step") }}</th><th>{{ self.t("probe.next_check") }}</th>
           </tr>
         </thead>
         <tbody>
@@ -72,10 +72,7 @@
                 <span class="small muted">{{ row.host }}:{{ row.port }}</span></td>
             <td class="mono small">{{ row.scheme }}</td>
             <td class="small muted">{{ self.opt_ts(&row.quarantined_at) | safe }}</td>
-            <td class="small muted">{{ self.opt_ts(&row.second_chance_at) | safe }}</td>
-            <td class="small muted col-optional">{{ self.opt_ts(&row.recheck_15m_at) | safe }}</td>
-            <td class="small muted col-optional">{{ self.opt_ts(&row.recheck_30m_at) | safe }}</td>
-            <td class="small muted col-optional">{{ self.opt_ts(&row.recheck_1h_at) | safe }}</td>
+            <td class="small muted">{{ self.step_label(&row) }}</td>
             <td class="small">{{ self.next_check(&row) | safe }}</td>
           </tr>
           {% endfor %}

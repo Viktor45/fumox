@@ -257,7 +257,7 @@ pub async fn stats(State(state): State<AdminState>, headers: HeaderMap) -> Respo
     let (in_quarantine, quarantine_second_chance, never_checked): (i64, i64, i64) =
         match sqlx::query_as(
             "SELECT COALESCE(SUM(status = 'quarantine'), 0),
-                    COALESCE(SUM(status = 'quarantine' AND second_chance_at IS NOT NULL), 0),
+                    COALESCE(SUM(status = 'quarantine' AND ladder_step = 0), 0),
                     COALESCE(SUM(last_checked_at IS NULL), 0)
              FROM proxies WHERE status != 'removed'",
         )

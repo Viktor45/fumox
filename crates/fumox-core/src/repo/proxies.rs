@@ -85,10 +85,11 @@ pub struct ProxyRow {
     pub last_checked_at: Option<i64>,
     pub last_alive_at: Option<i64>,
     pub quarantined_at: Option<i64>,
-    pub second_chance_at: Option<i64>,
-    pub recheck_15m_at: Option<i64>,
-    pub recheck_30m_at: Option<i64>,
-    pub recheck_1h_at: Option<i64>,
+    /// Next scheduled quarantine check (NULL outside `quarantine`).
+    pub ladder_at: Option<i64>,
+    /// Which ladder step the row waits on: 0 = second chance, `1..` = the
+    /// Nth recheck (delays from `[probe] recheck_delays_secs`).
+    pub ladder_step: i64,
     pub removed_at: Option<i64>,
     pub latency_ms: Option<i64>,
     pub speed_mbps: Option<f64>,
@@ -498,10 +499,8 @@ pub async fn reset_status(pool: &DbPool, id: i64) -> crate::Result<bool> {
              status = 'unknown',
              fail_count = 0,
              quarantined_at = NULL,
-             second_chance_at = NULL,
-             recheck_15m_at = NULL,
-             recheck_30m_at = NULL,
-             recheck_1h_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
              removed_at = NULL,
              updated_at = ?
          WHERE id = ?",
@@ -583,24 +582,13 @@ pub async fn purge_removed(pool: &DbPool) -> crate::Result<u64> {
 // makes the daemon restart-safe and idempotent.
 // ---------------------------------------------------------------------------
 
-/// Recheck ladder steps after a failed second chance (SPEC §8.3a), seconds.
-pub const RECHECK_15M_SECS: i64 = 15 * 60;
-pub const RECHECK_30M_SECS: i64 = 30 * 60;
-pub const RECHECK_1H_SECS: i64 = 60 * 60;
-
-/// Which scheduled quarantine check is due for a row (SPEC §8.3a ladder).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuarantineStage {
-    /// The initial second chance inside the `[24h, 48h)` window.
-    SecondChance,
-    /// First recheck, 15 minutes after the second chance failed.
-    Recheck15m,
-    /// Second recheck, 30 minutes after the previous failure.
-    Recheck30m,
-    /// Final recheck, 1 hour after the previous failure; failing it removes
-    /// the proxy.
-    Recheck1h,
-}
+// The quarantine schedule is a generic ladder (SPEC §8.3a): step 0 is the
+// second chance inside the `[24h, 48h)` window after quarantining, steps
+// `1..=N` are the consecutive rechecks whose delays come from
+// `[probe] recheck_delays_secs` (default 15m / 30m / 1h). The failed step
+// number travels with the row in `ladder_step`; `ladder_at` holds the
+// moment the next check fires. Failing step `k` schedules `delays[k]` —
+// or, past the end of the configured delays, removes the proxy.
 
 /// Minimal row needed to run a T1 connectivity check.
 #[derive(Debug, Clone, FromRow)]
@@ -621,19 +609,8 @@ pub struct DueQuarantine {
     pub host: String,
     pub port: i64,
     pub params: Option<String>,
-    /// Which scheduled check fired, derived from which `*_at` column matched.
-    pub stage: String,
-}
-
-impl DueQuarantine {
-    pub fn stage(&self) -> QuarantineStage {
-        match self.stage.as_str() {
-            "recheck_15m" => QuarantineStage::Recheck15m,
-            "recheck_30m" => QuarantineStage::Recheck30m,
-            "recheck_1h" => QuarantineStage::Recheck1h,
-            _ => QuarantineStage::SecondChance,
-        }
-    }
+    /// The ladder step this row is waiting on (0 = second chance).
+    pub ladder_step: i64,
 }
 
 /// Result of applying a check outcome to the lifecycle.
@@ -683,16 +660,18 @@ pub async fn select_t1_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
     Ok(query.fetch_all(pool).await?)
 }
 
-/// Random sample of `alive` proxies eligible for a T2 tunnel check through
-/// meow-rs (SPEC §8.2). T2 verifies real tunnel + credentials, so only
-/// proxies that already passed T1 are sampled. tuic/mieru are excluded —
-/// meow-rs cannot tunnel them (SPEC §8.5); hysteria2 is included (QUIC is
-/// fine at T2, it only skips T1).
+/// Random sample of proxies eligible for a T2 tunnel check through
+/// meow-rs (SPEC §8.2): every `alive` proxy (T2 re-verifies the tunnel),
+/// plus `unknown` hysteria2 — hysteria2 is excluded from T1 by design (a
+/// TCP connect to a QUIC port proves nothing, SPEC §8.5), so T2 is its
+/// first and only check; a failure counts through the regular `fail_limit`,
+/// it does not quarantine straight away. tuic/mieru are excluded — meow-rs
+/// cannot tunnel them (SPEC §8.5).
 pub async fn select_t2_candidates(pool: &DbPool, limit: u32) -> crate::Result<Vec<ProxyRow>> {
     let rows: Vec<ProxyRow> = sqlx::query_as(
         "SELECT p.*
          FROM proxies p
-         WHERE p.status = 'alive'
+         WHERE (p.status = 'alive' OR (p.status = 'unknown' AND p.scheme = 'hysteria2'))
            AND p.scheme NOT IN ('tuic', 'mieru')
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
          ORDER BY RANDOM()
@@ -703,38 +682,22 @@ pub async fn select_t2_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
     .await?;
     Ok(rows)
 }
-/// the recheck ladder steps) is due at `now` (SPEC §8.3a).
-///
-/// Exactly one of the schedule columns is non-NULL at any time — each
-/// transition clears the previous schedule before writing the next — so the
-/// four branches are mutually exclusive and the derived stage is unambiguous.
+/// the recheck ladder) is due at `now` (SPEC §8.3a): every `quarantine` row
+/// carries exactly one `ladder_at` (NULL only while a check is in flight),
+/// so a single comparison suffices and the failed step travels in
+/// `ladder_step`.
 pub async fn select_due_quarantine(
     pool: &DbPool,
     now: i64,
     limit: u32,
 ) -> crate::Result<Vec<DueQuarantine>> {
     let rows: Vec<DueQuarantine> = sqlx::query_as(
-        "SELECT id, scheme, host, port, params,
-                CASE
-                    WHEN recheck_1h_at IS NOT NULL THEN 'recheck_1h'
-                    WHEN recheck_30m_at IS NOT NULL THEN 'recheck_30m'
-                    WHEN recheck_15m_at IS NOT NULL THEN 'recheck_15m'
-                    ELSE 'second_chance'
-                END AS stage
+        "SELECT id, scheme, host, port, params, ladder_step
          FROM proxies
-         WHERE status = 'quarantine'
-           AND (
-               (second_chance_at IS NOT NULL AND second_chance_at <= ?)
-               OR (recheck_15m_at IS NOT NULL AND recheck_15m_at <= ?)
-               OR (recheck_30m_at IS NOT NULL AND recheck_30m_at <= ?)
-               OR (recheck_1h_at IS NOT NULL AND recheck_1h_at <= ?)
-           )
+         WHERE status = 'quarantine' AND ladder_at IS NOT NULL AND ladder_at <= ?
          ORDER BY RANDOM()
          LIMIT ?",
     )
-    .bind(now)
-    .bind(now)
-    .bind(now)
     .bind(now)
     .bind(i64::from(limit))
     .fetch_all(pool)
@@ -773,10 +736,8 @@ pub async fn check_succeeded(
              last_alive_at = ?,
              latency_ms = COALESCE(?, latency_ms),
              quarantined_at = NULL,
-             second_chance_at = NULL,
-             recheck_15m_at = NULL,
-             recheck_30m_at = NULL,
-             recheck_1h_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
              updated_at = ?
          WHERE id = ? AND status != 'removed'",
     )
@@ -839,7 +800,8 @@ pub async fn check_failed(
                  fail_count = ?,
                  last_checked_at = ?,
                  quarantined_at = ?,
-                 second_chance_at = ?,
+                 ladder_at = ?,
+                 ladder_step = 0,
                  updated_at = ?
              WHERE id = ?",
         )
@@ -870,32 +832,23 @@ pub async fn check_failed(
 /// Apply a failed quarantine check (second chance or a recheck ladder step).
 ///
 /// The ladder is always scheduled relative to the moment of the failure that
-/// triggered it (SPEC §8.3a step 4): +15m after the second chance, +30m
-/// after the first recheck, +1h after the second. Failing the third recheck
-/// removes the proxy (SPEC §8.3a step 5).
+/// triggered it (SPEC §8.3a step 4): failing step `k` schedules the next
+/// check at `now + delays[k]` — step 0 is the second chance, steps `1..`
+/// are the rechecks. Failing the last configured step (or an empty
+/// `delays` on the second chance) removes the proxy (SPEC §8.3a step 5).
+/// The delays come from `[probe] recheck_delays_secs` (default
+/// 15m / 30m / 1h).
 pub async fn quarantine_check_failed(
     pool: &DbPool,
     id: i64,
     now: i64,
-    stage: QuarantineStage,
+    step: i64,
+    delays: &[i64],
 ) -> crate::Result<Transition> {
-    let (transition, next_at, next_column) = match stage {
-        QuarantineStage::SecondChance => (
-            Transition::Unchanged,
-            now + RECHECK_15M_SECS,
-            "recheck_15m_at",
-        ),
-        QuarantineStage::Recheck15m => (
-            Transition::Unchanged,
-            now + RECHECK_30M_SECS,
-            "recheck_30m_at",
-        ),
-        QuarantineStage::Recheck30m => (
-            Transition::Unchanged,
-            now + RECHECK_1H_SECS,
-            "recheck_1h_at",
-        ),
-        QuarantineStage::Recheck1h => (Transition::Removed, 0, ""),
+    let next_delay = delays.get(step.max(0) as usize).copied();
+    let (transition, next_at) = match next_delay {
+        Some(delay) => (Transition::Unchanged, now + delay.max(0)),
+        None => (Transition::Removed, 0),
     };
 
     if transition == Transition::Removed {
@@ -904,10 +857,8 @@ pub async fn quarantine_check_failed(
                  status = 'removed',
                  last_checked_at = ?,
                  removed_at = ?,
-                 second_chance_at = NULL,
-                 recheck_15m_at = NULL,
-                 recheck_30m_at = NULL,
-                 recheck_1h_at = NULL,
+                 ladder_at = NULL,
+                 ladder_step = 0,
                  updated_at = ?
              WHERE id = ? AND status = 'quarantine'",
         )
@@ -920,25 +871,21 @@ pub async fn quarantine_check_failed(
         return Ok(Transition::Removed);
     }
 
-    // Column name comes from the fixed match above, never from user input.
-    let sql = format!(
+    sqlx::query(
         "UPDATE proxies SET
              last_checked_at = ?,
-             second_chance_at = NULL,
-             recheck_15m_at = NULL,
-             recheck_30m_at = NULL,
-             recheck_1h_at = NULL,
-             {next_column} = ?,
+             ladder_at = ?,
+             ladder_step = ?,
              updated_at = ?
-         WHERE id = ? AND status = 'quarantine'"
-    );
-    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-        .bind(now)
-        .bind(next_at)
-        .bind(now)
-        .bind(id)
-        .execute(pool)
-        .await?;
+         WHERE id = ? AND status = 'quarantine'",
+    )
+    .bind(now)
+    .bind(next_at)
+    .bind(step + 1)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(transition)
 }
 
@@ -1342,8 +1289,7 @@ mod tests {
         let fp = e.fingerprint();
         sqlx::query(
             "UPDATE proxies SET status = 'quarantine', fail_count = 3,
-                quarantined_at = 1500, second_chance_at = 9000,
-                recheck_15m_at = 2400, recheck_30m_at = 3300, recheck_1h_at = 5100
+                quarantined_at = 1500, ladder_at = 9000, ladder_step = 2
              WHERE fingerprint = ?",
         )
         .bind(&fp)
@@ -1367,10 +1313,8 @@ mod tests {
         assert_eq!(row.status, "quarantine");
         assert_eq!(row.fail_count, 3);
         assert_eq!(row.quarantined_at, Some(1500));
-        assert_eq!(row.second_chance_at, Some(9000));
-        assert_eq!(row.recheck_15m_at, Some(2400));
-        assert_eq!(row.recheck_30m_at, Some(3300));
-        assert_eq!(row.recheck_1h_at, Some(5100));
+        assert_eq!(row.ladder_at, Some(9000));
+        assert_eq!(row.ladder_step, 2);
     }
 
     #[tokio::test]
@@ -1745,10 +1689,11 @@ mod tests {
         assert_eq!(row.status, "quarantine");
         assert_eq!(row.fail_count, 3);
         assert_eq!(row.quarantined_at, Some(now));
-        // second_chance_at ∈ [now + 24h, now + 48h)
-        let sc = row.second_chance_at.unwrap();
+        // ladder_at ∈ [now + 24h, now + 48h), waiting on step 0.
+        let sc = row.ladder_at.unwrap();
         assert!(sc >= now + 86_400, "second chance too early: {sc}");
         assert!(sc < now + 2 * 86_400, "second chance too late: {sc}");
+        assert_eq!(row.ladder_step, 0);
         assert_eq!(row.removed_at, None);
     }
 
@@ -1772,7 +1717,8 @@ mod tests {
         assert_eq!(row.status, "alive");
         assert_eq!(row.fail_count, 0);
         assert_eq!(row.quarantined_at, None);
-        assert_eq!(row.second_chance_at, None);
+        assert_eq!(row.ladder_at, None);
+        assert_eq!(row.ladder_step, 0);
         assert_eq!(row.last_alive_at, Some(90_000));
     }
 
@@ -1783,45 +1729,113 @@ mod tests {
         for t in [10, 20, 30] {
             check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
         }
+        // The default ladder: three rechecks after the second chance.
+        let delays = [900i64, 1800, 3600];
 
-        // Second chance fails → recheck in 15 minutes from the failure.
+        // Second chance (step 0) fails → recheck in 15 minutes from the
+        // failure, now on step 1.
         let t = 90_000i64;
-        let transition = quarantine_check_failed(&pool, id, t, QuarantineStage::SecondChance)
+        let transition = quarantine_check_failed(&pool, id, t, 0, &delays)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Unchanged);
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.second_chance_at, None);
-        assert_eq!(row.recheck_15m_at, Some(t + RECHECK_15M_SECS));
+        assert_eq!(row.ladder_at, Some(t + delays[0]));
+        assert_eq!(row.ladder_step, 1);
 
-        // First recheck fails → +30m from this failure.
-        let t = t + RECHECK_15M_SECS;
-        quarantine_check_failed(&pool, id, t, QuarantineStage::Recheck15m)
+        // First recheck fails → +30m from this failure, step 2.
+        let t = t + delays[0];
+        quarantine_check_failed(&pool, id, t, 1, &delays)
             .await
             .unwrap();
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.recheck_15m_at, None);
-        assert_eq!(row.recheck_30m_at, Some(t + RECHECK_30M_SECS));
+        assert_eq!(row.ladder_at, Some(t + delays[1]));
+        assert_eq!(row.ladder_step, 2);
 
-        // Second recheck fails → +1h from this failure.
-        let t = t + RECHECK_30M_SECS;
-        quarantine_check_failed(&pool, id, t, QuarantineStage::Recheck30m)
+        // Second recheck fails → +1h from this failure, step 3.
+        let t = t + delays[1];
+        quarantine_check_failed(&pool, id, t, 2, &delays)
             .await
             .unwrap();
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.recheck_30m_at, None);
-        assert_eq!(row.recheck_1h_at, Some(t + RECHECK_1H_SECS));
+        assert_eq!(row.ladder_at, Some(t + delays[2]));
+        assert_eq!(row.ladder_step, 3);
 
-        // Final recheck fails → removed.
-        let t = t + RECHECK_1H_SECS;
-        let transition = quarantine_check_failed(&pool, id, t, QuarantineStage::Recheck1h)
+        // Final recheck fails → past the end of the delays: removed.
+        let t = t + delays[2];
+        let transition = quarantine_check_failed(&pool, id, t, 3, &delays)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Removed);
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "removed");
         assert_eq!(row.removed_at, Some(t));
-        assert_eq!(row.recheck_1h_at, None);
+        assert_eq!(row.ladder_at, None);
+    }
+
+    /// The ladder length follows `recheck_delays_secs`: an empty list
+    /// removes right after the failed second chance, a single entry after
+    /// one recheck, a longer list simply extends the walk.
+    #[tokio::test]
+    async fn ladder_length_follows_configured_delays() {
+        let pool = temp_pool().await;
+
+        // Empty ladder: the failed second chance removes immediately.
+        let id = seed_proxy(&pool, "vless", "empty.example.com").await;
+        for t in [10, 20, 30] {
+            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+        }
+        let transition = quarantine_check_failed(&pool, id, 100, 0, &[])
+            .await
+            .unwrap();
+        assert_eq!(transition, Transition::Removed);
+        assert_eq!(
+            get_by_id(&pool, id).await.unwrap().unwrap().status,
+            "removed"
+        );
+
+        // One recheck: second chance → recheck → removed.
+        let id = seed_proxy(&pool, "vless", "one.example.com").await;
+        for t in [10, 20, 30] {
+            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+        }
+        assert_eq!(
+            quarantine_check_failed(&pool, id, 100, 0, &[600])
+                .await
+                .unwrap(),
+            Transition::Unchanged
+        );
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!((row.ladder_at, row.ladder_step), (Some(700), 1));
+        assert_eq!(
+            quarantine_check_failed(&pool, id, 700, 1, &[600])
+                .await
+                .unwrap(),
+            Transition::Removed
+        );
+
+        // Four rechecks: the walk goes through step 4 before removal.
+        let id = seed_proxy(&pool, "vless", "four.example.com").await;
+        for t in [10, 20, 30] {
+            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+        }
+        let delays = [60i64; 4];
+        for step in 0..4i64 {
+            assert_eq!(
+                quarantine_check_failed(&pool, id, 1000 + step, step, &delays)
+                    .await
+                    .unwrap(),
+                Transition::Unchanged
+            );
+            let row = get_by_id(&pool, id).await.unwrap().unwrap();
+            assert_eq!(row.ladder_step, step + 1);
+        }
+        assert_eq!(
+            quarantine_check_failed(&pool, id, 2000, 4, &delays)
+                .await
+                .unwrap(),
+            Transition::Removed
+        );
     }
 
     #[tokio::test]
@@ -1831,22 +1845,22 @@ mod tests {
         for t in [10, 20, 30] {
             check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
         }
-        quarantine_check_failed(&pool, id, 90_000, QuarantineStage::SecondChance)
+        quarantine_check_failed(&pool, id, 90_000, 0, &[900])
             .await
             .unwrap();
 
-        // The 15-minute recheck succeeds → alive again.
-        let transition = check_succeeded(&pool, id, 90_000 + RECHECK_15M_SECS, None, true)
+        // The first recheck succeeds → alive again.
+        let transition = check_succeeded(&pool, id, 90_000 + 900, None, true)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Revived);
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "alive");
-        assert_eq!(row.recheck_15m_at, None);
+        assert_eq!(row.ladder_at, None);
     }
 
     #[tokio::test]
-    async fn due_quarantine_selection_respects_schedule_and_stage() {
+    async fn due_quarantine_selection_respects_schedule_and_step() {
         let pool = temp_pool().await;
         let early = seed_proxy(&pool, "vless", "early.example.com").await;
         let late = seed_proxy(&pool, "vless", "late.example.com").await;
@@ -1854,7 +1868,7 @@ mod tests {
 
         // early: second chance already due; late: still sleeping.
         sqlx::query(
-            "UPDATE proxies SET status = 'quarantine', quarantined_at = 0, second_chance_at = ? WHERE id = ?",
+            "UPDATE proxies SET status = 'quarantine', quarantined_at = 0, ladder_at = ?, ladder_step = 0 WHERE id = ?",
         )
         .bind(1_000i64)
         .bind(early)
@@ -1862,16 +1876,16 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "UPDATE proxies SET status = 'quarantine', quarantined_at = 0, second_chance_at = ? WHERE id = ?",
+            "UPDATE proxies SET status = 'quarantine', quarantined_at = 0, ladder_at = ?, ladder_step = 0 WHERE id = ?",
         )
         .bind(999_999i64)
         .bind(late)
         .execute(&pool)
         .await
         .unwrap();
-        // ladder: mid-ladder with a due 30-minute recheck.
+        // ladder: mid-ladder with a due second recheck.
         sqlx::query(
-            "UPDATE proxies SET status = 'quarantine', quarantined_at = 0, recheck_30m_at = ? WHERE id = ?",
+            "UPDATE proxies SET status = 'quarantine', quarantined_at = 0, ladder_at = ?, ladder_step = 2 WHERE id = ?",
         )
         .bind(2_000i64)
         .bind(ladder)
@@ -1885,10 +1899,10 @@ mod tests {
         assert!(ids.contains(&ladder));
         assert!(!ids.contains(&late));
 
-        let stages: std::collections::HashMap<i64, QuarantineStage> =
-            due.into_iter().map(|d| (d.id, d.stage())).collect();
-        assert_eq!(stages[&early], QuarantineStage::SecondChance);
-        assert_eq!(stages[&ladder], QuarantineStage::Recheck30m);
+        let steps: std::collections::HashMap<i64, i64> =
+            due.into_iter().map(|d| (d.id, d.ladder_step)).collect();
+        assert_eq!(steps[&early], 0);
+        assert_eq!(steps[&ladder], 2);
     }
 
     #[tokio::test]
@@ -1934,7 +1948,7 @@ mod tests {
         // "Restart": derive everything from the row itself.
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "quarantine");
-        let sc = row.second_chance_at.unwrap();
+        let sc = row.ladder_at.unwrap();
 
         // Nothing is due before the scheduled moment.
         assert!(
@@ -1946,17 +1960,18 @@ mod tests {
         // At the moment it becomes due exactly one check fires.
         let due = select_due_quarantine(&pool, sc, 100).await.unwrap();
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].stage(), QuarantineStage::SecondChance);
+        assert_eq!(due[0].ladder_step, 0);
 
         // Fail it, restart again, and the ladder continues from the DB.
-        quarantine_check_failed(&pool, id, sc, QuarantineStage::SecondChance)
+        quarantine_check_failed(&pool, id, sc, 0, &[900, 1800, 3600])
             .await
             .unwrap();
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
-        let next = row.recheck_15m_at.unwrap();
+        let next = row.ladder_at.unwrap();
+        assert_eq!(row.ladder_step, 1);
         let due = select_due_quarantine(&pool, next, 100).await.unwrap();
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].stage(), QuarantineStage::Recheck15m);
+        assert_eq!(due[0].ladder_step, 1);
     }
 
     #[tokio::test]
@@ -1971,12 +1986,17 @@ mod tests {
         // offered to T2 (meow-rs cannot tunnel it, SPEC §8.5).
         let mut alive_unprobeable = entry("tuic", "h5.example.com", 443);
         alive_unprobeable.scheme = Scheme::Tuic;
+        // hysteria2 skips T1 entirely (a TCP connect proves nothing on
+        // QUIC): an `unknown` one goes straight to the T2 batch.
+        let mut fresh_hysteria2 = entry("hy2", "h6.example.com", 443);
+        fresh_hysteria2.scheme = Scheme::Hysteria2;
         let all = vec![
             alive.clone(),
             never_checked.clone(),
             quarantined.clone(),
             removed.clone(),
             alive_unprobeable.clone(),
+            fresh_hysteria2.clone(),
         ];
         reconcile_source(&pool, "srcA0000000", &all, &[], 1000, false)
             .await
@@ -1988,6 +2008,7 @@ mod tests {
             (&quarantined, "quarantine"),
             (&removed, "removed"),
             (&alive_unprobeable, "alive"),
+            (&fresh_hysteria2, "unknown"),
         ] {
             sqlx::query("UPDATE proxies SET status = ? WHERE fingerprint = ?")
                 .bind(status)
@@ -1997,9 +2018,10 @@ mod tests {
                 .unwrap();
         }
 
-        let candidates = select_t2_candidates(&pool, 100).await.unwrap();
+        let mut candidates = select_t2_candidates(&pool, 100).await.unwrap();
+        candidates.sort_by(|a, b| a.host.cmp(&b.host));
         let hosts: Vec<&str> = candidates.iter().map(|row| row.host.as_str()).collect();
-        assert_eq!(hosts, vec!["h1.example.com"]);
+        assert_eq!(hosts, vec!["h1.example.com", "h6.example.com"]);
     }
 
     #[tokio::test]

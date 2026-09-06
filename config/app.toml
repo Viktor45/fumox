@@ -109,20 +109,41 @@ locales_dir = "locales"
 # Proxy health-check daemon.
 cycle_interval_secs = 60       # период цикла планирования / scheduling cycle period
 sample_size = 50              # случайная выборка прокси за цикл (без всплесков) / random proxy sample per cycle (no bursts)
-fail_limit = 3                # неудач подряд до карантина / consecutive failures before quarantine
+# Неудачных проверок подряд до карантина. Для нового прокси это T1-проверки
+# (приоритетная очередь, затем случайная выборка); провалы T2 считают в тот же
+# счётчик. Уменьшите значение, чтобы не тратить время T1 на мёртвые прокси.
+# Consecutive failed checks before quarantine. For a fresh proxy these are
+# T1 checks (priority queue, then the random sample); T2 failures count in
+# the same counter. Lower it to stop spending T1 time on dead proxies.
+fail_limit = 3
 connect_timeout_secs = 10     # T1: TCP-connect
 tls_timeout_secs = 10         # T1: TLS-handshake
 concurrency = 8
 heartbeat_interval_secs = 30  # meta-ключ probe_heartbeat для админки / probe_heartbeat meta key consumed by the admin panel
 # Второй шанс для прокси в карантине: повторная проверка в случайный момент
-# окна [24ч, 48ч) после карантина — окно задаётся как min + случайная
+# окна [12ч, 16ч) после карантина — окно задаётся как min + случайная
 # добавка от 0 до spread (UTC, момент фиксируется в базе на момент карантина).
 # A quarantined proxy's second chance: rechecked at a random moment of the
-# [24h, 48h) window after quarantine — the window is min plus a random
+# [12h, 16h) window after quarantine — the window is min plus a random
 # addition from 0 to spread (UTC, the moment is fixed in the database when
 # quarantined).
-second_chance_min_hours = 24
-second_chance_spread_hours = 24
+second_chance_min_hours = 12
+second_chance_spread_hours = 4
+# Лестница повторных проверок карантина: задержки в секундах
+# между последовательными ретраями после провала второго шанса. Провал ретрая
+# N назначает ретрай N+1 через recheck_delays_secs[N-1]; провал последней
+# ступени удаляет прокси. Длина произвольная (до 16 ступеней, каждая до 30
+# дней); пустой массив = удалять сразу после провала второго шанса.
+# Quarantine recheck ladder: delays in seconds between
+# consecutive rechecks after a failed second chance. Failing recheck N
+# schedules recheck N+1 after recheck_delays_secs[N-1]; failing the last
+# entry removes the proxy. Arbitrary length (up to 16 steps of at most 30
+# days); an empty list removes right after the failed second chance.
+recheck_delays_secs = [900, 1800, 3600]   # 15 мин → 30 мин → 1 ч / 15m → 30m → 1h
+# Записи очереди приоритетных проверок (probe_requests) старше этого срока
+# удаляются (ежедневная задача ротации).
+# Priority-queue entries (probe_requests) older than this are purged.
+queue_stale_days = 7
 retention_interval_secs = 86400   # период ротации истории / history rotation period
 
 [meow]
@@ -159,6 +180,12 @@ test_url = [
   "http://clients3.google.com/generate_204",           # legacy Android 2.3-4.x, still alive
 ]
 timeout_secs = 10
+# Backoff повторных обращений к meow-rs, когда он недоступен (удваивается с
+# каждым подряд идущим провалом, от initial до max).
+# Retry backoff while meow-rs is unavailable (doubles per consecutive
+# failure, from initial up to max).
+backoff_initial_secs = 60
+backoff_max_secs = 900
 
 [retention]
 # Ротация истории (ежедневная задача в probe).

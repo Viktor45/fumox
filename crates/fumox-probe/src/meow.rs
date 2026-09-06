@@ -224,6 +224,8 @@ mod tests {
             config_path: std::env::temp_dir().join("fumox-meow-test.yaml"),
             test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 5,
+            backoff_initial_secs: 60,
+            backoff_max_secs: 900,
         };
         (addr.to_string(), config, seen_test_urls)
     }
@@ -261,6 +263,8 @@ mod tests {
             config_path: std::env::temp_dir().join("fumox-meow-test.yaml"),
             test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 2,
+            backoff_initial_secs: 60,
+            backoff_max_secs: 900,
         };
         let client = MeowClient::new(&config);
         assert!(client.ping().await.is_err());

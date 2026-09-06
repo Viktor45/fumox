@@ -148,7 +148,7 @@ Two network listeners are involved, on purpose separated:
 | **Slug**                       | An optional human-readable identifier for a source or profile (`/sub/my-list` instead of `/sub/nNqRYHbOSqM5`).                                                              |
 | **Pipeline**                   | JSON rules describing how proxies are filtered, renamed, geo-tagged, deduplicated and sorted. A source has its own pipeline; a profile can override it.                     |
 | **Status**                     | A proxy's health state: `unknown`, `alive`, `quarantine`, `removed` (see [section 10](#10-health-checks-and-proxy-lifecycle)).                                              |
-| **Quarantine & second chance** | A proxy that keeps failing is excluded from output, then re-checked 24–48 hours later before any final decision.                                                            |
+| **Quarantine & second chance** | A proxy that keeps failing is excluded from output, then re-checked 12–16 hours later before any final decision.                                                            |
 | **T1 / T2**                    | The two health-check levels: T1 = direct TCP/TLS reachability; T2 = a real tunnel request through meow-rs.                                                                  |
 
 IDs and endpoint tokens are `nanoid(12)` strings over the alphabet
@@ -589,18 +589,20 @@ form.
 
 ### `[probe]` — health-check daemon
 
-| Key                          | Default | Meaning                                                                                                 |
-| ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
-| `cycle_interval_secs`        | `60`    | Scheduling cycle period                                                                                 |
-| `sample_size`                | `50`    | Random sample of proxies checked per cycle (spreads load, no bursts)                                    |
-| `fail_limit`                 | `3`     | Consecutive failures before quarantine                                                                  |
-| `connect_timeout_secs`       | `10`    | T1 TCP-connect timeout                                                                                  |
-| `tls_timeout_secs`           | `10`    | T1 TLS-handshake timeout                                                                                |
-| `concurrency`                | `8`     | Parallel checks                                                                                         |
-| `heartbeat_interval_secs`    | `30`    | How often the daemon writes its heartbeat (shown in the admin panel)                                    |
-| `second_chance_min_hours`    | `24`    | Second-chance window start, hours after quarantine                                                      |
-| `second_chance_spread_hours` | `24`    | Window width: the check happens at `+24h + U(0..24h)`, i.e. within [24h, 48h)                           |
-| `retention_interval_secs`    | `86400` | How often old history is purged                                                                         |
+| Key                          | Default             | Meaning                                                                                                 |
+| ---------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------- |
+| `cycle_interval_secs`        | `60`                | Scheduling cycle period                                                                                 |
+| `sample_size`                | `50`                | Random sample of proxies checked per cycle (spreads load, no bursts)                                    |
+| `fail_limit`                 | `3`                 | Consecutive failures before quarantine (T1 and T2 share one counter)                                    |
+| `connect_timeout_secs`       | `10`                | T1 TCP-connect timeout                                                                                  |
+| `tls_timeout_secs`           | `10`                | T1 TLS-handshake timeout                                                                                |
+| `concurrency`                | `8`                 | Parallel checks                                                                                         |
+| `heartbeat_interval_secs`    | `30`                | How often the daemon writes its heartbeat (shown in the admin panel)                                    |
+| `second_chance_min_hours`    | `12`                | Second-chance window start, hours after quarantine                                                      |
+| `second_chance_spread_hours` | `4`                 | Window width: the check happens at `+12h + U(0..4h)`, i.e. within [12h, 16h)                            |
+| `recheck_delays_secs`        | `[900, 1800, 3600]` | Quarantine recheck ladder: 15 min → 30 min → 1 h (see section 10)                                       |
+| `queue_stale_days`           | `7`                 | Lifetime of priority-queue entries                                                                      |
+| `retention_interval_secs`    | `86400`             | How often old history is purged                                                                         |
 
 ### `[meow]` — meow-rs integration (T2)
 
@@ -610,6 +612,8 @@ form.
 | `config_path`  | `"config/meow.yaml"`                                                                    | Where the probe writes the generated Clash config. **Must be a path meow-rs itself can read** (in Docker: the shared volume)                                                                                                                                                                                                      |
 | `test_url`     | Rotation over the Google Android `generate_204` endpoints (7 URLs, verified 2026-08-29) | URL(s) fetched through the proxy for delay tests: one URL, a TOML array, or a comma-separated string. The probe picks one at random per check, so a blocked endpoint no longer breaks T2 everywhere. iOS/Apple check URLs (`captive.apple.com/...`) answer 200, not 204 — usable, but only if your client accepts non-204 answers |
 | `timeout_secs` | `10`                                                                                    | Per-check timeout                                                                                                                                                                                                                                                                                                                 |
+| `backoff_initial_secs` | `60`  | Initial T2 backoff while meow-rs is unavailable (doubles per consecutive failure) |
+| `backoff_max_secs` | `900` | T2 backoff ceiling (15 min) — a dead meow-rs is never mistaken for dead proxies |
 
 ### `[retention]` — history rotation
 
@@ -727,11 +731,12 @@ cycle in four passes:
    newest first, then removed from the queue before the checks run;
 3. **T1** — a random sample of direct TCP-connect (plus TLS handshake where
    the protocol implies TLS) checks over `unknown`/`alive` proxies;
-4. **T2** — real tunnel checks for `alive` proxies through meow-rs: the probe
-   writes a Clash config with the batch, hot-reloads meow-rs via
-   `PUT /configs`, then measures delay via `GET /proxies/{name}/delay` against
-   a randomly picked URL from `[meow].test_url` (the checks rotate across the
-   configured list).
+4. **T2** — real tunnel checks through meow-rs: the probe writes a Clash
+   config with the batch, hot-reloads meow-rs via `PUT /configs`, then
+   measures delay via `GET /proxies/{name}/delay` against a randomly picked
+   URL from `[meow].test_url` (the checks rotate across the configured list).
+   The sample consists of `alive` proxies plus never-checked `unknown`
+   hysteria2, which T1 cannot say anything about (see below).
 
 The priority queue gives brand-new proxies a first check within one cycle of
 the source refresh instead of waiting out the random sample — with large
@@ -745,21 +750,27 @@ are never queued (they could not be checked anyway), and a proxy that leaves
 | **T2** (tunnel)  | The proxy *actually works*: credentials valid, traffic flows | vless, vmess, trojan, ss, hysteria2, socks5 |
 
 QUIC protocols (hysteria2, tuic) skip T1 — a TCP connect to a UDP port proves
-nothing. **tuic and mieru are unprobeable** altogether (meow-rs doesn't
-support them): they keep status `unknown` forever, always pass health filters,
-and are badged "unprobeable" in the admin panel. Exclude them with
-`filter.protocols` if you don't want them in a profile.
+nothing. **hysteria2** is not hurt by that: a fresh `unknown` hysteria2 goes
+straight into the T2 sample and from there follows the regular state machine
+(the failure counter is shared with T1). **tuic and mieru are unprobeable**
+altogether (meow-rs doesn't support them): they keep status `unknown` forever,
+always pass health filters, and are badged "unprobeable" in the admin panel.
+Exclude them with `filter.protocols` if you don't want them in a profile.
 
 ### The status state machine
 
 ```mermaid
 stateDiagram-v2
     [*] --> unknown : new proxy appears in a source
-    unknown --> alive : check succeeds
+    unknown --> alive : a check succeeds (T1 or T2)
     unknown --> quarantine : fail_limit consecutive failures
     alive --> quarantine : fail_limit consecutive failures
-    quarantine --> alive : second chance succeeds
-    quarantine --> removed : second chance fails, then 3 rechecks fail
+    quarantine --> alive : second chance or a ladder step succeeds
+    quarantine --> removed : second chance and every ladder step fail
+    note right of unknown
+        hysteria2 skips T1
+        and goes straight to T2
+    end note
 ```
 
 The rules in plain language:
@@ -773,12 +784,18 @@ The rules in plain language:
 - **Quarantine.** `fail_limit` (default 3) consecutive failures move an
   `unknown`/`alive` proxy to `quarantine`. It disappears from subscriptions
   immediately.
-- **Second chance.** At a random moment 24–48 hours after quarantine
-  (`quarantined_at + 24h + U(0..24h)`, UTC, drawn once and stored) the proxy
-  is re-checked. Success → back to `alive`.
-- **Recheck ladder.** A failed second chance is followed by rechecks at
-  +15 min, +30 min and +1 hour. Any success → `alive`. All three fail →
-  `removed`.
+- **Second chance.** At a random moment of the **[12 h, 16 h)** window after
+  quarantine (`quarantined_at + second_chance_min_hours +
+  U(0..second_chance_spread_hours)`, UTC, drawn once and stored) the proxy is
+  re-checked. Success → back to `alive`. The second chance and the ladder
+  steps are T1 checks: a quarantined proxy no longer enters the T2 sample.
+- **Recheck ladder.** After a failed second chance the proxy walks the ladder
+  of `[probe].recheck_delays_secs` (default 15 min → 30 min → 1 h): failing
+  step N schedules step N+1 after the Nth array entry; failing the last step
+  → `removed`. Any success → `alive`. The ladder length is arbitrary (up to
+  16 steps of at most 30 days); an empty list removes the proxy right after
+  the failed second chance. With the defaults, the "quarantine → removed"
+  path takes ~13 h 45 min – 17 h 45 min.
 - **Removed is not deleted.** Removed proxies stay in the database (purge them
   from the admin panel if you want). A removed proxy is terminal: if a source
   lists it again, its state is *not* reset — reconciliation never touches the
@@ -795,6 +812,29 @@ The rules in plain language:
   rule added later retires the already-stored rows on the next refresh;
   with the default `false` every source lingers — drop rules only stop
   new matches). Deleting a source from the admin panel never lingers.
+
+**State machine configuration parameters.** All of them live in
+`config/app.toml` (or are overridden via `FUMOX_*` variables) and apply after
+a restart of the owning process; the effective values are shown on the admin
+panel's *Settings* page.
+
+| Parameter | Default | What it controls |
+| --- | --- | --- |
+| `[probe].fail_limit` | `3` | Consecutive failed checks (T1 and T2 share one counter) before `quarantine` |
+| `[probe].second_chance_min_hours` | `12` | Second-chance window start, hours after `quarantined_at` |
+| `[probe].second_chance_spread_hours` | `4` | Second-chance window width: the check happens in `[min, min + spread)` |
+| `[probe].recheck_delays_secs` | `[900, 1800, 3600]` | Recheck ladder after a failed second chance: 15 min → 30 min → 1 h; up to 16 steps of ≤ 30 days, `[]` = remove right after the failed second chance |
+| `[probe].cycle_interval_secs` | `60` | How often quarantine dues run and T1/T2 samples are drawn |
+| `[probe].sample_size` | `50` | Random T1 sample size per cycle; the same limit caps quarantine checks per cycle |
+| `[probe].connect_timeout_secs` | `10` | T1 TCP-connect timeout (including quarantine checks) |
+| `[probe].tls_timeout_secs` | `10` | T1 TLS-handshake timeout |
+| `[probe].concurrency` | `8` | Parallelism of checks |
+| `[probe].queue_stale_days` | `7` | Lifetime of priority-queue entries (first check of new proxies) |
+| `[ingest].refresh_check_limit` | `50` | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables) |
+| `[ingest].drop_gate` | `false` | Whether `drop` rules unlink a live "lingerer" on the very next refresh |
+| `[meow].timeout_secs` | `10` | Per-check T2 delay-test timeout |
+| `[meow].backoff_initial_secs` | `60` | Initial T2 backoff while meow-rs is unavailable |
+| `[meow].backoff_max_secs` | `900` | T2 backoff ceiling (15 min) |
 
 If meow-rs is down, T2 doesn't spam it: the probe backs off exponentially
 (60 s → doubling → capped at 15 min), and proxy statuses are left untouched —

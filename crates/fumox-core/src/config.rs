@@ -84,7 +84,19 @@ impl AppConfig {
         // the section path).
         figment = figment.merge(Env::prefixed("FUMOX_").split("__"));
 
-        Ok(figment.extract()?)
+        let config: Self = figment.extract()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Cross-field checks serde cannot express on individual fields.
+    fn validate(&self) -> crate::Result<()> {
+        if self.meow.backoff_max_secs < self.meow.backoff_initial_secs {
+            return Err(crate::Error::Config(
+                "meow.backoff_max_secs must be >= meow.backoff_initial_secs".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -379,9 +391,25 @@ pub struct ProbeConfig {
     #[serde(default = "defaults::second_chance_min_hours")]
     pub second_chance_min_hours: u64,
     /// Width of the uniform jitter added on top of the minimum, giving the
-    /// `[24h, 48h)` window by default (SPEC §8.3a).
+    /// `[12h, 16h)` window by default (SPEC §8.3a).
     #[serde(default = "defaults::second_chance_spread_hours")]
     pub second_chance_spread_hours: u64,
+    /// Quarantine recheck ladder (SPEC §8.3a): delays in seconds between
+    /// consecutive rechecks after a failed second chance. Failing recheck
+    /// `N` schedules recheck `N+1` after `recheck_delays_secs[N-1]`;
+    /// failing the last entry removes the proxy. An empty list removes the
+    /// proxy right after the failed second chance. The ladder length is
+    /// arbitrary (the schedule lives in the generic `ladder_at`/`ladder_step`
+    /// columns), capped at 16 steps of at most 30 days.
+    #[serde(
+        default = "defaults::recheck_delays_secs",
+        deserialize_with = "de_recheck_delays"
+    )]
+    pub recheck_delays_secs: Vec<i64>,
+    /// `probe_requests` entries older than this many days are purged (the
+    /// priority queue holds rows for proxies that may never be re-checked).
+    #[serde(default = "defaults::queue_stale_days")]
+    pub queue_stale_days: u64,
     /// How often the retention rotation task runs.
     #[serde(default = "defaults::retention_interval_secs")]
     pub retention_interval_secs: u64,
@@ -399,6 +427,8 @@ impl Default for ProbeConfig {
             heartbeat_interval_secs: defaults::heartbeat_interval_secs(),
             second_chance_min_hours: defaults::second_chance_min_hours(),
             second_chance_spread_hours: defaults::second_chance_spread_hours(),
+            recheck_delays_secs: defaults::recheck_delays_secs(),
+            queue_stale_days: defaults::queue_stale_days(),
             retention_interval_secs: defaults::retention_interval_secs(),
         }
     }
@@ -425,6 +455,13 @@ pub struct MeowConfig {
     /// Per-check timeout.
     #[serde(default = "defaults::meow_timeout_secs")]
     pub timeout_secs: u64,
+    /// Initial delay before retrying meow-rs after it answered
+    /// `ServiceUnavailable`; doubles on every consecutive failure.
+    #[serde(default = "defaults::meow_backoff_initial_secs")]
+    pub backoff_initial_secs: u64,
+    /// Upper bound of the meow-rs retry backoff.
+    #[serde(default = "defaults::meow_backoff_max_secs")]
+    pub backoff_max_secs: u64,
 }
 
 impl Default for MeowConfig {
@@ -434,6 +471,8 @@ impl Default for MeowConfig {
             config_path: defaults::meow_config_path(),
             test_url: defaults::meow_test_url(),
             timeout_secs: defaults::meow_timeout_secs(),
+            backoff_initial_secs: defaults::meow_backoff_initial_secs(),
+            backoff_max_secs: defaults::meow_backoff_max_secs(),
         }
     }
 }
@@ -550,6 +589,33 @@ where
     }
 
     deserializer.deserialize_any(Visitor)
+}
+
+/// `[probe].recheck_delays_secs`: the quarantine recheck ladder. Bounded to
+/// 16 steps of at most 30 days each so a typo cannot schedule rechecks
+/// years out or build an unbounded ladder; an empty list is legal and means
+/// «remove right after the failed second chance».
+fn de_recheck_delays<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let delays = Vec::<i64>::deserialize(deserializer)?;
+    const MAX_STEPS: usize = 16;
+    const MAX_DELAY_SECS: i64 = 30 * 24 * 60 * 60;
+    if delays.len() > MAX_STEPS {
+        return Err(serde::de::Error::custom(format!(
+            "recheck_delays_secs: at most {MAX_STEPS} steps are supported (got {})",
+            delays.len()
+        )));
+    }
+    for delay in &delays {
+        if !(1..=MAX_DELAY_SECS).contains(delay) {
+            return Err(serde::de::Error::custom(format!(
+                "recheck_delays_secs: each delay must be 1..={MAX_DELAY_SECS} seconds (got {delay})"
+            )));
+        }
+    }
+    Ok(delays)
 }
 
 /// A rate limit expressed as a number of requests per time window.
@@ -743,13 +809,26 @@ mod defaults {
         30
     }
     pub const fn second_chance_min_hours() -> u64 {
-        24
+        12
     }
     pub const fn second_chance_spread_hours() -> u64 {
-        24
+        4
     }
     pub const fn retention_interval_secs() -> u64 {
         86400
+    }
+    pub fn recheck_delays_secs() -> Vec<i64> {
+        // SPEC §8.3a defaults: +15m, +30m, +1h after the failed second chance.
+        vec![15 * 60, 30 * 60, 60 * 60]
+    }
+    pub const fn queue_stale_days() -> u64 {
+        7
+    }
+    pub const fn meow_backoff_initial_secs() -> u64 {
+        60
+    }
+    pub const fn meow_backoff_max_secs() -> u64 {
+        15 * 60
     }
     pub fn meow_api_addr() -> String {
         "127.0.0.1:9090".to_string()

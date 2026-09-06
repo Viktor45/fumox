@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("nav.settings") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("nav.settings") }}</h1>
+</div>
+
+<p class="small muted">{{ self.t("set.banner") }}</p>
+
+<div class="grid cols-2">
+  <div class="panel">
+    <h2>{{ self.t("set.state_machine") }} <span class="badge neutral">probe</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><td>{{ self.t("probe.fail_limit") }}</td><td>{{ state.probe.fail_limit }}</td></tr>
+        <tr><td>{{ self.t("probe.second_chance_window") }}</td><td>{{ state.probe.second_chance_min_hours }} {{ self.t("probe.hours_short") }} + U(0..{{ state.probe.second_chance_spread_hours }} {{ self.t("probe.hours_short") }})</td></tr>
+        <tr><td>{{ self.t("set.ladder") }}</td><td class="mono small">{{ self.ladder_sentence() }}</td></tr>
+        <tr><td>{{ self.t("set.queue_stale") }}</td><td>{{ state.probe.queue_stale_days }} {{ self.t("probe.days_short") }}</td></tr>
+        <tr><td>{{ self.t("probe.history_rotation") }}</td><td>{{ self.t("probe.every_n_sec").replace("{}", &state.probe.retention_interval_secs.to_string()) }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("set.checking") }} <span class="badge neutral">probe</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><td>{{ self.t("probe.cycle_period") }}</td><td>{{ state.probe.cycle_interval_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("probe.sample_per_cycle") }}</td><td>{{ state.probe.sample_size }}</td></tr>
+        <tr><td>{{ self.t("probe.tcp_timeout") }}</td><td>{{ state.probe.connect_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("probe.tls_timeout") }}</td><td>{{ state.probe.tls_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("probe.concurrency") }}</td><td>{{ state.probe.concurrency }}</td></tr>
+        <tr><td>Heartbeat</td><td>{{ self.t("probe.every_n_sec").replace("{}", &state.probe.heartbeat_interval_secs.to_string()) }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("set.ingest") }} <span class="badge neutral">server</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><td>{{ self.t("set.refresh_check_limit") }}</td><td>{{ state.ingest.refresh_check_limit }}</td></tr>
+        <tr><td>{{ self.t("set.drop_gate") }}</td><td>{{ state.ingest.drop_gate }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("probe.meow_title") }} <span class="badge neutral">probe</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><td>{{ self.t("probe.check_timeout") }}</td><td>{{ state.meow.timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("set.backoff_initial") }}</td><td>{{ state.meow.backoff_initial_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("set.backoff_max") }}</td><td>{{ state.meow.backoff_max_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><td>{{ self.t("probe.retention_probe") }}</td><td>{{ state.retention.probe_results_days }} {{ self.t("probe.days_short") }}</td></tr>
+        <tr><td>{{ self.t("probe.retention_fetch") }}</td><td>{{ state.retention.fetch_log_days }} {{ self.t("probe.days_short") }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

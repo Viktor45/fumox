@@ -8,6 +8,7 @@ mod pipeline;
 mod probe;
 mod profiles;
 mod proxies;
+mod settings;
 mod sources;
 mod stats;
 
@@ -17,6 +18,7 @@ pub use pipeline::*;
 pub use probe::*;
 pub use profiles::*;
 pub use proxies::*;
+pub use settings::*;
 pub use sources::*;
 pub use stats::*;
 

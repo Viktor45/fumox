@@ -4,7 +4,8 @@
 # service DNS (FUMOX_MEOW__API_ADDR=127.0.0.1:9090).
 #
 # Before first start:
-#   1. Build both images (quadlet/.kube do not build):
+#   1. Prepare both images (quadlet/.kube do not build): either pull+tag the
+#      GHCR ones (see docker/README.md) or build locally:
 #        podman build -t localhost/fumox:local .
 #        podman build -t localhost/fumox-meow:local docker/meow
 #   2. Adjust the hostPath "config" below: a directory with app.toml (and

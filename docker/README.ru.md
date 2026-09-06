@@ -14,11 +14,26 @@ compose. Два варианта на выбор:
 
 ## Подготовка (для обоих вариантов)
 
-Quadlet не собирает образы — соберите их один раз из корня репозитория
-(или возьмите опубликованные в GHCR и перетегируйте в имена `localhost/…`
-из юнитов ниже: `ghcr.io/viktor45/fumox` CI публикует на каждый push в `main`
-и на теги `v*`, `ghcr.io/viktor45/fumox-meow` — только вручную, workflow'ом
-`docker-meow.yml`):
+Quadlet не собирает образы — юниты ссылаются на локальные имена
+`localhost/fumox:local` и `localhost/fumox-meow:local`. Подготовьте их любым
+из двух способов:
+
+**Способ 1 — забрать готовые образы из GHCR (быстрее всего):**
+
+```sh
+podman pull ghcr.io/viktor45/fumox:latest
+podman tag ghcr.io/viktor45/fumox:latest localhost/fumox:local
+podman pull ghcr.io/viktor45/fumox-meow:latest
+podman tag ghcr.io/viktor45/fumox-meow:latest localhost/fumox-meow:local
+```
+
+`ghcr.io/viktor45/fumox` публикует CI (`.github/workflows/docker.yml`);
+`ghcr.io/viktor45/fumox-meow` упаковывается вручную workflow'ом
+`docker-meow.yml`. Можно обойтись без перетегирования — поправьте строки
+`Image=` в юнитах на GHCR-имена напрямую; там же удобно запиннить версию
+(`ghcr.io/viktor45/fumox:0.2.0`) вместо `latest`.
+
+**Способ 2 — сборка из исходников** (из корня репозитория):
 
 ```sh
 podman build -t localhost/fumox:local .
@@ -93,7 +108,8 @@ PVC `fumox-data` и `meow-shared` при первом старте podman авт
 
 - `FUMOX_MEOW__API_ADDR: meow:9090` → `127.0.0.1:9090`: в поде общий сетевой
   namespace, DNS-имен сервисов нет. 9090 наружу не публикуется, как и в compose.
-- Сборка образов — вручную (`podman build`), а не `compose up --build`.
+- Образы либо тянутся из GHCR, либо собираются вручную (`podman build`);
+  compose умеет и то и другое (`up -d` тянет, `up --build` собирает).
 - Именованные volume-ы podman (`fumox-data`, `meow-shared`) — не те же
   хранилища, что у docker. Перенос БД из compose:
 
@@ -115,11 +131,24 @@ PVC `fumox-data` и `meow-shared` при первом старте podman авт
 
 ## Обновление версии
 
+С образами из GHCR (способ 1 из «Подготовки»):
+
+```sh
+podman pull ghcr.io/viktor45/fumox:latest
+podman tag ghcr.io/viktor45/fumox:latest localhost/fumox:local
+systemctl --user restart fumox-pod.service   # вариант B: fumox.service
+```
+
+С локально собранными:
+
 ```sh
 git pull
 podman build -t localhost/fumox:local .
 systemctl --user restart fumox-pod.service   # вариант B: fumox.service
 ```
+
+(Обертку `fumox-meow` обновляют так же, когда нужен более свежий релиз
+meow-rs.)
 
 ## Rootful (системный podman)
 

@@ -2,7 +2,8 @@
 # admin panel on :8081 (loopback-only). Default CMD of the image is already
 # fumox-server, so no Exec= override is needed.
 #
-# Quadlet does not build images — build before first start:
+# Quadlet does not build images — prepare localhost/fumox:local before the
+# first start: either pull+tag the GHCR image (see docker/README.md) or
 #   podman build -t localhost/fumox:local .
 
 [Unit]

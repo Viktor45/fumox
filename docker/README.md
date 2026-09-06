@@ -14,11 +14,26 @@ podman (recommended); rootful differences are at the end.
 
 ## Preparation (both variants)
 
-Quadlet does not build images — build them once from the repository root
-(or pull the GHCR-published ones and `podman tag` them to the `localhost/…`
-names the units below reference: `ghcr.io/viktor45/fumox` is pushed by CI on
-every push to `main` and on `v*` tags, `ghcr.io/viktor45/fumox-meow` — only
-manually, via the `docker-meow.yml` workflow):
+Quadlet does not build images — the units reference the local names
+`localhost/fumox:local` and `localhost/fumox-meow:local`. Prepare them either
+way:
+
+**Option 1 — pull the published GHCR images (fastest):**
+
+```sh
+podman pull ghcr.io/viktor45/fumox:latest
+podman tag ghcr.io/viktor45/fumox:latest localhost/fumox:local
+podman pull ghcr.io/viktor45/fumox-meow:latest
+podman tag ghcr.io/viktor45/fumox-meow:latest localhost/fumox-meow:local
+```
+
+`ghcr.io/viktor45/fumox` is pushed by CI (`.github/workflows/docker.yml`);
+`ghcr.io/viktor45/fumox-meow` is packaged manually by the `docker-meow.yml`
+workflow. To skip the retagging, edit the `Image=` lines of the units to the
+GHCR names directly — that is also where you pin a version
+(`ghcr.io/viktor45/fumox:0.2.0`) instead of `latest`.
+
+**Option 2 — build from source** (from the repository root):
 
 ```sh
 podman build -t localhost/fumox:local .
@@ -94,7 +109,8 @@ interface — close it with a firewall or upgrade.
 - `FUMOX_MEOW__API_ADDR: meow:9090` → `127.0.0.1:9090`: a pod shares one
   network namespace, there are no per-service DNS names. 9090 is not
   published to the host, same as compose.
-- Images are built manually (`podman build`), not by `compose up --build`.
+- Images are either pulled from GHCR or built manually (`podman build`);
+  compose does both for you (`up -d` pulls, `up --build` builds).
 - Podman named volumes (`fumox-data`, `meow-shared`) are not the same
   storage as docker's. Migrating the DB from compose:
 
@@ -117,11 +133,24 @@ interface — close it with a firewall or upgrade.
 
 ## Upgrading
 
+With the GHCR images (option 1 of Preparation):
+
+```sh
+podman pull ghcr.io/viktor45/fumox:latest
+podman tag ghcr.io/viktor45/fumox:latest localhost/fumox:local
+systemctl --user restart fumox-pod.service   # variant B: fumox.service
+```
+
+With locally built images:
+
 ```sh
 git pull
 podman build -t localhost/fumox:local .
 systemctl --user restart fumox-pod.service   # variant B: fumox.service
 ```
+
+(The `fumox-meow` wrapper is refreshed the same way when you want a newer
+meow-rs release.)
 
 ## Rootful (system podman)
 

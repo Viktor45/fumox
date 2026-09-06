@@ -218,10 +218,12 @@ Notes:
 
 ### Option B — Pre-built container image
 
-CI publishes a multi-arch image (`linux/amd64` + `linux/arm64`, with build
-provenance attestation) to GHCR on every push to `main` and on `v*` tags:
-`ghcr.io/<owner>/fumox`. The image ships **both** binaries; the server is the
-default command, the probe is a command override.
+CI publishes a multi-arch image (`linux/amd64` + `linux/arm64`, each platform
+attested with build provenance) to GHCR on every push to `main` and on `v*`
+tags: `ghcr.io/<owner>/fumox`. Tags: a push to `main` — `main` and
+`sha-<short sha>`; a `v0.2.0` tag adds `0.2.0`, `0.2` and `latest`. The image
+ships **both** binaries; the server is the default command, the probe is a
+command override.
 
 ```bash
 # Server
@@ -231,17 +233,17 @@ docker run -d --name fumox \
   -p 8080:8080 -p 127.0.0.1:8081:8081 \
   ghcr.io/<owner>/fumox
 
-# Probe (same image, shares the same volumes)
+# Probe (same image, shares the same volumes; fumox-probe is the command
+# argument — tini stays the entrypoint)
 docker run -d --name fumox-probe \
-  --entrypoint fumox-probe \
   -v fumox-config:/app/config -v fumox-data:/app/data \
-  ghcr.io/<owner>/fumox
+  ghcr.io/<owner>/fumox fumox-probe
 ```
 
 Inside the image: config is read from `/app/config/app.toml` (if mounted), the
 database is `/app/data/fumox.db`, and the admin listener is pre-set to
-`0.0.0.0:8081` (the compose file publishes it loopback-only). The image
-contains no shell or HTTP client — point orchestrator health probes at
+`0.0.0.0:8081` (the compose file publishes it loopback-only). There is no
+HTTP client (curl/wget) in the image — point orchestrator health probes at
 `GET /healthz` on port 8080.
 
 ### Option C — Build from source

@@ -61,7 +61,7 @@ services:
     restart: unless-stopped
 
   probe:
-    image: fumox:local         # same image as server, different entrypoint
+    image: fumox:local         # same image as server, different command
     command: ["fumox-probe"]
     depends_on:
       - server                 # let the server create/migrate the DB first

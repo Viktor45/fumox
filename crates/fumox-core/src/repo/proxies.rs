@@ -633,6 +633,13 @@ pub enum Transition {
 /// absent from T2 (meow-rs cannot tunnel them).
 pub const T1_EXCLUDED_SCHEMES: &[&str] = &["hysteria2", "tuic", "mieru"];
 
+/// Schemes meow-rs can actually tunnel (the T2 allowlist). Mirrors
+/// `fumox_probe::clash::is_supported` — probe filters the batch by it after
+/// the SQL, so the selector must not offer rows that would only be dropped
+/// again: under the recency-priority order a perpetually uncheckable row
+/// would otherwise sit at the head of the sample forever (starvation).
+pub const T2_SCHEMES: &[&str] = &["vless", "vmess", "trojan", "ss", "hysteria2", "socks5"];
+
 /// Random sample of probeable proxies for one T1 cycle (SPEC §8.3: random
 /// sampling spreads load and avoids bursts).
 ///
@@ -660,21 +667,36 @@ pub async fn select_t1_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
     Ok(query.fetch_all(pool).await?)
 }
 
-/// Random sample of proxies eligible for a T2 tunnel check through
-/// meow-rs (SPEC §8.2): every `alive` proxy (T2 re-verifies the tunnel),
-/// plus `unknown` hysteria2 — hysteria2 is excluded from T1 by design (a
-/// TCP connect to a QUIC port proves nothing, SPEC §8.5), so T2 is its
-/// first and only check; a failure counts through the regular `fail_limit`,
-/// it does not quarantine straight away. tuic/mieru are excluded — meow-rs
-/// cannot tunnel them (SPEC §8.5).
+/// Batch for a T2 tunnel check through meow-rs (SPEC §8.2): every `alive`
+/// proxy of a T2-supported scheme (T2 re-verifies the tunnel), plus
+/// `unknown` hysteria2 — hysteria2 is excluded from T1 by design (a TCP
+/// connect to a QUIC port proves nothing, SPEC §8.5), so T2 is its first
+/// and only check; a failure counts through the regular `fail_limit`, it
+/// does not quarantine straight away.
+///
+/// The order is **checked longest ago first** (owner decision 2026-09-06):
+/// proxies with no T2 attempt yet come first, then the ones whose last T2
+/// check is the oldest — `ORDER BY RANDOM()` could leave a proxy
+/// tunnel-unverified for months in a large pool while its `alive` status
+/// rested on T1 connectivity alone. The like-for-like counterpart of the
+/// T1 priority queue (SPEC §8.3): the first real verdict arrives within one
+/// cycle, the rest of the population follows by recency. The history
+/// lookup goes through `idx_probe_t2_last` (partial index, migration 0006);
+/// SQLite sorts NULLs first in ascending order, so the single `MAX`
+/// expression yields both tiers — never-checked before everything else,
+/// then the oldest last checks. Among peers with the same recency the row
+/// order is id-ascending, which spreads the batch across the pool as it
+/// cycles through it.
 pub async fn select_t2_candidates(pool: &DbPool, limit: u32) -> crate::Result<Vec<ProxyRow>> {
     let rows: Vec<ProxyRow> = sqlx::query_as(
         "SELECT p.*
          FROM proxies p
          WHERE (p.status = 'alive' OR (p.status = 'unknown' AND p.scheme = 'hysteria2'))
-           AND p.scheme NOT IN ('tuic', 'mieru')
+           AND p.scheme IN ('vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'socks5')
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
-         ORDER BY RANDOM()
+         ORDER BY (SELECT MAX(r.checked_at) FROM probe_results r
+                   WHERE r.proxy_id = p.id AND r.probe_kind = 't2') ASC,
+                  p.id ASC
          LIMIT ?",
     )
     .bind(i64::from(limit))
@@ -1983,9 +2005,14 @@ mod tests {
         let quarantined = entry("quar", "h3.example.com", 443);
         let removed = entry("gone", "h4.example.com", 443);
         // tuic cannot pass T1 by design — even an "alive" one must not be
-        // offered to T2 (meow-rs cannot tunnel it, SPEC §8.5).
+        // offered to T2 (meow-rs cannot tunnel it, SPEC §8.5). naive passes
+        // that old NOT IN guard but has no mihomo counterpart either: the
+        // allowlist must keep it out too, or under the recency order it
+        // would occupy the head of every batch (starvation).
         let mut alive_unprobeable = entry("tuic", "h5.example.com", 443);
         alive_unprobeable.scheme = Scheme::Tuic;
+        let mut alive_naive = entry("naive", "h7.example.com", 443);
+        alive_naive.scheme = Scheme::Naive;
         // hysteria2 skips T1 entirely (a TCP connect proves nothing on
         // QUIC): an `unknown` one goes straight to the T2 batch.
         let mut fresh_hysteria2 = entry("hy2", "h6.example.com", 443);
@@ -1997,6 +2024,7 @@ mod tests {
             removed.clone(),
             alive_unprobeable.clone(),
             fresh_hysteria2.clone(),
+            alive_naive.clone(),
         ];
         reconcile_source(&pool, "srcA0000000", &all, &[], 1000, false)
             .await
@@ -2009,6 +2037,7 @@ mod tests {
             (&removed, "removed"),
             (&alive_unprobeable, "alive"),
             (&fresh_hysteria2, "unknown"),
+            (&alive_naive, "alive"),
         ] {
             sqlx::query("UPDATE proxies SET status = ? WHERE fingerprint = ?")
                 .bind(status)
@@ -2022,6 +2051,102 @@ mod tests {
         candidates.sort_by(|a, b| a.host.cmp(&b.host));
         let hosts: Vec<&str> = candidates.iter().map(|row| row.host.as_str()).collect();
         assert_eq!(hosts, vec!["h1.example.com", "h6.example.com"]);
+    }
+
+    /// Journal one probe result straight into the history table.
+    async fn journal_result(pool: &DbPool, id: i64, at: i64, ok: bool, kind: &str) {
+        sqlx::query(
+            "INSERT INTO probe_results (proxy_id, checked_at, ok, probe_kind)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(at)
+        .bind(ok)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The T2 batch is recency-prioritized (owner decision 2026-09-06):
+    /// never-checked proxies first, then the ones whose last T2 check is
+    /// the oldest — a large pool must not keep a proxy tunnel-unverified
+    /// for months while its `alive` rests on T1 connectivity alone.
+    #[tokio::test]
+    async fn t2_sample_prioritizes_never_checked_then_oldest_last_check() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        // Five alive proxies: two never T2-checked, three checked at
+        // increasing timestamps.
+        let all = vec![
+            entry("fresh-a", "a.example.com", 443),
+            entry("fresh-b", "b.example.com", 443),
+            entry("stale", "s.example.com", 443),
+            entry("mid", "m.example.com", 443),
+            entry("recent", "r.example.com", 443),
+        ];
+        reconcile_source(&pool, "srcA0000000", &all, &[], 1000, false)
+            .await
+            .unwrap();
+        let id_of = async |fp: &str| get_by_fingerprint(&pool, fp).await.unwrap().unwrap().id;
+        let stale_id = id_of(&entry("stale", "s.example.com", 443).fingerprint()).await;
+        let mid_id = id_of(&entry("mid", "m.example.com", 443).fingerprint()).await;
+        let recent_id = id_of(&entry("recent", "r.example.com", 443).fingerprint()).await;
+        for (id, at) in [(stale_id, 100), (mid_id, 200), (recent_id, 300)] {
+            journal_result(&pool, id, at, true, "t2").await;
+        }
+        // T1 history must not disturb the T2 recency: `stale` also has a
+        // fresh tcp row, yet its last t2 is still the oldest.
+        journal_result(&pool, stale_id, 9_999, true, "tcp").await;
+        sqlx::query("UPDATE proxies SET status = 'alive' WHERE status = 'unknown'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let candidates = select_t2_candidates(&pool, 100).await.unwrap();
+        let hosts: Vec<&str> = candidates.iter().map(|row| row.host.as_str()).collect();
+        // Never-checked first, then the oldest last check upward; ties
+        // between the two never-checked rows break by id, which follows
+        // insertion order here (a, b).
+        assert_eq!(
+            hosts,
+            vec![
+                "a.example.com",
+                "b.example.com",
+                "s.example.com",
+                "m.example.com",
+                "r.example.com",
+            ]
+        );
+
+        // A limit cuts from the tail: the freshest-recently-checked row
+        // waits for a later batch, the head of the order is unchanged.
+        let head = select_t2_candidates(&pool, 3).await.unwrap();
+        let hosts: Vec<&str> = head.iter().map(|row| row.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            vec!["a.example.com", "b.example.com", "s.example.com"]
+        );
+    }
+
+    /// The SQL allowlist must mirror what meow-rs can actually tunnel
+    /// (fumox-probe filters the batch through `clash::is_supported`). A
+    /// divergence would either drop rows the SQL offered — under the
+    /// recency order a perpetually uncheckable row (e.g. naive) would
+    /// starve the whole batch — or skip schemes meow-rs handles fine.
+    #[test]
+    fn t2_scheme_allowlist_mirrors_meow_support() {
+        use crate::models::Scheme;
+        // The mirror lives in fumox-probe::clash::is_supported; the core
+        // crate cannot depend on it, so assert the exact expected set
+        // instead: adding a scheme there (or removing one) must update
+        // T2_SCHEMES in the same change.
+        let meow_supported: Vec<&str> = Scheme::all()
+            .iter()
+            .filter(|scheme| !matches!(scheme, Scheme::Tuic | Scheme::Mieru | Scheme::Naive))
+            .map(|scheme| scheme.as_str())
+            .collect();
+        assert_eq!(T2_SCHEMES, meow_supported.as_slice());
     }
 
     #[tokio::test]

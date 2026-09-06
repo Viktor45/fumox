@@ -613,7 +613,7 @@ form.
 | Key                          | Default             | Meaning                                                                      |
 | ---------------------------- | ------------------- | ---------------------------------------------------------------------------- |
 | `cycle_interval_secs`        | `60`                | Scheduling cycle period                                                      |
-| `sample_size`                | `50`                | Random sample of proxies checked per cycle (spreads load, no bursts)         |
+| `sample_size`                | `50`                | Proxies checked per cycle: a random T1 sample and a recency-prioritized T2 batch (spreads load, no bursts) |
 | `fail_limit`                 | `3`                 | Consecutive failures before quarantine (T1 and T2 share one counter)         |
 | `connect_timeout_secs`       | `10`                | T1 TCP-connect timeout                                                       |
 | `tls_timeout_secs`           | `10`                | T1 TLS-handshake timeout                                                     |
@@ -758,6 +758,10 @@ cycle in four passes:
    URL from `[meow].test_url` (the checks rotate across the configured list).
    The sample consists of `alive` proxies plus never-checked `unknown`
    hysteria2, which T1 cannot say anything about (see below).
+   The sample order is by recency, not random: proxies without a single
+   tunnel check come first, then the ones whose last check is the oldest —
+   in a large pool no proxy lingers without a tunnel verdict while its
+   `alive` rests on a bare TCP connect.
 
 The priority queue gives brand-new proxies a first check within one cycle of
 the source refresh instead of waiting out the random sample — with large
@@ -846,7 +850,7 @@ panel's *Settings* page.
 | `[probe].second_chance_spread_hours` | `4`                 | Second-chance window width: the check happens in `[min, min + spread)`                                                                              |
 | `[probe].recheck_delays_secs`        | `[900, 1800, 3600]` | Recheck ladder after a failed second chance: 15 min → 30 min → 1 h; up to 16 steps of ≤ 30 days, `[]` = remove right after the failed second chance |
 | `[probe].cycle_interval_secs`        | `60`                | How often quarantine dues run and T1/T2 samples are drawn                                                                                           |
-| `[probe].sample_size`                | `50`                | Random T1 sample size per cycle; the same limit caps quarantine checks per cycle                                                                    |
+| `[probe].sample_size`                | `50`                | T1 sample size (random) and T2 batch size (recency-prioritized) per cycle; the same limit caps quarantine checks per cycle                          |
 | `[probe].connect_timeout_secs`       | `10`                | T1 TCP-connect timeout (including quarantine checks)                                                                                                |
 | `[probe].tls_timeout_secs`           | `10`                | T1 TLS-handshake timeout                                                                                                                            |
 | `[probe].concurrency`                | `8`                 | Parallelism of checks                                                                                                                               |

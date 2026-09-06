@@ -120,6 +120,7 @@ mod tests {
             "idx_probe_time",
             "idx_probe_requests_time",
             "idx_proxies_ladder",
+            "idx_probe_t2_last",
             "idx_speed_proxy_time",
             "idx_fetch_source_time",
             "idx_fetch_time",
@@ -129,7 +130,7 @@ mod tests {
 
         // Schema version is stamped into meta by db::migrate.
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("5"));
+        assert_eq!(version.as_deref(), Some("6"));
 
         // WAL is active on the connection.
         let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")

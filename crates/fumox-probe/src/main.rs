@@ -8,6 +8,9 @@
 //!    the `unknown`/`alive` population (SPEC §8.1, §8.3);
 //! 3. **T2** — real tunnel checks for `alive` proxies through the meow-rs
 //!    REST API (SPEC §8.2), skipped with backoff when meow-rs is down.
+//!    The batch is recency-prioritized: proxies without a single T2
+//!    attempt first, then the ones whose last T2 check is the oldest
+//!    (owner decision 2026-09-06).
 //!
 //! All lifecycle state lives in SQLite, so the daemon is restart-safe:
 //! after a restart it simply resumes the schedules persisted in the DB.

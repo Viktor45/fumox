@@ -26,6 +26,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Redirect hops allowed between the shortlink and the release asset.
 const MAX_REDIRECTS: usize = 5;
+/// Upper bound on one database download: the City database is ~70 MB, so
+/// anything larger is a broken or hostile mirror, not a database. The
+/// stream is cut as soon as the running total passes the cap, so a rogue
+/// endpoint cannot fill the disk (the response is streamed to a temp file
+/// and would otherwise be bounded only by the 5-minute budget).
+const MAX_MMDB_BYTES: u64 = 512 * 1024 * 1024;
 /// The MaxMind metadata marker; a real `.mmdb` ends with its metadata block.
 const METADATA_MARKER: &[u8] = b"\xab\xcd\xefMaxMind.com";
 /// Tail window scanned for the metadata marker.
@@ -218,6 +224,17 @@ fn tmp_path(dest: &Path) -> PathBuf {
 }
 
 async fn download_body(url: &str, tmp: &Path, user_agent: &str) -> Result<u64, String> {
+    download_body_capped(url, tmp, user_agent, MAX_MMDB_BYTES).await
+}
+
+/// [`download_body`] with an explicit size cap, so tests can exercise the
+/// cutoff without streaming half a gigabyte.
+async fn download_body_capped(
+    url: &str,
+    tmp: &Path,
+    user_agent: &str,
+    max_bytes: u64,
+) -> Result<u64, String> {
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent(user_agent.to_string())
@@ -241,15 +258,23 @@ async fn download_body(url: &str, tmp: &Path, user_agent: &str) -> Result<u64, S
         use tokio::io::AsyncWriteExt;
         let mut total = 0u64;
         // `chunk()` streams the body without pulling in a Stream extension.
+        // The running total is checked before the write: a rogue mirror
+        // streaming an endless body is cut at MAX_MMDB_BYTES, not bounded
+        // only by the download budget.
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|err| format!("download interrupted: {err}"))?
         {
+            total += chunk.len() as u64;
+            if total > max_bytes {
+                return Err(format!(
+                    "download exceeds the {max_bytes} byte cap — not a GeoLite2 database"
+                ));
+            }
             file.write_all(&chunk)
                 .await
                 .map_err(|err| format!("cannot write the temporary file: {err}"))?;
-            total += chunk.len() as u64;
         }
         file.flush()
             .await
@@ -348,5 +373,58 @@ mod tests {
         let name = tmp.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("GeoLite2-City.mmdb."), "name was: {name}");
         assert!(name.ends_with(".tmp"));
+    }
+
+    /// A mirror streaming more than the cap must be cut off with an error
+    /// and the destination kept intact (security audit, 2026-09-06).
+    /// Exercised with a tiny cap through [`download_body_capped`] so the
+    /// test does not actually write half a gigabyte to disk.
+    #[tokio::test]
+    async fn oversized_download_is_cut_off_at_the_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        const CAP: u64 = 4 * 1024;
+        const SERVE: usize = 64 * 1024;
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {SERVE}\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                // Keep streaming until the client hangs up on the cap.
+                let zeros = vec![0u8; SERVE];
+                loop {
+                    if sock.write_all(&zeros).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let dir = scratch_dir();
+        let dest = dir.join("GeoLite2-Country.mmdb");
+        // A plausible previous database must survive the failed refresh.
+        std::fs::write(&dest, fake_mmdb(b"previous")).unwrap();
+
+        let err = download_body_capped(
+            &format!("http://{addr}/GeoLite2-Country.mmdb"),
+            &tmp_path(&dest),
+            "fumox-test",
+            CAP,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("byte cap"), "{err}");
+
+        // The temp file was cleaned up by the caller contract (checked by
+        // download_and_install in production); here only the error and the
+        // intact destination matter.
+        assert_eq!(std::fs::read(&dest).unwrap(), fake_mmdb(b"previous"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

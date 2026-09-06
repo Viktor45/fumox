@@ -51,6 +51,9 @@
     <h2>{{ self.t("probe.meow_title") }} <span class="badge neutral">probe</span></h2>
     <table class="kv">
       <tbody>
+        <tr><td>REST API</td><td class="mono small">{{ state.meow.api_addr }}</td></tr>
+        <tr><td>{{ self.t("probe.clash_config") }}</td><td class="mono small">{{ state.meow.config_path.display() }}</td></tr>
+        <tr><td>{{ self.t("probe.test_url") }}</td><td class="mono small">{{ state.meow.test_url.join(", ") }}</td></tr>
         <tr><td>{{ self.t("probe.check_timeout") }}</td><td>{{ state.meow.timeout_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><td>{{ self.t("set.backoff_initial") }}</td><td>{{ state.meow.backoff_initial_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><td>{{ self.t("set.backoff_max") }}</td><td>{{ state.meow.backoff_max_secs }} {{ self.t("common.sec") }}</td></tr>

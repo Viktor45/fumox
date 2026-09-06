@@ -735,6 +735,57 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
+    /// Vendored assets and HEAD requests bypass the admin rate limiter
+    /// (security audit, 2026-09-06): they must stay servable even after the
+    /// per-IP window is exhausted — a page hit by 429 still needs its CSS
+    /// to render the rate-limit message.
+    #[tokio::test]
+    async fn static_assets_and_head_bypass_the_rate_limit() {
+        let state = test_state(2).await;
+        let app = router(state);
+
+        // Burn the window with plain GETs of the panel root.
+        assert_eq!(
+            app.clone()
+                .oneshot(request("GET", "/admin/login", "", None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("GET", "/admin/login", "", None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("GET", "/admin/login", "", None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        // The window is exhausted, yet the assets and a HEAD still serve.
+        for uri in ["/admin/static/app.css", "/admin/static/htmx.min.js"] {
+            let response = app
+                .clone()
+                .oneshot(request("GET", uri, "", None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+        let response = app
+            .oneshot(request("HEAD", "/admin/login", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn list_screens_render_for_an_authenticated_session() {
         let state = test_state(1000).await;

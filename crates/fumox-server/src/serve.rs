@@ -122,6 +122,10 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
     }
     let response = next.run(req).await;
     if response.status() == StatusCode::FORBIDDEN && !state.limits.auth_failures.allow(&ip).await {
+        // The failure window rejected the request — give the hit back to the
+        // generous window so one brute-force attempt does not cost the
+        // caller two windows (security audit, 2026-09-06).
+        state.limits.all.refund(&ip).await;
         return error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed access attempts, try again later",
@@ -810,6 +814,48 @@ mod tests {
                 "10.1.1.2"
             )
             .await,
+            StatusCode::OK
+        );
+    }
+
+    /// A 429 from the strict failure window must refund its hit in the
+    /// generous window: brute-forcing the token may exhaust the failure
+    /// budget, but must not also eat into the plain request ceiling
+    /// (security audit, 2026-09-06).
+    #[tokio::test]
+    async fn failure_window_429_does_not_burn_the_generous_window() {
+        // both limits are small and equal, so the refund is observable:
+        // without it the third request (rejected by the failure window)
+        // would have also consumed the third slot of the generous window.
+        let state = state_with_limits(PublicRateLimits::new(3, 2)).await;
+        let profile = make_profile(&state, "profRef000000", &[]).await;
+        sqlx::query("UPDATE profiles SET access_token = 'secret' WHERE id = ?")
+            .bind(&profile.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = router(state);
+
+        let bad = format!("/sub/{}?token=wrong", profile.id);
+        let ok = format!("/sub/{}?token=secret", profile.id);
+        // Two failed checks: each counted in both windows, both allowed.
+        assert_eq!(
+            get_with_ip(app.clone(), &bad, "10.2.2.2").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_with_ip(app.clone(), &bad, "10.2.2.2").await,
+            StatusCode::FORBIDDEN
+        );
+        // Third failure: the failure window is done — 429, and the hit it
+        // consumed in the generous window comes back.
+        assert_eq!(
+            get_with_ip(app.clone(), &bad, "10.2.2.2").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // The generous window still has its slots: a correct token serves.
+        assert_eq!(
+            get_with_ip(app.clone(), &ok, "10.2.2.2").await,
             StatusCode::OK
         );
     }

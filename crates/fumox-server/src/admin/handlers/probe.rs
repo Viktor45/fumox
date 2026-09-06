@@ -59,7 +59,6 @@ struct ProbeTemplate {
     heartbeat: Option<Heartbeat>,
     meow_last_ok: Option<i64>,
     queue: Vec<QuarantineRow>,
-    state: AdminState,
 }
 
 impl ProbeTemplate {
@@ -92,7 +91,8 @@ impl ProbeTemplate {
 impl_i18n!(ProbeTemplate);
 
 /// Probe overview (ADMIN_PLAN §4.5): status aggregates, daemon heartbeat,
-/// meow-rs status, the quarantine queue and read-only cycle settings.
+/// meow-rs status and the quarantine queue. The read-only config tables
+/// live on the Settings page (ADMIN_PLAN §4.7).
 pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
@@ -157,7 +157,6 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
             heartbeat,
             meow_last_ok,
             queue,
-            state,
         },
         StatusCode::OK,
     )

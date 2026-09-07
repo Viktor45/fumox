@@ -59,6 +59,12 @@ cp config/GeoLite2-*.mmdb ~/fumox/config/   # optional: geo enrichment
    $EDITOR ~/.config/fumox/fumox.env          # set FUMOX_ADMIN__TOKEN
    ```
 
+   Besides `FUMOX_ADMIN__TOKEN`, the file can set `FUMOX_CONFIG` — the path
+   to the TOML config file inside the container (default:
+   `/app/config/app.toml` from the mounted config directory). Unit-level
+   `Environment=` values outrank this file, which is exactly why the path is
+   not fixed in the units — configure it here.
+
 2. Install the units (every file from the folder — into one unit directory):
 
    ```sh

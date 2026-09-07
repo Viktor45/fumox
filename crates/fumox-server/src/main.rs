@@ -31,7 +31,8 @@ use crate::scheduler::SchedulerState;
 #[derive(Parser)]
 #[command(name = "fumox-server", version, about = "Fumox subscription server")]
 struct Cli {
-    /// Path to the TOML config file (defaults to config/app.toml if present).
+    /// Path to the TOML config file (outranks FUMOX_CONFIG; the default
+    /// location is config/app.toml if present).
     #[arg(short, long)]
     config: Option<PathBuf>,
 }
@@ -51,8 +52,25 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    if cli.config.is_none() && !std::path::Path::new(fumox_core::DEFAULT_CONFIG_PATH).is_file() {
-        tracing::info!("config file not found, using built-in defaults");
+    // The loader cannot log (its own level comes from the config); report
+    // the file actually used once tracing is up.
+    match fumox_core::config::resolve_config_path(cli.config.as_deref()) {
+        Ok(fumox_core::config::ResolvedConfigPath::Loaded(file)) => {
+            tracing::info!(config = %file.display(), "config file loaded");
+        }
+        Ok(fumox_core::config::ResolvedConfigPath::Missing) => {
+            tracing::info!(
+                "no config file found (looked at {} or {}); using built-in defaults",
+                fumox_core::config::CONFIG_PATH_ENV,
+                fumox_core::DEFAULT_CONFIG_PATH
+            );
+        }
+        Err(already_reported) => {
+            // load() failed on the same resolution a moment ago — this
+            // arm is unreachable, but a misreported startup is worse than
+            // a redundant line.
+            tracing::warn!(%already_reported, "config file resolution failed");
+        }
     }
 
     let pool = fumox_core::db::connect_pool(&config.database).await?;

@@ -15,9 +15,20 @@ ContainerName=fumox-server
 Pod=fumox.pod
 
 # .env equivalent (see fumox.env.example); must exist before first start.
+# Values here CANNOT be overridden from the env file — podman gives
+# Environment= precedence over EnvironmentFile= — so only fixed wiring
+# lives in the unit; anything an operator may want to change belongs in
+# the env file.
 EnvironmentFile=%h/.config/fumox/fumox.env
 
 Environment=FUMOX_GEO__DB_DIR=/shared
+# Config file inside the container: the default below is what the image
+# uses anyway (config/app.toml relative to /app). Uncomment and adjust ONLY
+# if the file in the mounted config volume has a different name (the file
+# must exist — a missing one fails the startup loudly). Set it in the env
+# file instead when you just want to override the default:
+#   FUMOX_CONFIG=/app/config/app.toml
+#Environment=FUMOX_CONFIG=/app/config/app.toml
 
 # Left side: a directory with app.toml (and optional GeoLite2-*.mmdb).
 # %h expands to your home dir; point it at the repo's config/ if you prefer.

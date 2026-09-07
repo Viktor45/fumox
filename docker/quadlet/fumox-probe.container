@@ -18,6 +18,11 @@ EnvironmentFile=%h/.config/fumox/fumox.env
 
 # One network namespace inside the pod: meow is reached on loopback, not by
 # the compose DNS name "meow" (9090 is not published to the host).
+# The config file pointer (FUMOX_CONFIG) is NOT fixed here on purpose: values
+# in Environment= outrank the env file, and the operator may want to point it
+# at a differently named file in the mounted config volume — see
+# fumox.env.example. The image default (config/app.toml under /app) applies
+# when the variable is unset.
 Environment=FUMOX_GEO__DB_DIR=/shared
 Environment=FUMOX_MEOW__API_ADDR=127.0.0.1:9090
 Environment=FUMOX_MEOW__CONFIG_PATH=/shared/meow.yaml

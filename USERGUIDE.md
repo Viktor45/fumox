@@ -289,13 +289,16 @@ fumox-server [OPTIONS]
 fumox-probe  [OPTIONS]
 
 Options:
-  -c, --config <CONFIG>  Path to the TOML config file
-                         (defaults to config/app.toml if present)
+  -c, --config <CONFIG>  Path to the TOML config file (outranks FUMOX_CONFIG)
   -h, --help             Print help
   -V, --version          Print version
 ```
 
-That's the entire CLI — everything else is configuration. The server creates
+That's the entire CLI — everything else is configuration (the TOML file
+location can also be set with the `FUMOX_CONFIG` environment variable;
+without the flag or the variable, `config/app.toml` is used if present —
+the full layering is described in [section 8](#how-configuration-is-resolved)).
+The server creates
 the database and runs migrations on startup, then serves until SIGINT/SIGTERM
 (graceful shutdown). The probe opens no listening sockets at all.
 
@@ -533,12 +536,18 @@ Day/night themes are switched on the login screen or in the top bar
 Three layers, later wins:
 
 1. **Built-in defaults** — every key has one; Fumox runs with no config file at all.
-2. **TOML file** — `config/app.toml` by default, or whatever you pass via
-   `--config / -c`. The file may be partial: only the sections you care about.
+2. **TOML file** — the location is picked by priority: the `--config / -c`
+   flag → the `FUMOX_CONFIG` environment variable → `config/app.toml`
+   relative to the current directory. The file may be partial: only the
+   sections you care about. A file requested via the flag or the variable
+   must exist (a typo in the path is a loud startup error, not a silent
+   fall back to defaults); only the default location may be absent —
+   then the app runs on built-in defaults.
 3. **Environment variables** — `FUMOX_SECTION__KEY`, where a double underscore
    separates the section from the key:
 
    ```bash
+   FUMOX_CONFIG=/etc/fumox/app.toml  # path to the TOML file (when --config is absent)
    FUMOX_ADMIN__TOKEN=secret          # [admin] token
    FUMOX_DATABASE__PATH=/data/f.db    # [database] path
    FUMOX_MEOW__API_ADDR=meow:9090     # [meow] api_addr

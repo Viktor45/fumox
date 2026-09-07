@@ -13,7 +13,10 @@
 #   3. Create the env secret (envFrom on server and probe):
 #        printf 'FUMOX_ADMIN__TOKEN=change-me\n' | podman secret create fumox-env -
 #      Append FUMOX_MEOW__TEST_URL / FUMOX_ADMIN__ALLOW_PRIVATE_URLS lines
-#      to override those defaults.
+#      to override those defaults. FUMOX_CONFIG (a path to a differently
+#      named TOML inside the mounted config volume; unset = the image
+#      default /app/config/app.toml) can ride in the same secret — the
+#      manifest deliberately keeps only the fixed wiring in `env:`.
 #   4. The PVCs fumox-data / meow-shared are backed by podman named volumes
 #      created automatically on first start (`podman volume ls`).
 #

@@ -115,9 +115,9 @@ sample_size = 50              # случайная выборка прокси �
 # Consecutive failed checks before quarantine. For a fresh proxy these are
 # T1 checks (priority queue, then the random sample); T2 failures count in
 # the same counter. Lower it to stop spending T1 time on dead proxies.
-fail_limit = 3
-connect_timeout_secs = 10     # T1: TCP-connect
-tls_timeout_secs = 10         # T1: TLS-handshake
+fail_limit = 2
+connect_timeout_secs = 5     # T1: TCP-connect
+tls_timeout_secs = 5         # T1: TLS-handshake
 concurrency = 8
 heartbeat_interval_secs = 30  # meta-ключ probe_heartbeat для админки / probe_heartbeat meta key consumed by the admin panel
 # Второй шанс для прокси в карантине: повторная проверка в случайный момент
@@ -127,8 +127,8 @@ heartbeat_interval_secs = 30  # meta-ключ probe_heartbeat для админ�
 # [12h, 16h) window after quarantine — the window is min plus a random
 # addition from 0 to spread (UTC, the moment is fixed in the database when
 # quarantined).
-second_chance_min_hours = 12
-second_chance_spread_hours = 4
+second_chance_min_hours = 3
+second_chance_spread_hours = 1
 # Лестница повторных проверок карантина: задержки в секундах
 # между последовательными ретраями после провала второго шанса. Провал ретрая
 # N назначает ретрай N+1 через recheck_delays_secs[N-1]; провал последней
@@ -139,7 +139,7 @@ second_chance_spread_hours = 4
 # schedules recheck N+1 after recheck_delays_secs[N-1]; failing the last
 # entry removes the proxy. Arbitrary length (up to 16 steps of at most 30
 # days); an empty list removes right after the failed second chance.
-recheck_delays_secs = [900, 1800, 3600]   # 15 мин → 30 мин → 1 ч / 15m → 30m → 1h
+recheck_delays_secs = [600, 900]   # 10 мин → 15 мин / 10m → 15m
 # Записи очереди приоритетных проверок (probe_requests) старше этого срока
 # удаляются (ежедневная задача ротации).
 # Priority-queue entries (probe_requests) older than this are purged.
@@ -179,7 +179,7 @@ test_url = [
   "http://connectivitycheck.android.com/generate_204", # legacy Android 4.x, still alive
   "http://clients3.google.com/generate_204",           # legacy Android 2.3-4.x, still alive
 ]
-timeout_secs = 10
+timeout_secs = 7
 # Backoff повторных обращений к meow-rs, когда он недоступен (удваивается с
 # каждым подряд идущим провалом, от initial до max).
 # Retry backoff while meow-rs is unavailable (doubles per consecutive
@@ -190,8 +190,8 @@ backoff_max_secs = 900
 [retention]
 # Ротация истории (ежедневная задача в probe).
 # History rotation (a daily task in the probe daemon).
-probe_results_days = 14
-fetch_log_days = 30
+probe_results_days = 7
+fetch_log_days = 7
 
 [log]
 # Уровень консольных логов каждого процесса: error | warn | info | debug | trace.

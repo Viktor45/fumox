@@ -7,6 +7,10 @@
 //!
 //! Every key has a default so the service runs out of the box (PLAN, gap 13).
 //! Unknown keys are rejected to catch typos early.
+//!
+//! The TOML file itself is located by (strongest first): the `--config`
+//! CLI flag, the `FUMOX_CONFIG` environment variable, then the default
+//! `config/app.toml` resolved against the CWD.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -22,6 +26,15 @@ use crate::models::IpFamily;
 
 /// Default location of the TOML config file, resolved against the CWD.
 pub const DEFAULT_CONFIG_PATH: &str = "config/app.toml";
+
+/// Environment variable pointing at the TOML config file — the middle
+/// layer between the `--config` flag (strongest) and the default location.
+pub const CONFIG_PATH_ENV: &str = "FUMOX_CONFIG";
+
+/// Key of [`CONFIG_PATH_ENV`] after the `FUMOX_` prefix is stripped — the
+/// value provider must ignore it, or `deny_unknown_fields` rejects the
+/// pointer as an unknown top-level `config` key.
+const CONFIG_PATH_KEY: &str = "config";
 
 /// Top-level application configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -49,40 +62,88 @@ pub struct AppConfig {
     pub log: LogConfig,
 }
 
+/// Where the TOML config file was looked for, as resolved by
+/// [`AppConfig::load`] — lets the binaries log the truth (the loader
+/// itself cannot: the tracing subscriber is not installed until after the
+/// config, which carries the log level, is loaded).
+#[derive(Debug, PartialEq)]
+pub enum ResolvedConfigPath {
+    /// The file at this path was merged into the configuration.
+    Loaded(PathBuf),
+    /// No file anywhere — the service runs on built-in defaults plus env
+    /// overrides. The default location may legitimately be absent
+    /// (out-of-the-box run), so this is not an error.
+    Missing,
+}
+
+/// Resolve the TOML file location by priority: the explicit `path` (the
+/// `--config` flag) → [`CONFIG_PATH_ENV`] → [`DEFAULT_CONFIG_PATH`] against
+/// the CWD. An explicitly requested file (flag or env) must exist — a typo
+/// must fail loudly, not silently fall back to defaults. An empty env
+/// value counts as unset.
+pub fn resolve_config_path(path: Option<&Path>) -> crate::Result<ResolvedConfigPath> {
+    match path {
+        Some(p) => {
+            if p.is_file() {
+                Ok(ResolvedConfigPath::Loaded(p.to_path_buf()))
+            } else {
+                Err(crate::Error::Config(format!(
+                    "config file not found: {}",
+                    p.display()
+                )))
+            }
+        }
+        None => {
+            // No CLI flag — the env pointer, if set, wins over the default
+            // location. An empty value counts as unset.
+            let from_env = std::env::var(CONFIG_PATH_ENV)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from);
+            let file = from_env
+                .as_deref()
+                .unwrap_or(Path::new(DEFAULT_CONFIG_PATH));
+            if !file.is_file() {
+                if from_env.is_some() {
+                    return Err(crate::Error::Config(format!(
+                        "config file set via {CONFIG_PATH_ENV} not found: {}",
+                        file.display()
+                    )));
+                }
+                // The default location being absent is the out-of-the-box
+                // run, not an error.
+                return Ok(ResolvedConfigPath::Missing);
+            }
+            Ok(ResolvedConfigPath::Loaded(file.to_path_buf()))
+        }
+    }
+}
+
 impl AppConfig {
     /// Loads configuration from defaults, an optional TOML file and the
     /// environment.
     ///
-    /// When `path` is given explicitly the file must exist; when it is
-    /// `None`, the default location is used if present and silently skipped
-    /// otherwise (out-of-the-box run with built-in defaults).
+    /// The file location is resolved by [`resolve_config_path`]: the
+    /// explicit `path` (the `--config` flag) → the [`CONFIG_PATH_ENV`]
+    /// environment variable → [`DEFAULT_CONFIG_PATH`] against the CWD.
+    /// Every key has a default, so a missing default file runs the
+    /// service out of the box.
     pub fn load(path: Option<&Path>) -> crate::Result<Self> {
         let mut figment = Figment::from(Serialized::defaults(Self::default()));
 
-        match path {
-            Some(p) => {
-                if !p.is_file() {
-                    return Err(crate::Error::Config(format!(
-                        "config file not found: {}",
-                        p.display()
-                    )));
-                }
-                figment = figment.merge(Toml::file(p));
-            }
-            None => {
-                let default_path = Path::new(DEFAULT_CONFIG_PATH);
-                if default_path.is_file() {
-                    figment = figment.merge(Toml::file(default_path));
-                }
-                // A missing default file is not logged here: the subscriber
-                // is not installed yet (the level itself comes from this
-                // config). The binaries report it after `init_tracing`.
-            }
+        if let ResolvedConfigPath::Loaded(file) = resolve_config_path(path)? {
+            figment = figment.merge(Toml::file(file));
         }
 
         // Environment overrides: FUMOX_SECTION__KEY (double underscore splits
-        // the section path).
-        figment = figment.merge(Env::prefixed("FUMOX_").split("__"));
+        // the section path). FUMOX_CONFIG itself is the file pointer handled
+        // above, not a config key — keep it out of the value layer.
+        figment = figment.merge(
+            Env::prefixed("FUMOX_")
+                .split("__")
+                .ignore(&[CONFIG_PATH_KEY]),
+        );
 
         let config: Self = figment.extract()?;
         config.validate()?;
@@ -868,6 +929,14 @@ mod tests {
 
     #[test]
     fn defaults_load_without_file() {
+        // The env-pointer must not leak from other tests into this one:
+        // `defaults_load_without_file` asserts the built-in defaults.
+        let _guard = env_mutex().lock();
+        // SAFETY: every touch of FUMOX_CONFIG across the test suite is
+        // serialized by `env_mutex`; other threads read the variable only
+        // through the same lock.
+        unsafe { std::env::remove_var(CONFIG_PATH_ENV) };
+
         let cfg = AppConfig::load(None).expect("defaults must load");
         assert_eq!(cfg.admin.bind.to_string(), "127.0.0.1:8081");
         assert_eq!(cfg.database.busy_timeout_ms, 5000);
@@ -935,6 +1004,66 @@ mod tests {
     fn missing_explicit_path_is_an_error() {
         let err = AppConfig::load(Some(Path::new("/nonexistent/app.toml"))).unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
+    }
+
+    /// Serializes the tests that touch `FUMOX_CONFIG`: the process
+    /// environment is shared by every test thread, so two of them
+    /// manipulating the variable concurrently would race.
+    fn env_mutex() -> &'static std::sync::Mutex<()> {
+        static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// `FUMOX_CONFIG` points the loader at the TOML file when no CLI flag
+    /// is given; the flag keeps priority over the variable, and a set
+    /// variable whose file is missing is an error, not a silent fallback.
+    #[test]
+    fn env_pointed_config_file_is_loaded_and_validated() {
+        let _guard = env_mutex().lock();
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("env.toml");
+        std::fs::write(&file, "[retention]\nprobe_results_days = 7\n").unwrap();
+
+        // SAFETY: every touch of FUMOX_CONFIG across the test suite is
+        // serialized by `env_mutex`; other threads read the variable only
+        // through the same lock.
+        unsafe { std::env::set_var(CONFIG_PATH_ENV, &file) };
+        let cfg = AppConfig::load(None).expect("env-pointed file must load");
+        assert_eq!(cfg.retention.probe_results_days, 7);
+        assert_eq!(
+            cfg.retention.fetch_log_days, 30,
+            "untouched keys keep defaults"
+        );
+
+        // The explicit flag outranks the variable.
+        let flag_file = dir.join("flag.toml");
+        std::fs::write(&flag_file, "[retention]\nprobe_results_days = 5\n").unwrap();
+        let cfg = AppConfig::load(Some(&flag_file)).expect("the flag must outrank the env pointer");
+        assert_eq!(cfg.retention.probe_results_days, 5);
+
+        // A variable naming a missing file is an operator typo — loud.
+        // SAFETY: see above.
+        let missing = dir.join("missing.toml");
+        unsafe { std::env::set_var(CONFIG_PATH_ENV, &missing) };
+        let err = AppConfig::load(None).unwrap_err();
+        assert!(
+            err.to_string().contains(CONFIG_PATH_ENV),
+            "the error names the variable: {err}"
+        );
+
+        // Empty (or whitespace) value counts as unset — the default
+        // location applies again, exactly like without the variable.
+        // SAFETY: see above.
+        unsafe { std::env::set_var(CONFIG_PATH_ENV, "   ") };
+        let cfg = AppConfig::load(None).expect("empty pointer behaves as unset");
+        assert_eq!(cfg.retention.probe_results_days, 14);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(CONFIG_PATH_ENV);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]

@@ -12,8 +12,10 @@
 #                  file in and restart to add a language (embedded fallbacks
 #                  keep the panel working if the directory is removed)
 #
-# Configuration is resolved from built-in defaults, then /app/config/app.toml
-# if mounted, then FUMOX_SECTION__KEY environment overrides. The image sets:
+# Configuration is resolved from built-in defaults, then a TOML file (by
+# priority: --config, the FUMOX_CONFIG environment variable, or
+# /app/config/app.toml if mounted), then FUMOX_SECTION__KEY environment
+# overrides. The image sets:
 #   FUMOX_DATABASE__PATH=/app/data/fumox.db
 #   FUMOX_ADMIN__BIND=0.0.0.0:8081   (upstream default is loopback-only)
 # You must additionally provide FUMOX_ADMIN__TOKEN to enable the admin panel.

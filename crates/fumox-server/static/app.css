@@ -481,6 +481,10 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 .cleanup-op p { margin: 4px 0 0; }
 .cleanup-op .inline-controls { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 .cleanup-op input, .cleanup-op select { padding: 6px 8px; font-size: 13.5px; width: 120px; }
+/* The global `overflow-wrap: anywhere` would let a squeezed flex child
+   break its label letter-by-letter; the action button must never shrink
+   or wrap. */
+.cleanup-op .btn { flex-shrink: 0; white-space: nowrap; }
 
 .login-wrap {
   min-height: 100vh;

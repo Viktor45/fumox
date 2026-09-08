@@ -83,6 +83,12 @@ pub(crate) struct BuilderState {
     pub filter_defaults: bool,
     pub protocols: Vec<String>,
     pub exclude_protocols: Vec<String>,
+    /// AS numbers to keep, comma-separated free text (`24940, AS13335`).
+    /// Not a registry-driven checkbox list: the AS space is far too large,
+    /// so the widget validates instead of enumerating.
+    pub asns: String,
+    /// AS numbers to drop, the same comma-separated form.
+    pub exclude_asns: String,
     pub normalize_params: bool,
     pub rename: Vec<RenameRow>,
     pub rename_skip: bool,
@@ -104,6 +110,15 @@ pub(crate) struct BuilderState {
     /// Empty or `"source"` is the default (never emitted).
     pub sort_by: String,
     pub sort_desc: bool,
+    /// The `limit` section — the same tri-state as sort, over a single
+    /// number field (the output-size cap).
+    pub limit_set: bool,
+    pub limit_defaults: bool,
+    /// Cap as free text (`"100"`). A mistyped entry stays in the field and
+    /// reaches the JSON as-is, so the preview/save validation reports it
+    /// instead of the widget silently dropping it (the same contract as
+    /// the ASN fields).
+    pub limit_count: String,
 }
 
 /// Form-field values a section mode control submits: the source form uses a
@@ -228,6 +243,7 @@ impl BuilderState {
         let (geo_set, geo_defaults) = mode_flags(&get("ped_geo"));
         let (health_set, health_defaults) = mode_flags(&get("ped_health"));
         let (sort_set, sort_defaults) = mode_flags(&get("ped_sort"));
+        let (limit_set, limit_defaults) = mode_flags(&get("ped_limit"));
         let rename_mode = get("ped_rename");
         let drop_mode = get("ped_drop");
 
@@ -236,6 +252,8 @@ impl BuilderState {
             filter_defaults,
             protocols: get_all("ped_filter_protocols"),
             exclude_protocols: get_all("ped_filter_exclude"),
+            asns: get("ped_filter_asns"),
+            exclude_asns: get("ped_filter_exclude_asns"),
             normalize_params: get("ped_normalize") == "1",
             rename: rename_rows.into_values().collect(),
             rename_skip: rename_mode == "skip",
@@ -254,6 +272,9 @@ impl BuilderState {
             sort_defaults,
             sort_by: get("ped_sort_by"),
             sort_desc: get("ped_sort_desc") == "1",
+            limit_set,
+            limit_defaults,
+            limit_count: get("ped_limit_count"),
         }
     }
 
@@ -279,6 +300,12 @@ impl BuilderState {
             }
             if !self.exclude_protocols.is_empty() {
                 filter.insert("exclude_protocols".into(), strings(&self.exclude_protocols));
+            }
+            if let Some(asns) = split_asn_field(&self.asns) {
+                filter.insert("asns".into(), strings(&asns));
+            }
+            if let Some(exclude) = split_asn_field(&self.exclude_asns) {
+                filter.insert("exclude_asns".into(), strings(&exclude));
             }
             if !self.normalize_params {
                 filter.insert("normalize_params".into(), serde_json::Value::from(false));
@@ -403,6 +430,26 @@ impl BuilderState {
             }
         }
 
+        if self.limit_defaults {
+            // An explicit `null` cap: a profile resets the source's limit
+            // back to "no cap" (the same reset semantics as an empty
+            // rename/drop array).
+            map.insert("limit".into(), serde_json::json!({ "count": null }));
+        } else if self.limit_set {
+            let raw = self.limit_count.trim();
+            if !raw.is_empty() {
+                // A valid number is written as a number; a mistyped entry
+                // rides along as a string so the validator reports it on
+                // the panel language instead of the field silently
+                // disappearing.
+                let value = match raw.parse::<i64>() {
+                    Ok(count) => serde_json::Value::from(count),
+                    Err(_) => serde_json::Value::from(raw),
+                };
+                map.insert("limit".into(), serde_json::json!({ "count": value }));
+            }
+        }
+
         if map.len() == 1 {
             None // only "version" — nothing configured
         } else {
@@ -430,7 +477,7 @@ impl BuilderState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ingest {
     /// The stored pipeline is fully representable by the builder fields.
-    Builder(BuilderState),
+    Builder(Box<BuilderState>),
     /// Structural parse failed (unknown fields, wrong types), the version is
     /// not 1, or the config means something the widget cannot express — the
     /// widget stays out of the way and the raw JSON is edited by hand;
@@ -450,12 +497,12 @@ impl BuilderState {
     /// it), while emitting `{}` keeps the meaning exactly.
     pub(crate) fn ingest(value: Option<&serde_json::Value>) -> Ingest {
         let Some(value) = value else {
-            return Ingest::Builder(Self::new());
+            return Ingest::Builder(Box::new(Self::new()));
         };
         match value {
-            serde_json::Value::Null => return Ingest::Builder(Self::new()),
+            serde_json::Value::Null => return Ingest::Builder(Box::new(Self::new())),
             serde_json::Value::Object(map) if map.is_empty() => {
-                return Ingest::Builder(Self::new());
+                return Ingest::Builder(Box::new(Self::new()));
             }
             _ => {}
         }
@@ -472,6 +519,16 @@ impl BuilderState {
             .filter
             .as_ref()
             .is_some_and(|f| f.protocols.as_ref().is_some_and(|p| p.is_empty()))
+        {
+            return Ingest::Raw;
+        }
+        // Same raw-guard for the ASN allowlist: an empty `asns` array is
+        // "keep nothing", which the text field cannot distinguish from
+        // "not set".
+        if config
+            .filter
+            .as_ref()
+            .is_some_and(|f| f.asns.as_ref().is_some_and(|a| a.is_empty()))
         {
             return Ingest::Raw;
         }
@@ -500,11 +557,18 @@ impl BuilderState {
                     .exclude_protocols
                     .as_ref()
                     .is_some_and(|p| !p.is_empty())
+                || filter.asns.as_ref().is_some_and(|a| !a.is_empty())
+                || filter.exclude_asns.as_ref().is_some_and(|a| !a.is_empty())
                 || !filter.normalize_params;
             if has_values {
                 state.filter_set = true;
                 state.protocols = filter.protocols.unwrap_or_default();
                 state.exclude_protocols = filter.exclude_protocols.unwrap_or_default();
+                // The stored spellings (bare or `AS`-prefixed) are kept
+                // verbatim: the validator accepts both, so the round trip
+                // does not rewrite what was configured.
+                state.asns = filter.asns.unwrap_or_default().join(", ");
+                state.exclude_asns = filter.exclude_asns.unwrap_or_default().join(", ");
                 state.normalize_params = filter.normalize_params;
             } else {
                 state.filter_defaults = true;
@@ -596,10 +660,22 @@ impl BuilderState {
                 state.sort_defaults = true;
             }
         }
+        if let Some(limit) = config.limit {
+            match limit.count {
+                // `null` is the explicit "no cap" reset of the profile
+                // tri-state; a set cap is 1 or more (0/negative already
+                // failed validation before ingest sees it).
+                None => state.limit_defaults = true,
+                Some(count) => {
+                    state.limit_set = true;
+                    state.limit_count = count.to_string();
+                }
+            }
+        }
         // `dedup` has no builder field: in v1 it only accepts `by:
         // "fingerprint"`, which is semantically the default, so emit
         // canonicalizes it away.
-        Ingest::Builder(state)
+        Ingest::Builder(Box::new(state))
     }
 }
 
@@ -613,6 +689,7 @@ impl BuilderState {
 pub(crate) struct BuilderView {
     pub state: BuilderState,
     pub protocols: Vec<(String, bool)>,
+    pub exclude_protocols: Vec<(String, bool)>,
     pub statuses: Vec<(String, bool)>,
     pub sort_options: Vec<(&'static str, bool)>,
 }
@@ -628,6 +705,11 @@ impl BuilderView {
             .map(|name| (name.to_string(), any_of(&state.protocols, name)))
             .collect();
         append_outsiders(&mut protocols, &state.protocols);
+        let mut exclude_protocols: Vec<(String, bool)> = Schema::protocols()
+            .into_iter()
+            .map(|name| (name.to_string(), any_of(&state.exclude_protocols, name)))
+            .collect();
+        append_outsiders(&mut exclude_protocols, &state.exclude_protocols);
         let mut statuses: Vec<(String, bool)> = Schema::statuses()
             .into_iter()
             .map(|name| (name.to_string(), any_of(&state.exclude_statuses, name)))
@@ -635,6 +717,7 @@ impl BuilderView {
         append_outsiders(&mut statuses, &state.exclude_statuses);
         Self {
             protocols,
+            exclude_protocols,
             statuses,
             sort_options: Schema::sort_options()
                 .into_iter()
@@ -715,6 +798,25 @@ fn strings(values: &[String]) -> serde_json::Value {
         values
             .iter()
             .map(|value| serde_json::Value::from(value.as_str()))
+            .collect(),
+    )
+}
+
+/// Split the comma-separated ASN text field into trimmed entries. `None`
+/// when the field is empty (nothing configured — the key is not emitted);
+/// a non-numeric entry survives verbatim, exactly like an unknown protocol
+/// in a checkbox: the preview/save validation reports it instead of the
+/// widget silently dropping what was typed.
+fn split_asn_field(raw: &str) -> Option<Vec<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        trimmed
+            .split(',')
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
             .collect(),
     )
 }
@@ -940,6 +1042,34 @@ mod tests {
         s.geo_set = true;
         s.sort_set = true;
         assert_eq!(s.emit(), None);
+    }
+
+    #[test]
+    fn view_keep_include_and_exclude_protocol_columns_independent() {
+        // The two filter columns used to render from the same vector, so an
+        // allowed protocol re-appeared checked in «exclude» (and vice
+        // versa) when the widget was reopened.
+        let mut s = state();
+        s.filter_set = true;
+        s.protocols = vec!["vless".into(), "trojan".into()];
+        s.exclude_protocols = vec!["ss".into()];
+
+        let view = BuilderView::new(&s);
+        let order = Scheme::all().iter().map(|s| s.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            view.protocols,
+            order
+                .iter()
+                .map(|&name| (name.to_string(), matches!(name, "vless" | "trojan")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            view.exclude_protocols,
+            order
+                .iter()
+                .map(|&name| (name.to_string(), name == "ss"))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1301,6 +1431,8 @@ mod tests {
             set("ped_filter", &["1"]),
             set("ped_filter_protocols", &["vless", "trojan"]),
             set("ped_filter_exclude", &["naive"]),
+            vec![("ped_filter_asns".to_string(), "24940, AS13335".to_string())],
+            vec![("ped_filter_exclude_asns".to_string(), " 9009 ".to_string())],
             vec![("ped_normalize".to_string(), "1".to_string())],
             vec![
                 ("ped_rename_1_match".to_string(), "b".to_string()),
@@ -1327,6 +1459,9 @@ mod tests {
         assert!(s.filter_set && !s.filter_defaults);
         assert_eq!(s.protocols, ["vless", "trojan"]);
         assert_eq!(s.exclude_protocols, ["naive"]);
+        assert_eq!(s.asns, "24940, AS13335");
+        // from_form trims text fields, like every other widget input.
+        assert_eq!(s.exclude_asns, "9009");
         assert!(s.normalize_params);
         // Rows are ordered by index, not by form order; missing fields are empty.
         assert_eq!(
@@ -1352,6 +1487,118 @@ mod tests {
         assert_eq!(s.exclude_statuses, ["alive"]);
         assert!(s.sort_set && s.sort_desc);
         assert_eq!(s.sort_by, "country");
+    }
+
+    #[test]
+    fn asn_fields_round_trip_through_emit_and_ingest() {
+        // The comma-separated text field becomes a JSON string array; both
+        // ASN spellings survive the trip verbatim (the validator accepts
+        // them, so rewriting would only churn the stored config).
+        let mut s = state();
+        s.filter_set = true;
+        s.asns = "24940, AS13335".into();
+        s.exclude_asns = "9009".into();
+
+        let json = s.emit().expect("must emit");
+        assert_eq!(
+            json,
+            json!({
+                "version": 1,
+                "filter": { "asns": ["24940", "AS13335"], "exclude_asns": ["9009"] }
+            })
+        );
+        assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_ok());
+
+        let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
+            panic!("must parse");
+        };
+        assert_eq!(rebuilt.asns, "24940, AS13335");
+        assert_eq!(rebuilt.exclude_asns, "9009");
+        assert!(rebuilt.filter_set);
+    }
+
+    #[test]
+    fn empty_asns_array_stays_in_raw_mode() {
+        // `asns: []` means "keep nothing" — a real config the text field
+        // cannot express (empty there is "not set"), so ingest routes it
+        // to raw mode like an empty protocols allowlist.
+        assert_eq!(
+            BuilderState::ingest(Some(&json!({
+                "version": 1,
+                "filter": { "asns": [] }
+            }))),
+            Ingest::Raw
+        );
+    }
+
+    #[test]
+    fn asn_text_survives_whitespace_and_invalid_entries() {
+        // The field keeps what was typed, including a mistyped entry: the
+        // preview/save validation reports it instead of the widget
+        // silently dropping it (the same contract as the protocol
+        // checkboxes).
+        let mut s = state();
+        s.filter_set = true;
+        s.asns = " 24940 , , oops ".into();
+
+        let json = s.emit().expect("must emit");
+        assert_eq!(
+            json,
+            json!({
+                "version": 1,
+                "filter": { "asns": ["24940", "oops"] }
+            })
+        );
+        // The validator rejects the whole config with a field error.
+        let errors = crate::pipeline::CompiledPipeline::from_json(Some(&json)).unwrap_err();
+        assert_eq!(errors[0].key, "pipeline.unknown_asn");
+        assert_eq!(errors[0].args, ["filter.asns", "oops"]);
+    }
+
+    #[test]
+    fn limit_round_trips_and_defaults_reset() {
+        // Set: the number field becomes a JSON number and back.
+        let mut s = state();
+        s.limit_set = true;
+        s.limit_count = "100".into();
+        let json = s.emit().expect("must emit");
+        assert_eq!(json, json!({ "version": 1, "limit": { "count": 100 } }));
+        assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_ok());
+        let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
+            panic!("must parse");
+        };
+        assert!(rebuilt.limit_set);
+        assert_eq!(rebuilt.limit_count, "100");
+
+        // Defaults: an explicit `null` cap — the profile resets the
+        // source's limit back to "no cap".
+        let mut d = state();
+        d.limit_defaults = true;
+        let json = d.emit().expect("must emit");
+        assert_eq!(json, json!({ "version": 1, "limit": { "count": null } }));
+        assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_ok());
+        let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
+            panic!("must parse");
+        };
+        assert!(rebuilt.limit_defaults && !rebuilt.limit_set);
+
+        // Set with an empty number field emits nothing.
+        let mut e = state();
+        e.limit_set = true;
+        e.limit_count = "  ".into();
+        assert_eq!(e.emit(), None);
+    }
+
+    #[test]
+    fn limit_typo_rides_along_for_validation() {
+        // A mistyped cap becomes a JSON string: the validator reports it
+        // on the panel language instead of the field silently vanishing.
+        let mut s = state();
+        s.limit_set = true;
+        s.limit_count = "many".into();
+        let json = s.emit().expect("must emit");
+        assert_eq!(json, json!({ "version": 1, "limit": { "count": "many" } }));
+        assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_err());
     }
 
     #[test]
@@ -1397,7 +1644,11 @@ mod tests {
     fn ingest_empty_values_are_an_empty_state() {
         for value in [None, Some(&json!(null)), Some(&json!({}))] {
             let ingest = BuilderState::ingest(value);
-            assert_eq!(ingest, Ingest::Builder(BuilderState::new()), "{value:?}");
+            assert_eq!(
+                ingest,
+                Ingest::Builder(Box::new(BuilderState::new())),
+                "{value:?}"
+            );
         }
     }
 
@@ -1540,7 +1791,7 @@ mod tests {
         let Ingest::Builder(s) = BuilderState::ingest(Some(&json)) else {
             panic!("must parse");
         };
-        assert_eq!(s, BuilderState::new()); // nothing to configure
+        assert_eq!(*s, BuilderState::new()); // nothing to configure
         assert_eq!(s.emit(), None); // NULL is the equivalent config
     }
 
@@ -1620,7 +1871,7 @@ mod tests {
         let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
             panic!("must parse");
         };
-        assert_eq!(rebuilt, s);
+        assert_eq!(*rebuilt, s);
     }
 
     #[test]
@@ -1637,7 +1888,7 @@ mod tests {
         let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
             panic!("must parse");
         };
-        assert_eq!(rebuilt, s);
+        assert_eq!(*rebuilt, s);
     }
 
     #[test]

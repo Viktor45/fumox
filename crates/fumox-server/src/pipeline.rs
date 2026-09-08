@@ -51,6 +51,10 @@ pub(crate) struct PipelineConfig {
     pub(crate) dedup: Option<DedupConfig>,
     #[serde(default)]
     pub(crate) sort: Option<SortConfig>,
+    /// Output-size cap (SPEC §5 step 8a): keep at most `count` proxies of
+    /// the final, deduplicated and sorted list.
+    #[serde(default)]
+    pub(crate) limit: Option<LimitConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +64,13 @@ pub(crate) struct FilterConfig {
     pub(crate) protocols: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) exclude_protocols: Option<Vec<String>>,
+    /// AS numbers to keep — bare digits (`"24940"`); the `AS24940` spelling
+    /// is accepted and normalized to the number. null = no allowlist.
+    #[serde(default)]
+    pub(crate) asns: Option<Vec<String>>,
+    /// AS numbers to drop, the same accepted format as [`Self::asns`].
+    #[serde(default)]
+    pub(crate) exclude_asns: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub(crate) normalize_params: bool,
 }
@@ -253,6 +264,17 @@ pub(crate) struct SortConfig {
     pub(crate) desc: bool,
 }
 
+/// Output-size cap (SPEC §5 step 8a). `count` is `i64` so that negative or
+/// fractional input fails with the field-level `pipeline.invalid_limit`
+/// error instead of an opaque serde type error; `null`/missing means "no
+/// cap" — the explicit-defaults reset of the profile tri-state.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LimitConfig {
+    #[serde(default)]
+    pub(crate) count: Option<i64>,
+}
+
 const fn default_sort_by() -> SortBy {
     SortBy::Source
 }
@@ -277,6 +299,11 @@ struct CompiledDrop {
 pub struct CompiledPipeline {
     filter_protocols: Option<Vec<Scheme>>,
     exclude_protocols: Option<Vec<Scheme>>,
+    /// AS numbers to keep; a proxy whose stored ASN is missing from the
+    /// list is dropped (the same "confirmed facts only" semantics as the
+    /// profile country allowlist).
+    filter_asns: Option<Vec<u32>>,
+    exclude_asns: Option<Vec<u32>>,
     normalize_params: bool,
     rename: Vec<CompiledRename>,
     drop: Vec<CompiledDrop>,
@@ -285,6 +312,9 @@ pub struct CompiledPipeline {
     exclude_statuses: Vec<ProxyStatus>,
     sort_by: SortBy,
     sort_desc: bool,
+    /// Output-size cap: keep at most this many proxies of the final list
+    /// (SPEC §5 step 8a). `None` = no cap.
+    limit_count: Option<usize>,
     /// Whether `sort` was set explicitly (used to pick the sort config when
     /// several pipelines are merged: profile wins, then the first source).
     pub sort_explicit: bool,
@@ -298,6 +328,8 @@ impl Default for CompiledPipeline {
         Self {
             filter_protocols: None,
             exclude_protocols: None,
+            filter_asns: None,
+            exclude_asns: None,
             normalize_params: true,
             rename: Vec::new(),
             drop: Vec::new(),
@@ -306,6 +338,7 @@ impl Default for CompiledPipeline {
             exclude_statuses: vec![ProxyStatus::Quarantine, ProxyStatus::Removed],
             sort_by: SortBy::Source,
             sort_desc: false,
+            limit_count: None,
             sort_explicit: false,
         }
     }
@@ -368,6 +401,9 @@ impl CompiledPipeline {
                 "filter.exclude_protocols",
                 &mut errors,
             );
+            compiled.filter_asns = parse_asn_list(&filter.asns, "filter.asns", &mut errors);
+            compiled.exclude_asns =
+                parse_asn_list(&filter.exclude_asns, "filter.exclude_asns", &mut errors);
             compiled.normalize_params = filter.normalize_params;
         }
 
@@ -442,6 +478,22 @@ impl CompiledPipeline {
             compiled.sort_explicit = true;
         }
 
+        if let Some(limit) = config.limit {
+            // `null`/missing keeps the cap unset (the profile's explicit
+            // "defaults" reset); `0` and anything below is a field error —
+            // "no cap" is the absent section, not a magic number.
+            match limit.count {
+                None => {}
+                Some(count) if count >= 1 => {
+                    compiled.limit_count = Some(count as usize);
+                }
+                Some(count) => errors.push(PipelineIssue {
+                    key: "pipeline.invalid_limit",
+                    args: vec![count.to_string()],
+                }),
+            }
+        }
+
         if errors.is_empty() {
             Ok(compiled)
         } else {
@@ -511,6 +563,27 @@ impl CompiledPipeline {
         if let Some(excluded) = &self.exclude_protocols {
             candidates.retain(|c| !excluded.contains(&c.entry.scheme));
         }
+        // AS-number filter (SPEC §5 step 2): the stored `geo_asn` is a
+        // confirmed fact, resolved when the proxy was ingested — the same
+        // "only confirmed facts" contract as the profile country allowlist.
+        // An allowlist drops proxies without a resolved ASN; an exclude
+        // list only removes the named ASNs and keeps the unresolved ones.
+        if let Some(allowed) = &self.filter_asns {
+            candidates.retain(|c| {
+                c.geo_asn
+                    .as_deref()
+                    .and_then(stored_asn_number)
+                    .is_some_and(|asn| allowed.contains(&asn))
+            });
+        }
+        if let Some(excluded) = &self.exclude_asns {
+            candidates.retain(|c| {
+                c.geo_asn
+                    .as_deref()
+                    .and_then(stored_asn_number)
+                    .is_none_or(|asn| !excluded.contains(&asn))
+            });
+        }
 
         // filter.normalize_params — collapse duplicate/contradicting
         // insecure spellings (SPEC §5 step 2).
@@ -575,6 +648,12 @@ impl CompiledPipeline {
         let mut seen = HashSet::new();
         candidates.retain(|c| seen.insert(c.entry.fingerprint()));
         self.sort(candidates);
+        // Output cap (SPEC §5 step 8a): applied after dedup and sorting, so
+        // the list keeps its top in the chosen order — `sort: latency`
+        // yields the N fastest, `sort: source` the first N of the feed.
+        if let Some(limit) = self.limit_count {
+            candidates.truncate(limit);
+        }
     }
 
     fn sort(&self, candidates: &mut [Candidate]) {
@@ -743,6 +822,47 @@ fn parse_scheme_list(
     Some(schemes)
 }
 
+/// The AS number carried by a stored `geo_asn` value (`"AS24940"`), or any
+/// `AS{n}` / `24940` spelling accepted from a pipeline config.
+fn asn_number(raw: &str) -> Option<u32> {
+    let digits = raw
+        .trim()
+        .strip_prefix("AS")
+        .or_else(|| raw.trim().strip_prefix("as"))
+        .unwrap_or(raw.trim());
+    digits.parse::<u32>().ok()
+}
+
+/// [`asn_number`] over the stored `geo_asn` column format.
+fn stored_asn_number(raw: &str) -> Option<u32> {
+    asn_number(raw)
+}
+
+/// Validate an ASN list field (`filter.asns` / `filter.exclude_asns`):
+/// every entry must be a plain AS number, bare (`24940`) or with the `AS`
+/// prefix (`AS24940`). Like [`parse_scheme_list`], `None` means "not set"
+/// while an empty array stays empty — an allowlist that keeps nothing.
+fn parse_asn_list(
+    raw: &Option<Vec<String>>,
+    field: &str,
+    errors: &mut Vec<PipelineIssue>,
+) -> Option<Vec<u32>> {
+    let Some(raw) = raw else {
+        return None;
+    };
+    let mut asns = Vec::new();
+    for value in raw {
+        match asn_number(value) {
+            Some(asn) => asns.push(asn),
+            None => errors.push(PipelineIssue {
+                key: "pipeline.unknown_asn",
+                args: vec![field.to_string(), value.clone()],
+            }),
+        }
+    }
+    Some(asns)
+}
+
 /// Collapse the certificate-verification spellings (`insecure`,
 /// `allowInsecure`, `skip-cert-verify`) into a single parameter.
 ///
@@ -809,6 +929,9 @@ pub struct Candidate {
     pub latency_ms: Option<i64>,
     /// Country code stored on the proxy row by earlier enrichment.
     pub geo_country: Option<String>,
+    /// Autonomous system stored as `AS{n}` on the proxy row (SPEC §5.1
+    /// `filter.asns` / `filter.exclude_asns`).
+    pub geo_asn: Option<String>,
 }
 
 #[cfg(test)]
@@ -833,6 +956,7 @@ mod tests {
             status: ProxyStatus::Unknown,
             latency_ms: None,
             geo_country: None,
+            geo_asn: None,
         }
     }
 
@@ -1028,7 +1152,77 @@ mod tests {
             status: ProxyStatus::Unknown,
             latency_ms: None,
             geo_country: None,
+            geo_asn: None,
         }
+    }
+
+    /// A candidate carrying stored geo facts, as `rows_to_candidates`
+    /// loads them from the DB. The host is derived from the name so the
+    /// candidates differ by fingerprint and survive `finalize`'s dedup.
+    fn candidate_with_asn(name: &str, asn: Option<&str>) -> Candidate {
+        let mut c = candidate(name, Scheme::Vless, &format!("{name}.example.com"));
+        c.geo_asn = asn.map(String::from);
+        c
+    }
+
+    #[tokio::test]
+    async fn asns_allowlist_keeps_only_listed_and_drops_unresolved() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "asns": ["24940", "AS13335"] }
+        })))
+        .unwrap();
+        let candidates = vec![
+            candidate_with_asn("hetzner", Some("AS24940")),
+            candidate_with_asn("cloudflare", Some("AS13335")),
+            candidate_with_asn("other", Some("AS9009")),
+            candidate_with_asn("unresolved", None),
+        ];
+        let out = compiled.apply(candidates, &inactive_geo()).await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["hetzner", "cloudflare"]);
+    }
+
+    #[tokio::test]
+    async fn exclude_asns_drops_listed_and_keeps_unresolved() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "exclude_asns": ["AS24940"] }
+        })))
+        .unwrap();
+        let candidates = vec![
+            candidate_with_asn("hetzner", Some("AS24940")),
+            candidate_with_asn("other", Some("AS9009")),
+            candidate_with_asn("unresolved", None),
+        ];
+        let out = compiled.apply(candidates, &inactive_geo()).await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["other", "unresolved"]);
+    }
+
+    #[test]
+    fn invalid_asn_entries_are_rejected_with_field_errors() {
+        let errors = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "asns": ["24940", "bogus"], "exclude_asns": ["hetzner"] }
+        })))
+        .unwrap_err();
+        assert_eq!(errors[0].key, "pipeline.unknown_asn");
+        assert_eq!(errors[0].args, ["filter.asns", "bogus"]);
+        assert_eq!(errors[1].key, "pipeline.unknown_asn");
+        assert_eq!(errors[1].args, ["filter.exclude_asns", "hetzner"]);
+    }
+
+    #[test]
+    fn empty_asns_allowlist_keeps_nothing_and_compiles() {
+        // An explicit empty allowlist means "output nothing" — a real
+        // config, kept (the editor routes it to raw mode, PIPELINE.md §4).
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "asns": [] }
+        })))
+        .unwrap();
+        assert!(compiled.filter_asns.as_ref().is_some_and(|a| a.is_empty()));
     }
 
     #[tokio::test]
@@ -1449,6 +1643,66 @@ mod tests {
         let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
         // Descending, but the NULL latency stays last.
         assert_eq!(names, vec!["slow", "fast", "unknown"]);
+    }
+
+    #[tokio::test]
+    async fn limit_truncates_after_sort_to_the_top() {
+        // `sort: latency` + `limit: 2` yields the two fastest proxies.
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "sort": { "by": "latency" },
+            "limit": { "count": 2 }
+        })))
+        .unwrap();
+        let with_latency = |name: &str, host: &str, ms: i64| {
+            let mut c = candidate(name, Scheme::Vless, host);
+            c.latency_ms = Some(ms);
+            c
+        };
+        let out = compiled
+            .apply(
+                vec![
+                    with_latency("slow", "h1.example.com", 300),
+                    with_latency("fast", "h2.example.com", 20),
+                    with_latency("mid", "h3.example.com", 100),
+                    with_latency("fast2", "h4.example.com", 25),
+                ],
+                &inactive_geo(),
+            )
+            .await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, vec!["fast", "fast2"]);
+    }
+
+    #[tokio::test]
+    async fn limit_null_keeps_everything() {
+        // The explicit "defaults" reset (the profile tri-state): a present
+        // section with `count: null` must not cap anything.
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "limit": { "count": null }
+        })))
+        .unwrap();
+        let candidates = vec![
+            candidate("a", Scheme::Vless, "h1.example.com"),
+            candidate("b", Scheme::Vless, "h2.example.com"),
+            candidate("c", Scheme::Vless, "h3.example.com"),
+        ];
+        let out = compiled.apply(candidates, &inactive_geo()).await;
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn limit_rejects_zero_and_negative_counts() {
+        for count in [0, -5] {
+            let errors = CompiledPipeline::from_json(Some(&json!({
+                "version": 1,
+                "limit": { "count": count }
+            })))
+            .unwrap_err();
+            assert_eq!(errors[0].key, "pipeline.invalid_limit");
+            assert_eq!(errors[0].args, [count.to_string()]);
+        }
     }
 
     #[test]

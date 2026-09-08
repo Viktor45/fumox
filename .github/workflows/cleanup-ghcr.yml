@@ -1,0 +1,25 @@
+name: Cleanup Non-Latest GHCR Images
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  clean-ghcr:
+    permissions:
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune Old Images
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          # Keep the latest tag and explicitly exclude it from deletion
+          exclude-tags: "latest"
+          # Set to 0 to ensure any other tagged version is removed
+          keep-n-tagged: 0
+          # Clean up any unreferenced, untagged image layers left behind
+          keep-n-untagged: 0
+          # Optional: change to false once you verify it selects the right images
+          dry-run: true
+          # A token with 'write:packages' and 'delete:packages' scopes
+          token: ${{ secrets.GITHUB_TOKEN }}

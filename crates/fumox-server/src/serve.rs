@@ -562,6 +562,7 @@ fn rows_to_candidates(rows: Vec<proxies::ProxyRow>, source_position: i64) -> Vec
             status,
             latency_ms: row.latency_ms,
             geo_country: row.geo_country.clone(),
+            geo_asn: row.geo_asn.clone(),
         });
     }
     candidates

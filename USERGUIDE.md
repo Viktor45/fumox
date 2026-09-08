@@ -677,6 +677,8 @@ deduplicate by fingerprint". `"version": 1` is required.
   "filter": {
     "protocols": ["vless", "trojan"],
     "exclude_protocols": ["naive"],
+    "asns": ["24940", "AS13335"],
+    "exclude_asns": ["9009"],
     "normalize_params": true
   },
   "drop": [
@@ -694,19 +696,21 @@ deduplicate by fingerprint". `"version": 1` is required.
   "geo": { "enabled": true, "template": "{flag} {country} · {name}" },
   "health": { "exclude_statuses": ["quarantine", "removed"] },
   "dedup": { "by": "fingerprint" },
-  "sort": { "by": "source", "desc": false }
+  "sort": { "by": "source", "desc": false },
+  "limit": { "count": 100 }
 }
 ```
 
 | Section  | What it does                                                 | Fields and defaults                                                                                                                |
 | -------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `filter` | Keep/drop protocols; normalize `insecure=1`-style parameters | `protocols` / `exclude_protocols`: lists or null (= all); `normalize_params`: default `true`                                       |
+| `filter` | Keep/drop protocols and AS numbers; normalize `insecure=1`-style parameters | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null — matched against the stored `geo_asn`, the allowlist drops proxies whose ASN was never resolved (both `"24940"` and `"AS24940"` spellings work); `normalize_params`: default `true` |
 | `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` — default, `host`, `port`, `param:KEY`); rules are OR-ed; default `[]`        |
 | `rename` | Regex-based rewriting, rules applied in order                | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` — default, `host`, `port`, `param:KEY`); default `[]` |
 | `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment))   |
 | `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`                                                                            |
 | `dedup`  | Deduplication                                                | `by`: only `"fingerprint"` in v1                                                                                                   |
 | `sort`   | Output ordering                                              | `by`: `source` \| `name` \| `country` \| `latency` (null latencies go last); `desc`: default `false`                               |
+| `limit`  | Cap the output size                                          | `count`: integer ≥ 1 — keep at most this many proxies of the final, deduplicated and sorted list (its top); `null`/omitted = no cap |
 
 Validation is strict: unknown keys, a non-compiling regex or an invalid enum
 value are rejected with a field error in the admin form — nothing is saved.

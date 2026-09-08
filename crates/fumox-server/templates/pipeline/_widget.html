@@ -105,12 +105,26 @@
       </div>
       <div>
         <div class="hint">{{ self.t("ped.protocols_exclude") }}</div>
-        {% for (protocol, selected) in builder.protocols %}
+        {% for (protocol, selected) in builder.exclude_protocols %}
         <span class="check-row">
           <input type="checkbox" name="ped_filter_exclude" value="{{ protocol }}" id="ped-excl-{{ protocol }}" {% if selected %}checked{% endif %}>
           <label for="ped-excl-{{ protocol }}">{{ protocol }}</label>
         </span>
         {% endfor %}
+      </div>
+    </div>
+    <div class="ped-columns">
+      <div class="field">
+        <label for="ped-asns">{{ self.t("ped.asns_label") }}</label>
+        <input type="text" name="ped_filter_asns" id="ped-asns" value="{{ builder.state.asns }}"
+               placeholder="{{ self.t("ped.asns_placeholder") }}" inputmode="numeric" autocomplete="off">
+        <div class="hint">{{ self.t("ped.asns_hint") }}</div>
+      </div>
+      <div class="field">
+        <label for="ped-excl-asns">{{ self.t("ped.exclude_asns_label") }}</label>
+        <input type="text" name="ped_filter_exclude_asns" id="ped-excl-asns" value="{{ builder.state.exclude_asns }}"
+               placeholder="{{ self.t("ped.asns_placeholder") }}" inputmode="numeric" autocomplete="off">
+        <div class="hint">{{ self.t("ped.exclude_asns_hint") }}</div>
       </div>
     </div>
     <span class="check-row">
@@ -272,6 +286,34 @@
       <input type="checkbox" name="ped_sort_desc" value="1" id="ped-sort-desc" {% if builder.state.sort_desc %}checked{% endif %}>
       <label for="ped-sort-desc">{{ self.t("ped.sort_desc") }}</label>
     </span>
+  </div>
+
+  <div class="field">
+    {% if profile %}
+    <label>{{ self.t("ped.limit_label") }}</label>
+    <div class="ped-modes3">
+      <span class="check-row">
+        <input type="radio" name="ped_limit" value="skip" id="ped-limit-skip" {% if !builder.state.limit_set && !builder.state.limit_defaults %}checked{% endif %}>
+        <label for="ped-limit-skip">{{ self.t("ped.mode_skip") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_limit" value="defaults" id="ped-limit-defaults" {% if builder.state.limit_defaults %}checked{% endif %}>
+        <label for="ped-limit-defaults">{{ self.t("ped.mode_defaults") }}</label>
+      </span>
+      <span class="check-row">
+        <input type="radio" name="ped_limit" value="set" id="ped-limit-set" {% if builder.state.limit_set %}checked{% endif %}>
+        <label for="ped-limit-set">{{ self.t("ped.mode_set") }}</label>
+      </span>
+    </div>
+    {% else %}
+    <span class="check-row">
+      <input type="checkbox" name="ped_limit" value="1" id="ped-limit" {% if builder.state.limit_set %}checked{% endif %}>
+      <label for="ped-limit">{{ self.t("ped.limit_label") }}</label>
+    </span>
+    {% endif %}
+    <input type="number" min="1" step="1" name="ped_limit_count" id="ped-limit-count" value="{{ builder.state.limit_count }}"
+           placeholder="{{ self.t("ped.limit_placeholder") }}">
+    <div class="hint">{{ self.t("ped.limit_hint") }}</div>
   </div>
 </div>
 

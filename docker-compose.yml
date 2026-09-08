@@ -56,7 +56,7 @@ services:
       # (source URLs may then point at private/loopback addresses).
       FUMOX_ADMIN__ALLOW_PRIVATE_URLS: ${FUMOX_ADMIN__ALLOW_PRIVATE_URLS:-false}
     volumes:
-      - ./config:/app/config:ro
+      - ./config:/app/config:ro,z
       - fumox-data:/app/data
       - meow-shared:/shared
     ports:
@@ -83,7 +83,7 @@ services:
       # Override in .env if the default test URL is blocked in your region.
       FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-http://www.gstatic.com/generate_204}
     volumes:
-      - ./config:/app/config:ro
+      - ./config:/app/config:ro,z
       - fumox-data:/app/data
       - meow-shared:/shared
     restart: unless-stopped

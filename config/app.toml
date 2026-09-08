@@ -121,13 +121,13 @@ tls_timeout_secs = 5         # T1: TLS-handshake
 concurrency = 8
 heartbeat_interval_secs = 30  # meta-ключ probe_heartbeat для админки / probe_heartbeat meta key consumed by the admin panel
 # Второй шанс для прокси в карантине: повторная проверка в случайный момент
-# окна [12ч, 16ч) после карантина — окно задается как min + случайная
+# окна [1ч, 3ч) после карантина — окно задается как min + случайная
 # добавка от 0 до spread (UTC, момент фиксируется в базе при карантине).
 # A quarantined proxy's second chance: rechecked at a random moment of the
-# [12h, 16h) window after quarantine — the window is min plus a random
+# [1h, 3h) window after quarantine — the window is min plus a random
 # addition from 0 to spread (UTC, the moment is fixed in the database when
 # quarantined).
-second_chance_min_hours = 3
+second_chance_min_hours = 2
 second_chance_spread_hours = 1
 # Лестница повторных проверок карантина: задержки в секундах
 # между последовательными ретраями после провала второго шанса. Провал ретрая

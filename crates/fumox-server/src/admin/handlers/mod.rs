@@ -320,6 +320,29 @@ pub fn action_response(
     fragment_html: String,
     toast: &str,
 ) -> Response {
+    action_response_with_level(is_htmx, redirect_to, fragment_html, toast, "ok")
+}
+
+/// [`action_response`] with a rejected toast: same shape, but the toast
+/// carries level `error` so the client renders it with the error style.
+/// Used when a form-driven action fails validation and the browser path
+/// still lands back on the list.
+pub fn action_response_err(
+    is_htmx: bool,
+    redirect_to: &str,
+    fragment_html: String,
+    toast: &str,
+) -> Response {
+    action_response_with_level(is_htmx, redirect_to, fragment_html, toast, "error")
+}
+
+fn action_response_with_level(
+    is_htmx: bool,
+    redirect_to: &str,
+    fragment_html: String,
+    toast: &str,
+    level: &str,
+) -> Response {
     if is_htmx {
         let mut response = (
             StatusCode::OK,
@@ -328,7 +351,7 @@ pub fn action_response(
         )
             .into_response();
         let payload = format!(
-            "{{\"toast\": {{\"message\": \"{}\", \"level\": \"ok\"}}}}",
+            "{{\"toast\": {{\"message\": \"{}\", \"level\": \"{level}\"}}}}",
             header_safe(toast)
         );
         response.headers_mut().insert(

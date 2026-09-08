@@ -4,15 +4,15 @@
 //! action (ADMIN_PLAN §8).
 
 use super::{
-    QueryPairs, action_response, clamp_limit, flag_for, fmt_opt_ts_element, fmt_ts_element,
-    is_htmx, not_found, page_offset, pagination_pages, server_error,
+    QueryPairs, action_response, action_response_err, clamp_limit, flag_for, fmt_opt_ts_element,
+    fmt_ts_element, is_htmx, not_found, page_offset, pagination_pages, server_error,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
 use askama::Template;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use fumox_core::models::Scheme;
@@ -547,6 +547,163 @@ pub async fn proxies_purge_removed(
         &lang
             .t("px.purged_toast")
             .replace("{}", &deleted.to_string()),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Bulk cleanup (ADMIN_PLAN §13.1 decision 29)
+//
+// Every action below transitions rows into the terminal `removed` status —
+// they never delete. The physical cleanup stays the single «purge removed»
+// button, so each action is reversible via the per-proxy «reset status»
+// until purged.
+// ---------------------------------------------------------------------------
+
+/// Shared tail of the parameterless cleanup handlers: run the repo
+/// transition, log it and answer with the count badge + toast.
+macro_rules! bulk_cleanup_handler {
+    ($name:ident, $repo_fn:ident, $log_msg:literal) => {
+        pub async fn $name(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+            let lang = state.locales.lang_from_headers(&headers);
+            let moved = match proxies::$repo_fn(&state.pool).await {
+                Ok(moved) => moved,
+                Err(err) => return server_error(lang, &err),
+            };
+            tracing::info!(moved, $log_msg);
+            let fragment = format!(
+                "<span class=\"badge removed\">{}</span>",
+                lang.t("px.cleanup_moved_rows")
+                    .replace("{}", &moved.to_string())
+            );
+            action_response(
+                is_htmx(&headers),
+                "/admin/proxies",
+                fragment,
+                &lang
+                    .t("px.cleanup_moved_toast")
+                    .replace("{}", &moved.to_string()),
+            )
+        }
+    };
+}
+
+bulk_cleanup_handler!(
+    proxies_quarantine_to_removed,
+    quarantine_to_removed,
+    "moved quarantined proxies to removed"
+);
+bulk_cleanup_handler!(
+    proxies_remove_alive_no_country,
+    remove_alive_without_country,
+    "removed alive proxies without country"
+);
+bulk_cleanup_handler!(
+    proxies_remove_unprobeable,
+    remove_unprobeable_unknown,
+    "removed unprobeable unknown proxies"
+);
+
+/// Normalize an AS number typed into the cleanup form: accepts both
+/// `24940` and `AS24940`, returns the bare digits. `None` when the input
+/// is not a plain AS number (empty, non-digits, too long).
+fn normalize_asn(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let digits = trimmed
+        .strip_prefix("AS")
+        .or_else(|| trimmed.strip_prefix("as"))
+        .unwrap_or(trimmed);
+    if !digits.is_empty() && digits.len() <= 10 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        Some(digits.to_string())
+    } else {
+        None
+    }
+}
+
+/// Move every `alive` proxy of one autonomous system into `removed`
+/// (cleanup panel). The form field `asn` accepts `24940` and `AS24940`.
+pub async fn proxies_remove_alive_by_asn(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Form(form): Form<Vec<(String, String)>>,
+) -> Response {
+    let lang = state.locales.lang_from_headers(&headers);
+    let raw = form
+        .iter()
+        .find(|(k, _)| k == "asn")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or_default();
+    let Some(asn) = normalize_asn(raw) else {
+        tracing::info!("cleanup by ASN rejected: invalid input");
+        return action_response_err(
+            is_htmx(&headers),
+            "/admin/proxies",
+            String::new(),
+            lang.t("val.asn_format"),
+        );
+    };
+    let moved = match proxies::remove_alive_by_asn(&state.pool, &asn).await {
+        Ok(moved) => moved,
+        Err(err) => return server_error(lang, &err),
+    };
+    tracing::info!(asn = %asn, moved, "removed alive proxies by ASN");
+    let fragment = format!(
+        "<span class=\"badge removed\">{}</span>",
+        lang.t("px.cleanup_asn_rows")
+            .replace("{}", &moved.to_string())
+            .replace("{asn}", &asn),
+    );
+    action_response(
+        is_htmx(&headers),
+        "/admin/proxies",
+        fragment,
+        &lang
+            .t("px.cleanup_moved_toast")
+            .replace("{}", &moved.to_string()),
+    )
+}
+
+/// Move every `alive` proxy of one country into `removed` (cleanup panel).
+/// The form field `country` must be a 2-letter ISO code offered by the
+/// country dropdown.
+pub async fn proxies_remove_alive_by_country(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Form(form): Form<Vec<(String, String)>>,
+) -> Response {
+    let lang = state.locales.lang_from_headers(&headers);
+    let raw = form
+        .iter()
+        .find(|(k, _)| k == "country")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or_default();
+    let code = raw.trim().to_ascii_uppercase();
+    if code.len() != 2 || !code.bytes().all(|b| b.is_ascii_alphabetic()) {
+        tracing::info!("cleanup by country rejected: invalid input");
+        return action_response_err(
+            is_htmx(&headers),
+            "/admin/proxies",
+            String::new(),
+            &lang.t("val.country_format").replace("{}", &code),
+        );
+    }
+    let moved = match proxies::remove_alive_by_country(&state.pool, &code).await {
+        Ok(moved) => moved,
+        Err(err) => return server_error(lang, &err),
+    };
+    tracing::info!(country = %code, moved, "removed alive proxies by country");
+    let fragment = format!(
+        "<span class=\"badge removed\">{}</span>",
+        lang.t("px.cleanup_country_rows")
+            .replace("{}", &moved.to_string())
+            .replace("{country}", &code),
+    );
+    action_response(
+        is_htmx(&headers),
+        "/admin/proxies",
+        fragment,
+        &lang
+            .t("px.cleanup_moved_toast")
+            .replace("{}", &moved.to_string()),
     )
 }
 

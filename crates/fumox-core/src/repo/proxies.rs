@@ -563,13 +563,140 @@ pub async fn mark_orphans_removed(pool: &DbPool) -> crate::Result<u64> {
 
 /// Physically delete every `removed` proxy and, via `ON DELETE CASCADE`,
 /// its source links and probe/speed history (ADMIN_PLAN §13.16 «purge
-/// removed»). This is the only hard delete in the system and is guarded by
-/// a confirmation dialog in the admin UI. Returns the number of deleted
-/// proxy rows.
+/// removed»). This is the only hard delete in the system — the bulk
+/// cleanup actions above it only transition rows *into* `removed` — and
+/// is guarded by a confirmation dialog in the admin UI. Returns the
+/// number of deleted proxy rows.
 pub async fn purge_removed(pool: &DbPool) -> crate::Result<u64> {
     let result = sqlx::query("DELETE FROM proxies WHERE status = 'removed'")
         .execute(pool)
         .await?;
+    Ok(result.rows_affected())
+}
+
+// Bulk cleanup actions (ADMIN_PLAN §13.1 decision 29): one-click ways to
+// move whole groups of proxies into `removed`. They are status transitions,
+// never hard deletes — the physical cleanup stays the single «purge
+// removed» button, so every action remains reversible via the per-proxy
+// «reset status» until purged. Lifecycle fields are cleared to the same
+// pristine state as `reset_status` would leave, so a later reset is a
+// no-op on those columns.
+
+/// Move every `quarantine` proxy into `removed` (admin «cleanup» panel):
+/// a bulk shortcut past the recheck ladder for proxies the admin has
+/// already given up on. Returns how many rows were affected.
+pub async fn quarantine_to_removed(pool: &DbPool) -> crate::Result<u64> {
+    let now = crate::models::now_ts();
+    let result = sqlx::query(
+        "UPDATE proxies SET
+             status = 'removed',
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             removed_at = ?,
+             updated_at = ?
+         WHERE status = 'quarantine'",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Move every `alive` proxy with no resolved country into `removed`
+/// (admin «cleanup» panel). `geo_country IS NULL` means the country was
+/// never resolved — failed lookups keep NULL rather than writing an
+/// empty string, so this predicate catches exactly the never-resolved
+/// rows. Returns how many rows were affected.
+pub async fn remove_alive_without_country(pool: &DbPool) -> crate::Result<u64> {
+    let now = crate::models::now_ts();
+    let result = sqlx::query(
+        "UPDATE proxies SET
+             status = 'removed',
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             removed_at = ?,
+             updated_at = ?
+         WHERE status = 'alive' AND geo_country IS NULL",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Move every `alive` proxy of the given autonomous system into
+/// `removed` (admin «cleanup» panel). `asn` is the bare AS number —
+/// `"12345"`, not `"AS12345"` — and is stored/compared in the canonical
+/// `AS{n}` text format of `geo_asn`. Returns how many rows were
+/// affected.
+pub async fn remove_alive_by_asn(pool: &DbPool, asn: &str) -> crate::Result<u64> {
+    let now = crate::models::now_ts();
+    let result = sqlx::query(
+        "UPDATE proxies SET
+             status = 'removed',
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             removed_at = ?,
+             updated_at = ?
+         WHERE status = 'alive' AND geo_asn = ?",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(format!("AS{asn}"))
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Move every `alive` proxy of the given country into `removed` (admin
+/// «cleanup» panel). `code` is an ISO-3166-1 alpha-2 code, e.g. `"DE"`.
+/// Returns how many rows were affected.
+pub async fn remove_alive_by_country(pool: &DbPool, code: &str) -> crate::Result<u64> {
+    let now = crate::models::now_ts();
+    let result = sqlx::query(
+        "UPDATE proxies SET
+             status = 'removed',
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             removed_at = ?,
+             updated_at = ?
+         WHERE status = 'alive' AND geo_country = ?",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(code)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Move every `unknown` proxy of an unprobeable scheme into `removed`
+/// (admin «cleanup» panel). tuic/mieru cannot be checked at all (SPEC
+/// §8.5), so such rows sit in `unknown` forever unless the admin retires
+/// them; probeable schemes are untouched — their `unknown` rows are
+/// simply not yet checked. Returns how many rows were affected.
+pub async fn remove_unprobeable_unknown(pool: &DbPool) -> crate::Result<u64> {
+    let now = crate::models::now_ts();
+    let result = sqlx::query(
+        "UPDATE proxies SET
+             status = 'removed',
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             removed_at = ?,
+             updated_at = ?
+         WHERE status = 'unknown' AND scheme IN ('tuic', 'mieru')",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected())
 }
 
@@ -2237,5 +2364,186 @@ mod tests {
         // The row has country data now, so it no longer counts as missing.
         let missing = list_missing_geo(&pool, 0, 500).await.unwrap();
         assert!(missing.iter().all(|(known, _)| known != &id));
+    }
+
+    // Bulk cleanup transitions (ADMIN_PLAN §13.1 decision 29): each action
+    // must move exactly its target group into `removed`, clear the
+    // quarantine/ladder bookkeeping and leave everything else untouched.
+
+    /// Minimal raw insert — the bulk helpers filter on columns the
+    /// reconciliation path never populates (geo_asn, unprobeable schemes),
+    /// so tests seed rows directly.
+    async fn bulk_test_row(
+        pool: &DbPool,
+        fingerprint: &str,
+        scheme: &str,
+        status: &str,
+        geo_country: Option<&str>,
+        geo_asn: Option<&str>,
+    ) -> i64 {
+        let now = crate::models::now_ts();
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies
+                 (fingerprint, scheme, name, host, port, credential, params,
+                  unknown_params, raw_line, geo_country, geo_asn,
+                  status, fail_count, quarantined_at, ladder_step, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 443, '', '{}', '{}', '', ?, ?, ?, 0, NULL, 0, ?, ?)
+             RETURNING id",
+        )
+        .bind(fingerprint)
+        .bind(scheme)
+        .bind(fingerprint)
+        .bind(format!("{fingerprint}.example.com"))
+        .bind(geo_country)
+        .bind(geo_asn)
+        .bind(status)
+        .bind(now)
+        .bind(now)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn bulk_status_of(
+        pool: &DbPool,
+        id: i64,
+    ) -> (String, Option<i64>, Option<i64>, Option<i64>) {
+        sqlx::query_as(
+            "SELECT status, quarantined_at, ladder_at, removed_at FROM proxies WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn quarantine_to_removed_moves_only_quarantined() {
+        let pool = temp_pool().await;
+        let q = bulk_test_row(&pool, "bulk-q1", "vless", "quarantine", Some("DE"), None).await;
+        let alive = bulk_test_row(&pool, "bulk-a1", "vless", "alive", Some("DE"), None).await;
+
+        assert_eq!(quarantine_to_removed(&pool).await.unwrap(), 1);
+        assert_eq!(
+            bulk_status_of(&pool, q).await,
+            ("removed".into(), None, None, Some(crate::models::now_ts()))
+        );
+        assert_eq!(
+            bulk_status_of(&pool, alive).await,
+            ("alive".into(), None, None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantine_to_removed_clears_ladder_and_quarantine_fields() {
+        let pool = temp_pool().await;
+        let id = bulk_test_row(&pool, "bulk-q2", "vless", "quarantine", Some("DE"), None).await;
+        let now = crate::models::now_ts();
+        sqlx::query(
+            "UPDATE proxies SET fail_count = 3, quarantined_at = ?, ladder_at = ?,
+             ladder_step = 2, last_checked_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(now + 100)
+        .bind(now)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        quarantine_to_removed(&pool).await.unwrap();
+        let (status, quarantined_at, ladder_at, removed_at) = bulk_status_of(&pool, id).await;
+        assert_eq!(status, "removed");
+        assert_eq!(quarantined_at, None);
+        assert_eq!(ladder_at, None);
+        assert!(removed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn remove_alive_without_country_targets_only_alive_without_geo() {
+        let pool = temp_pool().await;
+        let no_country = bulk_test_row(&pool, "bulk-nc1", "vless", "alive", None, None).await;
+        let with_country =
+            bulk_test_row(&pool, "bulk-nc2", "vless", "alive", Some("US"), None).await;
+        let q_no_country =
+            bulk_test_row(&pool, "bulk-nc3", "vless", "quarantine", None, None).await;
+        let unknown_no_country =
+            bulk_test_row(&pool, "bulk-nc4", "vless", "unknown", None, None).await;
+
+        assert_eq!(remove_alive_without_country(&pool).await.unwrap(), 1);
+        assert_eq!(bulk_status_of(&pool, no_country).await.0, "removed");
+        assert_eq!(bulk_status_of(&pool, with_country).await.0, "alive");
+        assert_eq!(bulk_status_of(&pool, q_no_country).await.0, "quarantine");
+        assert_eq!(bulk_status_of(&pool, unknown_no_country).await.0, "unknown");
+    }
+
+    #[tokio::test]
+    async fn remove_alive_by_asn_matches_canonical_as_prefix() {
+        let pool = temp_pool().await;
+        let target = bulk_test_row(
+            &pool,
+            "bulk-as1",
+            "vless",
+            "alive",
+            Some("DE"),
+            Some("AS24940"),
+        )
+        .await;
+        let other_asn = bulk_test_row(
+            &pool,
+            "bulk-as2",
+            "vless",
+            "alive",
+            Some("DE"),
+            Some("AS13335"),
+        )
+        .await;
+        let quarantined_same = bulk_test_row(
+            &pool,
+            "bulk-as3",
+            "vless",
+            "quarantine",
+            Some("DE"),
+            Some("AS24940"),
+        )
+        .await;
+
+        assert_eq!(remove_alive_by_asn(&pool, "24940").await.unwrap(), 1);
+        assert_eq!(bulk_status_of(&pool, target).await.0, "removed");
+        assert_eq!(bulk_status_of(&pool, other_asn).await.0, "alive");
+        assert_eq!(
+            bulk_status_of(&pool, quarantined_same).await.0,
+            "quarantine"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_alive_by_country_targets_matching_alive_rows() {
+        let pool = temp_pool().await;
+        let de_alive = bulk_test_row(&pool, "bulk-c1", "vless", "alive", Some("DE"), None).await;
+        let de_quarantine =
+            bulk_test_row(&pool, "bulk-c2", "vless", "quarantine", Some("DE"), None).await;
+        let us_alive = bulk_test_row(&pool, "bulk-c3", "vless", "alive", Some("US"), None).await;
+
+        assert_eq!(remove_alive_by_country(&pool, "DE").await.unwrap(), 1);
+        assert_eq!(bulk_status_of(&pool, de_alive).await.0, "removed");
+        assert_eq!(bulk_status_of(&pool, de_quarantine).await.0, "quarantine");
+        assert_eq!(bulk_status_of(&pool, us_alive).await.0, "alive");
+    }
+
+    #[tokio::test]
+    async fn remove_unprobeable_unknown_retires_only_tuic_and_mieru() {
+        let pool = temp_pool().await;
+        let tuic = bulk_test_row(&pool, "bulk-u1", "tuic", "unknown", None, None).await;
+        let mieru = bulk_test_row(&pool, "bulk-u2", "mieru", "unknown", None, None).await;
+        let vless_unknown = bulk_test_row(&pool, "bulk-u3", "vless", "unknown", None, None).await;
+        let tuic_alive = bulk_test_row(&pool, "bulk-u4", "tuic", "alive", None, None).await;
+
+        assert_eq!(remove_unprobeable_unknown(&pool).await.unwrap(), 2);
+        assert_eq!(bulk_status_of(&pool, tuic).await.0, "removed");
+        assert_eq!(bulk_status_of(&pool, mieru).await.0, "removed");
+        assert_eq!(bulk_status_of(&pool, vless_unknown).await.0, "unknown");
+        assert_eq!(bulk_status_of(&pool, tuic_alive).await.0, "alive");
     }
 }

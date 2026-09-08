@@ -6,9 +6,94 @@
 <div class="page-head">
   <h1>{{ self.t("nav.proxies") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
   <div class="row-actions">
+    <button class="btn danger" type="button" onclick="document.getElementById('cleanup-dialog').showModal()">{{ self.t("px.cleanup_button") }}</button>
     <button class="btn danger" type="button" onclick="document.getElementById('purge-dialog').showModal()">{{ self.t("px.purge_button") }}</button>
   </div>
 </div>
+
+<!-- Bulk cleanup (ADMIN_PLAN §13.1 decision 29): five separate plain POST
+     forms in one dialog. Every action transitions rows into `removed`;
+     the physical delete stays the «purge removed» button above. -->
+<dialog id="cleanup-dialog">
+  <h2>{{ self.t("px.cleanup_title") }}</h2>
+  <p class="muted small">{{ self.t("px.cleanup_note") }}</p>
+  <ul class="cleanup-ops">
+    <li>
+      <form method="post" action="/admin/proxies/quarantine-to-removed">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.cleanup_quarantine_title") }}</strong>
+            <p class="muted small">{{ self.t("px.cleanup_quarantine_desc") }}</p>
+          </div>
+          <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+        </div>
+      </form>
+    </li>
+    <li>
+      <form method="post" action="/admin/proxies/remove-alive-no-country">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.cleanup_no_country_title") }}</strong>
+            <p class="muted small">{{ self.t("px.cleanup_no_country_desc") }}</p>
+          </div>
+          <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+        </div>
+      </form>
+    </li>
+    <li>
+      <form method="post" action="/admin/proxies/remove-alive-by-asn">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.cleanup_asn_title") }}</strong>
+            <p class="muted small">{{ self.t("px.cleanup_asn_desc") }}</p>
+          </div>
+          <div class="inline-controls">
+            <input type="text" name="asn" placeholder="AS24940" inputmode="numeric" autocomplete="off">
+            <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+          </div>
+        </div>
+      </form>
+    </li>
+    <li>
+      <form method="post" action="/admin/proxies/remove-alive-by-country">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.cleanup_country_title") }}</strong>
+            <p class="muted small">{{ self.t("px.cleanup_country_desc") }}</p>
+          </div>
+          <div class="inline-controls">
+            <select name="country">
+              <option value="">{{ self.t("common.choose") }}</option>
+              {% for country in countries %}
+                <option value="{{ country }}">{{ country }}</option>
+              {% endfor %}
+            </select>
+            <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+          </div>
+        </div>
+      </form>
+    </li>
+    <li>
+      <form method="post" action="/admin/proxies/remove-unprobeable">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.cleanup_unprobeable_title") }}</strong>
+            <p class="muted small">{{ self.t("px.cleanup_unprobeable_desc") }}</p>
+          </div>
+          <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+        </div>
+      </form>
+    </li>
+  </ul>
+  <div class="form-actions">
+    <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
+  </div>
+</dialog>
 
 <dialog id="purge-dialog">
   <form method="post" action="/admin/proxies/purge-removed">

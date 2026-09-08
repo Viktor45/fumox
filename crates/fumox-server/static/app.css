@@ -459,8 +459,28 @@ dialog {
   color: var(--text);
 }
 dialog::backdrop { background: rgba(10, 16, 30, 0.45); }
+dialog h2 { margin: 0 0 10px; font-size: 17px; }
 dialog h3 { margin: 0 0 10px; }
 dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+
+/* Bulk-cleanup dialog (proxies screen): a list of self-contained POST
+   forms, each with a description on the left and its input/submit on the
+   right. */
+.cleanup-ops { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 10px; }
+.cleanup-ops form { margin: 0; }
+.cleanup-op {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--input-bg);
+}
+.cleanup-op p { margin: 4px 0 0; }
+.cleanup-op .inline-controls { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.cleanup-op input, .cleanup-op select { padding: 6px 8px; font-size: 13.5px; width: 120px; }
 
 .login-wrap {
   min-height: 100vh;

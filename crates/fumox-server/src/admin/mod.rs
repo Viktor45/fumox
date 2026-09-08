@@ -185,6 +185,28 @@ pub fn router(state: AdminState) -> axum::Router {
             "/proxies/purge-removed",
             post(handlers::proxies_purge_removed),
         )
+        // Bulk cleanup transitions (ADMIN_PLAN §13.1 decision 29): literal
+        // action segments must be registered before the `/{id}` routes.
+        .route(
+            "/proxies/quarantine-to-removed",
+            post(handlers::proxies_quarantine_to_removed),
+        )
+        .route(
+            "/proxies/remove-alive-no-country",
+            post(handlers::proxies_remove_alive_no_country),
+        )
+        .route(
+            "/proxies/remove-alive-by-asn",
+            post(handlers::proxies_remove_alive_by_asn),
+        )
+        .route(
+            "/proxies/remove-alive-by-country",
+            post(handlers::proxies_remove_alive_by_country),
+        )
+        .route(
+            "/proxies/remove-unprobeable",
+            post(handlers::proxies_remove_unprobeable),
+        )
         .route("/proxies/{id}", get(handlers::proxy_detail))
         .route("/proxies/{id}/reset", post(handlers::proxy_reset))
         .route(
@@ -1466,6 +1488,266 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(remaining, vec![("fp-live".to_string(),)]);
+    }
+
+    /// Seed one proxy row for the bulk-cleanup tests; returns its id.
+    async fn seed_cleanup_proxy(
+        pool: &fumox_core::db::DbPool,
+        fp: &str,
+        scheme: &str,
+        status: &str,
+        geo_country: Option<&str>,
+        geo_asn: Option<&str>,
+    ) -> i64 {
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies
+                 (fingerprint, scheme, name, host, port, credential, params,
+                  unknown_params, raw_line, geo_country, geo_asn,
+                  status, fail_count, quarantined_at, ladder_step, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 443, '', '{}', '{}', '', ?, ?, ?, 0, NULL, 0, 1, 1)
+             RETURNING id",
+        )
+        .bind(fp)
+        .bind(scheme)
+        .bind(fp)
+        .bind(format!("{fp}.example.com"))
+        .bind(geo_country)
+        .bind(geo_asn)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn status_by_fp(pool: &fumox_core::db::DbPool, fp: &str) -> String {
+        let (status,): (String,) =
+            sqlx::query_as("SELECT status FROM proxies WHERE fingerprint = ?")
+                .bind(fp)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        status
+    }
+
+    #[tokio::test]
+    async fn quarantine_to_removed_moves_only_quarantined_rows() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        seed_cleanup_proxy(&pool, "fp-q", "vless", "quarantine", Some("DE"), None).await;
+        seed_cleanup_proxy(&pool, "fp-a", "vless", "alive", Some("DE"), None).await;
+        seed_cleanup_proxy(&pool, "fp-r", "vless", "removed", Some("DE"), None).await;
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/proxies/quarantine-to-removed",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        assert_eq!(status_by_fp(&pool, "fp-q").await, "removed");
+        assert_eq!(status_by_fp(&pool, "fp-a").await, "alive");
+        assert_eq!(status_by_fp(&pool, "fp-r").await, "removed");
+        let (removed_at,): (Option<i64>,) =
+            sqlx::query_as("SELECT removed_at FROM proxies WHERE fingerprint = 'fp-q'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(removed_at.is_some(), "removed_at must be stamped");
+    }
+
+    #[tokio::test]
+    async fn cleanup_htmx_answer_carries_toast_and_fragment() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        seed_cleanup_proxy(&pool, "fp-q", "vless", "quarantine", None, None).await;
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let mut req = request(
+            "POST",
+            "/admin/proxies/quarantine-to-removed",
+            &format!("_csrf={csrf}"),
+            Some(&cookie),
+        );
+        req.headers_mut()
+            .insert("HX-Request", "true".parse().unwrap());
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let trigger = response
+            .headers()
+            .get("HX-Trigger")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(trigger.contains("\"level\": \"ok\""), "{trigger}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(body.contains("badge removed"), "{body}");
+
+        assert_eq!(status_by_fp(&pool, "fp-q").await, "removed");
+    }
+
+    #[tokio::test]
+    async fn cleanup_by_asn_validates_input_and_matches_stored_format() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        seed_cleanup_proxy(
+            &pool,
+            "fp-ashet",
+            "vless",
+            "alive",
+            Some("DE"),
+            Some("AS24940"),
+        )
+        .await;
+        seed_cleanup_proxy(
+            &pool,
+            "fp-asno",
+            "vless",
+            "alive",
+            Some("DE"),
+            Some("AS9009"),
+        )
+        .await;
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // Invalid input: nothing changes, the HTMX toast reports the error.
+        let mut req = request(
+            "POST",
+            "/admin/proxies/remove-alive-by-asn",
+            &format!("_csrf={csrf}&asn=not-a-number"),
+            Some(&cookie),
+        );
+        req.headers_mut()
+            .insert("HX-Request", "true".parse().unwrap());
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let trigger = response
+            .headers()
+            .get("HX-Trigger")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(trigger.contains("\"level\": \"error\""), "{trigger}");
+        assert_eq!(status_by_fp(&pool, "fp-ashet").await, "alive");
+
+        // Bare number and AS prefix both work.
+        for asn in ["24940", "AS24940"] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    "/admin/proxies/remove-alive-by-asn",
+                    &format!("_csrf={csrf}&asn={asn}"),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        }
+        assert_eq!(status_by_fp(&pool, "fp-ashet").await, "removed");
+        assert_eq!(status_by_fp(&pool, "fp-asno").await, "alive");
+    }
+
+    #[tokio::test]
+    async fn cleanup_by_country_validates_input_and_targets_alive_only() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        seed_cleanup_proxy(&pool, "fp-dea", "vless", "alive", Some("DE"), None).await;
+        seed_cleanup_proxy(&pool, "fp-deq", "vless", "quarantine", Some("DE"), None).await;
+        seed_cleanup_proxy(&pool, "fp-usa", "vless", "alive", Some("US"), None).await;
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // Invalid input (empty country from the dropdown's placeholder).
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/proxies/remove-alive-by-country",
+                &format!("_csrf={csrf}&country="),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(status_by_fp(&pool, "fp-dea").await, "alive");
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/proxies/remove-alive-by-country",
+                &format!("_csrf={csrf}&country=de"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(status_by_fp(&pool, "fp-dea").await, "removed");
+        assert_eq!(status_by_fp(&pool, "fp-deq").await, "quarantine");
+        assert_eq!(status_by_fp(&pool, "fp-usa").await, "alive");
+    }
+
+    #[tokio::test]
+    async fn cleanup_no_country_and_unprobeable_target_their_groups() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        seed_cleanup_proxy(&pool, "fp-noc", "vless", "alive", None, None).await;
+        seed_cleanup_proxy(&pool, "fp-hasc", "vless", "alive", Some("US"), None).await;
+        seed_cleanup_proxy(&pool, "fp-tuic", "tuic", "unknown", None, None).await;
+        seed_cleanup_proxy(&pool, "fp-mieru", "mieru", "unknown", None, None).await;
+        seed_cleanup_proxy(&pool, "fp-vlessu", "vless", "unknown", None, None).await;
+        // tuic-alive carries a country so the no-country action above
+        // cannot touch it — it must survive both actions.
+        seed_cleanup_proxy(&pool, "fp-tuica", "tuic", "alive", Some("US"), None).await;
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/proxies/remove-alive-no-country",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(status_by_fp(&pool, "fp-noc").await, "removed");
+        assert_eq!(status_by_fp(&pool, "fp-hasc").await, "alive");
+
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/proxies/remove-unprobeable",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(status_by_fp(&pool, "fp-tuic").await, "removed");
+        assert_eq!(status_by_fp(&pool, "fp-mieru").await, "removed");
+        assert_eq!(status_by_fp(&pool, "fp-vlessu").await, "unknown");
+        assert_eq!(status_by_fp(&pool, "fp-tuica").await, "alive");
     }
 
     #[tokio::test]

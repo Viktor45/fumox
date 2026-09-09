@@ -43,9 +43,10 @@ pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String>
 }
 
 /// Whether the entry carries a truthy insecure toggle under any of its
-/// spelling aliases. Mirrors the alias set of the pipeline's
-/// `normalize_params` step, which leaves a lone alias in its original
-/// spelling.
+/// spelling aliases. Output formats only ever *reflect* an entry's own
+/// request (SPEC §10.3): the entry's original spelling is kept verbatim.
+/// The underscore `allow_insecure` form is deliberately not here — it
+/// never arrives from parsed feeds that these writers target.
 pub(crate) fn is_insecure(params: &[crate::models::Param]) -> bool {
     const ALIASES: [&str; 3] = ["insecure", "allowinsecure", "skip-cert-verify"];
     params.iter().any(|p| {

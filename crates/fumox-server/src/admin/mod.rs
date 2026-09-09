@@ -2522,7 +2522,7 @@ mod tests {
             ("ped_filter", "1"),
             ("ped_filter_protocols", "vless"),
             ("ped_filter_protocols", "trojan"),
-            ("ped_normalize", "1"),
+            ("ped_forbid_insecure", "1"),
             ("ped_sort", "1"),
             ("ped_sort_by", "latency"),
             ("ped_sort_desc", "1"),
@@ -2859,8 +2859,8 @@ mod tests {
 
         // Builder mode on the source form: the JSON is generated from the
         // widget fields server-side; a stale `pipeline` field is ignored.
-        // `ped_normalize`/`ped_geo_enabled` ride along exactly as a browser
-        // submits the rendered widget (every checkbox present).
+        // `ped_forbid_insecure`/`ped_geo_enabled` ride along exactly as a
+        // browser submits the rendered widget (every checkbox present).
         let body = urlencoded(&[
             ("_csrf", &csrf),
             ("name", "Builder"),
@@ -2869,7 +2869,7 @@ mod tests {
             ("pipeline_mode", "builder"),
             ("ped_filter", "1"),
             ("ped_filter_protocols", "vless"),
-            ("ped_normalize", "1"),
+            ("ped_forbid_insecure", "1"),
             ("ped_geo_enabled", "1"),
             ("ped_sort", "1"),
             ("ped_sort_by", "name"),

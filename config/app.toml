@@ -171,13 +171,15 @@ config_path = "/shared/meow.yaml"  # Clash YAML, генерируется probe 
 # HTTPS variants (www.google.com, connectivitycheck.gstatic.com,
 # play.googleapis.com) are alive too but add a TLS handshake inside the tunnel.
 test_url = [
-  "http://www.gstatic.com/generate_204",               # Android 5+ (primary since 7.1)
-  "http://connectivitycheck.gstatic.com/generate_204", # Android 7.1+
-  "http://www.google.com/generate_204",                # Android 4.2+ (fallback 9+)
-  "http://www.googleapis.com/generate_204",            # Android 4.3+ (fallback)
-  "http://play.googleapis.com/generate_204",           # Android 9+/11 fallback
-  "http://connectivitycheck.android.com/generate_204", # legacy Android 4.x, still alive
-  "http://clients3.google.com/generate_204",           # legacy Android 2.3-4.x, still alive
+  "https://cp.cloudflare.com/generate_204",
+  "https://connectivity-check.ubuntu.com",
+  "https://www.gstatic.com/generate_204",               # Android 5+ (primary since 7.1)
+  "https://connectivitycheck.gstatic.com/generate_204", # Android 7.1+
+  "https://www.google.com/generate_204",                # Android 4.2+ (fallback 9+)
+  "https://www.googleapis.com/generate_204",            # Android 4.3+ (fallback)
+  "https://play.googleapis.com/generate_204",           # Android 9+/11 fallback
+  "https://connectivitycheck.android.com/generate_204", # legacy Android 4.x, still alive
+  "https://clients3.google.com/generate_204",           # legacy Android 2.3-4.x, still alive
 ]
 timeout_secs = 7
 # Backoff повторных обращений к meow-rs, когда он недоступен (удваивается с

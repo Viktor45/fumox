@@ -127,10 +127,13 @@
         <div class="hint">{{ self.t("ped.exclude_asns_hint") }}</div>
       </div>
     </div>
-    <span class="check-row">
-      <input type="checkbox" name="ped_normalize" value="1" id="ped-normalize" {% if builder.state.normalize_params %}checked{% endif %}>
-      <label for="ped-normalize">{{ self.t("ped.normalize_params") }}</label>
-    </span>
+    <div class="field">
+      <span class="check-row">
+        <input type="checkbox" name="ped_forbid_insecure" value="1" id="ped-forbid-insecure" {% if builder.state.forbid_insecure %}checked{% endif %}>
+        <label for="ped-forbid-insecure">{{ self.t("ped.forbid_insecure") }}</label>
+      </span>
+      <div class="hint">{{ self.t("ped.forbid_insecure_hint") }}</div>
+    </div>
   </div>
 
   <div class="field">

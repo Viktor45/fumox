@@ -679,7 +679,7 @@ deduplicate by fingerprint". `"version": 1` is required.
     "exclude_protocols": ["naive"],
     "asns": ["24940", "AS13335"],
     "exclude_asns": ["9009"],
-    "normalize_params": true
+    "forbid_insecure": true
   },
   "drop": [
     { "match": "free|trial", "flags": "i" },
@@ -703,7 +703,7 @@ deduplicate by fingerprint". `"version": 1` is required.
 
 | Section  | What it does                                                 | Fields and defaults                                                                                                                |
 | -------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `filter` | Keep/drop protocols and AS numbers; normalize `insecure=1`-style parameters | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null — matched against the stored `geo_asn`, the allowlist drops proxies whose ASN was never resolved (both `"24940"` and `"AS24940"` spellings work); `normalize_params`: default `true` |
+| `filter` | Keep/drop protocols and AS numbers; drop proxies allowing insecure TLS | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null — matched against the stored `geo_asn`, the allowlist drops proxies whose ASN was never resolved (both `"24940"` and `"AS24940"` spellings work); `forbid_insecure`: default `true` — drops any proxy with a truthy `insecure`/`allowInsecure`/`skip-cert-verify`/`allow_insecure` toggle (the old `normalize_params` name is still accepted) |
 | `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` — default, `host`, `port`, `param:KEY`); rules are OR-ed; default `[]`        |
 | `rename` | Regex-based rewriting, rules applied in order                | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` — default, `host`, `port`, `param:KEY`); default `[]` |
 | `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment))   |

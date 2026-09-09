@@ -20,6 +20,6 @@ jobs:
           # Clean up any unreferenced, untagged image layers left behind
           keep-n-untagged: 0
           # Optional: change to false once you verify it selects the right images
-          dry-run: true
+          dry-run: false
           # A token with 'write:packages' and 'delete:packages' scopes
           token: ${{ secrets.GITHUB_TOKEN }}

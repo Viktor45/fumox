@@ -71,8 +71,12 @@ pub(crate) struct FilterConfig {
     /// AS numbers to drop, the same accepted format as [`Self::asns`].
     #[serde(default)]
     pub(crate) exclude_asns: Option<Vec<String>>,
-    #[serde(default = "default_true")]
-    pub(crate) normalize_params: bool,
+    /// Drop proxies that allow insecure TLS (SPEC §5 step 2): any
+    /// certificate-verification alias set to a truthy value. Default on.
+    /// `normalize_params` is the v1 name of the same switch (serde alias,
+    /// accepted forever so old exports keep importing).
+    #[serde(default = "default_true", alias = "normalize_params")]
+    pub(crate) forbid_insecure: bool,
 }
 
 const fn default_true() -> bool {
@@ -304,7 +308,9 @@ pub struct CompiledPipeline {
     /// profile country allowlist).
     filter_asns: Option<Vec<u32>>,
     exclude_asns: Option<Vec<u32>>,
-    normalize_params: bool,
+    /// Drop any proxy that allows insecure TLS (a truthy
+    /// certificate-verification alias, see [`allows_insecure`]).
+    forbid_insecure: bool,
     rename: Vec<CompiledRename>,
     drop: Vec<CompiledDrop>,
     geo_enabled: bool,
@@ -321,16 +327,16 @@ pub struct CompiledPipeline {
 }
 
 impl Default for CompiledPipeline {
-    /// Pass-through pipeline with the SPEC §5.1 defaults: normalize
-    /// insecure-aliases, geo-enrich, drop quarantine/removed, dedup by
-    /// fingerprint, keep source order.
+    /// Pass-through pipeline with the SPEC §5.1 defaults: drop
+    /// insecure-allowing entries, geo-enrich, drop quarantine/removed,
+    /// dedup by fingerprint, keep source order.
     fn default() -> Self {
         Self {
             filter_protocols: None,
             exclude_protocols: None,
             filter_asns: None,
             exclude_asns: None,
-            normalize_params: true,
+            forbid_insecure: true,
             rename: Vec::new(),
             drop: Vec::new(),
             geo_enabled: true,
@@ -404,7 +410,7 @@ impl CompiledPipeline {
             compiled.filter_asns = parse_asn_list(&filter.asns, "filter.asns", &mut errors);
             compiled.exclude_asns =
                 parse_asn_list(&filter.exclude_asns, "filter.exclude_asns", &mut errors);
-            compiled.normalize_params = filter.normalize_params;
+            compiled.forbid_insecure = filter.forbid_insecure;
         }
 
         if let Some(rules) = config.rename {
@@ -585,12 +591,11 @@ impl CompiledPipeline {
             });
         }
 
-        // filter.normalize_params — collapse duplicate/contradicting
-        // insecure spellings (SPEC §5 step 2).
-        if self.normalize_params {
-            for candidate in &mut candidates {
-                normalize_insecure_params(&mut candidate.entry.params);
-            }
+        // filter.forbid_insecure — drop proxies that allow insecure TLS in
+        // any spelling (SPEC §5 step 2). Falsy toggles (`insecure=0`) and
+        // alias-free entries survive; the DB row is never touched.
+        if self.forbid_insecure {
+            candidates.retain(|c| !allows_insecure(&c.entry.params));
         }
 
         // drop — discard rules (SPEC §5 step 3). Deliberately before
@@ -863,59 +868,23 @@ fn parse_asn_list(
     Some(asns)
 }
 
-/// Collapse the certificate-verification spellings (`insecure`,
-/// `allowInsecure`, `skip-cert-verify`) into a single parameter.
-///
-/// A lone alias is left untouched (clients expect their protocol's native
-/// spelling); only duplicate or contradicting toggles are merged. Any
-/// truthy value wins and is written back as `1` under the first spelling
-/// present; all-falsy sets keep the first spelling and value.
-fn normalize_insecure_params(params: &mut Vec<fumox_core::models::Param>) {
-    const ALIASES: [&str; 3] = ["insecure", "allowinsecure", "skip-cert-verify"];
-    fn is_alias(param: &fumox_core::models::Param) -> bool {
-        ALIASES.contains(&param.key.to_ascii_lowercase().as_str())
-    }
-
-    let positions: Vec<usize> = params
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| is_alias(p))
-        .map(|(idx, _)| idx)
-        .collect();
-    if positions.len() <= 1 {
-        return;
-    }
-
-    let any_truthy = positions.iter().any(|&idx| {
-        matches!(
-            params[idx].value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true"
-        )
-    });
-    let keep = positions[0];
-    let (key, value, known) = if any_truthy {
-        (
-            params[keep].key.clone(),
-            "1".to_string(),
-            params[keep].known,
-        )
-    } else {
-        (
-            params[keep].key.clone(),
-            params[keep].value.clone(),
-            params[keep].known,
-        )
-    };
-    // Drop every alias occurrence, then re-insert the survivor in place.
-    // `retain` rather than a reverse `remove` loop: a feed can supply
-    // thousands of alias spellings (the match is case-insensitive and
-    // `parse_query` keeps duplicates), and repeated `Vec::remove` made this
-    // O(k²) on untrusted input (security audit, 2026-09-05).
-    params.retain(|p| !is_alias(p));
-    params.insert(
-        keep.min(params.len()),
-        fumox_core::models::Param { key, value, known },
-    );
+/// Whether any certificate-verification alias is switched to a truthy
+/// value. Key match is case-insensitive; the value is compared after trim
+/// and lower-casing, like every other consumer of the toggle. The
+/// underscore `allow_insecure` spelling is included because it is the
+/// canonical form of tuic links, which pass it through as an unknown
+/// parameter.
+fn allows_insecure(params: &[fumox_core::models::Param]) -> bool {
+    const ALIASES: [&str; 4] = [
+        "insecure",
+        "allowinsecure",
+        "skip-cert-verify",
+        "allow_insecure",
+    ];
+    params.iter().any(|p| {
+        ALIASES.contains(&p.key.to_ascii_lowercase().as_str())
+            && matches!(p.value.trim().to_ascii_lowercase().as_str(), "1" | "true")
+    })
 }
 
 /// One proxy on its way through the pipeline: the entry plus the DB-side
@@ -1722,50 +1691,98 @@ mod tests {
         assert_eq!(merged["filter"]["protocols"][0], "vless");
     }
 
-    #[test]
-    fn insecure_normalization_merges_contradictions() {
-        let mut params = vec![
-            Param {
-                key: "sni".into(),
-                value: "x".into(),
+    #[tokio::test]
+    async fn forbid_insecure_drops_every_truthy_alias_spelling() {
+        for (key, value) in [
+            ("insecure", "1"),
+            ("allowInsecure", "1"),
+            ("skip-cert-verify", "true"),
+            ("allow_insecure", "1"),
+            ("INSECURE", " TRUE "),
+        ] {
+            let mut c = candidate(key, Scheme::Vless, &format!("{key}.example.com"));
+            c.entry.params.push(Param {
+                key: key.into(),
+                value: value.into(),
                 known: true,
-            },
-            Param {
-                key: "allowInsecure".into(),
-                value: "0".into(),
-                known: true,
-            },
-            Param {
-                key: "insecure".into(),
-                value: "1".into(),
-                known: true,
-            },
-        ];
-        normalize_insecure_params(&mut params);
-        let insecure: Vec<_> = params
-            .iter()
-            .filter(|p| {
-                ["insecure", "allowinsecure", "skip-cert-verify"]
-                    .contains(&p.key.to_ascii_lowercase().as_str())
-            })
-            .collect();
-        assert_eq!(insecure.len(), 1);
-        assert_eq!(insecure[0].key, "allowInsecure"); // first spelling present
-        assert_eq!(insecure[0].value, "1"); // truthy wins
-        assert!(params.iter().any(|p| p.key == "sni"));
+            });
+            let out = CompiledPipeline::from_json(None)
+                .unwrap()
+                .apply(vec![c], &inactive_geo())
+                .await;
+            assert!(
+                out.is_empty(),
+                "truthy alias {key}={value} must drop the proxy"
+            );
+        }
     }
 
-    #[test]
-    fn insecure_normalization_leaves_lone_alias_alone() {
-        let mut params = vec![Param {
-            key: "skip-cert-verify".into(),
-            value: "0".into(),
+    #[tokio::test]
+    async fn forbid_insecure_keeps_falsy_and_alias_free_entries() {
+        for key in [
+            "insecure",
+            "allowInsecure",
+            "skip-cert-verify",
+            "allow_insecure",
+        ] {
+            let mut c = candidate(key, Scheme::Vless, &format!("{key}.example.com"));
+            c.entry.params.push(Param {
+                key: key.into(),
+                value: "0".into(),
+                known: true,
+            });
+            let out = CompiledPipeline::from_json(None)
+                .unwrap()
+                .apply(vec![c], &inactive_geo())
+                .await;
+            assert_eq!(out.len(), 1, "falsy {key}=0 must survive");
+        }
+        // No alias at all — untouched by the filter.
+        let plain = candidate("plain", Scheme::Vless, "plain.example.com");
+        let out = CompiledPipeline::from_json(None)
+            .unwrap()
+            .apply(vec![plain], &inactive_geo())
+            .await;
+        assert_eq!(out.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forbid_insecure_off_keeps_insecure_entries() {
+        let config = json!({
+            "version": 1,
+            "filter": { "forbid_insecure": false }
+        });
+        let mut c = candidate("insecure one", Scheme::Vless, "insecure.example.com");
+        c.entry.params.push(Param {
+            key: "allowInsecure".into(),
+            value: "1".into(),
             known: true,
-        }];
-        let before = params.clone();
-        normalize_insecure_params(&mut params);
-        assert_eq!(params.len(), 1);
-        assert_eq!(params[0].key, before[0].key);
-        assert_eq!(params[0].value, before[0].value);
+        });
+        let out = CompiledPipeline::from_json(Some(&config))
+            .unwrap()
+            .apply(vec![c], &inactive_geo())
+            .await;
+        assert_eq!(out.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_normalize_params_name_still_compiles_as_the_same_switch() {
+        // Old exports carry "normalize_params": false — the v1 name of the
+        // switch, accepted via serde alias so imports keep working.
+        let legacy = json!({
+            "version": 1,
+            "filter": { "normalize_params": false }
+        });
+        let mut c = candidate("insecure one", Scheme::Vless, "legacy.example.com");
+        c.entry.params.push(Param {
+            key: "insecure".into(),
+            value: "1".into(),
+            known: true,
+        });
+        let out = CompiledPipeline::from_json(Some(&legacy))
+            .unwrap()
+            .apply(vec![c], &inactive_geo())
+            .await;
+        assert_eq!(out.len(), 1, "legacy false must disable the filter");
     }
 }

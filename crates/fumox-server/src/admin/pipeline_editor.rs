@@ -89,7 +89,9 @@ pub(crate) struct BuilderState {
     pub asns: String,
     /// AS numbers to drop, the same comma-separated form.
     pub exclude_asns: String,
-    pub normalize_params: bool,
+    /// Drop proxies that allow insecure TLS (SPEC §5 step 2). Defaults on;
+    /// `false` is the only non-default value the emit ever writes.
+    pub forbid_insecure: bool,
     pub rename: Vec<RenameRow>,
     pub rename_skip: bool,
     pub rename_defaults: bool,
@@ -165,7 +167,7 @@ impl BuilderState {
     /// A fresh state: every section unset, checkboxes at their SPEC defaults.
     pub(crate) fn new() -> Self {
         Self {
-            normalize_params: true,
+            forbid_insecure: true,
             geo_enabled: true,
             exclude_statuses: crate::pipeline::default_exclude_statuses(),
             ..Default::default()
@@ -254,7 +256,7 @@ impl BuilderState {
             exclude_protocols: get_all("ped_filter_exclude"),
             asns: get("ped_filter_asns"),
             exclude_asns: get("ped_filter_exclude_asns"),
-            normalize_params: get("ped_normalize") == "1",
+            forbid_insecure: get("ped_forbid_insecure") == "1",
             rename: rename_rows.into_values().collect(),
             rename_skip: rename_mode == "skip",
             rename_defaults: rename_mode == "defaults",
@@ -307,8 +309,8 @@ impl BuilderState {
             if let Some(exclude) = split_asn_field(&self.exclude_asns) {
                 filter.insert("exclude_asns".into(), strings(&exclude));
             }
-            if !self.normalize_params {
-                filter.insert("normalize_params".into(), serde_json::Value::from(false));
+            if !self.forbid_insecure {
+                filter.insert("forbid_insecure".into(), serde_json::Value::from(false));
             }
             if !filter.is_empty() {
                 map.insert("filter".into(), filter.into());
@@ -559,7 +561,7 @@ impl BuilderState {
                     .is_some_and(|p| !p.is_empty())
                 || filter.asns.as_ref().is_some_and(|a| !a.is_empty())
                 || filter.exclude_asns.as_ref().is_some_and(|a| !a.is_empty())
-                || !filter.normalize_params;
+                || !filter.forbid_insecure;
             if has_values {
                 state.filter_set = true;
                 state.protocols = filter.protocols.unwrap_or_default();
@@ -569,7 +571,7 @@ impl BuilderState {
                 // does not rewrite what was configured.
                 state.asns = filter.asns.unwrap_or_default().join(", ");
                 state.exclude_asns = filter.exclude_asns.unwrap_or_default().join(", ");
-                state.normalize_params = filter.normalize_params;
+                state.forbid_insecure = filter.forbid_insecure;
             } else {
                 state.filter_defaults = true;
             }
@@ -1077,7 +1079,7 @@ mod tests {
         let mut s = state();
         s.filter_set = true;
         s.protocols = vec!["vless".into(), "trojan".into()];
-        s.normalize_params = false;
+        s.forbid_insecure = false;
         s.geo_set = true;
         s.geo_enabled = false;
         s.geo_template = "{asn} · {name}".into();
@@ -1093,7 +1095,7 @@ mod tests {
                 "version": 1,
                 "filter": {
                     "protocols": ["vless", "trojan"],
-                    "normalize_params": false
+                    "forbid_insecure": false
                 },
                 "geo": { "enabled": false, "template": "{asn} · {name}" },
                 "health": { "exclude_statuses": ["removed"] },
@@ -1109,7 +1111,7 @@ mod tests {
         let mut s = state();
         s.filter_set = true;
         s.protocols = vec!["ss".into()];
-        s.normalize_params = true; // default — not emitted
+        s.forbid_insecure = true; // default — not emitted
         s.geo_set = true;
         s.geo_template = "{flag} {country} · {name}".into(); // default — not emitted
         s.rename = vec![
@@ -1433,7 +1435,7 @@ mod tests {
             set("ped_filter_exclude", &["naive"]),
             vec![("ped_filter_asns".to_string(), "24940, AS13335".to_string())],
             vec![("ped_filter_exclude_asns".to_string(), " 9009 ".to_string())],
-            vec![("ped_normalize".to_string(), "1".to_string())],
+            vec![("ped_forbid_insecure".to_string(), "1".to_string())],
             vec![
                 ("ped_rename_1_match".to_string(), "b".to_string()),
                 ("ped_rename_1_replace".to_string(), "B".to_string()),
@@ -1462,7 +1464,7 @@ mod tests {
         assert_eq!(s.asns, "24940, AS13335");
         // from_form trims text fields, like every other widget input.
         assert_eq!(s.exclude_asns, "9009");
-        assert!(s.normalize_params);
+        assert!(s.forbid_insecure);
         // Rows are ordered by index, not by form order; missing fields are empty.
         assert_eq!(
             s.rename,
@@ -1631,12 +1633,12 @@ mod tests {
         // empty — the emit is NULL, exactly like an untouched widget.
         let s = BuilderState::from_form(&[("name".into(), "x".into())]);
         assert!(!s.filter_set && !s.geo_set && !s.health_set && !s.sort_set);
-        assert!(!s.normalize_params && !s.geo_enabled && !s.sort_desc);
+        assert!(!s.forbid_insecure && !s.geo_enabled && !s.sort_desc);
         assert!(s.rename.is_empty());
         assert_eq!(s.emit(), None);
         // A rendered widget starts from different defaults — the SPEC ones.
         let fresh = BuilderState::new();
-        assert!(fresh.normalize_params && fresh.geo_enabled);
+        assert!(fresh.forbid_insecure && fresh.geo_enabled);
         assert_eq!(fresh.exclude_statuses, ["quarantine", "removed"]);
     }
 
@@ -1656,7 +1658,7 @@ mod tests {
     fn ingest_rebuilds_every_section() {
         let json = json!({
             "version": 1,
-            "filter": { "protocols": ["vless"], "exclude_protocols": ["ss"], "normalize_params": false },
+            "filter": { "protocols": ["vless"], "exclude_protocols": ["ss"], "forbid_insecure": false },
             "rename": [{ "match": "^x", "replace": "y", "flags": "im" }],
             "geo": { "enabled": false, "template": "{asn} · {name}" },
             "health": { "exclude_statuses": ["alive", "unknown"] },
@@ -1668,7 +1670,7 @@ mod tests {
         assert!(s.filter_set);
         assert_eq!(s.protocols, ["vless"]);
         assert_eq!(s.exclude_protocols, ["ss"]);
-        assert!(!s.normalize_params);
+        assert!(!s.forbid_insecure);
         assert_eq!(s.rename.len(), 1);
         assert_eq!(s.rename[0].match_pattern, "^x");
         assert_eq!(s.rename[0].flags, "im");
@@ -1681,6 +1683,29 @@ mod tests {
 
         // And the rebuilt state emits the same JSON back.
         assert_eq!(s.emit().unwrap(), json);
+    }
+
+    #[test]
+    fn ingest_accepts_the_legacy_normalize_params_name() {
+        // Old exports carry "normalize_params": false — the v1 name of the
+        // same switch (serde alias in FilterConfig). The widget rebuilds
+        // from it, and the emit writes the current name back.
+        let legacy = json!({
+            "version": 1,
+            "filter": { "normalize_params": false }
+        });
+        let Ingest::Builder(s) = BuilderState::ingest(Some(&legacy)) else {
+            panic!("must parse");
+        };
+        assert!(s.filter_set);
+        assert!(!s.forbid_insecure);
+        assert_eq!(
+            s.emit().unwrap(),
+            json!({
+                "version": 1,
+                "filter": { "forbid_insecure": false }
+            })
+        );
     }
 
     #[test]
@@ -1822,7 +1847,7 @@ mod tests {
         everything.filter_set = true;
         everything.protocols = vec!["vless".into()];
         everything.exclude_protocols = vec!["ss".into()];
-        everything.normalize_params = false;
+        everything.forbid_insecure = false;
         everything.rename = vec![RenameRow {
             match_pattern: "^(.*?)\\s*\\|".into(),
             replace: "$1".into(),
@@ -1851,7 +1876,7 @@ mod tests {
         let mut s = state();
         s.filter_set = true;
         s.protocols = vec!["vless".into()];
-        s.normalize_params = false;
+        s.forbid_insecure = false;
         s.rename = vec![RenameRow {
             match_pattern: "free".into(),
             replace: "FREE".into(),

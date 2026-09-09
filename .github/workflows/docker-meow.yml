@@ -71,7 +71,7 @@ jobs:
           echo "MEOW_VERSION=${MEOW_INPUT//[[:space:]]/}" >> "$GITHUB_ENV"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Compute image name
         id: image

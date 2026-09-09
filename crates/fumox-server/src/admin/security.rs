@@ -41,5 +41,9 @@ pub async fn headers(req: Request, next: Next) -> Response {
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(CONTENT_SECURITY_POLICY),
     );
+    // The panel renders secrets (masked headers, the alive-export link,
+    // the config export); nothing it serves belongs in any shared or
+    // intermediary cache (security audit v2, 2026-09-09, F8).
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }

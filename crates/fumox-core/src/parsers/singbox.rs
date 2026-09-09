@@ -827,6 +827,18 @@ fn finish(
             super::uri::MAX_QUERY_PARAMS
         ));
     }
+    // Field-size cap (security audit v2, 2026-09-09, F13): sing-box params
+    // bypass `parse_query`, so the byte cap is enforced here.
+    for param in &params {
+        if param.key.len() > super::uri::MAX_PARAM_BYTES
+            || param.value.len() > super::uri::MAX_PARAM_BYTES
+        {
+            return Err(format!(
+                "sing-box: field over the {}-byte cap",
+                super::uri::MAX_PARAM_BYTES
+            ));
+        }
+    }
     Ok(ProxyEntry {
         scheme,
         name: name.to_string(),

@@ -436,6 +436,14 @@ pub struct ProbeConfig {
     /// Consecutive failures before quarantine.
     #[serde(default = "defaults::fail_limit")]
     pub fail_limit: u32,
+    /// When `false` (the default), the daemon refuses to dial proxy hosts
+    /// that resolve to loopback / RFC1918 / link-local (cloud metadata) /
+    /// CGNAT / unique-local addresses (security audit v2, 2026-09-09, F1):
+    /// proxy hosts come from remote feeds, and without this gate a hostile
+    /// feed turns the probe into an internal port scanner. Mirrors
+    /// `[admin].allow_private_urls` of the fetcher.
+    #[serde(default)]
+    pub allow_private_targets: bool,
     /// TCP connect timeout for T1 checks.
     #[serde(default = "defaults::probe_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
@@ -482,6 +490,7 @@ impl Default for ProbeConfig {
             cycle_interval_secs: defaults::cycle_interval_secs(),
             sample_size: defaults::sample_size(),
             fail_limit: defaults::fail_limit(),
+            allow_private_targets: false,
             connect_timeout_secs: defaults::probe_connect_timeout_secs(),
             tls_timeout_secs: defaults::probe_tls_timeout_secs(),
             concurrency: defaults::probe_concurrency(),

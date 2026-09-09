@@ -28,6 +28,8 @@ use fumox_core::repo::{profiles, proxies, sources};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::caps;
+
 /// Slug format shared with the source/profile forms.
 const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
 /// Only schema version we understand today.
@@ -373,6 +375,38 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
     let mut errors: Vec<String> = Vec::new();
     let slug_re = regex::Regex::new(SLUG_RE).expect("valid slug regex");
 
+    // Row-count caps (security audit v2, F7): one 1 MiB body could carry
+    // thousands of rows, each triggering cache invalidation and (before the
+    // window below) a DNS lookup.
+    if file.sources.len() > caps::IMPORT_ROWS {
+        errors.push(
+            lang.t("val.import_too_many_rows")
+                .replace("{}", &caps::IMPORT_ROWS.to_string())
+                + " ("
+                + lang.t("io.source_word")
+                + ")",
+        );
+    }
+    if file.profiles.len() > caps::IMPORT_ROWS {
+        errors.push(
+            lang.t("val.import_too_many_rows")
+                .replace("{}", &caps::IMPORT_ROWS.to_string())
+                + " ("
+                + lang.t("io.profile_word")
+                + ")",
+        );
+    }
+    if !errors.is_empty() {
+        return errors; // nothing else is worth checking past the row caps
+    }
+
+    // DNS-vet window (security audit v2, F7): `vet_url` resolves every URL
+    // inside the request; past the window the URLs are only statically
+    // validated — the fetch path re-vets every request anyway, so this is
+    // latency/DNS-traffic hygiene, not a security hole.
+    let mut dns_budget = caps::IMPORT_DNS_VET;
+    let mut dns_capped = false;
+
     for s in &file.sources {
         let ctx = format!("{} «{}»", lang.t("io.source_word"), s.name);
         if s.name.trim().is_empty() {
@@ -382,15 +416,33 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         }
         if s.url.trim().is_empty() {
             errors.push(format!("{ctx}: {}", lang.t("val.required")));
-        } else if let Err(issue) = fetcher::vet_url(
-            &s.url,
-            state.admin.allow_private_urls,
-            s.ip_family
-                .unwrap_or_else(|| state.fetcher.default_family()),
-        )
-        .await
-        {
-            errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
+        } else if s.url.len() > caps::URL {
+            errors.push(format!(
+                "{ctx}: {}",
+                lang.t("val.field_too_long")
+                    .replace("{}", &caps::URL.to_string())
+            ));
+        } else {
+            let family = s
+                .ip_family
+                .unwrap_or_else(|| state.fetcher.default_family());
+            if state.admin.allow_private_urls {
+                // Nothing to reject at the DNS level — the fetch path still
+                // re-vets on every request.
+                if let Err(issue) = fetcher::validate_url(&s.url) {
+                    errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
+                }
+            } else if dns_budget > 0 {
+                dns_budget -= 1;
+                if let Err(issue) = fetcher::vet_url(&s.url, false, family).await {
+                    errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
+                }
+            } else {
+                dns_capped = true;
+                if let Err(issue) = fetcher::validate_url(&s.url) {
+                    errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
+                }
+            }
         }
         if let Some(slug) = s.slug.as_deref()
             && !slug.is_empty()
@@ -401,7 +453,31 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         if !(60..=86_400).contains(&s.cache_ttl_seconds) {
             errors.push(format!("{ctx}: {}", lang.t("val.ttl_range")));
         }
+        if let Some(tags) = s.tags.as_ref()
+            && (tags.len() > caps::TAGS || tags.iter().any(|t| t.len() > caps::TAG_BYTES))
+        {
+            errors.push(format!(
+                "{ctx}: {}",
+                lang.t("val.too_many_tags")
+                    .replace("{}", &caps::TAGS.to_string())
+            ));
+        }
         if let Some(map) = s.headers.as_ref() {
+            if map.len() > caps::HEADER_LINES {
+                errors.push(format!(
+                    "{ctx}: {}",
+                    lang.t("val.too_many_headers")
+                        .replace("{}", &caps::HEADER_LINES.to_string())
+                ));
+            }
+            let total: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
+            if total > caps::HEADER_BYTES {
+                errors.push(format!(
+                    "{ctx}: {}",
+                    lang.t("val.headers_too_long")
+                        .replace("{}", &caps::HEADER_BYTES.to_string())
+                ));
+            }
             for (key, value) in map {
                 if axum::http::HeaderName::try_from(key.as_str()).is_err()
                     || axum::http::HeaderValue::try_from(value.as_str()).is_err()
@@ -437,6 +513,25 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         {
             errors.push(format!("{ctx}: {}", lang.t("val.slug_format")));
         }
+        // Imported access tokens (security audit v2, F8): a third-party file
+        // must not plant a guessable secret on a public endpoint. Tokens
+        // shorter than the floor are hard errors — silently regenerating
+        // them would change what the operator expects the file to contain.
+        if let Some(token) = p.access_token.as_deref()
+            && !token.is_empty()
+            && token.chars().count() < caps::IMPORT_TOKEN_MIN
+        {
+            errors.push(format!("{ctx}: {}", lang.t("val.token_too_short_import")));
+        }
+        if let Some(token) = p.access_token.as_deref()
+            && token.len() > caps::ACCESS_TOKEN
+        {
+            errors.push(format!(
+                "{ctx}: {}",
+                lang.t("val.field_too_long")
+                    .replace("{}", &caps::ACCESS_TOKEN.to_string())
+            ));
+        }
         if let Some(pipeline) = p.pipeline.as_ref() {
             for issue in CompiledPipeline::from_json(Some(pipeline))
                 .err()
@@ -445,6 +540,13 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             {
                 errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
             }
+        }
+        if p.countries.len() > caps::COUNTRIES {
+            errors.push(format!(
+                "{ctx}: {}",
+                lang.t("val.too_many_countries")
+                    .replace("{}", &caps::COUNTRIES.to_string())
+            ));
         }
         for code in &p.countries {
             let upper = code.trim().to_ascii_uppercase();
@@ -455,6 +557,15 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
                 ));
             }
         }
+    }
+
+    // Not an error: the remaining URLs were only statically validated and
+    // are re-vetted (with DNS) at fetch time.
+    if dns_capped {
+        tracing::info!(
+            capped = file.sources.len() - caps::IMPORT_DNS_VET.min(file.sources.len()),
+            "import DNS vetting hit the per-request window"
+        );
     }
 
     errors
@@ -678,5 +789,74 @@ mod tests {
             None
         );
         assert_eq!(summary.warnings.len(), 2);
+    }
+
+    /// F7/F8 (security audit v2, 2026-09-09): import row caps and the
+    /// access-token floor are hard errors — nothing is written.
+    #[tokio::test]
+    async fn import_rejects_row_floods_and_short_tokens() {
+        // A minimal admin state (tests in admin::mod keep their own; this
+        // one only needs the fetcher defaults and the config).
+        let dir = std::env::temp_dir().join(format!("fumox-import-test-{}", models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(refresh_rx);
+        let config = fumox_core::AppConfig::default();
+        let fetcher = crate::fetcher::Fetcher::new(config.fetch.clone(), false);
+        let state = crate::admin::AdminState::new(
+            pool,
+            crate::cache::Caches::new(),
+            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
+            refresh_tx,
+            crate::scheduler::SchedulerState::new(1),
+            crate::events::EventBus::new(),
+            fetcher,
+            config,
+        );
+        let lang = state.locales.default_lang();
+
+        // 501 sources trip the row cap before any DNS work happens.
+        let flood = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: (0..caps::IMPORT_ROWS + 1)
+                .map(|i| source(&format!("ref{i}"), &format!("s{i}"), None))
+                .collect(),
+            profiles: Vec::new(),
+        };
+        let errors = validate_import(&state, &lang, &flood).await;
+        assert!(!errors.is_empty(), "row cap must fire");
+
+        // A profile with a guessable short token from a third-party file is
+        // rejected (the endpoint would be "protected" by a known secret).
+        let mut planted = profile("p", None, &[]);
+        planted.access_token = Some("123".to_string());
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: Vec::new(),
+            profiles: vec![planted],
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(!errors.is_empty(), "short imported token must be rejected");
+
+        // A proper-length token passes validation.
+        let mut ok = profile("p", None, &[]);
+        ok.access_token = Some("a".repeat(32));
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: Vec::new(),
+            profiles: vec![ok],
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

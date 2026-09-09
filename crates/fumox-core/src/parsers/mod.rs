@@ -36,6 +36,18 @@ pub enum LineOutcome {
 /// Parse one subscription line. Comments and blank lines must be filtered
 /// out by the caller ([`parse_subscription`] does this).
 pub fn parse_line(line: &str) -> LineOutcome {
+    // Line-size cap (security audit v2, 2026-09-09, F13): `raw_line` is
+    // persisted verbatim onto every stored row, so an oversized line is a
+    // storage bomb — the caller's log-and-skip path drops it like any other
+    // malformed line.
+    if line.len() > uri::MAX_LINE_BYTES {
+        tracing::debug!(
+            bytes = line.len(),
+            cap = uri::MAX_LINE_BYTES,
+            "skipping oversized proxy line"
+        );
+        return LineOutcome::Unrecognized;
+    }
     let line = line.trim();
     let Some((scheme_raw, rest)) = line.split_once("://") else {
         return LineOutcome::Unrecognized;

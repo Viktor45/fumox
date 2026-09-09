@@ -116,6 +116,14 @@ sample_size = 50              # случайная выборка прокси �
 # T1 checks (priority queue, then the random sample); T2 failures count in
 # the same counter. Lower it to stop spending T1 time on dead proxies.
 fail_limit = 2
+# Запрет диала приватных адресов из фидов (аудит безопасности v2, F1): без
+# этого флага демон не подключается к loopback/RFC1918/link-local/CGNAT
+# целям — фид может подсунуть «прокси» с адресом внутренней сети.
+# Refuse to dial private addresses coming from feeds (security audit v2,
+# F1): with this flag unset the daemon never connects to loopback/RFC1918/
+# link-local/CGNAT targets — a feed can plant a «proxy» pointing inside
+# your network.
+# allow_private_targets = false
 connect_timeout_secs = 5     # T1: TCP-connect
 tls_timeout_secs = 5         # T1: TLS-handshake
 concurrency = 8

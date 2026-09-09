@@ -124,7 +124,9 @@
   {% if pages.len() > 1 %}
     <div class="pagination">
       {% for (p, current) in pages %}
-        {% if current %}
+        {% if *p == 0 %}
+          <span class="page gap">…</span>
+        {% else if current %}
           <span class="page current">{{ p }}</span>
         {% else %}
           <a class="page" href="/admin/sources/{{ source.id }}?page={{ p }}">{{ p }}</a>

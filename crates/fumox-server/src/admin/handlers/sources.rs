@@ -3,8 +3,8 @@
 //! toggle / "обновить сейчас" / delete actions.
 
 use super::{
-    FormMap, action_response, clamp_limit, fmt_bytes, fmt_opt_ts_element, fmt_ts_element, is_htmx,
-    mask_secret, not_found, page_offset, pagination_pages, server_error,
+    FormMap, action_response, caps, clamp_limit, fmt_bytes, fmt_opt_ts_element, fmt_ts_element,
+    is_htmx, mask_secret, not_found, page_offset, pagination_pages, server_error,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -394,6 +394,12 @@ async fn build_source_from_form(
     let url = get("url");
     if url.is_empty() {
         errors.push(("url".into(), lang.t("val.required").into()));
+    } else if url.len() > caps::URL {
+        errors.push((
+            "url".into(),
+            lang.t("val.field_too_long")
+                .replace("{}", &caps::URL.to_string()),
+        ));
     } else if let Err(issue) = fetcher::vet_url(
         &url,
         state.admin.allow_private_urls,
@@ -460,13 +466,27 @@ async fn build_source_from_form(
     let tags: Option<Vec<String>> = if tags_raw.is_empty() {
         None
     } else {
-        Some(
-            tags_raw
-                .split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect(),
-        )
+        let list: Vec<String> = tags_raw
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        // Tag caps (security audit v2, F7): count and per-tag length.
+        if list.len() > caps::TAGS {
+            errors.push((
+                "tags".into(),
+                lang.t("val.too_many_tags")
+                    .replace("{}", &caps::TAGS.to_string()),
+            ));
+        }
+        if list.iter().any(|t| t.len() > caps::TAG_BYTES) {
+            errors.push((
+                "tags".into(),
+                lang.t("val.field_too_long")
+                    .replace("{}", &caps::TAG_BYTES.to_string()),
+            ));
+        }
+        Some(list)
     };
 
     // Headers: "Key: value" lines. Masked values from the edit form are
@@ -475,6 +495,28 @@ async fn build_source_from_form(
     let headers_raw = get("headers");
     let mut headers_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
+    // Header caps (security audit v2, F7): the whole map is replayed on
+    // every fetch of the source, so it is bounded like every other field.
+    let non_empty_lines = headers_raw.lines().filter(|l| !l.trim().is_empty()).count();
+    if non_empty_lines > caps::HEADER_LINES {
+        errors.push((
+            "headers".into(),
+            lang.t("val.too_many_headers")
+                .replace("{}", &caps::HEADER_LINES.to_string()),
+        ));
+    }
+    let headers_bytes: usize = headers_raw
+        .lines()
+        .map(|l| l.trim().len())
+        .filter(|len| *len > 0)
+        .sum();
+    if headers_bytes > caps::HEADER_BYTES {
+        errors.push((
+            "headers".into(),
+            lang.t("val.headers_too_long")
+                .replace("{}", &caps::HEADER_BYTES.to_string()),
+        ));
+    }
     for line in headers_raw.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -528,6 +570,15 @@ async fn build_source_from_form(
     } else {
         let pipeline_raw = get("pipeline");
         if pipeline_raw.trim().is_empty() {
+            None
+        } else if pipeline_raw.len() > caps::PIPELINE_BYTES {
+            // Pipeline cap (security audit v2, F7): the JSON is stored
+            // verbatim and re-rendered into every edit form.
+            errors.push((
+                "pipeline".into(),
+                lang.t("val.field_too_long")
+                    .replace("{}", &caps::PIPELINE_BYTES.to_string()),
+            ));
             None
         } else {
             match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {

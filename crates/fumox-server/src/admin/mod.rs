@@ -253,6 +253,11 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/admin/set-theme", get(theme::set_theme))
         .route("/admin/static/app.css", get(static_css))
         .route("/admin/static/htmx.min.js", get(static_htmx))
+        // Router-wide request-body cap (security audit v2, 2026-09-09, F7):
+        // the CSRF layer already buffers POSTs at 1 MiB; this gives every
+        // other extractor the same bound instead of relying on that
+        // coincidence.
+        .layer(axum::extract::DefaultBodyLimit::max(1 << 20))
         .layer(axum::middleware::from_fn(security::headers))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -917,6 +922,135 @@ mod tests {
             created.unwrap().ip_family,
             Some(fumox_core::models::IpFamily::Ipv6)
         );
+    }
+
+    /// F7 (security audit v2, 2026-09-09): unbounded form fields used to be
+    /// stored verbatim — a megabyte pipeline or a hundred tags degraded
+    /// every later render. The caps reject the submission.
+    #[tokio::test]
+    async fn oversized_form_fields_are_rejected() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // The test config allows private URLs, so vet_url short-circuits to
+        // static validation and the URL length cap is what fires here.
+        let long_url = format!("https://example.com/{}", "x".repeat(3000));
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "Caps"),
+            ("url", &long_url),
+            ("cache_ttl_seconds", "3600"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            fumox_core::repo::sources::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A pipeline over the byte cap is rejected even when it is valid JSON.
+        let huge_pipeline = format!(
+            "{{\"version\":1,\"rename\":[{{\"match\":\"{}\",\"replace\":\"x\"}}]}}",
+            "a".repeat(70_000)
+        );
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "Caps"),
+            ("url", "https://example.com/sub"),
+            ("cache_ttl_seconds", "3600"),
+            ("pipeline_mode", "raw"),
+            ("pipeline", &huge_pipeline),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            fumox_core::repo::sources::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Too many tags.
+        let tags: String = (0..30)
+            .map(|i| format!("tag{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "Caps"),
+            ("url", "https://example.com/sub"),
+            ("cache_ttl_seconds", "3600"),
+            ("tags", &tags),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            fumox_core::repo::sources::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// F8 (security audit v2, 2026-09-09): a profile token outside the
+    /// URL-safe alphabet is rejected by the form.
+    #[tokio::test]
+    async fn profile_token_validation_caps_and_charset() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // A token with spaces is not URL-safe: rejected.
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "T"),
+            ("output_format", "uri_list"),
+            ("access_token", "not url safe"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/profiles/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            fumox_core::repo::profiles::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A long but valid token passes the form (length capped at 128).
+        let token = "a".repeat(128);
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "T"),
+            ("output_format", "uri_list"),
+            ("access_token", &token),
+            ("enabled", "1"),
+        ]);
+        let response = app
+            .oneshot(request("POST", "/admin/profiles/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
     }
 
     #[tokio::test]
@@ -2230,7 +2364,7 @@ mod tests {
         let profile = fumox_core::models::Profile {
             id: "profX0000000".into(),
             slug: Some("exp-prof".into()),
-            access_token: Some("tok".into()),
+            access_token: Some("tok-0123456789abcdef".into()),
             name: "export profile".into(),
             output_format: fumox_core::models::OutputFormat::Clash,
             pipeline: None,
@@ -2305,7 +2439,10 @@ mod tests {
         assert_eq!(parsed["sources"][0]["slug"], "exp-src");
         assert_eq!(parsed["profiles"][0]["slug"], "exp-prof");
         assert_eq!(parsed["profiles"][0]["output_format"], "clash");
-        assert_eq!(parsed["profiles"][0]["access_token"], "tok");
+        assert_eq!(
+            parsed["profiles"][0]["access_token"],
+            "tok-0123456789abcdef"
+        );
         assert_eq!(
             parsed["profiles"][0]["sources"],
             serde_json::json!(["srcX0000000"])
@@ -2352,7 +2489,10 @@ mod tests {
         let new_profile = &profiles[0];
         assert_ne!(new_profile.id, "profX0000000");
         assert_eq!(new_profile.slug.as_deref(), Some("exp-prof"));
-        assert_eq!(new_profile.access_token.as_deref(), Some("tok"));
+        assert_eq!(
+            new_profile.access_token.as_deref(),
+            Some("tok-0123456789abcdef")
+        );
         let composition = fumox_core::repo::profiles::get_sources(&pool, &new_profile.id)
             .await
             .unwrap();

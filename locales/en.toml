@@ -443,3 +443,14 @@
 "val.url_scheme" = "only http/https URLs are supported, got '{0}'"
 "val.url_ssrf" = "SSRF protection: {0}"
 "val.url_too_long" = "the URL is longer than {0} characters"
+
+# Field caps (security audit v2, 2026-09-09, F7/F8).
+"val.field_too_long" = "at most {} characters"
+"val.too_many_tags" = "at most {} tags"
+"val.token_format" = "1–128 characters: letters, digits and '-_.~'"
+"val.too_many_countries" = "at most {} country codes"
+"val.too_many_headers" = "at most {} header lines"
+"val.headers_too_long" = "at most {} characters in total"
+"val.import_too_many_rows" = "the file holds more than {} entries"
+"val.import_dns_limit" = "SSRF vetting covered only the first {} URLs; the rest are re-vetted at fetch time"
+"val.token_too_short_import" = "access token shorter than 16 characters — replace with a generated one"

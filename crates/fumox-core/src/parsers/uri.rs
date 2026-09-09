@@ -237,6 +237,22 @@ pub fn parse_hostport(s: &str) -> Result<(String, u16), String> {
 /// log-and-skip path drops it.
 pub const MAX_QUERY_PARAMS: usize = 256;
 
+/// Upper bound on one parameter key or value, in bytes.
+///
+/// The count cap alone still let a 10 MiB single value ride one line into
+/// the DB twice (`raw_line` plus the params JSON, ~20 MiB per row,
+/// security audit v2, 2026-09-09, F13). Real proxy parameters are tens of
+/// bytes; anything past this cap is malformed.
+pub const MAX_PARAM_BYTES: usize = 8 * 1024;
+
+/// Upper bound on one subscription line, in bytes.
+///
+/// `raw_line` is persisted verbatim onto every stored row, so an oversized
+/// line is a storage bomb, not just a parse cost — a full 10 MiB fetch of a
+/// single line became ~20 MiB of SQLite data per row per refresh (security
+/// audit v2, 2026-09-09, F13). Legitimate proxy lines are well under 4 KiB.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
 /// Parse a raw query string into ordered parameters.
 ///
 /// Pairs are split on the first `=` only, so values may contain further `=`
@@ -244,8 +260,9 @@ pub const MAX_QUERY_PARAMS: usize = 256;
 /// empty-key params so serialization can reproduce them byte-for-byte.
 /// Values keep their percent-encoding untouched.
 ///
-/// Fails when the query exceeds [`MAX_QUERY_PARAMS`]; truncating instead
-/// would silently break the round-trip guarantee.
+/// Fails when the query exceeds [`MAX_QUERY_PARAMS`] or any single key or
+/// value exceeds [`MAX_PARAM_BYTES`]; truncating instead would silently
+/// break the round-trip guarantee.
 pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
     // Count before allocating: `split` is lazy, so this never materializes
     // the oversized parameter list.
@@ -255,21 +272,41 @@ pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
             "query has {count} parameters, over the {MAX_QUERY_PARAMS} cap"
         ));
     }
-    Ok(query
-        .split('&')
-        .map(|pair| match pair.split_once('=') {
-            Some((key, value)) => Param {
-                key: key.to_string(),
-                value: value.to_string(),
-                known: false,
-            },
-            None => Param {
-                key: pair.to_string(),
-                value: String::new(),
-                known: false,
-            },
-        })
-        .collect())
+    let mut params = Vec::with_capacity(count);
+    for pair in query.split('&') {
+        // Size caps run before any allocation for the pair (F13).
+        match pair.split_once('=') {
+            Some((key, value)) => {
+                check_param_size(key, value)?;
+                params.push(Param {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                    known: false,
+                });
+            }
+            None => {
+                check_param_size(pair, "")?;
+                params.push(Param {
+                    key: pair.to_string(),
+                    value: String::new(),
+                    known: false,
+                });
+            }
+        }
+    }
+    Ok(params)
+}
+
+/// Enforce [`MAX_PARAM_BYTES`] on one key/value pair.
+fn check_param_size(key: &str, value: &str) -> Result<(), String> {
+    if key.len() > MAX_PARAM_BYTES || value.len() > MAX_PARAM_BYTES {
+        return Err(format!(
+            "parameter over the {MAX_PARAM_BYTES}-byte cap (key {} bytes, value {} bytes)",
+            key.len(),
+            value.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Serialize ordered parameters back into a query string (`k=v&k=v`).
@@ -452,6 +489,50 @@ mod tests {
         assert!(matches!(
             super::super::parse_line(&line),
             super::super::LineOutcome::Unrecognized
+        ));
+    }
+
+    /// One multi-megabyte parameter value rode a single line into the DB
+    /// twice (`raw_line` + params JSON, ~20 MiB per row, security audit v2,
+    /// 2026-09-09, F13) — the count cap alone never saw it.
+    #[test]
+    fn oversized_param_value_is_rejected() {
+        let huge = "x".repeat(MAX_PARAM_BYTES + 1);
+        let err = parse_query(&format!("type={huge}")).unwrap_err();
+        assert!(err.contains("over the"), "{err}");
+        // And the whole line is skipped, not stored truncated.
+        let line = format!("vless://u@h.example.com:443?type={huge}");
+        assert!(matches!(
+            super::super::parse_line(&line),
+            super::super::LineOutcome::Unrecognized
+        ));
+        // Just under the cap passes.
+        let ok = "x".repeat(MAX_PARAM_BYTES);
+        assert!(parse_query(&format!("type={ok}")).is_ok());
+    }
+
+    /// `raw_line` is persisted verbatim onto every stored row, so an
+    /// oversized line is a storage bomb (security audit v2, 2026-09-09,
+    /// F13): a 10 MiB single-line fetch became ~20 MiB of SQLite data per
+    /// row per refresh.
+    #[test]
+    fn oversized_line_is_skipped_entirely() {
+        // One huge fragment keeps the line under the param-value cap but
+        // over the line cap — `parse_line` must drop it before anything is
+        // stored.
+        let name = "x".repeat(MAX_LINE_BYTES + 1);
+        let line = format!("vless://u@h.example.com:443?security=reality#{name}");
+        assert!(line.len() > MAX_LINE_BYTES);
+        assert!(matches!(
+            super::super::parse_line(&line),
+            super::super::LineOutcome::Unrecognized
+        ));
+
+        // A normal-length line still parses.
+        let ok = "vless://u@h.example.com:443?security=reality#node";
+        assert!(matches!(
+            super::super::parse_line(ok),
+            super::super::LineOutcome::Parsed(_)
         ));
     }
 

@@ -433,6 +433,7 @@ pre.mono { white-space: pre-wrap; }
   background: var(--btn-bg);
 }
 .pagination span.current { background: var(--accent); color: #fff; border-color: var(--accent); }
+.pagination span.gap { border: none; background: none; color: var(--muted); padding: 4px 4px; }
 
 .filters {
   display: flex;

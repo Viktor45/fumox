@@ -227,6 +227,10 @@ async fn run_t1_checks(
             );
             continue;
         };
+        if let Err(reason) = vet_target(&ctx, &candidate.host) {
+            tracing::warn!(id = candidate.id, %reason, "probe target blocked by the private-address policy, skipped");
+            continue;
+        }
         let kind = t1::check_kind(scheme, candidate.params.as_deref());
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
         tasks.spawn(async move {
@@ -238,6 +242,15 @@ async fn run_t1_checks(
         });
     }
     Ok(collect_tasks(&mut tasks).await)
+}
+
+/// SSRF gate for every dial target (security audit v2, 2026-09-09, F1):
+/// proxy hosts come from remote feeds, so each candidate must pass the
+/// shared address policy before the daemon opens a connection to it —
+/// loopback, RFC1918, link-local (cloud metadata), CGNAT and unique-local
+/// addresses are refused unless `[probe].allow_private_targets` is set.
+fn vet_target(ctx: &Context, host: &str) -> Result<(), String> {
+    fumox_core::ssrf::vet_probe_host(host, ctx.config.probe.allow_private_targets)
 }
 
 /// Run one T1 check and apply the outcome to the lifecycle: journal the
@@ -339,6 +352,10 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
             );
             continue;
         };
+        if let Err(reason) = vet_target(&ctx, &row.host) {
+            tracing::warn!(id = row.id, %reason, "quarantine target blocked by the private-address policy, skipped");
+            continue;
+        }
         let step = row.ladder_step;
         let kind = t1::check_kind(scheme, row.params.as_deref());
         let delays = ctx.config.probe.recheck_delays_secs.clone();
@@ -433,6 +450,17 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     let batch: Vec<_> = rows
         .into_iter()
         .filter(|row| row.scheme.parse::<Scheme>().is_ok_and(clash::is_supported))
+        // The tunnel dials the same feed-controlled hosts as T1 — the same
+        // private-address gate applies (security audit v2, F1).
+        .filter(|row| {
+            match vet_target(&ctx, &row.host) {
+                Ok(()) => true,
+                Err(reason) => {
+                    tracing::warn!(id = row.id, %reason, "T2 target blocked by the private-address policy, skipped");
+                    false
+                }
+            }
+        })
         .collect();
     if batch.is_empty() {
         return Ok(0);
@@ -685,6 +713,55 @@ mod tests {
         assert_eq!(retention_cutoff(100_000, 7), 100_000 - 7 * 86_400);
     }
 
+    /// F1 (security audit v2, 2026-09-09): with the default policy the
+    /// daemon must refuse to dial loopback feed targets. A live loopback
+    /// listener stays untouched across a full cycle, and no probe result
+    /// is journaled for the blocked proxy.
+    #[tokio::test]
+    async fn private_targets_are_not_dialed_by_default() {
+        let pool = temp_pool().await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        let hit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit_clone = hit.clone();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = match listener.accept().await {
+                    Ok(ok) => ok,
+                    Err(_) => break,
+                };
+                hit_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                drop(socket);
+            }
+        });
+        let id = seed_proxy(&pool, "vless", "127.0.0.1", live_port, "unknown").await;
+
+        // Default config: allow_private_targets = false.
+        let mut config = test_config(
+            1,
+            "127.0.0.1:1",
+            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
+        );
+        config.probe.allow_private_targets = false;
+        let ctx = Arc::new(Context::new(config, pool.clone()));
+
+        run_cycle(ctx).await.unwrap();
+
+        // The listener saw no connection and the proxy was never probed.
+        assert_eq!(hit.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let (attempts,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0, "a private target must not be probed at all");
+        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "unknown");
+        assert_eq!(row.fail_count, 0);
+    }
+
     /// Fresh migrated SQLite in a temp directory.
     async fn temp_pool() -> DbPool {
         let dir =
@@ -737,6 +814,9 @@ mod tests {
                 cycle_interval_secs: 60,
                 sample_size: 50,
                 fail_limit,
+                // The tests dial loopback listeners, which the default policy
+                // refuses (security audit v2, F1).
+                allow_private_targets: true,
                 connect_timeout_secs: 2,
                 tls_timeout_secs: 2,
                 concurrency: 4,

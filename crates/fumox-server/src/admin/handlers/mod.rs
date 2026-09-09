@@ -399,6 +399,39 @@ impl QueryPairs {
 pub const PAGE_SIZE: i64 = 50;
 pub const MAX_PAGE_SIZE: i64 = 200;
 
+/// Field/count caps for admin-stored input (security audit v2, 2026-09-09,
+/// F7/F8). A single POST is bounded by the CSRF buffer (1 MiB) and the
+/// router-wide `DefaultBodyLimit`; these caps keep what actually reaches
+/// SQLite — and every later re-render of it — proportionate to what the
+/// forms legitimately hold.
+pub mod caps {
+    /// Source/profile URL length (matches the fetcher's `MAX_URL_LEN`).
+    pub const URL: usize = 2048;
+    /// Stored pipeline JSON, in bytes.
+    pub const PIPELINE_BYTES: usize = 64 * 1024;
+    /// One profile access token.
+    pub const ACCESS_TOKEN: usize = 128;
+    /// Minimum length for an access token accepted from an *import file*
+    /// (a fresh form entry may be shorter at the admin's own risk; a
+    /// third-party template must not plant guessable tokens, F8).
+    pub const IMPORT_TOKEN_MIN: usize = 16;
+    /// Tags per source.
+    pub const TAGS: usize = 20;
+    /// One tag.
+    pub const TAG_BYTES: usize = 100;
+    /// Country codes per profile.
+    pub const COUNTRIES: usize = 64;
+    /// Header lines per source.
+    pub const HEADER_LINES: usize = 32;
+    /// Total bytes of all header key/value text per source.
+    pub const HEADER_BYTES: usize = 8 * 1024;
+    /// Sources or profiles accepted by one import request.
+    pub const IMPORT_ROWS: usize = 500;
+    /// URLs DNS-vetted per import request; the rest are re-vetted at fetch
+    /// time (the fetch path re-vets every request anyway).
+    pub const IMPORT_DNS_VET: usize = 25;
+}
+
 /// Clamp a requested page size into the allowed range.
 pub fn clamp_limit(requested: Option<i64>) -> i64 {
     requested.unwrap_or(PAGE_SIZE).clamp(1, MAX_PAGE_SIZE)
@@ -416,10 +449,48 @@ pub fn page_offset(page: i64, per_page: i64) -> i64 {
 }
 
 /// Build the pagination context: `(page number, is current)` pairs to
-/// render. Templates iterate without any arithmetic of their own.
+/// render, with gaps encoded as `(0, false)` sentinel rows the templates
+/// print as `…`. Templates iterate without any arithmetic of their own.
+///
+/// The window is first/last plus ±2 around the current page, so the render
+/// cost is bounded (~9 links) no matter how large the table is: with a
+/// million-row `fetch_log` and `per_page=1` the old `1..=pages` loop
+/// emitted a million `<a>` tags per request (security audit v2,
+/// 2026-09-09, F9).
 pub fn pagination_pages(page: i64, total: i64, per_page: i64) -> Vec<(i64, bool)> {
-    let pages = ((total + per_page - 1) / per_page).max(1);
-    (1..=pages).map(|p| (p, p == page)).collect()
+    let per_page = per_page.max(1);
+    // Stable ceiling division (i64::div_ceil is not stable on this
+    // toolchain); `total` is a COUNT and non-negative.
+    let pages = (total.max(0) + per_page - 1) / per_page.max(1);
+    let pages = pages.max(1);
+    let current = page.clamp(1, pages);
+    const SPAN: i64 = 2;
+
+    let mut wanted: Vec<i64> = Vec::new();
+    let push = |p: i64, wanted: &mut Vec<i64>| {
+        if (1..=pages).contains(&p) && !wanted.contains(&p) {
+            wanted.push(p);
+        }
+    };
+    push(1, &mut wanted);
+    for p in (current - SPAN)..=(current + SPAN) {
+        push(p, &mut wanted);
+    }
+    push(pages, &mut wanted);
+    wanted.sort_unstable();
+
+    let mut out: Vec<(i64, bool)> = Vec::with_capacity(wanted.len() * 2);
+    let mut previous: Option<i64> = None;
+    for p in wanted {
+        if let Some(prev) = previous
+            && p > prev + 1
+        {
+            out.push((0, false)); // gap marker
+        }
+        out.push((p, p == current));
+        previous = Some(p);
+    }
+    out
 }
 
 /// Fetch the source list for form selects (id + name), enabled first.
@@ -510,6 +581,61 @@ mod tests {
         assert_eq!(page_offset(3, 50), 100);
         assert_eq!(page_offset(i64::MAX, MAX_PAGE_SIZE), i64::MAX);
         assert_eq!(page_offset(i64::MIN, MAX_PAGE_SIZE), i64::MIN);
+    }
+
+    /// The pagination window is bounded no matter how many pages the table
+    /// has: a million-row `fetch_log` at `per_page=1` used to render a
+    /// million links per request (security audit v2, 2026-09-09, F9).
+    #[test]
+    fn pagination_pages_render_a_bounded_window() {
+        // Deep inside a huge table: first, current±2, last, with gaps.
+        let window = pagination_pages(500_000, 1_000_000, 1);
+        assert_eq!(
+            window,
+            vec![
+                (1, false),
+                (0, false), // gap
+                (499_998, false),
+                (499_999, false),
+                (500_000, true),
+                (500_001, false),
+                (500_002, false),
+                (0, false), // gap
+                (1_000_000, false),
+            ]
+        );
+        // The render is bounded: ~9 elements for any page count.
+        assert!(window.len() <= 9);
+
+        // Near the start the window is contiguous up to current±2, then a
+        // gap, then the last page.
+        let window = pagination_pages(3, 100, 10);
+        assert_eq!(
+            window,
+            vec![
+                (1, false),
+                (2, false),
+                (3, true),
+                (4, false),
+                (5, false),
+                (0, false), // gap before the last page
+                (10, false),
+            ]
+        );
+
+        // When current±2 already reaches the last page, no gap appears.
+        let window = pagination_pages(4, 50, 10);
+        assert_eq!(
+            window,
+            vec![(1, false), (2, false), (3, false), (4, true), (5, false)]
+        );
+
+        // A single page renders nothing (the templates check len > 1).
+        assert_eq!(pagination_pages(1, 7, 50), vec![(1, true)]);
+        // A page beyond the end clamps to the last page; the window then
+        // covers everything up to it — no gap needed for four pages.
+        let window = pagination_pages(i64::MAX, 40, 10);
+        assert_eq!(window, vec![(1, false), (2, false), (3, false), (4, true)]);
     }
 
     /// A `HashMap` keeps only the last value of a repeating key, which broke

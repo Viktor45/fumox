@@ -2,7 +2,7 @@
 //! (ADMIN_PLAN §4.3), card with dedup stats and an in-process output
 //! preview, toggle / delete actions.
 
-use super::{action_response, is_htmx, mask_secret, not_found, server_error};
+use super::{action_response, caps, is_htmx, mask_secret, not_found, server_error};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::pipeline_editor::{BuilderState, widget_from_posted, widget_from_stored};
@@ -390,6 +390,23 @@ async fn build_profile_from_form(
     } else {
         Some(token_raw.clone())
     };
+    // Token format cap (security audit v2, F7): the token guards a public
+    // endpoint, so it is URL-safe and bounded like every other field.
+    if let Some(token) = access_token.as_ref()
+        && token.len() > caps::ACCESS_TOKEN
+    {
+        errors.push((
+            "access_token".into(),
+            lang.t("val.field_too_long")
+                .replace("{}", &caps::ACCESS_TOKEN.to_string()),
+        ));
+    } else if let Some(token) = access_token.as_ref()
+        && !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+    {
+        errors.push(("access_token".into(), lang.t("val.token_format").into()));
+    }
     if let Some(id) = existing_id
         && token_raw.contains('•')
         && let Ok(Some(stored)) = profiles::get(&state.pool, id).await
@@ -428,6 +445,15 @@ async fn build_profile_from_form(
     } else {
         let pipeline_raw = get("pipeline");
         if pipeline_raw.trim().is_empty() {
+            None
+        } else if pipeline_raw.len() > caps::PIPELINE_BYTES {
+            // Pipeline cap (security audit v2, F7): the JSON is stored
+            // verbatim and re-rendered into every edit form.
+            errors.push((
+                "pipeline".into(),
+                lang.t("val.field_too_long")
+                    .replace("{}", &caps::PIPELINE_BYTES.to_string()),
+            ));
             None
         } else {
             match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {
@@ -471,6 +497,14 @@ async fn build_profile_from_form(
         if !countries.contains(&upper) {
             countries.push(upper);
         }
+    }
+    // Country count cap (security audit v2, F7).
+    if countries.len() > caps::COUNTRIES {
+        errors.push((
+            "countries".into(),
+            lang.t("val.too_many_countries")
+                .replace("{}", &caps::COUNTRIES.to_string()),
+        ));
     }
 
     // Every selected source must exist (guards against stale form posts).

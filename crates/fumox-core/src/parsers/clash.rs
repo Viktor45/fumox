@@ -211,6 +211,18 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
             super::uri::MAX_QUERY_PARAMS
         ));
     }
+    // Field-size cap (security audit v2, 2026-09-09, F13): Clash params
+    // bypass `parse_query`, so the byte cap is enforced here.
+    for param in &params {
+        if param.key.len() > super::uri::MAX_PARAM_BYTES
+            || param.value.len() > super::uri::MAX_PARAM_BYTES
+        {
+            return Err(format!(
+                "clash: field over the {}-byte cap",
+                super::uri::MAX_PARAM_BYTES
+            ));
+        }
+    }
 
     Ok(Some(ProxyEntry {
         scheme: spec.scheme,

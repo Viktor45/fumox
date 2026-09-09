@@ -514,62 +514,11 @@ pub async fn vet_url(
 /// With `allow_private_urls = false` the following are rejected: loopback,
 /// RFC 1918 private space, link-local (incl. the `169.254.169.254` cloud
 /// metadata endpoint), CGNAT, unspecified, broadcast and benchmark ranges,
-/// plus their IPv6 equivalents and IPv4-mapped IPv6 addresses.
+/// plus their IPv6 equivalents and IPv4-mapped IPv6 addresses. The policy
+/// itself lives in `fumox-core` so the probe daemon applies the identical
+/// blocklist to its dial targets (security audit v2, 2026-09-09, F1).
 pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
-    if allow_private {
-        return Ok(());
-    }
-    match ip {
-        IpAddr::V4(v4) => check_ipv4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return check_ipv4(mapped);
-            }
-            if v6.is_loopback() {
-                return Err("loopback address".into());
-            }
-            if v6.is_unspecified() {
-                return Err("unspecified address".into());
-            }
-            let segments = v6.segments();
-            // fe80::/10 link-local
-            if segments[0] & 0xffc0 == 0xfe80 {
-                return Err("link-local address".into());
-            }
-            // fc00::/7 unique-local
-            if segments[0] & 0xfe00 == 0xfc00 {
-                return Err("unique-local address".into());
-            }
-            Ok(())
-        }
-    }
-}
-
-fn check_ipv4(v4: std::net::Ipv4Addr) -> Result<(), String> {
-    let [a, b, _, _] = v4.octets();
-    if v4.is_loopback() {
-        return Err("loopback address".into());
-    }
-    if v4.is_private() {
-        return Err("RFC1918 private address".into());
-    }
-    if v4.is_link_local() {
-        // Covers 169.254.0.0/16 including the 169.254.169.254 metadata IP.
-        return Err("link-local address (cloud metadata range)".into());
-    }
-    if v4.is_unspecified() {
-        return Err("unspecified address".into());
-    }
-    if v4.is_broadcast() {
-        return Err("broadcast address".into());
-    }
-    match a {
-        0 => Err("0.0.0.0/8".into()),
-        100 if (b & 0xc0) == 64 => Err("100.64.0.0/10 CGNAT".into()),
-        198 if b == 18 || b == 19 => Err("198.18.0.0/15 benchmarking".into()),
-        192 if b == 0 => Err("192.0.0.0/24 IETF".into()),
-        _ => Ok(()),
-    }
+    fumox_core::ssrf::check_ip(ip, allow_private)
 }
 
 #[cfg(test)]

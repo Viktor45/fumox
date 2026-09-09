@@ -14,6 +14,7 @@ pub mod logging;
 pub mod models;
 pub mod parsers;
 pub mod repo;
+pub mod ssrf;
 
 pub use config::{AppConfig, DEFAULT_CONFIG_PATH};
 pub use error::{Error, Result};

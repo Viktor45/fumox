@@ -216,7 +216,6 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/logs/fetch", get(handlers::fetch_logs))
         .route("/probe", get(handlers::probe_overview))
         .route("/settings", get(handlers::settings_overview))
-        .route("/stats", get(handlers::stats))
         // Pipeline builder widget (PIPELINE.md §3): server-side generation
         // and validation inside the same auth+CSRF envelope as every POST.
         .route("/pipeline/preview", post(handlers::pipeline_preview))
@@ -874,7 +873,6 @@ mod tests {
             "/admin/proxies",
             "/admin/logs/fetch",
             "/admin/import",
-            "/admin/stats",
         ] {
             let response = app
                 .clone()
@@ -1297,10 +1295,10 @@ mod tests {
         // The filter dropdown carries the ready checkbox.
         assert!(html.contains("value=\"ready\""), "{html}");
 
-        // The stats screen counts the ready bucket per scheme.
+        // The dashboard counts the ready bucket per scheme.
         let response = app
             .clone()
-            .oneshot(request("GET", "/admin/stats", "", Some(&cookie)))
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1572,10 +1570,13 @@ mod tests {
     }
 
     /// Two sources with proxies in every status plus probe history; the
-    /// stats screen must render the per-source health counters, the
-    /// longest-living top and the 24h probe success rate.
+    /// dashboard (the former stats screen merged in, owner decision
+    /// 2026-09-10) must render the per-source health counters, the
+    /// longest-living top and the 24h probe success rate — with the
+    /// source-errors block above everything else and no "recent fetches"
+    /// table anymore.
     #[tokio::test]
-    async fn stats_screen_aggregates_per_source_and_top_alive() {
+    async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
         let state = test_state(1000).await;
         let pool = state.pool.clone();
         let now = fumox_core::models::now_ts();
@@ -1695,17 +1696,23 @@ mod tests {
         let cookie = login(&app).await;
         let response = app
             .clone()
-            .oneshot(request("GET", "/admin/stats", "", Some(&cookie)))
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html).into_owned();
 
-        // The page and its panels render.
-        assert!(html.contains("Статистика"), "{html}");
+        // The merged page renders every former stats panel.
+        assert!(html.contains("Дашборд"), "{html}");
         assert!(html.contains("Прокси по источникам"), "{html}");
         assert!(html.contains("Топ-10 самых живых прокси"), "{html}");
+        // The "recent fetches" table is gone from the dashboard; the
+        // source-errors block leads the screen.
+        let errors_at = html.find("Источники с ошибками").expect("errors block");
+        let stats_at = html.find("Прокси по источникам").expect("per-source block");
+        assert!(errors_at < stats_at, "source errors must render first");
+        assert!(!html.contains("Последние загрузки"), "{html}");
         // Per-source counters: source 1 has 2 alive, source 2 has 1 unknown.
         assert!(html.contains("source srcS0000001"), "{html}");
         assert!(html.contains("source srcS0000002"), "{html}");
@@ -3618,15 +3625,15 @@ mod tests {
 
         let app = router(state.clone());
         let cookie = login(&app).await;
-        // The dashboard's recent-fetches table has no error column at all,
-        // so the wrapping cell is only asserted where the column exists.
-        // The source card renders the same _log fragment inline, so it
-        // carries the journal table too.
+        // The dashboard no longer carries a fetches table (owner decision,
+        // 2026-09-10 — it moved to the logs screen only), so the wrapping
+        // cell is asserted wherever the error column exists. The source card
+        // renders the same _log fragment inline, so it carries the journal
+        // table too.
         for (path, check_error_cell) in [
             ("/admin/logs/fetch", true),
             (&format!("/admin/sources/{}/log", source.id), true),
             (&format!("/admin/sources/{}", source.id), true),
-            ("/admin", false),
         ] {
             let response = app
                 .clone()

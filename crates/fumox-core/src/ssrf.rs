@@ -60,11 +60,11 @@ pub async fn vet_probe_host(host: &str, allow_private: bool) -> Result<(), Strin
     if let Ok(ip) = host.parse::<IpAddr>() {
         return check_ip(ip, allow_private);
     }
-    let mut lookup = tokio::net::lookup_host((host, 0))
+    let lookup = tokio::net::lookup_host((host, 0))
         .await
         .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
     let mut vetted = false;
-    while let Some(addr) = lookup.next() {
+    for addr in lookup {
         vetted = true;
         check_ip(addr.ip(), allow_private).map_err(|reason| format!("{host}: {reason}"))?;
     }

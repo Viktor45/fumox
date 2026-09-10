@@ -38,12 +38,13 @@ pub fn derive_key(purpose: &[u8], token: &str) -> Vec<u8> {
 }
 
 fn mac_hex(key: &[u8], message: &str) -> String {
+    use std::fmt::Write as _;
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message.as_bytes());
     let bytes = mac.finalize().into_bytes();
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        let _ = write!(out, "{b:02x}");
     }
     out
 }

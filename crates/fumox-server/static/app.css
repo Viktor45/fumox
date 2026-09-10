@@ -21,6 +21,10 @@
   --warn: #9a6b00;
   --warn-bg: #fdf3dc;
   --info-bg: #e8eefc;
+  /* ready tier (T2-verified): violet, distinct from alive-green and
+     unknown-blue */
+  --ready: #6d28d9;
+  --ready-bg: #f1eafd;
   --code-bg: #f0f2f5;
   --radius: 8px;
   --shadow: 0 1px 3px rgba(16, 24, 40, 0.08);
@@ -67,6 +71,8 @@
   --warn: #d9a441;
   --warn-bg: #362c1a;
   --info-bg: #22304d;
+  --ready: #a78bfa;
+  --ready-bg: #2a2236;
   --code-bg: #232936;
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
   --th-bg: #202634;
@@ -288,6 +294,7 @@ time.ts { white-space: nowrap; }
   white-space: nowrap;
 }
 .badge.alive { background: var(--ok-bg); color: var(--ok); }
+.badge.ready { background: var(--ready-bg); color: var(--ready); }
 .badge.quarantine { background: var(--warn-bg); color: var(--warn); }
 .badge.removed { background: var(--danger-bg); color: var(--danger); }
 .badge.unknown { background: var(--info-bg); color: var(--accent); }
@@ -572,6 +579,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 }
 .stat-split-seg { height: 100%; width: var(--w, 0%); }
 .stat-split-seg.alive { background: var(--ok); }
+.stat-split-seg.ready { background: var(--ready); }
 .stat-split-seg.quarantine { background: var(--warn); }
 .stat-split-seg.unknown { background: var(--accent); }
 .stat-split-seg.removed { background: var(--danger); }
@@ -711,4 +719,49 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   /* Secondary columns of the widest tables — hidden, the scroll
      container covers the rest. */
   .col-optional { display: none; }
+
+  /* Filters panel (proxies/sources/logs): every `.field` is a flex child
+     capped at min-width: 130px — on a 360 px viewport seven fields would
+     overflow the row. Let each field grow to its own line so the apply
+     button lands below without ugly wrapping. */
+  .filters { flex-direction: column; align-items: stretch; }
+  .filters .field { min-width: 0; width: 100%; }
+  .filters .btn { align-self: flex-start; }
+
+  /* Bulk-cleanup dialog: each cleanup-op must wrap to a vertical stack
+     so the 120 px input + button + label do not overflow the dialog. */
+  .cleanup-op { flex-direction: column; align-items: stretch; }
+  .cleanup-op .inline-controls { flex-wrap: wrap; }
+  .cleanup-op input, .cleanup-op select { width: 100%; }
+  .cleanup-op .inline-controls .btn { width: 100%; }
+
+  /* Pipeline builder rows: the base `flex: 0 0 70px` on `.mono` inputs
+     plus the four other controls exceed a 360 px row. Let everything
+     grow to 100 % and stack vertically. */
+  .ped-row { flex-direction: column; align-items: stretch; }
+  .ped-row > * { flex: 1 1 auto !important; width: 100%; min-width: 0; }
+  .ped-row input[type="text"]:not(.mono) { flex-basis: auto; }
+  .ped-arrow { transform: rotate(90deg); align-self: flex-start; }
+  .ped-columns > div { min-width: 0; }
+
+  /* Stat-bar chart: cap each column at a sane minimum so seven bars fit
+     inside the panel padding without truncation of the bar label. */
+  .stat-bar-col { max-width: 36px; }
+  .stat-bar-label { font-size: 9.5px; }
+}
+
+/* Very narrow phones (iPhone SE 1st gen, older Android): a second
+   breakpoint that aggressively trims padding, hides the optional stat
+   table columns, and shrinks the stat-card number font. The breakpoint
+   is intentionally below 480 px so the rules above still apply on
+   common 6.1–6.7 in phones (393–430 px). */
+@media (max-width: 420px) {
+  .container { padding: 12px 10px 40px; }
+  .panel { padding: 12px; }
+  .page-head h1 { font-size: 18px; }
+  .stat-card .num { font-size: 22px; }
+  /* Wider stat-bars labels need more room than the 700 px breakpoint
+     gave them — drop the per-day value and rely on hover/title. */
+  .stat-bar-num { display: none; }
+  /* The login box already caps itself at 340 px; nothing else to do. */
 }

@@ -1956,7 +1956,7 @@ mod tests {
         );
         assert_eq!(
             Schema::statuses(),
-            ["unknown", "alive", "quarantine", "removed"]
+            ["unknown", "alive", "ready", "quarantine", "removed"]
         );
         assert_eq!(
             Schema::sort_options(),

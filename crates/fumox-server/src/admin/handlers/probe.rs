@@ -21,6 +21,12 @@ const HEARTBEAT_STALE_SECS: i64 = 90;
 
 /// Period for the `probe.stats` and `heartbeat` SSE events.
 const STATS_INTERVAL: Duration = Duration::from_secs(30);
+/// Idle cap on a single SSE connection (security audit, 2026-09-10, M5):
+/// even with `keep_alive` keepalive pings, a slow-loris client that never
+/// reads from the stream would otherwise sit on a per-IP admin slot
+/// forever. The browser-side `EventSource` reconnects on its own when the
+/// socket closes, so closing after 10 minutes is harmless to the UI.
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 // ---------------------------------------------------------------------------
 // Overview screen
@@ -210,6 +216,9 @@ pub async fn events_stream(
         let mut tick = tokio::time::interval(STATS_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // consume the immediate first tick
+        let mut idle = tokio::time::interval(SSE_IDLE_TIMEOUT);
+        idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        idle.tick().await; // first idle deadline is SSE_IDLE_TIMEOUT from now
 
         loop {
             tokio::select! {
@@ -243,6 +252,10 @@ pub async fn events_stream(
                         .event("heartbeat")
                         .data(payload.to_string()));
                 }
+                // Idle cap (security audit, 2026-09-10, M5): a connection
+                // that produced no event and no tick for SSE_IDLE_TIMEOUT
+                // is closed. The browser reconnects on its own.
+                _ = idle.tick() => break,
             }
         }
     };

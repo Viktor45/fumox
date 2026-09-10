@@ -102,8 +102,14 @@ impl MeowClient {
     /// `GET /proxies/{name}/delay` — run one real tunnel check.
     ///
     /// Distinguishes "the proxy is dead" (meow answered with a failure)
-    /// from "meow itself is down" (transport error / 5xx), so the caller
-    /// can quarantine the former and back off on the latter.
+    /// from "meow itself is down" (transport error / 5xx). Both are
+    /// *failures* for the proxy as far as the ladder is concerned (owner
+    /// decision, 2026-09-10) — the split only decides the error text and
+    /// whether the batch keeps hammering a dying engine: a
+    /// `ServiceUnavailable` aborts the remaining checks, while a
+    /// `ProxyFailed` lets the batch continue.
+    /// Success is strict: 2xx **with** a numeric `delay` field; a 2xx
+    /// without one is an engine malfunction, not a pass.
     pub async fn check_delay(&self, name: &str) -> DelayOutcome {
         let url = format!("{}/proxies/{name}/delay", self.base_url);
         let timeout_ms = self.timeout.as_millis().to_string();

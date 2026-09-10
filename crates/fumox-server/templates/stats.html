@@ -55,6 +55,7 @@
           <tr>
             <th>{{ self.t("common.source") }}</th>
             <th class="num">{{ self.t("common.status_alive") }}</th>
+            <th class="num">{{ self.t("common.status_ready") }}</th>
             <th class="num">{{ self.t("common.status_quarantine") }}</th>
             <th class="num">{{ self.t("common.status_unknown") }}</th>
             <th class="num">{{ self.t("common.status_removed") }}</th>
@@ -72,6 +73,7 @@
               {% if row.enabled == 0 %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
             </td>
             <td class="num">{% if row.alive > 0 %}<a href="/admin/proxies?status=alive&amp;source={{ row.id }}">{{ row.alive }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
+            <td class="num">{% if row.ready > 0 %}<a href="/admin/proxies?status=ready&amp;source={{ row.id }}">{{ row.ready }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
             <td class="num">{% if row.quarantine > 0 %}<a href="/admin/proxies?status=quarantine&amp;source={{ row.id }}">{{ row.quarantine }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
             <td class="num">{% if row.unknown > 0 %}<a href="/admin/proxies?status=unknown&amp;source={{ row.id }}">{{ row.unknown }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
             <td class="num">{% if row.removed > 0 %}<a href="/admin/proxies?status=removed&amp;source={{ row.id }}">{{ row.removed }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
@@ -170,6 +172,7 @@
           <div class="stat-split-bar">
             {% if row.alive > 0 %}
               <span class="stat-split-seg alive" style="--w: {{ self.bar_width(row.alive, row.total) }}%"></span>
+            <span class="stat-split-seg ready" style="--w: {{ self.bar_width(row.ready, row.total) }}%"></span>
             {% endif %}
             {% if row.quarantine > 0 %}
               <span class="stat-split-seg quarantine" style="--w: {{ self.bar_width(row.quarantine, row.total) }}%"></span>
@@ -183,6 +186,7 @@
           </div>
           <div class="stat-split-counts">
             <a href="/admin/proxies?scheme={{ row.value }}&amp;status=alive" class="badge alive" title="{{ self.t("common.status_alive") }}">{{ row.alive }}</a>
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=ready" class="badge ready" title="{{ self.t("common.status_ready") }}">{{ row.ready }}</a>
             <a href="/admin/proxies?scheme={{ row.value }}&amp;status=quarantine" class="badge quarantine" title="{{ self.t("common.status_quarantine") }}">{{ row.quarantine }}</a>
             <a href="/admin/proxies?scheme={{ row.value }}&amp;status=unknown" class="badge unknown" title="{{ self.t("common.status_unknown") }}">{{ row.unknown }}</a>
             <a href="/admin/proxies?scheme={{ row.value }}&amp;status=removed" class="badge removed" title="{{ self.t("common.status_removed") }}">{{ row.removed }}</a>
@@ -213,6 +217,7 @@
           <div class="stat-split-bar">
             {% if row.alive > 0 %}
               <span class="stat-split-seg alive" style="--w: {{ self.bar_width(row.alive, row.total) }}%"></span>
+            <span class="stat-split-seg ready" style="--w: {{ self.bar_width(row.ready, row.total) }}%"></span>
             {% endif %}
             {% if row.quarantine > 0 %}
               <span class="stat-split-seg quarantine" style="--w: {{ self.bar_width(row.quarantine, row.total) }}%"></span>
@@ -228,11 +233,13 @@
             {% match row.value %}
               {% when Some with (country) %}
                 <a href="/admin/proxies?country={{ country }}&amp;status=alive" class="badge alive" title="{{ self.t("common.status_alive") }}">{{ row.alive }}</a>
+                <a href="/admin/proxies?country={{ country }}&amp;status=ready" class="badge ready" title="{{ self.t("common.status_ready") }}">{{ row.ready }}</a>
                 <a href="/admin/proxies?country={{ country }}&amp;status=quarantine" class="badge quarantine" title="{{ self.t("common.status_quarantine") }}">{{ row.quarantine }}</a>
                 <a href="/admin/proxies?country={{ country }}&amp;status=unknown" class="badge unknown" title="{{ self.t("common.status_unknown") }}">{{ row.unknown }}</a>
                 <a href="/admin/proxies?country={{ country }}&amp;status=removed" class="badge removed" title="{{ self.t("common.status_removed") }}">{{ row.removed }}</a>
               {% when None %}
                 <span class="badge alive">{{ row.alive }}</span>
+                <span class="badge ready">{{ row.ready }}</span>
                 <span class="badge quarantine">{{ row.quarantine }}</span>
                 <span class="badge unknown">{{ row.unknown }}</span>
                 <span class="badge removed">{{ row.removed }}</span>

@@ -30,6 +30,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::caps;
 
+/// Body of `POST /admin/import`. A typed `Form` extractor parses only the
+/// `payload` field (the admin router's `DefaultBodyLimit::max(1 MiB)` still
+/// caps the raw body), so an attacker cannot force a `Vec<(String, String)>`
+/// of every duplicate pair into memory before the handler picks the field
+/// it actually needs (security audit, 2026-09-10, H3).
+#[derive(Deserialize)]
+pub(in crate::admin) struct ImportPayloadForm {
+    #[serde(default)]
+    payload: String,
+}
+
 /// Slug format shared with the source/profile forms.
 const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
 /// Only schema version we understand today.
@@ -215,6 +226,11 @@ struct ImportTemplate {
     alive_url: String,
     /// Alive+linked proxy count right now (button context).
     alive_count: i64,
+    /// Absolute public URL of the «all ready» export link — the same
+    /// shared token, the verified tier (owner decision, 2026-09-10).
+    ready_url: String,
+    /// Ready+linked proxy count right now.
+    ready_count: i64,
 }
 
 impl_i18n!(ImportTemplate);
@@ -240,7 +256,13 @@ async fn render_page(
         Ok(count) => count,
         Err(err) => return super::server_error(lang, &err),
     };
-    let alive_url = format!("{}/export/alive/{}", state.serve_base(headers), token);
+    let ready_count = match proxies::count_ready(&state.pool).await {
+        Ok(count) => count,
+        Err(err) => return super::server_error(lang, &err),
+    };
+    let base = state.serve_base(headers);
+    let alive_url = format!("{base}/export/alive/{token}");
+    let ready_url = format!("{base}/export/ready/{token}");
     render_html(
         lang.clone(),
         &ImportTemplate {
@@ -253,6 +275,8 @@ async fn render_page(
             summary,
             alive_url,
             alive_count,
+            ready_url,
+            ready_count,
         },
         status,
     )
@@ -278,16 +302,11 @@ pub async fn import_form(State(state): State<AdminState>, headers: HeaderMap) ->
 pub async fn import_submit(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    Form(form): Form<Vec<(String, String)>>,
+    Form(ImportPayloadForm { payload }): Form<ImportPayloadForm>,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
-    let payload = form
-        .iter()
-        .rev()
-        .find(|(k, _)| k == "payload")
-        .map(|(_, v)| v.trim().to_string())
-        .unwrap_or_default();
+    let payload = payload.trim().to_string();
 
     let file: ConfigExport = match serde_json::from_str(&payload) {
         Ok(file) => file,

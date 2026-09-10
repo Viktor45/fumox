@@ -195,7 +195,7 @@ pub async fn proxies_list(
     // needs QueryPairs — a HashMap would keep only the last value.
     let f_statuses: Vec<String> = params
         .all("status")
-        .filter(|v| ["unknown", "alive", "quarantine", "removed"].contains(&v.as_str()))
+        .filter(|v| ["unknown", "alive", "ready", "quarantine", "removed"].contains(&v.as_str()))
         .cloned()
         .collect();
     let f_scheme = params.get("scheme").cloned().unwrap_or_default();
@@ -331,6 +331,7 @@ pub async fn proxies_list(
             all_statuses: [
                 ("unknown", f_statuses.iter().any(|s| s == "unknown")),
                 ("alive", f_statuses.iter().any(|s| s == "alive")),
+                ("ready", f_statuses.iter().any(|s| s == "ready")),
                 ("quarantine", f_statuses.iter().any(|s| s == "quarantine")),
                 ("removed", f_statuses.iter().any(|s| s == "removed")),
             ]

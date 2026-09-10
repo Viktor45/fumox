@@ -93,6 +93,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sub/{id}", get(serve_sub))
         .route("/src/{id}", get(serve_src))
         .route("/export/alive/{token}", get(crate::alive_export::serve))
+        .route(
+            "/export/ready/{token}",
+            get(crate::alive_export::serve_ready),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             public_rate_limit,
@@ -398,12 +402,16 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     }
     // "All proxies quarantined/removed" verdict (SPEC §10.2): the profile
     // does hold proxies, but every one of them was dropped by a health
-    // filter.
+    // filter. `ready` counts as served-tier too — a verified proxy is
+    // not part of the "everything is hidden" story.
     let all_quarantined = !loaded_statuses.is_empty()
         && all.is_empty()
-        && loaded_statuses
-            .iter()
-            .all(|status| matches!(status, ProxyStatus::Quarantine | ProxyStatus::Removed));
+        && loaded_statuses.iter().all(|status| {
+            matches!(
+                status,
+                ProxyStatus::Quarantine | ProxyStatus::Removed | ProxyStatus::Ready
+            )
+        });
 
     // Global sort: the profile's explicit `sort` wins, otherwise the first
     // source (in profile order) that set one, otherwise source order.
@@ -481,10 +489,13 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
         .map_err(ErrorReply::internal)?;
     let mut candidates =
         rows_to_candidates(rows.into_iter().map(|linked| linked.proxy).collect(), 0);
-    // /src serves only health-checked, currently-alive proxies: rows that
-    // were never probed (unknown), quarantined or removed stay out even when
-    // the pipeline's health filter would let them through.
-    candidates.retain(|c| c.status == ProxyStatus::Alive);
+    // /src serves only health-checked, currently-live proxies: rows that
+    // were never probed (unknown), quarantined or removed stay out even
+    // when the pipeline's health filter would let them through. `ready`
+    // (the tunnel-verified tier, owner decision 2026-09-10) is a live tier
+    // too — a verified proxy must not vanish from client output the
+    // moment T2 promotes it.
+    candidates.retain(|c| matches!(c.status, ProxyStatus::Alive | ProxyStatus::Ready));
     let out = compiled.apply(candidates, &state.geo).await;
 
     // Same ttl-derived interval rule as the sub profile: whole hours
@@ -1392,6 +1403,62 @@ mod tests {
         let (status, _, body) = get(router(state), &format!("/export/alive/{fresh}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("h1.example.com"), "{body:?}");
+    }
+
+    /// The ready export link (owner decision, 2026-09-10): the same shared
+    /// token, but only the tunnel-verified `ready` tier is served — an
+    /// `alive` (unverified) proxy stays out, and rotation kills both links.
+    #[tokio::test]
+    async fn ready_export_link_serves_only_the_verified_tier() {
+        let state = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("plain", "h1.example.com", 443),
+                entry("verified", "h2.example.com", 443),
+            ],
+        )
+        .await;
+        sqlx::query("UPDATE proxies SET status = 'alive' WHERE host = 'h1.example.com'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET status = 'ready' WHERE host = 'h2.example.com'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let token = crate::alive_export::ensure_token(&state.pool)
+            .await
+            .unwrap();
+        let (status, _, body) = get(router(state.clone()), &format!("/export/ready/{token}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("export/ready"), "title block: {body:?}");
+        assert!(body.contains("h2.example.com"), "{body:?}");
+        // The plain alive tier stays out — the links are disjoint.
+        assert!(!body.contains("h1.example.com"), "{body:?}");
+
+        // The same token opens the alive link with the complementary set.
+        let (status, _, body) = get(router(state.clone()), &format!("/export/alive/{token}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("h1.example.com"), "{body:?}");
+        assert!(!body.contains("h2.example.com"), "{body:?}");
+
+        // An unknown token is the same ordinary 404.
+        let (status, _, _) = get(router(state.clone()), "/export/ready/zzzzzzzzzzzz").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Rotation kills both links — one secret, one rotation.
+        let fresh = crate::alive_export::rotate_token(&state.pool)
+            .await
+            .unwrap();
+        let (status, _, _) = get(router(state.clone()), &format!("/export/ready/{token}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, body) = get(router(state), &format!("/export/ready/{fresh}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("h2.example.com"), "{body:?}");
     }
 
     #[test]

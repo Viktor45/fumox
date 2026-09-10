@@ -15,7 +15,7 @@
 
 use crate::db::DbPool;
 use crate::geo::GeoInfo;
-use crate::models::{Param, ProxyEntry, Scheme};
+use crate::models::{Param, ProxyEntry, ProxyStatus, Scheme};
 use sqlx::FromRow;
 
 /// The geo facts of one proxy, as stored in the `proxies.geo_*` columns.
@@ -256,14 +256,15 @@ pub async fn reconcile_source(
 
     // Drop links this fetch no longer saw, then mark orphaned proxies
     // removed (idempotent: proxies already removed keep their removed_at).
-    // With `keep_alive_linger` an alive proxy keeps a link the fetch did
-    // not re-stamp — it stays linked to the source and keeps running the
-    // probe cycle; only the probe's own verdict can end it.
+    // With `keep_alive_linger` an alive *or ready* proxy keeps a link the
+    // fetch did not re-stamp — it stays linked to the source and keeps
+    // running the probe cycle; only the probe's own verdict can end it
+    // (`ready` is a live tier too, owner decision 2026-09-10).
     let unlinked_sql = if keep_alive_linger {
         "DELETE FROM proxy_source_links
          WHERE source_id = ?
            AND seen_at < ?
-           AND proxy_id NOT IN (SELECT id FROM proxies WHERE status = 'alive')"
+           AND proxy_id NOT IN (SELECT id FROM proxies WHERE status IN ('alive', 'ready'))"
     } else {
         "DELETE FROM proxy_source_links WHERE source_id = ? AND seen_at < ?"
     };
@@ -505,10 +506,29 @@ pub async fn list_with_source(
 /// link (SPEC §10.4). Fingerprints are unique in the table, so the set is
 /// already deduplicated; unlinked rows are excluded just like everywhere
 /// else proxies are served.
+///
+/// Strictly `alive` (owner decision, 2026-09-10): the tiers do not overlap
+/// — `ready` rows are served by [`list_ready`] and the ready export link.
 pub async fn list_alive(pool: &DbPool) -> crate::Result<Vec<ProxyRow>> {
     let rows: Vec<ProxyRow> = sqlx::query_as(
         "SELECT p.* FROM proxies p
          WHERE p.status = 'alive'
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
+         ORDER BY p.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Every currently-`ready` proxy (tunnel-verified tier, owner decision
+/// 2026-09-10) still linked to at least one source — the backing query of
+/// the public `/export/ready/{token}` link, the verified twin of
+/// [`list_alive`] (SPEC §10.4).
+pub async fn list_ready(pool: &DbPool) -> crate::Result<Vec<ProxyRow>> {
+    let rows: Vec<ProxyRow> = sqlx::query_as(
+        "SELECT p.* FROM proxies p
+         WHERE p.status = 'ready'
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
          ORDER BY p.id",
     )
@@ -522,6 +542,18 @@ pub async fn count_alive(pool: &DbPool) -> crate::Result<i64> {
     let (count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM proxies p
          WHERE p.status = 'alive'
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Number of proxies [`list_ready`] would return (admin screen badge).
+pub async fn count_ready(pool: &DbPool) -> crate::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM proxies p
+         WHERE p.status = 'ready'
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)",
     )
     .fetch_one(pool)
@@ -645,11 +677,12 @@ pub async fn quarantine_to_removed(pool: &DbPool) -> crate::Result<u64> {
     Ok(result.rows_affected())
 }
 
-/// Move every `alive` proxy with no resolved country into `removed`
-/// (admin «cleanup» panel). `geo_country IS NULL` means the country was
-/// never resolved — failed lookups keep NULL rather than writing an
-/// empty string, so this predicate catches exactly the never-resolved
-/// rows. Returns how many rows were affected.
+/// Move every `alive` (or `ready` — the cleanup targets all live tiers,
+/// owner decision 2026-09-10) proxy with no resolved country into
+/// `removed` (admin «cleanup» panel). `geo_country IS NULL` means the
+/// country was never resolved — failed lookups keep NULL rather than
+/// writing an empty string, so this predicate catches exactly the
+/// never-resolved rows. Returns how many rows were affected.
 pub async fn remove_alive_without_country(pool: &DbPool) -> crate::Result<u64> {
     let now = crate::models::now_ts();
     let result = sqlx::query(
@@ -660,7 +693,7 @@ pub async fn remove_alive_without_country(pool: &DbPool) -> crate::Result<u64> {
              ladder_step = 0,
              removed_at = ?,
              updated_at = ?
-         WHERE status = 'alive' AND geo_country IS NULL",
+         WHERE status IN ('alive', 'ready') AND geo_country IS NULL",
     )
     .bind(now)
     .bind(now)
@@ -669,11 +702,11 @@ pub async fn remove_alive_without_country(pool: &DbPool) -> crate::Result<u64> {
     Ok(result.rows_affected())
 }
 
-/// Move every `alive` proxy of the given autonomous system into
-/// `removed` (admin «cleanup» panel). `asn` is the bare AS number —
-/// `"12345"`, not `"AS12345"` — and is stored/compared in the canonical
-/// `AS{n}` text format of `geo_asn`. Returns how many rows were
-/// affected.
+/// Move every `alive` (or `ready` — the cleanup targets all live tiers)
+/// proxy of the given autonomous system into `removed` (admin «cleanup»
+/// panel). `asn` is the bare AS number — `"12345"`, not `"AS12345"` — and
+/// is stored/compared in the canonical `AS{n}` text format of `geo_asn`.
+/// Returns how many rows were affected.
 pub async fn remove_alive_by_asn(pool: &DbPool, asn: &str) -> crate::Result<u64> {
     let now = crate::models::now_ts();
     let result = sqlx::query(
@@ -684,7 +717,7 @@ pub async fn remove_alive_by_asn(pool: &DbPool, asn: &str) -> crate::Result<u64>
              ladder_step = 0,
              removed_at = ?,
              updated_at = ?
-         WHERE status = 'alive' AND geo_asn = ?",
+         WHERE status IN ('alive', 'ready') AND geo_asn = ?",
     )
     .bind(now)
     .bind(now)
@@ -694,9 +727,10 @@ pub async fn remove_alive_by_asn(pool: &DbPool, asn: &str) -> crate::Result<u64>
     Ok(result.rows_affected())
 }
 
-/// Move every `alive` proxy of the given country into `removed` (admin
-/// «cleanup» panel). `code` is an ISO-3166-1 alpha-2 code, e.g. `"DE"`.
-/// Returns how many rows were affected.
+/// Move every `alive` (or `ready` — the cleanup targets all live tiers)
+/// proxy of the given country into `removed` (admin «cleanup» panel).
+/// `code` is an ISO-3166-1 alpha-2 code, e.g. `"DE"`. Returns how many
+/// rows were affected.
 pub async fn remove_alive_by_country(pool: &DbPool, code: &str) -> crate::Result<u64> {
     let now = crate::models::now_ts();
     let result = sqlx::query(
@@ -707,7 +741,7 @@ pub async fn remove_alive_by_country(pool: &DbPool, code: &str) -> crate::Result
              ladder_step = 0,
              removed_at = ?,
              updated_at = ?
-         WHERE status = 'alive' AND geo_country = ?",
+         WHERE status IN ('alive', 'ready') AND geo_country = ?",
     )
     .bind(now)
     .bind(now)
@@ -836,11 +870,13 @@ pub async fn select_t1_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
 }
 
 /// Batch for a T2 tunnel check through meow-rs (SPEC §8.2): every `alive`
-/// proxy of a T2-supported scheme (T2 re-verifies the tunnel), plus
-/// `unknown` hysteria2 — hysteria2 is excluded from T1 by design (a TCP
-/// connect to a QUIC port proves nothing, SPEC §8.5), so T2 is its first
-/// and only check; a failure counts through the regular `fail_limit`, it
-/// does not quarantine straight away.
+/// **and `ready`** proxy of a T2-supported scheme (T2 re-verifies the
+/// tunnel; `ready` must be re-checked or a failed T2 could never demote
+/// it, owner decision 2026-09-10), plus `unknown` hysteria2 — hysteria2 is
+/// excluded from T1 by design (a TCP connect to a QUIC port proves
+/// nothing, SPEC §8.5), so T2 is its first and only check; a failure
+/// counts through the regular `fail_limit`, it does not quarantine
+/// straight away.
 ///
 /// The order is **checked longest ago first** (owner decision 2026-09-06):
 /// proxies with no T2 attempt yet come first, then the ones whose last T2
@@ -859,7 +895,7 @@ pub async fn select_t2_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
     let rows: Vec<ProxyRow> = sqlx::query_as(
         "SELECT p.*
          FROM proxies p
-         WHERE (p.status = 'alive' OR (p.status = 'unknown' AND p.scheme = 'hysteria2'))
+         WHERE (p.status IN ('alive', 'ready') OR (p.status = 'unknown' AND p.scheme = 'hysteria2'))
            AND p.scheme IN ('vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'socks5')
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
          ORDER BY (SELECT MAX(r.checked_at) FROM probe_results r
@@ -895,10 +931,19 @@ pub async fn select_due_quarantine(
     Ok(rows)
 }
 
-/// Apply a successful check: the proxy is `alive`, every
-/// quarantine/recheck timestamp cleared, `last_alive_at` stamped and the
-/// measured latency stored. Covers `unknown → alive` (first success,
-/// SPEC §8.4) and quarantine revival (SPEC §8.3a step 3/4) alike.
+/// Apply a successful check: the proxy is `alive` (or `ready` for a
+/// successful T2 — see `status_to`), every quarantine/recheck timestamp
+/// cleared, `last_alive_at` stamped and the measured latency stored.
+/// Covers `unknown → alive` (first success, SPEC §8.4) and quarantine
+/// revival (SPEC §8.3a step 3/4) alike.
+///
+/// `status_to` decides the target tier (owner decision, 2026-09-10):
+/// `"ready"` — the latest T2 tunnel check succeeded, the tunnel-verified
+/// tier; `"alive"` — a T1 success. A T1 success never demotes a `ready`
+/// row (the CASE keeps it), because a live TCP/TLS connect says nothing
+/// about the tunnel; only a failed T2 outcome does. The value is written
+/// as one of two fixed SQL literals chosen by the caller's own enum —
+/// never interpolated from untrusted input.
 ///
 /// `reset_fail_count` implements the strict T2 priority (owner decision
 /// 2026-08-29, SPEC §8.3): a T1 success must not wipe the fail counter
@@ -917,10 +962,16 @@ pub async fn check_succeeded(
     now: i64,
     latency_ms: Option<i64>,
     reset_fail_count: bool,
+    status_to: ProxyStatus,
 ) -> crate::Result<Transition> {
-    let result = sqlx::query(
+    // Fixed literal per target tier — never a bind of caller text.
+    let status_expr = match status_to {
+        ProxyStatus::Ready => "'ready'",
+        _ => "CASE WHEN status = 'ready' THEN 'ready' ELSE 'alive' END",
+    };
+    let sql = format!(
         "UPDATE proxies SET
-             status = 'alive',
+             status = {status_expr},
              fail_count = CASE WHEN ? THEN 0 ELSE fail_count END,
              last_checked_at = ?,
              last_alive_at = ?,
@@ -929,16 +980,17 @@ pub async fn check_succeeded(
              ladder_at = NULL,
              ladder_step = 0,
              updated_at = ?
-         WHERE id = ? AND status != 'removed'",
-    )
-    .bind(reset_fail_count)
-    .bind(now)
-    .bind(now)
-    .bind(latency_ms)
-    .bind(now)
-    .bind(id)
-    .execute(pool)
-    .await?;
+         WHERE id = ? AND status != 'removed'"
+    );
+    let result = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(reset_fail_count)
+        .bind(now)
+        .bind(now)
+        .bind(latency_ms)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(if result.rows_affected() > 0 {
         Transition::Revived
     } else {
@@ -946,13 +998,18 @@ pub async fn check_succeeded(
     })
 }
 
-/// Apply a failed regular check (proxy was `unknown` or `alive`).
+/// Apply a failed regular check (proxy was `unknown`, `alive` or `ready`).
 ///
 /// Increments `fail_count`; when the consecutive-failure limit is reached
 /// the proxy moves to `quarantine` and its second chance is scheduled at
 /// `quarantined_at + min + U(0..spread)` — the `[24h, 48h)` window by
 /// default (SPEC §8.3a step 2). The jitter is drawn here, in the core, so
 /// the moment is fixed in the DB and survives daemon restarts.
+///
+/// A `ready` row that fails (below the limit) is demoted to `alive`
+/// (owner decision, 2026-09-10): the tunnel-verified tier only lasts
+/// while the latest T2 outcome is a success — the next successful T2
+/// promotes it back.
 pub async fn check_failed(
     pool: &DbPool,
     id: i64,
@@ -965,7 +1022,7 @@ pub async fn check_failed(
     use rand::RngExt;
 
     let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT fail_count FROM proxies WHERE id = ? AND status IN ('unknown', 'alive')",
+        "SELECT fail_count FROM proxies WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -1006,7 +1063,11 @@ pub async fn check_failed(
         Ok(Transition::Quarantined)
     } else {
         sqlx::query(
-            "UPDATE proxies SET fail_count = ?, last_checked_at = ?, updated_at = ?
+            "UPDATE proxies SET
+                 status = CASE WHEN status = 'ready' THEN 'alive' ELSE status END,
+                 fail_count = ?,
+                 last_checked_at = ?,
+                 updated_at = ?
              WHERE id = ?",
         )
         .bind(new_count)
@@ -1082,6 +1143,7 @@ pub async fn quarantine_check_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ProxyStatus;
     use crate::models::Scheme;
     use crate::models::{Encoding, Source};
     use crate::repo::sources as sources_repo;
@@ -1850,7 +1912,7 @@ mod tests {
         let pool = temp_pool().await;
         let id = seed_proxy(&pool, "vless", "h1.example.com").await;
 
-        let transition = check_succeeded(&pool, id, 5000, Some(42), true)
+        let transition = check_succeeded(&pool, id, 5000, Some(42), true, ProxyStatus::Alive)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Revived);
@@ -1892,7 +1954,7 @@ mod tests {
 
         // A T1-style success WITHOUT reset keeps the T2-accumulated counter
         // (strict T2 priority) and keeps the proxy alive.
-        let transition = check_succeeded(&pool, id, 2000, Some(30), false)
+        let transition = check_succeeded(&pool, id, 2000, Some(30), false, ProxyStatus::Alive)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Revived);
@@ -1901,7 +1963,7 @@ mod tests {
         assert_eq!(row.fail_count, 2);
 
         // With reset the counter is wiped.
-        check_succeeded(&pool, id, 3000, Some(31), true)
+        check_succeeded(&pool, id, 3000, Some(31), true, ProxyStatus::Alive)
             .await
             .unwrap();
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
@@ -1913,12 +1975,115 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let transition = check_succeeded(&pool, id, 4000, Some(32), true)
+        let transition = check_succeeded(&pool, id, 4000, Some(32), true, ProxyStatus::Alive)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Unchanged);
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "removed");
+    }
+
+    /// The `ready` tier (owner decision, 2026-09-10): a successful T2
+    /// promotes to `ready`; a below-limit failure demotes back to `alive`;
+    /// a T1 success never touches a `ready` row.
+    #[tokio::test]
+    async fn ready_tier_lifecycle() {
+        let pool = temp_pool().await;
+        let id = seed_proxy(&pool, "vless", "h1.example.com").await;
+
+        // T1 success → alive (the plain tier).
+        check_succeeded(&pool, id, 1000, Some(20), true, ProxyStatus::Alive)
+            .await
+            .unwrap();
+
+        // T2 success → ready (the tunnel-verified tier).
+        check_succeeded(&pool, id, 2000, Some(42), true, ProxyStatus::Ready)
+            .await
+            .unwrap();
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "ready");
+        assert_eq!(row.fail_count, 0);
+
+        // A later T1 success must NOT demote the verified row (CASE keeps
+        // ready) — only a failed T2 outcome may.
+        check_succeeded(&pool, id, 3000, Some(21), true, ProxyStatus::Alive)
+            .await
+            .unwrap();
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "ready");
+        assert_eq!(row.latency_ms, Some(21), "the T1 latency is stored");
+
+        // A failed T2 (below the limit) demotes to alive.
+        let transition = check_failed(&pool, id, 4000, 3, 86_400, 0).await.unwrap();
+        assert_eq!(transition, Transition::Unchanged);
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "alive");
+        assert_eq!(row.fail_count, 1);
+
+        // The next T2 success promotes back.
+        check_succeeded(&pool, id, 5000, Some(45), true, ProxyStatus::Ready)
+            .await
+            .unwrap();
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "ready");
+
+        // Reaching the fail limit from ready quarantines like from alive.
+        for _ in 0..2 {
+            check_failed(&pool, id, 6000, 2, 86_400, 0).await.unwrap();
+        }
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "quarantine");
+        assert_eq!(row.fail_count, 2);
+
+        // list_alive/list_ready are disjoint tiers.
+        make_source(&pool, "srcR0000000").await;
+        sqlx::query("INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, 'srcR0000000', 1)")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let alive_rows = list_alive(&pool).await.unwrap();
+        let ready_rows = list_ready(&pool).await.unwrap();
+        assert!(alive_rows.iter().all(|r| r.id != id));
+        assert!(ready_rows.iter().all(|r| r.id != id));
+    }
+
+    /// Linger protects `ready` exactly like `alive`: a tunnel-verified
+    /// proxy that vanished from the feed keeps its link.
+    #[tokio::test]
+    async fn linger_protects_ready() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let e = entry("verified-linger", "h1.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            true,
+        )
+        .await
+        .unwrap();
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM proxies WHERE fingerprint = ?")
+            .bind(e.fingerprint())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET status = 'ready' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The feed no longer carries it; linger keeps the link.
+        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
+            .await
+            .unwrap();
+        assert_eq!(stats.unlinked, 0, "the ready proxy keeps its link");
+        assert_eq!(stats.removed, 0);
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "ready");
     }
 
     #[tokio::test]
@@ -1979,7 +2144,9 @@ mod tests {
             "quarantine"
         );
 
-        let transition = check_succeeded(&pool, id, 90_000, Some(10), true)
+        // The revival is a T1-style check → plain alive (the next
+        // successful T2 promotes to ready).
+        let transition = check_succeeded(&pool, id, 90_000, Some(10), true, ProxyStatus::Alive)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Revived);
@@ -2119,8 +2286,9 @@ mod tests {
             .await
             .unwrap();
 
-        // The first recheck succeeds → alive again.
-        let transition = check_succeeded(&pool, id, 90_000 + 900, None, true)
+        // The first recheck succeeds → alive again (a T1-style revival;
+        // the next successful T2 promotes to ready).
+        let transition = check_succeeded(&pool, id, 90_000 + 900, None, true, ProxyStatus::Alive)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Revived);

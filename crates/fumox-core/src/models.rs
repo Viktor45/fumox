@@ -95,11 +95,18 @@ impl FromStr for Scheme {
 }
 
 /// Proxy lifecycle status (`proxies.status`, SPEC §8).
+///
+/// `ready` (owner decision, 2026-09-10) is the tunnel-verified tier: it is
+/// assigned only while the latest T2 check succeeded and demoted back to
+/// `alive` by any failed T2 outcome. The tiers do not overlap — `alive`
+/// means T1-alive without a fresh successful T2, `ready` means alive plus
+/// the confirmed tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyStatus {
     Unknown,
     Alive,
+    Ready,
     Quarantine,
     Removed,
 }
@@ -107,9 +114,10 @@ pub enum ProxyStatus {
 impl ProxyStatus {
     /// Every status in schema order — the source for admin UI option lists
     /// (pipeline editor health filter, PIPELINE.md §5).
-    pub const ALL: [ProxyStatus; 4] = [
+    pub const ALL: [ProxyStatus; 5] = [
         ProxyStatus::Unknown,
         ProxyStatus::Alive,
+        ProxyStatus::Ready,
         ProxyStatus::Quarantine,
         ProxyStatus::Removed,
     ];
@@ -118,6 +126,7 @@ impl ProxyStatus {
         match self {
             ProxyStatus::Unknown => "unknown",
             ProxyStatus::Alive => "alive",
+            ProxyStatus::Ready => "ready",
             ProxyStatus::Quarantine => "quarantine",
             ProxyStatus::Removed => "removed",
         }
@@ -137,6 +146,7 @@ impl FromStr for ProxyStatus {
         let status = match s {
             "unknown" => ProxyStatus::Unknown,
             "alive" => ProxyStatus::Alive,
+            "ready" => ProxyStatus::Ready,
             "quarantine" => ProxyStatus::Quarantine,
             "removed" => ProxyStatus::Removed,
             other => {
@@ -560,11 +570,24 @@ mod tests {
         for (status, name) in [
             (ProxyStatus::Unknown, "unknown"),
             (ProxyStatus::Alive, "alive"),
+            (ProxyStatus::Ready, "ready"),
             (ProxyStatus::Quarantine, "quarantine"),
             (ProxyStatus::Removed, "removed"),
         ] {
             assert_eq!(status.as_str(), name);
             assert_eq!(name.parse::<ProxyStatus>().unwrap(), status);
+        }
+        // ALL carries every wire name exactly once (admin option lists
+        // derive from it).
+        let names: Vec<&str> = ProxyStatus::ALL.iter().map(|s| s.as_str()).collect();
+        for (_, name) in [
+            (ProxyStatus::Unknown, "unknown"),
+            (ProxyStatus::Alive, "alive"),
+            (ProxyStatus::Ready, "ready"),
+            (ProxyStatus::Quarantine, "quarantine"),
+            (ProxyStatus::Removed, "removed"),
+        ] {
+            assert!(names.contains(&name), "ALL must contain {name}");
         }
     }
 

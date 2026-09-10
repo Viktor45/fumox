@@ -51,18 +51,25 @@ pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
 /// directly; hostnames are rejected when they cannot be resolved to a
 /// vetted address (fail closed — an unresolvable name must never become a
 /// probe target). Returns `Ok(())` or a human-readable reason.
-pub fn vet_probe_host(host: &str, allow_private: bool) -> Result<(), String> {
+///
+/// The async DNS resolution (`tokio::net::lookup_host`) is intentional:
+/// every caller is on a Tokio task, and the previous synchronous
+/// `std::net::ToSocketAddrs` blocked the runtime worker for the full
+/// resolver timeout (security audit, 2026-09-10, L1).
+pub async fn vet_probe_host(host: &str, allow_private: bool) -> Result<(), String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return check_ip(ip, allow_private);
     }
-    // Hostname: resolve synchronously through the blocking helper. Probe
-    // selection runs once per cycle per candidate before any task is
-    // spawned, and an unresolvable name fails closed — the same behavior
-    // the T1 dial itself would produce on a bad address.
-    let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(host, 0))
+    let mut lookup = tokio::net::lookup_host((host, 0))
+        .await
         .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?;
-    for addr in addrs {
+    let mut vetted = false;
+    while let Some(addr) = lookup.next() {
+        vetted = true;
         check_ip(addr.ip(), allow_private).map_err(|reason| format!("{host}: {reason}"))?;
+    }
+    if !vetted {
+        return Err(format!("DNS resolution returned no addresses for {host}"));
     }
     Ok(())
 }
@@ -155,26 +162,31 @@ mod tests {
         assert!(check_ip(ip("100.128.0.0"), false).is_ok());
     }
 
-    #[test]
-    fn probe_host_vetting_literals() {
+    #[tokio::test]
+    async fn probe_host_vetting_literals() {
         // Private literals and public literals vet without DNS.
-        assert!(vet_probe_host("127.0.0.1", false).is_err());
-        assert!(vet_probe_host("::1", false).is_err());
-        assert!(vet_probe_host("8.8.8.8", false).is_ok());
+        assert!(vet_probe_host("127.0.0.1", false).await.is_err());
+        assert!(vet_probe_host("::1", false).await.is_err());
+        assert!(vet_probe_host("8.8.8.8", false).await.is_ok());
         // The allow flag turns everything into a pass.
-        assert!(vet_probe_host("10.0.0.5", true).is_ok());
-        // An unparseable, unresolvable name fails closed, not open.
-        let err = vet_probe_host("this-host-does-not-exist.invalid", false).unwrap_err();
+        assert!(vet_probe_host("10.0.0.5", true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn probe_host_vetting_unresolvable_name_fails_closed() {
+        let err = vet_probe_host("this-host-does-not-exist.invalid", false)
+            .await
+            .unwrap_err();
         assert!(err.contains("DNS resolution failed"), "{err}");
     }
 
     /// The localhost loopback must fail closed under the default policy —
     /// this is the exact primitive the F1 fix removes (a feed steering the
     /// probe at the host's own services).
-    #[test]
-    fn probe_host_vetting_localhost_hostname() {
+    #[tokio::test]
+    async fn probe_host_vetting_localhost_hostname() {
         // "localhost" resolves to loopback on every test platform.
-        assert!(vet_probe_host("localhost", false).is_err());
+        assert!(vet_probe_host("localhost", false).await.is_err());
     }
 
     #[test]

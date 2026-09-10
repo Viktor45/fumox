@@ -742,6 +742,54 @@ mod tests {
         assert!(!reloaded.enabled); // was true, toggled to false
     }
 
+    /// M3 (security audit, 2026-09-10): an over-cap body must be rejected
+    /// by the body-limit middleware before the CSRF layer runs. Anything
+    /// from `DefaultBodyLimit::max(1 MiB)` (a `413 Payload Too Large`) is
+    /// acceptable; a `400` from the CSRF layer's own `to_bytes` cap is
+    /// also acceptable. What is *not* acceptable: the request slipping
+    /// through to a `403` CSRF failure — that would mean the binary body
+    /// was parsed as urlencoded and silently treated as a missing `_csrf`.
+    #[tokio::test]
+    async fn oversized_binary_body_is_rejected_before_csrf() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // 1 MiB + 1 byte of arbitrary binary — invalid UTF-8 too, so even
+        // if the CSRF layer ran, it could not match `_csrf` against it.
+        let mut body = Vec::with_capacity((1 << 20) + 1);
+        body.extend_from_slice(&vec![0xFFu8; (1 << 20) + 1]);
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/admin/sources/srcA0000000/toggle")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, &cookie)
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo::<SocketAddr>(
+            "127.0.0.1:41000".parse().unwrap(),
+        ));
+
+        let response = app.oneshot(req).await.unwrap();
+        let status = response.status();
+        assert!(
+            status == StatusCode::PAYLOAD_TOO_LARGE || status == StatusCode::BAD_REQUEST,
+            "oversized binary body must be rejected before CSRF, got {status}"
+        );
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "binary body must not be parsed as urlencoded and silently fail CSRF"
+        );
+
+        // The genuine CSRF token is in the body already — even if a
+        // hypothetical parser guessed it, the body cap is the only
+        // load-bearing protection.
+        let _ = csrf;
+    }
+
     #[tokio::test]
     async fn rate_limit_kicks_in_past_the_soft_limit() {
         let state = test_state(3).await;
@@ -1208,6 +1256,70 @@ mod tests {
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
         assert!(html.contains("DE, US"), "card shows the filter: {html:?}");
+    }
+
+    /// The `ready` tier surfaces everywhere the statuses are listed
+    /// (owner decision, 2026-09-10): the proxy browser filter, the stats
+    /// splits and the export screen's ready link.
+    #[tokio::test]
+    async fn ready_tier_is_filterable_and_exported() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             VALUES ('fp-ready-1', 'vless', 'verified-one', 'r1.example.com', 443, 'c', 'ready', 1, 1),
+                    ('fp-alive-1', 'vless', 'plain-one', 'r2.example.com', 443, 'c', 'alive', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = router(state);
+        let cookie = login(&app).await;
+
+        // The browser filter selects the ready tier only.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin/proxies?status=ready",
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("verified-one"), "{html}");
+        assert!(!html.contains("plain-one"), "{html}");
+        // The filter dropdown carries the ready checkbox.
+        assert!(html.contains("value=\"ready\""), "{html}");
+
+        // The stats screen counts the ready bucket per scheme.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/stats", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("status=ready"), "{html}");
+
+        // The export screen shows the ready link with the shared token and
+        // its own count.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/import", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("/export/ready/"), "{html}");
+        assert!(html.contains("готовые"), "the ready column title: {html}");
     }
 
     #[tokio::test]
@@ -2317,6 +2429,62 @@ mod tests {
                 .unwrap()
                 .starts_with("fumox_lang=ru;")
         );
+    }
+
+    /// H4 (security audit, 2026-09-10): an attacker-controlled `lang=`
+    /// must never reach `Set-Cookie`, `Location`, or any other header. The
+    /// `lang_cookie` builder only ever sees a code that came out of
+    /// `Locales::resolve`, which falls back to the default catalog code —
+    /// a fixed literal in the locales TOML, never the raw input.
+    #[tokio::test]
+    async fn attacker_controlled_lang_does_not_leak_into_any_response_header() {
+        let state = test_state(1000).await;
+        let app = router(state);
+
+        // Every value is percent-encoded so the request URI stays valid;
+        // the server still sees the raw bytes after decoding.
+        for uri in [
+            "/admin/set-lang?lang=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+            "/admin/set-lang?lang=foo%0D%0ASet-Cookie:%20pwned",
+            "/admin/login?lang=en%00%2Fadmin%2Fexport",
+            "/admin/login?lang=..%2F..%2Fetc%2Fpasswd",
+            "/admin/set-lang?lang=&next=https://evil.example.com",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request("GET", uri, "", None))
+                .await
+                .unwrap();
+            // The cookie must always be a fixed catalog code with the
+            // standard attributes; the Location is constrained to /admin or
+            // to an absolute internal path from `next`.
+            let set_cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            assert!(
+                set_cookie.is_empty()
+                    || set_cookie.starts_with("fumox_lang=ru;")
+                    || set_cookie.starts_with("fumox_lang=en;"),
+                "untrusted value leaked into Set-Cookie for {uri}: {set_cookie:?}"
+            );
+            assert!(
+                !set_cookie.contains("<script>"),
+                "raw input reached the cookie for {uri}: {set_cookie:?}"
+            );
+            assert!(
+                !set_cookie.contains("pwned"),
+                "header injection reached the cookie for {uri}: {set_cookie:?}"
+            );
+            if let Some(location) = response.headers().get(header::LOCATION) {
+                let value = location.to_str().unwrap();
+                assert!(
+                    !value.contains("evil.example.com"),
+                    "open redirect via next for {uri}: {value:?}"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------

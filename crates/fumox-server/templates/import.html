@@ -47,9 +47,18 @@
   <p class="small">{{ self.t("io.alive_count") }} <strong>{{ alive_count }}</strong></p>
   <div class="row-actions">
     <a class="btn" href="{{ alive_url }}?download=1">{{ self.t("io.alive_download") }}</a>
+  </div>
+
+  <h3>{{ self.t("io.ready_title") }}</h3>
+  <div class="hint">{{ self.t("io.ready_hint") }}</div>
+  <p class="mono small"><a href="{{ ready_url }}">{{ ready_url }}</a></p>
+  <p class="small">{{ self.t("io.ready_count") }} <strong>{{ ready_count }}</strong></p>
+  <div class="row-actions">
+    <a class="btn" href="{{ ready_url }}?download=1">{{ self.t("io.ready_download") }}</a>
     <form method="post" action="/admin/import/alive-token">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
       <button class="btn" type="submit">{{ self.t("io.alive_rotate") }}</button>
+      <span class="hint">{{ self.t("io.rotate_hint") }}</span>
     </form>
   </div>
 </div>
@@ -65,8 +74,8 @@
       <div class="hint">{{ self.t("io.payload_hint") }}</div>
     </div>
     <div class="field">
-      <input type="file" id="io-file" accept=".json,application/json">
       <label for="io-file" class="hint">{{ self.t("io.file_hint") }}</label>
+      <input type="file" id="io-file" accept=".json,application/json">
     </div>
     <div class="form-actions">
       <button class="btn primary" type="submit">{{ self.t("io.submit") }}</button>

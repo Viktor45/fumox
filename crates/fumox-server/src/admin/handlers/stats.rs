@@ -22,6 +22,7 @@ struct SourceStatRow {
     name: String,
     enabled: i64,
     alive: i64,
+    ready: i64,
     quarantine: i64,
     unknown: i64,
     removed: i64,
@@ -55,6 +56,7 @@ struct TopAliveRow {
 struct SchemeSplitRow {
     value: String,
     alive: i64,
+    ready: i64,
     quarantine: i64,
     unknown: i64,
     removed: i64,
@@ -66,6 +68,7 @@ struct SchemeSplitRow {
 struct CountrySplitRow {
     value: Option<String>,
     alive: i64,
+    ready: i64,
     quarantine: i64,
     unknown: i64,
     removed: i64,
@@ -156,6 +159,7 @@ pub async fn stats(State(state): State<AdminState>, headers: HeaderMap) -> Respo
     let sources = match sqlx::query_as::<_, SourceStatRow>(
         "SELECT s.id, s.name, s.enabled,
                 COALESCE(SUM(p.status = 'alive'), 0)     AS alive,
+                COALESCE(SUM(p.status = 'ready'), 0)     AS ready,
                 COALESCE(SUM(p.status = 'quarantine'), 0) AS quarantine,
                 COALESCE(SUM(p.status = 'unknown'), 0)   AS unknown,
                 COALESCE(SUM(p.status = 'removed'), 0)    AS removed,
@@ -355,6 +359,7 @@ async fn scheme_split(
     Ok(sqlx::query_as::<_, SchemeSplitRow>(
         "SELECT scheme AS value,
                 COALESCE(SUM(status = 'alive'), 0)     AS alive,
+                COALESCE(SUM(status = 'ready'), 0)     AS ready,
                 COALESCE(SUM(status = 'quarantine'), 0) AS quarantine,
                 COALESCE(SUM(status = 'unknown'), 0)   AS unknown,
                 COALESCE(SUM(status = 'removed'), 0)   AS removed,
@@ -375,6 +380,7 @@ async fn country_split(
     Ok(sqlx::query_as::<_, CountrySplitRow>(
         "SELECT geo_country AS value,
                 COALESCE(SUM(status = 'alive'), 0)     AS alive,
+                COALESCE(SUM(status = 'ready'), 0)     AS ready,
                 COALESCE(SUM(status = 'quarantine'), 0) AS quarantine,
                 COALESCE(SUM(status = 'unknown'), 0)   AS unknown,
                 COALESCE(SUM(status = 'removed'), 0)   AS removed,

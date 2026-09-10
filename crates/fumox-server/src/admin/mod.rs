@@ -1281,6 +1281,144 @@ mod tests {
         assert!(html.contains("</time>"), "{html}");
     }
 
+    /// The probe screen's coverage panel partitions the population by
+    /// check-history buckets and each counter deep-links into the filtered
+    /// proxy browser.
+    #[tokio::test]
+    async fn probe_screen_shows_check_coverage() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             VALUES ('fp-cv-none', 'vless', 'never-probed', 'h0.example.com', 443, 'c', 'unknown', 1, 1),
+                    ('fp-cv-t1', 'vless', 'tcp-only', 'h1.example.com', 443, 'c', 'alive', 1, 1),
+                    ('fp-cv-both', 'vless', 'fully-checked', 'h2.example.com', 443, 'c', 'alive', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // One T1 attempt for tcp-only, T1 + T2 for fully-checked; a probe
+        // attempt needs its proxy id (rowid order of the insert above).
+        sqlx::query(
+            "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
+             SELECT id, 1, 1, 10, NULL, 'tcp' FROM proxies WHERE fingerprint = 'fp-cv-t1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for kind in ["tls", "t2"] {
+            sqlx::query(
+                "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
+                 SELECT id, 1, 1, 10, NULL, ? FROM proxies WHERE fingerprint = 'fp-cv-both'",
+            )
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let response = app
+            .oneshot(request("GET", "/admin/probe", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        // Panel title, bucket labels and one link per bucket.
+        assert!(html.contains("Покрытие проверками"), "{html}");
+        for label in ["Без проверок", "Только T1", "Только T2", "T1 и T2"] {
+            assert!(html.contains(label), "missing bucket label {label}: {html}");
+        }
+        for bucket in ["none", "t1_only", "t2_only", "both"] {
+            assert!(
+                html.contains(&format!("?coverage={bucket}\"")),
+                "missing link for {bucket}: {html}"
+            );
+        }
+    }
+
+    /// The proxy browser filters by check-coverage bucket and renders the
+    /// Checks column; a garbage bucket value degrades to "no filter".
+    #[tokio::test]
+    async fn proxies_list_filters_by_check_coverage() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+
+        // Four proxies, one per bucket.
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             VALUES ('fp-l-none', 'vless', 'untouched', 'h0.example.com', 443, 'c', 'unknown', 1, 1),
+                    ('fp-l-t1', 'vless', 'tcp-only', 'h1.example.com', 443, 'c', 'unknown', 1, 1),
+                    ('fp-l-t2', 'vless', 'tunnel-only', 'h2.example.com', 443, 'c', 'unknown', 1, 1),
+                    ('fp-l-both', 'vless', 'fully-checked', 'h3.example.com', 443, 'c', 'unknown', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (fingerprint, kind) in [
+            ("fp-l-t1", "tcp"),
+            ("fp-l-t2", "t2"),
+            ("fp-l-both", "tcp"),
+            ("fp-l-both", "t2"),
+        ] {
+            sqlx::query(
+                "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
+                 SELECT id, 1, 1, 10, NULL, ? FROM proxies WHERE fingerprint = ?",
+            )
+            .bind(kind)
+            .bind(fingerprint)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = router(state);
+        let cookie = login(&app).await;
+
+        // Every bucket selects exactly its proxy; a garbage bucket value is
+        // tolerated (no filter, all four rows).
+        for (query, expect, absent) in [
+            ("?coverage=none", "untouched", "tcp-only"),
+            ("?coverage=t1_only", "tcp-only", "untouched"),
+            ("?coverage=t2_only", "tunnel-only", "untouched"),
+            ("?coverage=both", "fully-checked", "untouched"),
+            ("?coverage=everything", "fully-checked", "no-such-proxy"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/admin/proxies{query}"),
+                    "",
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "query {query}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let html = String::from_utf8_lossy(&bytes);
+            assert!(html.contains(expect), "{expect} missing for {query}");
+            assert!(!html.contains(absent), "{absent} leaked into {query}");
+        }
+
+        // The Checks column marks a proxy with both tiers in its history.
+        let response = app
+            .oneshot(request(
+                "GET",
+                "/admin/proxies?coverage=both",
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(html.contains("T1+T2"), "the Checks column: {html}");
+    }
+
     /// The settings screen renders every state-machine section with the
     /// configured values and the restart banner (ADMIN_PLAN §4.7).
     #[tokio::test]

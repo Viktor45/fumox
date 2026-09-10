@@ -372,6 +372,47 @@ pub async fn count_by_status(pool: &DbPool) -> crate::Result<Vec<(String, i64)>>
     Ok(rows)
 }
 
+/// Check-coverage buckets of the whole population (probe overview panel):
+/// `none` — no journaled attempt at all, `t1_only` / `t2_only` — exactly one
+/// of the check tiers has history, `both` — T1 and T2 both do. T1 is
+/// `probe_kind IN ('tcp', 'tls')`, T2 is `probe_kind = 't2'`.
+///
+/// The buckets cover *preserved* history only: `probe_results` rotates after
+/// `[retention].probe_results_days`, so a long-unseen proxy may look
+/// unverified even though it was checked once — the same view the probe
+/// daemon itself has (the T2 recency selector reads the same rows).
+/// The order is fixed and missing buckets are zero-filled, so the panel
+/// never reshuffles when counts change.
+pub async fn count_by_check_coverage(pool: &DbPool) -> crate::Result<Vec<(String, i64)>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT bucket, COUNT(*) FROM (
+             SELECT CASE
+                 WHEN t1.e IS NOT NULL AND t2.e IS NOT NULL THEN 'both'
+                 WHEN t1.e IS NOT NULL THEN 't1_only'
+                 WHEN t2.e IS NOT NULL THEN 't2_only'
+                 ELSE 'none'
+             END AS bucket
+             FROM proxies p
+             LEFT JOIN (SELECT DISTINCT proxy_id, 1 AS e FROM probe_results
+                        WHERE probe_kind IN ('tcp', 'tls')) t1 ON t1.proxy_id = p.id
+             LEFT JOIN (SELECT DISTINCT proxy_id, 1 AS e FROM probe_results
+                        WHERE probe_kind = 't2') t2 ON t2.proxy_id = p.id
+         ) GROUP BY bucket",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out: Vec<(String, i64)> = ["none", "t1_only", "t2_only", "both"]
+        .iter()
+        .map(|bucket| (bucket.to_string(), 0))
+        .collect();
+    for (bucket, count) in rows {
+        if let Some(slot) = out.iter_mut().find(|(name, _)| name == &bucket) {
+            slot.1 = count;
+        }
+    }
+    Ok(out)
+}
+
 /// Load the deduplicated proxy set reachable from a list of sources, excluding
 /// the given lifecycle statuses (health-filter, SPEC §8.5).
 ///
@@ -1098,6 +1139,86 @@ mod tests {
             .unwrap()
             .unwrap();
         (row.status, row.fail_count)
+    }
+
+    /// Insert a probe attempt row for the proxy of `entry`.
+    async fn probe_attempt(pool: &DbPool, entry: &ProxyEntry, kind: &str) {
+        let row = get_by_fingerprint(pool, &entry.fingerprint())
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
+             VALUES (?, 1, 1, 10, NULL, ?)",
+        )
+        .bind(row.id)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn coverage_buckets_partition_the_population() {
+        let pool = temp_pool().await;
+
+        // An empty database still yields every bucket, zero-filled and in
+        // the fixed panel order.
+        assert_eq!(
+            count_by_check_coverage(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|(bucket, count)| (bucket.as_str(), *count))
+                .collect::<Vec<_>>(),
+            vec![("none", 0), ("t1_only", 0), ("t2_only", 0), ("both", 0)]
+        );
+
+        // One proxy per bucket: untouched, tcp-only, t2-only, tcp + t2.
+        make_source(&pool, "srcA0000000").await;
+        let untouched = entry("untouched", "h0.example.com", 443);
+        let tcp_only = entry("tcp-only", "h1.example.com", 443);
+        let t2_only = entry("t2-only", "h2.example.com", 443);
+        let both = entry("both", "h3.example.com", 443);
+        for e in [&untouched, &tcp_only, &t2_only, &both] {
+            reconcile_source(
+                &pool,
+                "srcA0000000",
+                std::slice::from_ref(e),
+                &[],
+                1000,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        probe_attempt(&pool, &tcp_only, "tcp").await;
+        probe_attempt(&pool, &t2_only, "t2").await;
+        probe_attempt(&pool, &both, "tls").await;
+        probe_attempt(&pool, &both, "t2").await;
+
+        assert_eq!(
+            count_by_check_coverage(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|(bucket, count)| (bucket.as_str(), *count))
+                .collect::<Vec<_>>(),
+            vec![("none", 1), ("t1_only", 1), ("t2_only", 1), ("both", 1)]
+        );
+
+        // A second T1 kind on a tcp-only proxy must not move it anywhere:
+        // the buckets count presence, not attempts.
+        probe_attempt(&pool, &tcp_only, "tls").await;
+        assert_eq!(
+            count_by_check_coverage(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|(bucket, count)| (bucket.as_str(), *count))
+                .collect::<Vec<_>>(),
+            vec![("none", 1), ("t1_only", 1), ("t2_only", 1), ("both", 1)]
+        );
     }
 
     #[tokio::test]

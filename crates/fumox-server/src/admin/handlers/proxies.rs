@@ -24,6 +24,37 @@ const SORT_UPDATED: &str = "p.updated_at DESC, p.id DESC";
 const SORT_LATENCY: &str = "p.latency_ms IS NULL ASC, p.latency_ms ASC, p.id DESC";
 const SORT_NAME: &str = "p.name COLLATE NOCASE ASC, p.id DESC";
 
+/// Recognized check-coverage filter buckets (whitelist — the value decides
+/// which fixed SQL fragment is appended). T1 is `probe_kind IN ('tcp','tls')`,
+/// T2 is `probe_kind = 't2'`; the same buckets power the probe screen panel.
+const COVERAGE_SQL: &[(&str, &str)] = &[
+    (
+        "none",
+        "NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id)",
+    ),
+    (
+        "t1_only",
+        "EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
+         AND r.probe_kind IN ('tcp', 'tls')) \
+         AND NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
+         AND r.probe_kind = 't2')",
+    ),
+    (
+        "t2_only",
+        "EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
+         AND r.probe_kind = 't2') \
+         AND NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
+         AND r.probe_kind IN ('tcp', 'tls'))",
+    ),
+    (
+        "both",
+        "EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
+         AND r.probe_kind IN ('tcp', 'tls')) \
+         AND EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
+         AND r.probe_kind = 't2')",
+    ),
+];
+
 // ---------------------------------------------------------------------------
 // List
 // ---------------------------------------------------------------------------
@@ -38,6 +69,9 @@ struct ProxyListRow {
     status: String,
     latency_ms: Option<i64>,
     geo_country: Option<String>,
+    /// Whether the preserved probe history carries any T1 / T2 attempt.
+    t1_checked: bool,
+    t2_checked: bool,
 }
 
 #[derive(Template)]
@@ -58,6 +92,8 @@ struct ProxiesListTemplate {
     f_source: String,
     f_q: String,
     f_sort: String,
+    /// Active coverage bucket ("" = no filter).
+    f_coverage: String,
     all_statuses: Vec<(&'static str, bool)>,
     all_schemes: Vec<(String, bool)>,
     countries: Vec<String>,
@@ -105,6 +141,9 @@ impl ProxiesListTemplate {
         if !self.f_q.is_empty() {
             parts.push(format!("q={}", urlencoding(&self.f_q)));
         }
+        if !self.f_coverage.is_empty() {
+            parts.push(format!("coverage={}", urlencoding(&self.f_coverage)));
+        }
         if !self.f_sort.is_empty() && self.f_sort != "updated" {
             parts.push(format!("sort={}", urlencoding(&self.f_sort)));
         }
@@ -121,6 +160,21 @@ impl ProxiesListTemplate {
 
     fn source_selected(&self, id: &str) -> bool {
         self.f_source == id
+    }
+
+    /// Whether a coverage-bucket option of the filter dropdown is active.
+    fn coverage_selected(&self, bucket: &str) -> bool {
+        self.f_coverage == bucket
+    }
+
+    /// The "Checks" cell of one row: which probe tiers have history.
+    fn checks_cell(&self, row: &ProxyListRow) -> String {
+        match (row.t1_checked, row.t2_checked) {
+            (true, true) => "T1+T2".to_string(),
+            (true, false) => "T1".to_string(),
+            (false, true) => "T2".to_string(),
+            (false, false) => "—".to_string(),
+        }
     }
 }
 
@@ -152,6 +206,18 @@ pub async fn proxies_list(
         .get("sort")
         .cloned()
         .unwrap_or_else(|| "updated".into());
+    // Coverage bucket: whitelist — a garbage value means "no filter", the
+    // same tolerance the scheme/country selects show.
+    let f_coverage = params
+        .get("coverage")
+        .cloned()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let f_coverage = if COVERAGE_SQL.iter().any(|(bucket, _)| *bucket == f_coverage) {
+        f_coverage
+    } else {
+        String::new()
+    };
     let page: i64 = params
         .get("page")
         .and_then(|v| v.parse().ok())
@@ -195,6 +261,12 @@ pub async fn proxies_list(
         binds.push(format!("%{f_q}%"));
         binds.push(format!("%{f_q}%"));
     }
+    if let Some((_, sql)) = COVERAGE_SQL
+        .iter()
+        .find(|(bucket, _)| *bucket == f_coverage)
+    {
+        clauses.push((*sql).into());
+    }
     let where_sql = if clauses.is_empty() {
         String::new()
     } else {
@@ -215,7 +287,11 @@ pub async fn proxies_list(
 
     let rows: Vec<ProxyListRow> = {
         let sql = format!(
-            "SELECT p.id, p.scheme, p.name, p.host, p.port, p.status, p.latency_ms, p.geo_country
+            "SELECT p.id, p.scheme, p.name, p.host, p.port, p.status, p.latency_ms, p.geo_country,
+                    EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id
+                            AND r.probe_kind IN ('tcp', 'tls')) AS t1_checked,
+                    EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id
+                            AND r.probe_kind = 't2') AS t2_checked
              FROM proxies p{where_sql}
              ORDER BY {order}
              LIMIT ? OFFSET ?"
@@ -273,6 +349,7 @@ pub async fn proxies_list(
             f_source,
             f_q,
             f_sort,
+            f_coverage,
             countries,
             sources,
         },

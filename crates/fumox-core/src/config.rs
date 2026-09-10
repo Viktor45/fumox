@@ -440,8 +440,10 @@ pub struct ProbeConfig {
     /// that resolve to loopback / RFC1918 / link-local (cloud metadata) /
     /// CGNAT / unique-local addresses (security audit v2, 2026-09-09, F1):
     /// proxy hosts come from remote feeds, and without this gate a hostile
-    /// feed turns the probe into an internal port scanner. Mirrors
-    /// `[admin].allow_private_urls` of the fetcher.
+    /// feed turns the probe into an internal port scanner. A refusal is
+    /// journaled as a *failed check* (owner decision, 2026-09-10), so a
+    /// blocked target walks the ordinary fail ladder instead of clogging
+    /// the queues. Mirrors `[admin].allow_private_urls` of the fetcher.
     #[serde(default)]
     pub allow_private_targets: bool,
     /// TCP connect timeout for T1 checks.

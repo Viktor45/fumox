@@ -53,6 +53,29 @@
 </div>
 
 <div class="panel">
+  <h2>{{ self.t("probe.coverage_title") }}</h2>
+  <p class="muted small">{{ self.t("probe.coverage_note") }}</p>
+  <div class="table-scroll">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>{{ self.t("px.checks_label") }}</th>
+          <th>{{ self.t("probe.coverage_count") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for (bucket, count) in coverage %}
+        <tr>
+          <td class="small">{{ self.coverage_label(bucket) }}</td>
+          <td><a href="/admin/proxies?coverage={{ bucket }}">{{ count }}</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel">
   <h2>{{ self.t("probe.queue_title") }}</h2>
   {% if queue.is_empty() %}
     <p class="muted">{{ self.t("probe.queue_empty") }}</p>

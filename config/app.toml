@@ -118,11 +118,16 @@ sample_size = 50              # случайная выборка прокси �
 fail_limit = 2
 # Запрет диала приватных адресов из фидов (аудит безопасности v2, F1): без
 # этого флага демон не подключается к loopback/RFC1918/link-local/CGNAT
-# целям — фид может подсунуть «прокси» с адресом внутренней сети.
+# целям — фид может подсунуть «прокси» с адресом внутренней сети. Отказ
+# регистрируется как проваленная проверка (решение владельца 2026-09-10):
+# заблокированная цель проходит обычную лестницу фейлов, а не зависает
+# в очередях навсегда.
 # Refuse to dial private addresses coming from feeds (security audit v2,
 # F1): with this flag unset the daemon never connects to loopback/RFC1918/
 # link-local/CGNAT targets — a feed can plant a «proxy» pointing inside
-# your network.
+# your network. A refusal is journaled as a *failed check* (owner decision
+# 2026-09-10): the blocked target walks the ordinary fail ladder instead
+# of clogging the queues forever.
 # allow_private_targets = false
 connect_timeout_secs = 5     # T1: TCP-connect
 tls_timeout_secs = 5         # T1: TLS-handshake

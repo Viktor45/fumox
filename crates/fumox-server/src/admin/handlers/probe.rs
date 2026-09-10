@@ -58,6 +58,9 @@ struct ProbeTemplate {
     proxy_counts: Vec<(String, i64)>,
     heartbeat: Option<Heartbeat>,
     meow_last_ok: Option<i64>,
+    /// Check-coverage buckets (`none`/`t1_only`/`t2_only`/`both`), fixed
+    /// order, zero-filled — each links into the filtered proxy browser.
+    coverage: Vec<(String, i64)>,
     queue: Vec<QuarantineRow>,
 }
 
@@ -85,6 +88,18 @@ impl ProbeTemplate {
             self.lang
                 .t_args("probe.step_recheck", &[row.ladder_step.to_string()])
         }
+    }
+
+    /// Localized bucket label for the coverage panel.
+    fn coverage_label(&self, bucket: &str) -> String {
+        let key = match bucket {
+            "none" => "px.checks_none",
+            "t1_only" => "px.checks_t1_only",
+            "t2_only" => "px.checks_t2_only",
+            "both" => "px.checks_both",
+            _ => "px.checks_none",
+        };
+        self.lang.t(key).to_string()
     }
 }
 
@@ -129,6 +144,11 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
         Err(err) => return server_error(lang, &err),
     };
 
+    let coverage = match proxies::count_by_check_coverage(pool).await {
+        Ok(coverage) => coverage,
+        Err(err) => return server_error(lang, &err),
+    };
+
     // The 50 quarantined proxies with the nearest upcoming check.
     let queue: Vec<QuarantineRow> = match sqlx::query_as(
         "SELECT id, name, host, port, scheme, quarantined_at, ladder_at, ladder_step
@@ -156,6 +176,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
             proxy_counts,
             heartbeat,
             meow_last_ok,
+            coverage,
             queue,
         },
         StatusCode::OK,

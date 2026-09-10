@@ -145,6 +145,16 @@
     </select>
   </div>
   <div class="field">
+    <label>{{ self.t("px.checks_label") }}</label>
+    <select name="coverage">
+      <option value="">{{ self.t("common.all") }}</option>
+      <option value="none" {% if self.coverage_selected("none") %}selected{% endif %}>{{ self.t("px.checks_none") }}</option>
+      <option value="t1_only" {% if self.coverage_selected("t1_only") %}selected{% endif %}>{{ self.t("px.checks_t1_only") }}</option>
+      <option value="t2_only" {% if self.coverage_selected("t2_only") %}selected{% endif %}>{{ self.t("px.checks_t2_only") }}</option>
+      <option value="both" {% if self.coverage_selected("both") %}selected{% endif %}>{{ self.t("px.checks_both") }}</option>
+    </select>
+  </div>
+  <div class="field">
     <label>{{ self.t("common.search") }}</label>
     <input type="text" name="q" value="{{ f_q }}" placeholder="{{ self.t("px.search_placeholder") }}">
   </div>
@@ -173,6 +183,7 @@
             <th>{{ self.t("common.country") }}</th>
             <th>{{ self.t("common.name") }}</th>
             <th>{{ self.t("common.latency") }}</th>
+            <th>{{ self.t("px.checks_label") }}</th>
           </tr>
         </thead>
         <tbody>
@@ -197,6 +208,7 @@
                 {% when None %}<span class="muted">—</span>
               {% endmatch %}
             </td>
+            <td class="small mono">{{ self.checks_cell(row) }}</td>
           </tr>
           {% endfor %}
         </tbody>

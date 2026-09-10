@@ -46,9 +46,11 @@
     {% endmatch %}
   </div>
   <div class="panel stat-card">
-    <div class="num">{{ queue.len() }}</div>
+    <div class="num">{{ quarantine_count }}</div>
     <div class="label">{{ self.t("probe.quarantine_queue_card") }}</div>
-    <div class="sub">{{ self.t("probe.queue_nearest").replace("{}", &queue.len().to_string()) }}</div>
+    {% if quarantine_count > queue_shown() %}
+      <div class="sub">{{ self.t("probe.queue_nearest").replace("{}", &queue_shown().to_string()) }}</div>
+    {% endif %}
   </div>
 </div>
 

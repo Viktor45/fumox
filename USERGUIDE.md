@@ -508,14 +508,19 @@ and access tokens) as a versioned JSON file. *Import* recreates them with
 - validation is all-or-nothing: any invalid object aborts the whole import
   (`422` with a list of problems, nothing written).
 
-The same screen offers an **alive proxies download**: a public link that
-always returns every currently-alive proxy as a plain `url_list` — paste it
-into a client or use it as an upstream source. The link carries a random
-token generated on first startup; `Download url_list` saves it as a file,
-and *Regenerate link* replaces the token if the link leaks (the old link
-stops working immediately). The output starts with the url_list metadata
-comments (see [Output formats](#output-formats)) with the title
-`export/alive` and an update interval of `1` hour.
+The same screen offers two **download links** that share the same
+random token:
+
+- `GET /export/alive/{token}` — every currently-alive proxy as a plain
+  `url_list`. Title in the metadata block: `export/alive`, update
+  interval `1` hour.
+- `GET /export/ready/{token}` — the `ready` tier only (proxies that
+  successfully completed both T1 and T2 checks). Same metadata shape,
+  title `export/ready`.
+
+`Download url_list` saves the body as a file; *Regenerate link*
+replaces the token if the link leaks (the old link stops working
+immediately, both endpoints rotate together).
 
 ### Languages and themes
 
@@ -868,6 +873,7 @@ panel's *Settings* page.
 | `[probe].tls_timeout_secs`           | `10`                | T1 TLS-handshake timeout                                                                                                                            |
 | `[probe].concurrency`                | `8`                 | Parallelism of checks                                                                                                                               |
 | `[probe].queue_stale_days`           | `7`                 | Lifetime of priority-queue entries (first check of new proxies)                                                                                     |
+| `[probe].allow_private_targets`      | `false`             | When `false`, the probe refuses to connect to loopback / link-local / RFC1918 / ULA addresses — protects against SSRF if an attacker publishes a proxy list pointing at cloud metadata (`169.254.169.254`) or a private subnet. Blocked attempts are journaled as `probe_results.error = "blocked by the private-address policy: <reason>"` so the T2 recency queue advances past them |
 | `[ingest].refresh_check_limit`       | `50`                | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables)                                                       |
 | `[ingest].drop_gate`                 | `false`             | Whether `drop` rules unlink a live "lingerer" on the very next refresh                                                                              |
 | `[meow].timeout_secs`                | `10`                | Per-check T2 delay-test timeout                                                                                                                     |

@@ -11,9 +11,10 @@
   </div>
 </div>
 
-<!-- Bulk cleanup (ADMIN_PLAN §13.1 decision 29): five separate plain POST
-     forms in one dialog. Every action transitions rows into `removed`;
-     the physical delete stays the «purge removed» button above. -->
+<!-- Bulk cleanup: five separate plain POST forms in one dialog. Every
+     action here transitions rows into `removed` (a soft state); the
+     actual delete from the database stays the "purge removed" button
+     above. Keeping the two buttons apart makes a mistake reversible. -->
 <dialog id="cleanup-dialog">
   <h2>{{ self.t("px.cleanup_title") }}</h2>
   <p class="muted small">{{ self.t("px.cleanup_note") }}</p>

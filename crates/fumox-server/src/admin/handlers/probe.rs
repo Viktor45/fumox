@@ -67,6 +67,10 @@ struct ProbeTemplate {
     /// Check-coverage buckets (`none`/`t1_only`/`t2_only`/`both`), fixed
     /// order, zero-filled — each links into the filtered proxy browser.
     coverage: Vec<(String, i64)>,
+    /// True count of proxies in `status = 'quarantine'` (from
+    /// `proxy_counts`). The `queue` table view is truncated to 50 rows,
+    /// so it cannot be used to size the card.
+    quarantine_count: i64,
     queue: Vec<QuarantineRow>,
 }
 
@@ -79,6 +83,11 @@ impl ProbeTemplate {
     }
     fn proxy_total(&self) -> i64 {
         self.proxy_counts.iter().map(|(_, count)| count).sum()
+    }
+    /// Number of quarantined proxies shown in the queue table below
+    /// (`min(quarantine_count, 50)`).
+    fn queue_shown(&self) -> i64 {
+        self.queue.len() as i64
     }
     /// The next scheduled check for a quarantined proxy.
     fn next_check(&self, row: &QuarantineRow) -> String {
@@ -170,6 +179,15 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
         Err(err) => return server_error(lang, &err),
     };
 
+    // True population count for the quarantine card. `proxy_counts` already
+    // ran; pull the entry out instead of issuing another query. Missing
+    // status (e.g. empty DB) collapses to 0.
+    let quarantine_count = proxy_counts
+        .iter()
+        .find(|(status, _)| status == "quarantine")
+        .map(|(_, count)| *count)
+        .unwrap_or(0);
+
     let langs = state.locales.choices().to_vec();
     render_html(
         lang.clone(),
@@ -183,6 +201,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
             heartbeat,
             meow_last_ok,
             coverage,
+            quarantine_count,
             queue,
         },
         StatusCode::OK,

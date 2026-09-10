@@ -1339,6 +1339,139 @@ mod tests {
         }
     }
 
+    /// The Profiles list shows a per-row count of "live" proxies reachable
+    /// through the profile's sources: `status` ∈ {alive, quarantine,
+    /// unknown}. `removed` is excluded (SPEC §8, terminal), and proxies
+    /// reachable only through sources **not** in the profile are excluded.
+    /// A proxy reachable through more than one profile source is counted
+    /// once (`DISTINCT p.id`).
+    #[tokio::test]
+    async fn profiles_list_shows_live_proxy_count_per_row() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        // Profile with one source. A second source exists in the DB but
+        // is not attached to the profile — proxies reachable only through
+        // that source must not show up in the count.
+        sqlx::query(
+            "INSERT INTO profiles (id, name, output_format, enabled, created_at, updated_at)
+             VALUES ('p-live', 'live-count', 'uri_list', 1, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sources (id, name, url, enabled, cache_ttl_seconds, created_at, updated_at)
+             VALUES ('s-in',  'in',  'http://in.example/list', 1, 3600, ?, ?),
+                    ('s-out', 'out', 'http://out.example/list', 1, 3600, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO profile_sources (profile_id, source_id, position) VALUES ('p-live', 's-in', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Proxies reachable through `s-in` (in the profile): two alive,
+        // one quarantine, one unknown, one removed — the removed one is
+        // excluded.
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             VALUES
+                ('fp-a1', 'vless', 'a1', 'h1.example', 1, 'c', 'alive',      ?, ?),
+                ('fp-a2', 'vless', 'a2', 'h2.example', 1, 'c', 'alive',      ?, ?),
+                ('fp-q1', 'vless', 'q1', 'h3.example', 1, 'c', 'quarantine', ?, ?),
+                ('fp-u1', 'vless', 'u1', 'h4.example', 1, 'c', 'unknown',    ?, ?),
+                ('fp-r1', 'vless', 'r1', 'h5.example', 1, 'c', 'removed',    ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // One extra alive proxy reachable only through `s-out` (not in the
+        // profile). Must not count toward the profile's total.
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             VALUES ('fp-x1', 'vless', 'x1', 'hx.example', 1, 'c', 'alive', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // And one alive proxy reachable through **both** sources — it must
+        // be counted once (DISTINCT p.id).
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             VALUES ('fp-both', 'vless', 'both', 'hb.example', 1, 'c', 'alive', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
+             SELECT p.id, s.id, ? FROM proxies p CROSS JOIN sources s
+             WHERE (p.fingerprint = 'fp-a1' AND s.id = 's-in')
+                OR (p.fingerprint = 'fp-a2' AND s.id = 's-in')
+                OR (p.fingerprint = 'fp-q1' AND s.id = 's-in')
+                OR (p.fingerprint = 'fp-u1' AND s.id = 's-in')
+                OR (p.fingerprint = 'fp-r1' AND s.id = 's-in')
+                OR (p.fingerprint = 'fp-x1' AND s.id = 's-out')
+                OR (p.fingerprint = 'fp-both' AND s.id IN ('s-in', 's-out'))",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let response = app
+            .oneshot(request("GET", "/admin/profiles", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+
+        // Profile "live-count" row: 2 alive + 1 quarantine + 1 unknown +
+        // 1 alive (in both sources, counted once) = 5. The removed one and
+        // the proxy reachable only through `s-out` are excluded.
+        assert!(html.contains(">live-count<"), "profile row missing: {html}");
+        // Sources count is 1 (only `s-in` is attached). Proxies count is
+        // 5 (the live-only count). They sit in two adjacent `<td class="num">`
+        // cells — the same pattern the rest of the table uses.
+        let needle = "<td class=\"num\">1</td>\n            <td class=\"num\">5</td>";
+        assert!(
+            html.contains(needle),
+            "expected sources_count=1 and proxies_count=5 adjacent: {html}"
+        );
+    }
+
     #[tokio::test]
     async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
         let state = test_state(1000).await;
@@ -1389,6 +1522,69 @@ mod tests {
         assert!(html.contains("<time class=\"ts\" datetime=\""), "{html}");
         assert!(html.contains("Z\">"), "{html}");
         assert!(html.contains("</time>"), "{html}");
+        // The "Quarantined (queue)" card uses the real status breakdown,
+        // not the truncated 50-row queue: with one quarantined proxy the
+        // number is 1.
+        assert!(
+            html.contains("\"num\">1</div>\n    <div class=\"label\">"),
+            "expected quarantine_count=1 to be rendered as the card number: {html}"
+        );
+    }
+
+    /// Regression: the quarantine card must show the true population count
+    /// even when the on-screen queue is truncated to 50 rows. Previously
+    /// the card showed `queue.len()` (always <= 50), which underreported
+    /// the population.
+    #[tokio::test]
+    async fn probe_quarantine_card_reflects_true_count_not_queue_len() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        // 60 quarantined proxies — enough to overflow the LIMIT 50 on the
+        // queue view. The card must still read 60.
+        for i in 0..60 {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
+                                      quarantined_at, ladder_at, created_at, updated_at)
+                 VALUES (?, 'vless', ?, ?, 443, 'c', 'quarantine',
+                         ?, ?, 1, 1)",
+            )
+            .bind(format!("fp-q-{i}"))
+            .bind(format!("q{i}"))
+            .bind(format!("h{i}.example.com"))
+            .bind(now - 3600)
+            .bind(now + 86_400 + i)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let response = app
+            .oneshot(request("GET", "/admin/probe", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        // True population (60) wins over the truncated queue (50).
+        assert!(
+            html.contains("\"num\">60</div>"),
+            "expected quarantine card to render the true count of 60: {html}"
+        );
+        assert!(
+            !html.contains("\"num\">50</div>"),
+            "card must not render the truncated queue length 50: {html}"
+        );
+        // The truncation hint is shown only when the count overflows 50.
+        // The default language in tests is Russian, so look for the
+        // translated substring; either locale would be acceptable.
+        assert!(
+            html.contains("ближайшие 50 из 50") || html.contains("nearest 50 of 50"),
+            "expected truncation hint when quarantine_count > 50: {html}"
+        );
     }
 
     /// The probe screen's coverage panel partitions the population by
@@ -3530,15 +3726,14 @@ mod tests {
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
         // Builder mode by default, filter section set, vless selected (but
-        // not trojan), sort by name descending.
+        // not trojan), sort by name descending. The filter section now uses
+        // the tri-state radios (post-fix); `ped-filter-set` carries the
+        // checked marker for the source form.
         assert!(
             html.contains(r#"name="pipeline_mode" value="builder""#),
             "{html}"
         );
-        assert!(
-            html.contains(r#"name="ped_filter" value="1" id="ped-filter" checked"#),
-            "{html}"
-        );
+        assert!(html.contains(r#"id="ped-filter-set" checked"#), "{html}");
         assert!(
             html.contains(
                 r#"name="ped_filter_protocols" value="vless" id="ped-proto-vless" checked"#

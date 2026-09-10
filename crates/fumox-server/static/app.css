@@ -644,6 +644,14 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   margin: 4px 0 8px;
   flex-wrap: wrap;
 }
+/* Inner fields of a tri-state section (geo / sort / limit). Always in
+   the DOM so the browser can hold typed values across radio toggles
+   without a server round-trip; hidden by default with `display:none`
+   on a section whose only checked radio is `skip`. The base.html JS
+   toggles the class on radio change. Without JS the inner block stays
+   visible regardless — the section's `emit()` silently discards typed
+   values when the radio is `skip`. */
+.ped-inner[hidden] { display: none !important; }
 
 /* ---------- mobile adaptation ---------- */
 

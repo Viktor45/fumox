@@ -135,6 +135,49 @@
         localize(document);
       });
     })();
+
+    // Pipeline widget: show/hide the inner fields of a tri-state section
+    // (geo / sort / limit) based on which radio is checked. The inner
+    // fields are always in the DOM so the browser can hold typed values
+    // across toggles; the `hidden` attribute is the only visibility knob.
+    // Runs on initial load (initial state) and on every HTMX settle (the
+    // widget re-renders on preset / mode / preview refresh).
+    (function () {
+      function syncSection(section) {
+        var name = section.getAttribute('data-ped-section');
+        if (!name) return;
+        var checked = section.querySelector('input[name="ped_' + name + '"]:checked');
+        var inner = section.querySelector('[data-ped-inner="' + name + '"]');
+        if (!inner) return;
+        // Hide when the section is `skip`; show otherwise. `defaults`
+        // and `set` keep the inner fields visible so the user can edit.
+        if (checked && checked.value === 'skip') {
+          inner.setAttribute('hidden', '');
+        } else {
+          inner.removeAttribute('hidden');
+        }
+      }
+      function syncAll(root) {
+        var sections = (root || document).querySelectorAll('[data-ped-section]');
+        for (var i = 0; i < sections.length; i++) syncSection(sections[i]);
+      }
+      syncAll(document);
+      // User clicks on a tri-state radio.
+      document.body.addEventListener('change', function (event) {
+        var target = event.target;
+        if (!(target instanceof HTMLInputElement)) return;
+        var name = target.name;
+        if (!name || name.indexOf('ped_') !== 0) return;
+        var section = target.closest('[data-ped-section]');
+        if (section) syncSection(section);
+      });
+      // The widget is re-rendered by HTMX on preset / mode / preview
+      // refresh — re-run after every settle so the initial state matches
+      // the rendered radios.
+      document.body.addEventListener('htmx:afterSettle', function () {
+        syncAll(document);
+      });
+    })();
   </script>
 </body>
 </html>

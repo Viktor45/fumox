@@ -37,6 +37,12 @@ struct ProfileListRow {
     enabled: bool,
     protected: bool,
     sources_count: i64,
+    /// Live proxies reachable through the profile's sources: `status` ∈
+    /// {alive, quarantine, unknown}. `removed` is terminal (SPEC §8) and
+    /// is excluded, matching the proxy counts shown elsewhere in the admin
+    /// panel. A proxy reachable through more than one source in the same
+    /// profile is counted once (`DISTINCT p.id`).
+    proxies_count: i64,
 }
 
 #[derive(Template)]
@@ -58,7 +64,13 @@ pub async fn profiles_list(State(state): State<AdminState>, headers: HeaderMap) 
     let rows: Vec<ProfileListRow> = match sqlx::query_as(
         "SELECT p.id, p.name, p.slug, p.output_format, p.enabled,
                 p.access_token IS NOT NULL AS protected,
-                (SELECT COUNT(*) FROM profile_sources ps WHERE ps.profile_id = p.id) AS sources_count
+                (SELECT COUNT(*) FROM profile_sources ps WHERE ps.profile_id = p.id) AS sources_count,
+                (SELECT COUNT(DISTINCT px.id)
+                 FROM profile_sources ps
+                 JOIN proxy_source_links l ON l.source_id = ps.source_id
+                 JOIN proxies px ON px.id = l.proxy_id
+                 WHERE ps.profile_id = p.id
+                   AND px.status IN ('alive', 'quarantine', 'unknown')) AS proxies_count
          FROM profiles p
          ORDER BY p.created_at",
     )

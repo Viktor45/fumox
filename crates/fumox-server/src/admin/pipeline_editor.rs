@@ -744,6 +744,47 @@ impl BuilderView {
     pub(crate) fn geo_placeholders(&self) -> String {
         Schema::geo_placeholders().join(" ")
     }
+
+    /// The geo section is being overridden: the user has picked "set" or
+    /// "defaults". The widget uses this to gate the inner `geo.enabled`
+    /// flag and the template input — both are meaningless when the
+    /// section is `skip` (no `geo` block is emitted and any typed values
+    /// would be silently dropped).
+    pub(crate) fn geo_section_active(&self) -> bool {
+        self.state.geo_set || self.state.geo_defaults
+    }
+
+    /// The filter section is being overridden: the user has picked "set"
+    /// or "defaults". When `skip`, the protocol/ASN/forbid_insecure
+    /// inner block is hidden because the JSON omits `filter` entirely
+    /// and the values would be silently dropped on save.
+    pub(crate) fn filter_section_active(&self) -> bool {
+        self.state.filter_set || self.state.filter_defaults
+    }
+
+    /// The health section is being overridden: the user has picked "set"
+    /// or "defaults". When `skip`, the exclude-statuses inner block is
+    /// hidden because the JSON omits `health` entirely and the values
+    /// would be silently dropped on save.
+    pub(crate) fn health_section_active(&self) -> bool {
+        self.state.health_set || self.state.health_defaults
+    }
+
+    /// The sort section is being overridden: the user has picked "set" or
+    /// "defaults". When `skip`, the field/desc checkbox are hidden because
+    /// the JSON omits `sort` entirely and the values would be silently
+    /// dropped on save.
+    pub(crate) fn sort_section_active(&self) -> bool {
+        self.state.sort_set || self.state.sort_defaults
+    }
+
+    /// The limit section is being overridden: the user has picked "set"
+    /// or "defaults". When `skip`, the count input is hidden because the
+    /// JSON omits `limit` entirely and the typed number would be silently
+    /// dropped on save.
+    pub(crate) fn limit_section_active(&self) -> bool {
+        self.state.limit_set || self.state.limit_defaults
+    }
 }
 
 fn any_of(values: &[String], name: &str) -> bool {
@@ -2117,5 +2158,430 @@ mod tests {
     fn test_lang() -> Lang {
         // Embedded catalogs load without a directory; ru is the default.
         crate::admin::i18n::Locales::load(Path::new("/nonexistent-fumox-locales")).default_lang()
+    }
+
+    /// When the geo section is `skip` (or absent), the inner
+    /// `ped_geo_enabled` checkbox and the `ped_geo_template` input stay
+    /// in the DOM but get the `hidden` attribute. The CSS rule
+    /// `.ped-inner[hidden]` hides them; the JS in base.html toggles the
+    /// attribute on radio change. The DOM-presence is what lets the
+    /// browser hold typed values across toggles without a server round
+    /// trip.
+    #[test]
+    fn geo_skip_marks_inner_block_hidden() {
+        let lang = test_lang();
+        let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
+        let html = widget_from_posted(lang.clone(), "c", &form, false, None);
+        assert!(
+            html.contains(r#"id="ped-geo-skip" checked"#),
+            "expected skip radio checked by default: {html}"
+        );
+        // Inner block is rendered with `hidden`.
+        assert!(
+            html.contains(r#"data-ped-inner="geo" hidden"#),
+            "inner block must carry the hidden attribute when geo is skipped: {html}"
+        );
+        // The inner inputs themselves stay in the DOM so the user can
+        // type into them as soon as the JS un-hides the block.
+        assert!(
+            html.contains(r#"id="ped-geo-enabled""#),
+            "disable checkbox stays in the DOM: {html}"
+        );
+        assert!(
+            html.contains(r#"id="ped-geo-template""#),
+            "template input stays in the DOM: {html}"
+        );
+    }
+
+    /// The source form's geo section can now emit `geo: {}` (explicit
+    /// defaults) — this was unreachable before the tri-state radio was
+    /// added to the source form. The `defaults` branch of `emit()` writes
+    /// the empty object, and `merge_configs` then treats it as an explicit
+    /// "use defaults" override at the profile layer.
+    #[test]
+    fn geo_defaults_round_trips_through_emit() {
+        let mut s = state();
+        s.geo_defaults = true;
+        let json = s.emit().expect("geo_defaults must produce a JSON");
+        let geo = json
+            .get("geo")
+            .expect("emit must include geo under defaults: {json}");
+        assert!(
+            geo.as_object().map(|o| o.is_empty()).unwrap_or(false),
+            "geo defaults block must be an empty object: {geo}"
+        );
+        assert_eq!(
+            s.geo_template, "",
+            "no template persisted in defaults mode: {s:?}"
+        );
+    }
+
+    /// When the section is `set` and the inner disable checkbox is
+    /// unchecked, `geo.enabled` is `false` and any non-default template
+    /// is emitted. This is the only path where the inner flag actually
+    /// persists — proves the labelled "Disable geo enrichment" checkbox
+    /// still controls what gets saved.
+    #[test]
+    fn geo_set_with_disable_persists_enabled_false() {
+        let mut s = state();
+        s.geo_set = true;
+        s.geo_enabled = false; // inner checkbox unchecked
+        s.geo_template = "{asn} · {name}".into();
+        let json = s.emit().expect("geo_set must produce a JSON");
+        assert_eq!(
+            json.get("geo").and_then(|g| g.get("enabled")),
+            Some(&serde_json::Value::from(false)),
+            "enabled must be emitted as false: {json}"
+        );
+        assert_eq!(
+            json.get("geo").and_then(|g| g.get("template")),
+            Some(&serde_json::Value::from("{asn} · {name}")),
+            "template must be emitted: {json}"
+        );
+    }
+
+    /// When the sort section is `skip` (the default), the inner sort
+    /// controls stay in the DOM but get the `hidden` attribute, so the
+    /// browser holds typed values across toggles. CSS hides the block;
+    /// the base.html JS toggles on radio change.
+    #[test]
+    fn sort_skip_marks_inner_block_hidden() {
+        let lang = test_lang();
+        let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
+        let html = widget_from_posted(lang.clone(), "c", &form, false, None);
+        assert!(
+            html.contains(r#"id="ped-sort-skip" checked"#),
+            "expected sort-skip radio checked by default: {html}"
+        );
+        assert!(
+            html.contains(r#"data-ped-inner="sort" hidden"#),
+            "sort inner block must carry hidden attribute: {html}"
+        );
+        assert!(
+            html.contains(r#"id="ped-sort-by""#),
+            "sort_by select stays in the DOM: {html}"
+        );
+        assert!(
+            html.contains(r#"id="ped-sort-desc""#),
+            "sort_desc checkbox stays in the DOM: {html}"
+        );
+    }
+
+    /// The source form's sort section can now emit `sort: {}` (explicit
+    /// defaults) — this was unreachable before the tri-state radio was
+    /// added to the source form. The `defaults` branch of `emit()`
+    /// writes the empty object.
+    #[test]
+    fn sort_defaults_round_trips_through_emit() {
+        let mut s = state();
+        s.sort_defaults = true;
+        let json = s.emit().expect("sort_defaults must produce a JSON");
+        let sort = json
+            .get("sort")
+            .expect("emit must include sort under defaults: {json}");
+        assert!(
+            sort.as_object().map(|o| o.is_empty()).unwrap_or(false),
+            "sort defaults block must be an empty object: {sort}"
+        );
+    }
+
+    /// When the limit section is `skip` (the default), the count input
+    /// stays in the DOM but the inner block gets the `hidden` attribute.
+    /// The browser can hold a typed number across toggles; CSS hides
+    /// the block; the JS toggles on radio change.
+    #[test]
+    fn limit_skip_marks_inner_block_hidden() {
+        let lang = test_lang();
+        let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
+        let html = widget_from_posted(lang.clone(), "c", &form, false, None);
+        assert!(
+            html.contains(r#"id="ped-limit-skip" checked"#),
+            "expected limit-skip radio checked by default: {html}"
+        );
+        assert!(
+            html.contains(r#"data-ped-inner="limit" hidden"#),
+            "limit inner block must carry hidden attribute: {html}"
+        );
+        assert!(
+            html.contains(r#"id="ped-limit-count""#),
+            "limit count input stays in the DOM: {html}"
+        );
+    }
+
+    /// The source form's limit section can now emit `limit: { count:
+    /// null }` (explicit defaults reset) — this was unreachable from the
+    /// source form before the tri-state radio was added.
+    #[test]
+    fn limit_defaults_round_trips_through_emit() {
+        let mut s = state();
+        s.limit_defaults = true;
+        let json = s.emit().expect("limit_defaults must produce a JSON");
+        let limit = json
+            .get("limit")
+            .expect("emit must include limit under defaults: {json}");
+        assert_eq!(
+            limit.get("count"),
+            Some(&serde_json::Value::Null),
+            "limit defaults block must carry count=null: {limit}"
+        );
+    }
+
+    /// A source with a stored pipeline that has `sort` and `limit` set:
+    /// opening the source edit page must re-render the widget with the
+    /// `set` radio checked and the inner fields visible. This is the
+    /// user-visible regression that the unification of the section
+    /// shape may have introduced on the source form.
+    #[test]
+    fn source_form_widget_rerenders_sort_and_limit_with_inner_fields() {
+        let lang = test_lang();
+        // A stored pipeline the builder can represent (sort + limit).
+        let pipeline = serde_json::json!({
+            "version": 1,
+            "sort": { "by": "latency", "desc": true },
+            "limit": { "count": 100 }
+        });
+        let Ingest::Builder(state) = BuilderState::ingest(Some(&pipeline)) else {
+            panic!("ingest must return Builder for a representable pipeline");
+        };
+        let html = WidgetFragment::builder_mode(lang, "c", &state, false, None).html();
+
+        // The `set` radio is checked for both sections.
+        assert!(
+            html.contains(r#"id="ped-sort-set" checked"#),
+            "expected ped-sort-set checked on reload: {html}"
+        );
+        assert!(
+            html.contains(r#"id="ped-limit-set" checked"#),
+            "expected ped-limit-set checked on reload: {html}"
+        );
+        // Inner blocks are visible: no `hidden` attribute on the inner
+        // div, the inner inputs stay in the DOM.
+        assert!(
+            html.contains(r#"data-ped-inner="sort""#)
+                && !html.contains(r#"data-ped-inner="sort" hidden"#),
+            "sort inner block must be visible on reload: {html}"
+        );
+        assert!(
+            html.contains(r#"data-ped-inner="limit""#)
+                && !html.contains(r#"data-ped-inner="limit" hidden"#),
+            "limit inner block must be visible on reload: {html}"
+        );
+        assert!(
+            html.contains(r#"id="ped-sort-by""#),
+            "expected sort_by select rendered on reload: {html}"
+        );
+        assert!(
+            html.contains(r#"id="ped-sort-desc""#),
+            "expected sort_desc checkbox rendered on reload: {html}"
+        );
+        assert!(
+            html.contains(r#"id="ped-limit-count""#),
+            "expected limit_count input rendered on reload: {html}"
+        );
+    }
+
+    /// Every field of every section, set to a non-default value,
+    /// survives the round-trip through `emit`/`ingest`. This is the
+    /// master check: if a field is dropped, renamed, or silently
+    /// canonicalized, this test catches it. Both source (`ped_*` checkbox
+    /// = `"1"`) and profile (`ped_*` radio = `"set"`) form paths are
+    /// exercised.
+    #[test]
+    fn every_field_round_trips_through_emit_and_ingest() {
+        fn check(form: Vec<(String, String)>) {
+            let s = BuilderState::from_form(&form);
+            let json = s
+                .emit()
+                .expect("every field populated must emit non-null JSON");
+            let Ingest::Builder(loaded) = BuilderState::ingest(Some(&json)) else {
+                panic!("ingest must return Builder, got Raw: {json}");
+            };
+            // Re-emit; idempotency (PIPELINE.md §10).
+            assert_eq!(
+                loaded.emit(),
+                Some(json.clone()),
+                "round-trip lost data: emit={json}, ingest={:?}",
+                loaded.emit()
+            );
+            // Per-field checks against the *re-emitted* JSON.
+            let v = &json;
+            // filter
+            assert_eq!(v["filter"]["protocols"][0], "vless");
+            assert_eq!(v["filter"]["exclude_protocols"][0], "trojan");
+            assert_eq!(v["filter"]["asns"][0], "24940");
+            assert_eq!(v["filter"]["asns"][1], "AS13335");
+            assert_eq!(v["filter"]["exclude_asns"][0], "9009");
+            assert_eq!(v["filter"]["forbid_insecure"], false);
+            // rename
+            assert_eq!(v["rename"][0]["match"], "a");
+            assert_eq!(v["rename"][0]["replace"], "A");
+            assert_eq!(v["rename"][0]["flags"], "i");
+            // geo
+            assert_eq!(v["geo"]["enabled"], false);
+            assert_eq!(v["geo"]["template"], "{asn} · {name}");
+            // health
+            assert_eq!(v["health"]["exclude_statuses"][0], "removed");
+            assert_eq!(v["health"]["exclude_statuses"][1], "quarantine");
+            assert_eq!(v["health"]["exclude_statuses"][2], "unknown");
+            // sort
+            assert_eq!(v["sort"]["by"], "latency");
+            assert_eq!(v["sort"]["desc"], true);
+            // limit
+            assert_eq!(v["limit"]["count"], 100);
+        }
+
+        let form_common = vec![
+            ("ped_filter_protocols".into(), "vless".into()),
+            ("ped_filter_exclude".into(), "trojan".into()),
+            ("ped_filter_asns".into(), "24940, AS13335".into()),
+            ("ped_filter_exclude_asns".into(), " 9009 ".into()),
+            // forbid_insecure explicitly off
+            ("ped_forbid_insecure".into(), "".into()),
+            ("ped_rename_0_match".into(), "a".into()),
+            ("ped_rename_0_replace".into(), "A".into()),
+            ("ped_rename_0_flags".into(), "i".into()),
+            ("ped_geo_enabled".into(), "".into()),
+            ("ped_geo_template".into(), "{asn} · {name}".into()),
+            // override SPEC default exclude_statuses (q+r) so the
+            // builder emits the section
+            ("ped_health_exclude".into(), "removed".into()),
+            ("ped_health_exclude".into(), "quarantine".into()),
+            ("ped_health_exclude".into(), "unknown".into()),
+            ("ped_sort_by".into(), "latency".into()),
+            ("ped_sort_desc".into(), "1".into()),
+            ("ped_limit_count".into(), "100".into()),
+        ];
+
+        // Source form: section toggles are checkboxes ("1" = set).
+        let mut source = form_common.clone();
+        source.extend([
+            ("ped_filter".into(), "1".into()),
+            ("ped_geo".into(), "1".into()),
+            ("ped_health".into(), "1".into()),
+            ("ped_sort".into(), "1".into()),
+            ("ped_limit".into(), "1".into()),
+        ]);
+        check(source);
+
+        // Profile form: section toggles are radios ("set" = set).
+        let mut profile = form_common;
+        profile.extend([
+            ("ped_filter".into(), "set".into()),
+            ("ped_geo".into(), "set".into()),
+            ("ped_health".into(), "set".into()),
+            ("ped_sort".into(), "set".into()),
+            ("ped_limit".into(), "set".into()),
+        ]);
+        check(profile);
+    }
+
+    /// Every section's `defaults` branch on the profile form must produce
+    /// an explicit empty block in JSON. This is the "profile resets the
+    /// source's section to SPEC defaults" affordance — without the
+    /// explicit `{}`/`[]`/`null`, the merge would inherit instead of
+    /// reset.
+    #[test]
+    fn every_section_defaults_branch_emits_explicit_empty() {
+        let mut s = state();
+        s.filter_defaults = true;
+        s.rename_defaults = true;
+        s.drop_defaults = true;
+        s.geo_defaults = true;
+        s.health_defaults = true;
+        s.sort_defaults = true;
+        s.limit_defaults = true;
+        let json = s.emit().expect("all-defaults state must emit");
+        assert_eq!(json["filter"], serde_json::json!({}));
+        assert_eq!(json["rename"], serde_json::json!([]));
+        assert_eq!(json["drop"], serde_json::json!([]));
+        assert_eq!(json["geo"], serde_json::json!({}));
+        assert_eq!(json["health"], serde_json::json!({}));
+        assert_eq!(json["sort"], serde_json::json!({}));
+        assert_eq!(json["limit"], serde_json::json!({ "count": null }));
+    }
+
+    /// Every section that has a tri-state must render **all three**
+    /// radios in the source form, so the user can pick `defaults` or
+    /// `set` from a fresh form (not just `skip`). This is the post-fix
+    /// regression guard for the source-form unification.
+    #[test]
+    fn source_form_renders_all_three_radios_for_every_section() {
+        let lang = test_lang();
+        let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
+        let html = widget_from_posted(lang.clone(), "c", &form, false, None);
+        // Sections with the unified tri-state: skip/defaults/set radios
+        // all rendered on both source and profile forms.
+        for section in ["filter", "geo", "health", "sort", "limit"] {
+            for mode in ["skip", "defaults", "set"] {
+                let needle = format!(r#"name="ped_{section}" value="{mode}""#);
+                assert!(
+                    html.contains(&needle),
+                    "source form must render {section} {mode} radio: missing {needle}"
+                );
+            }
+        }
+        // Rename and drop have no source-form toggle at all
+        // (profile-only by design).
+        assert!(
+            !html.contains(r#"name="ped_rename" value="skip""#),
+            "source form must NOT carry a rename radio: {html}"
+        );
+        assert!(
+            !html.contains(r#"name="ped_drop" value="skip""#),
+            "source form must NOT carry a drop radio: {html}"
+        );
+    }
+
+    /// Profile form must render the tri-state radios for **every**
+    /// section, including rename and drop.
+    #[test]
+    fn profile_form_renders_all_three_radios_for_every_section() {
+        let lang = test_lang();
+        let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
+        let html = widget_from_posted(lang.clone(), "c", &form, true, None);
+        for section in ["filter", "rename", "drop", "geo", "health", "sort", "limit"] {
+            for mode in ["skip", "defaults", "set"] {
+                let needle = format!(r#"name="ped_{section}" value="{mode}""#);
+                assert!(
+                    html.contains(&needle),
+                    "profile form must render {section} {mode} radio: missing {needle}"
+                );
+            }
+        }
+    }
+
+    /// A brand-new source (no stored pipeline): the widget renders with
+    /// every section in `skip` mode and the inner blocks carry the
+    /// `hidden` attribute. The inner inputs themselves stay in the DOM
+    /// so the user can type into them as soon as the JS un-hides the
+    /// block on radio change. (Originally the regression: the inner
+    /// block was server-side omitted, so clicking `set` did nothing
+    /// until a page reload.)
+    #[test]
+    fn new_source_widget_marks_all_inner_blocks_hidden() {
+        let lang = test_lang();
+        let state = BuilderState::new();
+        let html = WidgetFragment::builder_mode(lang, "c", &state, false, None).html();
+        // Every section's skip radio is the default selection.
+        for section in ["filter", "geo", "health", "sort", "limit"] {
+            assert!(
+                html.contains(&format!(r#"id="ped-{section}-skip" checked"#)),
+                "expected {section} skip radio checked by default: {html}"
+            );
+        }
+        // Every section's inner block is rendered with `hidden`.
+        for section in ["filter", "geo", "health", "sort", "limit"] {
+            assert!(
+                html.contains(&format!(r#"data-ped-inner="{section}" hidden"#)),
+                "{section} inner block must carry hidden: {html}"
+            );
+        }
+        // Inner inputs themselves remain in the DOM (so the JS toggle
+        // can immediately show them with their default values).
+        assert!(html.contains(r#"id="ped-sort-by""#), "{html}");
+        assert!(html.contains(r#"id="ped-sort-desc""#), "{html}");
+        assert!(html.contains(r#"id="ped-limit-count""#), "{html}");
+        assert!(html.contains(r#"id="ped-asns""#), "{html}");
+        assert!(html.contains(r#"id="ped-status-alive""#), "{html}");
     }
 }

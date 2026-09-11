@@ -60,6 +60,10 @@ jobs:
             echo "Deleting sha-* versions older than $RETENTION_DAYS days"
           fi
 
+          err_tmp="$(mktemp)"
+          cleanup() { rm -f "$err_tmp"; }
+          trap cleanup EXIT
+
           for pkg in ${PACKAGES//,/ }; do
             echo
             echo "=== $OWNER/$pkg ==="
@@ -69,9 +73,46 @@ jobs:
             # we never have to round-trip ref data.
             page=1
             while :; do
+              # Capture body on stdout, stderr to a temp file. A non-zero exit
+              # + 404 means the package itself is missing on page=1 (skip this
+              # package and move on) or end-of-list on a later page (break the
+              # walk). Other failures still bail out under set -e.
               resp=$(gh api \
                 -H "Accept: application/vnd.github+json" \
-                "/orgs/${OWNER}/packages/container/${pkg}/versions?per_page=100&page=${page}")
+                "/orgs/${OWNER}/packages/container/${pkg}/versions?per_page=100&page=${page}" \
+                2>"$err_tmp")
+              gh_status=$?
+              gh_err="$(cat "$err_tmp" 2>/dev/null || true)"
+              if [ "$gh_status" -ne 0 ] || [ -z "$resp" ]; then
+                case "$gh_err" in
+                  *"404"*)
+                    if [ "$page" -eq 1 ]; then
+                      echo "  skip: $pkg not found on $OWNER"
+                      echo "         (does it exist? token can read it?"
+                      echo "          no action this run.)"
+                      rm -f "$err_tmp"
+                      break 2   # exit both `while` and `for pkg`
+                    else
+                      echo "  page $page returned 404 — assuming end-of-list"
+                      break
+                    fi
+                    ;;
+                  *"403"*)
+                    if [ "$page" -eq 1 ]; then
+                      echo "  skip: $pkg private/no read access (403)"
+                      echo "         (use a PAT with packages:read.)"
+                      rm -f "$err_tmp"
+                      break 2
+                    fi
+                    ;;
+                  *)
+                    printf '%s\n' "$gh_err" | sed 's/^/  gh: /' >&2
+                    echo "  error: gh api exited with status $gh_status; aborting this package" >&2
+                    rm -f "$err_tmp"
+                    break 2
+                    ;;
+                esac
+              fi
               count=$(printf '%s' "$resp" | jq 'length')
               if [ "$count" = "0" ] || [ -z "$count" ]; then
                 break
@@ -130,9 +171,24 @@ jobs:
                   echo "  [dry-run] would delete id=$id — $reason"
                 else
                   echo "  deleting id=$id — $reason"
+                  # Idempotency: a 404 here means another job deleted this
+                  # version between our listing and our DELETE. Drop it from
+                  # the count without failing the run.
                   gh api -X DELETE \
                     -H "Accept: application/vnd.github+json" \
-                    "/orgs/${OWNER}/packages/container/${pkg}/versions/${id}"
+                    "/orgs/${OWNER}/packages/container/${pkg}/versions/${id}" \
+                    2>"$err_tmp"
+                  del_status=$?
+                  if [ "$del_status" -ne 0 ] && grep -q "404" "$err_tmp"; then
+                    echo "  (already gone — race with another job)"
+                    deleted_for_pkg=$((deleted_for_pkg + 1))
+                    continue
+                  elif [ "$del_status" -ne 0 ]; then
+                    printf '%s\n' "$(cat "$err_tmp")" | sed 's/^/  gh: /' >&2
+                    echo "  error: gh api DELETE exited with status $del_status; aborting this package" >&2
+                    rm -f "$err_tmp"
+                    break 2
+                  fi
                 fi
                 deleted_for_pkg=$((deleted_for_pkg + 1))
               done < <(printf '%s' "$resp" | jq -r '.[].id')

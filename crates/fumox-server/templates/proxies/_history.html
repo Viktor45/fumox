@@ -18,7 +18,7 @@
           <td class="num small">
             {% match probe.latency_ms %}
               {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
-              {% when None %}<span class="muted">—</span>
+              {% when None %}<span class="muted">–</span>
             {% endmatch %}
           </td>
           <td class="mono small">{{ probe.probe_kind }}</td>

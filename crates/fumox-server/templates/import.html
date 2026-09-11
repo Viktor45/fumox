@@ -69,8 +69,8 @@
   <form method="post" action="/admin/import">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <div class="field">
-      <label>{{ self.t("io.payload_label") }}</label>
-      <textarea class="mono" name="payload" rows="12" placeholder='{ "version": 1, … }'></textarea>
+      <label for="io-payload">{{ self.t("io.payload_label") }}</label>
+      <textarea class="mono" id="io-payload" name="payload" rows="12" placeholder='{ "version": 1, … }'></textarea>
       <div class="hint">{{ self.t("io.payload_hint") }}</div>
     </div>
     <div class="field">

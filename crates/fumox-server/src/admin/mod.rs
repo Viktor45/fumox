@@ -2533,9 +2533,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // Interface language (i18n)
-    // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn dashboard_defaults_to_russian_and_follows_the_language_cookie() {
@@ -2749,9 +2747,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // Interface theme (day/night)
-    // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn pages_default_to_light_and_follow_the_theme_cookie() {

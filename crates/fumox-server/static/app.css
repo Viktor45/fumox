@@ -11,14 +11,16 @@
   --panel: #ffffff;
   --border: #dde1e6;
   --text: #1c2330;
-  --muted: #68707f;
+  --muted: #5d6573;
   --accent: #2456d6;
   --accent-hover: #1c46b0;
+  /* text on accent fills (primary buttons, current page, error toast) */
+  --on-accent: #ffffff;
   --danger: #c2333b;
   --danger-bg: #fbeaec;
-  --ok: #1d7f45;
+  --ok: #176a39;
   --ok-bg: #e5f4eb;
-  --warn: #9a6b00;
+  --warn: #7d5700;
   --warn-bg: #fdf3dc;
   --info-bg: #e8eefc;
   /* ready tier (T2-verified): violet, distinct from alive-green and
@@ -64,7 +66,8 @@
   --muted: #98a1b3;
   --accent: #7aa2f7;
   --accent-hover: #97b5f9;
-  --danger: #e5646c;
+  --on-accent: #14203a;
+  --danger: #ef8a90;
   --danger-bg: #3a2226;
   --ok: #4cc38a;
   --ok-bg: #1d3229;
@@ -125,12 +128,13 @@ a:hover { text-decoration: underline; }
   gap: 24px;
   height: 52px;
 }
-.topbar .brand { font-weight: 700; font-size: 17px; color: var(--topbar-brand); }
+.topbar .brand { font-weight: 700; font-size: 17px; color: var(--topbar-brand); white-space: nowrap; }
 .topbar nav { display: flex; gap: 4px; }
 .topbar nav a {
   color: var(--topbar-link);
   padding: 6px 12px;
   border-radius: 6px;
+  white-space: nowrap;
 }
 .topbar nav a:hover { background: var(--topbar-hover); text-decoration: none; }
 .topbar nav a.active { background: var(--topbar-active); color: var(--topbar-brand); }
@@ -139,11 +143,16 @@ a:hover { text-decoration: underline; }
 
 /* language/theme switchers (topbar: dark context, login box: page context) */
 .lang-switch { display: inline-flex; gap: 2px; }
+/* Theme icons (sun/moon, inline SVG, no icon font: offline-safe) are
+   shown only on very narrow screens, where the text labels would push
+   the logout button off the first topbar row (see the 480px block). */
+.lang-switch a .theme-icon { display: none; }
 .lang-switch a {
   color: var(--topbar-link);
   font-size: 12px;
   padding: 4px 8px;
   border-radius: 6px;
+  white-space: nowrap;
 }
 .lang-switch a:hover { background: var(--topbar-hover); text-decoration: none; }
 .lang-switch a.active { background: var(--topbar-active); color: var(--topbar-brand); }
@@ -216,7 +225,7 @@ a:hover { text-decoration: underline; }
   border: 1px solid var(--border);
   border-radius: 4px;
   background: var(--bg);
-  color: var(--fg);
+  color: var(--text);
 }
 
 /* ---------- tables ---------- */
@@ -250,7 +259,7 @@ table.data th {
 }
 table.data tr:last-child td { border-bottom: none; }
 table.data tr:hover td { background: var(--row-hover); }
-table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.data td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Truncated source link inside a table cell (dashboard, fetch journal):
    same effect as .truncate, but as a class instead of an inline style. */
@@ -378,9 +387,10 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
   font: inherit;
   font-weight: 600;
   cursor: pointer;
+  white-space: nowrap;
 }
 .btn:hover { background: var(--btn-hover); text-decoration: none; }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .btn.primary:hover { background: var(--accent-hover); }
 .btn.danger { color: var(--danger); border-color: var(--danger); }
 .btn.danger:hover { background: var(--danger-bg); }
@@ -408,10 +418,13 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
   /* Never wider than the viewport minus the wrap's offsets. */
   max-width: min(380px, calc(100vw - 40px));
 }
-.toast.error { background: var(--danger); color: #fff; }
+.toast.error { background: var(--danger); color: var(--on-accent); cursor: pointer; }
 @keyframes toast-in {
   from { transform: translateY(8px); opacity: 0; }
   to { transform: none; opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast { animation: none; }
 }
 
 .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; font-weight: 500; }
@@ -427,6 +440,9 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
 
 .muted { color: var(--muted); }
 .small { font-size: 13px; }
+/* Focused or program-scrolled controls must stay clear of the sticky
+   topbar (52px + margin). */
+input, select, textarea, button, a, [tabindex] { scroll-margin-top: 64px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 code, pre.code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -458,7 +474,7 @@ pre.mono { white-space: pre-wrap; }
   border-radius: 6px;
   background: var(--btn-bg);
 }
-.pagination span.current { background: var(--accent); color: #fff; border-color: var(--accent); }
+.pagination span.current { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 .pagination span.gap { border: none; background: none; color: var(--muted); padding: 4px 4px; }
 
 .filters {
@@ -629,11 +645,11 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 .ped-row input.mono { flex: 0 0 70px; }
 .ped-row input[name$="_key"] { flex: 0 1 110px; }
 .ped-row select { flex: 0 0 auto; }
-.ped-arrow { color: var(--muted, #888); }
+.ped-arrow { color: var(--muted); }
 .ped-preview-json {
   padding: 10px 12px;
   border-radius: 6px;
-  background: var(--panel-alt, rgba(127, 127, 127, 0.08));
+  background: var(--code-bg);
   overflow-x: auto;
   max-height: 320px;
 }
@@ -647,7 +663,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   flex-wrap: wrap;
 }
 .ped-modes .ped-active {
-  border-color: var(--accent, #4a7dff);
+  border-color: var(--accent);
   font-weight: 600;
 }
 .ped-presets {
@@ -672,17 +688,34 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
    values when the radio is `skip`. */
 .ped-inner[hidden] { display: none !important; }
 
-/* ---------- mobile adaptation ---------- */
+/* Live preview in-flight cue: htmx flags the builder with
+   .htmx-request while the preview request runs (the preview container
+   is the builder's sibling). */
+#ped-builder.htmx-request ~ #ped-preview { opacity: 0.55; }
 
-/* One breakpoint below the existing 900px grid collapse. Everything here
-   must degrade gracefully without JavaScript. */
-@media (max-width: 700px) {
-  .container { padding: 16px 12px 48px; }
-  .panel { padding: 14px; }
+/* ---------- topbar squeeze (phones) ---------- */
 
-  /* Topbar wraps into two rows: brand + switchers + logout on the first
-     line, the nav as a horizontally scrollable strip below (no burger
-     menu — the panel must keep working without JS). */
+/* On very narrow screens the text theme labels would push the logout
+   button off the first topbar row, so the sun/moon icons take over
+   (the labels stay in the DOM; the accessible name lives in
+   aria-label on the link). Icon relevance: sun = light theme, moon =
+   dark theme. */
+@media (max-width: 480px) {
+  .topbar { gap: 2px 8px; }
+  .lang-switch a { padding: 4px 8px; }
+  .theme-switch a .theme-label { display: none; }
+  .theme-switch a .theme-icon {
+    display: inline-block;
+    vertical-align: -3px;
+  }
+}
+
+/* ---------- topbar wrap (tablets and small laptops) ---------- *//* The single-row topbar fits only above ~1180px: eight nav items plus
+   switchers. Below that it wraps into two rows: brand + switchers +
+   logout, then the nav as a horizontally scrollable strip (no burger
+   menu, no JavaScript needed). Without this the squeezed row lets
+   `overflow-wrap: anywhere` break the labels mid-word. */
+@media (max-width: 1180px) {
   .topbar {
     flex-wrap: wrap;
     height: auto;
@@ -701,7 +734,32 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
     padding: 2px 4px;
   }
   .topbar nav::-webkit-scrollbar { display: none; }
-  .topbar nav a { white-space: nowrap; padding: 8px 12px; }
+  .topbar nav a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    white-space: nowrap;
+    padding: 6px 12px;
+  }
+  .lang-switch a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  /* Below 1180px the topbar wraps to two rows (~110px): the 64px base
+     scroll-margin drops anchors and validation focus behind the header. */
+  input, select, textarea, button, a, [tabindex] {
+    scroll-margin-top: 120px;
+  }
+}
+
+/* ---------- mobile adaptation ---------- */
+
+/* One breakpoint below the existing 900px grid collapse. Everything here
+   must degrade gracefully without JavaScript. */
+@media (max-width: 700px) {
+  .container { padding: 16px 12px 48px; }
+  .panel { padding: 14px; }
 
   /* iOS Safari zooms the page on focus for any input with font-size
      below 16px — keep form controls at 16px. The selectors mirror the
@@ -711,10 +769,16 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   .field select, .field textarea,
   .filters .field input, .filters .field select { font-size: 16px; }
 
-  /* Comfortable touch targets for small controls. */
-  .btn.small { padding: 8px 12px; }
+  /* Comfortable touch targets (44px) for small controls. */
+  .btn.small { padding: 8px 12px; min-height: 44px; }
+  .check-row { min-height: 44px; }
   .check-row input { width: 18px; height: 18px; }
-  .pagination a, .pagination span.page { padding: 8px 13px; }
+  .pagination a, .pagination span.page {
+    padding: 8px 13px;
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
 
   /* Narrower truncation caps: more columns fit before the scroll
      container kicks in. */
@@ -723,9 +787,12 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   /* Readable floors for the columns that are allowed to shrink
      (`overflow-wrap: anywhere` would otherwise squeeze them to a few
      characters per line under table width pressure): the wrapping error
-     cell keeps a 200px floor, a host:port cell 150px, kv labels 110px. */
+     cell keeps a 200px floor, a host:port cell 190px — 165px of text
+     covers the longest IPv4:port (21 chars) plus the 24px cell padding,
+     so IPv4 addresses always stay on one line and only long IPv6 hosts
+     wrap, at the <wbr> in front of the port; kv labels 110px. */
   .cell-wrap { max-width: 240px; min-width: 200px; }
-  table.data td.addr { min-width: 150px; }
+  table.data td.addr { min-width: 190px; }
   .kv th { width: auto; min-width: 110px; }
 
   /* Distribution rows (stats): counters drop onto their own line
@@ -788,7 +855,8 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   .page-head h1 { font-size: 18px; }
   .stat-card .num { font-size: 22px; }
   /* Wider stat-bars labels need more room than the 700 px breakpoint
-     gave them — drop the per-day value and rely on hover/title. */
-  .stat-bar-num { display: none; }
+     gave them; the per-day value stays visible (a title-only value is
+     unreachable on touch), just smaller. */
+  .stat-bar-num { font-size: 9.5px; }
   /* The login box already caps itself at 340 px; nothing else to do. */
 }

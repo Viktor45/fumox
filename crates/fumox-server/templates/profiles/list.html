@@ -32,7 +32,7 @@
             <td class="mono small">
               {% match row.slug %}
                 {% when Some with (slug) %}{{ slug }}
-                {% when None %}<span class="muted">—</span>
+                {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
             <td class="mono small">{{ row.output_format }}</td>

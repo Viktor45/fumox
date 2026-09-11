@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ self.t("login.title") }} — Fumox</title>
+  <title>{{ self.t("login.title") }} · Fumox</title>
   <link rel="stylesheet" href="/admin/static/app.css">
 </head>
 <body>
@@ -21,11 +21,19 @@
              {% if self.lang_code() == code.as_str() %}class="active"{% endif %}>{{ label }}</a>
           {% endfor %}
         </span>
-        <span class="lang-switch login-lang">
+        <span class="lang-switch login-lang theme-switch">
           <a href="/admin/set-theme?theme=light&next=/admin/login"
-             {% if theme.is_light() %}class="active"{% endif %}>{{ self.t("theme.light") }}</a>
+             aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
+             {% if theme.is_light() %}class="active"{% endif %}>
+            <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+            <span class="theme-label">{{ self.t("theme.light") }}</span>
+          </a>
           <a href="/admin/set-theme?theme=dark&next=/admin/login"
-             {% if theme.is_dark() %}class="active"{% endif %}>{{ self.t("theme.dark") }}</a>
+             aria-label="{{ self.t("theme.dark") }}" title="{{ self.t("theme.dark") }}"
+             {% if theme.is_dark() %}class="active"{% endif %}>
+            <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+            <span class="theme-label">{{ self.t("theme.dark") }}</span>
+          </a>
         </span>
       </div>
       <h2 style="margin-top:0">{{ self.t("login.heading") }}</h2>

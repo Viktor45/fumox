@@ -114,7 +114,13 @@
     {% for (status, checked) in all_statuses %}
       <span class="check-row">
         <input type="checkbox" name="status" value="{{ status }}" id="st-{{ status }}" {% if checked %}checked{% endif %}>
-        <label for="st-{{ status }}">{{ status }}</label>
+        <label for="st-{{ status }}">
+          {% if status.as_str() == "alive" %}{{ self.t("common.status_alive") }}
+          {% else if status.as_str() == "ready" %}{{ self.t("common.status_ready") }}
+          {% else if status.as_str() == "quarantine" %}{{ self.t("common.status_quarantine") }}
+          {% else if status.as_str() == "removed" %}{{ self.t("common.status_removed") }}
+          {% else %}{{ self.t("common.status_unknown") }}{% endif %}
+        </label>
       </span>
     {% endfor %}
   </div>
@@ -190,23 +196,29 @@
         <tbody>
           {% for row in rows %}
           <tr>
-            <td><span class="badge {{ row.status }}">{{ row.status }}</span></td>
+            <td>
+              {% if row.status == "alive" %}<span class="badge alive">{{ self.t("common.status_alive") }}</span>
+              {% else if row.status == "ready" %}<span class="badge ready">{{ self.t("common.status_ready") }}</span>
+              {% else if row.status == "quarantine" %}<span class="badge quarantine">{{ self.t("common.status_quarantine") }}</span>
+              {% else if row.status == "removed" %}<span class="badge removed">{{ self.t("common.status_removed") }}</span>
+              {% else %}<span class="badge unknown">{{ self.t("common.status_unknown") }}</span>{% endif %}
+            </td>
             <td class="mono small">
               {{ row.scheme }}
-              {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">unprobeable</span>{% endif %}
+              {% if self.unprobeable(row.scheme) %}<span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">{{ self.t("px.unprobeable") }}</span>{% endif %}
             </td>
-            <td class="mono small addr">{{ row.host }}:{{ row.port }}</td>
+            <td class="mono small addr">{{ row.host }}:<wbr>{{ row.port }}</td>
             <td class="small">{{ self.flag(row.geo_country) }}
               {% match row.geo_country %}
                 {% when Some with (country) %}{{ country }}
-                {% when None %}<span class="muted">—</span>
+                {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
             <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(row.name) }}</a></td>
             <td class="num small">
               {% match row.latency_ms %}
                 {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
-                {% when None %}<span class="muted">—</span>
+                {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
             <td class="small mono">{{ self.checks_cell(row) }}</td>

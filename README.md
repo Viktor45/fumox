@@ -4,7 +4,7 @@
 
 `Fumox` is a blazing-fast, lightweight tool built for **real-time subscription data filtering and refinement**.
 
-It applies ultimate algorithmic mastery to chaotic live data streams, ensuring subscribers receive only clean, precise, and structured updates instantly on the fly.
+It takes messy proxy lists from many sources, filters and refines them in real time, and serves clean, structured subscriptions to clients.
 
 ---
 

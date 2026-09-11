@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}{{ self.t("common.admin") }}{% endblock %} — Fumox</title>
+  <title>{% block title %}{{ self.t("common.admin") }}{% endblock %} · Fumox</title>
   <link rel="stylesheet" href="/admin/static/app.css">
   <script src="/admin/static/htmx.min.js" defer></script>
 </head>
@@ -24,14 +24,24 @@
     {# Theme switcher (day/night): the choice is stored in the fumox_theme
        cookie and rendered server-side as data-theme on <html>, so it works
        without JavaScript. The onclick appends the current path as `next`,
-       same as the language switcher below. #}
-    <span class="lang-switch">
+       same as the language switcher below. On narrow screens CSS swaps the
+       text labels for the inline SVG sun/moon icons so the whole first
+       topbar row fits. #}
+    <span class="lang-switch theme-switch">
       <a href="/admin/set-theme?theme=light"
+         aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
          onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
-         {% if theme.is_light() %}class="active"{% endif %}>{{ self.t("theme.light") }}</a>
+         {% if theme.is_light() %}class="active"{% endif %}>
+        <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <span class="theme-label">{{ self.t("theme.light") }}</span>
+      </a>
       <a href="/admin/set-theme?theme=dark"
+         aria-label="{{ self.t("theme.dark") }}" title="{{ self.t("theme.dark") }}"
          onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
-         {% if theme.is_dark() %}class="active"{% endif %}>{{ self.t("theme.dark") }}</a>
+         {% if theme.is_dark() %}class="active"{% endif %}>
+        <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+        <span class="theme-label">{{ self.t("theme.dark") }}</span>
+      </a>
     </span>
     {# Language switcher: iterates every loaded catalog (`langs`), so new
        languages appear automatically. The onclick appends the current path
@@ -62,12 +72,17 @@
       if (!wrap) return;
       var detail = e.detail || {};
       var div = document.createElement('div');
-      div.className = 'toast' + (detail.level === 'error' ? ' error' : '');
+      var isError = detail.level === 'error';
+      div.className = 'toast' + (isError ? ' error' : '');
+      // role=status/alert makes the toast announced by screen readers;
+      // errors stay longer and are dismissable by click.
+      div.setAttribute('role', isError ? 'alert' : 'status');
       var message = detail.message || '';
       try { message = decodeURIComponent(message); } catch (_) {}
       div.textContent = message || String(e.detail);
+      div.addEventListener('click', function () { div.remove(); });
       wrap.appendChild(div);
-      setTimeout(function () { div.remove(); }, 4000);
+      setTimeout(function () { div.remove(); }, isError ? 10000 : 4000);
     });
 
     // SSE: push updates from the server. Each event is

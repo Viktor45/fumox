@@ -94,7 +94,7 @@ struct ProxiesListTemplate {
     f_sort: String,
     /// Active coverage bucket ("" = no filter).
     f_coverage: String,
-    all_statuses: Vec<(&'static str, bool)>,
+    all_statuses: Vec<(String, bool)>,
     all_schemes: Vec<(String, bool)>,
     countries: Vec<String>,
     sources: Vec<(String, String, bool)>,
@@ -329,11 +329,11 @@ pub async fn proxies_list(
             active: "proxies",
             csrf: state.csrf_for(&headers),
             all_statuses: [
-                ("unknown", f_statuses.iter().any(|s| s == "unknown")),
-                ("alive", f_statuses.iter().any(|s| s == "alive")),
-                ("ready", f_statuses.iter().any(|s| s == "ready")),
-                ("quarantine", f_statuses.iter().any(|s| s == "quarantine")),
-                ("removed", f_statuses.iter().any(|s| s == "removed")),
+                ("unknown".to_string(), f_statuses.iter().any(|s| s == "unknown")),
+                ("alive".to_string(), f_statuses.iter().any(|s| s == "alive")),
+                ("ready".to_string(), f_statuses.iter().any(|s| s == "ready")),
+                ("quarantine".to_string(), f_statuses.iter().any(|s| s == "quarantine")),
+                ("removed".to_string(), f_statuses.iter().any(|s| s == "removed")),
             ]
             .to_vec(),
             all_schemes: Scheme::all()
@@ -806,7 +806,12 @@ pub async fn proxy_reset(
     action_response(
         is_htmx(&headers),
         &format!("/admin/proxies/{id}"),
-        r#"<span class="badge unknown">unknown</span>"#.to_string(),
+        // The wrapper id must survive the swap: the form's hx-target points
+        // at it, so losing it kills the button for every subsequent click.
+        format!(
+            r#"<span id="status-badge"><span class="badge unknown">{}</span></span>"#,
+            lang.t("common.status_unknown"),
+        ),
         lang.t("px.reset_toast"),
     )
 }

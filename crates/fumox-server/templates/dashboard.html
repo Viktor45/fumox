@@ -37,14 +37,14 @@
             <td>
               {% match row.error_class %}
                 {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
-                {% when None %}<span class="muted">—</span>
+                {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
             <td class="small">
               {% match row.last_error %}
                 {% when Some with (message) %}
                   <span class="cell-wrap">{{ message }}</span>
-                {% when None %}<span class="muted">—</span>
+                {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
             <td class="small muted">{{ self.opt_ts(&row.last_fetched_at) | safe }}</td>
@@ -76,7 +76,7 @@
     <div class="label">{{ self.t("dash.proxies_total") }}</div>
     <div class="sub">
       {% for (status, count) in proxy_counts %}
-        <span class="badge {{ status }}">{{ status }}: {{ count }}</span>
+        <span class="badge {{ status }}">{{ self.status_label(status) }}: {{ count }}</span>
       {% endfor %}
     </div>
   </div>
@@ -98,7 +98,7 @@
     <div class="num">
       {% match latency_median %}
         {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
-        {% when None %}<span class="muted">—</span>
+        {% when None %}<span class="muted">–</span>
       {% endmatch %}
     </div>
     <div class="label">{{ self.t("stats.latency_median") }}</div>
@@ -186,7 +186,7 @@
         <tbody>
           {% for (reason, hits) in top_failures %}
           <tr>
-            <td class="mono small truncate" title="{{ reason }}">{{ reason }}</td>
+            <td class="mono small cell-wrap">{{ reason }}</td>
             <td class="num">{{ hits }}</td>
           </tr>
           {% endfor %}
@@ -240,11 +240,11 @@
           <tr>
             <td class="muted">{{ loop.index }}</td>
             <td class="mono small">{{ row.scheme }}</td>
-            <td class="mono small addr">{{ row.host }}:{{ row.port }}</td>
+            <td class="mono small addr">{{ row.host }}:<wbr>{{ row.port }}</td>
             <td class="small">{{ self.flag(row.geo_country) }}
               {% match row.geo_country %}
                 {% when Some with (country) %}{{ country }}
-                {% when None %}<span class="muted">—</span>
+                {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
             <td class="small truncate" title="{{ row.source_names }}">
@@ -254,7 +254,7 @@
             <td class="num small">
               {% match row.latency_ms %}
                 {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
-                {% when None %}<span class="muted">—</span>
+                {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
           </tr>

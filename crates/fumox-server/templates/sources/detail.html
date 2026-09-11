@@ -16,7 +16,7 @@
   <span class="spacer"></span>
   <div class="row-actions">
     <a class="btn" href="/admin/sources/{{ source.id }}/edit">{{ self.t("common.edit") }}</a>
-    <form method="post" action="/admin/sources/{{ source.id }}/toggle"
+    <form id="toggle-form" method="post" action="/admin/sources/{{ source.id }}/toggle"
           hx-post="/admin/sources/{{ source.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
       <button class="btn" type="submit">{% if source.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
@@ -29,7 +29,7 @@
     <form method="post" action="/admin/sources/{{ source.id }}/dry-run"
           hx-post="/admin/sources/{{ source.id }}/dry-run" hx-target="#dryrun-target" hx-swap="innerHTML">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
-      <button class="btn" type="submit">{{ self.t("src.dry_run") }}</button>
+      <button class="btn" type="submit">{{ self.t("src.dry_run") }}<span class="htmx-indicator">&nbsp;…</span></button>
     </form>
     <button class="btn danger" type="button" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
   </div>
@@ -45,7 +45,7 @@
       <tr><th>Slug</th><td class="mono">
         {% match source.slug %}
           {% when Some with (slug) %}{{ slug }}
-          {% when None %}<span class="muted">—</span>
+          {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
       <tr><th>{{ self.t("src.endpoint") }}</th><td class="mono small"><a href="{{ serve_url }}">{{ serve_url }}</a></td></tr>
@@ -67,7 +67,7 @@
       <tr><th>{{ self.t("src.tags_label") }}</th><td>
         {% match source.tags %}
           {% when Some with (tags) %}{{ tags.join(", ") }}
-          {% when None %}<span class="muted">—</span>
+          {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
       <tr><th>{{ self.t("common.created") }}</th><td class="small">{{ self.ts(source.created_at) | safe }}</td></tr>
@@ -76,7 +76,7 @@
       <tr><th>{{ self.t("src.last_error") }}</th><td class="small">
         {% match source.last_error %}
           {% when Some with (message) %}{{ message }}
-          {% when None %}<span class="muted">—</span>
+          {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
     </table>
@@ -89,7 +89,7 @@
     {% else %}
       <p>
         {% for (status, count) in counts %}
-          <span class="badge {{ status }}">{{ status }}: {{ count }}</span>
+          <span class="badge {{ status }}">{{ self.status_label(status) }}: {{ count }}</span>
         {% endfor %}
       </p>
     {% endif %}

@@ -14,8 +14,8 @@
     <h2>{{ self.t("src.general") }}</h2>
 
     <div class="field">
-      <label>{{ self.t("common.name") }} *</label>
-      <input type="text" name="name" value="{{ values.name }}" maxlength="200" required>
+      <label for="src-name">{{ self.t("common.name") }} *</label>
+      <input type="text" id="src-name" name="name" value="{{ values.name }}" maxlength="200" required>
       {% match self.error_for("name") %}
         {% when Some with (message) %}<div class="error-text">{{ message }}</div>
         {% when None %}
@@ -23,8 +23,8 @@
     </div>
 
     <div class="field">
-      <label>Slug</label>
-      <input type="text" name="slug" value="{{ values.slug }}" maxlength="64">
+      <label for="src-slug">Slug</label>
+      <input type="text" id="src-slug" name="slug" value="{{ values.slug }}" maxlength="64">
       <div class="hint">{{ self.t("src.slug_hint") }}</div>
       {% match self.error_for("slug") %}
         {% when Some with (message) %}<div class="error-text">{{ message }}</div>
@@ -33,8 +33,8 @@
     </div>
 
     <div class="field">
-      <label>{{ self.t("src.url_label") }}</label>
-      <input type="url" name="url" value="{{ values.url }}" required>
+      <label for="src-url">{{ self.t("src.url_label") }}</label>
+      <input type="url" id="src-url" name="url" value="{{ values.url }}" required>
       <div class="hint">{{ self.t("src.url_hint") }}</div>
       {% match self.error_for("url") %}
         {% when Some with (message) %}<div class="error-text">{{ message }}</div>
@@ -54,8 +54,8 @@
     <h2>{{ self.t("src.fetch_parse") }}</h2>
 
     <div class="field">
-      <label>{{ self.t("src.encoding_label") }}</label>
-      <select name="encoding">
+      <label for="src-encoding">{{ self.t("src.encoding_label") }}</label>
+      <select id="src-encoding" name="encoding">
         <option value="auto" {% if values.encoding == "auto" %}selected{% endif %}>{{ self.t("src.detect_auto") }}</option>
         <option value="plain" {% if values.encoding == "plain" %}selected{% endif %}>plain</option>
         <option value="base64" {% if values.encoding == "base64" %}selected{% endif %}>base64</option>
@@ -67,8 +67,8 @@
     </div>
 
     <div class="field">
-      <label>{{ self.t("src.input_format_label") }}</label>
-      <select name="input_format">
+      <label for="src-input-format">{{ self.t("src.input_format_label") }}</label>
+      <select id="src-input-format" name="input_format">
         <option value="" {% if values.input_format.is_empty() %}selected{% endif %}>{{ self.t("src.detect_auto") }}</option>
         <option value="uri_list" {% if values.input_format == "uri_list" %}selected{% endif %}>{{ self.t("src.uri_list") }}</option>
         <option value="clash_yaml" {% if values.input_format == "clash_yaml" %}selected{% endif %}>Clash YAML</option>
@@ -81,8 +81,8 @@
     </div>
 
     <div class="field">
-      <label>{{ self.t("src.ip_family_label") }}</label>
-      <select name="ip_family">
+      <label for="src-ip-family">{{ self.t("src.ip_family_label") }}</label>
+      <select id="src-ip-family" name="ip_family">
         <option value="" {% if values.ip_family.is_empty() %}selected{% endif %}>{{ self.t("src.ip_family_inherit") }}</option>
         <option value="any" {% if values.ip_family == "any" %}selected{% endif %}>{{ self.t("src.ip_family_any") }}</option>
         <option value="ipv4" {% if values.ip_family == "ipv4" %}selected{% endif %}>IPv4</option>
@@ -111,8 +111,8 @@
     </div>
 
     <div class="field">
-      <label>{{ self.t("src.ttl_label") }}</label>
-      <input type="number" name="cache_ttl_seconds" value="{{ values.cache_ttl_seconds }}" min="60" max="86400">
+      <label for="src-ttl">{{ self.t("src.ttl_label") }}</label>
+      <input type="number" id="src-ttl" name="cache_ttl_seconds" value="{{ values.cache_ttl_seconds }}" min="60" max="86400">
       <div class="hint">{{ self.t("src.ttl_hint") }}</div>
       {% match self.error_for("cache_ttl_seconds") %}
         {% when Some with (message) %}<div class="error-text">{{ message }}</div>
@@ -121,14 +121,14 @@
     </div>
 
     <div class="field">
-      <label>{{ self.t("src.tags_label") }}</label>
-      <input type="text" name="tags" value="{{ values.tags }}">
+      <label for="src-tags">{{ self.t("src.tags_label") }}</label>
+      <input type="text" id="src-tags" name="tags" value="{{ values.tags }}">
       <div class="hint">{{ self.t("src.tags_hint") }}</div>
     </div>
 
     <div class="field">
-      <label>{{ self.t("src.headers_label") }}</label>
-      <textarea class="mono" name="headers" rows="3" placeholder="User-Agent: …
+      <label for="src-headers">{{ self.t("src.headers_label") }}</label>
+      <textarea class="mono" id="src-headers" name="headers" rows="3" placeholder="User-Agent: …
 Authorization: Bearer …">{{ values.headers }}</textarea>
       <div class="hint">{{ self.t("src.headers_hint") }}</div>
       {% if headers_masked_note %}

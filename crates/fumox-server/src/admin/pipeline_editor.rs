@@ -864,9 +864,7 @@ fn split_asn_field(raw: &str) -> Option<Vec<String>> {
     )
 }
 
-// ---------------------------------------------------------------------------
 // Widget rendering (PIPELINE.md §3)
-// ---------------------------------------------------------------------------
 
 /// `#ped-preview` content: the generated JSON plus its validation outcome
 /// (the same `CompiledPipeline::from_json` the save path uses).

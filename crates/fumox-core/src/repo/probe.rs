@@ -93,9 +93,7 @@ pub async fn top_failure_reasons(
     Ok(rows)
 }
 
-// ---------------------------------------------------------------------------
 // Priority queue (`probe_requests`, SPEC §8.3)
-// ---------------------------------------------------------------------------
 
 /// Enqueue up to `limit` of `candidate_ids` for priority checking. Only
 /// T1-probeable schemes are accepted (unprobeable schemes would clog the

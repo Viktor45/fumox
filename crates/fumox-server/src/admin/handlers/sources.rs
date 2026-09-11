@@ -1023,13 +1023,28 @@ pub async fn source_toggle(
     action_response(
         is_htmx(&headers),
         &format!("/admin/sources/{id}"),
+        // The wrapper id must survive the swap (the form's hx-target points
+        // at it), and the toggle button must flip with the state — it lives
+        // outside the badge, so it travels along as an out-of-band swap.
         format!(
-            r#"<span class="badge {}">{}</span>"#,
+            r##"<span id="enabled-badge"><span class="badge {}">{}</span></span>
+               <form id="toggle-form" method="post" action="/admin/sources/{id}/toggle"
+                     hx-post="/admin/sources/{id}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML"
+                     hx-swap-oob="outerHTML:#toggle-form">
+                 <input type="hidden" name="_csrf" value="{}">
+                 <button class="btn" type="submit">{}</button>
+               </form>"##,
             if source.enabled { "on" } else { "off" },
             if source.enabled {
                 lang.t("common.on")
             } else {
                 lang.t("common.off")
+            },
+            state.csrf_for(&headers),
+            if source.enabled {
+                lang.t("common.disable")
+            } else {
+                lang.t("common.enable")
             }
         ),
         message,

@@ -27,14 +27,14 @@
           <td class="small">
             {% match row.http_status %}
               {% when Some with (status) %}{{ status }}
-              {% when None %}<span class="muted">—</span>
+              {% when None %}<span class="muted">–</span>
             {% endmatch %}
           </td>
           <td class="small col-optional">{{ self.bytes(row.bytes) }}</td>
           <td class="num">
             {% match row.proxies_found %}
               {% when Some with (count) %}{{ count }}
-              {% when None %}<span class="muted">—</span>
+              {% when None %}<span class="muted">–</span>
             {% endmatch %}
           </td>
           <td class="small">

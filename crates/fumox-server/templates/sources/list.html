@@ -64,7 +64,7 @@
             <td class="mono small col-optional">
               {% match row.slug %}
                 {% when Some with (slug) %}{{ slug }}
-                {% when None %}<span class="muted">—</span>
+                {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
             <td class="small truncate col-optional">{{ row.url }}</td>

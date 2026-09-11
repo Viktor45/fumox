@@ -11,7 +11,7 @@
   <span class="spacer"></span>
   <div class="row-actions">
     <a class="btn" href="/admin/profiles/{{ profile.id }}/edit">{{ self.t("common.edit") }}</a>
-    <form method="post" action="/admin/profiles/{{ profile.id }}/toggle"
+    <form id="toggle-form" method="post" action="/admin/profiles/{{ profile.id }}/toggle"
           hx-post="/admin/profiles/{{ profile.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
       <button class="btn" type="submit">{% if profile.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
@@ -27,7 +27,7 @@
       <tr><th>Slug</th><td class="mono">
         {% match profile.slug %}
           {% when Some with (slug) %}{{ slug }}
-          {% when None %}<span class="muted">—</span>
+          {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
       <tr><th>{{ self.t("prof.endpoint") }}</th><td class="mono small"><a href="{{ serve_url }}">{{ serve_url }}</a></td></tr>
@@ -68,7 +68,7 @@
                 {% match member.enabled %}
                   {% when Some with (enabled) %}
                     {% if enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
-                  {% when None %}<span class="muted">—</span>
+                  {% when None %}<span class="muted">–</span>
                 {% endmatch %}
               </td>
             </tr>

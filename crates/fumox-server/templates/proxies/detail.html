@@ -4,13 +4,18 @@
 
 {% block content %}
 <div class="page-head">
-  <h1 class="mono">{{ proxy.scheme }}:// {{ proxy.host }}:{{ proxy.port }}</h1>
-  <span id="status-badge"><span class="badge {{ proxy.status }}">{{ proxy.status }}</span></span>
+  <h1 class="mono">{{ proxy.scheme }}:// {{ proxy.host }}:<wbr>{{ proxy.port }}</h1>
+  <span id="status-badge">
+    {% if proxy.status == "alive" %}<span class="badge alive">{{ self.t("common.status_alive") }}</span>
+    {% else if proxy.status == "quarantine" %}<span class="badge quarantine">{{ self.t("common.status_quarantine") }}</span>
+    {% else if proxy.status == "removed" %}<span class="badge removed">{{ self.t("common.status_removed") }}</span>
+    {% else %}<span class="badge unknown">{{ self.t("common.status_unknown") }}</span>{% endif %}
+  </span>
   {# Unprobeable: UDP-based schemes the probe daemon cannot health-check
      (tuic, mieru — meow-rs cannot tunnel through them); they stay `unknown`
      permanently. #}
   {% if unprobeable %}
-    <span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">unprobeable</span>
+    <span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">{{ self.t("px.unprobeable") }}</span>
   {% endif %}
   <span class="spacer"></span>
   <div class="row-actions">
@@ -28,7 +33,7 @@
     <table class="kv">
       <tr><th>{{ self.t("common.name") }}</th><td class="small">{{ proxy.name }}</td></tr>
       <tr><th>{{ self.t("common.protocol") }}</th><td class="mono small">{{ proxy.scheme }}</td></tr>
-      <tr><th>{{ self.t("px.address") }}</th><td class="mono small">{{ proxy.host }}:{{ proxy.port }}</td></tr>
+      <tr><th>{{ self.t("px.address") }}</th><td class="mono small">{{ proxy.host }}:<wbr>{{ proxy.port }}</td></tr>
       {# The credential is shown in the open: the card also renders the raw
          subscription line and the parsed params JSON below, both of which
          carry the same secret — masking just this row was a false comfort. #}
@@ -44,25 +49,25 @@
       <tr><th>{{ self.t("common.country") }}</th><td>{{ self.flag(proxy.geo_country) }}
         {% match proxy.geo_country %}
           {% when Some with (country) %}{{ country }}
-          {% when None %}<span class="muted">—</span>
+          {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
       <tr><th>{{ self.t("px.city") }}</th><td>
         {% match proxy.geo_city %}
           {% when Some with (city) %}{{ city }}
-          {% when None %}<span class="muted">—</span>
+          {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
       <tr><th>ASN</th><td>
         {% match proxy.geo_asn %}
           {% when Some with (asn) %}{{ asn }}
-          {% when None %}<span class="muted">—</span>
+          {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
       <tr><th>{{ self.t("px.resolved_ip") }}</th><td class="mono small">
         {% match proxy.resolved_ip %}
           {% when Some with (ip) %}{{ ip }}
-          {% when None %}<span class="muted">—</span>
+          {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
     </table>

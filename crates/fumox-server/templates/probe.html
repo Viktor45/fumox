@@ -13,7 +13,7 @@
     <div class="label">{{ self.t("dash.proxies_total") }}</div>
     <div class="sub">
       {% for (status, count) in proxy_counts %}
-        <span class="badge {{ status }}">{{ status }}: {{ count }}</span>
+        <span class="badge {{ status }}">{{ self.status_label(status) }}: {{ count }}</span>
       {% endfor %}
     </div>
   </div>
@@ -94,7 +94,7 @@
           {% for row in queue %}
           <tr>
             <td><a href="/admin/proxies/{{ row.id }}">{{ row.name }}</a>
-                <span class="small muted">{{ row.host }}:{{ row.port }}</span></td>
+                <span class="small muted">{{ row.host }}:<wbr>{{ row.port }}</span></td>
             <td class="mono small">{{ row.scheme }}</td>
             <td class="small muted">{{ self.opt_ts(&row.quarantined_at) | safe }}</td>
             <td class="small muted">{{ self.step_label(&row) }}</td>

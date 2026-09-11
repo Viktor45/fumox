@@ -74,7 +74,7 @@ jobs:
           else
             echo "Deleting versions older than $RETENTION_DAYS days"
           fi
-          if [ "$PRUNE_UNTAGGED" = "true" ] && [ "$DRY_RUN" = "false" ]; then
+          if [ "$PRUNE_UNTAGGED" = "true" ]; then
             echo "Untagged-orphan pruning is ENABLED (reference-checked against every kept tag)"
           fi
 
@@ -100,20 +100,50 @@ jobs:
             # When PRUNE_UNTAGGED is on, collect the digests referenced by
             # every kept tag's manifest list so an untagged child of a LIVE
             # tag is never treated as an orphan. Runs before the version
-            # walk; the digest set covers all pages.
+            # walk, over ALL pages of the version list. Any failure here
+            # (gh api error past page 1, docker auth/inspect error) fails
+            # CLOSED: the reference set would be silently incomplete, so
+            # untagged versions of this package are kept instead of pruned.
+            prune_pkg=true
             if [ "$PRUNE_UNTAGGED" = "true" ]; then
               echo "$GH_TOKEN" | docker login ghcr.io -u "${OWNER}" --password-stdin >/dev/null 2>&1 || true
               : > "$ref_file"
-              versions_json="$(gh api -H "Accept: application/vnd.github+json" \
-                "${api_root}/${OWNER}/packages/container/${pkg}/versions?per_page=100" 2>/dev/null || true)"
-              while IFS= read -r tag; do
-                if [ -z "$tag" ] || [ "$tag" = "null" ]; then continue; fi
-                case "$tag" in sha-*) continue ;; esac   # not a kept tag
-                docker buildx imagetools inspect "ghcr.io/${OWNER,,}/${pkg}:${tag}" --raw 2>/dev/null \
-                  | jq -r 'select(.manifests) | .manifests[].digest' >> "$ref_file" || true
-              done < <(printf '%s' "$versions_json" \
-                | jq -r '.[].metadata.container.tags // [] | .[]' 2>/dev/null || true)
-              echo "  reference set: $(wc -l < "$ref_file" | tr -d ' ') digest(s) from kept tags"
+              ref_failed=false
+              ref_page=1
+              while :; do
+                set +e
+                versions_json="$(gh api -H "Accept: application/vnd.github+json" \
+                  "${api_root}/${OWNER}/packages/container/${pkg}/versions?per_page=100&page=${ref_page}" 2>/dev/null)"
+                ref_status=$?
+                set -e
+                if [ "$ref_status" -ne 0 ]; then
+                  # Page-1 failure = package missing/unreadable; the main
+                  # walk below reports it. Past page 1 it corrupts the
+                  # reference set — fail closed.
+                  if [ "$ref_page" -gt 1 ]; then ref_failed=true; fi
+                  break
+                fi
+                page_len="$(printf '%s' "$versions_json" | jq 'length' 2>/dev/null)" || page_len=""
+                if [ -z "$page_len" ] || [ "$page_len" = "0" ]; then break; fi
+                while IFS= read -r tag; do
+                  if [ -z "$tag" ] || [ "$tag" = "null" ]; then continue; fi
+                  case "$tag" in sha-*) continue ;; esac   # not a kept tag
+                  if ! docker buildx imagetools inspect "ghcr.io/${OWNER,,}/${pkg}:${tag}" --raw 2>/dev/null \
+                     | jq -r 'select(.manifests) | .manifests[].digest' >> "$ref_file"; then
+                    ref_failed=true
+                  fi
+                done < <(printf '%s' "$versions_json" \
+                  | jq -r '.[].metadata.container.tags // [] | .[]' 2>/dev/null || true)
+                if [ "$page_len" -lt 100 ]; then break; fi
+                ref_page=$((ref_page + 1))
+              done
+              ref_count="$(wc -l < "$ref_file" | tr -d ' ')"
+              echo "  reference set: ${ref_count} digest(s) from kept tags"
+              if [ "$ref_count" -eq 0 ] || [ "$ref_failed" = "true" ]; then
+                echo "  warning: kept-tag reference set is incomplete (gh/docker failure above?)" >&2
+                echo "  fail-closed: untagged versions are KEPT for this package" >&2
+                prune_pkg=false
+              fi
             fi
 
             # Walk the container versions. Each call returns up to 100 entries
@@ -182,7 +212,8 @@ jobs:
               # manifest list and must be kept) AND whose created_at is
               # older than the cutoff.
               deleted_for_page=0
-              while IFS=read -r id; do
+              real_deleted_for_page=0
+              while IFS= read -r id; do
                 if [ -z "$id" ] || [ "$id" = "null" ]; then continue; fi
 
                 tags=$(printf '%s' "$resp" | jq -r --argjson id "$id" \
@@ -231,7 +262,7 @@ jobs:
                   # (a) no kept tag's manifest list references and
                   # (b) are older than the retention window (grace against
                   # a merge job running concurrently).
-                  if [ "$PRUNE_UNTAGGED" != "true" ]; then continue; fi
+                  if [ "$PRUNE_UNTAGGED" != "true" ] || [ "$prune_pkg" != "true" ]; then continue; fi
                   digest=$(printf '%s' "$resp" | jq -r --argjson id "$id" \
                     '.[] | select(.id == $id) | .name')
                   if [ -n "$digest" ] && [ "$digest" != "null" ] \
@@ -269,7 +300,9 @@ jobs:
                     printf '%s\n' "$(cat "$err_tmp")" | sed 's/^/  gh: /' >&2
                     echo "  error: gh api DELETE exited with status $del_status; continuing with next package" >&2
                     rm -f "$err_tmp"
-                    break   # skip THIS package, move to the next one in PACKAGES
+                    break 2   # skip THIS package (id walk + page walk), move to the next in PACKAGES
+                  else
+                    real_deleted_for_page=$((real_deleted_for_page + 1))
                   fi
                 fi
                 deleted_for_page=$((deleted_for_page + 1))
@@ -277,15 +310,24 @@ jobs:
               deleted_total_pkg=$((deleted_total_pkg + deleted_for_page))
 
               # Deleting from page N shifts the remaining list up, so the
-              # next page would skip up to `deleted_for_page` unseen entries.
-              # Re-read the same page after a productive pass; advance only
-              # when this page yielded nothing.
-              if [ "$deleted_for_page" -eq 0 ]; then
+              # next page would skip up to `deleted_for_page` unseen
+              # entries. Re-read the same page only when something was
+              # REALLY deleted from it. In dry-run — and when every DELETE
+              # came back as an already-gone 404 — the server-side list
+              # did not change, so re-reading would reprocess the same
+              # entries forever; always advance instead.
+              if [ "$DRY_RUN" = "false" ] && [ "$real_deleted_for_page" -gt 0 ]; then
+                :   # the list shifted — re-read the same page
+              else
                 page=$((page + 1))
               fi
             done
 
-            echo "  $pkg: $deleted_total_pkg version(s) ${DRY_RUN:+would be }deleted"
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "  $pkg: $deleted_total_pkg version(s) would be deleted"
+            else
+              echo "  $pkg: $deleted_total_pkg version(s) deleted"
+            fi
           done
 
           echo

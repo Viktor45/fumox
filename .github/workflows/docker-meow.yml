@@ -84,8 +84,10 @@ jobs:
 
       - name: Compute image name
         id: image
+        env:
+          REPO: ${{ github.repository }}
         run: |
-          echo "name=${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-meow" \
+          echo "name=${{ env.REGISTRY }}/$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')-meow" \
             >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -186,8 +188,10 @@ jobs:
 
       - name: Compute image name
         id: image
+        env:
+          REPO: ${{ github.repository }}
         run: |
-          echo "name=${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-meow" \
+          echo "name=${{ env.REGISTRY }}/$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')-meow" \
             >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
@@ -202,12 +206,25 @@ jobs:
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
         run: |
+          # The digest is the FILENAME (one empty file per pushed arch).
+          # Quote into an array explicitly — `printf '%s@sha256:%s ' "$IMAGE" *`
+          # reuses its format for every glob element and would emit
+          # "<digest2>@sha256:" for each source after the first.
+          sources=()
+          for d in *; do
+            [ -f "$d" ] || continue
+            sources+=("${IMAGE}@sha256:${d}")
+          done
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ steps.image.outputs.name }}@sha256:%s ' *)
+            "${sources[@]}"
 
       - name: Inspect image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          docker buildx imagetools inspect \
-            "${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"

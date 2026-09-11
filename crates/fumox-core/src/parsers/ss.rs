@@ -19,8 +19,8 @@ use crate::models::{ProxyEntry, Scheme};
 use base64::Engine;
 
 use super::uri::{
-    encode_fragment, parse_hostport, parse_query, percent_decode, serialize_query, split_fragment,
-    split_path, split_query,
+    encode_fragment, host_for_uri, parse_hostport, parse_query, percent_decode, serialize_query,
+    split_fragment, split_path, split_query,
 };
 
 /// Parse the part of an ss line that follows `ss://`.
@@ -95,7 +95,7 @@ pub fn serialize(entry: &ProxyEntry) -> String {
     out.push_str("ss://");
     out.push_str(&blob);
     out.push('@');
-    out.push_str(&entry.host);
+    out.push_str(&host_for_uri(&entry.host));
     out.push(':');
     out.push_str(&entry.port.to_string());
     out.push_str(&entry.raw_path);
@@ -190,6 +190,24 @@ mod tests {
         assert_eq!(first.port, second.port);
         assert_eq!(first.credential, second.credential);
         assert_eq!(first.params, second.params);
+    }
+
+    /// An IPv6 host round-trips: the URI carries the bracketed
+    /// `[2001:db8::1]:8388` form, the entry stores the bare literal, and
+    /// re-parsing the serialized output yields the same host (regression
+    /// fixed 2026-09-11).
+    #[test]
+    fn ipv6_host_round_trips_bracketed() {
+        let blob = base64::engine::general_purpose::STANDARD_NO_PAD.encode(b"aes-256-gcm:pass");
+        let line = format!("ss://{blob}@[2001:db8::1]:8388#v6");
+        let first = parse(&line[5..], &line).unwrap();
+        assert_eq!(first.host, "2001:db8::1");
+        let serialized = serialize(&first);
+        assert!(serialized.contains("@[2001:db8::1]:8388"), "{serialized}");
+        let second = parse(serialized.strip_prefix("ss://").unwrap(), &serialized).unwrap();
+        assert_eq!(first.host, second.host);
+        assert_eq!(first.port, second.port);
+        assert_eq!(first.credential, second.credential);
     }
 
     #[test]

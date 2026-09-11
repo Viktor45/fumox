@@ -30,6 +30,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::models::Scheme;
 
+use crate::admin::dash_top_n::{self, DashTopN};
+
 /// Dashboard (ADMIN_PLAN §4.1; merged with the former statistics screen,
 /// owner decision 2026-09-10): aggregate counters, source errors (the
 /// operator's most actionable block, rendered first), per-source health,
@@ -75,6 +77,14 @@ struct DashboardTemplate {
     ingest_days: Vec<(i64, i64)>,
     /// Largest per-day value of `ingest_days` (bar scale).
     ingest_max: i64,
+    /// Configurable Top-N from the `fumox_dash_top_n` cookie — drives the
+    /// `recent_errors`, `top_alive`, `top_failures` widgets and the country
+    /// split's display cap.
+    top_n: DashTopN,
+    /// Top failure reasons (error message, hit count) over the last 24h,
+    /// ordered by hit count descending. Populated by
+    /// `fumox_core::repo::probe::top_failure_reasons`.
+    top_failures: Vec<(String, i64)>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -198,6 +208,7 @@ impl_i18n!(DashboardTemplate);
 pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
+    let top_n = dash_top_n::from_headers(&headers);
     let pool = &state.pool;
 
     let (src_total, src_enabled, src_errors): (i64, i64, i64) = match sqlx::query_as(
@@ -239,8 +250,9 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
     let recent_errors: Vec<SourceErrorRow> = match sqlx::query_as(
         "SELECT id, name, error_class, last_error, last_fetched_at FROM sources
          WHERE error_class IS NOT NULL
-         ORDER BY COALESCE(last_fetched_at, 0) DESC LIMIT 10",
+         ORDER BY COALESCE(last_fetched_at, 0) DESC LIMIT ?",
     )
+    .bind(top_n.as_i64())
     .fetch_all(pool)
     .await
     {
@@ -285,8 +297,9 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
          WHERE p.status = 'alive'
          GROUP BY p.id
          ORDER BY p.created_at ASC, p.id ASC
-         LIMIT 10",
+         LIMIT ?",
     )
+    .bind(top_n.as_i64())
     .fetch_all(pool)
     .await
     {
@@ -298,7 +311,7 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         Ok(rows) => rows,
         Err(err) => return server_error(lang, &err),
     };
-    let countries = match country_split(pool).await {
+    let countries = match country_split(pool, top_n.as_i64()).await {
         Ok(rows) => rows,
         Err(err) => return server_error(lang, &err),
     };
@@ -359,6 +372,15 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         .await
         {
             Ok(row) => row,
+            Err(err) => return server_error(lang, &err),
+        };
+
+    // Top failure reasons over the rolling 24h window — the operator's
+    // most actionable signal after the source-errors block at the top:
+    // "what kind of probe failure is happening most often right now?"
+    let top_failures: Vec<(String, i64)> =
+        match fumox_core::repo::probe::top_failure_reasons(pool, day_ago, top_n.as_i64()).await {
+            Ok(rows) => rows,
             Err(err) => return server_error(lang, &err),
         };
 
@@ -444,6 +466,8 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
             never_checked,
             ingest_days,
             ingest_max,
+            top_n,
+            top_failures,
         },
         StatusCode::OK,
     )
@@ -471,9 +495,12 @@ async fn scheme_split(
 }
 
 /// Grouped health counters per country, largest bucket first; proxies
-/// without a resolved country land in the trailing NULL bucket.
+/// without a resolved country land in the trailing NULL bucket. `limit`
+/// caps the rows returned by the SQL (the dashboard widget uses it to
+/// match the operator's configurable Top-N setting).
 async fn country_split(
     pool: &fumox_core::db::DbPool,
+    limit: i64,
 ) -> Result<Vec<CountrySplitRow>, fumox_core::Error> {
     Ok(sqlx::query_as::<_, CountrySplitRow>(
         "SELECT geo_country AS value,
@@ -485,8 +512,10 @@ async fn country_split(
                 COUNT(*)                               AS total
          FROM proxies
          GROUP BY geo_country
-         ORDER BY total DESC, value IS NULL, value ASC",
+         ORDER BY total DESC, value IS NULL, value ASC
+         LIMIT ?",
     )
+    .bind(limit)
     .fetch_all(pool)
     .await?)
 }

@@ -65,10 +65,19 @@ jobs:
       - name: Prepare
         env:
           MEOW_INPUT: ${{ inputs.meow_version }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
-          echo "MEOW_VERSION=${MEOW_INPUT//[[:space:]]/}" >> "$GITHUB_ENV"
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+          MEOW_VERSION="${MEOW_INPUT//[[:space:]]/}"
+          # Whitespace is stripped above; anything else outside the release-
+          # tag alphabet is rejected before it can reach the download URL,
+          # the published tag list, or the image itself (supply-chain
+          # hygiene: the value is operator input, but fail fast anyway).
+          if ! [[ "$MEOW_VERSION" =~ ^(latest|v?[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::meow_version must be 'latest' or a tag like v0.21.2, got: $MEOW_VERSION" >&2
+            exit 1
+          fi
+          echo "MEOW_VERSION=${MEOW_VERSION}" >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@v7
@@ -154,7 +163,16 @@ jobs:
         env:
           MEOW_INPUT: ${{ inputs.meow_version }}
         run: |
-          echo "MEOW_VERSION=${MEOW_INPUT//[[:space:]]/}" >> "$GITHUB_ENV"
+          MEOW_VERSION="${MEOW_INPUT//[[:space:]]/}"
+          # Whitespace is stripped above; anything else outside the release-
+          # tag alphabet is rejected before it can reach the download URL,
+          # the published tag list, or the image itself (supply-chain
+          # hygiene: the value is operator input, but fail fast anyway).
+          if ! [[ "$MEOW_VERSION" =~ ^(latest|v?[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::meow_version must be 'latest' or a tag like v0.21.2, got: $MEOW_VERSION" >&2
+            exit 1
+          fi
+          echo "MEOW_VERSION=${MEOW_VERSION}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4

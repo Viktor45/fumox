@@ -21,11 +21,13 @@ const HEARTBEAT_STALE_SECS: i64 = 90;
 
 /// Period for the `probe.stats` and `heartbeat` SSE events.
 const STATS_INTERVAL: Duration = Duration::from_secs(30);
-/// Idle cap on a single SSE connection (security audit, 2026-09-10, M5):
-/// even with `keep_alive` keepalive pings, a slow-loris client that never
-/// reads from the stream would otherwise sit on a per-IP admin slot
-/// forever. The browser-side `EventSource` reconnects on its own when the
-/// socket closes, so closing after 10 minutes is harmless to the UI.
+/// Lifetime cap on a single SSE connection (security audit, 2026-09-10,
+/// M5): even with `keep_alive` keepalive pings, a slow-loris client that
+/// never reads from the stream would otherwise sit on a per-IP admin slot
+/// forever. Note the cap is a fixed connection lifetime, not an idle
+/// timeout — the stream closes 10 minutes after connect regardless of
+/// traffic. The browser-side `EventSource` reconnects on its own when the
+/// socket closes, so this is harmless to the UI.
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 // ---------------------------------------------------------------------------
@@ -271,9 +273,12 @@ pub async fn events_stream(
                         .event("heartbeat")
                         .data(payload.to_string()));
                 }
-                // Idle cap (security audit, 2026-09-10, M5): a connection
-                // that produced no event and no tick for SSE_IDLE_TIMEOUT
-                // is closed. The browser reconnects on its own.
+                // Connection lifetime cap (security audit, 2026-09-10, M5):
+                // the stream never outlives SSE_IDLE_TIMEOUT (10 min) even
+                // under steady traffic — the interval is not reset on
+                // activity, so this is a hard cap, not an idle timeout.
+                // The browser's EventSource reconnects on its own, and the
+                // reconnect passes auth again.
                 _ = idle.tick() => break,
             }
         }

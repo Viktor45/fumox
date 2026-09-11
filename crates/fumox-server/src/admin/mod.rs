@@ -5,6 +5,7 @@
 //! assets vendored into the binary.
 
 pub mod auth;
+mod dash_top_n;
 mod handlers;
 pub mod i18n;
 pub(crate) mod pipeline_editor;
@@ -140,6 +141,21 @@ impl AdminState {
     }
 }
 
+/// Validated `?next=` target shared by the preference setters (`set-lang`,
+/// `set-theme`, `set-dash-top-n`): the redirect must stay on the admin
+/// surface and must not carry control characters — a percent-decoded CR/LF
+/// (e.g. `next=%2Fadmin%0D%0Ax`) would make the `Location` header value
+/// invalid and axum answers 500 instead of redirecting. Anything invalid
+/// falls back to `/admin`.
+pub(crate) fn admin_next(params: &std::collections::HashMap<String, String>) -> String {
+    params
+        .get("next")
+        .map(String::as_str)
+        .filter(|next| next.starts_with("/admin") && !next.chars().any(|c| c.is_ascii_control()))
+        .unwrap_or("/admin")
+        .to_string()
+}
+
 /// Build the admin router. Mounted only when the panel is active
 /// (enabled + non-empty token); otherwise the listener serves 404.
 pub fn router(state: AdminState) -> axum::Router {
@@ -250,6 +266,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/admin/logout", post(auth::logout))
         .route("/admin/set-lang", get(auth::set_lang))
         .route("/admin/set-theme", get(theme::set_theme))
+        .route("/admin/set-dash-top-n", get(dash_top_n::set_top_n))
         .route("/admin/static/app.css", get(static_css))
         .route("/admin/static/htmx.min.js", get(static_htmx))
         // Router-wide request-body cap (security audit v2, 2026-09-09, F7):
@@ -1902,7 +1919,11 @@ mod tests {
         // The merged page renders every former stats panel.
         assert!(html.contains("Дашборд"), "{html}");
         assert!(html.contains("Прокси по источникам"), "{html}");
-        assert!(html.contains("Топ-10 самых живых прокси"), "{html}");
+        assert!(html.contains("Самые живые прокси"), "{html}");
+        // The new Top-N picker renders the default 10 selected.
+        assert!(html.contains("Показать топ:"), "{html}");
+        // The new Top Failure Reasons panel renders even when empty.
+        assert!(html.contains("Топ причин отказов"), "{html}");
         // The "recent fetches" table is gone from the dashboard; the
         // source-errors block leads the screen.
         let errors_at = html.find("Источники с ошибками").expect("errors block");
@@ -2246,6 +2267,44 @@ mod tests {
         }
         assert_eq!(status_by_fp(&pool, "fp-ashet").await, "removed");
         assert_eq!(status_by_fp(&pool, "fp-asno").await, "alive");
+
+        // Regression (2026-09-11): the HTMX badge fragment substitutes the
+        // `{asn}` placeholder — the catalogs read "removed by AS{asn}" and a
+        // mismatch used to render the literal "AS{n}" to the operator.
+        seed_cleanup_proxy(
+            &pool,
+            "fp-asfrag",
+            "vless",
+            "alive",
+            Some("DE"),
+            Some("AS3333"),
+        )
+        .await;
+        let mut req = request(
+            "POST",
+            "/admin/proxies/remove-alive-by-asn",
+            &format!("_csrf={csrf}&asn=3333"),
+            Some(&cookie),
+        );
+        req.headers_mut()
+            .insert("HX-Request", "true".parse().unwrap());
+        let response = app.oneshot(req).await.unwrap();
+        let body = String::from_utf8_lossy(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+        )
+        .into_owned();
+        assert!(
+            body.contains("AS3333"),
+            "fragment must name the ASN: {body}"
+        );
+        assert!(!body.contains("AS{n}"), "placeholder leaked: {body}");
+        assert_eq!(status_by_fp(&pool, "fp-asfrag").await, "removed");
     }
 
     #[tokio::test]
@@ -2797,6 +2856,228 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .starts_with("fumox_theme=light;")
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Dashboard Top-N picker (configurable widget sizes)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
+        let state = test_state(1000).await;
+        let app = router(state);
+
+        // Valid next: back to the requested admin page with the new cookie.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin/set-dash-top-n?n=25&next=/admin",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            cookie.starts_with("fumox_dash_top_n=25;"),
+            "cookie: {cookie}"
+        );
+
+        // External `next` values are dropped: redirect stays inside /admin.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin/set-dash-top-n?n=15&next=https://evil.example.com",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
+
+        // A percent-decoded CR/LF inside `next` (invalid Location header
+        // value — axum would answer 500) falls back to /admin as well.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin/set-dash-top-n?n=10&next=%2Fadmin%0D%0Ax",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
+
+        // Out-of-list values fall back to the default 10.
+        for bad in ["999", "0", "-5", "abc"] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/admin/set-dash-top-n?n={bad}"),
+                    "",
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            let cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                cookie.starts_with("fumox_dash_top_n=10;"),
+                "bad={bad} cookie: {cookie}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_top_n_cookie_is_respected_by_widgets() {
+        // Seed enough source errors (12) and alive proxies (12) that top_n=5
+        // truncates both lists, proving the cookie flows through the handler
+        // into the SQL LIMIT parameters.
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+        for idx in 0..12 {
+            let id = format!("srcT{idx:07}");
+            fumox_core::repo::sources::create(
+                &pool,
+                &test_source(&id, &format!("slug-topn-{idx}")),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE sources SET error_class = 'network', last_error = 'fail', last_fetched_at = ? WHERE id = ?")
+                .bind(now - idx as i64)
+                .bind(&id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let app = router(state);
+        let cookie = login(&app).await;
+
+        // With top_n=5, the source-errors block must show exactly 5 rows
+        // and the picker selects "5". Scope the count to the recent-errors
+        // panel because src IDs also appear in the per-source table.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin",
+                "",
+                Some(&format!("{cookie}; fumox_dash_top_n=5")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8_lossy(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+        )
+        .into_owned();
+        assert!(html.contains("Источники с ошибками"));
+        let errors_panel_end = html
+            .find("Прокси по источникам")
+            .expect("per-source table heading must render after errors");
+        let errors_html = &html[..errors_panel_end];
+        // The first 5 source IDs (most recent last_fetched_at) are the
+        // top 5 — they MUST show up in the errors panel; the remaining
+        // IDs MUST NOT show up here. The seed assigns `last_fetched_at =
+        // now - idx`, so the most recent is srcT0000000 (idx=0),
+        // descending to srcT0000011 (idx=11).
+        for idx in 0..5 {
+            assert!(
+                errors_html.contains(&format!("srcT{idx:07}")),
+                "errors panel should include srcT{idx:07}"
+            );
+        }
+        for idx in 5..12 {
+            assert!(
+                !errors_html.contains(&format!("srcT{idx:07}")),
+                "errors panel should NOT include srcT{idx:07}"
+            );
+        }
+        // The picker selects the current value.
+        assert!(
+            html.contains(r#"<option value="5" selected"#),
+            "5 should be the selected option"
+        );
+
+        // Default behaviour (no top-n cookie): top_n=10 — the picker
+        // shows "10" selected and the errors panel renders ≤10 rows.
+        let response = app
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8_lossy(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+        )
+        .into_owned();
+        assert!(
+            html.contains(r#"<option value="10" selected"#),
+            "10 should be the selected option when the cookie is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_renders_top_failures_panel() {
+        // Empty repo: the panel renders an "no failures" placeholder.
+        let state = test_state(1000).await;
+        let app = router(state);
+        let cookie = login(&app).await;
+        let response = app
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+        )
+        .into_owned();
+        assert!(
+            html.contains("Топ причин отказов"),
+            "panel heading must render"
+        );
+        assert!(
+            html.contains("Отказов проверок за последние 24 ч нет."),
+            "empty-state copy must render"
         );
     }
 

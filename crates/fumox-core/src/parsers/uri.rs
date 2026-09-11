@@ -108,6 +108,20 @@ pub static TUIC_SPEC: UriSchemeSpec = UriSchemeSpec {
     credential_required: true,
 };
 
+/// Render a host for a `host:port` context: an IPv6 literal must be
+/// bracketed (`[2001:db8::1]:443`) or the concatenation is not a parseable
+/// `host:port` at all — both directions of the round-trip and every
+/// consumer of the subscription output rely on that. `parse_hostport`
+/// strips the brackets on input, so round-tripping stays byte-stable for
+/// bracketed feeds too. Everything else (hostnames, IPv4) passes through.
+pub(crate) fn host_for_uri(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 pub static MIERU_SPEC: UriSchemeSpec = UriSchemeSpec {
     scheme: Scheme::Mieru,
     prefix: "mieru://",
@@ -404,7 +418,7 @@ pub fn serialize_with_spec(spec: &UriSchemeSpec, entry: &ProxyEntry) -> String {
         out.push_str(&entry.credential);
         out.push('@');
     }
-    out.push_str(&entry.host);
+    out.push_str(&host_for_uri(&entry.host));
     out.push(':');
     out.push_str(&entry.port.to_string());
     out.push_str(&entry.raw_path);
@@ -455,6 +469,37 @@ mod tests {
         let (host, port) = parse_hostport("[2001:db8::1]:8443").unwrap();
         assert_eq!(host, "2001:db8::1");
         assert_eq!(port, 8443);
+    }
+
+    /// The serializer must bracket an IPv6 literal in the `host:port`
+    /// context: the unbracketed `2001:db8::1:8443` is not a parseable
+    /// `host:port` at all, so the subscription output used to be broken for
+    /// every IPv6 proxy (regression fixed 2026-09-11).
+    #[test]
+    fn serializes_ipv6_host_bracketed_and_round_trips() {
+        let entry = ProxyEntry {
+            scheme: Scheme::Vless,
+            name: "v6".into(),
+            host: "2001:db8::1".into(),
+            port: 8443,
+            credential: "uuid".into(),
+            params: vec![Param {
+                key: "security".into(),
+                value: "tls".into(),
+                known: true,
+            }],
+            raw_path: String::new(),
+            raw_line: String::new(),
+        };
+        let out = serialize_with_spec(&VLESS_SPEC, &entry);
+        assert!(out.contains("@[2001:db8::1]:8443"), "{out}");
+        // Bracketed input parses back to the same bare-literal host.
+        let parsed =
+            parse_with_spec(&VLESS_SPEC, out.strip_prefix("vless://").unwrap(), &out).unwrap();
+        assert_eq!(parsed.host, "2001:db8::1");
+        assert_eq!(parsed.port, 8443);
+        assert_eq!(parsed.credential, "uuid");
+        assert_eq!(parsed.name, "v6");
     }
 
     #[test]

@@ -1,26 +1,35 @@
-# Manifest-aware GHCR retention for the Fumox container image.
+# Manifest-aware GHCR retention for the Fumox container images.
 #
-# The build workflow pushes per-arch images by digest and then runs a merge
-# job that stitches them into one multi-arch manifest list tagged with
-# `latest`, semver (`0.2.0`, `0.2`) and `main`. Per-arch images also get
-# transient `sha-<shortsha>` tags for trace.
+# The build workflow pushes per-arch images BY DIGEST (untagged) and then
+# runs a merge job that stitches them — plus the provenance attestation
+# manifests — into one multi-arch index tagged with `latest`, semver
+# (`0.2.0`, `0.2`), `main` and a transient `sha-<shortsha>`. The per-arch
+# children therefore have NO tags of their own, and every live tag
+# references them.
 #
-# A naive "delete anything not `latest`" cleanup breaks the merged manifest
-# list — the per-arch digests it references would disappear before the
-# manifest itself. So this workflow deletes ONLY:
-#   - versions with an empty/null tag list (buildx "unknown/unknown"
-#     artifacts from docker/build-push-action#820/#900), regardless of age;
-#   - intermediate per-arch digest tags matching `sha-*`, older than
-#     RETENTION_DAYS (default 30).
-# All other tags (`latest`, `main`, `0.x.y`) are kept. Run manually.
+# A naive "delete anything not `latest`" — or "delete anything untagged" —
+# cleanup breaks the merged manifest list: the per-arch digests it
+# references would disappear and `docker pull` of `latest`/semver starts
+# failing with manifest-unknown (and `gh attestation verify` loses its
+# targets). So this workflow deletes ONLY:
+#   - versions whose tag list contains ONLY `sha-*` entries, older than
+#     RETENTION_DAYS (default 30) — these are the merged indexes of past
+#     builds nobody consumes anymore;
+#   - untagged versions, ONLY when PRUNE_UNTAGGED is enabled AND the
+#     version's digest is not referenced by ANY kept tag's manifest list
+#     AND older than RETENTION_DAYS (the age gate also covers the race
+#     against a merge job that is mid-run). Disabled by default: run a
+#     `dry_run` pass first and check the output before enabling.
+# All other tags (`latest`, `main`, `0.x.y`) and ALL other untagged
+# versions (the children of live tags, attestations) are kept.
 
-name: Cleanup Non-Latest GHCR Images
+name: Cleanup Old GHCR Images
 
 on:
   workflow_dispatch:
     inputs:
       retention_days:
-        description: "Delete `sha-*` tags older than this many days (1-365)"
+        description: "Delete `sha-*`-only tags older than this many days (1-365)"
         required: true
         default: "30"
         type: string
@@ -29,22 +38,28 @@ on:
         required: false
         default: "true"
         type: boolean
+      prune_untagged:
+        description: "Also delete untagged orphans not referenced by any kept tag (run a dry_run pass first)"
+        required: false
+        default: "false"
+        type: boolean
 
 permissions:
   packages: write
 
 jobs:
-  prune-sha-tags:
+  prune-old-versions:
     runs-on: ubuntu-latest
     env:
-      OWNER: Viktor45
+      OWNER: ${{ github.repository_owner }}
       PACKAGES: fumox,fumox-meow
     steps:
-      - name: Delete old `sha-*` tags, preserve `latest`/`main`/semver
+      - name: Delete stale `sha-*` indexes, preserve live tags and their children
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RETENTION_DAYS: ${{ github.event.inputs.retention_days }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
+          PRUNE_UNTAGGED: ${{ github.event.inputs.prune_untagged }}
         run: |
           set -euo pipefail
 
@@ -55,43 +70,85 @@ jobs:
 
           cutoff=$(date -u -d "-${RETENTION_DAYS} days" +%s)
           if [ "$DRY_RUN" = "true" ]; then
-            echo "DRY-RUN: listing sha-* versions older than $RETENTION_DAYS days (no delete)"
+            echo "DRY-RUN: listing versions older than $RETENTION_DAYS days (no delete)"
           else
-            echo "Deleting sha-* versions older than $RETENTION_DAYS days"
+            echo "Deleting versions older than $RETENTION_DAYS days"
+          fi
+          if [ "$PRUNE_UNTAGGED" = "true" ] && [ "$DRY_RUN" = "false" ]; then
+            echo "Untagged-orphan pruning is ENABLED (reference-checked against every kept tag)"
           fi
 
+          # The packages API is path-scoped: user-owned packages live under
+          # /users/<name>, org-owned under /orgs/<name>. Detect the owner
+          # type once (GET /users/<name> resolves both) instead of guessing.
+          api_root="/users"
+          owner_type="$(gh api "/users/${OWNER}" --jq .type 2>/dev/null || true)"
+          case "$owner_type" in
+            Organization) api_root="/orgs" ;;
+          esac
+          echo "Owner ${OWNER} type=${owner_type:-<lookup failed, trying /users>} → ${api_root}/${OWNER}"
+
           err_tmp="$(mktemp)"
-          cleanup() { rm -f "$err_tmp"; }
+          ref_file="$(mktemp)"
+          cleanup() { rm -f "$err_tmp" "$ref_file"; }
           trap cleanup EXIT
 
           for pkg in ${PACKAGES//,/ }; do
             echo
-            echo "=== $OWNER/$pkg ==="
+            echo "=== ${OWNER}/${pkg} ==="
+
+            # When PRUNE_UNTAGGED is on, collect the digests referenced by
+            # every kept tag's manifest list so an untagged child of a LIVE
+            # tag is never treated as an orphan. Runs before the version
+            # walk; the digest set covers all pages.
+            if [ "$PRUNE_UNTAGGED" = "true" ]; then
+              echo "$GH_TOKEN" | docker login ghcr.io -u "${OWNER}" --password-stdin >/dev/null 2>&1 || true
+              : > "$ref_file"
+              versions_json="$(gh api -H "Accept: application/vnd.github+json" \
+                "${api_root}/${OWNER}/packages/container/${pkg}/versions?per_page=100" 2>/dev/null || true)"
+              while IFS= read -r tag; do
+                if [ -z "$tag" ] || [ "$tag" = "null" ]; then continue; fi
+                case "$tag" in sha-*) continue ;; esac   # not a kept tag
+                docker buildx imagetools inspect "ghcr.io/${OWNER,,}/${pkg}:${tag}" --raw 2>/dev/null \
+                  | jq -r 'select(.manifests) | .manifests[].digest' >> "$ref_file" || true
+              done < <(printf '%s' "$versions_json" \
+                | jq -r '.[].metadata.container.tags // [] | .[]' 2>/dev/null || true)
+              echo "  reference set: $(wc -l < "$ref_file" | tr -d ' ') digest(s) from kept tags"
+            fi
 
             # Walk the container versions. Each call returns up to 100 entries
             # (paged); we filter client-side by tag prefix and created_at so
             # we never have to round-trip ref data.
             page=1
+            deleted_total_pkg=0
             while :; do
-              # Capture body on stdout, stderr to a temp file. A non-zero exit
-              # + 404 means the package itself is missing on page=1 (skip this
-              # package and move on) or end-of-list on a later page (break the
-              # walk). Other failures still bail out under set -e.
+              # Capture body on stdout, stderr to a temp file. A non-zero
+              # exit + 404 means the package itself is missing on page=1
+              # (skip this package and move on) or end-of-list on a later
+              # page (break the walk). Other failures skip this package.
+              #
+              # The `set +e ... set -e` guard around `gh api` is essential —
+              # `set -e` propagates failures out of a `$(...)` substitution
+              # BEFORE we can capture `$?`, so without it the script exits
+              # on the first 4xx/5xx response.
+              set +e
               resp=$(gh api \
                 -H "Accept: application/vnd.github+json" \
-                "/orgs/${OWNER}/packages/container/${pkg}/versions?per_page=100&page=${page}" \
+                "${api_root}/${OWNER}/packages/container/${pkg}/versions?per_page=100&page=${page}" \
                 2>"$err_tmp")
               gh_status=$?
+              set -e
+              : "${resp:=}"   # normalise unset to empty (always success)
               gh_err="$(cat "$err_tmp" 2>/dev/null || true)"
               if [ "$gh_status" -ne 0 ] || [ -z "$resp" ]; then
                 case "$gh_err" in
                   *"404"*)
                     if [ "$page" -eq 1 ]; then
-                      echo "  skip: $pkg not found on $OWNER"
+                      echo "  skip: $pkg not found on ${api_root}/${OWNER}"
                       echo "         (does it exist? token can read it?"
-                      echo "          no action this run.)"
+                      echo "          moving on to the next package.)"
                       rm -f "$err_tmp"
-                      break 2   # exit both `while` and `for pkg`
+                      break   # next package
                     else
                       echo "  page $page returned 404 — assuming end-of-list"
                       break
@@ -102,14 +159,16 @@ jobs:
                       echo "  skip: $pkg private/no read access (403)"
                       echo "         (use a PAT with packages:read.)"
                       rm -f "$err_tmp"
-                      break 2
+                      break   # next package
                     fi
                     ;;
                   *)
                     printf '%s\n' "$gh_err" | sed 's/^/  gh: /' >&2
-                    echo "  error: gh api exited with status $gh_status; aborting this package" >&2
+                    # Body may contain the actual reason; print it short.
+                    printf '%s\n' "$resp" | head -c 200 | sed 's/^/  body: /' >&2 || true
+                    echo "  skip: $pkg — gh api exited $gh_status; continuing with next package" >&2
                     rm -f "$err_tmp"
-                    break 2
+                    break   # skip THIS package, move to the next one in PACKAGES
                     ;;
                 esac
               fi
@@ -118,24 +177,22 @@ jobs:
                 break
               fi
 
-              # IDs whose tag list contains a `sha-*` value (and ONLY sha-*
-              # tags — if it also has `latest`/`main`/semver, it's referenced
-              # by a manifest list and must be kept) AND whose created_at is
+              # IDs whose tag list contains ONLY `sha-*` values (a version
+              # that also has `latest`/`main`/semver is referenced by a live
+              # manifest list and must be kept) AND whose created_at is
               # older than the cutoff.
-              deleted_for_pkg=0
+              deleted_for_page=0
               while IFS=read -r id; do
                 if [ -z "$id" ] || [ "$id" = "null" ]; then continue; fi
 
                 tags=$(printf '%s' "$resp" | jq -r --argjson id "$id" \
                   '.[] | select(.id == $id) | .metadata.container.tags // [] | .[]')
 
-                # A version whose tag list is empty (or contains only
-                # null/empty entries) is the buildx "unknown/unknown" artifact
-                # documented in docker/build-push-action#820 (closed) and #900
-                # (open): the manifest-list entry the registry can't map to a
-                # recognised os/architecture pair. It carries no human-readable
-                # name and cannot be referenced by any external tag, so it is
-                # ALWAYS safe to delete regardless of age.
+                # A version whose tag list is empty is either a per-arch
+                # child manifest of a merged index or a provenance
+                # attestation — deleting those breaks pulls and attestations
+                # of every tag that references them. They are only touched
+                # in the opt-in, reference-checked PRUNE_UNTAGGED path.
                 untagged=true
                 while IFS= read -r tag; do
                   case "$tag" in
@@ -159,12 +216,36 @@ jobs:
 
                   created_at=$(printf '%s' "$resp" | jq -r --argjson id "$id" \
                     '.[] | select(.id == $id) | .created_at')
-                  # RFC-3339 timestamp -> epoch seconds.
-                  created_epoch=$(date -u -d "$created_at" +%s 2>/dev/null || echo 0)
+                  # RFC-3339 timestamp -> epoch seconds. An unparseable
+                  # timestamp is a reason to SKIP, never to classify the
+                  # version as ancient (epoch 0 would make it deletable).
+                  created_epoch=$(date -u -d "$created_at" +%s 2>/dev/null) || {
+                    echo "  skip: id=$id — unparseable created_at: ${created_at}" >&2
+                    continue
+                  }
                   if [ "$created_epoch" -ge "$cutoff" ]; then continue; fi
                   reason="sha-*-only, created_at=$created_at"
                 else
-                  reason='untagged (unknown/unknown artifact)'
+                  # Untagged: by default KEEP — it is a child/attestation of
+                  # a live index. The opt-in path deletes only orphans that
+                  # (a) no kept tag's manifest list references and
+                  # (b) are older than the retention window (grace against
+                  # a merge job running concurrently).
+                  if [ "$PRUNE_UNTAGGED" != "true" ]; then continue; fi
+                  digest=$(printf '%s' "$resp" | jq -r --argjson id "$id" \
+                    '.[] | select(.id == $id) | .name')
+                  if [ -n "$digest" ] && [ "$digest" != "null" ] \
+                     && grep -qF "$digest" "$ref_file" 2>/dev/null; then
+                    continue   # referenced by a kept tag — not an orphan
+                  fi
+                  created_at=$(printf '%s' "$resp" | jq -r --argjson id "$id" \
+                    '.[] | select(.id == $id) | .created_at')
+                  created_epoch=$(date -u -d "$created_at" +%s 2>/dev/null) || {
+                    echo "  skip: id=$id — unparseable created_at: ${created_at}" >&2
+                    continue
+                  }
+                  if [ "$created_epoch" -ge "$cutoff" ]; then continue; fi
+                  reason="untagged orphan (not referenced by any kept tag), created_at=$created_at"
                 fi
 
                 if [ "$DRY_RUN" = "true" ]; then
@@ -172,31 +253,39 @@ jobs:
                 else
                   echo "  deleting id=$id — $reason"
                   # Idempotency: a 404 here means another job deleted this
-                  # version between our listing and our DELETE. Drop it from
-                  # the count without failing the run.
+                  # version between our listing and our DELETE. Count it as
+                  # gone and carry on without failing the run.
+                  # Same `set -e` propagation caveat as the GET above.
+                  set +e
                   gh api -X DELETE \
                     -H "Accept: application/vnd.github+json" \
-                    "/orgs/${OWNER}/packages/container/${pkg}/versions/${id}" \
+                    "${api_root}/${OWNER}/packages/container/${pkg}/versions/${id}" \
                     2>"$err_tmp"
                   del_status=$?
+                  set -e
                   if [ "$del_status" -ne 0 ] && grep -q "404" "$err_tmp"; then
                     echo "  (already gone — race with another job)"
-                    deleted_for_pkg=$((deleted_for_pkg + 1))
-                    continue
                   elif [ "$del_status" -ne 0 ]; then
                     printf '%s\n' "$(cat "$err_tmp")" | sed 's/^/  gh: /' >&2
-                    echo "  error: gh api DELETE exited with status $del_status; aborting this package" >&2
+                    echo "  error: gh api DELETE exited with status $del_status; continuing with next package" >&2
                     rm -f "$err_tmp"
-                    break 2
+                    break   # skip THIS package, move to the next one in PACKAGES
                   fi
                 fi
-                deleted_for_pkg=$((deleted_for_pkg + 1))
+                deleted_for_page=$((deleted_for_page + 1))
               done < <(printf '%s' "$resp" | jq -r '.[].id')
+              deleted_total_pkg=$((deleted_total_pkg + deleted_for_page))
 
-              page=$((page + 1))
+              # Deleting from page N shifts the remaining list up, so the
+              # next page would skip up to `deleted_for_page` unseen entries.
+              # Re-read the same page after a productive pass; advance only
+              # when this page yielded nothing.
+              if [ "$deleted_for_page" -eq 0 ]; then
+                page=$((page + 1))
+              fi
             done
 
-            echo "  $pkg: $deleted_for_pkg version(s) ${DRY_RUN:+would be }deleted"
+            echo "  $pkg: $deleted_total_pkg version(s) ${DRY_RUN:+would be }deleted"
           done
 
           echo

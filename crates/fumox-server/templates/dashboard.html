@@ -5,6 +5,17 @@
 {% block content %}
 <div class="page-head">
   <h1>{{ self.t("nav.dashboard") }}</h1>
+  <form method="get" action="/admin/set-dash-top-n" class="topn-picker">
+    <label>
+      <span>{{ self.t("dash.top_n_label") }}</span>
+      <select name="n" onchange="this.form.submit()">
+        {% for n in [5_i64, 10_i64, 15_i64, 25_i64, 50_i64] %}
+          <option value="{{ n }}"{% if top_n.as_i64() == *n %} selected{% endif %}>{{ n }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <input type="hidden" name="next" value="/admin">
+  </form>
 </div>
 
 {# Source errors first (owner decision, 2026-09-10): the operator's most
@@ -156,6 +167,35 @@
   {% endif %}
 </div>
 
+{# Top-N probe failure reasons over the rolling 24h window — the
+   operator's most actionable signal: "what kind of failure is hitting
+   the proxy pool right now?". Respects the configurable top_n. #}
+<div class="panel">
+  <h2>{{ self.t("stats.top_failures") }}</h2>
+  {% if top_failures.is_empty() %}
+    <p class="muted">{{ self.t("stats.no_failures") }}</p>
+  {% else %}
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>{{ self.t("stats.error_reason") }}</th>
+            <th class="num">{{ self.t("stats.failures_24h") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for (reason, hits) in top_failures %}
+          <tr>
+            <td class="mono small truncate" title="{{ reason }}">{{ reason }}</td>
+            <td class="num">{{ hits }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+
 {# Ingest dynamics: new proxies per day over the last 7 days. #}
 <div class="panel">
   <h2>{{ self.t("stats.ingest_week") }}</h2>
@@ -275,7 +315,7 @@
     {% else %}
       <div class="stat-split">
         {% for row in countries %}
-        {% if loop.index <= 15 %}
+        {% if loop.index as i64 <= top_n.as_i64() %}
         <div class="stat-split-row">
           <div class="stat-split-name">{{ self.flag(row.value) }}
             {% match row.value %}

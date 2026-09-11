@@ -558,7 +558,23 @@ async fn build_source_from_form(
         match generated {
             None => None,
             Some(value) => match CompiledPipeline::from_json(Some(&value)) {
-                Ok(_) => Some(value),
+                Ok(_) => {
+                    // Same cap as raw mode (security audit v2, F7): the
+                    // generated JSON is stored verbatim and re-rendered
+                    // into every edit form, so a form with thousands of
+                    // widget rows must not exceed the budget either.
+                    let bytes = serde_json::to_string(&value).map_or(usize::MAX, |text| text.len());
+                    if bytes > caps::PIPELINE_BYTES {
+                        errors.push((
+                            "pipeline".into(),
+                            lang.t("val.field_too_long")
+                                .replace("{}", &caps::PIPELINE_BYTES.to_string()),
+                        ));
+                        None
+                    } else {
+                        Some(value)
+                    }
+                }
                 Err(issues) => {
                     for issue in issues {
                         errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));

@@ -75,10 +75,10 @@ impl Context {
     fn backoff_meow(&self) {
         let backoff = self.meow_backoff_secs.load(Ordering::Relaxed);
         let max = i64::try_from(self.config.meow.backoff_max_secs).unwrap_or(i64::MAX);
-        let next = (backoff * 2).min(max);
+        let next = backoff.saturating_mul(2).min(max);
         self.meow_backoff_secs.store(next, Ordering::Relaxed);
         self.meow_retry_at
-            .store(now_ts() + backoff, Ordering::Relaxed);
+            .store(now_ts().saturating_add(backoff), Ordering::Relaxed);
     }
 
     /// meow-rs answered — clear the backoff.
@@ -229,12 +229,15 @@ async fn run_t1_checks(
             continue;
         };
         let kind = t1::check_kind(scheme, candidate.params.as_deref());
-        if let Err(reason) = vet_target(&ctx, &candidate.host).await {
-            tracing::warn!(id = candidate.id, %reason, "probe target blocked by the private-address policy, journaled as a failed check");
-            apply_vet_block(&ctx, candidate.id, kind.as_str(), &reason).await;
-            blocked += 1;
-            continue;
-        }
+        let vetted = match vet_target_addrs(&ctx, &candidate.host).await {
+            Ok(addrs) => addrs,
+            Err(reason) => {
+                tracing::warn!(id = candidate.id, %reason, "probe target blocked by the private-address policy, journaled as a failed check");
+                apply_vet_block(&ctx, candidate.id, kind.as_str(), &reason).await;
+                blocked += 1;
+                continue;
+            }
+        };
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
         tasks.spawn(async move {
             // `acquire_owned` is infallible: the semaphore lives in this
@@ -246,7 +249,13 @@ async fn run_t1_checks(
                 Ok(permit) => permit,
                 Err(_) => return,
             };
-            perform_t1_check(&ctx, candidate.id, &candidate.host, port, kind).await;
+            let target = t1::Target {
+                host: &candidate.host,
+                port,
+                kind,
+                vetted: &vetted,
+            };
+            perform_t1_check(&ctx, candidate.id, &target).await;
         });
     }
     let done = collect_tasks(&mut tasks).await;
@@ -264,6 +273,13 @@ async fn run_t1_checks(
 /// OS resolver runs (security audit, 2026-09-10, L1).
 async fn vet_target(ctx: &Context, host: &str) -> Result<(), String> {
     fumox_core::ssrf::vet_probe_host(host, ctx.config.probe.allow_private_targets).await
+}
+
+/// Same gate as [`vet_target`], returning the vetted addresses: T1 dials
+/// those exact IPs instead of re-resolving the hostname, so a rebinding
+/// DNS answer cannot steer the connect elsewhere between vet and dial.
+async fn vet_target_addrs(ctx: &Context, host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    fumox_core::ssrf::vet_probe_host_addrs(host, ctx.config.probe.allow_private_targets).await
 }
 
 /// A vet-refused target is a *failed check*, not a skip (owner decision,
@@ -292,11 +308,12 @@ async fn apply_vet_block(ctx: &Context, id: i64, probe_kind: &str, reason: &str)
 }
 
 /// Run one T1 check and apply the outcome to the lifecycle: journal the
-/// attempt into `probe_results`, then move the state machine.
-async fn perform_t1_check(ctx: &Context, id: i64, host: &str, port: u16, kind: t1::CheckKind) {
+/// attempt into `probe_results`, then move the state machine. `vetted`
+/// carries the SSRF-approved dial addresses (see [`vet_target_addrs`]).
+async fn perform_t1_check(ctx: &Context, id: i64, target: &t1::Target<'_>) {
     let connect_timeout = Duration::from_secs(ctx.config.probe.connect_timeout_secs.max(1));
     let tls_timeout = Duration::from_secs(ctx.config.probe.tls_timeout_secs.max(1));
-    let outcome = t1::run(host, port, kind, connect_timeout, tls_timeout).await;
+    let outcome = t1::run(target, connect_timeout, tls_timeout).await;
     let now = now_ts();
 
     match outcome {
@@ -310,7 +327,7 @@ async fn perform_t1_check(ctx: &Context, id: i64, host: &str, port: u16, kind: t
                     ok: true,
                     latency_ms: Some(latency),
                     error: None,
-                    probe_kind: kind.as_str(),
+                    probe_kind: target.kind.as_str(),
                 },
             )
             .await;
@@ -349,7 +366,7 @@ async fn perform_t1_check(ctx: &Context, id: i64, host: &str, port: u16, kind: t
                     ok: false,
                     latency_ms: None,
                     error: Some(&reason),
-                    probe_kind: kind.as_str(),
+                    probe_kind: target.kind.as_str(),
                 },
             )
             .await;
@@ -362,8 +379,10 @@ async fn perform_t1_check(ctx: &Context, id: i64, host: &str, port: u16, kind: t
 /// is reached (SPEC §8.3).
 async fn apply_regular_failure(ctx: &Context, id: i64, now: i64) {
     let probe = &ctx.config.probe;
-    let min_secs = i64::try_from(probe.second_chance_min_hours * 3600).unwrap_or(i64::MAX);
-    let spread_secs = i64::try_from(probe.second_chance_spread_hours * 3600).unwrap_or(0);
+    let min_secs =
+        i64::try_from(probe.second_chance_min_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
+    let spread_secs =
+        i64::try_from(probe.second_chance_spread_hours.saturating_mul(3600)).unwrap_or(0);
     match proxies::check_failed(&ctx.pool, id, now, probe.fail_limit, min_secs, spread_secs).await {
         Ok(proxies::Transition::Quarantined) => {
             tracing::info!(id, "proxy quarantined after consecutive failures")
@@ -400,21 +419,24 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
             );
             continue;
         };
-        if let Err(reason) = vet_target(&ctx, &row.host).await {
-            tracing::warn!(id = row.id, %reason, "quarantine target blocked by the private-address policy, journaled as a failed recheck");
-            apply_quarantine_vet_block(
-                &ctx,
-                row.id,
-                t1::check_kind(scheme, row.params.as_deref()).as_str(),
-                row.ladder_step,
-                &reason,
-            )
-            .await;
-            blocked += 1;
-            continue;
-        }
-        let step = row.ladder_step;
         let kind = t1::check_kind(scheme, row.params.as_deref());
+        let vetted = match vet_target_addrs(&ctx, &row.host).await {
+            Ok(addrs) => addrs,
+            Err(reason) => {
+                tracing::warn!(id = row.id, %reason, "quarantine target blocked by the private-address policy, journaled as a failed recheck");
+                apply_quarantine_vet_block(
+                    &ctx,
+                    row.id,
+                    t1::check_kind(scheme, row.params.as_deref()).as_str(),
+                    row.ladder_step,
+                    &reason,
+                )
+                .await;
+                blocked += 1;
+                continue;
+            }
+        };
+        let step = row.ladder_step;
         let delays = ctx.config.probe.recheck_delays_secs.clone();
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
         tasks.spawn(async move {
@@ -425,7 +447,13 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
                 Ok(permit) => permit,
                 Err(_) => return,
             };
-            perform_quarantine_check(&ctx, row.id, &row.host, port, kind, step, &delays).await;
+            let target = t1::Target {
+                host: &row.host,
+                port,
+                kind,
+                vetted: &vetted,
+            };
+            perform_quarantine_check(&ctx, row.id, &target, step, &delays).await;
         });
     }
     let done = collect_tasks(&mut tasks).await;
@@ -468,19 +496,18 @@ async fn apply_quarantine_vet_block(
 
 /// One quarantine re-check: success revives the proxy with a clean slate;
 /// failure advances the configured ladder or removes the proxy after the
-/// last configured recheck failed (SPEC §8.3a steps 3–5).
+/// last configured recheck failed (SPEC §8.3a steps 3–5). `vetted` carries
+/// the SSRF-approved dial addresses (see [`vet_target_addrs`]).
 async fn perform_quarantine_check(
     ctx: &Context,
     id: i64,
-    host: &str,
-    port: u16,
-    kind: t1::CheckKind,
+    target: &t1::Target<'_>,
     step: i64,
     delays: &[i64],
 ) {
     let connect_timeout = Duration::from_secs(ctx.config.probe.connect_timeout_secs.max(1));
     let tls_timeout = Duration::from_secs(ctx.config.probe.tls_timeout_secs.max(1));
-    let outcome = t1::run(host, port, kind, connect_timeout, tls_timeout).await;
+    let outcome = t1::run(target, connect_timeout, tls_timeout).await;
     let now = now_ts();
 
     match outcome {
@@ -494,7 +521,7 @@ async fn perform_quarantine_check(
                     ok: true,
                     latency_ms: Some(latency),
                     error: None,
-                    probe_kind: kind.as_str(),
+                    probe_kind: target.kind.as_str(),
                 },
             )
             .await;
@@ -524,7 +551,7 @@ async fn perform_quarantine_check(
                     ok: false,
                     latency_ms: None,
                     error: Some(&reason),
-                    probe_kind: kind.as_str(),
+                    probe_kind: target.kind.as_str(),
                 },
             )
             .await;
@@ -569,10 +596,20 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     // got a t2 row, so the selector re-served them every cycle).
     let mut batch: Vec<_> = Vec::with_capacity(rows.len());
     let fail_limit = ctx.config.probe.fail_limit;
-    let min_secs =
-        i64::try_from(ctx.config.probe.second_chance_min_hours * 3600).unwrap_or(i64::MAX);
-    let spread_secs =
-        i64::try_from(ctx.config.probe.second_chance_spread_hours * 3600).unwrap_or(0);
+    let min_secs = i64::try_from(
+        ctx.config
+            .probe
+            .second_chance_min_hours
+            .saturating_mul(3600),
+    )
+    .unwrap_or(i64::MAX);
+    let spread_secs = i64::try_from(
+        ctx.config
+            .probe
+            .second_chance_spread_hours
+            .saturating_mul(3600),
+    )
+    .unwrap_or(0);
     let mut blocked = 0usize;
     for row in rows {
         let scheme = row.scheme.parse::<Scheme>().ok();
@@ -608,11 +645,28 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
         return Ok(batch.len() + blocked);
     }
 
-    let yaml = clash::generate(&batch)?;
+    let (yaml, included) = clash::generate(&batch)?;
     let config_path = &ctx.config.meow.config_path;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // The YAML carries every proxy credential of the batch in plain text —
+    // same exposure as the SQLite database, same 0600 answer (the DB chmod
+    // rationale lives in fumox-core/src/db.rs). The mode is set at creation
+    // time so the file is never briefly world-readable.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(config_path)?;
+        file.write_all(yaml.as_bytes())?;
+    }
+    #[cfg(not(unix))]
     std::fs::write(config_path, yaml)?;
 
     if let Err(error) = ctx.meow.reload_config(config_path).await {
@@ -633,6 +687,19 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut tasks = tokio::task::JoinSet::new();
     for row in batch {
+        // Rows that never made it into the generated config (their entry
+        // could not be serialized, `clash::generate` skipped them) must get
+        // the real reason journaled — routing them through the engine would
+        // produce a misleading "proxy not found" failure.
+        if !included.contains(&row.id) {
+            journal_and_fail(
+                &ctx,
+                row.id,
+                "proxy entry cannot be serialized for the T2 engine config",
+            )
+            .await;
+            continue;
+        }
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
         let aborted = aborted.clone();
         tasks.spawn(async move {
@@ -760,8 +827,10 @@ async fn journal_and_fail(ctx: &Context, id: i64, reason: &str) {
     )
     .await;
     let probe = &ctx.config.probe;
-    let min_secs = i64::try_from(probe.second_chance_min_hours * 3600).unwrap_or(i64::MAX);
-    let spread_secs = i64::try_from(probe.second_chance_spread_hours * 3600).unwrap_or(0);
+    let min_secs =
+        i64::try_from(probe.second_chance_min_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
+    let spread_secs =
+        i64::try_from(probe.second_chance_spread_hours.saturating_mul(3600)).unwrap_or(0);
     if let Err(error) =
         proxies::check_failed(&ctx.pool, id, now, probe.fail_limit, min_secs, spread_secs).await
     {

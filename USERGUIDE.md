@@ -343,10 +343,14 @@ A five-minute walkthrough, assuming the stack is running
    `http://<host>:8080/sub/nNqRYHbOSqM5` (or with `?token=…` if you set an
    access token). Paste it into your proxy client as a subscription.
 
-5. **Watch it live.** The dashboard shows source/proxy counts and errors; the
-   *Proxies* browser lists every node with its status, country and latency;
-   the *Probe* page shows the health-check daemon's heartbeat and the
-   quarantine queue. Updates arrive live over server-sent events.
+5. **Watch it live.** The dashboard shows source/proxy counts and errors,
+   recent fetches, the **Top Failure Reasons** panel over a 24 h rolling
+   window, and per-source aggregates — every "top-N" knob on the page
+   shares one per-admin cookie `fumox_dash_top_n` (5/10/15/25/50,
+   defaults to 10); the *Proxies* browser lists every node with its
+   status, country and latency; the *Probe* page shows the health-check
+   daemon's heartbeat and the quarantine queue (true count, not the
+   previewed slice). Updates arrive live over server-sent events.
 
 From here on, Fumox keeps fetching your sources (hourly by default), and the
 probe keeps checking proxies. Dead nodes drop out of the subscription

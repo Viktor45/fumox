@@ -329,8 +329,9 @@ pub async fn login_submit(
 }
 
 /// Language switch: persists the choice in the `fumox_lang` cookie and
-/// redirects back to `next` (restricted to `/admin` paths, so no open
-/// redirect). Mounted outside the auth/CSRF layers so it works pre-auth.
+/// redirects back to `next` (validated by `super::admin_next` — admin-surface
+/// paths only, no open redirect). Mounted outside the auth/CSRF layers so it
+/// works pre-auth.
 pub async fn set_lang(
     State(state): State<AdminState>,
     Query(params): Query<HashMap<String, String>>,
@@ -339,16 +340,12 @@ pub async fn set_lang(
         .get("lang")
         .map(|value| state.locales.resolve(value))
         .unwrap_or_else(|| state.locales.default_lang());
-    let next = params
-        .get("next")
-        .map(String::as_str)
-        .filter(|next| next.starts_with("/admin"))
-        .unwrap_or("/admin");
+    let next = super::admin_next(&params);
     (
         StatusCode::SEE_OTHER,
         [
             (header::SET_COOKIE, i18n::lang_cookie(lang.code())),
-            (header::LOCATION, next.to_string()),
+            (header::LOCATION, next),
         ],
     )
         .into_response()

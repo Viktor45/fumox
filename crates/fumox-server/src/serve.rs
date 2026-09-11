@@ -18,7 +18,7 @@ use crate::cache::{Caches, Rendered};
 use crate::pipeline::{self, Candidate, CompiledPipeline, PipelineIssue};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -110,11 +110,16 @@ pub fn router(state: AppState) -> Router {
 /// counts against the strict `[server].auth_fail_rate_limit`, and once that
 /// window is exhausted the endpoint answers 429 instead. Requests without
 /// connect info (unit tests, embedded runtimes) pass through uncounted.
+///
+/// The listener installs `into_make_service_with_connect_info::<SocketAddr>()`,
+/// which stores the peer address as `ConnectInfo<SocketAddr>` — reading the
+/// bare `SocketAddr` here would silently match nothing and disable the whole
+/// limiter (regression fixed 2026-09-11).
 async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(ip) = req
         .extensions()
-        .get::<SocketAddr>()
-        .map(|addr| addr.ip().to_string())
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip().to_string())
     else {
         return next.run(req).await;
     };
@@ -761,13 +766,38 @@ mod tests {
     }
 
     /// Perform one GET carrying a peer-address extension — the public
-    /// rate-limit middleware keys on it.
+    /// rate-limit middleware keys on it. The extension is inserted exactly
+    /// the way `into_make_service_with_connect_info` does in production
+    /// (`ConnectInfo<SocketAddr>`), so the test fails if the middleware
+    /// ever reads the wrong extension type again.
     async fn get_with_ip(app: Router, uri: &str, ip: &str) -> StatusCode {
         let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
-        request
-            .extensions_mut()
-            .insert(format!("{ip}:1").parse::<SocketAddr>().unwrap());
+        request.extensions_mut().insert(ConnectInfo(
+            format!("{ip}:1").parse::<SocketAddr>().unwrap(),
+        ));
         app.oneshot(request).await.unwrap().status()
+    }
+
+    /// Requests without connect info (embedded runtimes) must pass through
+    /// uncounted: with a ceiling of 1, three extension-less requests all
+    /// reach the handler instead of tripping the limiter.
+    #[tokio::test]
+    async fn requests_without_connect_info_pass_through_uncounted() {
+        let state = state_with_limits(PublicRateLimits::new(1, 1)).await;
+        let app = router(state);
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/sub/missing")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]

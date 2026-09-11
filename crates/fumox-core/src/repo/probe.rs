@@ -66,6 +66,33 @@ pub async fn last_failed_kind(pool: &DbPool, proxy_id: i64) -> crate::Result<Opt
     Ok(row.map(|(kind,)| kind))
 }
 
+/// Aggregate the most common probe failure reasons (`probe_results.error`)
+/// over a rolling time window, ordered by hit count descending. Used by the
+/// admin dashboard's Top Failure Reasons widget.
+///
+/// `since_ts` is the lower bound on `checked_at` (Unix seconds, inclusive);
+/// `limit` caps the returned rows. Errors with `NULL` reason text are
+/// excluded — they are uninformative aggregates of successful probes that
+/// stored no diagnostic.
+pub async fn top_failure_reasons(
+    pool: &DbPool,
+    since_ts: i64,
+    limit: i64,
+) -> crate::Result<Vec<(String, i64)>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT error, COUNT(*) AS hits FROM probe_results
+         WHERE ok = 0 AND error IS NOT NULL AND checked_at >= ?
+         GROUP BY error
+         ORDER BY hits DESC, error ASC
+         LIMIT ?",
+    )
+    .bind(since_ts)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------------------
 // Priority queue (`probe_requests`, SPEC §8.3)
 // ---------------------------------------------------------------------------
@@ -321,6 +348,84 @@ mod tests {
             last_failed_kind(&pool, id).await.unwrap().as_deref(),
             Some("tls")
         );
+    }
+
+    #[tokio::test]
+    async fn top_failure_reasons_groups_by_error_and_orders_by_hits() {
+        let pool = temp_pool().await;
+        let id = insert_proxy(&pool, "fp-fail", "vless", "alive", false).await;
+
+        // Five distinct failure reasons with hit counts 3, 5, 1 plus one
+        // NULL (which must be excluded) and one row outside the window.
+        let cases: &[(i64, Option<&str>)] = &[
+            (100, Some("timeout")),
+            (110, Some("timeout")),
+            (120, Some("timeout")),
+            (200, Some("tls handshake failed")),
+            (210, Some("tls handshake failed")),
+            (220, Some("tls handshake failed")),
+            (230, Some("tls handshake failed")),
+            (240, Some("tls handshake failed")),
+            (300, Some("reset by peer")),
+            // Outside the window:
+            (50, Some("timeout")),
+            // Excluded (NULL reason):
+            (400, None),
+        ];
+        for (ts, err) in cases {
+            insert(
+                &pool,
+                &ProbeResultEntry {
+                    proxy_id: id,
+                    checked_at: *ts,
+                    ok: false,
+                    latency_ms: None,
+                    error: *err,
+                    probe_kind: "tcp",
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Window starts at 100; expect 3 distinct reasons, ordered by hits desc
+        // then by reason text asc (deterministic tie-break).
+        let top = top_failure_reasons(&pool, 100, 10).await.unwrap();
+        assert_eq!(
+            top,
+            vec![
+                ("tls handshake failed".to_string(), 5),
+                ("timeout".to_string(), 3),
+                ("reset by peer".to_string(), 1),
+            ]
+        );
+
+        // The limit truncates the result regardless of hit counts.
+        let top2 = top_failure_reasons(&pool, 100, 2).await.unwrap();
+        assert_eq!(top2.len(), 2);
+        assert_eq!(top2[0].0, "tls handshake failed");
+        assert_eq!(top2[1].0, "timeout");
+
+        // An empty window returns nothing.
+        let empty = top_failure_reasons(&pool, 9_999_999, 10).await.unwrap();
+        assert!(empty.is_empty());
+
+        // Successful probes do not contribute (their `error` column is NULL).
+        insert(
+            &pool,
+            &ProbeResultEntry {
+                proxy_id: id,
+                checked_at: 500,
+                ok: true,
+                latency_ms: Some(20),
+                error: None,
+                probe_kind: "tcp",
+            },
+        )
+        .await
+        .unwrap();
+        let after_success = top_failure_reasons(&pool, 100, 10).await.unwrap();
+        assert_eq!(after_success.len(), 3); // unchanged
     }
 
     /// Minimal proxies fixture: rows are linked to a source unless

@@ -34,7 +34,13 @@ fn num(value: i64) -> Value {
     Value::Number(value.into())
 }
 
-/// Generate the full Clash config for one T2 batch.
+/// Generate the full Clash config for one T2 batch, returning the YAML plus
+/// the ids of the rows actually included in it.
+///
+/// Rows whose entry cannot be serialized are skipped (`None` from
+/// [`proxy_to_value`]) and their ids stay out of the returned list — the
+/// caller must journal them explicitly, otherwise the engine later answers
+/// "proxy not found" for them and the journal shows a misleading reason.
 ///
 /// Listener ports are disabled (`0`): meow-rs only needs the proxy
 /// definitions to run delay tests. Proxy definitions come from the shared
@@ -48,8 +54,15 @@ fn num(value: i64) -> Value {
 /// impersonate the server and harvest it. `skip-cert-verify` is therefore
 /// emitted by the core mapping only for entries whose own parameters ask for
 /// it (security audit, 2026-09-05).
-pub fn generate(rows: &[ProxyRow]) -> serde_norway::Result<String> {
-    let proxies: Vec<Value> = rows.iter().filter_map(proxy_to_value).collect();
+pub fn generate(rows: &[ProxyRow]) -> serde_norway::Result<(String, Vec<i64>)> {
+    let mut included = Vec::new();
+    let mut proxies = Vec::new();
+    for row in rows {
+        if let Some(value) = proxy_to_value(row) {
+            included.push(row.id);
+            proxies.push(value);
+        }
+    }
 
     let mut root = serde_norway::Mapping::new();
     root.insert(Value::String("port".into()), num(0));
@@ -61,7 +74,7 @@ pub fn generate(rows: &[ProxyRow]) -> serde_norway::Result<String> {
         Value::String("silent".into()),
     );
     root.insert(Value::String("proxies".into()), Value::Sequence(proxies));
-    serde_norway::to_string(&Value::Mapping(root))
+    Ok((serde_norway::to_string(&Value::Mapping(root))?, included))
 }
 
 /// Map one DB row onto a Clash proxy definition; returns `None` for
@@ -167,7 +180,7 @@ mod tests {
             ),
         ];
 
-        let yaml = generate(&rows).unwrap();
+        let (yaml, _) = generate(&rows).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies.len(), 6);
@@ -223,7 +236,7 @@ mod tests {
         assert!(!is_supported(Scheme::Naive));
 
         let rows = vec![row_from_entry(9, entry(Scheme::Tuic, "c", &[]))];
-        let yaml = generate(&rows).unwrap();
+        let (yaml, _) = generate(&rows).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert!(parsed["proxies"].as_sequence().unwrap().is_empty());
     }
@@ -244,7 +257,7 @@ mod tests {
                 entry(Scheme::Trojan, "pass", &[("skip-cert-verify", "true")]),
             ),
         ];
-        let yaml = generate(&rows).unwrap();
+        let (yaml, _) = generate(&rows).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
 

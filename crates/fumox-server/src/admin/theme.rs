@@ -86,16 +86,12 @@ pub async fn set_theme(Query(params): Query<HashMap<String, String>>) -> Respons
         .get("theme")
         .map(|value| Theme::parse(value))
         .unwrap_or_default();
-    let next = params
-        .get("next")
-        .map(String::as_str)
-        .filter(|next| next.starts_with("/admin"))
-        .unwrap_or("/admin");
+    let next = super::admin_next(&params);
     (
         StatusCode::SEE_OTHER,
         [
             (header::SET_COOKIE, theme_cookie(theme)),
-            (header::LOCATION, next.to_string()),
+            (header::LOCATION, next),
         ],
     )
         .into_response()

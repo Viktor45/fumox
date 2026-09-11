@@ -200,6 +200,25 @@ a:hover { text-decoration: underline; }
 }
 .page-head h1 { font-size: 21px; margin: 0; flex: 1; }
 
+/* Dashboard Top-N selector — small form, right side of the page-head.
+   Drops to a new line on narrow screens via the parent's flex-wrap. */
+.topn-picker { font-size: 13px; color: var(--muted); }
+.topn-picker label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.topn-picker select {
+  font-size: 13px;
+  font-family: inherit;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
 /* ---------- tables ---------- */
 
 table.data {

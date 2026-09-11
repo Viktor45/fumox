@@ -41,7 +41,17 @@ impl MeowClient {
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(timeout)
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .unwrap_or_else(|_| {
+                    // The builder above cannot fail with static settings,
+                    // but a plain `Client::new()` fallback would defeat the
+                    // whole timeout floor — carry the timeouts into the
+                    // fallback too.
+                    reqwest::Client::builder()
+                        .connect_timeout(Duration::from_secs(5))
+                        .timeout(timeout)
+                        .build()
+                        .expect("fallback client uses the same static, valid settings")
+                }),
             base_url: format!("http://{}", config.api_addr),
             test_urls: config.test_url.clone(),
             timeout,

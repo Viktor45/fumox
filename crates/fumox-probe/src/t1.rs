@@ -119,30 +119,60 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
     }
 }
 
-/// Run one T1 check against `host:port`. Returns the elapsed time on
-/// success or a human-readable failure reason (journaled verbatim into
-/// `probe_results.error`).
+/// One vetted T1 dial target: `host` is the name as stored (used for the
+/// TLS SNI), `vetted` holds the SSRF-approved addresses to dial.
+pub struct Target<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub kind: CheckKind,
+    pub vetted: &'a [std::net::IpAddr],
+}
+
+/// Run one T1 check, dialing only the addresses the SSRF gate already
+/// vetted. Returns the elapsed time on success or a human-readable failure
+/// reason (journaled verbatim into `probe_results.error`).
+///
+/// `target.vetted` must be non-empty: it is what `fumox_core::ssrf::
+/// vet_probe_host_addrs` returned for `target.host` moments ago. Connecting
+/// to those exact IPs (instead of re-resolving the hostname) closes the
+/// DNS-rebinding window between vet and dial, and sidesteps the IPv6
+/// `host:port` formatting trap entirely — a `SocketAddr` needs no brackets.
 pub async fn run(
-    host: &str,
-    port: u16,
-    kind: CheckKind,
+    target: &Target<'_>,
     connect_timeout: Duration,
     tls_timeout: Duration,
 ) -> Result<Duration, String> {
-    let addr = format!("{host}:{port}");
     let started = Instant::now();
 
-    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(&addr))
-        .await
-        .map_err(|_| format!("tcp connect timed out after {}s", connect_timeout.as_secs()))?
-        .map_err(|e| format!("tcp connect failed: {e}"))?;
+    // Try each vetted address in order; the first successful connect wins.
+    // The timeout covers one dial attempt, mirroring the previous single-
+    // address behaviour; a multi-address host costs at most
+    // `vetted.len() × connect_timeout`.
+    let mut stream = None;
+    let mut last_error = "no vetted address to connect to".to_string();
+    for ip in target.vetted {
+        let addr = std::net::SocketAddr::new(*ip, target.port);
+        match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => {
+                stream = Some(s);
+                break;
+            }
+            Ok(Err(e)) => last_error = format!("tcp connect failed: {e}"),
+            Err(_) => {
+                last_error = format!("tcp connect timed out after {}s", connect_timeout.as_secs())
+            }
+        }
+    }
+    let Some(stream) = stream else {
+        return Err(last_error);
+    };
 
-    if kind == CheckKind::Tcp {
+    if target.kind == CheckKind::Tcp {
         return Ok(started.elapsed());
     }
 
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|e| format!("invalid TLS server name {host:?}: {e}"))?;
+    let server_name = rustls::pki_types::ServerName::try_from(target.host.to_string())
+        .map_err(|e| format!("invalid TLS server name {}: {e}", target.host))?;
     let handshake = tls_connector().connect(server_name, stream);
     tokio::time::timeout(tls_timeout, handshake)
         .await
@@ -197,9 +227,34 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let result = run(
-            "127.0.0.1",
-            port,
-            CheckKind::Tcp,
+            &Target {
+                host: "127.0.0.1",
+                port,
+                kind: CheckKind::Tcp,
+                vetted: &["127.0.0.1".parse().unwrap()],
+            },
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok(), "expected a successful connect: {result:?}");
+    }
+
+    /// An IPv6-literal host connects fine when dialed as a `SocketAddr` —
+    /// the previous `format!("{host}:{port}")` produced an unparseable
+    /// `2001:db8::1:443` string and every IPv6 proxy failed T1.
+    #[tokio::test]
+    async fn tcp_check_handles_ipv6_loopback() {
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let result = run(
+            &Target {
+                host: "::1",
+                port,
+                kind: CheckKind::Tcp,
+                vetted: &["::1".parse().unwrap()],
+            },
             Duration::from_secs(2),
             Duration::from_secs(2),
         )
@@ -216,9 +271,12 @@ mod tests {
         drop(listener);
 
         let result = run(
-            "127.0.0.1",
-            port,
-            CheckKind::Tcp,
+            &Target {
+                host: "127.0.0.1",
+                port,
+                kind: CheckKind::Tcp,
+                vetted: &["127.0.0.1".parse().unwrap()],
+            },
             Duration::from_secs(2),
             Duration::from_secs(2),
         )

@@ -7,11 +7,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # sqlx links the system SQLite (not bundled), so headers are required.
       - name: Install SQLite dev package

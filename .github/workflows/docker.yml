@@ -62,17 +62,20 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Compute image name
         id: image
+        env:
+          REPO: ${{ github.repository }}
         run: |
-          echo "name=${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" \
+          echo "name=${REGISTRY}/$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')" \
             >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -155,8 +158,10 @@ jobs:
 
       - name: Compute image name
         id: image
+        env:
+          REPO: ${{ github.repository }}
         run: |
-          echo "name=${{ env.REGISTRY }}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" \
+          echo "name=${REGISTRY}/$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')" \
             >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
@@ -173,10 +178,12 @@ jobs:
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ steps.image.outputs.name }}@sha256:%s ' *)
+            $(printf '%s@sha256:%s ' "${IMAGE}" *)
 
       - name: Inspect image
         run: |

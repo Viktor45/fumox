@@ -27,7 +27,9 @@ podman pull ghcr.io/viktor45/fumox-meow:latest
 podman tag ghcr.io/viktor45/fumox-meow:latest localhost/fumox-meow:local
 ```
 
-`ghcr.io/viktor45/fumox` публикует CI (`.github/workflows/docker.yml`);
+`ghcr.io/viktor45/fumox` публикуется workflow `.github/workflows/docker.yml`
+по тегам `v*` и вручную через `workflow_dispatch` (см. заголовок файла —
+автосборки при push в `main` нет);
 `ghcr.io/viktor45/fumox-meow` упаковывается вручную workflow'ом
 `docker-meow.yml`. Можно обойтись без перетегирования — поправьте строки
 `Image=` в юнитах на GHCR-имена напрямую; там же удобно запиннить версию

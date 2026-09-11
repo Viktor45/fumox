@@ -228,11 +228,12 @@ Notes:
 ### Option B — Pre-built container image
 
 CI publishes a multi-arch image (`linux/amd64` + `linux/arm64`, each platform
-attested with build provenance) to GHCR on every push to `main` and on `v*`
-tags: `ghcr.io/viktor45/fumox`. Tags: a push to `main` — `main`,
-`sha-<short sha>` and `latest`; a `v0.2.0` tag adds `0.2.0` and `0.2`. The image
-ships **both** binaries; the server is the default command, the probe is a
-command override.
+attested with build provenance) to GHCR **on `v*` tags and via manual
+dispatch** — `.github/workflows/docker.yml`: `ghcr.io/viktor45/fumox`. Tags:
+a `v0.2.0` tag adds `0.2.0`, `0.2`, `sha-<short sha>` and `latest`; a manual
+dispatch from another branch only adds the ref/sha tags, not `latest`. There
+is no automatic rebuild on push to `main`. The image ships **both** binaries;
+the server is the default command, the probe is a command override.
 
 ```bash
 # Server

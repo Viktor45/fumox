@@ -12,10 +12,11 @@
 # digest, so the final manifest list is fully attested per platform.
 #
 # Resulting tags:
-#   push to main  -> main, sha-<shortsha>, latest
-#   push v0.2.0   -> 0.2.0, 0.2, sha-<shortsha>, latest
-# (`latest` follows main builds and v* releases; a manual dispatch from
-# another branch does not move it.)
+#   push v0.2.0       -> 0.2.0, 0.2, sha-<shortsha>, latest
+#   workflow_dispatch -> ref/sha tags from docker/metadata-action (no `latest`
+#                        unless the dispatched ref is main or a v* tag).
+# There is no automatic rebuild on push to `main` — only `v*` tags and manual
+# dispatch trigger this workflow (see the `on:` block below).
 #
 # Run the image (see Dockerfile header for details; admin stays loopback-only
 # on the host, and the probe runs as the command argument — tini remains the

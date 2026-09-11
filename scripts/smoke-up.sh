@@ -38,7 +38,27 @@ else
 fi
 
 # --- pre-flight ----------------------------------------------------------------
-port_busy() { lsof -ti ":$1" >/dev/null 2>&1; }
+# Check whether a TCP port on this host already has a listener. lsof is on
+# macOS and most Linux installs; parse /proc/net/tcp{,6} on bare Linux where
+# it's missing. Returns 0 if the port is busy, 1 if it's free (port_busy name
+# kept for grep-friendly exit codes).
+port_busy() {
+    local port="$1" hex
+    hex=$(printf '%04X' "$port")
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -tiTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+        return
+    fi
+    # Linux fallback: /proc/net/tcp{,6} lines have local_address in
+    # "<hex_ip>:<hex_port>"; state 0A == LISTEN. Matches both v4 and v6.
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$f" ] || continue
+        awk -v hex=":$hex" '$4 == "0A" && $2 ~ hex"$" { found=1 } END { exit found ? 0 : 1 }' "$f"
+        return
+    done
+    # No /proc/net/tcp and no lsof: assume free rather than falsely abort.
+    return 1
+}
 for port in "$SMOKE_PUBLIC_PORT" "$SMOKE_ADMIN_PORT"; do
     if port_busy "$port"; then
         echo "error: host port $port is already in use; free it or pick another via" >&2

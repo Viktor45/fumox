@@ -3,6 +3,10 @@
 .github
 .dockerignore
 Dockerfile
+# Excludes the top-level ./docker/ tree from the root build context only.
+# The meow wrapper image builds with its own context (./docker/meow),
+# so removing this line is also safe today; keep it for clarity and to
+# prevent a future shared/ subdir from leaking into the fumox image.
 docker
 scripts
 

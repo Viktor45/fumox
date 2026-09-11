@@ -75,8 +75,10 @@ cp config/GeoLite2-*.mmdb ~/fumox/config/   # опционально: гео-о�
    systemctl --user start fumox-pod.service
    ```
 
-   Старт пода поднимает все три контейнера (probe стартует после server и
-   ждет, пока тот мигрирует БД, — аналог `depends_on` в compose).
+   Старт пода поднимает все три контейнера (probe запускается после server
+   согласно зависимости пода в quadlet; сервер мигрирует БД при первом
+   подключении, а probe при `database is locked` повторяет попытки по своему
+   backoff).
 
 3. Автостарт без активной сессии: `loginctl enable-linger $USER`.
 

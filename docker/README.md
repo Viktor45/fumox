@@ -27,11 +27,13 @@ podman pull ghcr.io/viktor45/fumox-meow:latest
 podman tag ghcr.io/viktor45/fumox-meow:latest localhost/fumox-meow:local
 ```
 
-`ghcr.io/viktor45/fumox` is pushed by CI (`.github/workflows/docker.yml`);
-`ghcr.io/viktor45/fumox-meow` is packaged manually by the `docker-meow.yml`
-workflow. To skip the retagging, edit the `Image=` lines of the units to the
-GHCR names directly — that is also where you pin a version
-(`ghcr.io/viktor45/fumox:0.2.0`) instead of `latest`.
+`ghcr.io/viktor45/fumox` is published by `.github/workflows/docker.yml` on
+`v*` tags and manual `workflow_dispatch` (see the in-file header for the
+current tag rules — there is no automatic rebuild on push to `main`).
+`ghcr.io/viktor45/fumox-meow` is packaged manually by `docker-meow.yml`. To
+skip the retagging, edit the `Image=` lines of the units to the GHCR names
+directly — that is also where you pin a version (`ghcr.io/viktor45/fumox:0.2.0`)
+instead of `latest`.
 
 **Option 2 — build from source** (from the repository root):
 
@@ -75,8 +77,10 @@ cp config/GeoLite2-*.mmdb ~/fumox/config/   # optional: geo enrichment
    systemctl --user start fumox-pod.service
    ```
 
-   Starting the pod pulls up all three containers (probe waits for the
-   server to migrate the DB first — the `depends_on` of compose).
+   Starting the pod pulls up all three containers (probe starts after the
+   server via the quadlet pod dependency; the server migrates the DB on
+   first connect, and the probe retries on `database is locked` with its
+   own backoff).
 
 3. Autostart without an active login session: `loginctl enable-linger $USER`.
 

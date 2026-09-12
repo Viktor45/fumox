@@ -93,8 +93,8 @@
         <tbody>
           {% for row in queue %}
           <tr>
-            <td><a href="/admin/proxies/{{ row.id }}">{{ row.name }}</a>
-                <span class="small muted">{{ row.host }}:<wbr>{{ row.port }}</span></td>
+            <td class="queue-name"><a href="/admin/proxies/{{ row.id }}">{{ self.display_name(&row.name, &row.host, row.port) }}</a>
+                {% if !row.name.trim().is_empty() %}<span class="small muted queue-addr">{{ row.host }}:<wbr>{{ row.port }}</span>{% endif %}</td>
             <td class="mono small">{{ row.scheme }}</td>
             <td class="small muted">{{ self.opt_ts(&row.quarantined_at) | safe }}</td>
             <td class="small muted">{{ self.step_label(&row) }}</td>

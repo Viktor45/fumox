@@ -31,7 +31,7 @@
   <div class="panel">
     <h2>{{ self.t("px.model_params") }}</h2>
     <table class="kv">
-      <tr><th>{{ self.t("common.name") }}</th><td class="small">{{ proxy.name }}</td></tr>
+      <tr><th>{{ self.t("common.name") }}</th><td class="small">{{ self.display_name(&proxy.name, &proxy.host, proxy.port) }}</td></tr>
       <tr><th>{{ self.t("common.protocol") }}</th><td class="mono small">{{ proxy.scheme }}</td></tr>
       <tr><th>{{ self.t("px.address") }}</th><td class="mono small">{{ proxy.host }}:<wbr>{{ proxy.port }}</td></tr>
       {# The credential is shown in the open: the card also renders the raw

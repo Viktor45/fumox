@@ -17,10 +17,10 @@ If you only have five minutes, read sections [1](#1-what-is-fumox),
   - [2. How it works](#2-how-it-works)
   - [3. Key concepts](#3-key-concepts)
   - [4. Quick start](#4-quick-start)
-    - [Option A — Docker Compose (recommended)](#option-a--docker-compose-recommended)
-    - [Option B — Pre-built container image](#option-b--pre-built-container-image)
-    - [Option C — Build from source](#option-c--build-from-source)
-  - [5. Your first subscription — step by step](#5-your-first-subscription--step-by-step)
+    - [Option A – Docker Compose (recommended)](#option-a--docker-compose-recommended)
+    - [Option B – Pre-built container image](#option-b--pre-built-container-image)
+    - [Option C – Build from source](#option-c--build-from-source)
+  - [5. Your first subscription – step by step](#5-your-first-subscription--step-by-step)
   - [6. Subscription endpoints](#6-subscription-endpoints)
     - [Access tokens](#access-tokens)
     - [Output formats](#output-formats)
@@ -34,22 +34,22 @@ If you only have five minutes, read sections [1](#1-what-is-fumox),
     - [Languages and themes](#languages-and-themes)
   - [8. Configuration reference](#8-configuration-reference)
     - [How configuration is resolved](#how-configuration-is-resolved)
-    - [`[server]` — public listener](#server--public-listener)
-    - [`[database]` — SQLite](#database--sqlite)
-    - [`[fetch]` — source fetching](#fetch--source-fetching)
-    - [`[ingest]` — source ingestion](#ingest--source-ingestion)
-    - [`[geo]` — geo enrichment](#geo--geo-enrichment)
-    - [`[admin]` — admin panel](#admin--admin-panel)
-    - [`[probe]` — health-check daemon](#probe--health-check-daemon)
-    - [`[meow]` — meow-rs integration (T2)](#meow--meow-rs-integration-t2)
-    - [`[retention]` — history rotation](#retention--history-rotation)
-    - [`[log]` — console log levels](#log--console-log-levels)
+    - [`[server]` – public listener](#server--public-listener)
+    - [`[database]` – SQLite](#database--sqlite)
+    - [`[fetch]` – source fetching](#fetch--source-fetching)
+    - [`[ingest]` – source ingestion](#ingest--source-ingestion)
+    - [`[geo]` – geo enrichment](#geo--geo-enrichment)
+    - [`[admin]` – admin panel](#admin--admin-panel)
+    - [`[probe]` – health-check daemon](#probe--health-check-daemon)
+    - [`[meow]` – meow-rs integration (T2)](#meow--meow-rs-integration-t2)
+    - [`[retention]` – history rotation](#retention--history-rotation)
+    - [`[log]` – console log levels](#log--console-log-levels)
   - [9. The processing pipeline](#9-the-processing-pipeline)
   - [10. Health checks and proxy lifecycle](#10-health-checks-and-proxy-lifecycle)
     - [The status state machine](#the-status-state-machine)
   - [11. Geo enrichment](#11-geo-enrichment)
   - [12. Data, backups, retention](#12-data-backups-retention)
-  - [13. Running in production — checklist](#13-running-in-production--checklist)
+  - [13. Running in production – checklist](#13-running-in-production--checklist)
   - [14. Troubleshooting](#14-troubleshooting)
   - [15. Where to read more](#15-where-to-read-more)
 
@@ -58,8 +58,8 @@ If you only have five minutes, read sections [1](#1-what-is-fumox),
 ## 1. What is Fumox
 
 **Fumox** is a lightweight proxy-subscription aggregation service written in
-Rust. You point it at any number of *subscription sources* — URLs that return
-lists of proxy links — and Fumox turns that chaos into clean, filtered
+Rust. You point it at any number of *subscription sources* (URLs that return
+lists of proxy links), and Fumox turns that chaos into clean, filtered
 subscriptions you can paste straight into your proxy client (v2rayN, Nekobox,
 Clash/Mihomo, sing-box and similar).
 
@@ -71,7 +71,7 @@ Concretely, Fumox:
 - **Parses** every proxy line into a normalized model. Supported protocols:
   `vless`, `vmess`, `trojan`, `ss` (Shadowsocks), `hysteria2`, `tuic`, `mieru`,
   `socks5`, `naive+https`. Parameters Fumox doesn't recognize are carried
-  through untouched — nothing is ever lost.
+  through untouched: nothing is ever lost.
 - **Processes** proxies through a configurable pipeline: protocol filters,
   regex renaming, geo-tagging with country flags, health filtering,
   deduplication, sorting.
@@ -88,7 +88,7 @@ What this means in practice:
 | Dead proxies sit in your client until you notice                 | Dead proxies are quarantined automatically |
 | The same node appears three times under different names          | Duplicates are merged across all sources   |
 | Names like `relay-01-xyz`                                        | Names like `🇩🇪 Germany · relay-01-xyz`      |
-| One format per source                                            | One format per profile — you choose        |
+| One format per source                                            | One format per profile – you choose        |
 
 ## 2. How it works
 
@@ -99,9 +99,9 @@ Fumox is a Cargo workspace with three crates and one external helper:
 | `fumox-core`   | library          | Shared data models, SQLite storage and migrations, protocol parsers/serializers, geo resolution, fingerprinting, configuration loading                                 |
 | `fumox-server` | binary           | Fetches sources, runs the processing pipeline, serves subscriptions (`/sub`, `/src`) and the admin panel                                                               |
 | `fumox-probe`  | binary           | Health-check daemon: probes proxies and manages their lifecycle (alive / quarantine / removed)                                                                         |
-| **meow-rs**    | external process | A mihomo/Clash-compatible proxy kernel with a REST API. The probe drives it for real tunnel checks (T2). Fumox never installs or manages it — it only talks to its API |
+| **meow-rs**    | external process | A mihomo/Clash-compatible proxy kernel with a REST API. The probe drives it for real tunnel checks (T2). Fumox never installs or manages it: it only talks to its API |
 
-Everything shares one SQLite database in WAL mode — it is the single source of
+Everything shares one SQLite database in WAL mode: it is the single source of
 truth. In-memory caches exist only to answer requests faster.
 
 ```mermaid
@@ -114,7 +114,7 @@ flowchart LR
     ADMIN["Admin panel<br/>http://127.0.0.1:8081"] --> SRV
 ```
 
-**A request's journey.** When your proxy client polls
+**What happens on a request.** When your proxy client polls
 `GET /sub/{token}`, the server assembles the profile's sources, applies the
 pipeline (filters → rename → geo → health filter → dedup → sort), encodes the
 result in the profile's output format and answers. The rendered result is
@@ -124,7 +124,7 @@ background (stale-while-revalidate).
 **The background loop.** Independently of requests, `fumox-server` runs a
 scheduler that periodically re-fetches every enabled source, reconciles the
 parsed proxies with the database (new → insert, gone → unlink; an `alive`
-proxy stays linked while the probe confirms it — see alive-linger in
+proxy stays linked while the probe confirms it (see alive-linger in
 [section 10](#10-health-checks-and-proxy-lifecycle), reappeared → refresh
 identity fields only), and journals every fetch. Meanwhile `fumox-probe`
 samples proxies and updates their health status, which the health filter
@@ -134,8 +134,8 @@ Two network listeners are involved, on purpose separated:
 
 | Listener | Default address  | Serves                                           | Exposed to the network?                                            |
 | -------- | ---------------- | ------------------------------------------------ | ------------------------------------------------------------------ |
-| Public   | `0.0.0.0:8080`   | `GET /sub/{id}`, `GET /src/{id}`, `GET /healthz` | Yes — this is what your clients poll                               |
-| Admin    | `127.0.0.1:8081` | The admin panel (`/admin/*`)                     | No — loopback only; reach it via SSH tunnel or a TLS reverse proxy |
+| Public   | `0.0.0.0:8080`   | `GET /sub/{id}`, `GET /src/{id}`, `GET /healthz` | Yes – this is what your clients poll                               |
+| Admin    | `127.0.0.1:8081` | The admin panel (`/admin/*`)                     | No – loopback only; reach it via SSH tunnel or a TLS reverse proxy |
 
 ## 3. Key concepts
 
@@ -144,7 +144,7 @@ Two network listeners are involved, on purpose separated:
 | **Source**                     | A subscription URL plus its fetch settings (TTL, encoding, headers, pipeline).                                                                                              |
 | **Proxy**                      | One normalized proxy record. Its identity is a *fingerprint*, not its name.                                                                                                 |
 | **Fingerprint**                | `sha256(scheme \| normalized host \| port \| credential \| security parameters)`. The display name is deliberately excluded, so renaming a proxy never creates a duplicate. |
-| **Profile**                    | A named set of sources + processing rules + output format. Each profile has its own endpoint `/sub/{id or slug}` — this is the URL you put in your client.                  |
+| **Profile**                    | A named set of sources + processing rules + output format. Each profile has its own endpoint `/sub/{id or slug}`; this is the URL you put in your client.                  |
 | **Slug**                       | An optional human-readable identifier for a source or profile (`/sub/my-list` instead of `/sub/nNqRYHbOSqM5`).                                                              |
 | **Pipeline**                   | JSON rules describing how proxies are filtered, renamed, geo-tagged, deduplicated and sorted. A source has its own pipeline; a profile can override it.                     |
 | **Status**                     | A proxy's health state: `unknown`, `alive`, `quarantine`, `removed` (see [section 10](#10-health-checks-and-proxy-lifecycle)).                                              |
@@ -152,17 +152,17 @@ Two network listeners are involved, on purpose separated:
 | **T1 / T2**                    | The two health-check levels: T1 = direct TCP/TLS reachability; T2 = a real tunnel request through meow-rs.                                                                  |
 
 IDs and endpoint tokens are `nanoid(12)` strings over the alphabet
-`A-Za-z0-9_-` (≈71 bits of entropy — brute-forcing them is pointless).
+`A-Za-z0-9_-` (72 bits of entropy, brute-forcing them is pointless).
 
 ## 4. Quick start
 
 Three ways to run Fumox. **Docker Compose is the recommended path**: one
 command gives you the server, the probe daemon and the meow-rs kernel wired
 together. On Podman instead of Docker? The same stack deploys as a
-systemd-managed podman pod via quadlet units — see
-[`docker/README.md`](./docker/README.md).
+systemd-managed podman pod via quadlet units (see
+[`docker/README.md`](./docker/README.md)).
 
-### Option A — Docker Compose (recommended)
+### Option A – Docker Compose (recommended)
 
 Requirements: Docker with the Compose plugin.
 
@@ -173,7 +173,7 @@ cd fumox
 cp .env.example .env
 # edit .env: set a real FUMOX_ADMIN__TOKEN (the admin panel login secret)
 
-docker compose up -d          # prebuilt images from GHCR — the fastest path
+docker compose up -d          # prebuilt images from GHCR, the fastest path
 docker compose up -d --build  # ...or build server + the meow wrapper from source
 ```
 
@@ -185,7 +185,7 @@ the same names. To move to fresh images: `docker compose pull && docker compose 
 That's it. What you get:
 
 - Subscriptions: `http://<host>:8080/sub/{id}`
-- Admin panel: <http://127.0.0.1:8081/admin> — log in with the token from `.env`
+- Admin panel: <http://127.0.0.1:8081/admin> (log in with the token from `.env`)
 - Three containers: `server` (fumox-server), `probe` (fumox-probe), `meow`
   (meow-rs kernel for T2 tunnel checks)
 
@@ -193,9 +193,9 @@ Useful `.env` variables (all except the token are optional):
 
 | Variable                          | Default                               | Purpose                                                                                                                                                          |
 | --------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `FUMOX_ADMIN__TOKEN`              | — (**required**)                      | Admin panel login token. The panel is disabled without it.                                                                                                       |
+| `FUMOX_ADMIN__TOKEN`              | – (**required**)                      | Admin panel login token. The panel is disabled without it.                                                                                                       |
 | `FUMOX_PUBLIC_PORT`               | `8080`                                | Host port for the public listeners; shift it to run a second, isolated stand next to the main one.                                                               |
-| `FUMOX_ADMIN_PORT`                | `8081`                                | Host port for the admin panel (always published to loopback only or `FUMOX_ADMIN_BIND` ).                                                                        |
+| `FUMOX_ADMIN_PORT`                | `8081`                                | Host port for the admin panel (always published to loopback only or `FUMOX_ADMIN_BIND`).                                                                        |
 | `FUMOX_MEOW__TEST_URL`            | `http://www.gstatic.com/generate_204` | URL used for T2 delay tests. Override if it is blocked in your region (e.g. `http://cp.cloudflare.com`).                                                         |
 | `FUMOX_ADMIN__ALLOW_PRIVATE_URLS` | `false`                               | Allow source URLs pointing at private/loopback addresses (disables the SSRF guard). Local testing only.                                                          |
 | `MEOW_VERSION`                    | `latest`                              | The meow-rs release for **local builds** of the wrapper image (`--build` mode; no effect when pulling). `latest` resolves the newest release via the GitHub API; a tag (e.g. `v0.21.2`) pins one. |
@@ -218,18 +218,18 @@ Notes:
   `SMOKE_BIND` and `SMOKE_ADMIN_PORT`), generates its own admin token, waits for startup and
   runs basic checks (`/healthz`, the admin login page, a 404 from a wrong
   alive-export token, all three containers settling into `running` without
-  restarts — a check independent of the configured log levels).
+  restarts, a check independent of the configured log levels).
   `scripts/smoke-down.sh` tears
   it down (volumes deleted unless `--keep-data`). The main stack is never
   touched; both stands share the image tags (`ghcr.io/viktor45/fumox:latest`,
   `ghcr.io/viktor45/fumox-meow:latest`), so the smoke build doubles as the
   main-stack rebuild.
 
-### Option B — Pre-built container image
+### Option B – Pre-built container image
 
 CI publishes a multi-arch image (`linux/amd64` + `linux/arm64`, each platform
 attested with build provenance) to GHCR **on `v*` tags and via manual
-dispatch** — `.github/workflows/docker.yml`: `ghcr.io/viktor45/fumox`. Tags:
+dispatch**; see `.github/workflows/docker.yml`: `ghcr.io/viktor45/fumox`. Tags:
 a `v0.2.0` tag adds `0.2.0`, `0.2`, `sha-<short sha>` and `latest`; a manual
 dispatch from another branch only adds the ref/sha tags, not `latest`. There
 is no automatic rebuild on push to `main`. The image ships **both** binaries;
@@ -244,7 +244,7 @@ docker run -d --name fumox \
   ghcr.io/viktor45/fumox
 
 # Probe (same image, shares the same volumes; fumox-probe is the command
-# argument — tini stays the entrypoint)
+# argument, tini stays the entrypoint)
 docker run -d --name fumox-probe \
   -v fumox-config:/app/config -v fumox-data:/app/data \
   ghcr.io/viktor45/fumox fumox-probe
@@ -253,25 +253,25 @@ docker run -d --name fumox-probe \
 Inside the image: config is read from `/app/config/app.toml` (if mounted), the
 database is `/app/data/fumox.db`, and the admin listener is pre-set to
 `0.0.0.0:8081` (the compose file publishes it loopback-only). There is no
-HTTP client (curl/wget) in the image — point orchestrator health probes at
+HTTP client (curl/wget) in the image; point orchestrator health probes at
 `GET /healthz` on port 8080.
 
-The meow-rs wrapper (`docker/meow/Dockerfile`) is on GHCR too —
-`ghcr.io/viktor45/fumox-meow` — but it is published **manually only**: the
+The meow-rs wrapper (`docker/meow/Dockerfile`) is on GHCR too,
+`ghcr.io/viktor45/fumox-meow`, but it is published **manually only**: the
 `docker-meow.yml` workflow never runs on push or tags; dispatch it from the
-Actions tab (the `meow_version` input: `latest` — the freshest release at
-build time, or a tag like `v0.21.2`). Resulting tags — the `meow_version`
+Actions tab (the `meow_version` input: `latest`, the freshest release at
+build time, or a tag like `v0.21.2`). Resulting tags: the `meow_version`
 value, `main` and `sha-<short sha>`; the attestation is the same, per
 platform. The Option A stack already references this image: `docker compose
 up -d` pulls it, `--build` compiles the wrapper locally (the `.env`
 `MEOW_VERSION` variable picks the release in build mode only).
 
-### Option C — Build from source
+### Option C – Build from source
 
 Requirements:
 
 - Rust toolchain **≥ 1.94** (edition 2024).
-- System SQLite development package — sqlx links the system library, it is not
+- System SQLite development package: sqlx links the system library, it is not
   bundled. On Debian/Ubuntu: `sudo apt install libsqlite3-dev pkg-config`.
 - No OpenSSL needed (rustls), no frontend build step.
 
@@ -295,9 +295,9 @@ Options:
   -V, --version          Print version
 ```
 
-That's the entire CLI — everything else is configuration (the TOML file
+That's the entire CLI; everything else is configuration (the TOML file
 location can also be set with the `FUMOX_CONFIG` environment variable;
-without the flag or the variable, `config/app.toml` is used if present —
+without the flag or the variable, `config/app.toml` is used if present;
 the full layering is described in [section 8](#how-configuration-is-resolved)).
 The server creates
 the database and runs migrations on startup, then serves until SIGINT/SIGTERM
@@ -310,34 +310,34 @@ cargo run -p fumox-server
 cargo run -p fumox-probe
 ```
 
-## 5. Your first subscription — step by step
+## 5. Your first subscription – step by step
 
 A five-minute walkthrough, assuming the stack is running
 ([Quick start](#4-quick-start)).
 
 1. **Log in.** Open <http://127.0.0.1:8081/admin> and enter your
    `[admin].token` (the `FUMOX_ADMIN__TOKEN` value). Pick your language on the
-   login screen if you like — the choice is remembered.
+   login screen if you like; the choice is remembered.
 
 2. **Add a source.** *Sources → New*. Paste the subscription URL, give it a
    name. Everything else has sensible defaults: encoding `auto` (base64 is
    detected automatically), input format auto-detect (URI list / Clash YAML),
    cache TTL 1 hour. If the host is only reachable over one IP family, set
-   **IP family** (`ipv4`/`ipv6`) on the form — otherwise leave it on
+   **IP family** (`ipv4`/`ipv6`) on the form; otherwise leave it on
    *default* to follow the `[fetch] ip_family` setting. Save. The source is
-   fetched immediately — you should see how many proxies were found.
+   fetched immediately: you should see how many proxies were found.
 
 3. **Create a profile.** *Profiles → New*. Name it, tick the sources it should
    contain, pick the output format:
-   - `uri_list` — plain text, one proxy link per line (universal);
-   - `base64` — the same list base64-encoded (what many clients expect);
-   - `clash` — Clash/Mihomo YAML config;
-   - `sing_box` — sing-box JSON config.
+   - `uri_list`: plain text, one proxy link per line (universal);
+   - `base64`: the same list base64-encoded (what many clients expect);
+   - `clash`: Clash/Mihomo YAML config;
+   - `sing_box`: sing-box JSON config.
 
    Optionally set a **slug** (then the endpoint is `/sub/your-slug`) and an
-   **access token** (then clients must present it — see below). You can also
+   **access token** (then clients must present it, see below). You can also
    list **countries** (e.g. `DE, US`) to serve only proxies resolved to those
-   countries — see [Country filter](#country-filter).
+   countries (see [Country filter](#country-filter)).
 
 4. **Copy the URL.** The profile card shows the subscription URL, e.g.
    `http://<host>:8080/sub/nNqRYHbOSqM5` (or with `?token=…` if you set an
@@ -345,7 +345,7 @@ A five-minute walkthrough, assuming the stack is running
 
 5. **Watch it live.** The dashboard shows source/proxy counts and errors,
    recent fetches, the **Top Failure Reasons** panel over a 24 h rolling
-   window, and per-source aggregates — every "top-N" knob on the page
+   window, and per-source aggregates: every top-N knob on the page
    shares one per-admin cookie `fumox_dash_top_n` (5/10/15/25/50,
    defaults to 10); the *Proxies* browser lists every node with its
    status, country and latency; the *Probe* page shows the health-check
@@ -368,7 +368,7 @@ All public endpoints live on the public listener (default port **8080**).
 
 ### Access tokens
 
-By default a profile's endpoint is public to anyone who knows the URL — the
+By default a profile's endpoint is public to anyone who knows the URL: the
 12-character random id is unguessable. For extra protection a profile can have
 an **access token**: then every request must present it, either as
 
@@ -390,7 +390,7 @@ a generous per-IP ceiling (`rate_limit`, default `300/min`) against scraping.
 
 ### Output formats
 
-The format is a property of the profile — one profile, one format. The
+The format is a property of the profile: one profile, one format. The
 `?format=` query parameter is **not supported** and returns `400`; if you need
 the same set of proxies in another format, create a second profile (it's
 cheap).
@@ -404,7 +404,7 @@ cheap).
 
 Every plain `uri_list` output (`/sub` with the `uri_list` format, `/src`,
 and the alive export) starts with a small comment block that documents the
-file — HTTP headers get lost on copy-paste or download, the comments travel
+file: HTTP headers get lost on copy-paste or download, the comments travel
 with the file:
 
 ```
@@ -418,7 +418,7 @@ with the file:
 (derived from the member sources' cache TTL; the alive export always says
 `1`); `nodes count` is the number of proxy lines actually served; the
 `generated by` line carries the server version and the UTC moment the body
-was rendered. Proxy clients skip `#` lines, so the block is inert for them —
+was rendered. Proxy clients skip `#` lines, so the block is inert for them,
 and for another fumox consuming the link as a source. Base64 profiles do
 not carry the block: the blob must stay a plain encoded list.
 
@@ -430,13 +430,13 @@ suffixes: `Name`, `Name (2)`, `Name (3)`…
 ### Country filter
 
 A profile can restrict its output to specific countries: list ISO 3166-1
-alpha-2 codes in the profile form's **Countries** field (e.g. `DE, US` —
+alpha-2 codes in the profile form's **Countries** field (e.g. `DE, US`;
 order and case don't matter). While the list is non-empty, `/sub` serves
 only proxies whose country was resolved from the GeoIP database; the facts
 are stored at ingestion time and backfilled at startup.
 
 Proxies whose country could **not** be determined are excluded while the
-filter is active — "only these countries" means confirmed facts, not
+filter is active: the filter means confirmed facts, not
 everything-not-foreign. An empty list turns the filter off. Changing the
 list takes effect immediately: the very next client refresh gets the new
 selection.
@@ -446,22 +446,22 @@ selection.
 | Situation                                                                                            | Response                                                                                                                                                                                                                      |
 | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Everything is fine                                                                                   | `200` + fresh data                                                                                                                                                                                                            |
-| Some sources are temporarily down (`network`, `http_server` errors)                                  | `200` + last good data for the failed sources, fresh data for the rest; header `X-Fumox-Stale: true`. Stale data is served as long as needed — the health filter keeps cleaning dead proxies out, so the output "self-heals". |
-| A source returned HTTP 200 but the content doesn't parse (`parse_error` — anti-bot pages, CDN stubs) | `200` + last good snapshot if one exists, otherwise an empty valid config; header `X-Fumox-Warning: parse-error`                                                                                                              |
+| Some sources are temporarily down (`network`, `http_server` errors)                                  | `200` + last good data for the failed sources, fresh data for the rest; header `X-Fumox-Stale: true`. Stale data is served as long as needed; the health filter keeps cleaning dead proxies out, so the output self-heals. |
+| A source returned HTTP 200 but the content doesn't parse (`parse_error`: anti-bot pages, CDN stubs) | `200` + last good snapshot if one exists, otherwise an empty valid config; header `X-Fumox-Warning: parse-error`                                                                                                              |
 | All proxies of the profile are quarantined/removed                                                   | `200` + a valid **empty** config + header `X-Fumox-Warning: all-proxies-quarantined`                                                                                                                                          |
 | A source is permanently broken (`http_client`: 400/403/404/410)                                      | The upstream status code is passed through; not cached                                                                                                                                                                        |
 | Profile doesn't exist / disabled                                                                     | `404`                                                                                                                                                                                                                         |
-| Too many requests from one IP (rate limit or exhausted failure window)                               | `429 Too Many Requests` — slow down                                                                                                                                                                                           |
+| Too many requests from one IP (rate limit or exhausted failure window)                               | `429 Too Many Requests`, slow down                                                                                                                                                                                           |
 | Fumox itself is broken (DB down, bad config)                                                         | `500`                                                                                                                                                                                                                         |
 
 Proxies in `quarantine` or `removed` state never appear in output. Proxies
 with status `unknown` (not checked yet, or unprobeable tuic/mieru) **are**
-included — better to hand a client a maybe-working node than to throw away
+included: better to hand a client a maybe-working node than to throw away
 known-good ones.
 
 ## 7. The admin panel
 
-The admin panel is a server-rendered web UI (askama + HTMX — every page works
+The admin panel is a server-rendered web UI (askama + HTMX; every page works
 even with JavaScript disabled). It listens on its **own** socket, by default
 `127.0.0.1:8081`, physically separated from the public endpoints.
 
@@ -471,7 +471,7 @@ Enter the `[admin].token` value on the login screen. A successful login sets a
 signed (HMAC) HttpOnly session cookie, valid for 7 days by default
 (`session_ttl_hours`). Changing the token in the config invalidates all
 existing sessions. An **empty token** (or `enabled = false`) disables the
-panel entirely — every `/admin/*` route answers 404.
+panel entirely: every `/admin/*` route answers 404.
 
 Built-in protections: CSRF tokens on every form, per-IP rate limiting
 (`120/min` general, `5/min` on login), security response headers
@@ -493,8 +493,8 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 
 ### Times and timezones
 
-Every timestamp shown in the panel — fetch log, probe history, proxy
-lifecycle, quarantine queue — is rendered in **your browser's timezone**,
+Every timestamp shown in the panel (fetch log, probe history, proxy
+lifecycle, quarantine queue) is rendered in **your browser's timezone**,
 formatted according to the interface language. Hover over a timestamp to see
 the original UTC instant and the timezone name. With JavaScript disabled the
 UTC text (`YYYY-MM-DD HH:MM:SS`) is displayed instead. Stored data, exports
@@ -506,7 +506,7 @@ and server logs always remain UTC.
 and access tokens) as a versioned JSON file. *Import* recreates them with
 **create-new-only** semantics:
 
-- imported objects always get fresh ids — existing rows are never overwritten;
+- imported objects always get fresh ids; existing rows are never overwritten;
 - profile composition is remapped onto the new source ids;
 - a slug collision → the object is created without a slug (reported as a warning);
 - a reference to a source missing from the file → dropped from the composition (warning);
@@ -516,10 +516,10 @@ and access tokens) as a versioned JSON file. *Import* recreates them with
 The same screen offers two **download links** that share the same
 random token:
 
-- `GET /export/alive/{token}` — every currently-alive proxy as a plain
+- `GET /export/alive/{token}`: every currently-alive proxy as a plain
   `url_list`. Title in the metadata block: `export/alive`, update
   interval `1` hour.
-- `GET /export/ready/{token}` — the `ready` tier only (proxies that
+- `GET /export/ready/{token}`: the `ready` tier only (proxies that
   successfully completed both T1 and T2 checks). Same metadata shape,
   title `export/ready`.
 
@@ -533,7 +533,7 @@ The interface is multilingual: Russian (default) and English ship with the
 binary; the language is chosen on the login screen and remembered in the
 `fumox_lang` cookie. To add a language, copy any file from `locales/`,
 translate the values, save it as `locales/<code>.toml` (flat
-`"domain.key" = "text"` pairs) and restart — no rebuild needed. Files on disk
+`"domain.key" = "text"` pairs) and restart; no rebuild needed. Files on disk
 override the embedded catalogs.
 
 Day/night themes are switched on the login screen or in the top bar
@@ -545,15 +545,15 @@ Day/night themes are switched on the login screen or in the top bar
 
 Three layers, later wins:
 
-1. **Built-in defaults** — every key has one; Fumox runs with no config file at all.
-2. **TOML file** — the location is picked by priority: the `--config / -c`
+1. **Built-in defaults**: every key has one; Fumox runs with no config file at all.
+2. **TOML file**: the location is picked by priority: the `--config / -c`
    flag → the `FUMOX_CONFIG` environment variable → `config/app.toml`
    relative to the current directory. The file may be partial: only the
    sections you care about. A file requested via the flag or the variable
    must exist (a typo in the path is a loud startup error, not a silent
-   fall back to defaults); only the default location may be absent —
+   fall back to defaults); only the default location may be absent;
    then the app runs on built-in defaults.
-3. **Environment variables** — `FUMOX_SECTION__KEY`, where a double underscore
+3. **Environment variables**: `FUMOX_SECTION__KEY`, where a double underscore
    separates the section from the key:
 
    ```bash
@@ -567,7 +567,7 @@ The annotated reference file shipped with the repo is
 [`config/app.toml`](./config/app.toml). Below is the same information in table
 form.
 
-### `[server]` — public listener
+### `[server]` – public listener
 
 | Key                    | Default          | Meaning                                                                                     |
 | ---------------------- | ---------------- | ------------------------------------------------------------------------------------------- |
@@ -575,7 +575,7 @@ form.
 | `rate_limit`           | `"300/min"`      | Per-IP ceiling for all public requests                                                      |
 | `auth_fail_rate_limit` | `"30/min"`       | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets |
 
-### `[database]` — SQLite
+### `[database]` – SQLite
 
 | Key               | Default      | Meaning                                                                                 |
 | ----------------- | ------------ | --------------------------------------------------------------------------------------- |
@@ -583,7 +583,7 @@ form.
 | `busy_timeout_ms` | `5000`       | Wait for locks instead of failing. Keep it set: server and probe write to the same file |
 | `max_connections` | `8`          | Pool size                                                                               |
 
-### `[fetch]` — source fetching
+### `[fetch]` – source fetching
 
 | Key                     | Default             | Meaning                                                                                                                                                                                                                                    |
 | ----------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -594,16 +594,16 @@ form.
 | `max_retries`           | `2`                 | Retries, only for recoverable errors (`network`, `http_server`)                                                                                                                                                                            |
 | `retry_base_backoff_ms` | `500`               | Exponential backoff base between retries                                                                                                                                                                                                   |
 | `user_agent`            | `"fumox/<version>"` | User-Agent header; per-source `headers` override it                                                                                                                                                                                        |
-| `ip_family`             | `any`               | Default IP family for fetching source URLs: `any` (dual-stack: first IPv4 wins, IPv6 fallback), `ipv4` or `ipv6`. A source without its own IP family inherits this; a set family is strict — no address of that family means a fetch error |
+| `ip_family`             | `any`               | Default IP family for fetching source URLs: `any` (dual-stack: first IPv4 wins, IPv6 fallback), `ipv4` or `ipv6`. A source without its own IP family inherits this; a set family is strict: no address of that family means a fetch error |
 
-### `[ingest]` — source ingestion
+### `[ingest]` – source ingestion
 
 | Key                   | Default | Meaning                                                                                                                                                                                                       |
 | --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `refresh_check_limit` | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue)                                                                                                       |
-| `drop_gate`           | `false` | Drop-rules gate on the alive-linger: `true` — an alive proxy of a source with `drop` rules leaves on the next refresh once a rule catches it; `false` — every source lingers, the probe alone retires proxies |
+| `drop_gate`           | `false` | Drop-rules gate on the alive-linger. `true`: an alive proxy of a source with `drop` rules leaves on the next refresh once a rule catches it; `false`: every source lingers, the probe alone retires proxies |
 
-### `[geo]` — geo enrichment
+### `[geo]` – geo enrichment
 
 | Key                 | Default     | Meaning                                                    |
 | ------------------- | ----------- | ---------------------------------------------------------- |
@@ -613,7 +613,7 @@ form.
 | `cache_max_entries` | `16384`     | Host→geo cache size                                        |
 | `dns_timeout_secs`  | `5`         | DNS resolution timeout                                     |
 
-### `[admin]` — admin panel
+### `[admin]` – admin panel
 
 | Key                  | Default            | Meaning                                                                                                                                                 |
 | -------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -624,10 +624,10 @@ form.
 | `allow_private_urls` | `false`            | SSRF guard: when false, source URLs may not resolve to loopback, RFC1918, link-local or cloud-metadata addresses (checked at save *and* at every fetch) |
 | `rate_limit`         | `"120/min"`        | Per-IP limit for admin routes                                                                                                                           |
 | `login_rate_limit`   | `"5/min"`          | Per-IP limit for the login form                                                                                                                         |
-| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie — enable when the panel is reached through an HTTPS reverse proxy                                                  |
+| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy                                                  |
 | `locales_dir`        | `"locales"`        | Directory with UI translation catalogs (`<code>.toml`)                                                                                                  |
 
-### `[probe]` — health-check daemon
+### `[probe]` – health-check daemon
 
 | Key                          | Default             | Meaning                                                                      |
 | ---------------------------- | ------------------- | ---------------------------------------------------------------------------- |
@@ -644,25 +644,25 @@ form.
 | `queue_stale_days`           | `7`                 | Lifetime of priority-queue entries                                           |
 | `retention_interval_secs`    | `86400`             | How often old history is purged                                              |
 
-### `[meow]` — meow-rs integration (T2)
+### `[meow]` – meow-rs integration (T2)
 
 | Key                    | Default                                                                                 | Meaning                                                                                                                                                                                                                                                                                                                           |
 | ---------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `api_addr`             | `"127.0.0.1:9090"`                                                                      | meow-rs REST API address (its external-controller)                                                                                                                                                                                                                                                                                |
 | `config_path`          | `"config/meow.yaml"`                                                                    | Where the probe writes the generated Clash config. **Must be a path meow-rs itself can read** (in Docker: the shared volume)                                                                                                                                                                                                      |
-| `test_url`             | Rotation over the Google Android `generate_204` endpoints (7 URLs, verified 2026-08-29) | URL(s) fetched through the proxy for delay tests: one URL, a TOML array, or a comma-separated string. The probe picks one at random per check, so a blocked endpoint no longer breaks T2 everywhere. iOS/Apple check URLs (`captive.apple.com/...`) answer 200, not 204 — usable, but only if your client accepts non-204 answers |
+| `test_url`             | Rotation over the Google Android `generate_204` endpoints (7 URLs, verified 2026-08-29) | URL(s) fetched through the proxy for delay tests: one URL, a TOML array, or a comma-separated string. The probe picks one at random per check, so a blocked endpoint no longer breaks T2 everywhere. iOS/Apple check URLs (`captive.apple.com/...`) answer 200, not 204 (usable, but only if your client accepts non-204 answers) |
 | `timeout_secs`         | `10`                                                                                    | Per-check timeout                                                                                                                                                                                                                                                                                                                 |
 | `backoff_initial_secs` | `60`                                                                                    | Initial T2 backoff while meow-rs is unavailable (doubles per consecutive failure)                                                                                                                                                                                                                                                 |
-| `backoff_max_secs`     | `900`                                                                                   | T2 backoff ceiling (15 min) — a dead meow-rs is never mistaken for dead proxies                                                                                                                                                                                                                                                   |
+| `backoff_max_secs`     | `900`                                                                                   | T2 backoff ceiling (15 min); a dead meow-rs is never mistaken for dead proxies                                                                                                                                                                                                                                                   |
 
-### `[retention]` — history rotation
+### `[retention]` – history rotation
 
 | Key                  | Default | Meaning                           |
 | -------------------- | ------- | --------------------------------- |
 | `probe_results_days` | `14`    | Keep probe history for N days     |
 | `fetch_log_days`     | `30`    | Keep the fetch journal for N days |
 
-### `[log]` — console log levels
+### `[log]` – console log levels
 
 Both processes read the same file, so each has its own key. A level is one of
 `error`, `warn`, `info`, `debug`, `trace`. `RUST_LOG` with full `EnvFilter`
@@ -678,7 +678,7 @@ config when set; `FUMOX_LOG__SERVER` / `FUMOX_LOG__PROBE` work as usual.
 
 The pipeline is a versioned JSON document stored on a source and/or a profile
 (the profile's pipeline overrides matching sections of the source's). All
-sections are optional — `{}` (or no pipeline at all) means "pass through and
+sections are optional: `{}` (or no pipeline at all) means "pass through and
 deduplicate by fingerprint". `"version": 1` is required.
 
 ```json
@@ -713,26 +713,26 @@ deduplicate by fingerprint". `"version": 1` is required.
 
 | Section  | What it does                                                 | Fields and defaults                                                                                                                |
 | -------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `filter` | Keep/drop protocols and AS numbers; drop proxies allowing insecure TLS | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null — matched against the stored `geo_asn`, the allowlist drops proxies whose ASN was never resolved (both `"24940"` and `"AS24940"` spellings work); `forbid_insecure`: default `true` — drops any proxy with a truthy `insecure`/`allowInsecure`/`skip-cert-verify`/`allow_insecure` toggle (the old `normalize_params` name is still accepted) |
-| `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` — default, `host`, `port`, `param:KEY`); rules are OR-ed; default `[]`        |
-| `rename` | Regex-based rewriting, rules applied in order                | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` — default, `host`, `port`, `param:KEY`); default `[]` |
+| `filter` | Keep/drop protocols and AS numbers; drop proxies allowing insecure TLS | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null, matched against the stored `geo_asn`, the allowlist drops proxies whose ASN was never resolved (both `"24940"` and `"AS24940"` spellings work); `forbid_insecure`: default `true`, drops any proxy with a truthy `insecure`/`allowInsecure`/`skip-cert-verify`/`allow_insecure` toggle (the old `normalize_params` name is still accepted) |
+| `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` default, `host`, `port`, `param:KEY`); rules are OR-ed; default `[]`        |
+| `rename` | Regex-based rewriting, rules applied in order                | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` default, `host`, `port`, `param:KEY`); default `[]` |
 | `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment))   |
 | `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`                                                                            |
 | `dedup`  | Deduplication                                                | `by`: only `"fingerprint"` in v1                                                                                                   |
 | `sort`   | Output ordering                                              | `by`: `source` \| `name` \| `country` \| `latency` (null latencies go last); `desc`: default `false`                               |
-| `limit`  | Cap the output size                                          | `count`: integer ≥ 1 — keep at most this many proxies of the final, deduplicated and sorted list (its top); `null`/omitted = no cap |
+| `limit`  | Cap the output size                                          | `count`: integer ≥ 1, keep at most this many proxies of the final, deduplicated and sorted list (its top); `null`/omitted = no cap |
 
 Validation is strict: unknown keys, a non-compiling regex or an invalid enum
-value are rejected with a field error in the admin form — nothing is saved.
+value are rejected with a field error in the admin form; nothing is saved.
 This strictness is deliberate, so a future schema v2 can add fields without
 ambiguity.
 
-A rule's optional `target` picks what its regex rewrites — not just the display
-name. The default (`name`, also omitted in the JSON) is the classic renaming;
+A rule's optional `target` picks what its regex rewrites; the display name is
+only the default target: `name` (also omitted in the JSON) is the classic renaming;
 `host` and `port` rewrite the proxy address, and `param:KEY` rewrites the
 first parameter with that key (case-insensitive: feeds mix `headerType` and
 `headertype`). Parameter values are matched and written in their raw,
-percent-encoded form — exactly as they appear in the URI — so `path=%2Fws` is
+percent-encoded form, exactly as they appear in the URI, so `path=%2Fws` is
 rewritten through its encoded spelling. Host and port results are guarded on
 serving: an empty host, a host containing URI delimiters or a port outside
 0–65535 is skipped with a WARN log entry and the original value kept, so one
@@ -742,20 +742,20 @@ two nodes rewritten to the same address merge at the dedup step (which runs
 after renaming, first occurrence wins).
 
 The `drop` section works the other way around: instead of rewriting, a
-matching proxy is thrown away entirely — not just hidden from the
-subscription, but never written to the database in the first place. The
+matching proxy is thrown away entirely: it never appears in the
+subscription, because it is never written to the database in the first place. The
 rules use the same selectors as rename (`match`, `flags`, `target`; no
-`replace` — the strict schema rejects it) and are OR-ed: a single match
+`replace`, the strict schema rejects it) and are OR-ed: a single match
 discards the proxy. They are applied twice, always before `rename` so both
 sides see the original values: at ingestion by the source's own pipeline
 (a matching proxy is not stored, geo-resolved or queued for probing; a
 corrupted config fails closed as a parse error, and if every proxy matches,
-the fetch is recorded as a parse error — the database stays untouched) and
+the fetch is recorded as a parse error; the database stays untouched) and
 on serving by the effective pipeline (so a profile's `drop` section works
 too, and a rule added later hides the already-stored rows immediately).
 Proxies stored before a rule was added leave through the normal lifecycle:
 the source's next refresh does not stamp their link, they are unlinked and,
-without any other source, marked `removed` by the probe state machine — no
+without any other source, marked `removed` by the probe state machine; no
 hard deletes. A proxy dropped by one source but still published by another
 stays in the database. The admin dry run shows how many proxies the source's
 filters discarded, so rules can be tuned before the first real fetch.
@@ -768,26 +768,26 @@ The pipeline runs in a fixed order:
 The `fumox-probe` daemon runs an endless cycle (default: every 60 s), each
 cycle in four passes:
 
-1. **Quarantine dues** — second chances and recheck-ladder steps whose moment
+1. **Quarantine dues**: second chances and recheck-ladder steps whose moment
    has arrived;
-2. **Priority queue** — freshly inserted proxies the server queued at source
+2. **Priority queue**: freshly inserted proxies the server queued at source
    refresh time (up to `[ingest].refresh_check_limit` per refresh), drained
    newest first, then removed from the queue before the checks run;
-3. **T1** — a random sample of direct TCP-connect (plus TLS handshake where
+3. **T1**: a random sample of direct TCP-connect (plus TLS handshake where
    the protocol implies TLS) checks over `unknown`/`alive` proxies;
-4. **T2** — real tunnel checks through meow-rs: the probe writes a Clash
+4. **T2**: real tunnel checks through meow-rs: the probe writes a Clash
    config with the batch, hot-reloads meow-rs via `PUT /configs`, then
    measures delay via `GET /proxies/{name}/delay` against a randomly picked
    URL from `[meow].test_url` (the checks rotate across the configured list).
    The sample consists of `alive` proxies plus never-checked `unknown`
    hysteria2, which T1 cannot say anything about (see below).
    The sample order is by recency, not random: proxies without a single
-   tunnel check come first, then the ones whose last check is the oldest —
+   tunnel check come first, then the ones whose last check is the oldest, so
    in a large pool no proxy lingers without a tunnel verdict while its
    `alive` rests on a bare TCP connect.
 
 The priority queue gives brand-new proxies a first check within one cycle of
-the source refresh instead of waiting out the random sample — with large
+the source refresh instead of waiting out the random sample; with large
 pools that wait can otherwise stretch to hours or days. Unprobeable schemes
 are never queued (they could not be checked anyway), and a proxy that leaves
 `unknown` through the random path simply drops out of the queue.
@@ -797,7 +797,7 @@ are never queued (they could not be checked anyway), and a proxy that leaves
 | **T1** (TCP/TLS) | The server is reachable at `host:port`                       | vless, vmess, trojan, ss, socks5, naive     |
 | **T2** (tunnel)  | The proxy *actually works*: credentials valid, traffic flows | vless, vmess, trojan, ss, hysteria2, socks5 |
 
-QUIC protocols (hysteria2, tuic) skip T1 — a TCP connect to a UDP port proves
+QUIC protocols (hysteria2, tuic) skip T1: a TCP connect to a UDP port proves
 nothing. **hysteria2** is not hurt by that: a fresh `unknown` hysteria2 goes
 straight into the T2 sample and from there follows the regular state machine
 (the failure counter is shared with T1). **tuic and mieru are unprobeable**
@@ -846,19 +846,19 @@ The rules in plain language:
   path takes ~13 h 45 min – 17 h 45 min.
 - **Removed is not deleted.** Removed proxies stay in the database (purge them
   from the admin panel if you want). A removed proxy is terminal: if a source
-  lists it again, its state is *not* reset — reconciliation never touches the
+  lists it again, its state is *not* reset: reconciliation never touches the
   state machine (only the probe does). Ways back: *Reset status* on the proxy
   card, or *Purge removed* followed by the next fetch inserting it as new.
 - **Disappearing from a source does not retire a live proxy (alive-linger).**
   While the probe keeps confirming a proxy (`alive`), a source refresh that no
   longer sees it keeps its link: the proxy continues its check cycle and stays
-  in that source's subscriptions. The probe alone decides when it leaves —
+  in that source's subscriptions. The probe alone decides when it leaves:
   once it quarantines the node, the next refresh drops the link and the proxy
   becomes `removed` as usual. This does not apply to `unknown` proxies
-  (never verified — unlinked on the next refresh) and to sources with
+  (never verified, unlinked on the next refresh) and to sources with
   `drop` rules **when** `[ingest].drop_gate = true` in the config (then a
   rule added later retires the already-stored rows on the next refresh;
-  with the default `false` every source lingers — drop rules only stop
+  with the default `false` every source lingers; drop rules only stop
   new matches). Deleting a source from the admin panel never lingers.
 
 **State machine configuration parameters.** All of them live in
@@ -878,7 +878,7 @@ panel's *Settings* page.
 | `[probe].tls_timeout_secs`           | `10`                | T1 TLS-handshake timeout                                                                                                                            |
 | `[probe].concurrency`                | `8`                 | Parallelism of checks                                                                                                                               |
 | `[probe].queue_stale_days`           | `7`                 | Lifetime of priority-queue entries (first check of new proxies)                                                                                     |
-| `[probe].allow_private_targets`      | `false`             | When `false`, the probe refuses to connect to loopback / link-local / RFC1918 / ULA addresses — protects against SSRF if an attacker publishes a proxy list pointing at cloud metadata (`169.254.169.254`) or a private subnet. Blocked attempts are journaled as `probe_results.error = "blocked by the private-address policy: <reason>"` so the T2 recency queue advances past them |
+| `[probe].allow_private_targets`      | `false`             | When `false`, the probe refuses to connect to loopback / link-local / RFC1918 / ULA addresses. This protects against SSRF if an attacker publishes a proxy list pointing at cloud metadata (`169.254.169.254`) or a private subnet. Blocked attempts are journaled as `probe_results.error = "blocked by the private-address policy: <reason>"` so the T2 recency queue advances past them |
 | `[ingest].refresh_check_limit`       | `50`                | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables)                                                       |
 | `[ingest].drop_gate`                 | `false`             | Whether `drop` rules unlink a live "lingerer" on the very next refresh                                                                              |
 | `[meow].timeout_secs`                | `10`                | Per-check T2 delay-test timeout                                                                                                                     |
@@ -886,7 +886,7 @@ panel's *Settings* page.
 | `[meow].backoff_max_secs`            | `900`               | T2 backoff ceiling (15 min)                                                                                                                         |
 
 If meow-rs is down, T2 doesn't spam it: the probe backs off exponentially
-(60 s → doubling → capped at 15 min), and proxy statuses are left untouched —
+(60 s → doubling → capped at 15 min), and proxy statuses are left untouched:
 a dead meow-rs is never mistaken for dead proxies. T1 and the server are
 unaffected; Fumox works fine without meow-rs, just without tunnel-level
 verification.
@@ -927,9 +927,9 @@ or older than a month from a public release mirror.
 | `{city}`    | City name                             | City database            |
 | `{asn}`     | AS number, rendered as `AS12345`      | ASN database             |
 | `{asn_org}` | AS organization name                  | ASN database             |
-| `{name}`    | The original display name             | —                        |
+| `{name}`    | The original display name             | –                        |
 
-A placeholder with no data behind it collapses to nothing — extra whitespace
+A placeholder with no data behind it collapses to nothing: extra whitespace
 and dangling separators are cleaned up, so `"{flag} {country} {city} · {name}"`
 still looks right when the city is unknown. The name is left completely
 untouched only when there is no geo data at all. DNS and geo lookups are
@@ -940,14 +940,14 @@ persisted to the database at ingest time (and a background pass at startup
 fills in proxies that were ingested before a database was available). This is
 what feeds the admin panel: the country filter in the *Proxies* list and the
 *Geography* block of the proxy card show stored facts, so they populate after
-the next source refresh or server restart — even if no subscription has been
+the next source refresh or server restart, even if no subscription has been
 requested yet. A fresh lookup that returns nothing never erases facts already
 stored.
 
 ## 12. Data, backups, retention
 
 - **Storage.** One SQLite file in WAL mode. It contains proxy credentials in
-  plaintext — the file is created with `0600` permissions; keep the directory
+  plaintext: the file is created with `0600` permissions; keep the directory
   access restricted.
 - **Backups.** Use the WAL-safe online backup, not a raw file copy:
 
@@ -959,12 +959,12 @@ stored.
   `probe_results` older than 14 days and `fetch_log` older than 30 days by
   default (`[retention]`). Removed proxies accumulate until you press *Purge
   removed* in the admin panel.
-- **Configuration backup.** Use the admin panel's *Export* — it captures all
+- **Configuration backup.** Use the admin panel's *Export*: it captures all
   sources and profiles in a JSON file you can import on another instance.
 - **Timestamps** everywhere are Unix epoch seconds, UTC; the admin panel
   displays them in your browser's timezone (see *Times and timezones*).
 
-## 13. Running in production — checklist
+## 13. Running in production – checklist
 
 - [ ] Strong `[admin].token` set (the shipped `change-me` is a placeholder and
       logs a warning at startup); `secure_cookies = true` when behind HTTPS.
@@ -1007,9 +1007,9 @@ WantedBy=multi-user.target
 
 | Symptom                                                               | Likely cause / fix                                                                                                                                 |
 | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Admin panel returns 404 everywhere                                    | `[admin].token` is empty or `enabled = false` — the panel is intentionally inert. Set a token and restart.                                         |
+| Admin panel returns 404 everywhere                                    | `[admin].token` is empty or `enabled = false`: the panel is intentionally inert. Set a token and restart.                                         |
 | Can't reach the admin panel from another machine                      | It binds to `127.0.0.1` by design. Use `ssh -L 8081:127.0.0.1:8081 host` or a reverse proxy.                                                       |
-| `/sub/…` returns 403                                                  | The profile has an access token — add `?token=…` or the `Authorization: Bearer` header.                                                            |
+| `/sub/…` returns 403                                                  | The profile has an access token: add `?token=…` or the `Authorization: Bearer` header.                                                            |
 | `/sub/…?format=clash` returns 400                                     | `?format=` is forbidden by design. Create a separate profile with the needed format.                                                               |
 | Subscription is empty with `X-Fumox-Warning: all-proxies-quarantined` | Every proxy failed its checks. Look at the *Probe* page and the proxies' history; check `[meow].test_url` reachability.                            |
 | `X-Fumox-Stale: true` header                                          | Some sources are temporarily unreachable; last good data is being served. The fetch log shows which sources and why (`error_class`).               |

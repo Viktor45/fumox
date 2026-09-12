@@ -10,6 +10,9 @@
   --bg: #f6f7f9;
   --panel: #ffffff;
   --border: #dde1e6;
+  /* Interactive-component boundary (WCAG 1.4.11 needs 3:1): inputs, buttons,
+     pagination. --border stays on decorative containers (panels, tables). */
+  --border-strong: #7d8492;
   --text: #1c2330;
   --muted: #5d6573;
   --accent: #2456d6;
@@ -36,7 +39,7 @@
   --badge-neutral-bg: #eceef1;
   /* form controls and buttons */
   --input-bg: #ffffff;
-  --focus-ring: rgba(36, 86, 214, 0.35);
+  --focus-ring: #2456d6;
   --btn-bg: #ffffff;
   --btn-hover: #f2f4f7;
   /* toast (dark in both themes, like the topbar) */
@@ -62,6 +65,7 @@
   --bg: #12151c;
   --panel: #1a1f28;
   --border: #2a3140;
+  --border-strong: #6f7a8e;
   --text: #e7eaf0;
   --muted: #98a1b3;
   --accent: #7aa2f7;
@@ -82,7 +86,7 @@
   --row-hover: #1f2530;
   --badge-neutral-bg: #2a3140;
   --input-bg: #141821;
-  --focus-ring: rgba(122, 162, 247, 0.4);
+  --focus-ring: #7aa2f7;
   --btn-bg: #1f2530;
   --btn-hover: #262e3d;
   --toast-bg: #2a3140;
@@ -112,7 +116,7 @@ body {
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
-/* ---------- layout ---------- */
+/* layout */
 
 /* Sticky: the nav stays reachable while a long table is scrolled.
    z-index below the toast layer (50); dialogs live in the top layer. */
@@ -182,7 +186,7 @@ a:hover { text-decoration: underline; }
 /* Long unbreakable content shrinks the panel, never the grid columns. */
 .grid > * { min-width: 0; }
 
-/* ---------- panels & cards ---------- */
+/* panels & cards */
 
 .panel {
   background: var(--panel);
@@ -222,13 +226,13 @@ a:hover { text-decoration: underline; }
   font-size: 13px;
   font-family: inherit;
   padding: 2px 6px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 4px;
   background: var(--bg);
   color: var(--text);
 }
 
-/* ---------- tables ---------- */
+/* tables */
 
 table.data {
   width: 100%;
@@ -303,6 +307,11 @@ table.data.journal td .cell-wrap { white-space: normal; }
    hostname must not stretch the column. */
 table.data td.mono { white-space: nowrap; }
 table.data td.addr { overflow-wrap: anywhere; white-space: normal; }
+/* Probe quarantine queue: the address is an atomic inline box — under
+   width pressure it drops to its own line whole instead of splitting
+   "9.9.9.9:" / "8388" at the <wbr>. A box wider than the cell (long
+   IPv6 host) still wraps internally. */
+.queue-addr { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
 /* Status and error-class badges never break across lines — a wrapped
    "http_server" would change the row height and shift the table. */
 table.data .badge { white-space: nowrap; }
@@ -311,7 +320,7 @@ table.data .badge { white-space: nowrap; }
    user's timezone): keep date and time on one line, never mid-cell wrap. */
 time.ts { white-space: nowrap; }
 
-/* ---------- badges ---------- */
+/* badges */
 
 .badge {
   display: inline-block;
@@ -334,7 +343,7 @@ time.ts { white-space: nowrap; }
 .badge.parse_error { background: var(--info-bg); color: var(--accent); }
 .badge.neutral { background: var(--badge-neutral-bg); color: var(--muted); }
 
-/* ---------- forms ---------- */
+/* forms */
 
 form.stack { max-width: 760px; }
 .field { margin-bottom: 14px; }
@@ -347,7 +356,7 @@ form.stack { max-width: 760px; }
 .field input[type="url"], .field select, .field textarea {
   width: 100%;
   padding: 8px 10px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
   font: inherit;
   background: var(--input-bg);
@@ -375,13 +384,13 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
 
 .form-actions { display: flex; gap: 10px; margin-top: 18px; align-items: center; flex-wrap: wrap; }
 
-/* ---------- buttons ---------- */
+/* buttons */
 
 .btn {
   display: inline-block;
   padding: 7px 14px;
   border-radius: 6px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   background: var(--btn-bg);
   color: var(--text);
   font: inherit;
@@ -397,7 +406,7 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
 .btn.small { padding: 3px 10px; font-size: 13px; }
 .btn:disabled { opacity: 0.55; cursor: default; }
 
-/* ---------- flash / toast ---------- */
+/* flash / toast */
 
 .toast-wrap {
   position: fixed;
@@ -436,7 +445,7 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
 .error-list { margin: 0; padding-left: 20px; }
 .error-list li { margin-bottom: 4px; }
 
-/* ---------- misc ---------- */
+/* misc */
 
 .muted { color: var(--muted); }
 .small { font-size: 13px; }
@@ -470,7 +479,7 @@ pre.mono { white-space: pre-wrap; }
 .pagination { display: flex; gap: 6px; margin-top: 14px; align-items: center; flex-wrap: wrap; }
 .pagination a, .pagination span.page {
   padding: 4px 11px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
   background: var(--btn-bg);
 }
@@ -540,7 +549,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 .htmx-indicator { display: none; }
 .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline-block; }
 
-/* ---------- statistics screen ---------- */
+/* statistics screen */
 
 /* Ingest chart: one column per day; the count rides above the bar and the
    day label below (the <time> element is rewritten into the local zone by
@@ -693,7 +702,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
    is the builder's sibling). */
 #ped-builder.htmx-request ~ #ped-preview { opacity: 0.55; }
 
-/* ---------- topbar squeeze (phones) ---------- */
+/* topbar squeeze (phones) */
 
 /* On very narrow screens the text theme labels would push the logout
    button off the first topbar row, so the sun/moon icons take over
@@ -710,7 +719,8 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   }
 }
 
-/* ---------- topbar wrap (tablets and small laptops) ---------- *//* The single-row topbar fits only above ~1180px: eight nav items plus
+/* topbar wrap (tablets and small laptops) */
+/* The single-row topbar fits only above ~1180px: eight nav items plus
    switchers. Below that it wraps into two rows: brand + switchers +
    logout, then the nav as a horizontally scrollable strip (no burger
    menu, no JavaScript needed). Without this the squeezed row lets
@@ -753,7 +763,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   }
 }
 
-/* ---------- mobile adaptation ---------- */
+/* mobile adaptation */
 
 /* One breakpoint below the existing 900px grid collapse. Everything here
    must degrade gracefully without JavaScript. */
@@ -793,6 +803,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
      wrap, at the <wbr> in front of the port; kv labels 110px. */
   .cell-wrap { max-width: 240px; min-width: 200px; }
   table.data td.addr { min-width: 190px; }
+  table.data td.queue-name { min-width: 190px; }
   .kv th { width: auto; min-width: 110px; }
 
   /* Distribution rows (stats): counters drop onto their own line

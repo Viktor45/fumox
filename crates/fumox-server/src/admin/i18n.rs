@@ -281,6 +281,18 @@ macro_rules! impl_i18n {
                 };
                 self.lang.t(key).to_string()
             }
+            /// Display name of a proxy: the source-provided name, or the
+            /// server address when the source sent none — an empty name
+            /// would render an empty, unclickable-looking link. Whitespace
+            /// only counts as empty: it displays as nothing.
+            #[allow(dead_code)]
+            fn display_name(&self, name: &str, host: &str, port: &i64) -> String {
+                if name.trim().is_empty() {
+                    format!("{host}:{port}")
+                } else {
+                    name.to_string()
+                }
+            }
         }
     };
 }

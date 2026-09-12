@@ -248,7 +248,7 @@
               {% endmatch %}
             </td>
             <td class="small truncate" title="{{ row.source_names }}">
-              <a href="/admin/proxies/{{ row.id }}">{{ self.short_name(row.name) }}</a>
+              <a href="/admin/proxies/{{ row.id }}">{{ self.short_name(&self.display_name(&row.name, &row.host, row.port)) }}</a>
             </td>
             <td class="small">{{ self.ts(row.created_at) | safe }}</td>
             <td class="num small">

@@ -214,7 +214,7 @@
                 {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
-            <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(row.name) }}</a></td>
+            <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(&self.display_name(&row.name, &row.host, row.port)) }}</a></td>
             <td class="num small">
               {% match row.latency_ms %}
                 {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}

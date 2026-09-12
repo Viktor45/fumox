@@ -40,6 +40,8 @@ config/meow.yaml
 .zcode/
 .agents/
 .mimosa/
+gui-test-screenshots/
+anti-slop/
 # Debug-only parser fixture: may contain non-public confidential data —
 # never commit it. Recreate locally from public subscriptions if needed;
 # fixture tests skip themselves when the file is absent.

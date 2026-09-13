@@ -73,18 +73,19 @@ refresh_check_limit = 50
 drop_gate = false
 
 [geo]
-# Гео-обогащение MaxMind GeoLite2: по IP-адресу узла определяется страна
-# (и город/автономная система при выборе другой базы). Файлы .mmdb не
-# коммитятся; при старте сервер сам скачивает отсутствующие/устаревшие
-# базы в db_dir, если каталог доступен для записи.
-# MaxMind GeoLite2 geo enrichment: a node's IP resolves to its country
-# (or city / autonomous system with a different database choice). The
-# .mmdb files are never committed; at startup the server downloads
+# Гео-обогащение MaxMind GeoLite2: по IP-адресу узла определяются страна,
+# город и автономная система — открываются ВСЕ базы в db_dir и их факты
+# объединяются, поэтому {country}, {city} и {asn} работают в одном шаблоне
+# имени. Файлы .mmdb не коммитятся; при старте сервер сам скачивает
+# отсутствующие/устаревшие базы в db_dir, если каталог доступен для записи.
+# MaxMind GeoLite2 geo enrichment: a node's IP resolves to its country,
+# city and autonomous system — ALL databases in db_dir are opened and their
+# facts merged, so {country}, {city} and {asn} work in one name template.
+# The .mmdb files are never committed; at startup the server downloads
 # missing/stale databases into db_dir on its own, provided the directory
 # is writable.
 enabled = true
-db = "country"                # country | city | asn (по умолчанию Country / Country by default)
-db_dir = "config"           # каталог с GeoLite2-{Country,City,ASN}.mmdb / directory holding GeoLite2-{Country,City,ASN}.mmdb
+db_dir = "config"           # каталог с GeoLite2-{City,ASN}.mmdb / directory holding GeoLite2-{City,ASN}.mmdb
 cache_max_entries = 16384     # кэш host→geo (moka) / host→geo cache (moka)
 dns_timeout_secs = 5
 

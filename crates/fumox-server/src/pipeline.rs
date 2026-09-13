@@ -1520,34 +1520,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn geo_step_applies_asn_template_when_db_present() {
+    async fn geo_step_renders_merged_country_city_and_asn_facts() {
         // GeoLite2 files are gitignored, so CI runs without them.
         let db_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
-        if !db_dir.join("GeoLite2-ASN.mmdb").exists() {
-            eprintln!("skipped: GeoLite2-ASN.mmdb is not present");
+        if !db_dir.join("GeoLite2-ASN.mmdb").exists()
+            || !db_dir.join("GeoLite2-City.mmdb").exists()
+        {
+            eprintln!("skipped: GeoLite2-ASN/City.mmdb not present");
             return;
         }
         let cfg = fumox_core::config::GeoConfig {
             enabled: true,
-            db: fumox_core::config::GeoDbKind::Asn,
             db_dir,
             ..Default::default()
         };
         let geo = GeoResolver::new(&cfg);
         assert!(geo.is_active());
 
+        // The resolver merges every database in db_dir, so one template can
+        // draw country and ASN facts at once — the one-database era could
+        // not render this. 8.8.8.8 is anycast (no city): the missing city
+        // must collapse away, not break the name.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
-            // ASN-only data (no country) must still rename, not no-op.
-            "geo": { "enabled": true, "template": "{asn} · {name}" }
+            "geo": { "enabled": true, "template": "{country} {city} · {asn} {name}" }
         })))
         .unwrap();
-        // Literal IP → no DNS round-trip; 8.8.8.8 is AS15169 (Google).
+        // Literal IP → no DNS round-trip; 8.8.8.8 is US, AS15169 (Google).
         let out = compiled
             .apply(vec![candidate("Node-1", Scheme::Vless, "8.8.8.8")], &geo)
             .await;
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].entry.name, "AS15169 · Node-1");
+        assert_eq!(out[0].entry.name, "United States · AS15169 Node-1");
     }
 
     #[tokio::test]

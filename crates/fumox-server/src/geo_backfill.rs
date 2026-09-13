@@ -92,11 +92,11 @@ mod tests {
         pool
     }
 
-    /// GeoLite2-Country from the workspace `config/` directory (gitignored —
+    /// GeoLite2-City from the workspace `config/` directory (gitignored —
     /// the test skips itself when the file is absent, like the geo tests).
-    fn country_resolver() -> Option<Arc<GeoResolver>> {
+    fn geo_resolver() -> Option<Arc<GeoResolver>> {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/GeoLite2-Country.mmdb");
+            .join("../../config/GeoLite2-City.mmdb");
         if !path.exists() {
             return None;
         }
@@ -159,8 +159,8 @@ mod tests {
     /// without the mmdb file (CI runs without it).
     #[tokio::test]
     async fn backfill_fills_rows_ingested_without_geo() {
-        let Some(geo) = country_resolver() else {
-            eprintln!("skipping: config/GeoLite2-Country.mmdb not present");
+        let Some(geo) = geo_resolver() else {
+            eprintln!("skipping: config/GeoLite2-City.mmdb not present");
             return;
         };
         let pool = temp_pool().await;

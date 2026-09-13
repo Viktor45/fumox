@@ -1,18 +1,20 @@
 //! Geo enrichment (MaxMind GeoLite2) — SPEC §6.
 //!
 //! Pipeline: `host` → (async DNS if it is a domain) → IP → MaxMind lookup →
-//! geo facts (country, optionally city/ASN depending on the database) applied
-//! to the display name through a template (default `"{flag} {country} ·
-//! {name}"`, placeholders `{flag} {country} {city} {asn} {asn_org} {name}`,
-//! SPEC §5.1/§6).
+//! merged geo facts (country + city from City, ASN from ASN — every unique
+//! database present in `[geo].db_dir` contributes; the Country database is
+//! redundant, City carries all of its facts, and is not read) applied to
+//! the display name through a template (default `"{flag} {country} ·
+//! {name}"`, placeholders `{flag} {country} {city} {asn} {asn_org}
+//! {name}`, SPEC §5.1/§6).
 //!
 //! DNS and lookup results are cached per host (hosts repeat heavily in
 //! subscription feeds); negative results are cached too, so unresolvable
 //! hosts are not re-queried on every pipeline run.
 //!
-//! The `.mmdb` files are never committed. When the configured database file
-//! is absent the resolver degrades to a no-op with a warning — geo
-//! enrichment is an optional enhancement, not a startup requirement.
+//! The `.mmdb` files are never committed. When no database file can be
+//! opened the resolver degrades to a no-op with a warning — geo enrichment
+//! is an optional enhancement, not a startup requirement.
 
 use crate::config::{GeoConfig, GeoDbKind};
 use maxminddb::Reader;
@@ -110,89 +112,139 @@ fn collapse_whitespace(text: &str) -> String {
     out.trim().to_string()
 }
 
-enum Backend {
-    Country(Reader<Vec<u8>>),
-    City(Reader<Vec<u8>>),
-    Asn(Reader<Vec<u8>>),
+/// Every GeoLite2 database that carries unique facts and is found in
+/// `[geo].db_dir`: City (country + city) and ASN (autonomous system). The
+/// Country database is deliberately not read — City carries every fact it
+/// has (a leftover `GeoLite2-Country.mmdb` is simply ignored). Missing
+/// kinds contribute no facts; a directory with only `GeoLite2-ASN.mmdb`
+/// still resolves AS numbers.
+struct Backends {
+    city: Option<Reader<Vec<u8>>>,
+    asn: Option<Reader<Vec<u8>>>,
+}
+
+impl Backends {
+    fn from_dir(dir: &std::path::Path) -> Self {
+        let open = |kind: GeoDbKind| {
+            let path = dir.join(kind.file_name());
+            match Reader::open_readfile(&path) {
+                Ok(reader) => Some(reader),
+                // missing file — contributing no facts is the documented
+                // behavior for an absent database, not an error
+                Err(_) if !path.exists() => None,
+                Err(err) => {
+                    tracing::warn!(
+                        file = kind.file_name(),
+                        error = %err,
+                        "GeoLite2 database unreadable; its facts are skipped"
+                    );
+                    None
+                }
+            }
+        };
+        Self {
+            city: open(GeoDbKind::City),
+            asn: open(GeoDbKind::Asn),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.city.is_none() && self.asn.is_none()
+    }
 }
 
 /// Host → geo resolver with an in-memory cache. Cheap to clone/share: the
 /// internals are `Arc`-wrapped.
 #[derive(Clone)]
 pub struct GeoResolver {
-    backend: Option<Arc<Backend>>,
+    backends: Option<Arc<Backends>>,
     cache: Cache<String, Option<Arc<GeoInfo>>>,
     dns_timeout: Duration,
 }
 
 impl GeoResolver {
-    /// Build a resolver from config. Returns a no-op resolver (with a
-    /// warning logged) when geo is disabled or the database file is missing.
+    /// Build a resolver from config. Every GeoLite2 database found in
+    /// `[geo].db_dir` is opened and all of them contribute facts — a name
+    /// template can mix `{country}`, `{city}` and `{asn}` freely. Returns a
+    /// no-op resolver (with a warning logged) when geo is disabled or no
+    /// database file could be opened.
     pub fn new(cfg: &GeoConfig) -> Self {
         let cache = Cache::builder().max_capacity(cfg.cache_max_entries).build();
         let dns_timeout = Duration::from_secs(cfg.dns_timeout_secs);
         if !cfg.enabled {
             return Self {
-                backend: None,
+                backends: None,
                 cache,
                 dns_timeout,
             };
         }
-        let path = cfg.db_path();
-        let reader = match Reader::open_readfile(&path) {
-            Ok(reader) => reader,
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "GeoLite2 database unavailable; geo enrichment disabled"
-                );
-                return Self {
-                    backend: None,
-                    cache,
-                    dns_timeout,
-                };
-            }
-        };
-        let backend = match cfg.db {
-            GeoDbKind::Country => Backend::Country(reader),
-            GeoDbKind::City => Backend::City(reader),
-            GeoDbKind::Asn => Backend::Asn(reader),
-        };
+        let backends = Backends::from_dir(&cfg.db_dir);
+        if backends.is_empty() {
+            tracing::warn!(
+                dir = %cfg.db_dir.display(),
+                "no GeoLite2 database could be opened; geo enrichment disabled"
+            );
+            return Self {
+                backends: None,
+                cache,
+                dns_timeout,
+            };
+        }
         Self {
-            backend: Some(Arc::new(backend)),
+            backends: Some(Arc::new(backends)),
             cache,
             dns_timeout,
         }
     }
 
-    /// Whether this resolver can actually enrich (database loaded).
+    /// Whether this resolver can actually enrich (at least one database
+    /// loaded).
     pub fn is_active(&self) -> bool {
-        self.backend.is_some()
+        self.backends.is_some()
     }
 
     /// Resolve geo information for a proxy host (domain or literal IP).
-    /// Returns `None` when the resolver is inactive, DNS fails, or the
-    /// database has no data for the address.
+    /// Returns `None` when the resolver is inactive, DNS fails, or no loaded
+    /// database has data for the address.
     pub async fn resolve(&self, host: &str) -> Option<Arc<GeoInfo>> {
-        let backend = self.backend.as_ref()?;
+        let backends = self.backends.as_ref()?;
         let key = host.to_ascii_lowercase();
         if let Some(cached) = self.cache.get(&key).await {
             return cached;
         }
-        let info = self.resolve_uncached(backend, host).await.map(Arc::new);
+        let info = self.resolve_uncached(backends, host).await.map(Arc::new);
         self.cache.insert(key, info.clone()).await;
         info
     }
 
-    async fn resolve_uncached(&self, backend: &Backend, host: &str) -> Option<GeoInfo> {
+    /// Merge the facts of every loaded database for one IP: City
+    /// contributes country + city, ASN the autonomous system on top.
+    async fn resolve_uncached(&self, backends: &Backends, host: &str) -> Option<GeoInfo> {
         let ip = match host.parse::<IpAddr>() {
             Ok(ip) => ip,
             Err(_) => self.dns_resolve(host).await?,
         };
-        let mut info = lookup(backend, ip)?;
-        info.ip = ip.to_string();
-        Some(info)
+        let mut info = GeoInfo {
+            ip: ip.to_string(),
+            ..Default::default()
+        };
+        let mut any = false;
+        if let Some(reader) = &backends.city
+            && let Some(city) = lookup_city(reader, ip)
+        {
+            info.country_code = info.country_code.or(city.country_code);
+            info.country_name = info.country_name.or(city.country_name);
+            info.city_name = info.city_name.or(city.city_name);
+            any = true;
+        }
+        if let Some(reader) = &backends.asn
+            && let Some(asn) = lookup_asn(reader, ip)
+        {
+            info.asn = asn.asn;
+            info.asn_org = asn.asn_org;
+            any = true;
+        }
+        any.then_some(info)
     }
 
     /// Async DNS resolution with the configured timeout. Prefers the first
@@ -215,37 +267,32 @@ fn first_ip(lookup: impl Iterator<Item = std::net::SocketAddr>) -> Option<IpAddr
 }
 
 /// On-demand enrichment over **every** GeoLite2 database found in
-/// `[geo].db_dir` — not just the one `[geo].db` selects for the pipeline
-/// (admin proxy-card "resolve City/ASN" action). The three readers are
-/// opened lazily on first use and kept for the process lifetime; databases
-/// missing from the directory simply contribute no facts.
+/// `[geo].db_dir` (admin proxy-card "resolve City/ASN" action). Same
+/// resolution semantics as [`GeoResolver`] — both open and merge all
+/// databases — kept as a thin wrapper so the admin panel can hold its own
+/// resolver instance (with its own cache) next to the pipeline one.
 pub struct FullResolver {
-    country: Option<Reader<Vec<u8>>>,
-    city: Option<Reader<Vec<u8>>>,
-    asn: Option<Reader<Vec<u8>>>,
-    dns_timeout: Duration,
+    inner: GeoResolver,
 }
 
 impl FullResolver {
-    /// Open every database present in `db_dir`. Missing files are skipped
-    /// silently: the caller decides what to report when nothing resolved.
+    /// Open every database present in `db_dir` — regardless of
+    /// `[geo].enabled`, which gates the pipeline's own resolver (the card
+    /// enrichment is independent of the pipeline). Missing files are
+    /// skipped silently: the caller decides what to report when nothing
+    /// resolved.
     pub fn from_dir(cfg: &GeoConfig) -> Self {
-        let open = |kind: GeoDbKind| {
-            let path = cfg.db_dir.join(kind.file_name());
-            Reader::open_readfile(&path).ok()
-        };
+        let mut cfg = cfg.clone();
+        cfg.enabled = true;
         Self {
-            country: open(GeoDbKind::Country),
-            city: open(GeoDbKind::City),
-            asn: open(GeoDbKind::Asn),
-            dns_timeout: Duration::from_secs(cfg.dns_timeout_secs),
+            inner: GeoResolver::new(&cfg),
         }
     }
 
     /// Whether any database loaded at all — `false` means there is nothing
     /// to enrich with and the UI should not offer the action.
     pub fn is_active(&self) -> bool {
-        self.country.is_some() || self.city.is_some() || self.asn.is_some()
+        self.inner.is_active()
     }
 
     /// Resolve a host against every loaded database and merge the facts:
@@ -253,60 +300,8 @@ impl FullResolver {
     /// autonomous system. `None` when the host does not resolve to an IP
     /// or no database knows the address.
     pub async fn resolve(&self, host: &str) -> Option<GeoInfo> {
-        let ip = match host.parse::<IpAddr>() {
-            Ok(ip) => ip,
-            Err(_) => {
-                let lookup =
-                    tokio::time::timeout(self.dns_timeout, tokio::net::lookup_host((host, 0)))
-                        .await
-                        .ok()?
-                        .ok()?;
-                first_ip(lookup)?
-            }
-        };
-        let mut info = GeoInfo {
-            ip: ip.to_string(),
-            ..Default::default()
-        };
-        let mut any = false;
-        if let Some(reader) = &self.city
-            && let Some(city) = lookup_city(reader, ip)
-        {
-            info.country_code = info.country_code.or(city.country_code);
-            info.country_name = info.country_name.or(city.country_name);
-            info.city_name = info.city_name.or(city.city_name);
-            any = true;
-        }
-        if info.country_code.is_none()
-            && let Some(reader) = &self.country
-            && let Some(country) = lookup_country(reader, ip)
-        {
-            info.country_code = info.country_code.or(country.country_code);
-            info.country_name = info.country_name.or(country.country_name);
-            any = true;
-        }
-        if let Some(reader) = &self.asn
-            && let Some(asn) = lookup_asn(reader, ip)
-        {
-            info.asn = asn.asn;
-            info.asn_org = asn.asn_org;
-            any = true;
-        }
-        any.then_some(info)
+        self.inner.resolve(host).await.map(|info| (*info).clone())
     }
-}
-
-fn lookup_country(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<GeoInfo> {
-    use maxminddb::geoip2;
-    let record: geoip2::Country = reader.lookup(ip).ok()?.decode().ok().flatten()?;
-    if record.country.is_empty() {
-        return None;
-    }
-    Some(GeoInfo {
-        country_code: record.country.iso_code.map(str::to_string),
-        country_name: english_name(&record.country.names),
-        ..Default::default()
-    })
 }
 
 fn lookup_city(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<GeoInfo> {
@@ -331,14 +326,6 @@ fn lookup_asn(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<GeoInfo> {
         asn_org: record.autonomous_system_organization.map(str::to_string),
         ..Default::default()
     })
-}
-
-fn lookup(backend: &Backend, ip: IpAddr) -> Option<GeoInfo> {
-    match backend {
-        Backend::Country(reader) => lookup_country(reader, ip),
-        Backend::City(reader) => lookup_city(reader, ip),
-        Backend::Asn(reader) => lookup_asn(reader, ip),
-    }
 }
 
 /// Since maxminddb 0.27 the geoip2 model exposes names as a typed struct
@@ -366,7 +353,7 @@ mod tests {
     /// (tests skip themselves when it is empty — CI runs without them).
     fn workspace_db_dir() -> Option<std::path::PathBuf> {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
-        let has_any = [GeoDbKind::Country, GeoDbKind::City, GeoDbKind::Asn]
+        let has_any = [GeoDbKind::City, GeoDbKind::Asn]
             .iter()
             .any(|kind| dir.join(kind.file_name()).is_file());
         has_any.then(|| dir.canonicalize().unwrap())
@@ -426,26 +413,45 @@ mod tests {
         assert!(resolver.resolve("8.8.8.8").await.is_none());
     }
 
-    /// The pipeline resolver keeps working on its single configured database
-    /// regardless of the others (regression guard for the refactor that
-    /// extracted the per-kind lookup helpers). Skipped without the files.
+    /// The pipeline resolver merges every unique database found in `db_dir`
+    /// (regression guard for the one-database era: a template can mix
+    /// country, city and ASN facts at once). Skipped without the files.
     #[tokio::test]
-    async fn pipeline_resolver_still_resolves_its_configured_database() {
-        let Some(dir) = workspace_db_dir() else {
-            eprintln!("skipping: no GeoLite2 databases in workspace config/");
+    async fn pipeline_resolver_merges_all_databases() {
+        let Some(resolver) = resolver_for(GeoDbKind::City) else {
+            eprintln!("skipping: GeoLite2-City.mmdb not present");
             return;
         };
-        let resolver = GeoResolver::new(&GeoConfig {
-            enabled: true,
-            db_dir: dir,
-            ..Default::default()
-        });
-        if !resolver.is_active() {
-            eprintln!("skipping: configured database (Country) not present");
-            return;
-        }
         let info = resolver.resolve("8.8.8.8").await.expect("8.8.8.8 known");
         assert_eq!(info.country_code.as_deref(), Some("US"));
+        // 8.8.8.8 is anycast Google DNS: City has no city for it, but when
+        // the ASN database is present its facts must merge in alongside the
+        // country — impossible in the one-database era.
+        if mmdb_path(GeoDbKind::Asn).is_some() {
+            assert_eq!(info.asn, Some(15169), "Google ASN expected: {info:?}");
+            assert_eq!(info.asn_org.as_deref(), Some("Google LLC"));
+        }
+    }
+
+    /// The merged facts flow through a mixed template: country, city and
+    /// ASN together in one name. Skipped without the files.
+    #[tokio::test]
+    async fn merged_template_renders_country_city_and_asn_at_once() {
+        let Some(resolver) = resolver_for(GeoDbKind::City) else {
+            eprintln!("skipping: GeoLite2-City.mmdb not present");
+            return;
+        };
+        // Literal IP: no DNS round-trip. 8.8.8.8 is US/AS15169 with no
+        // city (anycast) — the template must render country and ASN in one
+        // pass, with the missing city collapsing away.
+        let info = resolver.resolve("8.8.8.8").await.expect("8.8.8.8 known");
+        assert_eq!(info.country_code.as_deref(), Some("US"));
+        if mmdb_path(GeoDbKind::Asn).is_some() {
+            assert_eq!(
+                apply_template("{flag} {country} {city} · {asn} {asn_org} · {name}", &info, "Node-1"),
+                "🇺🇸 United States · AS15169 Google LLC · Node-1"
+            );
+        }
     }
 
     #[test]
@@ -611,22 +617,22 @@ mod tests {
         path.exists().then_some(path)
     }
 
+    /// A resolver over the workspace `config/` directory, active only when
+    /// at least the given database kind is present (CI runs without any).
     fn resolver_for(kind: GeoDbKind) -> Option<GeoResolver> {
-        let db_dir = mmdb_path(kind)?;
-        let cfg = GeoConfig {
+        let db_dir = mmdb_path(kind)?.parent().unwrap().to_path_buf();
+        let resolver = GeoResolver::new(&GeoConfig {
             enabled: true,
-            db: kind,
-            db_dir: db_dir.parent().unwrap().to_path_buf(),
+            db_dir,
             ..Default::default()
-        };
-        let resolver = GeoResolver::new(&cfg);
+        });
         resolver.is_active().then_some(resolver)
     }
 
     #[tokio::test]
     async fn country_lookup_for_literal_ip() {
-        let Some(resolver) = resolver_for(GeoDbKind::Country) else {
-            eprintln!("skipped: GeoLite2-Country.mmdb not present");
+        let Some(resolver) = resolver_for(GeoDbKind::City) else {
+            eprintln!("skipped: GeoLite2-City.mmdb not present");
             return;
         };
         // 8.8.8.8 is Google's DNS, reliably geo-tagged as US.
@@ -641,8 +647,8 @@ mod tests {
 
     #[tokio::test]
     async fn results_are_cached_including_negative() {
-        let Some(resolver) = resolver_for(GeoDbKind::Country) else {
-            eprintln!("skipped: GeoLite2-Country.mmdb not present");
+        let Some(resolver) = resolver_for(GeoDbKind::City) else {
+            eprintln!("skipped: GeoLite2-City.mmdb not present");
             return;
         };
         // TEST-NET-1 address: valid IP, typically without geo data — the
@@ -693,8 +699,8 @@ mod tests {
 
     #[tokio::test]
     async fn dns_resolution_for_domain_host() {
-        let Some(resolver) = resolver_for(GeoDbKind::Country) else {
-            eprintln!("skipped: GeoLite2-Country.mmdb not present");
+        let Some(resolver) = resolver_for(GeoDbKind::City) else {
+            eprintln!("skipped: GeoLite2-City.mmdb not present");
             return;
         };
         // Requires network; treated as a skip when the sandbox is offline.

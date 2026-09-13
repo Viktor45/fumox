@@ -740,7 +740,7 @@ impl BuilderView {
     }
 
     /// The placeholder registry joined for the template hint (PIPELINE.md
-    /// §5): when Phase 4 extends the registry, the hint follows on its own.
+    /// §5); the hint follows the registry on its own.
     pub(crate) fn geo_placeholders(&self) -> String {
         Schema::geo_placeholders().join(" ")
     }
@@ -829,10 +829,11 @@ impl Schema {
         SortBy::ALL.iter().map(|s| s.as_str()).collect()
     }
 
-    /// Geo template placeholders (SPEC §5.1). Phase 4 extends this registry
-    /// with `{city} {asn} {asn_org}` — one constant, no other changes.
-    pub(crate) fn geo_placeholders() -> [&'static str; 3] {
-        ["{flag}", "{country}", "{name}"]
+    /// Geo template placeholders (SPEC §5.1) — all six that
+    /// `fumox_core::geo::apply_template` renders, so the hint cannot drift
+    /// from the engine.
+    pub(crate) fn geo_placeholders() -> [&'static str; 6] {
+        ["{flag}", "{country}", "{city}", "{asn}", "{asn_org}", "{name}"]
     }
 }
 
@@ -2003,7 +2004,7 @@ mod tests {
         );
         assert_eq!(
             Schema::geo_placeholders(),
-            ["{flag}", "{country}", "{name}"]
+            ["{flag}", "{country}", "{city}", "{asn}", "{asn_org}", "{name}"]
         );
     }
 

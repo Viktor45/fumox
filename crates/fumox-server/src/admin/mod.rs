@@ -32,9 +32,9 @@ pub struct AdminState {
     pub pool: DbPool,
     pub caches: Caches,
     pub geo: Arc<GeoResolver>,
-    /// On-demand enrichment over every GeoLite2 database in `[geo].db_dir`
-    /// (admin proxy-card "resolve City/ASN" action). Opened lazily on first
-    /// use — the files are large and the action is rare.
+    /// On-demand enrichment for the proxy card over every GeoLite2 database
+    /// in `[geo].db_dir` — an instance independent of the pipeline resolver
+    /// (own cache), unaffected by `[geo].enabled` gating the pipeline.
     pub geo_full: Arc<fumox_core::geo::FullResolver>,
     /// Immediate-refresh channel into the scheduler (source ids).
     pub refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,

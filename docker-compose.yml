@@ -31,7 +31,7 @@
 #   fumox-data   SQLite database, shared by server and probe -> /app/data
 #   meow-shared  generated Clash config exchange             -> /shared
 #   ./config     app.toml + GeoLite2 .mmdb files (read-only) -> /app/config
-#                Drop GeoLite2-Country.mmdb (or City/ASN) into ./config to
+#                Drop GeoLite2-City.mmdb (or ASN) into ./config to
 #                enable geo enrichment; it is gitignored and not bundled.
 
 services:

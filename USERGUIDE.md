@@ -608,8 +608,8 @@ form.
 | Key                 | Default     | Meaning                                                    |
 | ------------------- | ----------- | ---------------------------------------------------------- |
 | `enabled`           | `true`      | Master switch                                              |
-| `db`                | `"country"` | Which GeoLite2 database to use: `country`, `city` or `asn` |
-| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{Country,City,ASN}.mmdb`    |
+| `db`                | `"country"` | Legacy key from the one-database era; kept so existing configs parse, no longer affects resolution — all databases in `db_dir` are merged |
+| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`            |
 | `cache_max_entries` | `16384`     | Host→geo cache size                                        |
 | `dns_timeout_secs`  | `5`         | DNS resolution timeout                                     |
 
@@ -907,10 +907,13 @@ Manual installation (e.g. with your own MaxMind license) goes like this:
 2. Download the database you need via
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/).
 3. Place the file into `[geo].db_dir` (default `config/`) under its canonical
-   name: `GeoLite2-Country.mmdb`, `GeoLite2-City.mmdb` or `GeoLite2-ASN.mmdb`.
+   name: `GeoLite2-City.mmdb` or `GeoLite2-ASN.mmdb`.
 
-Pick the database with `[geo].db` (`country` by default). If the file is
-missing, geo enrichment quietly disables itself (a warning is logged) and
+Fumox opens **every** database it finds in `[geo].db_dir` and merges their
+facts, so country, city and ASN data combine in one name template. The
+Country database is not used: City carries every fact it has (an existing
+`GeoLite2-Country.mmdb` is simply ignored). If no database file can be
+opened, geo enrichment quietly disables itself (a warning is logged) and
 everything else keeps working. MaxMind updates their databases weekly.
 
 Fumox fetches the databases itself: at startup the server checks
@@ -918,16 +921,17 @@ Fumox fetches the databases itself: at startup the server checks
 or older than a month from a public release mirror.
 
 **Name templates.** The `geo.template` pipeline setting (default
-`"{flag} {country} · {name}"`) supports these placeholders:
+`"{flag} {country} · {name}"`) supports these placeholders — all of them
+work in one template at the same time, each drawing on its own database:
 
-| Placeholder | Meaning                               | Requires                 |
-| ----------- | ------------------------------------- | ------------------------ |
-| `{flag}`    | Country flag emoji                    | Country or City database |
-| `{country}` | Country name (falls back to ISO code) | Country or City database |
-| `{city}`    | City name                             | City database            |
-| `{asn}`     | AS number, rendered as `AS12345`      | ASN database             |
-| `{asn_org}` | AS organization name                  | ASN database             |
-| `{name}`    | The original display name             | –                        |
+| Placeholder | Meaning                               | Data source              |
+| ----------- | ------------------------------------- | ----------------------- |
+| `{flag}`    | Country flag emoji                    | City database           |
+| `{country}` | Country name (falls back to ISO code) | City database           |
+| `{city}`    | City name                             | City database           |
+| `{asn}`     | AS number, rendered as `AS12345`      | ASN database            |
+| `{asn_org}` | AS organization name                  | ASN database            |
+| `{name}`    | The original display name             | –                       |
 
 A placeholder with no data behind it collapses to nothing: extra whitespace
 and dangling separators are cleaned up, so `"{flag} {country} {city} · {name}"`

@@ -295,15 +295,18 @@ impl Default for FetchConfig {
     }
 }
 
-/// Geo enrichment via MaxMind GeoLite2 (SPEC §6). The Country database is
-/// the default; City and ASN are reserved for the future.
+/// Geo enrichment via MaxMind GeoLite2 (SPEC §6). Every database found in
+/// `db_dir` is opened and all of them contribute facts — a name template
+/// can mix `{country}`, `{city}` and `{asn}` placeholders freely.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GeoConfig {
     /// Master switch for geo enrichment.
     #[serde(default = "defaults::geo_enabled")]
     pub enabled: bool,
-    /// Which GeoLite2 database to use.
+    /// Legacy selector from the one-database era. No longer affects
+    /// resolution — every database in `db_dir` is merged — but the key is
+    /// still accepted so existing configs keep parsing.
     #[serde(default)]
     pub db: GeoDbKind,
     /// Directory containing the `.mmdb` files (never committed).
@@ -326,13 +329,6 @@ impl Default for GeoConfig {
             cache_max_entries: defaults::geo_cache_max_entries(),
             dns_timeout_secs: defaults::dns_timeout_secs(),
         }
-    }
-}
-
-impl GeoConfig {
-    /// Full path of the configured `.mmdb` file.
-    pub fn db_path(&self) -> PathBuf {
-        self.db_dir.join(self.db.file_name())
     }
 }
 
@@ -956,7 +952,6 @@ mod tests {
         assert_eq!(cfg.log.server, LogLevel::Info);
         assert_eq!(cfg.log.probe, LogLevel::Info);
         assert!(cfg.admin.is_active());
-        assert_eq!(cfg.geo.db_path(), Path::new("config/GeoLite2-Country.mmdb"));
         // Ingest defaults: alive-linger for everyone (the drop gate is
         // opt-in) and the priority-probe queue enabled.
         assert!(!cfg.ingest.drop_gate);

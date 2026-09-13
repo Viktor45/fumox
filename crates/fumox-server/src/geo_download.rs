@@ -44,12 +44,8 @@ struct GeoFile {
     url: &'static str,
 }
 
-fn all_files() -> [GeoFile; 3] {
+fn all_files() -> [GeoFile; 2] {
     [
-        GeoFile {
-            kind: GeoDbKind::Country,
-            url: "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb",
-        },
         GeoFile {
             kind: GeoDbKind::City,
             url: "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb",
@@ -406,12 +402,12 @@ mod tests {
         });
 
         let dir = scratch_dir();
-        let dest = dir.join("GeoLite2-Country.mmdb");
+        let dest = dir.join("GeoLite2-City.mmdb");
         // A plausible previous database must survive the failed refresh.
         std::fs::write(&dest, fake_mmdb(b"previous")).unwrap();
 
         let err = download_body_capped(
-            &format!("http://{addr}/GeoLite2-Country.mmdb"),
+            &format!("http://{addr}/GeoLite2-City.mmdb"),
             &tmp_path(&dest),
             "fumox-test",
             CAP,

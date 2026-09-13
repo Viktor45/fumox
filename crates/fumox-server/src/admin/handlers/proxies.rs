@@ -816,12 +816,12 @@ pub async fn proxy_reset(
     )
 }
 
-/// Refresh the geo facts of one proxy from every GeoLite2 database in
-/// `[geo].db_dir` (Country, City, ASN — the card shows all of them, not
-/// just the pipeline's `[geo].db`). Called while rendering the card, so
-/// opening the page is enough and no button is needed. A host that does
-/// not resolve keeps its stored facts — an empty stamp must never wipe
-/// them; the resolver's DNS+lookup cache makes repeat opens cheap.
+/// Refresh the geo facts of one proxy (Country, City, ASN — every GeoLite2
+/// database in `[geo].db_dir` contributes, the same merge the pipeline
+/// resolver uses). Called while rendering the card, so opening the page is
+/// enough and no button is needed. A host that does not resolve keeps its
+/// stored facts — an empty stamp must never wipe them; the resolver's
+/// DNS+lookup cache makes repeat opens cheap.
 async fn refresh_geo(state: &AdminState, proxy: &mut proxies::ProxyRow) {
     if !state.geo_full.is_active() {
         return;

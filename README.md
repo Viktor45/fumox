@@ -70,8 +70,9 @@ them into `config/` separately:
 1. Sign up at <https://www.maxmind.com/en/geolite2/signup> (free account).
 2. Download the databases you need via
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/):
-   `GeoLite2-Country.mmdb` is used by default (`GeoLite2-City.mmdb` and
-   `GeoLite2-ASN.mmdb` are optional).
+   `GeoLite2-City.mmdb` for country flags/names and city names
+   (`GeoLite2-ASN.mmdb` adds AS numbers/organizations — every database
+   present is merged, so they combine in one name template).
 3. Place each file in `config/` under its canonical name.
 
 Without a database file, geo enrichment disables itself automatically (a

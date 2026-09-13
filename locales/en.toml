@@ -127,7 +127,7 @@
 "ped.exclude_asns_label" = "exclude AS numbers"
 "ped.geo_disable_label" = "Disable geo enrichment"
 "ped.geo_enabled" = "enable geo enrichment"
-"ped.geo_placeholders" = "placeholders:"
+"ped.geo_placeholders" = "placeholders (all work together):"
 "ped.geo_template" = "name template"
 "ped.health_exclude" = "statuses excluded from the output"
 "ped.limit_hint" = "Keep at most this many proxies after dedup and sorting: the top of the chosen sort order."

@@ -264,6 +264,10 @@ table.data th {
 table.data tr:last-child td { border-bottom: none; }
 table.data tr:hover td { background: var(--row-hover); }
 table.data td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Rank cell (dashboard top-alive `#` column): the global
+   `overflow-wrap: anywhere` lets a squeezed column shrink below one
+   digit, splitting "20" onto two lines. */
+table.data td.rank { white-space: nowrap; }
 table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Truncated source link inside a table cell (dashboard, fetch journal):
    same effect as .truncate, but as a class instead of an inline style. */
@@ -304,8 +308,17 @@ table.data.journal td .cell-wrap { white-space: normal; }
    never break across lines: `overflow-wrap: anywhere` on body would
    otherwise hyphenate `hysteria2` inside narrow table columns (probe
    quarantine queue, stats). Host:port addresses keep wrapping — a long
-   hostname must not stretch the column. */
+   hostname must not stretch the column. The wrapping error cells
+   (.cell-wrap: dashboard failure reasons, journal errors) override the
+   nowrap — `td.mono` is more specific than `.cell-wrap`, so the
+   exclusion must be spelled out the same way as td.addr below. */
 table.data td.mono { white-space: nowrap; }
+table.data td.mono.cell-wrap { white-space: normal; }
+/* Two-column failure-reason table (dashboard): nothing competes with the
+   reason column for width, so it takes all the space the panel offers —
+   the journal-grade 360px cap would pin the text to a narrow strip and
+   leave a dead gap before the counter column. */
+table.data.failures td.cell-wrap { max-width: none; }
 table.data td.addr { overflow-wrap: anywhere; white-space: normal; }
 /* Probe quarantine queue: the address is an atomic inline box — under
    width pressure it drops to its own line whole instead of splitting
@@ -383,6 +396,11 @@ fieldset {
 legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
 
 .form-actions { display: flex; gap: 10px; margin-top: 18px; align-items: center; flex-wrap: wrap; }
+
+/* Token rotate form under the endpoints table (import page): the
+   same row-of-controls pattern as .form-actions, but attached to the
+   table above, so the margin comes from the table, not the form. */
+.rotate-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
 
 /* buttons */
 
@@ -802,6 +820,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
      so IPv4 addresses always stay on one line and only long IPv6 hosts
      wrap, at the <wbr> in front of the port; kv labels 110px. */
   .cell-wrap { max-width: 240px; min-width: 200px; }
+  table.data.failures td.cell-wrap { max-width: none; min-width: 0; }
   table.data td.addr { min-width: 190px; }
   table.data td.queue-name { min-width: 190px; }
   .kv th { width: auto; min-width: 110px; }

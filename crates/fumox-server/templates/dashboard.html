@@ -176,7 +176,7 @@
     <p class="muted">{{ self.t("stats.no_failures") }}</p>
   {% else %}
     <div class="table-scroll">
-      <table class="data">
+      <table class="data failures">
         <thead>
           <tr>
             <th>{{ self.t("stats.error_reason") }}</th>
@@ -238,7 +238,7 @@
         <tbody>
           {% for row in top_alive %}
           <tr>
-            <td class="muted">{{ loop.index }}</td>
+            <td class="muted rank">{{ loop.index }}</td>
             <td class="mono small">{{ row.scheme }}</td>
             <td class="mono small addr">{{ row.host }}:<wbr>{{ row.port }}</td>
             <td class="small">{{ self.flag(row.geo_country) }}

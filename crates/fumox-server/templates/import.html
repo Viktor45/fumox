@@ -37,34 +37,49 @@
 {% endmatch %}
 
 <div class="panel">
-  <h2>{{ self.t("io.export_title") }}</h2>
-  <div class="hint">{{ self.t("io.export_hint") }}</div>
-  <p><a class="btn" href="/admin/export">{{ self.t("io.export_btn") }}</a></p>
-
-  <h3>{{ self.t("io.alive_title") }}</h3>
-  <div class="hint">{{ self.t("io.alive_hint") }}</div>
-  <p class="mono small"><a href="{{ alive_url }}">{{ alive_url }}</a></p>
-  <p class="small">{{ self.t("io.alive_count") }} <strong>{{ alive_count }}</strong></p>
-  <div class="row-actions">
-    <a class="btn" href="{{ alive_url }}?download=1">{{ self.t("io.alive_download") }}</a>
+  <h2>{{ self.t("io.endpoints_title") }}</h2>
+  <div class="hint">{{ self.t("io.endpoints_hint") }}</div>
+  <div class="table-scroll">
+    <table class="data endpoints">
+      <thead>
+        <tr>
+          <th>{{ self.t("io.col_endpoint") }}</th>
+          <th>{{ self.t("io.col_url") }}</th>
+          <th>{{ self.t("io.col_count") }}</th>
+          <th>{{ self.t("io.col_download") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>{{ self.t("io.alive_title") }}</td>
+          <td class="mono small"><a class="cell-link" href="{{ alive_url }}" title="{{ alive_url }}">{{ alive_url }}</a></td>
+          <td class="num">{{ alive_count }}</td>
+          <td><a class="btn small" href="{{ alive_url }}?download=1">{{ self.t("io.alive_download") }}</a></td>
+        </tr>
+        <tr>
+          <td>{{ self.t("io.ready_title") }}</td>
+          <td class="mono small"><a class="cell-link" href="{{ ready_url }}" title="{{ ready_url }}">{{ ready_url }}</a></td>
+          <td class="num">{{ ready_count }}</td>
+          <td><a class="btn small" href="{{ ready_url }}?download=1">{{ self.t("io.ready_download") }}</a></td>
+        </tr>
+      </tbody>
+    </table>
   </div>
-
-  <h3>{{ self.t("io.ready_title") }}</h3>
-  <div class="hint">{{ self.t("io.ready_hint") }}</div>
-  <p class="mono small"><a href="{{ ready_url }}">{{ ready_url }}</a></p>
-  <p class="small">{{ self.t("io.ready_count") }} <strong>{{ ready_count }}</strong></p>
-  <div class="row-actions">
-    <a class="btn" href="{{ ready_url }}?download=1">{{ self.t("io.ready_download") }}</a>
-    <form method="post" action="/admin/import/alive-token">
-      <input type="hidden" name="_csrf" value="{{ csrf }}">
-      <button class="btn" type="submit">{{ self.t("io.alive_rotate") }}</button>
-      <span class="hint">{{ self.t("io.rotate_hint") }}</span>
-    </form>
-  </div>
+  <form method="post" action="/admin/import/alive-token" class="rotate-actions">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button class="btn" type="submit">{{ self.t("io.alive_rotate") }}</button>
+    <span class="hint">{{ self.t("io.rotate_hint") }}</span>
+  </form>
 </div>
 
 <div class="panel">
-  <h2>{{ self.t("io.import_title") }}</h2>
+  <h2>{{ self.t("io.config_title") }}</h2>
+  <div class="hint">{{ self.t("io.export_hint") }}</div>
+  <div class="form-actions">
+    <a class="btn primary" href="/admin/export">{{ self.t("io.export_btn") }}</a>
+  </div>
+
+  <h3>{{ self.t("io.import_title") }}</h3>
   <div class="hint">{{ self.t("io.import_hint") }}</div>
   <form method="post" action="/admin/import">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
@@ -74,8 +89,9 @@
       <div class="hint">{{ self.t("io.payload_hint") }}</div>
     </div>
     <div class="field">
-      <label for="io-file" class="hint">{{ self.t("io.file_hint") }}</label>
-      <input type="file" id="io-file" accept=".json,application/json">
+      <label for="io-file">{{ self.t("io.file_label") }}</label>
+      <input type="file" id="io-file" name="file" accept=".json,application/json">
+      <div class="hint">{{ self.t("io.file_hint") }}</div>
     </div>
     <div class="form-actions">
       <button class="btn primary" type="submit">{{ self.t("io.submit") }}</button>

@@ -67,6 +67,20 @@ services:
       - "${FUMOX_ADMIN_BIND:-127.0.0.1}:${FUMOX_ADMIN_PORT:-8081}:8081"   # admin panel: loopback-only by
       # default; put a reverse proxy / SSH tunnel in
       # front to expose it
+      #
+      # HTTPS front (optional): docker/nginx/ holds a ready example —
+      # an nginx container terminating TLS for /sub (→ server:8080) and
+      # /admin (→ server:8081), with ACME challenges on port 80. Add:
+      #
+      #   frontend:
+      #     build: { context: docker/nginx }
+      #     ports: ["443:443", "80:80"]
+      #     volumes:
+      #       - ./docker/nginx/certs:/certs:ro     # fullchain.pem + privkey.pem
+      #
+      # …and set FUMOX_ADMIN__SECURE_COOKIES=true (the panel is HTTPS-only
+      # behind the front). The server ports above can then be unpublished
+      # entirely — nginx reaches both listeners over the compose network.
     restart: unless-stopped
 
   probe:

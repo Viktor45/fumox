@@ -204,7 +204,10 @@ Notes:
 
 - The admin port is published to `127.0.0.1` only. To reach it from another
   machine, use an SSH tunnel (`ssh -L 8081:127.0.0.1:8081 host`) or put a TLS
-  reverse proxy in front.
+  reverse proxy in front. A ready-made example lives in `docker/nginx/`:
+  an nginx container terminating TLS for both `/sub` and `/admin`
+  (certificates mount into `/certs`, ACME challenges are served on port 80);
+  wire it up as a compose service in front of `server`.
 - The SQLite database lives in the `fumox-data` volume; `./config` is mounted
   read-only for `app.toml` and GeoLite2 files.
 - meow-rs publishes no official Docker image, so the small wrapper

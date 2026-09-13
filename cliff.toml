@@ -1,0 +1,65 @@
+# git-cliff ~ configuration file
+# https://git-cliff.org/docs/configuration
+#
+# Dated image-snapshot changelog (rolling release): a section per publishing
+# batch, keyed by the image sha-tag. The body template is deliberately FLAT —
+# one machine-readable line per commit, `date|sha|category|message` — because
+# Tera cannot group by a computed attribute (the calendar day of a Unix
+# timestamp). The day-sectioning is done by scripts/make-changelog.py,
+# which reads this draft on stdin; a human pass afterwards rewrites the
+# terse subjects and drops what never shipped in an image.
+#
+# Pipeline:
+#   git-cliff --config cliff.toml | scripts/make-changelog.py
+#
+# Category mapping (Keep a Changelog taxonomy): feat → Added, fix → Fixed,
+# perf/refactor/upd → Changed, docs/manual → Docs, chore and dependabot
+# merges → dropped (they never change the shipped image).
+
+[changelog]
+header = """
+# Changelog
+
+Fumox ships as rolling image snapshots (`ghcr.io/viktor45/fumox:sha-<hash>`
+plus the moving `latest`); this changelog lists what each published batch
+of changes contains, newest first. Match the `sha-` tag of the image you
+pulled (`docker images`) to the hash in a section header, or just diff
+your pull date against the section dates.
+"""
+body = """
+{% for commit in commits %}\
+{{ commit.committer.timestamp | date(fmt="%Y-%m-%d") }}|{{ commit.id | truncate(length=7, end="") }}|{{ commit.group }}|{{ commit.message | upper_first | replace(from="\\n", to=" ") }}
+{% endfor %}\
+"""
+# Remove leading and trailing whitespaces from the changelog's body.
+trim = true
+# Render body even when there are no releases to process.
+render_always = true
+
+[git]
+# Parse commits according to the conventional commits specification.
+conventional_commits = true
+# Non-conventional subjects (Initial commit, Create README.md) are filed
+# under Changed instead of being dropped.
+filter_unconventional = false
+# Split commits on newlines, treating each line as an individual commit.
+split_commits = false
+# Order commits within a day oldest-first (the script writes the day
+# header at the batch's last commit, matching the image tag).
+sort_commits = "oldest"
+
+commit_parsers = [
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^perf", group = "Changed" },
+    { message = "^refactor", group = "Changed" },
+    { message = "^docs", group = "Docs" },
+    { message = "^manual", group = "Docs" },
+    { message = "^upd", group = "Changed" },
+    # dependency bumps and merge noise never change the shipped image
+    { message = "^chore", group = "Internal", drop = true },
+    { message = "^Merge pull request", group = "Internal", drop = true },
+    { message = ".*", group = "Changed" },
+]
+# Exclude commits that are dropped above.
+filter_commits = true

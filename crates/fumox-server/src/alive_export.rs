@@ -1,5 +1,5 @@
 //! Public «all alive» / «all ready» export links (owner request, 2026-08-29;
-//! the ready tier, owner decision 2026-09-10).
+//! the ready tier).
 //!
 //! `GET /export/alive/{token}` serves every currently-`alive` proxy that is
 //! still linked to a source as a plain url_list, so the link can be pasted
@@ -108,8 +108,7 @@ async fn serve_tier(
             );
         }
     };
-    // Constant-time comparison: the token is a public capability link
-    // (security audit, 2026-08-30).
+    // Constant-time comparison: the token is a public capability link.
     if !crate::admin::auth::ct_eq(&expected, &token) {
         return serve::error_response(StatusCode::NOT_FOUND, "link not found");
     }

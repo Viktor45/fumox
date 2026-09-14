@@ -1,4 +1,4 @@
-//! Processing pipeline JSON v1 (SPEC §5, §5.1).
+//! Processing pipeline JSON v1.
 //!
 //! The pipeline configuration is stored as JSON in `sources.pipeline` and
 //! `profiles.pipeline`; the profile config overrides matching top-level
@@ -6,7 +6,7 @@
 //! errors, so a future schema v2 can add fields without ambiguity. Regexes
 //! are compiled at save time; an uncompilable pattern rejects the form.
 //!
-//! Step order (SPEC §5): parse → filter → drop → rename → geo-enrich →
+//! Step order: parse → filter → drop → rename → geo-enrich →
 //! health-filter → merge+dedup → sort → encode. Parse happens during
 //! ingestion, health-filtering is expressed as a status exclusion list for
 //! the repository query (and re-applied here defensively), encode lives in
@@ -22,13 +22,13 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::str::FromStr;
 
-/// Default geo name template (SPEC §5.1).
+/// Default geo name template.
 pub(crate) const DEFAULT_GEO_TEMPLATE: &str = "{flag} {country} · {name}";
 
 /// Raw pipeline configuration, deserialized with `deny_unknown_fields` at
 /// every level so unknown keys fail validation. `pub(crate)` so the admin
 /// pipeline editor's ingest parses JSON with the exact same definitions
-/// (PIPELINE.md §4) instead of mirroring them.
+/// instead of mirroring them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PipelineConfig {
@@ -38,7 +38,7 @@ pub(crate) struct PipelineConfig {
     pub(crate) filter: Option<FilterConfig>,
     #[serde(default)]
     pub(crate) rename: Option<Vec<RenameRule>>,
-    /// Discard rules (SPEC §5 step 3): a proxy matching any rule is never
+    /// Discard rules: a proxy matching any rule is never
     /// stored. Applied at ingestion (the source's own pipeline) and again
     /// on serving before `rename`, so both sides see the original values.
     #[serde(default)]
@@ -51,7 +51,7 @@ pub(crate) struct PipelineConfig {
     pub(crate) dedup: Option<DedupConfig>,
     #[serde(default)]
     pub(crate) sort: Option<SortConfig>,
-    /// Output-size cap (SPEC §5 step 8a): keep at most `count` proxies of
+    /// Output-size cap: keep at most `count` proxies of
     /// the final, deduplicated and sorted list.
     #[serde(default)]
     pub(crate) limit: Option<LimitConfig>,
@@ -71,7 +71,7 @@ pub(crate) struct FilterConfig {
     /// AS numbers to drop, the same accepted format as [`Self::asns`].
     #[serde(default)]
     pub(crate) exclude_asns: Option<Vec<String>>,
-    /// Drop proxies that allow insecure TLS (SPEC §5 step 2): any
+    /// Drop proxies that allow insecure TLS: any
     /// certificate-verification alias set to a truthy value. Default on.
     /// `normalize_params` is the v1 name of the same switch (serde alias,
     /// accepted forever so old exports keep importing).
@@ -218,7 +218,7 @@ pub(crate) struct HealthConfig {
     pub(crate) exclude_statuses: Vec<String>,
 }
 
-/// Default health exclusion (SPEC §8): quarantine and removed are hidden
+/// Default health exclusion: quarantine and removed are hidden
 /// from subscriptions unless the pipeline says otherwise.
 pub(crate) fn default_exclude_statuses() -> Vec<String> {
     vec!["quarantine".to_string(), "removed".to_string()]
@@ -268,7 +268,7 @@ pub(crate) struct SortConfig {
     pub(crate) desc: bool,
 }
 
-/// Output-size cap (SPEC §5 step 8a). `count` is `i64` so that negative or
+/// Output-size cap. `count` is `i64` so that negative or
 /// fractional input fails with the field-level `pipeline.invalid_limit`
 /// error instead of an opaque serde type error; `null`/missing means "no
 /// cap" — the explicit-defaults reset of the profile tri-state.
@@ -319,7 +319,7 @@ pub struct CompiledPipeline {
     sort_by: SortBy,
     sort_desc: bool,
     /// Output-size cap: keep at most this many proxies of the final list
-    /// (SPEC §5 step 8a). `None` = no cap.
+    /// `None` = no cap.
     limit_count: Option<usize>,
     /// Whether `sort` was set explicitly (used to pick the sort config when
     /// several pipelines are merged: profile wins, then the first source).
@@ -327,7 +327,7 @@ pub struct CompiledPipeline {
 }
 
 impl Default for CompiledPipeline {
-    /// Pass-through pipeline with the SPEC §5.1 defaults: drop
+    /// Pass-through pipeline with the defaults: drop
     /// insecure-allowing entries, geo-enrich, drop quarantine/removed,
     /// dedup by fingerprint, keep source order.
     fn default() -> Self {
@@ -366,9 +366,9 @@ pub struct PipelineIssue {
 
 impl CompiledPipeline {
     /// Compile a pipeline JSON value, collecting every validation error
-    /// (field-level issues for the admin form, ADMIN_PLAN §6).
+    /// (field-level issues for the admin form).
     ///
-    /// `NULL` and `{}` mean pass-through with defaults (SPEC §5.1).
+    /// `NULL` and `{}` mean pass-through with defaults.
     pub fn from_json(value: Option<&serde_json::Value>) -> Result<Self, Vec<PipelineIssue>> {
         let Some(value) = value else {
             return Ok(Self::default());
@@ -522,7 +522,7 @@ impl CompiledPipeline {
         out
     }
 
-    /// Discard entries matching the `drop` rules (ingestion side, SPEC §5
+    /// Discard entries matching the `drop` rules (ingestion side
     /// step 3): a matching proxy is never stored, reconciled, geo-resolved
     /// or queued for probing. Only the drop step runs here — the pipeline's
     /// other sections are serving-side by design (a profile may override
@@ -545,7 +545,7 @@ impl CompiledPipeline {
     }
 
     /// Whether any `drop` rule is configured. Reconciliation asks before a
-    /// fetch (SPEC §8.1): a source with drop rules never keeps lingering
+    /// fetch: a source with drop rules never keeps lingering
     /// links, so a rule added later cannot be held off by still-alive rows —
     /// serving-side drop hides them instantly, the next refresh unlinks
     /// them for good.
@@ -553,7 +553,7 @@ impl CompiledPipeline {
         !self.drop.is_empty()
     }
 
-    /// Per-source steps (SPEC §5 steps 2–6): filter → normalize → rename →
+    /// Per-source steps: filter → normalize → rename →
     /// geo-enrich → health-filter. `/sub` runs this for every source with
     /// the merged (source + profile) pipeline, then calls [`Self::finalize`]
     /// once on the merged result.
@@ -569,7 +569,7 @@ impl CompiledPipeline {
         if let Some(excluded) = &self.exclude_protocols {
             candidates.retain(|c| !excluded.contains(&c.entry.scheme));
         }
-        // AS-number filter (SPEC §5 step 2): the stored `geo_asn` is a
+        // AS-number filter: the stored `geo_asn` is a
         // confirmed fact, resolved when the proxy was ingested — the same
         // "only confirmed facts" contract as the profile country allowlist.
         // An allowlist drops proxies without a resolved ASN; an exclude
@@ -592,13 +592,13 @@ impl CompiledPipeline {
         }
 
         // filter.forbid_insecure — drop proxies that allow insecure TLS in
-        // any spelling (SPEC §5 step 2). Falsy toggles (`insecure=0`) and
+        // any spelling. Falsy toggles (`insecure=0`) and
         // alias-free entries survive; the DB row is never touched.
         if self.forbid_insecure {
             candidates.retain(|c| !allows_insecure(&c.entry.params));
         }
 
-        // drop — discard rules (SPEC §5 step 3). Deliberately before
+        // drop — discard rules. Deliberately before
         // `rename`: both this serving-side pass and the ingestion-side one
         // must see the original values, or the two would disagree; a
         // rewrite must never decide whether a proxy is stored. Any rule
@@ -645,7 +645,7 @@ impl CompiledPipeline {
         candidates
     }
 
-    /// Post-merge steps (SPEC §5 step 7): dedup by fingerprint — the first
+    /// Post-merge steps: dedup by fingerprint — the first
     /// occurrence wins, so the earlier source keeps the name it contributed —
     /// followed by the global sort. Speed-enrich is a stub until Phase 4:
     /// latency comes from probe results already stored on the row.
@@ -653,7 +653,7 @@ impl CompiledPipeline {
         let mut seen = HashSet::new();
         candidates.retain(|c| seen.insert(c.entry.fingerprint()));
         self.sort(candidates);
-        // Output cap (SPEC §5 step 8a): applied after dedup and sorting, so
+        // Output cap: applied after dedup and sorting, so
         // the list keeps its top in the chosen order — `sort: latency`
         // yields the N fastest, `sort: source` the first N of the feed.
         if let Some(limit) = self.limit_count {
@@ -693,7 +693,7 @@ impl CompiledPipeline {
 }
 
 /// Merge a source pipeline with the profile override: the profile's
-/// top-level sections replace the source's (SPEC §5.1).
+/// top-level sections replace the source's.
 pub fn merge_configs(
     source: Option<&serde_json::Value>,
     profile: Option<&serde_json::Value>,
@@ -898,8 +898,7 @@ pub struct Candidate {
     pub latency_ms: Option<i64>,
     /// Country code stored on the proxy row by earlier enrichment.
     pub geo_country: Option<String>,
-    /// Autonomous system stored as `AS{n}` on the proxy row (SPEC §5.1
-    /// `filter.asns` / `filter.exclude_asns`).
+    /// Autonomous system stored as `AS{n}` on the proxy row.
     pub geo_asn: Option<String>,
 }
 
@@ -1185,7 +1184,7 @@ mod tests {
     #[test]
     fn empty_asns_allowlist_keeps_nothing_and_compiles() {
         // An explicit empty allowlist means "output nothing" — a real
-        // config, kept (the editor routes it to raw mode, PIPELINE.md §4).
+        // config, kept (the editor routes it to raw mode).
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "filter": { "asns": [] }

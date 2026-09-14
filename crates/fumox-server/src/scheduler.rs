@@ -5,7 +5,7 @@
 //! concurrently, bounded by a semaphore (`[fetch].max_concurrency`).
 //! The admin panel can request an immediate refresh through the mpsc
 //! channel; a per-source in-flight guard prevents duplicate fetches
-//! (ADMIN_PLAN §5).
+//!.
 
 use crate::cache::Caches;
 use crate::events::EventBus;
@@ -47,8 +47,7 @@ impl SchedulerState {
     /// mutexes do not poison, so a panic anywhere in `ingest_source` used to
     /// unwind past the release and pin the id in `in_flight` forever — that
     /// source could never be refreshed again until a restart, and the
-    /// `JoinSet` sweep swallows the `JoinError` silently (security audit,
-    /// 2026-09-05).
+    /// `JoinSet` sweep swallows the `JoinError` silently.
     async fn acquire_source(&self, source_id: &str) -> Option<InFlightGuard> {
         let inserted = {
             let mut guard = self.in_flight.lock().await;
@@ -212,8 +211,8 @@ fn spawn_ingest(
             } => {
                 // New/changed/removed rows → every rendered output containing
                 // this source is stale. Drop them now so clients see the fresh
-                // data immediately instead of waiting out the processed TTL
-                // (SPEC §7). When nothing changed the renderings stay valid.
+                // data immediately instead of waiting out the processed TTL.
+                // When nothing changed the renderings stay valid.
                 if stats.inserted + stats.updated + stats.removed > 0 {
                     caches.invalidate_processed_for_source(&source_id).await;
                 }
@@ -278,7 +277,7 @@ mod tests {
     }
 
     /// A panic in the ingest task must not pin the source as in-flight
-    /// forever (security audit, 2026-09-05).
+    /// forever.
     #[tokio::test]
     async fn in_flight_guard_survives_a_panicking_task() {
         let state = SchedulerState::new(4);

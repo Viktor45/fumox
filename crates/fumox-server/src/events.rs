@@ -1,4 +1,4 @@
-//! In-process event bus for admin-panel push updates (ADMIN_PLAN §9).
+//! In-process event bus for admin-panel push updates.
 //!
 //! The scheduler publishes fetch lifecycle events here; the SSE endpoint
 //! (`GET /admin/events`) subscribes and forwards them to the browser,

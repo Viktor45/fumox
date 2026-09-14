@@ -1,6 +1,6 @@
 //! Startup download of the GeoLite2 databases.
 //!
-//! Fumox never ships the `.mmdb` files (they are gitignored, §12). Until
+//! Fumox never ships the `.mmdb` files (they are gitignored). Until
 //! now the operator had to fetch them by hand; this module closes that gap:
 //! before the listeners bind, each GeoLite2 database in `[geo].db_dir` is
 //! checked and — when missing, implausible (a truncated or broken download
@@ -12,7 +12,7 @@
 //!
 //! Everything here is best-effort: a failure (unwritable directory, no
 //! network, mirror down) is logged and skipped — geo enrichment is an
-//! optional enhancement (SPEC §6), never a startup requirement.
+//! optional enhancement, never a startup requirement.
 
 use fumox_core::config::{AppConfig, GeoDbKind};
 use std::path::{Path, PathBuf};
@@ -372,7 +372,7 @@ mod tests {
     }
 
     /// A mirror streaming more than the cap must be cut off with an error
-    /// and the destination kept intact (security audit, 2026-09-06).
+    /// and the destination kept intact.
     /// Exercised with a tiny cap through [`download_body_capped`] so the
     /// test does not actually write half a gigabyte to disk.
     #[tokio::test]

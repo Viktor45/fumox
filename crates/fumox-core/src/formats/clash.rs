@@ -1,8 +1,8 @@
-//! Clash/Mihomo YAML output (SPEC §10).
+//! Clash/Mihomo YAML output.
 //!
 //! The emitted document carries only the `proxies:` list; mihomo fills the
 //! rest with its defaults. An empty profile yields a valid `proxies: []`
-//! document (SPEC §10.2 «пустой валидный конф»).
+//! document.
 //!
 //! The mapping follows the mihomo proxy schema: TLS is enabled by
 //! `security=tls|reality` (vless/trojan) or the vmess `tls` field, REALITY

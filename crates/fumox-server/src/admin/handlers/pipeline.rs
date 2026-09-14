@@ -1,4 +1,4 @@
-//! Pipeline builder endpoints (PIPELINE.md §3): server-side generation and
+//! Pipeline builder endpoints: server-side generation and
 //! validation for the admin form widget. All of them are POSTs inside the
 //! protected admin router, so session auth and the CSRF middleware apply
 //! exactly like to every other admin action; the builder fields ride in the
@@ -69,7 +69,7 @@ pub async fn pipeline_rows(
     render_html(lang, &fragment, StatusCode::OK)
 }
 
-/// Mode switch (PIPELINE.md §2.2): the asymmetric builder ⇄ raw toggle.
+/// Mode switch: the asymmetric builder ⇄ raw toggle.
 /// Builder → raw is always safe — the JSON is generated from the fields.
 /// Raw → builder only when the textarea parses into the builder; otherwise
 /// the widget stays in raw mode with the warning and the JSON untouched.
@@ -123,7 +123,7 @@ pub async fn pipeline_mode(
         .into_response()
 }
 
-/// A preset (PIPELINE.md §6): re-render the whole widget with the ready-made
+/// A preset: re-render the whole widget with the ready-made
 /// state; the preview is refreshed with it (it is part of the widget).
 pub async fn pipeline_preset(
     State(state): State<AdminState>,

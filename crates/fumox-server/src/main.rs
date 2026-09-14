@@ -2,7 +2,7 @@
 //!
 //! Loads configuration, opens the database, runs the background source
 //! refresh scheduler, serves `/sub` and `/src` on the public listener and
-//! the SSR admin panel on a separate loopback listener (ADMIN_PLAN §2),
+//! the SSR admin panel on a separate loopback listener,
 //! and shuts down gracefully on SIGINT/SIGTERM.
 
 mod admin;
@@ -76,14 +76,14 @@ async fn main() -> anyhow::Result<()> {
     let pool = fumox_core::db::connect_pool(&config.database).await?;
     fumox_core::db::migrate(&pool).await?;
 
-    // The public «all alive» export link (SPEC §10.4): generate the
+    // The public «all alive» export link: generate the
     // capability token on first startup; it persists in `meta`, so the
     // link is stable across restarts until rotated from the admin panel.
     alive_export::ensure_token(&pool).await?;
 
     // Best-effort GeoLite2 database download into [geo].db_dir: fetch what
     // is missing, broken or older than a month. Runs before the geo
-    // resolver opens the files; failures never block startup (SPEC §6).
+    // resolver opens the files; failures never block startup.
     geo_download::ensure_geo_databases(&config).await;
 
     // Background source refresh loop: fetch → parse → reconcile → journal.
@@ -92,12 +92,12 @@ async fn main() -> anyhow::Result<()> {
     let caches = Caches::new();
     let geo = Arc::new(fumox_core::geo::GeoResolver::new(&config.geo));
     // Fill the geo columns of proxies ingested before a database existed
-    // (background: never blocks startup, SPEC §6).
+    // (background: never blocks startup).
     tokio::spawn(geo_backfill::backfill_missing_geo(
         pool.clone(),
         geo.clone(),
     ));
-    // Push updates to the admin panel over SSE (ADMIN_PLAN §9); the
+    // Push updates to the admin panel over SSE; the
     // scheduler publishes fetch lifecycle events onto this bus.
     let events = events::EventBus::new();
     // The admin panel sends source ids over this channel for an immediate
@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let app = serve::router(state).route("/healthz", get(|| async { "ok\n" }));
 
-    // Admin listener (ADMIN_PLAN §2): a separate loopback interface. With
+    // Admin listener: a separate loopback interface. With
     // an empty token or enabled=false the panel is inert — the listener
     // still binds and answers 404 to everything.
     let admin_router = if config.admin.is_active() {

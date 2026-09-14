@@ -1,4 +1,4 @@
-//! Global settings overview (ADMIN_PLAN §4.7): a read-only view of every
+//! Global settings overview: a read-only view of every
 //! tunable of the proxy state machine and its supporting knobs, grouped by
 //! the process that applies them.
 //!
@@ -6,9 +6,8 @@
 //! overrides) and the config is read once at startup, so each section is
 //! badged with its owning process and the page states that changes apply
 //! after that process restarts. The admin panel deliberately cannot edit
-//! them: the config file is the single source of truth (owner decision
-//! 2026-09-06); an editable overlay would need a DB-backed precedence
-//! layer, which was explicitly deferred.
+//! them: the config file is the single source of truth; an editable
+//! overlay would need a DB-backed precedence layer, which was deferred.
 
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -61,7 +60,7 @@ impl SettingsTemplate {
 
 impl_i18n!(SettingsTemplate);
 
-/// Settings overview (ADMIN_PLAN §4.7): the effective configuration,
+/// Settings overview: the effective configuration,
 /// grouped by owning process.
 pub async fn settings_overview(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);

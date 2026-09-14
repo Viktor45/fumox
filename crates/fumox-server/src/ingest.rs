@@ -2,14 +2,14 @@
 //!
 //! One [`ingest_source`] call refreshes a single source end to end and
 //! records the outcome in `fetch_log` and on the source row itself
-//! (`last_fetched_at` / `last_error` / `error_class`, SPEC §10.2).
+//! (`last_fetched_at` / `last_error` / `error_class`).
 //!
 //! Parse failures are soft: HTTP 200 with unrecognizable content is
-//! classified `parse_error` (SPEC §16.11) — including the "zero recognized
+//! classified `parse_error` — including the "zero recognized
 //! lines" case — and never panics.
 //!
 //! Reconciliation keeps alive-linger links for sources without `drop`
-//! rules (SPEC §8.1): a probe-verified proxy missing from the feed stays
+//! rules: a probe-verified proxy missing from the feed stays
 //! linked until the probe itself retires it.
 
 use crate::cache::Caches;
@@ -46,7 +46,7 @@ impl IngestOutcome {
 pub struct IngestSettings {
     /// `[ingest].refresh_check_limit`: how many newly inserted unknown
     /// proxies per refresh are enqueued for priority probing (0 disables
-    /// the queue; SPEC §8.3).
+    /// the queue).
     pub refresh_check_limit: u32,
     /// `[ingest].drop_gate`: whether pipeline `drop` rules switch off the
     /// alive-linger link policy for their source (see `reconcile_source`).
@@ -57,17 +57,17 @@ pub struct IngestSettings {
 ///
 /// With `force = false` a still-fresh raw snapshot (younger than the
 /// source TTL) short-circuits the HTTP fetch — the database is already
-/// reconciled from that payload (SPEC §7 raw cache). Forced refreshes
+/// reconciled from that payload. Forced refreshes
 /// ("обновить сейчас" from the admin panel) always hit the network.
 ///
 /// Geo facts are resolved per proxy host while the raw payload is already
 /// parsed (the resolver caches both DNS and lookups) and persisted onto the
 /// `proxies.geo_*` columns during reconciliation, so the admin panel's
 /// country filter and geo card work without waiting for a subscription
-/// render (SPEC §6).
+/// render.
 ///
 /// Freshly inserted proxies are enqueued for priority probing (up to
-/// `settings.refresh_check_limit`, SPEC §8.3): the probe drains the queue
+/// `settings.refresh_check_limit`): the probe drains the queue
 /// at the start of its next cycle, newest first, so new servers get
 /// verified instead of waiting out the random sample.
 pub async fn ingest_source(
@@ -113,7 +113,7 @@ pub async fn ingest_source(
         Ok(filtered) => {
             let found = filtered.entries.len();
             let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
-            // Alive-linger (SPEC §8.1). `[ingest].drop_gate` decides whether
+            // Alive-linger. `[ingest].drop_gate` decides whether
             // a source's drop rules disable it: gated (true) — a rule added
             // later reaches the already-stored rows on the very next
             // refresh; ungated (false, the default) — the probe alone
@@ -154,7 +154,7 @@ pub async fn ingest_source(
     }
 }
 
-/// Result of an admin dry-run fetch (ADMIN_PLAN §13.11): everything a real
+/// Result of an admin dry-run fetch: everything a real
 /// ingestion does up to parsing — same SSRF vetting, same decode/parse —
 /// but nothing is reconciled or journaled.
 #[derive(Debug)]
@@ -221,7 +221,7 @@ pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome
     }
 }
 
-/// Priority-check handoff (SPEC §8.3): enqueue up to `limit` of the pass's
+/// Priority-check handoff: enqueue up to `limit` of the pass's
 /// newly inserted proxies (repo-side filtering keeps only T1-probeable
 /// `unknown` rows). A failure is logged and never fails the ingest — the
 /// random sample covers those proxies anyway.
@@ -274,7 +274,7 @@ async fn resolve_geo_stamps(
 struct FilteredPayload {
     entries: Vec<ProxyEntry>,
     dropped: usize,
-    /// Gates the alive-linger policy (SPEC §8.1): a source with drop rules
+    /// Gates the alive-linger policy: a source with drop rules
     /// must not keep links its rules would have discarded.
     has_drop_rules: bool,
 }
@@ -289,7 +289,7 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     let parsed = fumox_core::parsers::parse_subscription(text, encoding, source.input_format)
         .map_err(|e| e.to_string())?;
     if parsed.entries.is_empty() {
-        // HTTP 200 with zero recognized lines is parse_error (SPEC §16.11).
+        // HTTP 200 with zero recognized lines is parse_error.
         return Err(format!(
             "no proxies recognized (discarded={}, unrecognized={}, clash_skipped={})",
             parsed.discarded, parsed.unrecognized, parsed.clash_skipped
@@ -305,7 +305,7 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
             .collect(),
         None => parsed.entries,
     };
-    // Pipeline `drop` rules (SPEC §5 step 3): a matching proxy is never
+    // Pipeline `drop` rules: a matching proxy is never
     // stored. Only the source's own pipeline runs here — profiles may
     // override the section on serving, but they never take part in
     // ingestion (one source feeds many profiles). Fail-closed like the
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn drop_rules_gate_off_the_alive_linger() {
-        // SPEC §8.1 + `[ingest].drop_gate`: the linger decision is
+        // + `[ingest].drop_gate`: the linger decision is
         // `!(drop_gate && has_drop_rules)` — has_drop_rules alone never
         // disables linger when the config leaves the gate off (the
         // default: the probe alone retires live proxies, drop rules only

@@ -1,7 +1,7 @@
 //! Shared SSRF address policy for both long-lived consumers of untrusted
 //! network input: the server's source fetcher (`[admin].allow_private_urls`)
 //! and the probe daemon's dial targets (`[probe].allow_private_targets`,
-//! security audit v2, 2026-09-09, finding F1).
+//! security review v2).
 //!
 //! Proxy hosts and ports arrive from remote subscription feeds and were
 //! previously dialed by the probe with no vetting at all — a feed line like
@@ -90,7 +90,7 @@ fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
 /// The async DNS resolution (`tokio::net::lookup_host`) is intentional:
 /// every caller is on a Tokio task, and the previous synchronous
 /// `std::net::ToSocketAddrs` blocked the runtime worker for the full
-/// resolver timeout (security audit, 2026-09-10, L1).
+/// resolver timeout.
 pub async fn vet_probe_host_addrs(host: &str, allow_private: bool) -> Result<Vec<IpAddr>, String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         check_ip(ip, allow_private)?;

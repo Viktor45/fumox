@@ -1,4 +1,4 @@
-//! Global fetch journal screen (ADMIN_PLAN §4.6): `fetch_log` across all
+//! Global fetch journal screen: `fetch_log` across all
 //! sources with ok/error, error-class and source filters plus pagination.
 //! Probe history intentionally has no page of its own — it lives on the
 //! proxy card.

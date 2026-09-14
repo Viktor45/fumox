@@ -1,8 +1,8 @@
-//! Configuration import/export (ADMIN_PLAN §4.6, Phase 4).
+//! Configuration import/export.
 //!
 //! Export serializes every source and profile (plus profile composition)
 //! into a versioned JSON file; import recreates them. The semantics are
-//! **create-new only** (owner decision 2026-08-28): imported objects always
+//! **create-new only**: imported objects always
 //! receive fresh `nanoid(12)` ids, profile composition is remapped onto the
 //! new source ids, and existing rows are never overwritten. Slug collisions
 //! with the database (or within the file) drop the slug rather than the
@@ -34,7 +34,7 @@ use super::caps;
 /// `payload` field (the admin router's `DefaultBodyLimit::max(1 MiB)` still
 /// caps the raw body), so an attacker cannot force a `Vec<(String, String)>`
 /// of every duplicate pair into memory before the handler picks the field
-/// it actually needs (security audit, 2026-09-10, H3).
+/// it actually needs.
 #[derive(Deserialize)]
 pub(in crate::admin) struct ImportPayloadForm {
     #[serde(default)]
@@ -227,7 +227,7 @@ struct ImportTemplate {
     /// Alive+linked proxy count right now (button context).
     alive_count: i64,
     /// Absolute public URL of the «all ready» export link — the same
-    /// shared token, the verified tier (owner decision, 2026-09-10).
+    /// shared token, the verified tier.
     ready_url: String,
     /// Ready+linked proxy count right now.
     ready_count: i64,
@@ -394,7 +394,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
     let mut errors: Vec<String> = Vec::new();
     let slug_re = regex::Regex::new(SLUG_RE).expect("valid slug regex");
 
-    // Row-count caps (security audit v2, F7): one 1 MiB body could carry
+    // Row-count caps: one 1 MiB body could carry
     // thousands of rows, each triggering cache invalidation and (before the
     // window below) a DNS lookup.
     if file.sources.len() > caps::IMPORT_ROWS {
@@ -419,7 +419,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         return errors; // nothing else is worth checking past the row caps
     }
 
-    // DNS-vet window (security audit v2, F7): `vet_url` resolves every URL
+    // DNS-vet window: `vet_url` resolves every URL
     // inside the request; past the window the URLs are only statically
     // validated — the fetch path re-vets every request anyway, so this is
     // latency/DNS-traffic hygiene, not a security hole.
@@ -532,7 +532,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         {
             errors.push(format!("{ctx}: {}", lang.t("val.slug_format")));
         }
-        // Imported access tokens (security audit v2, F8): a third-party file
+        // Imported access tokens: a third-party file
         // must not plant a guessable secret on a public endpoint. Tokens
         // shorter than the floor are hard errors — silently regenerating
         // them would change what the operator expects the file to contain.
@@ -810,7 +810,7 @@ mod tests {
         assert_eq!(summary.warnings.len(), 2);
     }
 
-    /// F7/F8 (security audit v2, 2026-09-09): import row caps and the
+    /// F7/F8: import row caps and the
     /// access-token floor are hard errors — nothing is written.
     #[tokio::test]
     async fn import_rejects_row_floods_and_short_tokens() {

@@ -1,5 +1,5 @@
 //! Admin panel: SSR (askama) + HTMX, served on a dedicated loopback
-//! listener (ADMIN_PLAN §2). Multilingual UI (Russian default, English and
+//! listener. Multilingual UI (Russian default, English and
 //! any number of extra languages from external TOML catalogs, switchable on
 //! the login screen) with day/night themes, no frontend build step, static
 //! assets vendored into the binary.
@@ -43,7 +43,7 @@ pub struct AdminState {
     /// Event bus feeding the SSE endpoint (`/admin/events`).
     pub events: EventBus,
     /// HTTP fetcher shared with the scheduler; reused by dry-run so the
-    /// SSRF vetting is exactly the same code path (ADMIN_PLAN §13.11).
+    /// SSRF vetting is exactly the same code path.
     pub fetcher: Fetcher,
     /// The `[admin]` configuration block (token, rate limits, TTL).
     pub admin: AdminConfig,
@@ -51,13 +51,13 @@ pub struct AdminState {
     /// serve links shown on the source/profile cards.
     pub server_bind: SocketAddr,
     /// Read-only probe/meow/retention/ingest settings shown on
-    /// `/admin/probe` and `/admin/settings` (ADMIN_PLAN §4.5, §4.7).
+    /// `/admin/probe` and `/admin/settings`.
     pub probe: ProbeConfig,
     pub meow: MeowConfig,
     pub retention: RetentionConfig,
     pub ingest: IngestConfig,
     /// HMAC key for session cookies, derived from the admin token so that
-    /// rotating the token revokes every existing session (ADMIN_PLAN §13.1).
+    /// rotating the token revokes every existing session.
     pub session_key: Vec<u8>,
     /// HMAC key for CSRF tokens (independent from the session key).
     pub csrf_key: Vec<u8>,
@@ -201,7 +201,7 @@ pub fn router(state: AdminState) -> axum::Router {
             "/proxies/purge-removed",
             post(handlers::proxies_purge_removed),
         )
-        // Bulk cleanup transitions (ADMIN_PLAN §13.1 decision 29): literal
+        // Bulk cleanup transitions: literal
         // action segments must be registered before the `/{id}` routes.
         .route(
             "/proxies/quarantine-to-removed",
@@ -232,7 +232,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/logs/fetch", get(handlers::fetch_logs))
         .route("/probe", get(handlers::probe_overview))
         .route("/settings", get(handlers::settings_overview))
-        // Pipeline builder widget (PIPELINE.md §3): server-side generation
+        // Pipeline builder widget: server-side generation
         // and validation inside the same auth+CSRF envelope as every POST.
         .route("/pipeline/preview", post(handlers::pipeline_preview))
         .route("/pipeline/mode", post(handlers::pipeline_mode))
@@ -269,7 +269,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/admin/set-dash-top-n", get(dash_top_n::set_top_n))
         .route("/admin/static/app.css", get(static_css))
         .route("/admin/static/htmx.min.js", get(static_htmx))
-        // Router-wide request-body cap (security audit v2, 2026-09-09, F7):
+        // Router-wide request-body cap:
         // the CSRF layer already buffers POSTs at 1 MiB; this gives every
         // other extractor the same bound instead of relying on that
         // coincidence.
@@ -304,7 +304,7 @@ pub fn render_html(lang: Lang, template: &impl Template, status: StatusCode) -> 
     }
 }
 
-/// Vendored stylesheet (ADMIN_PLAN §11, §13.13).
+/// Vendored stylesheet.
 async fn static_css() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
@@ -758,7 +758,7 @@ mod tests {
         assert!(!reloaded.enabled); // was true, toggled to false
     }
 
-    /// M3 (security audit, 2026-09-10): an over-cap body must be rejected
+    /// M3: an over-cap body must be rejected
     /// by the body-limit middleware before the CSRF layer runs. Anything
     /// from `DefaultBodyLimit::max(1 MiB)` (a `413 Payload Too Large`) is
     /// acceptable; a `400` from the CSRF layer's own `to_bytes` cap is
@@ -826,8 +826,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    /// Vendored assets and HEAD requests bypass the admin rate limiter
-    /// (security audit, 2026-09-06): they must stay servable even after the
+    /// Vendored assets and HEAD requests bypass the admin rate limiter:
+    /// they must stay servable even after the
     /// per-IP window is exhausted — a page hit by 429 still needs its CSS
     /// to render the rate-limit message.
     #[tokio::test]
@@ -908,7 +908,7 @@ mod tests {
         let csrf = csrf_for(&state, &cookie);
 
         // A control byte inside a header value is refused by the HTTP layer;
-        // the form must reject it up front (security audit, 2026-08-30).
+        // the form must reject it up front.
         let body = format!(
             "_csrf={csrf}&name=Hdr&url=https%3A%2F%2Fexample.com%2Fsub&cache_ttl_seconds=3600&headers=X-Token%3A%20abc%0Ddef"
         );
@@ -987,7 +987,7 @@ mod tests {
         );
     }
 
-    /// F7 (security audit v2, 2026-09-09): unbounded form fields used to be
+    /// F7: unbounded form fields used to be
     /// stored verbatim — a megabyte pipeline or a hundred tags degraded
     /// every later render. The caps reject the submission.
     #[tokio::test]
@@ -1071,7 +1071,7 @@ mod tests {
         );
     }
 
-    /// F8 (security audit v2, 2026-09-09): a profile token outside the
+    /// F8: a profile token outside the
     /// URL-safe alphabet is rejected by the form.
     #[tokio::test]
     async fn profile_token_validation_caps_and_charset() {
@@ -1273,8 +1273,8 @@ mod tests {
         assert!(html.contains("DE, US"), "card shows the filter: {html:?}");
     }
 
-    /// The `ready` tier surfaces everywhere the statuses are listed
-    /// (owner decision, 2026-09-10): the proxy browser filter, the stats
+    /// The `ready` tier surfaces everywhere the statuses are listed:
+    /// the proxy browser filter, the stats
     /// splits and the export screen's ready link.
     #[tokio::test]
     async fn ready_tier_is_filterable_and_exported() {
@@ -1358,7 +1358,7 @@ mod tests {
 
     /// The Profiles list shows a per-row count of "live" proxies reachable
     /// through the profile's sources: `status` ∈ {alive, quarantine,
-    /// unknown}. `removed` is excluded (SPEC §8, terminal), and proxies
+    /// unknown}. `removed` is excluded, and proxies
     /// reachable only through sources **not** in the profile are excluded.
     /// A proxy reachable through more than one profile source is counted
     /// once (`DISTINCT p.id`).
@@ -1743,7 +1743,7 @@ mod tests {
     }
 
     /// The settings screen renders every state-machine section with the
-    /// configured values and the restart banner (ADMIN_PLAN §4.7).
+    /// configured values and the restart banner.
     #[tokio::test]
     async fn settings_screen_shows_effective_config_sections() {
         let state = test_state(1000).await;
@@ -1783,8 +1783,8 @@ mod tests {
     }
 
     /// Two sources with proxies in every status plus probe history; the
-    /// dashboard (the former stats screen merged in, owner decision
-    /// 2026-09-10) must render the per-source health counters, the
+    /// dashboard (the former stats screen merged in) must render the
+    /// per-source health counters, the
     /// longest-living top and the 24h probe success rate — with the
     /// source-errors block above everything else and no "recent fetches"
     /// table anymore.
@@ -1944,7 +1944,7 @@ mod tests {
         assert!(html.contains("ср: 52"), "{html}");
     }
 
-    /// Proxy-card geo refresh (SPEC §6, on-demand City/ASN): opening the
+    /// Proxy-card geo refresh: opening the
     /// card resolves the host against every GeoLite2 database in the
     /// workspace `config/` and stores the country/city/ASN facts plus the
     /// resolved IP; without them the card renders the stored facts as-is
@@ -2691,7 +2691,7 @@ mod tests {
         );
     }
 
-    /// H4 (security audit, 2026-09-10): an attacker-controlled `lang=`
+    /// H4: an attacker-controlled `lang=`
     /// must never reach `Set-Cookie`, `Location`, or any other header. The
     /// `lang_cookie` builder only ever sees a code that came out of
     /// `Locales::resolve`, which falls back to the default catalog code —
@@ -3400,7 +3400,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Pipeline builder (PIPELINE.md, ADMIN_PLAN §13.1 decision 26)
+    // Pipeline builder
     // -----------------------------------------------------------------
 
     #[tokio::test]
@@ -4097,8 +4097,7 @@ mod tests {
 
         let app = router(state.clone());
         let cookie = login(&app).await;
-        // The dashboard no longer carries a fetches table (owner decision,
-        // 2026-09-10 — it moved to the logs screen only), so the wrapping
+        // The dashboard no longer carries a fetches table — it moved to the logs screen only, so the wrapping
         // cell is asserted wherever the error column exists. The source card
         // renders the same _log fragment inline, so it carries the journal
         // table too.

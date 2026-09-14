@@ -1,6 +1,6 @@
 //! `probe_results` journal: one row per health-check attempt (T1/T2).
 //!
-//! Also the probe priority queue (`probe_requests`, SPEC §8.3): the server
+//! Also the probe priority queue (`probe_requests`): the server
 //! enqueues freshly ingested `unknown` proxies at source-refresh time and
 //! the probe drains the queue at the start of every cycle, newest first,
 //! before falling back to the random sample.
@@ -18,7 +18,7 @@ pub struct ProbeResultEntry<'a> {
     pub latency_ms: Option<i64>,
     /// Failure reason (logged for diagnostics).
     pub error: Option<&'a str>,
-    /// `'tcp'` | `'tls'` | `'t2'` (DATABASE.md).
+    /// `'tcp'` | `'tls'` | `'t2'`.
     pub probe_kind: &'a str,
 }
 
@@ -39,7 +39,7 @@ pub async fn insert(pool: &DbPool, entry: &ProbeResultEntry<'_>) -> crate::Resul
     Ok(())
 }
 
-/// Delete probe history older than the cutoff (retention, SPEC §12).
+/// Delete probe history older than the cutoff (retention).
 pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
     let affected = sqlx::query("DELETE FROM probe_results WHERE checked_at < ?")
         .bind(cutoff)
@@ -51,8 +51,8 @@ pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
 
 /// The `probe_kind` of the most recent failed attempt for a proxy, or `None`
 /// when it has no failed attempts. Newest first via the
-/// `idx_probe_proxy_time` index. Feeds the strict T2-priority rule
-/// (SPEC §8.3): a T1 success must not wipe the fail counter accumulated by
+/// `idx_probe_proxy_time` index. Feeds the strict T2-priority rule:
+/// a T1 success must not wipe the fail counter accumulated by
 /// T2 failures, so the caller needs to know what the last failure was.
 pub async fn last_failed_kind(pool: &DbPool, proxy_id: i64) -> crate::Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(
@@ -93,7 +93,7 @@ pub async fn top_failure_reasons(
     Ok(rows)
 }
 
-// Priority queue (`probe_requests`, SPEC §8.3)
+// Priority queue (`probe_requests`)
 
 /// Enqueue up to `limit` of `candidate_ids` for priority checking. Only
 /// T1-probeable schemes are accepted (unprobeable schemes would clog the
@@ -141,7 +141,7 @@ pub async fn enqueue_checks(
     Ok(queued)
 }
 
-/// Drain the queue, newest first (fresh proxies check first, SPEC §8.3).
+/// Drain the queue, newest first (fresh proxies check first).
 /// Returns candidates that are still `unknown`, still linked to a source
 /// and T1-probeable; everything else in the queue is skipped here and
 /// removed by [`purge_settled_checks`].
@@ -201,7 +201,7 @@ pub async fn purge_settled_checks(pool: &DbPool) -> crate::Result<u64> {
 }
 
 /// Drop queue entries older than the cutoff (retention for the case when
-/// the probe is offline for a long time; SPEC §12).
+/// the probe is offline for a long time.
 pub async fn purge_requests_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
     let affected = sqlx::query("DELETE FROM probe_requests WHERE requested_at < ?")
         .bind(cutoff)

@@ -1,4 +1,4 @@
-//! meow-rs REST client for T2 checks (SPEC §8.2).
+//! meow-rs REST client for T2 checks.
 //!
 //! meow-rs runs as a separate system service; the probe only reloads its
 //! config (`PUT /configs`) and asks for per-proxy delay measurements
@@ -35,8 +35,7 @@ impl MeowClient {
         Self {
             // Client-level timeouts as a floor: every call below also sets a
             // per-request timeout (which takes precedence), but a future one
-            // that forgets to would otherwise hang forever (security audit,
-            // 2026-09-05).
+            // that forgets to would otherwise hang forever.
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(timeout)

@@ -1,4 +1,4 @@
-//! Probe overview screen and the SSE event stream (ADMIN_PLAN §4.5, §9).
+//! Probe overview screen and the SSE event stream.
 
 use super::{fmt_opt_ts_element, fmt_ts_element, server_error};
 use crate::admin::AdminState;
@@ -21,8 +21,8 @@ const HEARTBEAT_STALE_SECS: i64 = 90;
 
 /// Period for the `probe.stats` and `heartbeat` SSE events.
 const STATS_INTERVAL: Duration = Duration::from_secs(30);
-/// Lifetime cap on a single SSE connection (security audit, 2026-09-10,
-/// M5): even with `keep_alive` keepalive pings, a slow-loris client that
+/// Lifetime cap on a single SSE connection: even with `keep_alive`
+/// keepalive pings, a slow-loris client that
 /// never reads from the stream would otherwise sit on a per-IP admin slot
 /// forever. Note the cap is a fixed connection lifetime, not an idle
 /// timeout — the stream closes 10 minutes after connect regardless of
@@ -122,9 +122,9 @@ impl ProbeTemplate {
 
 impl_i18n!(ProbeTemplate);
 
-/// Probe overview (ADMIN_PLAN §4.5): status aggregates, daemon heartbeat,
+/// Probe overview: status aggregates, daemon heartbeat,
 /// meow-rs status and the quarantine queue. The read-only config tables
-/// live on the Settings page (ADMIN_PLAN §4.7).
+/// live on the Settings page.
 pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
@@ -214,7 +214,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
 // SSE stream
 // ---------------------------------------------------------------------------
 
-/// SSE endpoint (ADMIN_PLAN §9): forwards scheduler fetch events from the
+/// SSE endpoint: forwards scheduler fetch events from the
 /// event bus and interleaves periodic `probe.stats` / `heartbeat` events
 /// read from the database. The browser wires this via `EventSource` in the
 /// base template; without JS the polling fragments keep working.
@@ -273,7 +273,7 @@ pub async fn events_stream(
                         .event("heartbeat")
                         .data(payload.to_string()));
                 }
-                // Connection lifetime cap (security audit, 2026-09-10, M5):
+                // Connection lifetime cap:
                 // the stream never outlives SSE_IDLE_TIMEOUT (10 min) even
                 // under steady traffic — the interval is not reset on
                 // activity, so this is a hard cap, not an idle timeout.

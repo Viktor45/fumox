@@ -1,4 +1,4 @@
-//! sing-box / Xray JSON subscription input (SPEC §4).
+//! sing-box / Xray JSON subscription input.
 //!
 //! Two JSON dialects share the `outbounds` key and are both accepted:
 //!
@@ -827,7 +827,7 @@ fn finish(
             super::uri::MAX_QUERY_PARAMS
         ));
     }
-    // Field-size cap (security audit v2, 2026-09-09, F13): sing-box params
+    // Field-size cap: sing-box params
     // bypass `parse_query`, so the byte cap is enforced here.
     for param in &params {
         if param.key.len() > super::uri::MAX_PARAM_BYTES

@@ -467,7 +467,7 @@
 "val.url_ssrf" = "SSRF protection: {0}"
 "val.url_too_long" = "the URL is longer than {0} characters"
 
-# Field caps (security audit v2, 2026-09-09, F7/F8).
+# Field caps: guard against unbounded stored form input.
 "val.field_too_long" = "at most {} characters"
 "val.too_many_tags" = "at most {} tags"
 "val.token_format" = "1–128 characters: letters, digits and '-_.~'"

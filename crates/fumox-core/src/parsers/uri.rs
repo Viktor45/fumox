@@ -245,8 +245,8 @@ pub fn parse_hostport(s: &str) -> Result<(String, u16), String> {
 ///
 /// One `Param` costs ~56 bytes plus two heap allocations, and a query is
 /// split on every `&`, so a single 10 MiB line of `?&&&&…` expanded into
-/// ~1 GB of resident memory — a process-wide OOM, not a per-task failure
-/// (security audit, 2026-09-05). Real feeds carry at most a dozen
+/// ~1 GB of resident memory — a process-wide OOM, not a per-task failure.
+/// Real feeds carry at most a dozen
 /// parameters; a line past this cap is malformed, and the caller's
 /// log-and-skip path drops it.
 pub const MAX_QUERY_PARAMS: usize = 256;
@@ -255,7 +255,7 @@ pub const MAX_QUERY_PARAMS: usize = 256;
 ///
 /// The count cap alone still let a 10 MiB single value ride one line into
 /// the DB twice (`raw_line` plus the params JSON, ~20 MiB per row,
-/// security audit v2, 2026-09-09, F13). Real proxy parameters are tens of
+/// otherwise). Real proxy parameters are tens of
 /// bytes; anything past this cap is malformed.
 pub const MAX_PARAM_BYTES: usize = 8 * 1024;
 
@@ -519,7 +519,7 @@ mod tests {
     }
 
     /// A 10 MiB line of `&` separators expanded into ~1 GB of `Param`s — a
-    /// process-wide OOM (security audit, 2026-09-05).
+    /// process-wide OOM.
     #[test]
     fn oversized_query_is_rejected_not_truncated() {
         let ok = "a=1&".repeat(MAX_QUERY_PARAMS - 1);
@@ -538,8 +538,8 @@ mod tests {
     }
 
     /// One multi-megabyte parameter value rode a single line into the DB
-    /// twice (`raw_line` + params JSON, ~20 MiB per row, security audit v2,
-    /// 2026-09-09, F13) — the count cap alone never saw it.
+    /// twice (`raw_line` + params JSON, ~20 MiB per row) — the count cap
+    /// alone never saw it.
     #[test]
     fn oversized_param_value_is_rejected() {
         let huge = "x".repeat(MAX_PARAM_BYTES + 1);
@@ -557,9 +557,8 @@ mod tests {
     }
 
     /// `raw_line` is persisted verbatim onto every stored row, so an
-    /// oversized line is a storage bomb (security audit v2, 2026-09-09,
-    /// F13): a 10 MiB single-line fetch became ~20 MiB of SQLite data per
-    /// row per refresh.
+    /// oversized line is a storage bomb: a 10 MiB single-line fetch
+    /// became ~20 MiB of SQLite data per row per refresh.
     #[test]
     fn oversized_line_is_skipped_entirely() {
         // One huge fragment keeps the line under the param-value cap but

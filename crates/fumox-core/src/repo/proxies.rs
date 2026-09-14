@@ -1,14 +1,13 @@
 //! Proxy upsert and reconciliation (`proxies`, `proxy_source_links`).
 //!
-//! Reconciliation runs after every successful source fetch (DATABASE.md
-//! «Reconciliation»):
+//! Reconciliation runs after every successful source fetch:
 //!
 //! 1. every parsed entry is upserted by `fingerprint` — mutable fields (name,
 //!    params, raw_line, geo) refresh, but the lifecycle state is never
 //!    touched: `status`, `fail_count` and the quarantine fields are owned by
 //!    the probe state machine, and a reappearing `removed`/`quarantine`
-//!    proxy keeps them (owner decision 2026-08-31, superseding the DATABASE
-//!    v0.4 resurrection rule);
+//!    proxy keeps them — the early resurrection rule is deliberately
+//!    superseded);
 //! 2. `proxy_source_links.seen_at` is stamped for every proxy still present;
 //! 3. links of this source not stamped by the fetch are deleted; a proxy
 //!    with no remaining links is marked `removed`.
@@ -58,7 +57,7 @@ pub struct ReconciliationStats {
     pub unlinked: usize,
     pub removed: usize,
     /// Ids of the rows inserted by this pass (a superset of what the caller
-    /// may enqueue for priority probing — SPEC §8.3); unsorted, chunked
+    /// may enqueue for priority probing; unsorted, chunked
     /// consumers must not rely on order.
     pub inserted_ids: Vec<i64>,
 }
@@ -140,7 +139,7 @@ impl ProxyRow {
 /// `None` element means "no fresh geo facts" — the COALESCE upsert branch
 /// then keeps whatever is already stored).
 ///
-/// `keep_alive_linger` (SPEC §8.1): when the source has no `drop` rules,
+/// `keep_alive_linger`: when the source has no `drop` rules,
 /// an `alive` proxy that vanished from the feed keeps its link — the probe
 /// stays the sole owner of its lifecycle, so a live node is not terminated
 /// by upstream churn. The next refresh to see it back re-stamps the link.
@@ -259,7 +258,7 @@ pub async fn reconcile_source(
     // With `keep_alive_linger` an alive *or ready* proxy keeps a link the
     // fetch did not re-stamp — it stays linked to the source and keeps
     // running the probe cycle; only the probe's own verdict can end it
-    // (`ready` is a live tier too, owner decision 2026-09-10).
+    // (`ready` is a live tier too).
     let unlinked_sql = if keep_alive_linger {
         "DELETE FROM proxy_source_links
          WHERE source_id = ?
@@ -415,7 +414,7 @@ pub async fn count_by_check_coverage(pool: &DbPool) -> crate::Result<Vec<(String
 }
 
 /// Load the deduplicated proxy set reachable from a list of sources, excluding
-/// the given lifecycle statuses (health-filter, SPEC §8.5).
+/// the given lifecycle statuses (health-filter).
 ///
 /// A proxy linked from several of the selected sources is returned once.
 /// Ordering is stable (by id) so callers can apply their own `sort.by`.
@@ -474,7 +473,7 @@ pub struct ProxyWithSource {
 }
 
 /// Load proxies together with each source they are linked to, for pipeline
-/// processing (SPEC §5): a proxy linked from several of the selected
+/// processing: a proxy linked from several of the selected
 /// sources appears once per link, so every source can run its own merged
 /// pipeline before the results are merged and deduplicated.
 ///
@@ -503,11 +502,11 @@ pub async fn list_with_source(
 
 /// Every currently-`alive` proxy still linked to at least one source, in
 /// stable id order — the backing query of the public «all alive» export
-/// link (SPEC §10.4). Fingerprints are unique in the table, so the set is
+/// link. Fingerprints are unique in the table, so the set is
 /// already deduplicated; unlinked rows are excluded just like everywhere
 /// else proxies are served.
 ///
-/// Strictly `alive` (owner decision, 2026-09-10): the tiers do not overlap
+/// Strictly `alive`: the tiers do not overlap
 /// — `ready` rows are served by [`list_ready`] and the ready export link.
 pub async fn list_alive(pool: &DbPool) -> crate::Result<Vec<ProxyRow>> {
     let rows: Vec<ProxyRow> = sqlx::query_as(
@@ -521,10 +520,10 @@ pub async fn list_alive(pool: &DbPool) -> crate::Result<Vec<ProxyRow>> {
     Ok(rows)
 }
 
-/// Every currently-`ready` proxy (tunnel-verified tier, owner decision
-/// 2026-09-10) still linked to at least one source — the backing query of
+/// Every currently-`ready` proxy (tunnel-verified tier) still linked
+/// to at least one source — the backing query of
 /// the public `/export/ready/{token}` link, the verified twin of
-/// [`list_alive`] (SPEC §10.4).
+/// [`list_alive`].
 pub async fn list_ready(pool: &DbPool) -> crate::Result<Vec<ProxyRow>> {
     let rows: Vec<ProxyRow> = sqlx::query_as(
         "SELECT p.* FROM proxies p
@@ -561,7 +560,7 @@ pub async fn count_ready(pool: &DbPool) -> crate::Result<i64> {
     Ok(count)
 }
 
-/// Manual "re-check as new" action from the admin panel (ADMIN_PLAN §8):
+/// Manual "re-check as new" action from the admin panel:
 /// reset the lifecycle to a pristine `unknown`, clearing the fail counter
 /// and every quarantine / second-chance / recheck timestamp. The probe
 /// daemon stays the sole owner of the state machine — this only puts the
@@ -615,7 +614,7 @@ pub async fn count_by_status_for_source(
 }
 
 /// Mark proxies that lost their last source link as `removed`
-/// (ADMIN_PLAN §13.1 decision 9: deleting a source is soft — orphaned
+/// (deleting a source is soft — orphaned
 /// proxies are not physically deleted, they transition to `removed`.
 /// `removed` is terminal for reconciliation: a proxy that reappears in a
 /// fetch keeps its state — the ways back are the admin "reset status"
@@ -635,7 +634,7 @@ pub async fn mark_orphans_removed(pool: &DbPool) -> crate::Result<u64> {
 }
 
 /// Physically delete every `removed` proxy and, via `ON DELETE CASCADE`,
-/// its source links and probe/speed history (ADMIN_PLAN §13.16 «purge
+/// its source links and probe/speed history («purge
 /// removed»). This is the only hard delete in the system — the bulk
 /// cleanup actions above it only transition rows *into* `removed` — and
 /// is guarded by a confirmation dialog in the admin UI. Returns the
@@ -647,7 +646,7 @@ pub async fn purge_removed(pool: &DbPool) -> crate::Result<u64> {
     Ok(result.rows_affected())
 }
 
-// Bulk cleanup actions (ADMIN_PLAN §13.1 decision 29): one-click ways to
+// Bulk cleanup actions: one-click ways to
 // move whole groups of proxies into `removed`. They are status transitions,
 // never hard deletes — the physical cleanup stays the single «purge
 // removed» button, so every action remains reversible via the per-proxy
@@ -678,7 +677,7 @@ pub async fn quarantine_to_removed(pool: &DbPool) -> crate::Result<u64> {
 }
 
 /// Move every `alive` (or `ready` — the cleanup targets all live tiers,
-/// owner decision 2026-09-10) proxy with no resolved country into
+/// countryless) proxy with no resolved country into
 /// `removed` (admin «cleanup» panel). `geo_country IS NULL` means the
 /// country was never resolved — failed lookups keep NULL rather than
 /// writing an empty string, so this predicate catches exactly the
@@ -752,8 +751,8 @@ pub async fn remove_alive_by_country(pool: &DbPool, code: &str) -> crate::Result
 }
 
 /// Move every `unknown` proxy of an unprobeable scheme into `removed`
-/// (admin «cleanup» panel). tuic/mieru cannot be checked at all (SPEC
-/// §8.5), so such rows sit in `unknown` forever unless the admin retires
+/// (admin «cleanup» panel). tuic/mieru cannot be checked at all
+/// (T1-unjudgeable), so such rows sit in `unknown` forever unless the admin retires
 /// them; probeable schemes are untouched — their `unknown` rows are
 /// simply not yet checked. Returns how many rows were affected.
 pub async fn remove_unprobeable_unknown(pool: &DbPool) -> crate::Result<u64> {
@@ -776,7 +775,7 @@ pub async fn remove_unprobeable_unknown(pool: &DbPool) -> crate::Result<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// Probe state machine (SPEC §8.3, §8.3a, §8.4)
+// Probe state machine
 //
 // The probe daemon is the sole driver; every transition is a single atomic
 // UPDATE so a crash between "check finished" and "state written" cannot
@@ -784,7 +783,7 @@ pub async fn remove_unprobeable_unknown(pool: &DbPool) -> crate::Result<u64> {
 // makes the daemon restart-safe and idempotent.
 // ---------------------------------------------------------------------------
 
-// The quarantine schedule is a generic ladder (SPEC §8.3a): step 0 is the
+// The quarantine schedule is a generic ladder: step 0 is the
 // second chance inside the `[24h, 48h)` window after quarantining, steps
 // `1..=N` are the consecutive rechecks whose delays come from
 // `[probe] recheck_delays_secs` (default 15m / 30m / 1h). The failed step
@@ -829,7 +828,7 @@ pub enum Transition {
     Removed,
 }
 
-/// Schemes the T1 connectivity check cannot judge (SPEC §8.5): a TCP/TLS
+/// Schemes the T1 connectivity check cannot judge: a TCP/TLS
 /// connect to a UDP-only port would quarantine healthy proxies. Shared by
 /// the random sample and the priority queue; tuic/mieru are additionally
 /// absent from T2 (meow-rs cannot tunnel them).
@@ -842,8 +841,7 @@ pub const T1_EXCLUDED_SCHEMES: &[&str] = &["hysteria2", "tuic", "mieru"];
 /// would otherwise sit at the head of the sample forever (starvation).
 pub const T2_SCHEMES: &[&str] = &["vless", "vmess", "trojan", "ss", "hysteria2", "socks5"];
 
-/// Random sample of probeable proxies for one T1 cycle (SPEC §8.3: random
-/// sampling spreads load and avoids bursts).
+/// Random sample of probeable proxies for one T1 cycle.
 ///
 /// Eligible: `unknown` or `alive` (quarantine rows follow their own
 /// schedule; `removed` is terminal), still linked to at least one source,
@@ -869,21 +867,21 @@ pub async fn select_t1_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
     Ok(query.fetch_all(pool).await?)
 }
 
-/// Batch for a T2 tunnel check through meow-rs (SPEC §8.2): every `alive`
+/// Batch for a T2 tunnel check through meow-rs: every `alive`
 /// **and `ready`** proxy of a T2-supported scheme (T2 re-verifies the
 /// tunnel; `ready` must be re-checked or a failed T2 could never demote
-/// it, owner decision 2026-09-10), plus `unknown` hysteria2 — hysteria2 is
+/// it), plus `unknown` hysteria2 — hysteria2 is
 /// excluded from T1 by design (a TCP connect to a QUIC port proves
-/// nothing, SPEC §8.5), so T2 is its first and only check; a failure
+/// nothing), so T2 is its first and only check; a failure
 /// counts through the regular `fail_limit`, it does not quarantine
 /// straight away.
 ///
-/// The order is **checked longest ago first** (owner decision 2026-09-06):
+/// The order is **checked longest ago first**:
 /// proxies with no T2 attempt yet come first, then the ones whose last T2
 /// check is the oldest — `ORDER BY RANDOM()` could leave a proxy
 /// tunnel-unverified for months in a large pool while its `alive` status
 /// rested on T1 connectivity alone. The like-for-like counterpart of the
-/// T1 priority queue (SPEC §8.3): the first real verdict arrives within one
+/// T1 priority queue: the first real verdict arrives within one
 /// cycle, the rest of the population follows by recency. The history
 /// lookup goes through `idx_probe_t2_last` (partial index, migration 0006);
 /// SQLite sorts NULLs first in ascending order, so the single `MAX`
@@ -908,7 +906,7 @@ pub async fn select_t2_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
     .await?;
     Ok(rows)
 }
-/// the recheck ladder) is due at `now` (SPEC §8.3a): every `quarantine` row
+/// the recheck ladder) is due at `now`: every `quarantine` row
 /// carries exactly one `ladder_at` (NULL only while a check is in flight),
 /// so a single comparison suffices and the failed step travels in
 /// `ladder_step`.
@@ -934,10 +932,10 @@ pub async fn select_due_quarantine(
 /// Apply a successful check: the proxy is `alive` (or `ready` for a
 /// successful T2 — see `status_to`), every quarantine/recheck timestamp
 /// cleared, `last_alive_at` stamped and the measured latency stored.
-/// Covers `unknown → alive` (first success, SPEC §8.4) and quarantine
-/// revival (SPEC §8.3a step 3/4) alike.
+/// Covers `unknown → alive` (first success) and quarantine
+/// revival alike.
 ///
-/// `status_to` decides the target tier (owner decision, 2026-09-10):
+/// `status_to` decides the target tier:
 /// `"ready"` — the latest T2 tunnel check succeeded, the tunnel-verified
 /// tier; `"alive"` — a T1 success. A T1 success never demotes a `ready`
 /// row (the CASE keeps it), because a live TCP/TLS connect says nothing
@@ -945,8 +943,8 @@ pub async fn select_due_quarantine(
 /// as one of two fixed SQL literals chosen by the caller's own enum —
 /// never interpolated from untrusted input.
 ///
-/// `reset_fail_count` implements the strict T2 priority (owner decision
-/// 2026-08-29, SPEC §8.3): a T1 success must not wipe the fail counter
+/// `reset_fail_count` implements the strict T2 priority: a T1 success
+/// must not wipe the fail counter
 /// accumulated from T2 failures — the tunnel verdict stands until T2 itself
 /// confirms the proxy or the quarantine ladder takes over. T2 successes and
 /// second-chance revivals reset the counter unconditionally; a T1 success
@@ -1003,11 +1001,11 @@ pub async fn check_succeeded(
 /// Increments `fail_count`; when the consecutive-failure limit is reached
 /// the proxy moves to `quarantine` and its second chance is scheduled at
 /// `quarantined_at + min + U(0..spread)` — the `[24h, 48h)` window by
-/// default (SPEC §8.3a step 2). The jitter is drawn here, in the core, so
+/// default. The jitter is drawn here, in the core, so
 /// the moment is fixed in the DB and survives daemon restarts.
 ///
-/// A `ready` row that fails (below the limit) is demoted to `alive`
-/// (owner decision, 2026-09-10): the tunnel-verified tier only lasts
+/// A `ready` row that fails (below the limit) is demoted to `alive`:
+/// the tunnel-verified tier only lasts
 /// while the latest T2 outcome is a success — the next successful T2
 /// promotes it back.
 pub async fn check_failed(
@@ -1083,10 +1081,10 @@ pub async fn check_failed(
 /// Apply a failed quarantine check (second chance or a recheck ladder step).
 ///
 /// The ladder is always scheduled relative to the moment of the failure that
-/// triggered it (SPEC §8.3a step 4): failing step `k` schedules the next
+/// triggered it: failing step `k` schedules the next
 /// check at `now + delays[k]` — step 0 is the second chance, steps `1..`
 /// are the rechecks. Failing the last configured step (or an empty
-/// `delays` on the second chance) removes the proxy (SPEC §8.3a step 5).
+/// `delays` on the second chance) removes the proxy.
 /// The delays come from `[probe] recheck_delays_secs` (default
 /// 15m / 30m / 1h).
 pub async fn quarantine_check_failed(
@@ -1393,7 +1391,7 @@ mod tests {
 
     #[tokio::test]
     async fn alive_linger_keeps_link_and_serves_while_alive() {
-        // SPEC §8.1: a probe-verified proxy that vanished from the feed
+        //: a probe-verified proxy that vanished from the feed
         // keeps its link — the probe alone decides when it leaves.
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
@@ -1578,7 +1576,7 @@ mod tests {
         assert_eq!(status_of(&pool, &e).await.0, "removed");
 
         // Reappearing in a live source does NOT reset the lifecycle
-        // (owner decision 2026-08-31): `removed` is terminal for
+        //: `removed` is terminal for
         // reconciliation; only mutable fields refresh.
         let stats = reconcile_source(
             &pool,
@@ -1874,7 +1872,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Probe state machine (SPEC §8.3, §8.3a)
+    // Probe state machine
     // ------------------------------------------------------------------
 
     /// Insert a bare proxy row with the given scheme and link it to a source
@@ -1983,7 +1981,7 @@ mod tests {
         assert_eq!(row.status, "removed");
     }
 
-    /// The `ready` tier (owner decision, 2026-09-10): a successful T2
+    /// The `ready` tier: a successful T2
     /// promotes to `ready`; a below-limit failure demotes back to `alive`;
     /// a T1 success never touches a `ready` row.
     #[tokio::test]
@@ -2421,7 +2419,7 @@ mod tests {
         let quarantined = entry("quar", "h3.example.com", 443);
         let removed = entry("gone", "h4.example.com", 443);
         // tuic cannot pass T1 by design — even an "alive" one must not be
-        // offered to T2 (meow-rs cannot tunnel it, SPEC §8.5). naive passes
+        // offered to T2 (meow-rs cannot tunnel it). naive passes
         // that old NOT IN guard but has no mihomo counterpart either: the
         // allowlist must keep it out too, or under the recency order it
         // would occupy the head of every batch (starvation).
@@ -2484,7 +2482,7 @@ mod tests {
         .unwrap();
     }
 
-    /// The T2 batch is recency-prioritized (owner decision 2026-09-06):
+    /// The T2 batch is recency-prioritized:
     /// never-checked proxies first, then the ones whose last T2 check is
     /// the oldest — a large pool must not keep a proxy tunnel-unverified
     /// for months while its `alive` rests on T1 connectivity alone.
@@ -2655,7 +2653,7 @@ mod tests {
         assert!(missing.iter().all(|(known, _)| known != &id));
     }
 
-    // Bulk cleanup transitions (ADMIN_PLAN §13.1 decision 29): each action
+    // Bulk cleanup transitions: each action
     // must move exactly its target group into `removed`, clear the
     // quarantine/ladder bookkeeping and leave everything else untouched.
 

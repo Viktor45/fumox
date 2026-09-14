@@ -74,7 +74,7 @@ pub async fn recent_global(pool: &DbPool, limit: i64) -> crate::Result<Vec<Fetch
     Ok(rows)
 }
 
-/// Delete journal entries older than the cutoff (retention, SPEC §12).
+/// Delete journal entries older than the cutoff (retention).
 pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
     let affected = sqlx::query("DELETE FROM fetch_log WHERE fetched_at < ?")
         .bind(cutoff)

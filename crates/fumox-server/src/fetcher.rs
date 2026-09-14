@@ -1,8 +1,8 @@
 //! Source fetcher: HTTP download with SSRF protection, size caps and
-//! retries with exponential backoff (SPEC §16 gaps 4–5, ADMIN_PLAN §3).
+//! retries with exponential backoff.
 //!
-//! Error classification follows the single `error_class` vocabulary
-//! (SPEC §10.2): `network` / `http_server` are recoverable and retried;
+//! Error classification follows the single `error_class` vocabulary:
+//! `network` / `http_server` are recoverable and retried;
 //! `http_client` is not. An SSRF-blocked URL is reported as `http_client`
 //! with status 403 — the source configuration is at fault and retrying
 //! cannot help.
@@ -13,13 +13,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use url::Url;
 
-/// Maximum accepted URL length (ADMIN_PLAN §3).
+/// Maximum accepted URL length.
 const MAX_URL_LEN: usize = 2048;
 /// Upper bound on followed redirects.
 const MAX_REDIRECTS: usize = 5;
 /// Hard ceiling for one retry backoff: a misconfigured `[fetch].max_retries`
 /// must neither overflow the exponential multiply nor park a fetch task for
-/// hours (security audit, 2026-08-30).
+/// hours.
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
 /// A successfully downloaded payload.
@@ -54,7 +54,7 @@ impl FetchFailure {
         }
     }
 
-    /// Whether a retry can plausibly succeed (SPEC §16.5).
+    /// Whether a retry can plausibly succeed.
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
@@ -115,7 +115,7 @@ impl Fetcher {
     /// `Policy::none()` is load-bearing, not a default: reqwest's redirect
     /// layer would consume the 3xx internally and hand back only the final
     /// response, which silently skips the per-hop SSRF vetting in
-    /// [`Self::fetch_once`] (security audit, 2026-09-05). `resolve()` does
+    /// [`Self::fetch_once`]. `resolve()` does
     /// not contain an automatic follow — it is a per-hostname DNS override,
     /// ignored outright for IP literals and overridden by a port in the
     /// redirect target — so the loop must see every hop itself.
@@ -197,8 +197,7 @@ impl Fetcher {
         // Source-configured headers may carry subscription secrets, and
         // reqwest only strips the standardized ones (`Authorization`,
         // `Cookie`, …) across a redirect. They stay scoped to the origin the
-        // admin configured, so a redirect to a collector harvests nothing
-        // (security audit, 2026-09-05).
+        // admin configured, so a redirect to a collector harvests nothing.
         let configured_origin = Url::parse(url).ok().map(|parsed| origin_of(&parsed));
         for _hop in 0..=MAX_REDIRECTS {
             if current.len() > MAX_URL_LEN {
@@ -310,7 +309,7 @@ impl Fetcher {
 
 /// Strip userinfo (`user:pass@`) from a URL string. Applied on every path
 /// where a URL — or an error text embedding one — reaches the tracing log,
-/// `fetch_log` or `sources.last_error` (security audit, 2026-08-30).
+/// `fetch_log` or `sources.last_error`.
 fn redact_url(url: &str) -> String {
     match Url::parse(url) {
         Ok(mut parsed) => {
@@ -442,7 +441,7 @@ pub struct UrlIssue {
     pub args: Vec<String>,
 }
 
-/// Static URL validation applied when a source is saved (ADMIN_PLAN §3).
+/// Static URL validation applied when a source is saved.
 ///
 /// The DNS-level SSRF vetting happens at fetch time (addresses can change
 /// between save and fetch), but scheme, length and host shape are checked
@@ -476,7 +475,7 @@ pub fn validate_url(url: &str) -> Result<(), UrlIssue> {
     Ok(())
 }
 
-/// Save-time SSRF check (ADMIN_PLAN §3): static validation plus DNS
+/// Save-time SSRF check: static validation plus DNS
 /// resolution and address vetting. The fetch path re-vets on every request
 /// to defend against DNS rebinding, so a failure here is fast feedback for
 /// the form, not the last line of defense. Skips DNS when private URLs are
@@ -516,7 +515,7 @@ pub async fn vet_url(
 /// metadata endpoint), CGNAT, unspecified, broadcast and benchmark ranges,
 /// plus their IPv6 equivalents and IPv4-mapped IPv6 addresses. The policy
 /// itself lives in `fumox-core` so the probe daemon applies the identical
-/// blocklist to its dial targets (security audit v2, 2026-09-09, F1).
+/// blocklist to its dial targets.
 pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
     fumox_core::ssrf::check_ip(ip, allow_private)
 }
@@ -767,8 +766,7 @@ mod tests {
     /// The manual redirect loop must actually observe each hop, so that
     /// `resolve_and_vet` runs against the *target* of every redirect. reqwest
     /// following redirects itself would hide the hop and let a vetted public
-    /// source bounce the fetch into a private address (security audit,
-    /// 2026-09-05).
+    /// source bounce the fetch into a private address.
     #[tokio::test]
     async fn a_redirect_into_a_private_address_is_blocked() {
         let internal = spawn_v4_listener().await;

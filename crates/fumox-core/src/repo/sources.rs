@@ -252,8 +252,7 @@ pub async fn delete(pool: &DbPool, id: &str) -> crate::Result<bool> {
 }
 
 /// Record the outcome of a fetch attempt: success stamps `last_fetched_at`
-/// and clears the error fields; failure stores the message and its class
-/// (SPEC §10.2 vocabulary).
+/// and clears the error fields; failure stores the message and its class.
 pub async fn record_fetch_outcome(
     pool: &DbPool,
     id: &str,

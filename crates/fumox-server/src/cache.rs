@@ -1,4 +1,4 @@
-//! In-memory cache layers (SPEC §7).
+//! In-memory cache layers.
 //!
 //! Two layers, both acceleration only — SQLite stays the source of truth:
 //!
@@ -11,8 +11,8 @@
 //!    own `fresh_until`; a stale entry is still served
 //!    (stale-while-revalidate) while a background re-render is scheduled.
 //!
-//! Only 200 responses are cached; 404/500 must stay fresh (SPEC §10.2).
-//! Invalidation (ADMIN_PLAN §7) happens in the same handler that saves the
+//! Only 200 responses are cached; 404/500 must stay fresh.
+//! Invalidation happens in the same handler that saves the
 //! change: a source change clears its raw entry plus every processed entry
 //! that contains the source; a profile change clears its processed entry. A
 //! successful ingest that reconciled new data clears every processed entry
@@ -131,7 +131,7 @@ impl Caches {
         self.processed.invalidate(&key.to_string()).await;
     }
 
-    // ---- invalidation (ADMIN_PLAN §7) ----
+    // ---- invalidation ----
 
     /// Source changed (url/encoding/input_format/protocols/headers/TTL/
     /// pipeline/enabled): drop its raw snapshot and every rendered output
@@ -174,8 +174,7 @@ impl Caches {
     /// The guard releases through `Drop` because tokio mutexes do not poison:
     /// a panic in the background re-render used to unwind past the explicit
     /// release and pin the key in `revalidating` forever, so that endpoint
-    /// served its stale snapshot and never re-rendered again (security audit,
-    /// 2026-09-05).
+    /// served its stale snapshot and never re-rendered again.
     pub async fn try_start_revalidate(&self, key: &str) -> Option<RevalidateGuard> {
         let inserted = self.revalidating.lock().await.insert(key.to_string());
         inserted.then(|| RevalidateGuard {
@@ -330,8 +329,7 @@ mod tests {
     }
 
     /// A panic in the background re-render must release the claim, otherwise
-    /// the endpoint serves its stale snapshot forever (security audit,
-    /// 2026-09-05).
+    /// the endpoint serves its stale snapshot forever.
     #[tokio::test]
     async fn revalidation_claim_survives_a_panicking_task() {
         let caches = Caches::new();

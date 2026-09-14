@@ -36,7 +36,7 @@ pub enum LineOutcome {
 /// Parse one subscription line. Comments and blank lines must be filtered
 /// out by the caller ([`parse_subscription`] does this).
 pub fn parse_line(line: &str) -> LineOutcome {
-    // Line-size cap (security audit v2, 2026-09-09, F13): `raw_line` is
+    // Line-size cap: `raw_line` is
     // persisted verbatim onto every stored row, so an oversized line is a
     // storage bomb — the caller's log-and-skip path drops it like any other
     // malformed line.
@@ -91,7 +91,7 @@ fn parsed(result: Result<ProxyEntry, String>) -> LineOutcome {
 /// break inside any of them splits one stored proxy into several output
 /// lines. A crafted Clash YAML or legacy-`ss` feed could smuggle a proxy of
 /// an entirely different scheme past a source's protocol allowlist that way,
-/// or forge `url_list` metadata comments (security audit, 2026-09-05).
+/// or forge `url_list` metadata comments.
 ///
 /// URI-list input cannot reach this: `parse_uri_list` iterates over
 /// `str::lines`. The vectors are the formats whose fields are not
@@ -371,7 +371,7 @@ mod tests {
     /// A line break in `host`/`credential`/params splits one stored proxy
     /// into several output lines, which smuggles a proxy of a different
     /// scheme past a source's protocol allowlist and forges `url_list`
-    /// metadata comments (security audit, 2026-09-05).
+    /// metadata comments.
     #[test]
     fn line_breaks_are_rejected_at_parse_time() {
         let clash = |body: &str| {

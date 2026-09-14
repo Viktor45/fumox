@@ -32,8 +32,8 @@ use fumox_core::models::Scheme;
 
 use crate::admin::dash_top_n::{self, DashTopN};
 
-/// Dashboard (ADMIN_PLAN §4.1; merged with the former statistics screen,
-/// owner decision 2026-09-10): aggregate counters, source errors (the
+/// Dashboard (merged with the former statistics screen,
+/// aggregate counters, source errors (the
 /// operator's most actionable block, rendered first), per-source health,
 /// probe summary, latency aggregates, ingest dynamics and the
 /// protocol/country splits.
@@ -384,7 +384,7 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
             Err(err) => return server_error(lang, &err),
         };
 
-    // Unprobeable schemes (tuic/mieru stay `unknown` forever, SPEC §8.5).
+    // Unprobeable schemes (tuic/mieru stay `unknown` forever).
     let unprobeable_schemes: Vec<&'static str> = Scheme::all()
         .iter()
         .filter(|scheme| !scheme.is_probeable())
@@ -524,8 +524,8 @@ async fn country_split(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (ADMIN_PLAN §13.1,
-/// decision 17). This text is the no-JS fallback inside [`fmt_ts_element`].
+/// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (the no-JS
+/// fallback). This text is the no-JS fallback inside [`fmt_ts_element`].
 pub fn fmt_ts(ts: i64) -> String {
     const FMT: &[time::format_description::FormatItem<'static>] =
         time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
@@ -545,8 +545,8 @@ fn fmt_ts_attr(ts: i64) -> String {
     }
 }
 
-/// Render a Unix timestamp as a `<time class="ts">` element (ADMIN_PLAN
-/// §13.1, decision 22): the `datetime` attribute carries the UTC instant in
+/// Render a Unix timestamp as a `<time class="ts">` element: the
+/// `datetime` attribute carries the UTC instant in
 /// RFC 3339 form, the text keeps the UTC `YYYY-MM-DD HH:MM:SS` fallback. The
 /// admin JS (base.html) rewrites the text into the user's timezone and
 /// re-runs after every HTMX swap; without JS the UTC text stays readable.
@@ -588,7 +588,7 @@ pub fn fmt_bytes(lang: &Lang, bytes: i64) -> String {
     }
 }
 
-/// Credential masking for lists and forms (ADMIN_PLAN §3): first three
+/// Credential masking for lists and forms: first three
 /// characters plus a fixed tail; short values are hidden entirely.
 pub fn mask_secret(value: &str) -> String {
     if value.is_empty() {
@@ -736,8 +736,8 @@ impl QueryPairs {
 pub const PAGE_SIZE: i64 = 50;
 pub const MAX_PAGE_SIZE: i64 = 200;
 
-/// Field/count caps for admin-stored input (security audit v2, 2026-09-09,
-/// F7/F8). A single POST is bounded by the CSRF buffer (1 MiB) and the
+/// Field/count caps for admin-stored input. A single POST is bounded by
+/// the CSRF buffer (1 MiB) and the
 /// router-wide `DefaultBodyLimit`; these caps keep what actually reaches
 /// SQLite — and every later re-render of it — proportionate to what the
 /// forms legitimately hold.
@@ -779,7 +779,7 @@ pub fn clamp_limit(requested: Option<i64>) -> i64 {
 /// `page` comes from the query string and is only clamped from below, so the
 /// plain `(page - 1) * per_page` overflowed on `?page=9223372036854775807`:
 /// a debug build panicked inside the handler, and release wrapped to a
-/// negative offset (security audit, 2026-09-05). Saturating instead yields an
+/// negative offset. Saturating instead yields an
 /// offset past the end, i.e. an empty page.
 pub fn page_offset(page: i64, per_page: i64) -> i64 {
     page.saturating_sub(1).saturating_mul(per_page)
@@ -792,8 +792,7 @@ pub fn page_offset(page: i64, per_page: i64) -> i64 {
 /// The window is first/last plus ±2 around the current page, so the render
 /// cost is bounded (~9 links) no matter how large the table is: with a
 /// million-row `fetch_log` and `per_page=1` the old `1..=pages` loop
-/// emitted a million `<a>` tags per request (security audit v2,
-/// 2026-09-09, F9).
+/// emitted a million `<a>` tags per request.
 pub fn pagination_pages(page: i64, total: i64, per_page: i64) -> Vec<(i64, bool)> {
     let per_page = per_page.max(1);
     // Stable ceiling division (i64::div_ceil is not stable on this
@@ -911,7 +910,7 @@ mod tests {
     }
 
     /// `?page=i64::MAX` overflowed the offset multiply: a debug build panicked
-    /// inside the handler (security audit, 2026-09-05).
+    /// inside the handler.
     #[test]
     fn page_offset_saturates_instead_of_overflowing() {
         assert_eq!(page_offset(1, 50), 0);
@@ -922,7 +921,7 @@ mod tests {
 
     /// The pagination window is bounded no matter how many pages the table
     /// has: a million-row `fetch_log` at `per_page=1` used to render a
-    /// million links per request (security audit v2, 2026-09-09, F9).
+    /// million links per request.
     #[test]
     fn pagination_pages_render_a_bounded_window() {
         // Deep inside a huge table: first, current±2, last, with gaps.

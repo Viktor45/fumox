@@ -1,5 +1,5 @@
 //! Source screens: list with filters, create/edit form with full
-//! validation (ADMIN_PLAN §4.2), card with aggregates and fetch log,
+//! validation, card with aggregates and fetch log,
 //! toggle / "обновить сейчас" / delete actions.
 
 use super::{
@@ -21,7 +21,7 @@ use fumox_core::models::{Encoding, InputFormat, IpFamily, Scheme, Source, new_id
 use fumox_core::repo::{proxies, sources};
 use std::str::FromStr;
 
-/// Slug rules (ADMIN_PLAN §4.2): starts alphanumeric, then `[A-Za-z0-9_-]`,
+/// Slug rules: starts alphanumeric, then `[A-Za-z0-9_-]`,
 /// total length 2–64.
 const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
 
@@ -173,7 +173,7 @@ struct SourceFormTemplate {
     errors: Vec<(String, String)>,
     all_protocols: Vec<(String, bool)>,
     headers_masked_note: bool,
-    /// Pipeline widget HTML (builder ⇄ raw, PIPELINE.md §3), rendered by the
+    /// Pipeline widget HTML (builder ⇄ raw), rendered by the
     /// editor module; prefilled from the stored pipeline on GET, from the
     /// posted fields on validation errors.
     widget_html: String,
@@ -253,7 +253,7 @@ pub async fn source_edit_form(
     };
     // The widget is prefilled from the stored pipeline when the builder can
     // represent it; otherwise it opens in raw mode with the stored JSON and
-    // the raw-mode warning (PIPELINE.md §2.2).
+    // the raw-mode warning.
     let raw_value = source
         .pipeline
         .as_ref()
@@ -471,7 +471,7 @@ async fn build_source_from_form(
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect();
-        // Tag caps (security audit v2, F7): count and per-tag length.
+        // Tag caps: count and per-tag length.
         if list.len() > caps::TAGS {
             errors.push((
                 "tags".into(),
@@ -495,7 +495,7 @@ async fn build_source_from_form(
     let headers_raw = get("headers");
     let mut headers_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    // Header caps (security audit v2, F7): the whole map is replayed on
+    // Header caps: the whole map is replayed on
     // every fetch of the source, so it is bounded like every other field.
     let non_empty_lines = headers_raw.lines().filter(|l| !l.trim().is_empty()).count();
     if non_empty_lines > caps::HEADER_LINES {
@@ -536,8 +536,7 @@ async fn build_source_from_form(
         }
         let value = value.trim().to_string();
         // Reject names/values the HTTP layer would refuse, so a bad line
-        // fails the form now instead of every future fetch (security audit,
-        // 2026-08-30).
+        // fails the form now instead of every future fetch.
         if axum::http::HeaderName::try_from(key.as_str()).is_err()
             || axum::http::HeaderValue::try_from(value.as_str()).is_err()
         {
@@ -550,7 +549,7 @@ async fn build_source_from_form(
         headers_map.insert(key, value);
     }
 
-    // Pipeline (PIPELINE.md §3): in builder mode the JSON is generated from
+    // Pipeline: in builder mode the JSON is generated from
     // the widget fields server-side (a stale `pipeline` textarea, if any,
     // is ignored); in raw mode the textarea is the input, as before.
     let pipeline = if get("pipeline_mode") == "builder" {
@@ -559,7 +558,7 @@ async fn build_source_from_form(
             None => None,
             Some(value) => match CompiledPipeline::from_json(Some(&value)) {
                 Ok(_) => {
-                    // Same cap as raw mode (security audit v2, F7): the
+                    // Same cap as raw mode: the
                     // generated JSON is stored verbatim and re-rendered
                     // into every edit form, so a form with thousands of
                     // widget rows must not exceed the budget either.
@@ -588,7 +587,7 @@ async fn build_source_from_form(
         if pipeline_raw.trim().is_empty() {
             None
         } else if pipeline_raw.len() > caps::PIPELINE_BYTES {
-            // Pipeline cap (security audit v2, F7): the JSON is stored
+            // Pipeline cap: the JSON is stored
             // verbatim and re-rendered into every edit form.
             errors.push((
                 "pipeline".into(),
@@ -789,7 +788,7 @@ pub async fn source_update(
     if let Err(err) = sources::update(&state.pool, &source).await {
         return server_error(lang, &err);
     }
-    // "Сохранил → сразу действует" (ADMIN_PLAN §7).
+    // "Сохранил → сразу действует".
     state.caches.invalidate_source(&source.id).await;
     tracing::info!(source = %source.id, "source updated");
     if is_htmx(&headers) {
@@ -909,7 +908,7 @@ fn render_source_detail(
         source.slug.clone().unwrap_or_else(|| source.id.clone())
     );
     // Absolute serve link: the host the admin panel was opened on with the
-    // public port from [server].bind (ADMIN_PLAN §4.2).
+    // public port from [server].bind.
     let serve_url = format!("{}{}", state.serve_base(headers), serve_path);
     let headers_display: Vec<(String, String)> = source
         .headers
@@ -1051,7 +1050,7 @@ pub async fn source_toggle(
     )
 }
 
-/// "Обновить сейчас": enqueue an immediate fetch (ADMIN_PLAN §5, §7).
+/// "Обновить сейчас": enqueue an immediate fetch.
 /// The scheduler's per-source guard deduplicates concurrent requests.
 pub async fn source_refresh(
     State(state): State<AdminState>,
@@ -1097,7 +1096,7 @@ pub async fn source_refresh(
 }
 
 /// Polled refresh status: keeps `data-busy="1"` while the fetch is in
-/// flight, then shows the outcome and stops polling (ADMIN_PLAN §5).
+/// flight, then shows the outcome and stops polling.
 #[derive(Template)]
 #[template(path = "sources/_status.html")]
 struct RefreshStatusFragment {
@@ -1178,7 +1177,7 @@ pub async fn source_delete(
     }
     // Orphaned proxies (no remaining links) transition to `removed`;
     // reconciliation never resets it — a proxy that reappears in a fetch
-    // keeps its state (ADMIN_PLAN §13.1, decisions 9 and 23).
+    // keeps its state.
     match proxies::mark_orphans_removed(&state.pool).await {
         Ok(orphans) if orphans > 0 => {
             tracing::info!(orphans, "orphaned proxies marked removed");
@@ -1197,7 +1196,7 @@ pub async fn source_delete(
 }
 
 // ---------------------------------------------------------------------------
-// Dry-run fetch (ADMIN_PLAN §13.11)
+// Dry-run fetch
 // ---------------------------------------------------------------------------
 
 /// Dry-run result fragment: what a real fetch would see, without writing

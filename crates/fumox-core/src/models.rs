@@ -1,6 +1,6 @@
 //! Domain models shared by `fumox-server` and `fumox-probe`.
 //!
-//! The types mirror the SQLite schema (`docs/DATABASE.md` v0.4). The
+//! The types mirror the SQLite schema. The
 //! persistence mapping itself lives in the repository layer; these structs
 //! stay database-agnostic so parsers and the pipeline can work with them
 //! without a database handle.
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// Proxy protocol scheme (`proxies.scheme` in DATABASE.md).
+/// Proxy protocol scheme (`proxies.scheme`).
 ///
 /// Serialized as the lower-case wire name used in subscription URIs and in
 /// the database. `naive` covers both `naive+https` and `naive+quic` origins.
@@ -60,7 +60,7 @@ impl Scheme {
     /// Whether the probe daemon can actively health-check this scheme.
     ///
     /// tuic and mieru are UDP-only with no T2 support, so they stay
-    /// permanently `unknown` and pass health filters (SPEC §8.5).
+    /// permanently `unknown` and pass health filters.
     pub const fn is_probeable(self) -> bool {
         !matches!(self, Scheme::Tuic | Scheme::Mieru)
     }
@@ -94,9 +94,9 @@ impl FromStr for Scheme {
     }
 }
 
-/// Proxy lifecycle status (`proxies.status`, SPEC §8).
+/// Proxy lifecycle status (`proxies.status`).
 ///
-/// `ready` (owner decision, 2026-09-10) is the tunnel-verified tier: it is
+/// `ready` is the tunnel-verified tier: it is
 /// assigned only while the latest T2 check succeeded and demoted back to
 /// `alive` by any failed T2 outcome. The tiers do not overlap — `alive`
 /// means T1-alive without a fresh successful T2, `ready` means alive plus
@@ -113,7 +113,7 @@ pub enum ProxyStatus {
 
 impl ProxyStatus {
     /// Every status in schema order — the source for admin UI option lists
-    /// (pipeline editor health filter, PIPELINE.md §5).
+    /// (pipeline editor health filter).
     pub const ALL: [ProxyStatus; 5] = [
         ProxyStatus::Unknown,
         ProxyStatus::Alive,
@@ -159,8 +159,8 @@ impl FromStr for ProxyStatus {
     }
 }
 
-/// Fetch error classification (`sources.error_class`, `fetch_log.error_class`;
-/// SPEC §10.2). This is the only permitted vocabulary — the legacy
+/// Fetch error classification (`sources.error_class`, `fetch_log.error_class`).
+/// This is the only permitted vocabulary — the legacy
 /// `stale|unreachable|…` set is removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -320,12 +320,12 @@ pub struct Source {
     pub protocols: Option<Vec<Scheme>>,
     pub cache_ttl_seconds: i64,
     pub tags: Option<Vec<String>>,
-    /// Processing rules, pipeline JSON v1 (SPEC §5.1). Validated by the
+    /// Processing rules, pipeline JSON v1. Validated by the
     /// pipeline module before storage.
     pub pipeline: Option<serde_json::Value>,
     /// Extra HTTP headers sent with the fetch request.
     pub headers: Option<std::collections::BTreeMap<String, String>>,
-    /// Preferred IP protocol family for fetching the URL (SPEC §10.1).
+    /// Preferred IP protocol family for fetching the URL.
     /// `None` inherits the deployment default (`[fetch] ip_family`); a set
     /// family is strict — without an address of that family the fetch fails.
     pub ip_family: Option<IpFamily>,
@@ -384,7 +384,7 @@ pub struct Profile {
     /// `nanoid(12)`; doubles as the `/sub/{id}` token when `slug` is unset.
     pub id: String,
     pub slug: Option<String>,
-    /// Optional access token for `/sub` (SPEC §10.1); `None` = public.
+    /// Optional access token for `/sub`; `None` = public.
     pub access_token: Option<String>,
     pub name: String,
     pub output_format: OutputFormat,

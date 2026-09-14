@@ -1,7 +1,7 @@
-//! Proxy browser (ADMIN_PLAN §4.4): server-side filtered and paginated
+//! Proxy browser: server-side filtered and paginated
 //! list (thousands of rows — never "show all"), detail card with lifecycle
 //! timeline, probe history and source links, and the manual "reset status"
-//! action (ADMIN_PLAN §8).
+//! action.
 
 use super::{
     QueryPairs, action_response, action_response_err, clamp_limit, flag_for, fmt_opt_ts_element,
@@ -105,7 +105,7 @@ impl ProxiesListTemplate {
         flag_for(country)
     }
 
-    /// tuic/mieru cannot be probed and stay `unknown` forever (SPEC §8.5).
+    /// tuic/mieru cannot be probed and stay `unknown` forever.
     fn unprobeable(&self, scheme: &str) -> bool {
         scheme
             .parse::<Scheme>()
@@ -511,7 +511,7 @@ pub async fn proxy_detail(
         Err(err) => return server_error(lang, &err),
     };
 
-    // Unprobeable badge (SPEC §8.5): the schemes the daemon cannot check
+    // Unprobeable badge: the schemes the daemon cannot check
     // stay `unknown`; the tooltip text itself is the px.unprobeable_title
     // catalog entry (admin-facing text must not reference design docs).
     let unprobeable = proxy
@@ -540,7 +540,7 @@ pub async fn proxy_detail(
 }
 
 // ---------------------------------------------------------------------------
-// Probe history fragment (live refresh, ADMIN_PLAN §4.4)
+// Probe history fragment (live refresh)
 // ---------------------------------------------------------------------------
 
 /// Standalone fragment template for the probe history table; the same
@@ -599,7 +599,7 @@ pub async fn proxy_probe_history(
 }
 
 // ---------------------------------------------------------------------------
-// Purge removed (ADMIN_PLAN §13.16)
+// Purge removed
 // ---------------------------------------------------------------------------
 
 /// Physically delete every `removed` proxy (and, via cascade, its links and
@@ -629,7 +629,7 @@ pub async fn proxies_purge_removed(
 }
 
 // ---------------------------------------------------------------------------
-// Bulk cleanup (ADMIN_PLAN §13.1 decision 29)
+// Bulk cleanup
 //
 // Every action below transitions rows into the terminal `removed` status —
 // they never delete. The physical cleanup stays the single «purge removed»
@@ -789,7 +789,7 @@ pub async fn proxies_remove_alive_by_country(
 // Actions
 // ---------------------------------------------------------------------------
 
-/// Manual "reset status" (ADMIN_PLAN §8): back to a pristine `unknown`,
+/// Manual "reset status": back to a pristine `unknown`,
 /// the probe daemon picks the proxy up on its next cycle.
 pub async fn proxy_reset(
     State(state): State<AdminState>,

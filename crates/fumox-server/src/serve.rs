@@ -1,9 +1,9 @@
-//! Public subscription endpoints (SPEC §10).
+//! Public subscription endpoints.
 //!
 //! `GET /sub/{token|slug}` serves a profile, `GET /src/{token|slug}` a
 //! single source. Output format is fixed by the profile (`?format=` is
-//! forbidden, SPEC §10.1); only 200 responses are cached, and the full
-//! SPEC §10.2 outcome table is implemented:
+//! forbidden); only 200 responses are cached, and the full
+//! outcome table is implemented:
 //!
 //! - recoverable source errors (`network`, `http_server`) → serve the DB
 //!   snapshot as stale + `X-Fumox-Stale: true`, no cutoff;
@@ -45,7 +45,7 @@ pub struct AppState {
     #[allow(dead_code)]
     pub refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Public-listener rate limiters (`[server].rate_limit` /
-    /// `[server].auth_fail_rate_limit`; security audit, 2026-08-30).
+    /// `[server].auth_fail_rate_limit`).
     pub limits: PublicRateLimits,
 }
 
@@ -104,8 +104,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Per-IP rate limiting for the public listener (security audit,
-/// 2026-08-30): every request counts against the generous
+/// Per-IP rate limiting for the public listener: every request counts against the generous
 /// `[server].rate_limit`; a 403 (failed access-token check) additionally
 /// counts against the strict `[server].auth_fail_rate_limit`, and once that
 /// window is exhausted the endpoint answers 429 instead. Requests without
@@ -133,7 +132,7 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
     if response.status() == StatusCode::FORBIDDEN && !state.limits.auth_failures.allow(&ip).await {
         // The failure window rejected the request — give the hit back to the
         // generous window so one brute-force attempt does not cost the
-        // caller two windows (security audit, 2026-09-06).
+        // caller two windows.
         state.limits.all.refund(&ip).await;
         return error_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -193,7 +192,7 @@ async fn serve_sub(
     if !profile.enabled {
         return error_response(StatusCode::NOT_FOUND, "profile not found");
     }
-    // Optional per-profile access token (SPEC §10.1): query parameter or
+    // Optional per-profile access token: query parameter or
     // Authorization: Bearer. NULL means the endpoint is public.
     if let Some(required) = &profile.access_token {
         let provided = params
@@ -201,7 +200,7 @@ async fn serve_sub(
             .cloned()
             .or_else(|| bearer_token(&headers));
         // Constant-time comparison: the token is a secret checked on the
-        // public listener (security audit, 2026-08-30).
+        // public listener.
         let ok = provided
             .as_deref()
             .is_some_and(|provided| crate::admin::auth::ct_eq(provided, required));
@@ -255,10 +254,10 @@ async fn serve_src(
     .await
 }
 
-/// Cache lookup with stale-while-revalidate (SPEC §7): a fresh entry is
+/// Cache lookup with stale-while-revalidate: a fresh entry is
 /// served as-is; a stale one is served immediately while a background
 /// re-render refreshes the entry; a miss renders inline. Only 200
-/// responses are stored (SPEC §10.2).
+/// responses are stored.
 async fn serve_cached<F, Fut>(state: &AppState, key: String, make_render: F) -> Response
 where
     F: Fn() -> Fut + Send + 'static,
@@ -304,7 +303,7 @@ where
 }
 
 /// Render a profile: per-source merged pipelines → merge → dedup → sort →
-/// encode (SPEC §5), with the §10.2 outcome policy.
+/// encode, with the serving outcome policy.
 async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, ErrorReply> {
     let links = profiles::get_sources(&state.pool, &profile.id)
         .await
@@ -331,7 +330,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     }
 
     // An unrecoverable source error short-circuits the whole profile to
-    // the upstream status code (SPEC §10.2), not cached.
+    // the upstream status code, not cached.
     for (source, _) in &members {
         if source.error_class == Some(ErrorClass::HttpClient) {
             let upstream = last_http_status(state, &source.id).await.unwrap_or(502);
@@ -363,7 +362,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
             .push(linked.proxy);
     }
 
-    // Profile-level country allowlist (SPEC §10.1): when the profile lists
+    // Profile-level country allowlist: when the profile lists
     // countries, only proxies whose stored geo fact matches are served.
     // Proxies without a determined country stay out while the filter is
     // active — "only these countries" means confirmed facts, not guesses.
@@ -405,7 +404,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         loaded_statuses.extend(candidates.iter().map(|c| c.status));
         all.extend(compiled.apply_per_source(candidates, &state.geo).await);
     }
-    // "All proxies quarantined/removed" verdict (SPEC §10.2): the profile
+    // "All proxies quarantined/removed" verdict: the profile
     // does hold proxies, but every one of them was dropped by a health
     // filter. `ready` counts as served-tier too — a verified proxy is
     // not part of the "everything is hidden" story.
@@ -497,8 +496,8 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
     // /src serves only health-checked, currently-live proxies: rows that
     // were never probed (unknown), quarantined or removed stay out even
     // when the pipeline's health filter would let them through. `ready`
-    // (the tunnel-verified tier, owner decision 2026-09-10) is a live tier
-    // too — a verified proxy must not vanish from client output the
+    // (the tunnel-verified tier) is a live tier too — a verified proxy
+    // must not vanish from client output the
     // moment T2 promotes it.
     candidates.retain(|c| matches!(c.status, ProxyStatus::Alive | ProxyStatus::Ready));
     let out = compiled.apply(candidates, &state.geo).await;
@@ -532,8 +531,8 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
     })
 }
 
-/// In-process preview of a profile's output for the admin card
-/// (ADMIN_PLAN §4.3): renders exactly what `/sub` would serve — without an
+/// In-process preview of a profile's output for the admin card —
+/// renders exactly what `/sub` would serve, without an
 /// HTTP round trip to self — and returns the first `max_lines` lines.
 /// Base64 output is decoded so the preview stays readable.
 pub(crate) async fn preview_sub(
@@ -584,7 +583,7 @@ fn rows_to_candidates(rows: Vec<proxies::ProxyRow>, source_position: i64) -> Vec
     candidates
 }
 
-/// Serialize candidates into the profile's output format (SPEC §10). The
+/// Serialize candidates into the profile's output format. The
 /// `header_block` closure supplies the url_list metadata comments; it is
 /// only invoked (and only prepended) for the plain uri_list format.
 fn encode(
@@ -682,7 +681,7 @@ fn update_interval_hours(members: &[(Source, CompiledPipeline)]) -> String {
 }
 
 /// The upstream HTTP status of the source's latest fetch attempt, for the
-/// "return the original code" policy (SPEC §10.2).
+/// "return the original code" policy.
 async fn last_http_status(state: &AppState, source_id: &str) -> Option<u16> {
     let rows = fetch_log::recent_for_source(&state.pool, source_id, 1)
         .await
@@ -862,8 +861,7 @@ mod tests {
 
     /// A 429 from the strict failure window must refund its hit in the
     /// generous window: brute-forcing the token may exhaust the failure
-    /// budget, but must not also eat into the plain request ceiling
-    /// (security audit, 2026-09-06).
+    /// budget, but must not also eat into the plain request ceiling.
     #[tokio::test]
     async fn failure_window_429_does_not_burn_the_generous_window() {
         // both limits are small and equal, so the refund is observable:
@@ -972,7 +970,7 @@ mod tests {
     }
 
     async fn ingest(state: &AppState, source_id: &str, entries: &[ProxyEntry]) {
-        // Test helper: no drop rules anywhere, linger allowed (SPEC §8.1).
+        // Test helper: no drop rules anywhere, linger allowed.
         proxies::reconcile_source(
             &state.pool,
             source_id,
@@ -1111,7 +1109,7 @@ mod tests {
         profile.updated_at = fumox_core::models::now_ts();
         profiles::update(&state.pool, &profile).await.unwrap();
         // Saved means immediately effective: the admin invalidates the /sub
-        // cache on every profile save (ADMIN_PLAN §7).
+        // cache on every profile save.
         state.caches.invalidate_profile(&profile.id).await;
         let (status, _, body) = get(router(state.clone()), "/sub/profA0000000").await;
         assert_eq!(status, StatusCode::OK);
@@ -1435,7 +1433,7 @@ mod tests {
         assert!(body.contains("h1.example.com"), "{body:?}");
     }
 
-    /// The ready export link (owner decision, 2026-09-10): the same shared
+    /// The ready export link: the same shared
     /// token, but only the tunnel-verified `ready` tier is served — an
     /// `alive` (unverified) proxy stays out, and rotation kills both links.
     #[tokio::test]

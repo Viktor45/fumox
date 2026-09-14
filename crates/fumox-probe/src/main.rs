@@ -1,16 +1,16 @@
-//! fumox-probe — health-check daemon (SPEC §8).
+//! fumox-probe — health-check daemon.
 //!
 //! Every scheduling cycle runs three passes:
 //!
 //! 1. **Quarantine dues** — second chances and recheck-ladder steps whose
-//!    scheduled moment has arrived (SPEC §8.3a);
+//!    scheduled moment has arrived;
 //! 2. **T1** — a random sample of TCP-connect / TLS-handshake checks over
-//!    the `unknown`/`alive` population (SPEC §8.1, §8.3);
+//!    the `unknown`/`alive` population;
 //! 3. **T2** — real tunnel checks for `alive` proxies through the meow-rs
-//!    REST API (SPEC §8.2), skipped with backoff when meow-rs is down.
+//!    REST API, skipped with backoff when meow-rs is down.
 //!    The batch is recency-prioritized: proxies without a single T2
 //!    attempt first, then the ones whose last T2 check is the oldest
-//!    (owner decision 2026-09-06).
+//!   .
 //!
 //! All lifecycle state lives in SQLite, so the daemon is restart-safe:
 //! after a restart it simply resumes the schedules persisted in the DB.
@@ -33,7 +33,7 @@ use fumox_core::repo::{fetch_log, meta_set, probe as probe_repo, proxies};
 use meow::{DelayOutcome, MeowClient};
 use tokio::sync::Semaphore;
 
-/// `probe_results.probe_kind` of the tunnel check (DATABASE.md).
+/// `probe_results.probe_kind` of the tunnel check.
 const T2_KIND: &str = "t2";
 
 #[derive(Parser)]
@@ -158,7 +158,7 @@ async fn run(ctx: Arc<Context>) -> anyhow::Result<()> {
 }
 
 /// One scheduling cycle: quarantine dues first (they are time-sensitive),
-/// then the priority queue (fresh proxies, SPEC §8.3), then the T1 sample
+/// then the priority queue (fresh proxies), then the T1 sample
 /// and the T2 batch.
 async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
     let now = now_ts();
@@ -180,7 +180,7 @@ async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
 // T1: random connectivity sample
 // ---------------------------------------------------------------------------
 
-/// Priority lane (SPEC §8.3): T1 checks the server enqueued at source
+/// Priority lane: T1 checks the server enqueued at source
 /// refresh time for freshly inserted proxies. Drained newest first, capped
 /// by the same per-cycle quota as the random sample. Requests are claimed
 /// (deleted) up-front, so a mid-batch crash cannot turn them into an
@@ -197,7 +197,7 @@ async fn probe_queued_checks(ctx: Arc<Context>) -> anyhow::Result<usize> {
     run_t1_checks(ctx, candidates).await
 }
 
-/// Probe a random sample of `unknown`/`alive` proxies (SPEC §8.3).
+/// Probe a random sample of `unknown`/`alive` proxies.
 async fn probe_t1_sample(ctx: Arc<Context>) -> anyhow::Result<usize> {
     let candidates = proxies::select_t1_candidates(&ctx.pool, ctx.config.probe.sample_size).await?;
     if candidates.is_empty() {
@@ -243,8 +243,7 @@ async fn run_t1_checks(
             // `acquire_owned` is infallible: the semaphore lives in this
             // scope and is only dropped after `collect_tasks` joins every
             // spawned task, so it cannot close while a task is awaiting a
-            // permit. No `.expect` panic, no M2 risk (security audit,
-            // 2026-09-10).
+            // permit. No `.expect` panic, no deadlock risk.
             let _permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => return,
@@ -262,7 +261,7 @@ async fn run_t1_checks(
     Ok(done + blocked)
 }
 
-/// SSRF gate for every dial target (security audit v2, 2026-09-09, F1):
+/// SSRF gate for every dial target:
 /// proxy hosts come from remote feeds, so each candidate must pass the
 /// shared address policy before the daemon opens a connection to it —
 /// loopback, RFC1918, link-local (cloud metadata), CGNAT and unique-local
@@ -270,7 +269,7 @@ async fn run_t1_checks(
 ///
 /// Async because the underlying DNS lookup is async — keeping the call
 /// async end-to-end means the runtime worker is never blocked while the
-/// OS resolver runs (security audit, 2026-09-10, L1).
+/// OS resolver runs.
 async fn vet_target(ctx: &Context, host: &str) -> Result<(), String> {
     fumox_core::ssrf::vet_probe_host(host, ctx.config.probe.allow_private_targets).await
 }
@@ -282,8 +281,7 @@ async fn vet_target_addrs(ctx: &Context, host: &str) -> Result<Vec<std::net::IpA
     fumox_core::ssrf::vet_probe_host_addrs(host, ctx.config.probe.allow_private_targets).await
 }
 
-/// A vet-refused target is a *failed check*, not a skip (owner decision,
-/// 2026-09-10): the policy blocks exactly what a dead proxy looks like —
+/// A vet-refused target is a *failed check*, not a skip: the policy blocks exactly what a dead proxy looks like —
 /// unresolvable names and internal addresses — so the attempt is journaled
 /// into `probe_results` with the refusal reason and the fail ladder runs.
 /// Silently skipping these let blocked rows clog the head of the T2
@@ -331,7 +329,7 @@ async fn perform_t1_check(ctx: &Context, id: i64, target: &t1::Target<'_>) {
                 },
             )
             .await;
-            // Strict T2 priority (owner decision 2026-08-29, SPEC §8.3): a
+            // Strict T2 priority: a
             // T1 success must not wipe the fail counter accumulated from T2
             // tunnel failures — the counter clears only via a T2 success or
             // the quarantine ladder. Conservative on lookup errors: keep it.
@@ -376,7 +374,7 @@ async fn perform_t1_check(ctx: &Context, id: i64, target: &t1::Target<'_>) {
 }
 
 /// Bump the fail counter, quarantining when the consecutive-failure limit
-/// is reached (SPEC §8.3).
+/// is reached.
 async fn apply_regular_failure(ctx: &Context, id: i64, now: i64) {
     let probe = &ctx.config.probe;
     let min_secs =
@@ -393,7 +391,7 @@ async fn apply_regular_failure(ctx: &Context, id: i64, now: i64) {
 }
 
 // ---------------------------------------------------------------------------
-// Quarantine: second chances and the recheck ladder (SPEC §8.3a)
+// Quarantine: second chances and the recheck ladder
 // ---------------------------------------------------------------------------
 
 /// Re-check quarantined proxies whose scheduled moment has arrived.
@@ -441,8 +439,7 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
         tasks.spawn(async move {
             // The semaphore lives in this scope until `collect_tasks`
-            // returns; a closed semaphore here is structurally impossible
-            // (security audit, 2026-09-10, M2).
+            // returns; a closed semaphore here is structurally impossible.
             let _permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => return,
@@ -461,7 +458,7 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
 }
 
 /// The quarantine-ladder counterpart of [`apply_vet_block`]: a vet-refused
-/// recheck is a failed recheck (owner decision, 2026-09-10) — journaled
+/// recheck is a failed recheck — journaled
 /// with the refusal reason, the ladder advances (or the proxy is removed
 /// after the last configured step).
 async fn apply_quarantine_vet_block(
@@ -496,7 +493,7 @@ async fn apply_quarantine_vet_block(
 
 /// One quarantine re-check: success revives the proxy with a clean slate;
 /// failure advances the configured ladder or removes the proxy after the
-/// last configured recheck failed (SPEC §8.3a steps 3–5). `vetted` carries
+/// last configured recheck failed. `vetted` carries
 /// the SSRF-approved dial addresses (see [`vet_target_addrs`]).
 async fn perform_quarantine_check(
     ctx: &Context,
@@ -527,7 +524,7 @@ async fn perform_quarantine_check(
             .await;
             // The revival check is T1 (TCP/TLS), so the proxy returns to the
             // plain `alive` tier; the next successful T2 promotes it to
-            // `ready` (owner decision, 2026-09-10).
+            // `ready`.
             let revived = proxies::check_succeeded(
                 &ctx.pool,
                 id,
@@ -567,13 +564,13 @@ async fn perform_quarantine_check(
 }
 
 // ---------------------------------------------------------------------------
-// T2: real tunnel checks through meow-rs (SPEC §8.2)
+// T2: real tunnel checks through meow-rs
 // ---------------------------------------------------------------------------
 
 /// Generate a Clash batch, reload meow-rs, and delay-test every proxy
 /// through a real tunnel.
 ///
-/// Success is strict (owner decision, 2026-09-10): only a tunnel that came
+/// Success is strict: only a tunnel that came
 /// up *and* answered with a measured `delay` counts — anything else the
 /// engine reports is a failure. A meow-rs outage is likewise a *failed*
 /// check for every proxy that was due one (journaled as
@@ -590,7 +587,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
 
     let rows = proxies::select_t2_candidates(&ctx.pool, ctx.config.probe.sample_size).await?;
     // Vet every candidate before anything touches meow-rs. A refused target
-    // is a *failed* t2 check (owner decision, 2026-09-10), not a skip: the
+    // is a *failed* t2 check, not a skip: the
     // policy blocks unresolvable names and internal addresses, and a skip
     // left such rows at the head of the recency queue forever (they never
     // got a t2 row, so the selector re-served them every cycle).
@@ -637,7 +634,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
 
     // Cheap liveness check first: no point rewriting the config file when
     // the service is down anyway. An outage here fails the whole batch on
-    // the ladder (owner decision, 2026-09-10) and backs off.
+    // the ladder and backs off.
     if let Err(error) = ctx.meow.ping().await {
         tracing::warn!(%error, "meow-rs unavailable, T2 batch failed with backoff");
         ctx.backoff_meow();
@@ -704,8 +701,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
         let aborted = aborted.clone();
         tasks.spawn(async move {
             // The semaphore lives in this scope until `collect_tasks`
-            // returns; a closed semaphore here is structurally impossible
-            // (security audit, 2026-09-10, M2).
+            // returns; a closed semaphore here is structurally impossible.
             let _permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => return,
@@ -785,8 +781,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                 }
                 DelayOutcome::ServiceUnavailable(error) => {
                     // The engine failed mid-batch: from this moment the
-                    // whole batch is failed on the ladder (owner decision,
-                    // 2026-09-10) — this record included — and the rest of
+                    // whole batch is failed on the ladder — this record included — and the rest of
                     // the tasks journal an aborted-failure without calling
                     // meow-rs again. Back off regardless of which task saw
                     // it first (idempotent).
@@ -807,8 +802,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     Ok(done + blocked)
 }
 
-/// Journal one failed T2 attempt and run the fail ladder (owner decision,
-/// 2026-09-10): a proxy that could not get its tunnel check — whether the
+/// Journal one failed T2 attempt and run the fail ladder: a proxy that could not get its tunnel check — whether the
 /// tunnel itself failed, the target was vet-refused, or meow-rs was down —
 /// receives a `probe_kind='t2'` failure record, which is also what moves
 /// it forward in the recency queue.
@@ -839,7 +833,7 @@ async fn journal_and_fail(ctx: &Context, id: i64, reason: &str) {
 }
 
 /// Fail every proxy of a batch on the ladder with the same engine-outage
-/// reason (owner decision, 2026-09-10): a meow-rs outage at ping/reload
+/// reason: a meow-rs outage at ping/reload
 /// time means every due proxy went unverified this cycle — an unrecorded
 /// skip is indistinguishable from an empty pool and pins the head of the
 /// recency queue for the whole outage.
@@ -855,14 +849,13 @@ async fn journal_engine_failure(ctx: &Context, batch: &[proxies::ProxyRow], reas
 // ---------------------------------------------------------------------------
 
 /// Cutoff timestamp for a retention window of `days`. A zero window would
-/// wipe the whole history on every cycle, so it is clamped to one day
-/// (security audit, 2026-08-30).
+/// wipe the whole history on every cycle, so it is clamped to one day.
 fn retention_cutoff(now: i64, days: u32) -> i64 {
     now - i64::from(days.max(1)) * 86_400
 }
 
 /// Periodically upsert `probe_heartbeat` into `meta` so the admin panel can
-/// tell the daemon is alive (ADMIN_PLAN §4.5).
+/// tell the daemon is alive.
 async fn heartbeat_loop(ctx: Arc<Context>) {
     let period = Duration::from_secs(ctx.config.probe.heartbeat_interval_secs.max(5));
     let mut ticker = tokio::time::interval(period);
@@ -881,7 +874,7 @@ async fn heartbeat_loop(ctx: Arc<Context>) {
     }
 }
 
-/// History rotation (SPEC §12): `probe_results` and `fetch_log` older than
+/// History rotation: `probe_results` and `fetch_log` older than
 /// the configured windows are purged once at startup and then periodically.
 async fn retention_loop(ctx: Arc<Context>) {
     run_retention(&ctx).await;
@@ -910,7 +903,7 @@ async fn run_retention(ctx: &Context) {
         Ok(deleted) => tracing::info!(deleted, "rotated fetch_log"),
         Err(error) => tracing::warn!(%error, "fetch_log rotation failed"),
     }
-    // Priority queue housekeeping (SPEC §8.3): requests whose proxy already
+    // Priority queue housekeeping: requests whose proxy already
     // left `unknown`, and stale leftovers from an offline probe.
     match probe_repo::purge_settled_checks(&ctx.pool).await {
         Ok(0) => {}
@@ -990,7 +983,7 @@ mod tests {
         assert_eq!(retention_cutoff(100_000, 7), 100_000 - 7 * 86_400);
     }
 
-    /// F1 (security audit v2, 2026-09-09) + owner decision 2026-09-10: with
+    /// Hardening: with
     /// the default policy the daemon must refuse to *dial* loopback feed
     /// targets — but the refusal itself is now a journaled failed check
     /// (the fail ladder runs), so a blocked proxy cannot clog the queues
@@ -1052,7 +1045,7 @@ mod tests {
         assert!(row.ladder_at.is_some());
     }
 
-    /// The T2 counterpart (owner decision, 2026-09-10): a vet-refused T2
+    /// The T2 counterpart: a vet-refused T2
     /// candidate is journaled as a failed `t2` check even when meow-rs is
     /// completely down — the journal row is what un-sticks the head of the
     /// recency queue (the selector orders by the last t2 attempt).
@@ -1100,7 +1093,7 @@ mod tests {
         assert_eq!(row.fail_count, 2);
     }
 
-    /// Owner decision 2026-09-10, engine-failure branch 1: meow answers
+    /// Engine failure (engine-failure branch 1): meow answers
     /// /version but rejects the config reload — every proxy of the batch
     /// gets a journaled failed t2 check (outage reason, fail ladder) and
     /// the recency queue head cannot pin during the outage.
@@ -1169,7 +1162,7 @@ mod tests {
         );
     }
 
-    /// Owner decision 2026-09-10, engine-failure branch 2: meow dies
+    /// Engine failure (engine-failure branch 2): meow dies
     /// mid-batch — the first delay request sees the failure, the rest of
     /// the batch gets aborted-failure records without further meow calls.
     #[tokio::test]
@@ -1375,7 +1368,7 @@ mod tests {
                 sample_size: 50,
                 fail_limit,
                 // The tests dial loopback listeners, which the default policy
-                // refuses (security audit v2, F1).
+                // refuses.
                 allow_private_targets: true,
                 connect_timeout_secs: 2,
                 tls_timeout_secs: 2,
@@ -1428,7 +1421,7 @@ mod tests {
         let dying = seed_proxy(&pool, "vless", "127.0.0.1", dead_port, "unknown").await;
 
         // meow-rs is absent: its T2 lane fails the due proxies on the
-        // ladder (owner decision, 2026-09-10) — the live proxy collects
+        // ladder — the live proxy collects
         // one engine-outage failure per cycle, not a silent skip.
         let config = test_config(
             2,
@@ -1579,7 +1572,7 @@ mod tests {
         assert!(yaml.contains("fumox-2"));
 
         // Good proxy: T2 confirmed the tunnel — it reaches the
-        // tunnel-verified `ready` tier (owner decision, 2026-09-10),
+        // tunnel-verified `ready` tier,
         // latency from the tunnel test.
         let row = proxies::get_by_id(&pool, good).await.unwrap().unwrap();
         assert_eq!(row.status, "ready");
@@ -1610,7 +1603,7 @@ mod tests {
         assert!(stamp.is_some());
     }
 
-    /// Strict T2 priority (owner decision 2026-08-29): a tunnel-dead proxy
+    /// Strict T2 priority: a tunnel-dead proxy
     /// that keeps passing T1 must still reach quarantine — the T1 success of
     /// every cycle must not wipe the fail counter accumulated by T2.
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! Geo enrichment (MaxMind GeoLite2) — SPEC §6.
+//! Geo enrichment (MaxMind GeoLite2) —
 //!
 //! Pipeline: `host` → (async DNS if it is a domain) → IP → MaxMind lookup →
 //! merged geo facts (country + city from City, ASN from ASN — every unique
@@ -6,7 +6,7 @@
 //! redundant, City carries all of its facts, and is not read) applied to
 //! the display name through a template (default `"{flag} {country} ·
 //! {name}"`, placeholders `{flag} {country} {city} {asn} {asn_org}
-//! {name}`, SPEC §5.1/§6).
+//! {name}`).
 //!
 //! DNS and lookup results are cached per host (hosts repeat heavily in
 //! subscription feeds); negative results are cached too, so unresolvable
@@ -57,7 +57,7 @@ pub fn flag_emoji(iso_code: &str) -> Option<String> {
     Some(out)
 }
 
-/// Apply the rename template (SPEC §5.1 `geo.template`).
+/// Apply the rename template.
 ///
 /// Placeholders: `{flag}`, `{country}`, `{city}`, `{asn}`, `{asn_org}`,
 /// `{name}`. The original name is returned unchanged only when there is no

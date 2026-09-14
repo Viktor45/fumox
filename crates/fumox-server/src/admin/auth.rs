@@ -1,8 +1,8 @@
 //! Admin panel protection: HMAC-signed session cookies, CSRF tokens and
-//! per-IP rate limiting (ADMIN_PLAN §3).
+//! per-IP rate limiting.
 //!
 //! The session key is derived from `[admin].token`, so rotating the token
-//! instantly revokes every session (ADMIN_PLAN §13.1, decision 2). The
+//! instantly revokes every session. The
 //! panel is single-user by design; there is no user table.
 
 use crate::admin::AdminState;
@@ -134,8 +134,7 @@ impl RateLimiter {
     /// Give one hit back to `key`'s window: the outer middleware counts
     /// every request up front, but a deeper rate-limiting layer may reject
     /// the very same request too — without the refund the outer window pays
-    /// for hits the inner limiter already punished (security audit,
-    /// 2026-09-06). Saturating: a refund for a key whose counter already
+    /// for hits the inner limiter already punished. Saturating: a refund for a key whose counter already
     /// expired with its window (or never existed) must never wrap below
     /// zero — the wrap would blacklist the key for the whole window.
     pub async fn refund(&self, key: &str) {
@@ -149,15 +148,14 @@ impl RateLimiter {
 }
 
 /// Outermost admin middleware: per-IP rate limiting. Login gets the hard
-/// limit, everything else the soft one (ADMIN_PLAN §3).
+/// limit, everything else the soft one.
 ///
 /// `/admin/static/*` (the vendored CSS/htmx assets) and HEAD requests are
 /// exempt: they carry no state and answer identically for everyone, but
 /// each would otherwise burn the same per-IP window as a panel action — a
 /// page referencing them re-opens after a burst of fragment loads could be
 /// pushed to 429 by asset fetches alone, and an anonymous passer-by could
-/// exhaust someone else's NAT-shared window with cheap GETs of the CSS
-/// (security audit, 2026-09-06).
+/// exhaust someone else's NAT-shared window with cheap GETs of the CSS.
 pub async fn rate_limit(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -188,7 +186,7 @@ pub async fn rate_limit(
     let response = next.run(req).await;
     // A rejected response was already punished by a stricter limiter (the
     // login one) or is not this layer's business at all: the outer window
-    // must not pay for it twice (security audit, 2026-09-06).
+    // must not pay for it twice.
     if response.status() == StatusCode::TOO_MANY_REQUESTS {
         limiter.refund(&ip).await;
     }
@@ -460,8 +458,7 @@ mod tests {
         assert!(limiter.allow("ip2").await);
     }
 
-    /// A refunded hit opens the window slot it consumed (security audit,
-    /// 2026-09-06): a request that passed this limiter but was rejected by
+    /// A refunded hit opens the window slot it consumed: a request that passed this limiter but was rejected by
     /// a deeper one must not cost this window anything.
     #[tokio::test]
     async fn rate_limiter_refund_returns_the_hit_to_the_window() {

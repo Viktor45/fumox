@@ -1,8 +1,8 @@
-//! sing-box JSON output (SPEC §10).
+//! sing-box JSON output.
 //!
 //! The emitted document carries only the `outbounds` array; sing-box fills
 //! the rest with its defaults. An empty profile yields a valid
-//! `{"outbounds": []}` document (SPEC §10.2 «пустой валидный конф»).
+//! `{"outbounds": []}` document.
 //! Outbound tags must be unique, so duplicate names get the same « (2)»
 //! suffixes as Clash output (PLAN gap 14).
 
@@ -68,7 +68,7 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
                 .unwrap_or(0);
             // `as u16` silently truncated (aid=65536 became 0) while the
             // Clash encoder parses the same field as i64, so the two outputs
-            // disagreed for one proxy (security audit, 2026-09-05).
+            // disagreed for one proxy.
             m.insert("alter_id".into(), unsigned(alter_id));
             // vmess JSON spells TLS as `tls: "tls"`; Clash input uses the
             // boolean `tls: true`; some feeds spell it `security=tls`.

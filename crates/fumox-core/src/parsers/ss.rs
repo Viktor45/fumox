@@ -217,8 +217,7 @@ mod tests {
     }
 
     /// The base64 blob is arbitrary bytes, so both forms can carry a line
-    /// break into fields the serializer emits verbatim (security audit,
-    /// 2026-09-05).
+    /// break into fields the serializer emits verbatim.
     #[test]
     fn rejects_line_breaks_smuggled_through_base64() {
         let sip002 = base64::engine::general_purpose::STANDARD_NO_PAD

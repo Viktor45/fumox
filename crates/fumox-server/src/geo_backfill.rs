@@ -1,4 +1,4 @@
-//! One-shot startup backfill of the `proxies.geo_*` columns (SPEC §6).
+//! One-shot startup backfill of the `proxies.geo_*` columns.
 //!
 //! Ingestion resolves geo facts for every proxy it upserts, but rows that
 //! entered the database before a geo database was available (or while the

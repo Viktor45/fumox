@@ -1,4 +1,4 @@
-//! Pipeline builder state (PIPELINE.md): the server-side half of the admin
+//! Pipeline builder state: the server-side half of the admin
 //! pipeline editor. `BuilderState` mirrors the widget's form fields; [`emit`]
 //! generates the pipeline JSON (validator semantics, only non-default values)
 //! and [`ingest`] rebuilds the state from a stored JSON or reports "raw
@@ -32,7 +32,7 @@ pub(crate) struct RenameRow {
 /// The rule's `target` JSON value: the compact UI form recombined. An
 /// unknown selector or an empty `param` key is emitted as-is (a `param:`
 /// with nothing after the colon) — the builder holds values the validator
-/// will flag in the preview, never silently dropping them (PIPELINE.md §4).
+/// will flag in the preview, never silently dropping them.
 /// `name` emits nothing: it is the schema default and stays implicit.
 pub(crate) fn emit_rename_target(row: &RenameRow) -> Option<String> {
     match row.target.trim() {
@@ -69,9 +69,9 @@ impl DropRow {
 /// Values of the builder widget, exactly as the form fields carry them.
 /// Section toggles (`*_set`) express the administrator's intent; [`emit`]
 /// turns a set section into JSON only when it holds at least one value that
-/// differs from the SPEC §5.1 defaults.
+/// differs from the defaults.
 ///
-/// The `*_defaults` flags are the profile tri-state (PIPELINE.md §6): a
+/// The `*_defaults` flags are the profile tri-state: a
 /// profile section replaces the source's section wholesale, so besides "not
 /// set" (inherit the source's rule) and "set" there is "explicit defaults" —
 /// an empty section that resets the source's rule to the SPEC defaults.
@@ -89,7 +89,7 @@ pub(crate) struct BuilderState {
     pub asns: String,
     /// AS numbers to drop, the same comma-separated form.
     pub exclude_asns: String,
-    /// Drop proxies that allow insecure TLS (SPEC §5 step 2). Defaults on;
+    /// Drop proxies that allow insecure TLS. Defaults on;
     /// `false` is the only non-default value the emit ever writes.
     pub forbid_insecure: bool,
     pub rename: Vec<RenameRow>,
@@ -130,12 +130,12 @@ fn mode_flags(value: &str) -> (bool, bool) {
     (value == "1" || value == "set", value == "defaults")
 }
 
-/// Ready-made builder states (PIPELINE.md §6); `blank` is the empty state.
+/// Ready-made builder states; `blank` is the empty state.
 pub(crate) fn preset(name: &str) -> BuilderState {
     match name {
         // Output only proxies that passed a probe: drop everything never
         // verified, including the permanently `unknown` unprobeable
-        // protocols (SPEC §8.5).
+        // protocols.
         "workers" => BuilderState {
             health_set: true,
             exclude_statuses: vec!["unknown".into(), "quarantine".into(), "removed".into()],
@@ -280,8 +280,8 @@ impl BuilderState {
         }
     }
 
-    /// Generate the pipeline JSON (PIPELINE.md §4): `version` 1 plus only the
-    /// values that differ from the SPEC §5.1 defaults. A set section with no
+    /// Generate the pipeline JSON: `version` 1 plus only the
+    /// values that differ from the defaults. A set section with no
     /// non-default value emits nothing — the preview shows the administrator
     /// the resulting (NULL) configuration, and forcing explicit defaults is
     /// what the `*_defaults` mode is for. `None` means "nothing configured":
@@ -459,7 +459,7 @@ impl BuilderState {
         }
     }
 
-    /// Canonical round-trip (PIPELINE.md §10): rebuilding the state from the
+    /// Canonical round-trip: rebuilding the state from the
     /// emitted JSON and emitting again produces the same JSON. Holds for
     /// every state, including degenerate ones (a set section with no
     /// non-default value collapses in the first emit).
@@ -483,12 +483,12 @@ pub(crate) enum Ingest {
     /// Structural parse failed (unknown fields, wrong types), the version is
     /// not 1, or the config means something the widget cannot express — the
     /// widget stays out of the way and the raw JSON is edited by hand;
-    /// nothing is reinterpreted silently (PIPELINE.md §2.2).
+    /// nothing is reinterpreted silently.
     Raw,
 }
 
 impl BuilderState {
-    /// Rebuild builder fields from a stored pipeline value (PIPELINE.md §4).
+    /// Rebuild builder fields from a stored pipeline value.
     /// Structural only: an unknown protocol name or an invalid regex stays in
     /// the fields and is caught by the preview/save validation, exactly as in
     /// raw mode. `NULL` and `{}` produce an empty state.
@@ -733,14 +733,13 @@ impl BuilderView {
         }
     }
 
-    /// The SPEC §5.1 geo template, shown as the template field's placeholder:
+    /// The geo template, shown as the template field's placeholder:
     /// an empty field means "default" and is never emitted.
     pub(crate) fn default_geo_template(&self) -> &'static str {
         crate::pipeline::DEFAULT_GEO_TEMPLATE
     }
 
-    /// The placeholder registry joined for the template hint (PIPELINE.md
-    /// §5); the hint follows the registry on its own.
+    /// The placeholder registry joined for the template hint; the hint follows the registry on its own.
     pub(crate) fn geo_placeholders(&self) -> String {
         Schema::geo_placeholders().join(" ")
     }
@@ -793,8 +792,7 @@ fn any_of(values: &[String], name: &str) -> bool {
 
 /// Append the selected values that are not part of the schema list, so an
 /// unknown (validator-rejecting) value stays visible and checked in the
-/// widget instead of silently dropping out (PIPELINE.md §4: the builder
-/// holds such values; the preview and save report them).
+/// widget instead of silently dropping out.
 fn append_outsiders(rows: &mut Vec<(String, bool)>, selected: &[String]) {
     for value in selected {
         if !rows.iter().any(|(name, _)| name == value) {
@@ -812,7 +810,7 @@ pub(crate) fn display_rows<Row: Default + Clone>(rows: &[Row]) -> Vec<Row> {
     }
 }
 
-/// UI descriptor of the pipeline v1 schema (PIPELINE.md §5). Every list is
+/// UI descriptor of the pipeline v1 schema. Every list is
 /// sourced from the validator's own enums.
 pub(crate) struct Schema;
 
@@ -829,7 +827,7 @@ impl Schema {
         SortBy::ALL.iter().map(|s| s.as_str()).collect()
     }
 
-    /// Geo template placeholders (SPEC §5.1) — all six that
+    /// Geo template placeholders — all six that
     /// `fumox_core::geo::apply_template` renders, so the hint cannot drift
     /// from the engine.
     pub(crate) fn geo_placeholders() -> [&'static str; 6] {
@@ -865,7 +863,7 @@ fn split_asn_field(raw: &str) -> Option<Vec<String>> {
     )
 }
 
-// Widget rendering (PIPELINE.md §3)
+// Widget rendering
 
 /// `#ped-preview` content: the generated JSON plus its validation outcome
 /// (the same `CompiledPipeline::from_json` the save path uses).
@@ -942,7 +940,7 @@ impl RowsFragment {
 
 impl_i18n!(RowsFragment);
 
-/// The whole pipeline widget (PIPELINE.md §3): the mode switch (builder ⇄
+/// The whole pipeline widget: the mode switch (builder ⇄
 /// raw), presets, the builder fields with their preview — or the raw JSON
 /// textarea. Rendered into the source/profile forms at construction time and
 /// swapped by the `mode`/`preset` endpoints; `pipeline_mode` tells the save
@@ -960,7 +958,7 @@ pub(crate) struct WidgetFragment {
     /// Localized pipeline validation error to show next to the fields.
     pub error: Option<String>,
     /// Raw mode was entered because the stored JSON is not representable
-    /// (PIPELINE.md §2.2) — the template shows the warning.
+    /// — the template shows the warning.
     pub raw_warning: bool,
     /// Profile form: tri-state section controls (inherit / defaults / set).
     pub profile: bool,
@@ -1019,7 +1017,7 @@ impl WidgetFragment {
 }
 
 /// Widget HTML for a form: prefill from the stored pipeline when the builder
-/// can represent it, otherwise raw mode with the warning (PIPELINE.md §2.2).
+/// can represent it, otherwise raw mode with the warning.
 pub(crate) fn widget_from_stored(
     lang: Lang,
     csrf: &str,
@@ -1752,7 +1750,7 @@ mod tests {
     fn ingest_maps_default_valued_sections_to_explicit_defaults() {
         // `{}` and sections carrying only default values must survive a
         // profile round-trip: dropping them would make the profile inherit
-        // the source's rule instead of resetting it (PIPELINE.md §6).
+        // the source's rule instead of resetting it.
         let json = json!({
             "version": 1,
             "filter": {},
@@ -1832,7 +1830,7 @@ mod tests {
     #[test]
     fn ingest_keeps_values_the_validator_will_flag() {
         // Unknown names are structural strings — the builder holds them and
-        // the preview/save validation reports them (PIPELINE.md §4).
+        // the preview/save validation reports them.
         let json = json!({
             "version": 1,
             "filter": { "protocols": ["quantum"] },
@@ -2395,7 +2393,7 @@ mod tests {
             let Ingest::Builder(loaded) = BuilderState::ingest(Some(&json)) else {
                 panic!("ingest must return Builder, got Raw: {json}");
             };
-            // Re-emit; idempotency (PIPELINE.md §10).
+            // Re-emit; idempotency.
             assert_eq!(
                 loaded.emit(),
                 Some(json.clone()),

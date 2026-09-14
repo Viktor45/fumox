@@ -1,5 +1,5 @@
 //! Profile screens: list, create/edit form with source composition
-//! (ADMIN_PLAN §4.3), card with dedup stats and an in-process output
+//!, card with dedup stats and an in-process output
 //! preview, toggle / delete actions.
 
 use super::{action_response, caps, is_htmx, mask_secret, not_found, server_error};
@@ -17,11 +17,11 @@ use fumox_core::models::{OutputFormat, Profile, new_id, now_ts};
 use fumox_core::repo::{profiles, sources};
 use std::str::FromStr;
 
-/// Slug rules shared with sources (ADMIN_PLAN §4.2): starts alphanumeric,
+/// Slug rules shared with sources: starts alphanumeric,
 /// then `[A-Za-z0-9_-]`, total length 2–64.
 const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
 
-/// Preview length on the profile card (ADMIN_PLAN §4.3).
+/// Preview length on the profile card.
 const PREVIEW_LINES: usize = 50;
 
 // ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ struct ProfileListRow {
     protected: bool,
     sources_count: i64,
     /// Live proxies reachable through the profile's sources: `status` ∈
-    /// {alive, quarantine, unknown}. `removed` is terminal (SPEC §8) and
+    /// {alive, quarantine, unknown}. `removed` is terminal and
     /// is excluded, matching the proxy counts shown elsewhere in the admin
     /// panel. A proxy reachable through more than one source in the same
     /// profile is counted once (`DISTINCT p.id`).
@@ -144,7 +144,7 @@ struct ProfileFormTemplate {
     formats: Vec<FormatOption>,
     source_picks: Vec<SourcePick>,
     token_masked_note: bool,
-    /// Pipeline widget HTML (builder ⇄ raw, PIPELINE.md §3): the profile
+    /// Pipeline widget HTML (builder ⇄ raw): the profile
     /// flavor with tri-state section controls (inherit / defaults / set).
     widget_html: String,
 }
@@ -402,7 +402,7 @@ async fn build_profile_from_form(
     } else {
         Some(token_raw.clone())
     };
-    // Token format cap (security audit v2, F7): the token guards a public
+    // Token format cap: the token guards a public
     // endpoint, so it is URL-safe and bounded like every other field.
     if let Some(token) = access_token.as_ref()
         && token.len() > caps::ACCESS_TOKEN
@@ -435,7 +435,7 @@ async fn build_profile_from_form(
         }
     };
 
-    // Pipeline (PIPELINE.md §3, §6): in builder mode the JSON is generated
+    // Pipeline: in builder mode the JSON is generated
     // from the widget fields server-side (a stale `pipeline` textarea, if
     // any, is ignored); in raw mode the textarea is the input, as before.
     // The tri-state radios let a profile explicitly reset a source's
@@ -446,7 +446,7 @@ async fn build_profile_from_form(
             None => None,
             Some(value) => match CompiledPipeline::from_json(Some(&value)) {
                 Ok(_) => {
-                    // Same cap as raw mode (security audit v2, F7): the
+                    // Same cap as raw mode: the
                     // generated JSON is stored verbatim and re-rendered
                     // into every edit form, so a form with thousands of
                     // widget rows must not exceed the budget either.
@@ -475,7 +475,7 @@ async fn build_profile_from_form(
         if pipeline_raw.trim().is_empty() {
             None
         } else if pipeline_raw.len() > caps::PIPELINE_BYTES {
-            // Pipeline cap (security audit v2, F7): the JSON is stored
+            // Pipeline cap: the JSON is stored
             // verbatim and re-rendered into every edit form.
             errors.push((
                 "pipeline".into(),
@@ -526,7 +526,7 @@ async fn build_profile_from_form(
             countries.push(upper);
         }
     }
-    // Country count cap (security audit v2, F7).
+    // Country count cap.
     if countries.len() > caps::COUNTRIES {
         errors.push((
             "countries".into(),
@@ -681,7 +681,7 @@ pub async fn profile_update(
     if let Err(err) = profiles::set_sources(&state.pool, &profile.id, &composition).await {
         return server_error(lang, &err);
     }
-    // Saved means immediately effective (ADMIN_PLAN §7).
+    // Saved means immediately effective.
     state.caches.invalidate_profile(&profile.id).await;
     tracing::info!(profile = %profile.id, "profile updated");
     Redirect::to(&format!("/admin/profiles/{}", profile.id)).into_response()
@@ -756,7 +756,7 @@ pub async fn profile_detail(
         Err(err) => return server_error(lang, &err),
     };
 
-    // Dedup statistics across the composition (ADMIN_PLAN §4.3):
+    // Dedup statistics across the composition:
     // total link rows vs distinct fingerprints.
     let (stats_total, stats_unique): (i64, i64) = match sqlx::query_as(
         "SELECT COUNT(*), COUNT(DISTINCT p.fingerprint)
@@ -800,7 +800,7 @@ pub async fn profile_detail(
         profile.slug.clone().unwrap_or_else(|| profile.id.clone())
     );
     // Absolute serve link: the host the admin panel was opened on with the
-    // public port from [server].bind (ADMIN_PLAN §4.2).
+    // public port from [server].bind.
     let serve_url = format!("{}{}", state.serve_base(&headers), serve_path);
 
     let token_display = profile

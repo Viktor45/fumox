@@ -1,5 +1,5 @@
 //! T1 connectivity checks: TCP connect with an optional TLS handshake
-//! (SPEC §8.1). The measured wall time becomes the proxy's latency.
+//!. The measured wall time becomes the proxy's latency.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ pub enum CheckKind {
 }
 
 impl CheckKind {
-    /// Value stored in `probe_results.probe_kind` (DATABASE.md).
+    /// Value stored in `probe_results.probe_kind`.
     pub fn as_str(self) -> &'static str {
         match self {
             CheckKind::Tcp => "tcp",

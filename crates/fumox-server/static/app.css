@@ -1,4 +1,4 @@
-/* Fumox admin panel — single self-contained stylesheet (ADMIN_PLAN §13.13).
+/* Fumox admin panel — single self-contained stylesheet.
    No framework, no CDN: the interface must work offline.
 
    Day/night themes: every color goes through a CSS custom property; the
@@ -653,7 +653,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 }
 .stat-split-counts a.badge:hover { text-decoration: none; filter: brightness(0.92); }
 
-/* Pipeline builder widget (PIPELINE.md §3). */
+/* Pipeline builder widget. */
 .ped-columns {
   display: flex;
   gap: 24px;
@@ -681,7 +681,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   max-height: 320px;
 }
 
-/* Pipeline widget modes, presets and tri-state rows (PIPELINE.md §6). */
+/* Pipeline widget modes, presets and tri-state rows. */
 .ped-modes {
   display: flex;
   gap: 8px;

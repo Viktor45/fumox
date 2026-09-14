@@ -1,4 +1,4 @@
-//! Output formats for served subscriptions (SPEC §10).
+//! Output formats for served subscriptions.
 //!
 //! The pipeline ends with the `encode` step: the deduplicated, sorted
 //! candidate list is serialized according to the profile's output format.
@@ -44,7 +44,7 @@ pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String>
 
 /// Whether the entry carries a truthy insecure toggle under any of its
 /// spelling aliases. Output formats only ever *reflect* an entry's own
-/// request (SPEC §10.3): the entry's original spelling is kept verbatim.
+/// request: the entry's original spelling is kept verbatim.
 /// The underscore `allow_insecure` form is deliberately not here — it
 /// never arrives from parsed feeds that these writers target.
 pub(crate) fn is_insecure(params: &[crate::models::Param]) -> bool {

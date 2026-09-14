@@ -1,6 +1,6 @@
 //! Application configuration.
 //!
-//! Layered configuration (SPEC §12): built-in defaults → TOML file
+//! Layered configuration: built-in defaults → TOML file
 //! (`config/app.toml` by default) → environment variables with the
 //! `FUMOX_` prefix and `__` as the section separator
 //! (e.g. `FUMOX_ADMIN__TOKEN=secret`).
@@ -173,8 +173,7 @@ pub struct ServerConfig {
     #[serde(default = "defaults::public_rate_limit")]
     pub rate_limit: RateLimit,
     /// Per-IP limit fed by failed access-token checks (HTTP 403 on `/sub`) —
-    /// the brute-force signal for protected profiles (security audit,
-    /// 2026-08-30).
+    /// the brute-force signal for protected profiles.
     #[serde(default = "defaults::auth_fail_rate_limit")]
     pub auth_fail_rate_limit: RateLimit,
 }
@@ -190,7 +189,7 @@ impl Default for ServerConfig {
 }
 
 /// Source ingestion of `fumox-server`'s scheduler (fetch → parse →
-/// reconcile; SPEC §8.1). Owns the knobs of the reconcile pass that are
+/// reconcile). Owns the knobs of the reconcile pass that are
 /// not per-source.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -201,7 +200,7 @@ pub struct IngestConfig {
     #[serde(default = "defaults::refresh_check_limit")]
     pub refresh_check_limit: u32,
     /// Whether pipeline `drop` rules switch off the alive-linger link
-    /// policy for their source (SPEC §8.1/§8.4). `true`: an alive proxy of
+    /// policy for their source. `true`: an alive proxy of
     /// a source with drop rules leaves on the next refresh after the rule
     /// catches it. `false` (the default): the probe alone retires proxies —
     /// every source lingers, even ones with drop rules, so a rule added
@@ -275,7 +274,7 @@ pub struct FetchConfig {
     /// Default IP protocol family for fetching source URLs. A source
     /// without its own `ip_family` inherits this. `any` = dual-stack (first
     /// IPv4 wins, IPv6 fallback); `ipv4` / `ipv6` are strict — no address of
-    /// that family means the fetch fails (SPEC §10.1, §16).
+    /// that family means the fetch fails.
     #[serde(default)]
     pub ip_family: IpFamily,
 }
@@ -295,7 +294,7 @@ impl Default for FetchConfig {
     }
 }
 
-/// Geo enrichment via MaxMind GeoLite2 (SPEC §6). Every database found in
+/// Geo enrichment via MaxMind GeoLite2. Every database found in
 /// `db_dir` is opened and all of them contribute facts — a name template
 /// can mix `{country}`, `{city}` and `{asn}` placeholders freely.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -353,10 +352,10 @@ impl GeoDbKind {
     }
 }
 
-/// Admin panel settings (ADMIN_PLAN §2–3). An empty `token` disables the
+/// Admin panel settings. An empty `token` disables the
 /// admin listener entirely (it answers 404).
 /// Built-in default of `[admin].token`; fumox-server logs a warning at
-/// startup when the panel is active with it (security audit, 2026-08-30).
+/// startup when the panel is active with it.
 pub const DEFAULT_ADMIN_TOKEN: &str = "change-me";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -368,7 +367,7 @@ pub struct AdminConfig {
     /// Login secret. Empty string = admin disabled.
     #[serde(default = "defaults::admin_token")]
     pub token: String,
-    /// Separate loopback listener (ADMIN_PLAN §2).
+    /// Separate loopback listener.
     #[serde(default = "defaults::admin_bind")]
     pub bind: SocketAddr,
     /// HMAC session cookie lifetime.
@@ -419,7 +418,7 @@ impl AdminConfig {
     }
 }
 
-/// Probe daemon behaviour (SPEC §8).
+/// Probe daemon behaviour.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeConfig {
@@ -434,10 +433,10 @@ pub struct ProbeConfig {
     pub fail_limit: u32,
     /// When `false` (the default), the daemon refuses to dial proxy hosts
     /// that resolve to loopback / RFC1918 / link-local (cloud metadata) /
-    /// CGNAT / unique-local addresses (security audit v2, 2026-09-09, F1):
+    /// CGNAT / unique-local addresses:
     /// proxy hosts come from remote feeds, and without this gate a hostile
     /// feed turns the probe into an internal port scanner. A refusal is
-    /// journaled as a *failed check* (owner decision, 2026-09-10), so a
+    /// journaled as a *failed check*, so a
     /// blocked target walks the ordinary fail ladder instead of clogging
     /// the queues. Mirrors `[admin].allow_private_urls` of the fetcher.
     #[serde(default)]
@@ -458,10 +457,10 @@ pub struct ProbeConfig {
     #[serde(default = "defaults::second_chance_min_hours")]
     pub second_chance_min_hours: u64,
     /// Width of the uniform jitter added on top of the minimum, giving the
-    /// `[12h, 16h)` window by default (SPEC §8.3a).
+    /// `[12h, 16h)` window by default.
     #[serde(default = "defaults::second_chance_spread_hours")]
     pub second_chance_spread_hours: u64,
-    /// Quarantine recheck ladder (SPEC §8.3a): delays in seconds between
+    /// Quarantine recheck ladder: delays in seconds between
     /// consecutive rechecks after a failed second chance. Failing recheck
     /// `N` schedules recheck `N+1` after `recheck_delays_secs[N-1]`;
     /// failing the last entry removes the proxy. An empty list removes the
@@ -502,7 +501,7 @@ impl Default for ProbeConfig {
     }
 }
 
-/// meow-rs integration for T2 checks (SPEC §8.2). meow-rs runs as a separate
+/// meow-rs integration for T2 checks. meow-rs runs as a separate
 /// system service; Fumox only talks to its REST API and reloads its config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -545,7 +544,7 @@ impl Default for MeowConfig {
     }
 }
 
-/// History rotation (SPEC §12 `[retention]`); enforced by a daily task in
+/// History rotation; enforced by a daily task in
 /// the probe daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -886,7 +885,7 @@ mod defaults {
         86400
     }
     pub fn recheck_delays_secs() -> Vec<i64> {
-        // SPEC §8.3a defaults: +15m, +30m, +1h after the failed second chance.
+        // defaults: +15m, +30m, +1h after the failed second chance.
         vec![15 * 60, 30 * 60, 60 * 60]
     }
     pub const fn queue_stale_days() -> u64 {

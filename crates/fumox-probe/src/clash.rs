@@ -1,4 +1,4 @@
-//! Clash (mihomo) YAML generation for T2 batches (SPEC §8.2).
+//! Clash (mihomo) YAML generation for T2 batches.
 //!
 //! The probe writes this config to `meow.config_path` and asks meow-rs to
 //! reload it via `PUT /configs`; every proxy is then delay-tested through a
@@ -11,7 +11,7 @@ use fumox_core::repo::proxies::ProxyRow;
 use serde_norway::Value;
 
 /// Schemes meow-rs can actually tunnel. naive has no mihomo counterpart and
-/// tuic/mieru are unsupported (SPEC §8.5), so they never enter a T2 batch.
+/// tuic/mieru are unsupported, so they never enter a T2 batch.
 pub fn is_supported(scheme: Scheme) -> bool {
     matches!(
         scheme,
@@ -53,7 +53,7 @@ fn num(value: i64) -> Value {
 /// `method:password`), so an unverified connection lets an on-path attacker
 /// impersonate the server and harvest it. `skip-cert-verify` is therefore
 /// emitted by the core mapping only for entries whose own parameters ask for
-/// it (security audit, 2026-09-05).
+/// it.
 pub fn generate(rows: &[ProxyRow]) -> serde_norway::Result<(String, Vec<i64>)> {
     let mut included = Vec::new();
     let mut proxies = Vec::new();
@@ -242,8 +242,7 @@ mod tests {
     }
 
     /// T2 tunnels carry the proxy credential, so certificate verification
-    /// follows the entry's own setting instead of being forced off
-    /// (security audit, 2026-09-05).
+    /// follows the entry's own setting instead of being forced off.
     #[test]
     fn skip_cert_verify_follows_the_entry_and_is_never_forced() {
         let rows = vec![

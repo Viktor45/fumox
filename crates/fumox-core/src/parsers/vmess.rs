@@ -102,7 +102,7 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, String> {
     for param in &params {
         super::reject_line_breaks(&format!("vmess: field {:?}", param.key), &param.value)?;
     }
-    // Field-size cap (security audit v2, 2026-09-09, F13): vmess params
+    // Field-size cap: vmess params
     // bypass `parse_query`, so the byte cap is enforced here.
     for param in &params {
         if param.key.len() > super::uri::MAX_PARAM_BYTES

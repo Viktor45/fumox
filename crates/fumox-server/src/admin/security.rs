@@ -1,6 +1,6 @@
-//! Response-hardening middleware for the admin listener (ADMIN_PLAN §3):
+//! Response-hardening middleware for the admin listener:
 //! clickjacking, MIME sniffing and referrer leakage protection, plus a
-//! Content-Security-Policy (security audit, 2026-08-30). The panel renders
+//! Content-Security-Policy. The panel renders
 //! with server-side askama escaping and ships its script (htmx) and the
 //! inline bootstrap scripts/styles from itself, so `'unsafe-inline'` for
 //! script/style is the current floor — no external origins are allowed.
@@ -43,7 +43,7 @@ pub async fn headers(req: Request, next: Next) -> Response {
     );
     // The panel renders secrets (masked headers, the alive-export link,
     // the config export); nothing it serves belongs in any shared or
-    // intermediary cache (security audit v2, 2026-09-09, F8).
+    // intermediary cache.
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }

@@ -12,6 +12,10 @@ Two variants to choose from:
 Requires podman ≥ 4.4 (5.x preferred). Everything below assumes **rootless**
 podman (recommended); rootful differences are at the end.
 
+The pod publishes plain HTTP only: terminate HTTPS with a reverse proxy in
+front of the server listener — `docker/nginx/` holds a ready nginx example,
+shared with the docker-compose setup.
+
 ## Preparation (both variants)
 
 Quadlet does not build images — the units reference the local names

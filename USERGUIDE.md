@@ -516,8 +516,9 @@ and access tokens) as a versioned JSON file. *Import* recreates them with
 - validation is all-or-nothing: any invalid object aborts the whole import
   (`422` with a list of problems, nothing written).
 
-The same screen offers two **download links** that share the same
-random token:
+The same screen shows the two **public download links** in one table,
+together with the live proxy counts. Both links share the same random
+token:
 
 - `GET /export/alive/{token}`: every currently-alive proxy as a plain
   `url_list`. Title in the metadata block: `export/alive`, update
@@ -529,6 +530,10 @@ random token:
 `Download url_list` saves the body as a file; *Regenerate link*
 replaces the token if the link leaks (the old link stops working
 immediately, both endpoints rotate together).
+
+The import form takes the JSON either pasted into the textarea or via
+the file picker, which loads the chosen file into the same textarea;
+manual paste keeps working without JavaScript.
 
 ### Languages and themes
 

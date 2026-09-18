@@ -59,7 +59,7 @@ ip_family = "any"
 # Source ingestion by the fumox-server scheduler: fetch → parse → reconcile.
 # новых unknown-прокси за обновление источника в приоритет-очередь (0 = выкл)
 # newly inserted unknown proxies per source refresh queued for priority checking (0 = off)
-refresh_check_limit = 50
+refresh_check_limit = 100
 # Как поступать с живым прокси, исчезнувшим из выдачи источника.
 # false (дефолт): прокси остается за источником, пока проверки подтверждают,
 # что он жив; как только проверки завалят его — прокси сам уйдет из базы.

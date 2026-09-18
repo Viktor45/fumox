@@ -10,6 +10,23 @@ The categories follow [Keep a Changelog](https://keepachangelog.com/);
 `Docs` covers the user guide and READMEs, `Internal` (dependency bumps,
 CI plumbing) is omitted — it never changes the shipped image.
 
+## 2026-09-14 · sha-bba0ed6
+
+### Added
+
+- TLS reverse-proxy example: `docker/nginx/` (nginx.conf + Dockerfile)
+  terminates HTTPS for both `/sub` and `/admin` in front of the compose
+  stack; a ready-to-uncomment service stub was added to
+  `docker-compose.yml` (certificates mount into `/certs`, ACME
+  challenges are served on port 80).
+
+### Fixed
+
+- Import/export screen reworked: the alive/ready endpoints are now a
+  compact table with live proxy counts, and the import form gained a
+  JSON file picker that loads the chosen file into the payload field
+  (manual paste still works without JavaScript).
+
 ## 2026-09-13 · sha-45458b6
 
 ### Changed

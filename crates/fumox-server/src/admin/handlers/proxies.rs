@@ -329,11 +329,20 @@ pub async fn proxies_list(
             active: "proxies",
             csrf: state.csrf_for(&headers),
             all_statuses: [
-                ("unknown".to_string(), f_statuses.iter().any(|s| s == "unknown")),
+                (
+                    "unknown".to_string(),
+                    f_statuses.iter().any(|s| s == "unknown"),
+                ),
                 ("alive".to_string(), f_statuses.iter().any(|s| s == "alive")),
                 ("ready".to_string(), f_statuses.iter().any(|s| s == "ready")),
-                ("quarantine".to_string(), f_statuses.iter().any(|s| s == "quarantine")),
-                ("removed".to_string(), f_statuses.iter().any(|s| s == "removed")),
+                (
+                    "quarantine".to_string(),
+                    f_statuses.iter().any(|s| s == "quarantine"),
+                ),
+                (
+                    "removed".to_string(),
+                    f_statuses.iter().any(|s| s == "removed"),
+                ),
             ]
             .to_vec(),
             all_schemes: Scheme::all()

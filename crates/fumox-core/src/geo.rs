@@ -448,7 +448,11 @@ mod tests {
         assert_eq!(info.country_code.as_deref(), Some("US"));
         if mmdb_path(GeoDbKind::Asn).is_some() {
             assert_eq!(
-                apply_template("{flag} {country} {city} · {asn} {asn_org} · {name}", &info, "Node-1"),
+                apply_template(
+                    "{flag} {country} {city} · {asn} {asn_org} · {name}",
+                    &info,
+                    "Node-1"
+                ),
                 "🇺🇸 United States · AS15169 Google LLC · Node-1"
             );
         }

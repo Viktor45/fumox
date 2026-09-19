@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
             settings: ingest::IngestSettings {
                 refresh_check_limit: config.ingest.refresh_check_limit,
                 drop_gate: config.ingest.drop_gate,
+                removed_as_unknown: config.ingest.removed_as_unknown,
             },
         },
         scheduler_state.clone(),

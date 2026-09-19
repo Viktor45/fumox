@@ -831,7 +831,14 @@ impl Schema {
     /// `fumox_core::geo::apply_template` renders, so the hint cannot drift
     /// from the engine.
     pub(crate) fn geo_placeholders() -> [&'static str; 6] {
-        ["{flag}", "{country}", "{city}", "{asn}", "{asn_org}", "{name}"]
+        [
+            "{flag}",
+            "{country}",
+            "{city}",
+            "{asn}",
+            "{asn_org}",
+            "{name}",
+        ]
     }
 }
 
@@ -2002,7 +2009,14 @@ mod tests {
         );
         assert_eq!(
             Schema::geo_placeholders(),
-            ["{flag}", "{country}", "{city}", "{asn}", "{asn_org}", "{name}"]
+            [
+                "{flag}",
+                "{country}",
+                "{city}",
+                "{asn}",
+                "{asn_org}",
+                "{name}"
+            ]
         );
     }
 

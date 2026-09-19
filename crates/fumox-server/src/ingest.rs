@@ -51,6 +51,10 @@ pub struct IngestSettings {
     /// `[ingest].drop_gate`: whether pipeline `drop` rules switch off the
     /// alive-linger link policy for their source (see `reconcile_source`).
     pub drop_gate: bool,
+    /// `[ingest].removed_as_unknown`: whether a `removed` proxy the feed
+    /// still carries is revived to `unknown` (via `proxies::revive_removed`)
+    /// and re-enters the probe cycle.
+    pub removed_as_unknown: bool,
 }
 
 /// Fetch, parse and reconcile one source; journal the result.
@@ -131,7 +135,27 @@ pub async fn ingest_source(
             {
                 Ok(stats) => {
                     journal_success(pool, source, &payload, found, now).await;
-                    enqueue_probe_requests(pool, &stats, settings.refresh_check_limit, now).await;
+                    // `[ingest].removed_as_unknown`: a removed proxy the feed
+                    // still carries resets to the pristine `unknown` state and
+                    // gets the same priority-queue handoff as a fresh insert.
+                    // A failure is logged and never fails the ingest — the
+                    // next refresh simply retries.
+                    let mut queue_ids = stats.inserted_ids.clone();
+                    if settings.removed_as_unknown {
+                        let fps: Vec<String> = filtered
+                            .entries
+                            .iter()
+                            .map(ProxyEntry::fingerprint)
+                            .collect();
+                        match proxies::revive_removed(pool, &fps, now).await {
+                            Ok(ids) => queue_ids.extend(ids),
+                            Err(err) => {
+                                tracing::warn!(error = %err, "removed-as-unknown revival failed")
+                            }
+                        }
+                    }
+                    enqueue_probe_requests(pool, &queue_ids, settings.refresh_check_limit, now)
+                        .await;
                     IngestOutcome::Ok {
                         proxies_found: found,
                         stats,
@@ -222,19 +246,15 @@ pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome
 }
 
 /// Priority-check handoff: enqueue up to `limit` of the pass's
-/// newly inserted proxies (repo-side filtering keeps only T1-probeable
+/// newly inserted (and, with `[ingest].removed_as_unknown`, revived)
+/// proxies (repo-side filtering keeps only T1-probeable
 /// `unknown` rows). A failure is logged and never fails the ingest — the
 /// random sample covers those proxies anyway.
-async fn enqueue_probe_requests(
-    pool: &DbPool,
-    stats: &proxies::ReconciliationStats,
-    limit: u32,
-    now: i64,
-) {
-    if limit == 0 || stats.inserted_ids.is_empty() {
+async fn enqueue_probe_requests(pool: &DbPool, ids: &[i64], limit: u32, now: i64) {
+    if limit == 0 || ids.is_empty() {
         return;
     }
-    match probe::enqueue_checks(pool, &stats.inserted_ids, limit, now).await {
+    match probe::enqueue_checks(pool, ids, limit, now).await {
         Ok(0) => {}
         Ok(queued) => {
             tracing::debug!(queued, "new proxies queued for priority probing");

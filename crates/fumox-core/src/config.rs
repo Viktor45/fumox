@@ -207,6 +207,15 @@ pub struct IngestConfig {
     /// later only stops new matches, never stored ones.
     #[serde(default = "defaults::drop_gate")]
     pub drop_gate: bool,
+    /// Revive a `removed` proxy the feed still carries: on the next
+    /// refresh of a source containing it, the row resets to the pristine
+    /// `unknown` state (fail_count and quarantine schedules cleared, same
+    /// as the admin "reset status" action) and re-enters the probe cycle.
+    /// `false` (the default) keeps `removed` terminal — the only ways back
+    /// are the admin "reset status" action or «purge removed» followed by
+    /// a re-insert from a fetch.
+    #[serde(default = "defaults::removed_as_unknown")]
+    pub removed_as_unknown: bool,
 }
 
 impl Default for IngestConfig {
@@ -214,6 +223,7 @@ impl Default for IngestConfig {
         Self {
             refresh_check_limit: defaults::refresh_check_limit(),
             drop_gate: defaults::drop_gate(),
+            removed_as_unknown: defaults::removed_as_unknown(),
         }
     }
 }
@@ -859,6 +869,9 @@ mod defaults {
     }
     pub const fn refresh_check_limit() -> u32 {
         50
+    }
+    pub const fn removed_as_unknown() -> bool {
+        false
     }
     pub const fn fail_limit() -> u32 {
         3

@@ -1522,8 +1522,7 @@ mod tests {
     async fn geo_step_renders_merged_country_city_and_asn_facts() {
         // GeoLite2 files are gitignored, so CI runs without them.
         let db_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
-        if !db_dir.join("GeoLite2-ASN.mmdb").exists()
-            || !db_dir.join("GeoLite2-City.mmdb").exists()
+        if !db_dir.join("GeoLite2-ASN.mmdb").exists() || !db_dir.join("GeoLite2-City.mmdb").exists()
         {
             eprintln!("skipped: GeoLite2-ASN/City.mmdb not present");
             return;

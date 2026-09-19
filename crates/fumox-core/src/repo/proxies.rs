@@ -7,7 +7,9 @@
 //!    touched: `status`, `fail_count` and the quarantine fields are owned by
 //!    the probe state machine, and a reappearing `removed`/`quarantine`
 //!    proxy keeps them — the early resurrection rule is deliberately
-//!    superseded);
+//!    superseded; the opt-in `[ingest].removed_as_unknown` revival
+//!    ([`revive_removed`], called by the server right after
+//!    reconciliation) is the only exception);
 //! 2. `proxy_source_links.seen_at` is stamped for every proxy still present;
 //! 3. links of this source not stamped by the fetch are deleted; a proxy
 //!    with no remaining links is marked `removed`.
@@ -582,6 +584,46 @@ pub async fn reset_status(pool: &DbPool, id: i64) -> crate::Result<bool> {
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Opt-in revival (`[ingest].removed_as_unknown`): a `removed` proxy the
+/// feed still carries returns to the probe state machine. Every row whose
+/// fingerprint is listed and whose status is `removed` resets to the same
+/// pristine state the admin "reset status" action leaves (`unknown`,
+/// `fail_count = 0`, quarantine schedules and `removed_at` cleared), so a
+/// later recheck or a source refresh that stops carrying the proxy behaves
+/// exactly as if the row had never been removed. Returns the ids of the
+/// revived rows — the caller hands them to the priority-probe queue like a
+/// fresh insert. Chunked by fingerprint like every other batch statement.
+pub async fn revive_removed(
+    pool: &DbPool,
+    fingerprints: &[String],
+    now: i64,
+) -> crate::Result<Vec<i64>> {
+    let mut revived = Vec::new();
+    for chunk in fingerprints.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "UPDATE proxies SET
+                 status = 'unknown',
+                 fail_count = 0,
+                 quarantined_at = NULL,
+                 ladder_at = NULL,
+                 ladder_step = 0,
+                 removed_at = NULL,
+                 updated_at = ?
+             WHERE status = 'removed' AND fingerprint IN ({placeholders})
+             RETURNING id"
+        );
+        // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
+        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql.as_str())).bind(now);
+        for fp in chunk {
+            query = query.bind(fp);
+        }
+        let rows: Vec<(i64,)> = query.fetch_all(pool).await?;
+        revived.extend(rows.into_iter().map(|(id,)| id));
+    }
+    Ok(revived)
 }
 
 /// Sources currently linking a proxy, with the last-seen timestamp.
@@ -1305,6 +1347,68 @@ mod tests {
             .unwrap();
         assert_eq!(stats.updated, 2);
         assert!(stats.inserted_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revive_removed_resets_terminal_rows_and_reconcile_keeps_them() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let entries = vec![entry("one", "h1.example.com", 443)];
+        reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
+            .await
+            .unwrap();
+        let fp = entries[0].fingerprint();
+        sqlx::query(
+            "UPDATE proxies SET status = 'removed', fail_count = 3,
+                 removed_at = 1500, ladder_at = 1600, ladder_step = 2
+             WHERE fingerprint = ?",
+        )
+        .bind(&fp)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Reconciliation itself never touches the terminal state.
+        reconcile_source(&pool, "srcA0000000", &entries, &[], 2000, false)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, &entries[0]).await, ("removed".into(), 3));
+
+        // The opt-in revival resets the pristine state and returns the id.
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM proxies WHERE fingerprint = ?")
+            .bind(&fp)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let ids = revive_removed(&pool, std::slice::from_ref(&fp), 3000)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![id]);
+        assert_eq!(status_of(&pool, &entries[0]).await, ("unknown".into(), 0));
+        let (removed_at, quarantined_at, ladder_at, ladder_step): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT removed_at, quarantined_at, ladder_at, ladder_step
+             FROM proxies WHERE fingerprint = ?",
+        )
+        .bind(&fp)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (removed_at, quarantined_at, ladder_at, ladder_step),
+            (None, None, None, 0)
+        );
+
+        // Idempotent: a second pass is a no-op for the now-`unknown` row,
+        // and a fingerprint with no `removed` row never matches.
+        let ids = revive_removed(&pool, &[fp, "no-such-fingerprint0000000".to_string()], 4000)
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
     }
 
     #[tokio::test]

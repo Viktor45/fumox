@@ -10,6 +10,16 @@ The categories follow [Keep a Changelog](https://keepachangelog.com/);
 `Docs` covers the user guide and READMEs, `Internal` (dependency bumps,
 CI plumbing) is omitted — it never changes the shipped image.
 
+## Unreleased (2026-09-17)
+
+### Added
+
+- `[ingest].removed_as_unknown` (default `false`): a `removed` proxy the
+  feed still carries can be revived — the row resets to the pristine
+  `unknown` state (fail count and quarantine fields cleared) and walks
+  the checks again, joining the priority-probe queue like a fresh
+  insert. With the default, `removed` stays terminal.
+
 ## 2026-09-14 · sha-bba0ed6
 
 ### Added

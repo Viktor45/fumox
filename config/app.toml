@@ -71,6 +71,19 @@ refresh_check_limit = 100
 # on its own. true: when the source has pipeline drop rules, an alive
 # proxy caught by a rule is removed on the very next refresh.
 drop_gate = false
+# Возврат удаленного прокси, который снова появился в источнике.
+# false (дефолт): removed терминален — возврат только вручную («сбросить
+# статус» в админке) или через «purge removed» + повторная вставка.
+# true: прокси, все еще приходящий из фида, сбрасывается в статус
+# unknown (fail_count и карантинные поля очищены, как после «сброса
+# статуса») и заново проходит проверки, вставая в приоритет-очередь.
+# Revive a removed proxy that reappears in a source feed.
+# false (the default): removed stays terminal — the only ways back are the
+# admin "reset status" action or «purge removed» plus a re-insert.
+# true: a proxy the feed still carries resets to the pristine unknown
+# state (fail_count and quarantine fields cleared, same as "reset status")
+# and walks the checks again, joining the priority queue.
+removed_as_unknown = false
 
 [geo]
 # Гео-обогащение MaxMind GeoLite2: по IP-адресу узла определяются страна,

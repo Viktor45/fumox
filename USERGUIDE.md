@@ -610,6 +610,7 @@ form.
 | --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `refresh_check_limit` | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue)                                                                                                       |
 | `drop_gate`           | `false` | Drop-rules gate on the alive-linger. `true`: an alive proxy of a source with `drop` rules leaves on the next refresh once a rule catches it; `false`: every source lingers, the probe alone retires proxies |
+| `removed_as_unknown`  | `false` | Revive a `removed` proxy the feed still carries: the row resets to the pristine `unknown` state (fail count and quarantine fields cleared) and walks the checks again, joining the priority queue. `false`: `removed` stays terminal — the only ways back are the admin "reset status" action or «purge removed» plus a re-insert |
 
 ### `[geo]` – geo enrichment
 
@@ -889,6 +890,7 @@ panel's *Settings* page.
 | `[probe].allow_private_targets`      | `false`             | When `false`, the probe refuses to connect to loopback / link-local / RFC1918 / ULA addresses. This protects against SSRF if an attacker publishes a proxy list pointing at cloud metadata (`169.254.169.254`) or a private subnet. Blocked attempts are journaled as `probe_results.error = "blocked by the private-address policy: <reason>"` so the T2 recency queue advances past them |
 | `[ingest].refresh_check_limit`       | `50`                | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables)                                                       |
 | `[ingest].drop_gate`                 | `false`             | Whether `drop` rules unlink a live "lingerer" on the very next refresh                                                                              |
+| `[ingest].removed_as_unknown`        | `false`             | Revive a `removed` proxy the feed still carries: reset to pristine `unknown` and re-check                                                           |
 | `[meow].timeout_secs`                | `10`                | Per-check T2 delay-test timeout                                                                                                                     |
 | `[meow].backoff_initial_secs`        | `60`                | Initial T2 backoff while meow-rs is unavailable                                                                                                     |
 | `[meow].backoff_max_secs`            | `900`               | T2 backoff ceiling (15 min)                                                                                                                         |

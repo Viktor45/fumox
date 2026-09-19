@@ -56,6 +56,20 @@ impl SettingsTemplate {
             format!("{secs} {}", self.lang.t("common.sec"))
         }
     }
+
+    /// Human-readable byte cap: whole MiB, else whole KiB, else raw bytes.
+    /// Takes a reference — askama field access yields one.
+    fn fmt_bytes(&self, bytes: &u64) -> String {
+        const MIB: u64 = 1024 * 1024;
+        const KIB: u64 = 1024;
+        if *bytes != 0 && bytes.is_multiple_of(MIB) {
+            format!("{} MiB", bytes / MIB)
+        } else if *bytes != 0 && bytes.is_multiple_of(KIB) {
+            format!("{} KiB", bytes / KIB)
+        } else {
+            format!("{bytes} {}", self.lang.t("set.bytes"))
+        }
+    }
 }
 
 impl_i18n!(SettingsTemplate);

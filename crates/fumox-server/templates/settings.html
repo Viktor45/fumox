@@ -43,6 +43,23 @@
       <tbody>
         <tr><th>{{ self.t("set.refresh_check_limit") }}</th><td>{{ state.ingest.refresh_check_limit }}</td></tr>
         <tr><th>{{ self.t("set.drop_gate") }}</th><td>{{ state.ingest.drop_gate }}</td></tr>
+        <tr><th>{{ self.t("set.removed_as_unknown") }}</th><td>{{ state.ingest.removed_as_unknown }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("set.fetch") }} <span class="badge neutral">server</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><th>{{ self.t("set.fetch_connect") }}</th><td>{{ state.fetch.connect_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><th>{{ self.t("set.fetch_read") }}</th><td>{{ state.fetch.read_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><th>{{ self.t("set.fetch_max_response") }}</th><td>{{ self.fmt_bytes(state.fetch.max_response_bytes) }}</td></tr>
+        <tr><th>{{ self.t("set.fetch_concurrency") }}</th><td>{{ state.fetch.max_concurrency }}</td></tr>
+        <tr><th>{{ self.t("set.fetch_retries") }}</th><td>{{ state.fetch.max_retries }}</td></tr>
+        <tr><th>{{ self.t("set.fetch_backoff") }}</th><td>{{ state.fetch.retry_base_backoff_ms }} {{ self.t("common.ms") }}</td></tr>
+        <tr><th>{{ self.t("set.fetch_user_agent") }}</th><td class="mono small">{{ state.fetch.user_agent }}</td></tr>
+        <tr><th>{{ self.t("set.fetch_ip_family") }}</th><td>{{ state.fetch.ip_family.as_str() }}</td></tr>
       </tbody>
     </table>
   </div>

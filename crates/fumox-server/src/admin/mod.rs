@@ -19,7 +19,9 @@ use crate::scheduler::SchedulerState;
 use askama::Template;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use fumox_core::config::{AdminConfig, IngestConfig, MeowConfig, ProbeConfig, RetentionConfig};
+use fumox_core::config::{
+    AdminConfig, FetchConfig, IngestConfig, MeowConfig, ProbeConfig, RetentionConfig,
+};
 use fumox_core::db::DbPool;
 use fumox_core::geo::GeoResolver;
 use i18n::Lang;
@@ -50,12 +52,14 @@ pub struct AdminState {
     /// Public subscription listener (`[server].bind`); its port builds the
     /// serve links shown on the source/profile cards.
     pub server_bind: SocketAddr,
-    /// Read-only probe/meow/retention/ingest settings shown on
+    /// Read-only probe/meow/retention/ingest/fetch settings shown on
     /// `/admin/probe` and `/admin/settings`.
     pub probe: ProbeConfig,
     pub meow: MeowConfig,
     pub retention: RetentionConfig,
     pub ingest: IngestConfig,
+    /// The `[fetch]` block for the settings screen (HTTP fetching knobs).
+    pub fetch: FetchConfig,
     /// HMAC key for session cookies, derived from the admin token so that
     /// rotating the token revokes every existing session.
     pub session_key: Vec<u8>,
@@ -113,6 +117,7 @@ impl AdminState {
             meow: config.meow.clone(),
             retention: config.retention.clone(),
             ingest: config.ingest,
+            fetch: config.fetch,
             session_key,
             csrf_key,
             login_limiter,
@@ -1751,6 +1756,7 @@ mod tests {
         let ingest = state.ingest.clone();
         let meow = state.meow.clone();
         let retention = state.retention.clone();
+        let fetch = state.fetch.clone();
         let app = router(state);
         let cookie = login(&app).await;
         let response = app
@@ -1780,6 +1786,22 @@ mod tests {
         ] {
             assert!(html.contains(&key_value), "missing {key_value}: {html}");
         }
+        // The full `[ingest]` trio: the revived-row toggle is shown with its
+        // localized label next to the effective value.
+        assert!(
+            html.contains("Возвращать удаленных прокси"),
+            "the removed_as_unknown label: {html}"
+        );
+        assert!(
+            html.contains(&ingest.removed_as_unknown.to_string()),
+            "{html}"
+        );
+        // The `[fetch]` panel: the localized title, the User-Agent and the
+        // human-readable response cap.
+        assert!(html.contains("Загрузка по HTTP"), "the fetch panel: {html}");
+        assert!(html.contains(&fetch.user_agent), "{html}");
+        assert!(html.contains(fetch.ip_family.as_str()), "{html}");
+        assert!(html.contains("10 MiB"), "{html}");
     }
 
     /// Two sources with proxies in every status plus probe history; the

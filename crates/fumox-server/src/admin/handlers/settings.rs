@@ -17,6 +17,7 @@ use askama::Template;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use fumox_core::config::{GeoDbKind, RateLimit};
 
 #[derive(Template)]
 #[template(path = "settings.html")]
@@ -68,6 +69,30 @@ impl SettingsTemplate {
             format!("{} KiB", bytes / KIB)
         } else {
             format!("{bytes} {}", self.lang.t("set.bytes"))
+        }
+    }
+
+    /// A rate limit rendered back in the canonical config form («300/min»,
+    /// «5/h», «100/day», «90/45s» for a non-round window).
+    fn rate_limit(&self, rl: &RateLimit) -> String {
+        let unit = match rl.window.as_secs() {
+            60 => "min".to_string(),
+            3600 => "h".to_string(),
+            86400 => "day".to_string(),
+            other => format!("{other}s"),
+        };
+        format!("{}/{}", rl.limit, unit)
+    }
+
+    /// The `[geo].db` value as the config-facing string. The key is legacy
+    /// and inert — resolution merges every database in `db_dir` — but the
+    /// row is still shown (marked as such) so the effective config is
+    /// complete.
+    fn geo_db(&self) -> &'static str {
+        match self.state.geo_config.db {
+            GeoDbKind::Country => "country",
+            GeoDbKind::City => "city",
+            GeoDbKind::Asn => "asn",
         }
     }
 }

@@ -20,7 +20,8 @@ use askama::Template;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::config::{
-    AdminConfig, FetchConfig, IngestConfig, MeowConfig, ProbeConfig, RetentionConfig,
+    AdminConfig, DatabaseConfig, FetchConfig, GeoConfig, IngestConfig, LogConfig, MeowConfig,
+    ProbeConfig, RetentionConfig, ServerConfig,
 };
 use fumox_core::db::DbPool;
 use fumox_core::geo::GeoResolver;
@@ -60,6 +61,15 @@ pub struct AdminState {
     pub ingest: IngestConfig,
     /// The `[fetch]` block for the settings screen (HTTP fetching knobs).
     pub fetch: FetchConfig,
+    /// The `[server]` block for the settings screen (public listener).
+    pub server: ServerConfig,
+    /// The `[database]` block for the settings screen.
+    pub database: DatabaseConfig,
+    /// The `[geo]` block for the settings screen (the `geo: Arc<GeoResolver>`
+    /// field above is the live resolver, not the config).
+    pub geo_config: GeoConfig,
+    /// The `[log]` block for the settings screen (console log levels).
+    pub log: LogConfig,
     /// HMAC key for session cookies, derived from the admin token so that
     /// rotating the token revokes every existing session.
     pub session_key: Vec<u8>,
@@ -118,6 +128,10 @@ impl AdminState {
             retention: config.retention.clone(),
             ingest: config.ingest,
             fetch: config.fetch,
+            server: config.server,
+            database: config.database,
+            geo_config: config.geo,
+            log: config.log,
             session_key,
             csrf_key,
             login_limiter,
@@ -1757,6 +1771,9 @@ mod tests {
         let meow = state.meow.clone();
         let retention = state.retention.clone();
         let fetch = state.fetch.clone();
+        let database = state.database.clone();
+        let admin = state.admin.clone();
+        let log = state.log.clone();
         let app = router(state);
         let cookie = login(&app).await;
         let response = app
@@ -1799,9 +1816,32 @@ mod tests {
         // The `[fetch]` panel: the localized title, the User-Agent and the
         // human-readable response cap.
         assert!(html.contains("Загрузка по HTTP"), "the fetch panel: {html}");
-        assert!(html.contains(&fetch.user_agent), "{html}");
+        assert!(html.contains(fetch.user_agent.as_str()), "{html}");
         assert!(html.contains(fetch.ip_family.as_str()), "{html}");
         assert!(html.contains("10 MiB"), "{html}");
+        // The remaining sections render with their localized titles; the
+        // rate limits come back in the canonical config form.
+        for title in [
+            "Публичный слушатель",
+            "База данных",
+            "Гео-обогащение",
+            "Админка",
+            "Уровни консольных логов",
+        ] {
+            assert!(html.contains(title), "missing panel {title}: {html}");
+        }
+        assert!(
+            html.contains("Соединяться с приватными адресами"),
+            "the allow_private_targets label: {html}"
+        );
+        assert!(html.contains("300/min"), "public rate limit: {html}");
+        assert!(
+            html.contains(database.busy_timeout_ms.to_string().as_str()),
+            "{html}"
+        );
+        assert!(html.contains(log.server.as_str()), "{html}");
+        // The admin token is a secret — it must never reach the page.
+        assert!(!html.contains(&admin.token), "token leaked: {html}");
     }
 
     /// Two sources with proxies in every status plus probe history; the

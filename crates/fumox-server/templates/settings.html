@@ -32,6 +32,7 @@
         <tr><th>{{ self.t("probe.tcp_timeout") }}</th><td>{{ state.probe.connect_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><th>{{ self.t("probe.tls_timeout") }}</th><td>{{ state.probe.tls_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><th>{{ self.t("probe.concurrency") }}</th><td>{{ state.probe.concurrency }}</td></tr>
+        <tr><th>{{ self.t("probe.allow_private_targets") }}</th><td>{{ state.probe.allow_private_targets }}</td></tr>
         <tr><th>Heartbeat</th><td>{{ self.t("probe.every_n_sec").replace("{}", &state.probe.heartbeat_interval_secs.to_string()) }}</td></tr>
       </tbody>
     </table>
@@ -60,6 +61,67 @@
         <tr><th>{{ self.t("set.fetch_backoff") }}</th><td>{{ state.fetch.retry_base_backoff_ms }} {{ self.t("common.ms") }}</td></tr>
         <tr><th>{{ self.t("set.fetch_user_agent") }}</th><td class="mono small">{{ state.fetch.user_agent }}</td></tr>
         <tr><th>{{ self.t("set.fetch_ip_family") }}</th><td>{{ state.fetch.ip_family.as_str() }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("set.public_listener") }} <span class="badge neutral">server</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><th>{{ self.t("set.bind") }}</th><td class="mono small">{{ state.server.bind }}</td></tr>
+        <tr><th>{{ self.t("set.rate_limit") }}</th><td>{{ self.rate_limit(&state.server.rate_limit) }}</td></tr>
+        <tr><th>{{ self.t("set.auth_fail_limit") }}</th><td>{{ self.rate_limit(&state.server.auth_fail_rate_limit) }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("set.database") }} <span class="badge neutral">server</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><th>{{ self.t("set.db_path") }}</th><td class="mono small">{{ state.database.path.display() }}</td></tr>
+        <tr><th>{{ self.t("set.busy_timeout") }}</th><td>{{ state.database.busy_timeout_ms }} {{ self.t("common.ms") }}</td></tr>
+        <tr><th>{{ self.t("set.max_connections") }}</th><td>{{ state.database.max_connections }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("set.geo_panel") }} <span class="badge neutral">server</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><th>{{ self.t("set.enabled") }}</th><td>{{ state.geo_config.enabled }}</td></tr>
+        <tr><th>{{ self.t("set.geo_db_dir") }}</th><td class="mono small">{{ state.geo_config.db_dir.display() }}</td></tr>
+        <tr><th>{{ self.t("set.geo_cache") }}</th><td>{{ state.geo_config.cache_max_entries }}</td></tr>
+        <tr><th>{{ self.t("set.dns_timeout") }}</th><td>{{ state.geo_config.dns_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><th>{{ self.t("set.geo_db") }}</th><td>{{ self.geo_db() }} <span class="hint">{{ self.t("set.legacy") }}</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("set.admin_panel") }} <span class="badge neutral">server</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><th>{{ self.t("set.enabled") }}</th><td>{{ state.admin.enabled }}</td></tr>
+        <tr><th>{{ self.t("set.bind") }}</th><td class="mono small">{{ state.admin.bind }}</td></tr>
+        <tr><th>{{ self.t("set.session_ttl") }}</th><td>{{ state.admin.session_ttl_hours }} {{ self.t("probe.hours_short") }}</td></tr>
+        <tr><th>{{ self.t("set.allow_private_urls") }}</th><td>{{ state.admin.allow_private_urls }}</td></tr>
+        <tr><th>{{ self.t("set.rate_limit") }}</th><td>{{ self.rate_limit(&state.admin.rate_limit) }}</td></tr>
+        <tr><th>{{ self.t("set.login_rate_limit") }}</th><td>{{ self.rate_limit(&state.admin.login_rate_limit) }}</td></tr>
+        <tr><th>{{ self.t("set.secure_cookies") }}</th><td>{{ state.admin.secure_cookies }}</td></tr>
+        <tr><th>{{ self.t("set.locales_dir") }}</th><td class="mono small">{{ state.admin.locales_dir }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>{{ self.t("set.log_levels") }} <span class="badge neutral">server+probe</span></h2>
+    <table class="kv">
+      <tbody>
+        <tr><th>fumox-server</th><td>{{ state.log.server.as_str() }}</td></tr>
+        <tr><th>fumox-probe</th><td>{{ state.log.probe.as_str() }}</td></tr>
       </tbody>
     </table>
   </div>

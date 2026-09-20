@@ -493,6 +493,7 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 | **Fetch log**       | Journal of every source fetch: time, status, bytes, proxies found, error class                                                                                                                        |
 | **Probe**           | Health-check daemon status: heartbeat, meow-rs status, quarantine queue with scheduled second chances                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
+| **Settings**        | Read-only overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels — every `config/app.toml` knob except the admin token, which is never rendered |
 
 ### Times and timezones
 
@@ -894,6 +895,12 @@ panel's *Settings* page.
 | `[meow].timeout_secs`                | `10`                | Per-check T2 delay-test timeout                                                                                                                     |
 | `[meow].backoff_initial_secs`        | `60`                | Initial T2 backoff while meow-rs is unavailable                                                                                                     |
 | `[meow].backoff_max_secs`            | `900`               | T2 backoff ceiling (15 min)                                                                                                                         |
+
+The *Settings* page renders the **complete** effective config, not just the
+state machine: the table above, plus `[server]`, `[database]`, `[geo]`,
+`[admin]` and `[log]` panels (rate limits in the canonical `N/unit` form,
+response caps human-readable, the legacy `[geo].db` marked as ignored). The
+admin token is the only value that never appears on the page.
 
 If meow-rs is down, T2 doesn't spam it: the probe backs off exponentially
 (60 s → doubling → capped at 15 min), and proxy statuses are left untouched:

@@ -20,6 +20,16 @@ CI plumbing) is omitted — it never changes the shipped image.
   the checks again, joining the priority-probe queue like a fresh
   insert. With the default, `removed` stays terminal.
 
+### Changed
+
+- The admin *Settings* screen now renders the **complete** effective
+  config: new `[server]`, `[database]`, `[geo]`, `[admin]` and `[log]`
+  panels next to the existing probe/ingest/fetch/meow ones, plus the
+  previously missing `[probe].allow_private_targets`. Rate limits are
+  shown in the canonical `N/unit` form, response caps human-readable,
+  the legacy `[geo].db` is marked as ignored — and the admin token is
+  never rendered.
+
 ## 2026-09-14 · sha-bba0ed6
 
 ### Added

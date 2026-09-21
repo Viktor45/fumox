@@ -296,8 +296,7 @@ mod tests {
         let allowed = vec!["vpn.example.com".to_string()];
         // The port is stripped for the URL host component — the caller
         // appends the public port from `[server].bind`.
-        let out =
-            build_serve_link_host(bind, &host("vpn.example.com:8081"), &allowed).unwrap();
+        let out = build_serve_link_host(bind, &host("vpn.example.com:8081"), &allowed).unwrap();
         assert_eq!(out, "vpn.example.com");
     }
 

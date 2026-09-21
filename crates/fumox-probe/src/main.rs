@@ -378,7 +378,20 @@ async fn apply_regular_failure(ctx: &Context, id: i64, now: i64) {
         i64::try_from(probe.second_chance_min_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
     let spread_secs =
         i64::try_from(probe.second_chance_spread_hours.saturating_mul(3600)).unwrap_or(0);
-    match proxies::check_failed(&ctx.pool, id, now, probe.fail_limit, min_secs, spread_secs).await {
+    // T1 failure: a closed TCP/TLS port says nothing about the tunnel and
+    // must not trigger the T1-suppression flag (SPEC §8.3, see
+    // `proxies::check_failed`).
+    match proxies::check_failed(
+        &ctx.pool,
+        id,
+        now,
+        probe.fail_limit,
+        min_secs,
+        spread_secs,
+        false,
+    )
+    .await
+    {
         Ok(proxies::Transition::Quarantined) => {
             tracing::info!(id, "proxy quarantined after consecutive failures")
         }
@@ -778,6 +791,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                         fail_limit,
                         min_secs,
                         spread_secs,
+                        true,
                     )
                     .await
                     {
@@ -836,8 +850,19 @@ async fn journal_and_fail(ctx: &Context, id: i64, reason: &str) {
         i64::try_from(probe.second_chance_min_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
     let spread_secs =
         i64::try_from(probe.second_chance_spread_hours.saturating_mul(3600)).unwrap_or(0);
-    if let Err(error) =
-        proxies::check_failed(&ctx.pool, id, now, probe.fail_limit, min_secs, spread_secs).await
+    if let Err(error) = proxies::check_failed(
+        &ctx.pool,
+        id,
+        now,
+        probe.fail_limit,
+        min_secs,
+        spread_secs,
+        // T2-side failure (the caller is `journal_and_fail`, which is only
+        // invoked from T2 paths): stamp the suppression flag so the T1
+        // selector skips this proxy until its next T2 succeeds.
+        true,
+    )
+    .await
     {
         tracing::warn!(id, %error, "failed to record T2 failure");
     }
@@ -1478,13 +1503,17 @@ mod tests {
         // outage is journaled once per backoff window, not every cycle.
         let row = proxies::get_by_id(&pool, live).await.unwrap().unwrap();
         assert_eq!(row.status, "alive");
+        // Exactly one successful T1: the cycle-2 batch is skipped because
+        // the cycle-1 T2 outage stamped `last_t2_failed_at`, and T2 itself
+        // is still under the meow backoff. The proxy waits in the recency
+        // queue for the next T2 verdict (SPEC §8.3 T1 suppression).
         let (ok_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND ok = 1")
                 .bind(live)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!(ok_count >= 2);
+        assert_eq!(ok_count, 1);
         let (fail_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND ok = 0")
                 .bind(dying)

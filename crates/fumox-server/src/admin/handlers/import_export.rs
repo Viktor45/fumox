@@ -236,20 +236,32 @@ struct ImportTemplate {
 
 impl_i18n!(ImportTemplate);
 
+/// Inputs for [`render_page`] — bundled to keep the call sites compact
+/// and the function's signature below clippy's argument-count cap.
+struct RenderArgs<'a> {
+    lang: Lang,
+    theme: Theme,
+    peer: SocketAddr,
+    headers: &'a HeaderMap,
+    status: StatusCode,
+    errors: Vec<String>,
+    summary: Option<ImportSummary>,
+}
+
 /// Render the import/export screen, filling in the alive-export link data
 /// shared by every entry point (fresh page, validation errors, import
 /// summary). The token is generated on first visit if startup has not
 /// already created it.
-async fn render_page(
-    state: &AdminState,
-    lang: Lang,
-    theme: Theme,
-    peer: SocketAddr,
-    headers: &HeaderMap,
-    status: StatusCode,
-    errors: Vec<String>,
-    summary: Option<ImportSummary>,
-) -> Response {
+async fn render_page(state: &AdminState, args: RenderArgs<'_>) -> Response {
+    let RenderArgs {
+        lang,
+        theme,
+        peer,
+        headers,
+        status,
+        errors,
+        summary,
+    } = args;
     let token = match alive_export::ensure_token(&state.pool).await {
         Ok(token) => token,
         Err(err) => return super::server_error(lang, &err),
@@ -297,13 +309,15 @@ pub async fn import_form(
     let theme = theme::from_headers(&headers);
     render_page(
         &state,
-        lang,
-        theme,
-        peer,
-        &headers,
-        StatusCode::OK,
-        Vec::new(),
-        None,
+        RenderArgs {
+            lang,
+            theme,
+            peer,
+            headers: &headers,
+            status: StatusCode::OK,
+            errors: Vec::new(),
+            summary: None,
+        },
     )
     .await
 }
@@ -325,13 +339,15 @@ pub async fn import_submit(
             let errors = vec![lang.t("io.err_parse").replace("{}", &err.to_string())];
             return render_page(
                 &state,
-                lang,
-                theme,
-                peer,
-                &headers,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                errors,
-                None,
+                RenderArgs {
+                    lang,
+                    theme,
+                    peer,
+                    headers: &headers,
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    errors,
+                    summary: None,
+                },
             )
             .await;
         }
@@ -343,13 +359,15 @@ pub async fn import_submit(
         ];
         return render_page(
             &state,
-            lang,
-            theme,
-            peer,
-            &headers,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            errors,
-            None,
+            RenderArgs {
+                lang,
+                theme,
+                peer,
+                headers: &headers,
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                errors,
+                summary: None,
+            },
         )
         .await;
     }
@@ -359,15 +377,17 @@ pub async fn import_submit(
     if !errors.is_empty() {
         return render_page(
             &state,
-            lang,
-            theme,
-            peer,
-            &headers,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            errors,
-            None,
+            RenderArgs {
+                lang,
+                theme,
+                peer,
+                headers: &headers,
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                errors,
+                summary: None,
+            },
         )
-        .await;
+            .await;
     }
 
     match apply_import(&state, &lang, file).await {
@@ -379,13 +399,15 @@ pub async fn import_submit(
             );
             render_page(
                 &state,
-                lang,
-                theme,
-                peer,
-                &headers,
-                StatusCode::OK,
-                Vec::new(),
-                Some(summary),
+                RenderArgs {
+                    lang,
+                    theme,
+                    peer,
+                    headers: &headers,
+                    status: StatusCode::OK,
+                    errors: Vec::new(),
+                    summary: Some(summary),
+                },
             )
             .await
         }
@@ -845,11 +867,8 @@ mod tests {
         let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
         std::mem::forget(refresh_rx);
         let config = fumox_core::AppConfig::default();
-        let fetcher = crate::fetcher::Fetcher::new(
-            config.fetch.clone(),
-            false,
-            config.geo.dns_timeout(),
-        );
+        let fetcher =
+            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.geo.dns_timeout());
         let state = crate::admin::AdminState::new(
             pool,
             crate::cache::Caches::new(),

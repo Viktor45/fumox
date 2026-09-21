@@ -94,6 +94,11 @@ pub struct ProxyRow {
     pub removed_at: Option<i64>,
     pub latency_ms: Option<i64>,
     pub speed_mbps: Option<f64>,
+    /// When the most recent T2 attempt failed; NULL means either no T2
+    /// attempt yet or a successful T2 since. Filters T1 candidates
+    /// ([`select_t1_candidates`], SPEC §8.3) so a proxy waits out T1 until
+    /// its next T2 succeeds.
+    pub last_t2_failed_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -897,6 +902,7 @@ pub async fn select_t1_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
          FROM proxies p
          WHERE p.status IN ('unknown', 'alive')
            AND p.scheme NOT IN ({excluded})
+           AND p.last_t2_failed_at IS NULL
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
          ORDER BY RANDOM()
          LIMIT ?"
@@ -1019,6 +1025,7 @@ pub async fn check_succeeded(
              quarantined_at = NULL,
              ladder_at = NULL,
              ladder_step = 0,
+             last_t2_failed_at = NULL,
              updated_at = ?
          WHERE id = ? AND status != 'removed'"
     );
@@ -1050,6 +1057,13 @@ pub async fn check_succeeded(
 /// the tunnel-verified tier only lasts
 /// while the latest T2 outcome is a success — the next successful T2
 /// promotes it back.
+///
+/// `mark_t2_failed` records the moment on `last_t2_failed_at`. Only
+/// T2-side failures pass `true`: a T1 failure keeps the field untouched,
+/// because a TCP/TLS miss does not mean the tunnel is dead and T1 has to
+/// keep retrying on its own schedule. Set by [`check_failed`] callers
+/// that handle T2 outcomes (see [`crate::repo::probe`] / the probe
+/// daemon's `journal_and_fail`).
 pub async fn check_failed(
     pool: &DbPool,
     id: i64,
@@ -1057,6 +1071,7 @@ pub async fn check_failed(
     fail_limit: u32,
     second_chance_min_secs: i64,
     second_chance_spread_secs: i64,
+    mark_t2_failed: bool,
 ) -> crate::Result<Transition> {
     // rand 0.10: `random_range` moved from `Rng` to `RngExt`.
     use rand::RngExt;
@@ -1089,6 +1104,7 @@ pub async fn check_failed(
                  quarantined_at = ?,
                  ladder_at = ?,
                  ladder_step = 0,
+                 last_t2_failed_at = CASE WHEN ? THEN ? ELSE last_t2_failed_at END,
                  updated_at = ?
              WHERE id = ?",
         )
@@ -1096,6 +1112,8 @@ pub async fn check_failed(
         .bind(now)
         .bind(now)
         .bind(second_chance_at)
+        .bind(mark_t2_failed)
+        .bind(now)
         .bind(now)
         .bind(id)
         .execute(pool)
@@ -1107,10 +1125,13 @@ pub async fn check_failed(
                  status = CASE WHEN status = 'ready' THEN 'alive' ELSE status END,
                  fail_count = ?,
                  last_checked_at = ?,
+                 last_t2_failed_at = CASE WHEN ? THEN ? ELSE last_t2_failed_at END,
                  updated_at = ?
              WHERE id = ?",
         )
         .bind(new_count)
+        .bind(now)
+        .bind(mark_t2_failed)
         .bind(now)
         .bind(now)
         .bind(id)
@@ -2116,7 +2137,9 @@ mod tests {
         assert_eq!(row.latency_ms, Some(21), "the T1 latency is stored");
 
         // A failed T2 (below the limit) demotes to alive.
-        let transition = check_failed(&pool, id, 4000, 3, 86_400, 0).await.unwrap();
+        let transition = check_failed(&pool, id, 4000, 3, 86_400, 0, false)
+            .await
+            .unwrap();
         assert_eq!(transition, Transition::Unchanged);
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "alive");
@@ -2131,7 +2154,9 @@ mod tests {
 
         // Reaching the fail limit from ready quarantines like from alive.
         for _ in 0..2 {
-            check_failed(&pool, id, 6000, 2, 86_400, 0).await.unwrap();
+            check_failed(&pool, id, 6000, 2, 86_400, 0, false)
+                .await
+                .unwrap();
         }
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "quarantine");
@@ -2194,7 +2219,7 @@ mod tests {
         let id = seed_proxy(&pool, "vless", "h1.example.com").await;
 
         for step in 1..3i64 {
-            let transition = check_failed(&pool, id, 1000 + step, 3, 86_400, 86_400)
+            let transition = check_failed(&pool, id, 1000 + step, 3, 86_400, 86_400, false)
                 .await
                 .unwrap();
             assert_eq!(transition, Transition::Unchanged);
@@ -2211,13 +2236,13 @@ mod tests {
         let id = seed_proxy(&pool, "vless", "h1.example.com").await;
         let now = 100_000i64;
 
-        check_failed(&pool, id, now - 10, 3, 86_400, 86_400)
+        check_failed(&pool, id, now - 10, 3, 86_400, 86_400, false)
             .await
             .unwrap();
-        check_failed(&pool, id, now - 5, 3, 86_400, 86_400)
+        check_failed(&pool, id, now - 5, 3, 86_400, 86_400, false)
             .await
             .unwrap();
-        let transition = check_failed(&pool, id, now, 3, 86_400, 86_400)
+        let transition = check_failed(&pool, id, now, 3, 86_400, 86_400, false)
             .await
             .unwrap();
         assert_eq!(transition, Transition::Quarantined);
@@ -2239,7 +2264,9 @@ mod tests {
         let pool = temp_pool().await;
         let id = seed_proxy(&pool, "vless", "h1.example.com").await;
         for t in [10, 20, 30] {
-            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+            check_failed(&pool, id, t, 3, 86_400, 0, false)
+                .await
+                .unwrap();
         }
         assert_eq!(
             get_by_id(&pool, id).await.unwrap().unwrap().status,
@@ -2266,7 +2293,9 @@ mod tests {
         let pool = temp_pool().await;
         let id = seed_proxy(&pool, "vless", "h1.example.com").await;
         for t in [10, 20, 30] {
-            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+            check_failed(&pool, id, t, 3, 86_400, 0, false)
+                .await
+                .unwrap();
         }
         // The default ladder: three rechecks after the second chance.
         let delays = [900i64, 1800, 3600];
@@ -2322,7 +2351,9 @@ mod tests {
         // Empty ladder: the failed second chance removes immediately.
         let id = seed_proxy(&pool, "vless", "empty.example.com").await;
         for t in [10, 20, 30] {
-            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+            check_failed(&pool, id, t, 3, 86_400, 0, false)
+                .await
+                .unwrap();
         }
         let transition = quarantine_check_failed(&pool, id, 100, 0, &[])
             .await
@@ -2336,7 +2367,9 @@ mod tests {
         // One recheck: second chance → recheck → removed.
         let id = seed_proxy(&pool, "vless", "one.example.com").await;
         for t in [10, 20, 30] {
-            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+            check_failed(&pool, id, t, 3, 86_400, 0, false)
+                .await
+                .unwrap();
         }
         assert_eq!(
             quarantine_check_failed(&pool, id, 100, 0, &[600])
@@ -2356,7 +2389,9 @@ mod tests {
         // Four rechecks: the walk goes through step 4 before removal.
         let id = seed_proxy(&pool, "vless", "four.example.com").await;
         for t in [10, 20, 30] {
-            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+            check_failed(&pool, id, t, 3, 86_400, 0, false)
+                .await
+                .unwrap();
         }
         let delays = [60i64; 4];
         for step in 0..4i64 {
@@ -2382,7 +2417,9 @@ mod tests {
         let pool = temp_pool().await;
         let id = seed_proxy(&pool, "vless", "h1.example.com").await;
         for t in [10, 20, 30] {
-            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+            check_failed(&pool, id, t, 3, 86_400, 0, false)
+                .await
+                .unwrap();
         }
         quarantine_check_failed(&pool, id, 90_000, 0, &[900])
             .await
@@ -2474,6 +2511,97 @@ mod tests {
         }
     }
 
+    /// A `last_t2_failed_at` stamp excludes the proxy from the T1 sample:
+    /// the only path back to T1 is a successful T2 (SPEC §8.3).
+    #[tokio::test]
+    async fn t1_candidates_skip_proxies_with_recent_t2_failure() {
+        let pool = temp_pool().await;
+        let clean = seed_proxy(&pool, "vless", "clean.example.com").await;
+        let blocked = seed_proxy(&pool, "vless", "blocked.example.com").await;
+
+        // Mark only `blocked` as recently T2-failed.
+        sqlx::query("UPDATE proxies SET last_t2_failed_at = 5_000 WHERE id = ?")
+            .bind(blocked)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let ids: Vec<i64> = select_t1_candidates(&pool, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec![clean]);
+    }
+
+    /// A T1-side failure must not stamp `last_t2_failed_at`: a closed
+    /// TCP/TLS port does not mean the tunnel is dead, and T1 needs to keep
+    /// retrying on its own schedule. Only T2 callers pass `true`.
+    #[tokio::test]
+    async fn t1_failure_does_not_set_t2_block() {
+        let pool = temp_pool().await;
+        let id = seed_proxy(&pool, "vless", "t1fail.example.com").await;
+
+        // fail_limit=100 so a single T1 fail does not move us to quarantine
+        // and the row stays in the T1 candidate set.
+        check_failed(&pool, id, 1_000, 100, 86_400, 0, false)
+            .await
+            .unwrap();
+
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert!(
+            row.last_t2_failed_at.is_none(),
+            "T1 failure must not stamp last_t2_failed_at, got {:?}",
+            row.last_t2_failed_at
+        );
+    }
+
+    /// The symmetric side of the suppression flag: any successful
+    /// check — T1 or T2, `alive` or revival from quarantine — clears
+    /// `last_t2_failed_at`, so the proxy re-enters the T1 sample.
+    #[tokio::test]
+    async fn t2_block_clears_on_next_success() {
+        let pool = temp_pool().await;
+        let id = seed_proxy(&pool, "vless", "unblock.example.com").await;
+
+        sqlx::query("UPDATE proxies SET last_t2_failed_at = 1_000 WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let blocked_ids: Vec<i64> = select_t1_candidates(&pool, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(!blocked_ids.contains(&id));
+
+        // Any successful check resets the flag — the probe daemon passes
+        // `reset_fail_count` based on the source (T2 always true, T1
+        // conditional on `last_failed_kind`), but the t2-block clearing is
+        // unconditional.
+        check_succeeded(&pool, id, 2_000, Some(10), false, ProxyStatus::Alive)
+            .await
+            .unwrap();
+
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert!(
+            row.last_t2_failed_at.is_none(),
+            "successful check must clear last_t2_failed_at, got {:?}",
+            row.last_t2_failed_at
+        );
+        let unblocked_ids: Vec<i64> = select_t1_candidates(&pool, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(unblocked_ids.contains(&id));
+    }
+
     #[tokio::test]
     async fn full_lifecycle_is_restart_safe() {
         // The whole machine is driven by DB columns only: simulate a daemon
@@ -2483,7 +2611,9 @@ mod tests {
         let id = seed_proxy(&pool, "vless", "h1.example.com").await;
 
         for t in [10, 20, 30] {
-            check_failed(&pool, id, t, 3, 86_400, 0).await.unwrap();
+            check_failed(&pool, id, t, 3, 86_400, 0, false)
+                .await
+                .unwrap();
         }
         // "Restart": derive everything from the row itself.
         let row = get_by_id(&pool, id).await.unwrap().unwrap();

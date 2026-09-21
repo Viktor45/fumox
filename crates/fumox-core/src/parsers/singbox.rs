@@ -823,10 +823,7 @@ fn finish(
     // JSON strings may contain `\n`, and the URI serializers emit these
     // fields verbatim (see `parsers::reject_line_breaks`).
     for param in &params {
-        super::reject_line_breaks(
-            &format!("sing-box: field {:?}", param.key),
-            &param.value,
-        )?;
+        super::reject_line_breaks(&format!("sing-box: field {:?}", param.key), &param.value)?;
     }
     if params.len() > super::uri::MAX_QUERY_PARAMS {
         return Err(format!(

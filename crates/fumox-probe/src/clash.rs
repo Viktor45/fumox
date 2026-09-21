@@ -124,6 +124,7 @@ mod tests {
             params: Some(known),
             unknown_params: None,
             raw_line: None,
+            last_t2_failed_at: None,
             geo_country: None,
             geo_city: None,
             geo_asn: None,

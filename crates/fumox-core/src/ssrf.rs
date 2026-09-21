@@ -304,19 +304,27 @@ mod tests {
     #[tokio::test]
     async fn probe_host_vetting_literals() {
         // Private literals and public literals vet without DNS.
-        assert!(vet_probe_host("127.0.0.1", false, Duration::from_secs(5))
-            .await
-            .is_err());
-        assert!(vet_probe_host("::1", false, Duration::from_secs(5))
-            .await
-            .is_err());
-        assert!(vet_probe_host("8.8.8.8", false, Duration::from_secs(5))
-            .await
-            .is_ok());
+        assert!(
+            vet_probe_host("127.0.0.1", false, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert!(
+            vet_probe_host("::1", false, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert!(
+            vet_probe_host("8.8.8.8", false, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
         // The allow flag turns everything into a pass.
-        assert!(vet_probe_host("10.0.0.5", true, Duration::from_secs(5))
-            .await
-            .is_ok());
+        assert!(
+            vet_probe_host("10.0.0.5", true, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -361,38 +369,40 @@ mod tests {
     #[tokio::test]
     async fn probe_host_vetting_localhost_hostname() {
         // "localhost" resolves to loopback on every test platform.
-        assert!(vet_probe_host("localhost", false, Duration::from_secs(5))
-            .await
-            .is_err());
+        assert!(
+            vet_probe_host("localhost", false, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
     }
 
-/// Drive the timer-fired branch directly by injecting a future that
-/// sleeps past `dns_timeout`. On macOS where `.invalid` short-circuits
-/// synchronously the original assertion (`|| "DNS resolution failed"`)
-/// would still pass even if the `tokio::time::timeout` wrapper were
-/// removed; this rewrite pins the timeout path itself.
-#[tokio::test]
-async fn lookup_with_timeout_returns_quickly_when_resolver_hangs() {
-    use std::net::SocketAddr;
-    let dns_timeout = Duration::from_millis(100);
-    let start = std::time::Instant::now();
-    let fut = async {
-        tokio::time::sleep(dns_timeout + Duration::from_secs(5)).await;
-        Ok(Vec::<SocketAddr>::new().into_iter())
-    };
-    let err = timeout_lookup("synthetic-host", dns_timeout, fut)
-        .await
-        .unwrap_err();
-    let elapsed = start.elapsed();
-    assert!(
-        err.contains("timed out"),
-        "expected timer-fired timeout error, got: {err}"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_millis(500),
-        "lookup should not block past the OS resolver default, took {elapsed:?}"
-    );
-}
+    /// Drive the timer-fired branch directly by injecting a future that
+    /// sleeps past `dns_timeout`. On macOS where `.invalid` short-circuits
+    /// synchronously the original assertion (`|| "DNS resolution failed"`)
+    /// would still pass even if the `tokio::time::timeout` wrapper were
+    /// removed; this rewrite pins the timeout path itself.
+    #[tokio::test]
+    async fn lookup_with_timeout_returns_quickly_when_resolver_hangs() {
+        use std::net::SocketAddr;
+        let dns_timeout = Duration::from_millis(100);
+        let start = std::time::Instant::now();
+        let fut = async {
+            tokio::time::sleep(dns_timeout + Duration::from_secs(5)).await;
+            Ok(Vec::<SocketAddr>::new().into_iter())
+        };
+        let err = timeout_lookup("synthetic-host", dns_timeout, fut)
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            err.contains("timed out"),
+            "expected timer-fired timeout error, got: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "lookup should not block past the OS resolver default, took {elapsed:?}"
+        );
+    }
 
     /// Empty-string hostname is universally invalid in `getaddrinfo` and
     /// `tokio::net::lookup_host`; the call deterministically returns an

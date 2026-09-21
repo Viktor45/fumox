@@ -92,11 +92,7 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
-    pub fn new(
-        config: FetchConfig,
-        allow_private_urls: bool,
-        dns_timeout: Duration,
-    ) -> Self {
+    pub fn new(config: FetchConfig, allow_private_urls: bool, dns_timeout: Duration) -> Self {
         Self {
             config,
             allow_private_urls,

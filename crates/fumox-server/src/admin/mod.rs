@@ -631,7 +631,11 @@ mod tests {
 
     #[test]
     fn request_is_https_trusted_peer_honors_xfp() {
-        assert!(request_is_https(trusted_peer(), &xfp_https(), &trusted_v4()));
+        assert!(request_is_https(
+            trusted_peer(),
+            &xfp_https(),
+            &trusted_v4()
+        ));
     }
 
     #[test]
@@ -645,12 +649,20 @@ mod tests {
 
     #[test]
     fn request_is_https_untrusted_peer_drops_xfp() {
-        assert!(!request_is_https(untrusted_peer(), &xfp_https(), &trusted_v4()));
+        assert!(!request_is_https(
+            untrusted_peer(),
+            &xfp_https(),
+            &trusted_v4()
+        ));
     }
 
     #[test]
     fn request_is_https_trusted_peer_with_explicit_http_stays_http() {
-        assert!(!request_is_https(trusted_peer(), &xfp_http(), &trusted_v4()));
+        assert!(!request_is_https(
+            trusted_peer(),
+            &xfp_http(),
+            &trusted_v4()
+        ));
     }
 
     fn admin_config(admin_limit: u32) -> fumox_core::config::AdminConfig {
@@ -1032,9 +1044,8 @@ mod tests {
             r.headers_mut()
                 .insert("x-forwarded-for", xff.parse().unwrap());
             // Override the ConnectInfo peer to a trusted CIDR address.
-            r.extensions_mut().insert(ConnectInfo::<SocketAddr>(
-                "2.2.2.2:41000".parse().unwrap(),
-            ));
+            r.extensions_mut()
+                .insert(ConnectInfo::<SocketAddr>("2.2.2.2:41000".parse().unwrap()));
             r
         };
 

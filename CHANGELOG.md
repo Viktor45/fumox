@@ -34,6 +34,16 @@ CI plumbing) is omitted — it never changes the shipped image.
 
 ### Changed
 
+- T1 checks are now suppressed after a T2 failure: when a proxy's most
+  recent T2 attempt fails (bad credentials, meow-rs unreachable, the
+  target hit the SSRF policy, or a `ServiceUnavailable` from the
+  engine), subsequent T1 checks for that proxy are skipped until the
+  next successful T2 — the T2 recency selector is the only path back
+  into the T1 rotation. A T1 failure (a closed TCP port) does not
+  trigger the suppression because it is not a property of the tunnel.
+  New column `proxies.last_t2_failed_at` (migration 0007) plus the
+  `idx_proxies_t2_block` index; `select_t1_candidates` now filters on
+  `last_t2_failed_at IS NULL`. See SPEC §8.3 for the rationale.
 - The admin *Settings* screen now renders the **complete** effective
   config: new `[server]`, `[database]`, `[geo]`, `[admin]` and `[log]`
   panels next to the existing probe/ingest/fetch/meow ones, plus the

@@ -126,8 +126,8 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
     let Some(connect) = req.extensions().get::<ConnectInfo<SocketAddr>>().cloned() else {
         return next.run(req).await;
     };
-    let ip = crate::admin::auth::client_key(connect.0, req.headers(), &state.trusted_cidrs)
-        .to_string();
+    let ip =
+        crate::admin::auth::client_key(connect.0, req.headers(), &state.trusted_cidrs).to_string();
     if !state.limits.all.allow(&ip).await {
         return error_response(
             StatusCode::TOO_MANY_REQUESTS,

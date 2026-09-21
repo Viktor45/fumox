@@ -83,29 +83,27 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
 
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|err| {
-                    crate::Error::Database(format!(
-                        "failed to create database parent dir {}: {err}",
-                        parent.display()
-                    ))
-                })?;
-                if let Ok(meta) = std::fs::metadata(parent) {
-                    let mut perms = meta.permissions();
-                    perms.set_mode(0o700);
-                    if let Err(err) = std::fs::set_permissions(parent, perms) {
-                        // Warn-only: hard-fail would refuse to start when the
-                        // parent dir exists with ownership outside the fumox
-                        // process (common in /var/lib deployments). Warn makes
-                        // the failure visible without an operational disruption.
-                        tracing::warn!(
-                            path = %parent.display(),
-                            mode = 0o700_u32,
-                            error = %err,
-                            "failed to chmod database parent dir to 0700",
-                        );
-                    }
+        if let Some(parent) = path.parent().filter(|p| !p.exists()) {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                crate::Error::Database(format!(
+                    "failed to create database parent dir {}: {err}",
+                    parent.display()
+                ))
+            })?;
+            if let Ok(meta) = std::fs::metadata(parent) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o700);
+                if let Err(err) = std::fs::set_permissions(parent, perms) {
+                    // Warn-only: hard-fail would refuse to start when the
+                    // parent dir exists with ownership outside the fumox
+                    // process (common in /var/lib deployments). Warn makes
+                    // the failure visible without an operational disruption.
+                    tracing::warn!(
+                        path = %parent.display(),
+                        mode = 0o700_u32,
+                        error = %err,
+                        "failed to chmod database parent dir to 0700",
+                    );
                 }
             }
         }
@@ -194,9 +192,9 @@ static SIMULATE_CHMOD_FAIL: std::sync::atomic::AtomicBool =
 /// `connect_pool_returns_err_when_chmod_fails` test would race the other
 /// two and leak a transient `true` into their `connect_pool` calls.
 #[cfg(all(test, unix))]
-fn chmod_test_mutex() -> &'static std::sync::Mutex<()> {
-    static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+fn chmod_test_mutex() -> &'static tokio::sync::Mutex<()> {
+    static MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Confirm the database file is `0600` on Unix; abort with a hard error if
@@ -254,7 +252,7 @@ mod unix_db_tests {
 
     #[tokio::test]
     async fn connect_pool_writes_file_with_mode_0600() {
-        let _serial = chmod_test_mutex().lock().unwrap_or_else(|err| err.into_inner());
+        let _serial = chmod_test_mutex().lock().await;
         let (_dir, path) = fresh_db_path("db-mode");
         let cfg = DatabaseConfig {
             path: path.clone(),
@@ -268,7 +266,7 @@ mod unix_db_tests {
 
     #[tokio::test]
     async fn connect_pool_restores_0600_on_existing_file_with_wrong_mode() {
-        let _serial = chmod_test_mutex().lock().unwrap_or_else(|err| err.into_inner());
+        let _serial = chmod_test_mutex().lock().await;
         let (_dir, path) = fresh_db_path("db-wrong");
         // Pre-create the file with permissive mode — restrict_file_permissions
         // must succeed (chmod it back to 0600) and the pool must open.
@@ -304,7 +302,7 @@ mod unix_db_tests {
         // flag can never leak into a concurrently-running chmod test. The
         // ChmodFailGuard's Drop resets the flag itself; the mutex keeps
         // the window tight.
-        let _serial = chmod_test_mutex().lock().unwrap_or_else(|err| err.into_inner());
+        let _serial = chmod_test_mutex().lock().await;
         let (_dir, path) = fresh_db_path("db-chmod-fail");
         SIMULATE_CHMOD_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
         let _guard = ChmodFailGuard;
@@ -345,7 +343,7 @@ mod unix_db_tests {
         // also calls `connect_pool` and would race
         // `connect_pool_returns_err_when_chmod_fails` for the
         // `SIMULATE_CHMOD_FAIL` flag if it ran in parallel.
-        let _serial = chmod_test_mutex().lock().unwrap_or_else(|err| err.into_inner());
+        let _serial = chmod_test_mutex().lock().await;
         // Nested fresh path under a non-existent parent; the parent dir
         // creation path in pre_create_db_file should chmod it 0700.
         let dir = tempdir_lite::TempDir::new("db-parent");
@@ -432,10 +430,8 @@ mod tempdir_lite {
     }
     impl TempDir {
         pub fn new(label: &str) -> Self {
-            let base = std::env::temp_dir().join(format!(
-                "fumox-db-test-{label}-{}",
-                std::process::id(),
-            ));
+            let base =
+                std::env::temp_dir().join(format!("fumox-db-test-{label}-{}", std::process::id(),));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&base).unwrap();
             Self { path: base }

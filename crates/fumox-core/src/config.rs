@@ -1321,9 +1321,6 @@ probe_results_days = 7
             dns_timeout_secs: 7,
             ..Default::default()
         };
-        assert_eq!(
-            cfg.dns_timeout(),
-            std::time::Duration::from_secs(7)
-        );
+        assert_eq!(cfg.dns_timeout(), std::time::Duration::from_secs(7));
     }
 }

@@ -182,13 +182,9 @@ mod tests {
     /// Bootstrap a fresh app + persist a known alive-export token into the
     /// `meta` table so the test can address `/export/alive/{token}` without
     /// rotating.
-    async fn app_with_token(
-        allowed_hosts: Vec<String>,
-    ) -> (axum::Router, String) {
-        let dir = std::env::temp_dir().join(format!(
-            "fumox-alive-test-{}",
-            fumox_core::models::new_id()
-        ));
+    async fn app_with_token(allowed_hosts: Vec<String>) -> (axum::Router, String) {
+        let dir =
+            std::env::temp_dir().join(format!("fumox-alive-test-{}", fumox_core::models::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = fumox_core::config::DatabaseConfig {
             path: dir.join("test.db"),
@@ -198,7 +194,9 @@ mod tests {
         fumox_core::db::migrate(&pool).await.unwrap();
 
         let token = "abcdef123456".to_string();
-        fumox_core::repo::meta_set(&pool, TOKEN_KEY, &token).await.unwrap();
+        fumox_core::repo::meta_set(&pool, TOKEN_KEY, &token)
+            .await
+            .unwrap();
 
         let state = crate::serve::AppState {
             pool,
@@ -267,7 +265,9 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes), "link not found\n");
     }
 
@@ -292,7 +292,7 @@ mod tests {
         // Valid host, bad token.
         let bad_token_req = Request::builder()
             .method("GET")
-            .uri(format!("/export/alive/wrong"))
+            .uri("/export/alive/wrong")
             .header(header::HOST, "vpn.example.com")
             .body(Body::empty())
             .unwrap();
@@ -343,7 +343,9 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes), "link not found\n");
     }
 }

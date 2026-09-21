@@ -634,7 +634,10 @@ mod tests {
     fn untrusted_peer_ignores_xff_and_keeps_peer() {
         let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
         let h = xff("1.2.3.4");
-        assert_eq!(client_key(untrusted_peer, &h, &trusted_v4()), untrusted_peer.ip());
+        assert_eq!(
+            client_key(untrusted_peer, &h, &trusted_v4()),
+            untrusted_peer.ip()
+        );
     }
 
     #[test]

@@ -170,7 +170,7 @@ impl GeoResolver {
     /// database file could be opened.
     pub fn new(cfg: &GeoConfig) -> Self {
         let cache = Cache::builder().max_capacity(cfg.cache_max_entries).build();
-        let dns_timeout = Duration::from_secs(cfg.dns_timeout_secs);
+        let dns_timeout = cfg.dns_timeout();
         if !cfg.enabled {
             return Self {
                 backends: None,

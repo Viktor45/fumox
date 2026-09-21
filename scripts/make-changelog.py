@@ -5,14 +5,32 @@ Input:  lines `date|sha|category|message` on stdin (the flat-draft template
         in cliff.toml — see the "Flat draft" comment there).
 Output: one `## <date> · sha-<last-commit-of-the-day>` section per day,
         Keep a Changelog categories (Added/Changed/Removed/Fixed/Docs)
-        inside, oldest first — the hand-editing pass then rewrites the terse
-        commit subjects and trims whatever landed before the first image
-        was ever published.
+        inside, oldest first — the hand-editing pass then rewrites the
+        terse commit subjects and trims whatever landed before the first
+        image was ever published.
 
 Why a script and not a pure git-cliff template: tera cannot group by a
 computed attribute (day = timestamp floored), and `group_by` on the raw
 timestamp yields one group per commit. The flat draft carries everything
 git-cliff parsed; the day-sectioning is trivial afterwards.
+
+Post-processing convention (see `.agents/AGENTS.md` → "Maintaining
+CHANGELOG.md" for the canonical rule):
+
+  - This script's output is the structural source of truth: section
+    anchors, dates, and category placement.
+  - The hand-editing pass rewrites the terse commit subjects into
+    prose-style multi-line bullets, one bullet per logical change.
+  - The output is OLDEST first (matching git-cliff's `sort_commits =
+    "oldest"`); when integrating into CHANGELOG.md, REVERSE the
+    dated sections so the freshest sits directly below the manual
+    `## Unreleased` block.
+  - New in-progress work (commits not yet on an image tag) lives in
+    a manual `## Unreleased (YYYY-MM-DD)` pre-block above the dated
+    sections; the hand-editing pass adds it there, not via this
+    pipeline.
+  - Pre-image commits are kept (no trim); do not delete early
+    sections even if they predate the first GHCR-published image.
 """
 import sys
 from collections import OrderedDict

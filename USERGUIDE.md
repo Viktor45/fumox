@@ -208,6 +208,22 @@ Notes:
   an nginx container terminating TLS for both `/sub` and `/admin`
   (certificates mount into `/certs`, ACME challenges are served on port 80);
   wire it up as a compose service in front of `server`.
+
+> **Behind a reverse proxy, two config keys must be set** for both the
+> `/sub` clients and the admin panel to behave correctly:
+>
+> - `[server].trust_proxy_ips` / `[admin].trust_proxy_ips` — the proxy's
+>   CIDR (`["127.0.0.1/32"]` for nginx on the same host). Without this,
+>   the per-IP rate limit collapses to one budget because every request
+>   arrives from the proxy's IP.
+> - `[server].allowed_hosts` / `[admin].allowed_hosts` — your public
+>   hostname (`["fumox.example.com"]`). Without this, the `Host` header is
+>   trusted as-is: an attacker that can poison the `Host` reaching the
+>   listener can render admin URLs and the alive/ready export endpoints
+>   pointing at a host they control. Both keys default to `[]` to preserve
+>   the historical behavior behind a direct connection; the safe
+>   configuration for any reverse-proxy-fronted deployment is to set
+>   both.
 - The SQLite database lives in the `fumox-data` volume; `./config` is mounted
   read-only for `app.toml` and GeoLite2 files.
 - meow-rs publishes no official Docker image, so the small wrapper
@@ -578,11 +594,13 @@ form.
 
 ### `[server]` – public listener
 
-| Key                    | Default          | Meaning                                                                                     |
-| ---------------------- | ---------------- | ------------------------------------------------------------------------------------------- |
-| `bind`                 | `"0.0.0.0:8080"` | Address of the public listener (`/sub`, `/src`, `/healthz`)                                 |
-| `rate_limit`           | `"300/min"`      | Per-IP ceiling for all public requests                                                      |
-| `auth_fail_rate_limit` | `"30/min"`       | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets |
+| Key                    | Default          | Meaning                                                                                                                                                                                                          |
+| ---------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bind`                 | `"0.0.0.0:8080"` | Address of the public listener (`/sub`, `/src`, `/healthz`)                                                                                                                                                      |
+| `rate_limit`           | `"300/min"`      | Per-IP ceiling for all public requests                                                                                                                                                                           |
+| `auth_fail_rate_limit` | `"30/min"`       | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets                                                                                                                      |
+| `trust_proxy_ips`      | `[]`             | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the per-IP rate-limit and admin URL scheme. Empty = never trust forwarded headers (direct-connection default). Set this when behind nginx |
+| `allowed_hosts`        | `[]`             | Hostnames / IPs allowed to reach the public listener, including the `/export/alive/{token}` and `/export/ready/{token}` endpoints. Empty = accept any `Host` value. Set this when serving from a fixed domain name |
 
 ### `[database]` – SQLite
 
@@ -625,17 +643,19 @@ form.
 
 ### `[admin]` – admin panel
 
-| Key                  | Default            | Meaning                                                                                                                                                 |
-| -------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`            | `true`             | Master switch                                                                                                                                           |
-| `token`              | `"change-me"`      | Login secret. **Change it.** Empty value disables the panel (404); the default logs a warning at startup                                                |
-| `bind`               | `"127.0.0.1:8081"` | Admin listener address. Keep it on loopback; expose only via reverse proxy/SSH tunnel                                                                   |
-| `session_ttl_hours`  | `168`              | Session cookie lifetime (7 days)                                                                                                                        |
-| `allow_private_urls` | `false`            | SSRF guard: when false, source URLs may not resolve to loopback, RFC1918, link-local or cloud-metadata addresses (checked at save *and* at every fetch) |
-| `rate_limit`         | `"120/min"`        | Per-IP limit for admin routes                                                                                                                           |
-| `login_rate_limit`   | `"5/min"`          | Per-IP limit for the login form                                                                                                                         |
-| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy                                                  |
-| `locales_dir`        | `"locales"`        | Directory with UI translation catalogs (`<code>.toml`)                                                                                                  |
+| Key                  | Default            | Meaning                                                                                                                                                                              |
+| -------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `enabled`            | `true`             | Master switch                                                                                                                                                                        |
+| `token`              | `"change-me"`      | Login secret. **Change it.** Empty value disables the panel (404); the default logs a warning at startup                                                                             |
+| `bind`               | `"127.0.0.1:8081"` | Admin listener address. Keep it on loopback; expose only via reverse proxy/SSH tunnel                                                                                                |
+| `session_ttl_hours`  | `168`              | Session cookie lifetime (7 days)                                                                                                                                                     |
+| `allow_private_urls` | `false`            | SSRF guard: when false, source URLs may not resolve to loopback, RFC1918, link-local or cloud-metadata addresses (checked at save *and* at every fetch)                            |
+| `rate_limit`         | `"120/min"`        | Per-IP limit for admin routes                                                                                                                                                        |
+| `login_rate_limit`   | `"5/min"`          | Per-IP limit for the login form                                                                                                                                                      |
+| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy                                                                               |
+| `trust_proxy_ips`    | `[]`               | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the admin per-IP rate-limit and rendered URL scheme. Empty = never trust forwarded headers                   |
+| `allowed_hosts`      | `[]`               | Hostnames / IPs allowed to reach the admin listener. Empty = accept any `Host` value. Set this when serving the admin from a fixed domain name (e.g. reverse-proxied to `fumox.local`) |
+| `locales_dir`        | `"locales"`        | Directory with UI translation catalogs (`<code>.toml`)                                                                                                                               |
 
 ### `[probe]` – health-check daemon
 
@@ -991,6 +1011,20 @@ stored.
       logs a warning at startup); `secure_cookies = true` when behind HTTPS.
 - [ ] Admin listener stays on loopback; external access only through a TLS
       reverse proxy or SSH tunnel.
+- [ ] **Behind a reverse proxy:** set `[server].trust_proxy_ips` and
+      `[admin].trust_proxy_ips` to the proxy's CIDR (e.g.
+      `["127.0.0.1/32"]` for nginx on the same host, or the proxy
+      subnet for an off-host reverse proxy). Without it, every request
+      shares the proxy's IP and the per-IP rate limit collapses to a
+      single budget for the whole fleet.
+- [ ] **Behind a reverse proxy:** set `[server].allowed_hosts` and
+      `[admin].allowed_hosts` to the hostname the proxy serves (e.g.
+      `["fumox.example.com"]`). Without it, the `Host` header is
+      honored as-is for the alive/ready export token URLs and the
+      rendered admin URLs — an attacker who can poison the `Host`
+      header reaching the listener can make the admin render URLs
+      pointing at attacker-controlled hosts and steal the capability
+      token. Set this on every deployment served from a fixed hostname.
 - [ ] `allow_private_urls` left `false` (SSRF protection), unless you have a
       specific trusted-internal-source reason.
 - [ ] One `fumox-server` + one `fumox-probe` against the same database file;

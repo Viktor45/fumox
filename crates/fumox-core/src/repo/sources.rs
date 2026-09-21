@@ -193,7 +193,7 @@ pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
     .await?
     .rows_affected();
     if affected == 0 {
-        return Err(crate::Error::Database(sqlx::Error::RowNotFound));
+        return Err(crate::Error::Database(sqlx::Error::RowNotFound.to_string()));
     }
     Ok(())
 }

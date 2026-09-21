@@ -54,11 +54,14 @@ fn num(value: i64) -> Value {
 /// impersonate the server and harvest it. `skip-cert-verify` is therefore
 /// emitted by the core mapping only for entries whose own parameters ask for
 /// it.
-pub fn generate(rows: &[ProxyRow]) -> serde_norway::Result<(String, Vec<i64>)> {
+pub fn generate(
+    rows: &[ProxyRow],
+    pins: &std::collections::HashMap<String, std::net::IpAddr>,
+) -> serde_norway::Result<(String, Vec<i64>)> {
     let mut included = Vec::new();
     let mut proxies = Vec::new();
     for row in rows {
-        if let Some(value) = proxy_to_value(row) {
+        if let Some(value) = proxy_to_value(row, pins) {
             included.push(row.id);
             proxies.push(value);
         }
@@ -79,10 +82,26 @@ pub fn generate(rows: &[ProxyRow]) -> serde_norway::Result<(String, Vec<i64>)> {
 
 /// Map one DB row onto a Clash proxy definition; returns `None` for
 /// unsupported schemes (they are skipped, never fatal — log+skip policy).
-fn proxy_to_value(row: &ProxyRow) -> Option<Value> {
+///
+/// When `pins` contains an entry for the row's host, the entry is cloned with
+/// `host` replaced by the pinned IP literal before being serialized. This
+/// closes the vet/dial TOCTOU the same way T1 closes it: the proxy dials the
+/// vetted address, not whatever the OS resolver returns next. mihomo accepts
+/// an IP literal in `server`; certificate verification still runs against the
+/// entry's own `sni`/`servername` params (the proxy's hostname never enters
+/// the dial), and the per-entry `insecure`/`skip-cert-verify` flag drives
+/// opt-out from cert verification.
+fn proxy_to_value(
+    row: &ProxyRow,
+    pins: &std::collections::HashMap<String, std::net::IpAddr>,
+) -> Option<Value> {
     let entry = row.to_entry().ok()?;
     if !is_supported(entry.scheme) {
         return None;
+    }
+    let mut entry = entry;
+    if let Some(ip) = pins.get(&row.host) {
+        entry.host = ip.to_string();
     }
     entry_to_clash_named(&entry, &proxy_name(row.id))
 }
@@ -180,7 +199,7 @@ mod tests {
             ),
         ];
 
-        let (yaml, _) = generate(&rows).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies.len(), 6);
@@ -236,7 +255,7 @@ mod tests {
         assert!(!is_supported(Scheme::Naive));
 
         let rows = vec![row_from_entry(9, entry(Scheme::Tuic, "c", &[]))];
-        let (yaml, _) = generate(&rows).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert!(parsed["proxies"].as_sequence().unwrap().is_empty());
     }
@@ -256,7 +275,7 @@ mod tests {
                 entry(Scheme::Trojan, "pass", &[("skip-cert-verify", "true")]),
             ),
         ];
-        let (yaml, _) = generate(&rows).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
 
@@ -266,5 +285,73 @@ mod tests {
         );
         assert_eq!(proxies[1]["skip-cert-verify"].as_bool(), Some(true));
         assert_eq!(proxies[2]["skip-cert-verify"].as_bool(), Some(true));
+    }
+
+    /// Single-row batch + pin map mapping the row's host to a vetted IP:
+    /// the emitted `server` must be the pinned IP literal, and any
+    /// `sni`/`servername` on the entry must remain the original hostname
+    /// (mihomo's TLS handshake reads SNI from those params, not from
+    /// `server`).
+    #[test]
+    fn generates_yaml_with_pinned_ip_overrides_server() {
+        let rows = vec![row_from_entry(
+            1,
+            entry(
+                Scheme::Vless,
+                "uuid",
+                &[("security", "tls"), ("sni", "real.example.com")],
+            ),
+        )];
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            "h.example.com".to_string(),
+            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
+        );
+
+        let (yaml, included) = generate(&rows, &pins).unwrap();
+        assert_eq!(included, vec![1]);
+        let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+        let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
+        assert_eq!(proxy["server"].as_str(), Some("203.0.113.10"));
+        assert_eq!(proxy["servername"].as_str(), Some("real.example.com"));
+    }
+
+    /// Empty pin map → `server` keeps the original hostname verbatim,
+    /// matching today's behavior for any operator who hasn't enabled T2
+    /// IP pinning via the vetted-address path.
+    #[test]
+    fn generates_yaml_with_empty_pin_keeps_original_host() {
+        let rows = vec![row_from_entry(
+            1,
+            entry(Scheme::Trojan, "pass", &[("sni", "t.example.com")]),
+        )];
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
+        let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+        let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
+        assert_eq!(proxy["server"].as_str(), Some("h.example.com"));
+    }
+
+    /// Two rows sharing a hostname with one pin map entry → both YAML
+    /// entries use the pinned IP. This is the documented overwrite
+    /// semantic: the probe batch is already id-deduplicated upstream, so
+    /// two rows sharing a hostname is by definition the same operator
+    /// intent for the same vetted IP.
+    #[test]
+    fn two_rows_same_host_use_the_same_pin() {
+        let rows = vec![
+            row_from_entry(1, entry(Scheme::Vless, "uuid-1", &[])),
+            row_from_entry(2, entry(Scheme::Trojan, "pw", &[])),
+        ];
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            "h.example.com".to_string(),
+            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
+        );
+
+        let (yaml, _) = generate(&rows, &pins).unwrap();
+        let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+        let proxies = parsed["proxies"].as_sequence().unwrap();
+        assert_eq!(proxies[0]["server"].as_str(), Some("203.0.113.10"));
+        assert_eq!(proxies[1]["server"].as_str(), Some("203.0.113.10"));
     }
 }

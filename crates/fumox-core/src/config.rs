@@ -176,6 +176,17 @@ pub struct ServerConfig {
     /// the brute-force signal for protected profiles.
     #[serde(default = "defaults::auth_fail_rate_limit")]
     pub auth_fail_rate_limit: RateLimit,
+    /// CIDRs of reverse proxies whose `X-Forwarded-For` (or RFC 7239
+    /// `Forwarded: for=…`) is honored for the per-IP rate-limit key. Empty
+    /// = never honor forwarded headers (any caller can otherwise spoof the
+    /// key).
+    #[serde(default = "defaults::trust_proxy_ips")]
+    pub trust_proxy_ips: Vec<String>,
+    /// Hostnames / IPs allowed to reach the public listener. Empty = accept
+    /// any host (today's behavior); setting this locks the
+    /// alive-export endpoint to the operator's own hostname.
+    #[serde(default = "defaults::allowed_hosts")]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -184,6 +195,8 @@ impl Default for ServerConfig {
             bind: defaults::server_bind(),
             rate_limit: defaults::public_rate_limit(),
             auth_fail_rate_limit: defaults::auth_fail_rate_limit(),
+            trust_proxy_ips: defaults::trust_proxy_ips(),
+            allowed_hosts: defaults::allowed_hosts(),
         }
     }
 }
@@ -341,6 +354,15 @@ impl Default for GeoConfig {
     }
 }
 
+impl GeoConfig {
+    /// Centralized `u64 → Duration` conversion so the SSRF vet, fetcher and
+    /// geo enrichment all consume the same bound instead of duplicating the
+    /// conversion at each call site.
+    pub fn dns_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.dns_timeout_secs)
+    }
+}
+
 /// Selectable GeoLite2 database kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -403,6 +425,15 @@ pub struct AdminConfig {
     /// embedded in the binary.
     #[serde(default = "defaults::admin_locales_dir")]
     pub locales_dir: String,
+    /// CIDRs of reverse proxies whose `X-Forwarded-For` (or RFC 7239
+    /// `Forwarded: for=…`) is honored for the admin per-IP rate-limit key.
+    /// Empty = never honor forwarded headers.
+    #[serde(default = "defaults::trust_proxy_ips")]
+    pub trust_proxy_ips: Vec<String>,
+    /// Hostnames / IPs allowed to reach the admin listener. Empty = accept
+    /// any host (today's behavior).
+    #[serde(default = "defaults::allowed_hosts")]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for AdminConfig {
@@ -417,6 +448,8 @@ impl Default for AdminConfig {
             login_rate_limit: defaults::login_rate_limit(),
             secure_cookies: false,
             locales_dir: defaults::admin_locales_dir(),
+            trust_proxy_ips: defaults::trust_proxy_ips(),
+            allowed_hosts: defaults::allowed_hosts(),
         }
     }
 }
@@ -861,6 +894,19 @@ mod defaults {
     pub fn admin_locales_dir() -> String {
         "locales".to_string()
     }
+    /// Empty by default — fumox is exposed directly without a reverse proxy
+    /// in most deployments, so honoring `X-Forwarded-For` would let any
+    /// caller spoof the per-IP rate-limit key.
+    pub fn trust_proxy_ips() -> Vec<String> {
+        Vec::new()
+    }
+    /// Empty by default — the Host header is accepted verbatim, matching the
+    /// historical behavior. Operators behind a reverse proxy that rewrites
+    /// Host should enumerate the expected hosts here to lock the
+    /// alive-export endpoint to the proxy's own hostname.
+    pub fn allowed_hosts() -> Vec<String> {
+        Vec::new()
+    }
     pub const fn cycle_interval_secs() -> u64 {
         60
     }
@@ -1267,5 +1313,17 @@ probe_results_days = 7
                 out.insert(prefix.to_string());
             }
         }
+    }
+
+    #[test]
+    fn geo_dns_timeout_returns_duration_from_secs() {
+        let cfg = GeoConfig {
+            dns_timeout_secs: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.dns_timeout(),
+            std::time::Duration::from_secs(7)
+        );
     }
 }

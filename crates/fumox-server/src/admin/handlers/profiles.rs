@@ -10,11 +10,12 @@ use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
 use crate::pipeline::CompiledPipeline;
 use askama::Template;
-use axum::extract::{Form, Path, State};
+use axum::extract::{ConnectInfo, Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::models::{OutputFormat, Profile, new_id, now_ts};
 use fumox_core::repo::{profiles, sources};
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 /// Slug rules shared with sources: starts alphanumeric,
@@ -732,6 +733,7 @@ impl_i18n!(ProfileDetailTemplate);
 pub async fn profile_detail(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
@@ -782,6 +784,8 @@ pub async fn profile_detail(
         // The preview renders in-process and never crosses the public
         // rate-limit middleware; fresh counters here are never consulted.
         limits: crate::serve::PublicRateLimits::unlimited(),
+        trusted_cidrs: Vec::new(),
+        allowed_hosts: Vec::new(),
     };
     let (preview, preview_note) =
         match crate::serve::preview_sub(&app_state, &profile, PREVIEW_LINES).await {
@@ -801,7 +805,11 @@ pub async fn profile_detail(
     );
     // Absolute serve link: the host the admin panel was opened on with the
     // public port from [server].bind.
-    let serve_url = format!("{}{}", state.serve_base(&headers), serve_path);
+    let base = match state.serve_base(peer, &headers) {
+        Ok(b) => b,
+        Err(err) => return super::server_error(lang, &fumox_core::Error::Config(err.to_string())),
+    };
+    let serve_url = format!("{base}{serve_path}");
 
     let token_display = profile
         .access_token

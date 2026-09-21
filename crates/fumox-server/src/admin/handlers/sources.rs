@@ -14,11 +14,12 @@ use crate::admin::theme::{self, Theme};
 use crate::fetcher;
 use crate::pipeline::CompiledPipeline;
 use askama::Template;
-use axum::extract::{Form, Path, Query, State};
+use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::models::{Encoding, InputFormat, IpFamily, Scheme, Source, new_id, now_ts};
 use fumox_core::repo::{proxies, sources};
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 /// Slug rules: starts alphanumeric, then `[A-Za-z0-9_-]`,
@@ -404,6 +405,7 @@ async fn build_source_from_form(
         &url,
         state.admin.allow_private_urls,
         ip_family.unwrap_or_else(|| state.fetcher.default_family()),
+        state.fetcher.dns_timeout,
     )
     .await
     {
@@ -842,6 +844,7 @@ impl_i18n!(SourceDetailTemplate);
 pub async fn source_detail(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(params): Query<FormMap>,
 ) -> Response {
@@ -887,7 +890,7 @@ pub async fn source_detail(
     };
 
     render_source_detail(
-        &state, lang, &headers, source, counts, log, page, per_page, total,
+        &state, lang, peer, &headers, source, counts, log, page, per_page, total,
     )
 }
 
@@ -895,6 +898,7 @@ pub async fn source_detail(
 fn render_source_detail(
     state: &AdminState,
     lang: Lang,
+    peer: SocketAddr,
     headers: &HeaderMap,
     source: Source,
     counts: Vec<(String, i64)>,
@@ -909,7 +913,11 @@ fn render_source_detail(
     );
     // Absolute serve link: the host the admin panel was opened on with the
     // public port from [server].bind.
-    let serve_url = format!("{}{}", state.serve_base(headers), serve_path);
+    let base = match state.serve_base(peer, headers) {
+        Ok(b) => b,
+        Err(err) => return super::server_error(lang, &fumox_core::Error::Config(err.to_string())),
+    };
+    let serve_url = format!("{base}{serve_path}");
     let headers_display: Vec<(String, String)> = source
         .headers
         .as_ref()

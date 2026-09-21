@@ -10,20 +10,110 @@ use crate::admin::i18n::{self, Lang};
 use crate::admin::theme::{self, Theme};
 use askama::Template;
 use axum::extract::{ConnectInfo, Form, Query, Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use hmac::{Hmac, KeyInit, Mac};
 use moka::future::Cache;
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Session cookie name.
 pub const SESSION_COOKIE: &str = "fumox_session";
+
+/// Compute the per-IP rate-limit key for the incoming request.
+///
+/// The two early-return conditions stay as two distinct code paths (a single
+/// combined `if` would let a "trusted proxy, peer is the trusted CIDR" case
+/// fall through to header inspection when `trusted_cidrs` is empty by
+/// accident — easy bug, hard to catch in review).
+///
+/// 1. No trusted proxies configured ⇒ never honor forwarded headers.
+/// 2. Peer is not in any trusted CIDR ⇒ the header is untrusted.
+/// 3. Trusted peer: walk XFF left-to-right, take the first non-trusted IP.
+/// 4. Same left-to-right trust walk on RFC 7239 `Forwarded: for=…`.
+/// 5. Nothing usable: fall back to the peer IP.
+pub fn client_key(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> IpAddr {
+    // 1. No trusted proxies configured ⇒ never honor forwarded headers.
+    if trusted_cidrs.is_empty() {
+        return peer.ip();
+    }
+    // 2. Peer is not in any trusted CIDR ⇒ header is untrusted.
+    if !trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) {
+        return peer.ip();
+    }
+    // 3. Trusted peer: walk XFF left-to-right, take the first non-trusted IP.
+    if let Some(ip) = walk_xff(headers, trusted_cidrs) {
+        return ip;
+    }
+    // 4. Same left-to-right trust walk on RFC 7239 Forwarded: for=…
+    if let Some(ip) = walk_forwarded(headers, trusted_cidrs) {
+        return ip;
+    }
+    // 5. Nothing usable.
+    peer.ip()
+}
+
+/// Walk `X-Forwarded-For` left-to-right: the left-most entry is the
+/// originating client per RFC 6. Take the first entry that parses as an IP
+/// AND is not in any trusted CIDR.
+fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Option<IpAddr> {
+    let value = headers.get("x-forwarded-for")?.to_str().ok()?;
+    for raw in value.split(',') {
+        let candidate = raw.trim();
+        let Ok(ip) = candidate.parse::<IpAddr>() else {
+            continue;
+        };
+        if !trusted_cidrs.iter().any(|net| net.contains(&ip)) {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+/// Walk RFC 7239 `Forwarded: for=…` left-to-right (originating client first
+/// per §4). Bracket-strip IPv6 literals; skip `for=_hidden` and `for=unknown`.
+fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Option<IpAddr> {
+    let value = headers.get(axum::http::header::FORWARDED)?.to_str().ok()?;
+    for raw in value.split(',') {
+        let entry = raw.trim();
+        // Each Forwarded element is a `;`-separated list of parameters.
+        for param in entry.split(';') {
+            let param = param.trim();
+            let Some(value) = param.strip_prefix("for=") else {
+                continue;
+            };
+            let value = strip_obfuscation(value.trim_matches('"'));
+            if value == "_hidden" || value.eq_ignore_ascii_case("unknown") {
+                break;
+            }
+            let value = value
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .unwrap_or(value);
+            let Ok(ip) = value.parse::<IpAddr>() else {
+                continue;
+            };
+            if !trusted_cidrs.iter().any(|net| net.contains(&ip)) {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
+/// Strip RFC 7239 §6.3 obfuscation (`for=_hidden`, `for=unknown`) and
+/// surrounding quotes; returns the inner value.
+fn strip_obfuscation(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value)
+}
 /// Upper bound for buffered POST bodies (CSRF inspection).
 const MAX_BODY_BYTES: usize = 1 << 20;
 
@@ -166,7 +256,7 @@ pub async fn rate_limit(
     if req.method() == Method::HEAD || path.starts_with("/admin/static/") {
         return next.run(req).await;
     }
-    let ip = addr.ip().to_string();
+    let ip = client_key(addr, req.headers(), &state.trusted_cidrs).to_string();
     let is_login = req.method() == Method::POST && path == "/admin/login";
     let limiter = if is_login {
         state.login_limiter.clone()
@@ -480,5 +570,127 @@ mod tests {
         assert!(limiter.allow("never-seen").await);
         assert!(limiter.allow("never-seen").await);
         assert!(!limiter.allow("never-seen").await);
+    }
+
+    fn trusted_v4() -> Vec<ipnet::IpNet> {
+        vec!["2.2.2.2/32".parse().unwrap()]
+    }
+
+    fn peer() -> SocketAddr {
+        "2.2.2.2:41000".parse().unwrap()
+    }
+
+    fn xff(value: &str) -> axum::http::HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+
+    fn fwd(value: &str) -> axum::http::HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::FORWARDED, value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn empty_trusted_list_never_honors_forwarded_headers() {
+        // Even with XFF claiming 1.2.3.4, an unconfigured trust list must
+        // not let the header influence the rate-limit key — peer wins.
+        let h = xff("1.2.3.4");
+        assert_eq!(client_key(peer(), &h, &[]), peer().ip());
+        let h = fwd("for=1.2.3.4;proto=https");
+        assert_eq!(client_key(peer(), &h, &[]), peer().ip());
+    }
+
+    #[test]
+    fn trusted_peer_with_single_xff_hop_returns_that_ip() {
+        let h = xff("1.2.3.4");
+        assert_eq!(
+            client_key(peer(), &h, &trusted_v4()),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn trusted_peer_with_chain_walks_past_trusted_hops_left_to_right() {
+        // The trusted proxy is at the right; the originating client is at
+        // the left. Per RFC 6 the left-most is the originating client.
+        let h = xff("1.1.1.1, 2.2.2.2");
+        assert_eq!(
+            client_key(peer(), &h, &trusted_v4()),
+            "1.1.1.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn chain_with_all_trusted_entries_falls_back_to_peer() {
+        // Both hops are inside the trusted CIDR — walking past them all
+        // leaves nothing usable, so the peer wins.
+        let h = xff("2.2.2.2, 2.2.2.2");
+        assert_eq!(client_key(peer(), &h, &trusted_v4()), peer().ip());
+    }
+
+    #[test]
+    fn untrusted_peer_ignores_xff_and_keeps_peer() {
+        let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
+        let h = xff("1.2.3.4");
+        assert_eq!(client_key(untrusted_peer, &h, &trusted_v4()), untrusted_peer.ip());
+    }
+
+    #[test]
+    fn trusted_peer_with_rfc7239_forwarded_returns_first_untrusted_for() {
+        let h = fwd("for=1.2.3.4;proto=https");
+        assert_eq!(
+            client_key(peer(), &h, &trusted_v4()),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn forwarded_for_hidden_falls_back_to_peer() {
+        let h = fwd("for=_hidden");
+        assert_eq!(client_key(peer(), &h, &trusted_v4()), peer().ip());
+    }
+
+    #[test]
+    fn forwarded_walks_left_to_right_past_trusted_for_entries() {
+        // The originating client is on the left (for=1.1.1.1); the trusted
+        // proxy is on the right (for=2.2.2.2). Per RFC 7239 §4 the walk
+        // must skip the trusted one and return 1.1.1.1.
+        let h = fwd("for=1.1.1.1, for=2.2.2.2");
+        assert_eq!(
+            client_key(peer(), &h, &trusted_v4()),
+            "1.1.1.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn forwarded_with_bracketed_ipv6_literal_is_bracket_stripped() {
+        let h = fwd("for=[2001:db8::1];proto=https");
+        assert_eq!(
+            client_key(peer(), &h, &trusted_v4()),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// RFC 7239 §4 does not pin parameter ordering. A non-`for=` parameter
+    /// appearing before the `for=` must not abort the walk — only the `for=`
+    /// parameter is load-bearing for the originating-client lookup. The
+    /// audit's reported shape was `Forwarded: proto=https;for=1.2.3.4` and
+    /// the pre-fix code bailed at `proto=https` (`?` on `strip_prefix`).
+    #[test]
+    fn walk_forwarded_takes_first_for_param_regardless_of_position() {
+        let h = fwd("proto=https;for=1.2.3.4");
+        assert_eq!(
+            client_key(peer(), &h, &trusted_v4()),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
+        // Also pin a chain shape with a non-`for=` parameter in the same
+        // entry to make sure the loop walks the whole `;`-separated list.
+        let h = fwd("for=1.2.3.4;by=2.2.2.2;proto=https");
+        assert_eq!(
+            client_key(peer(), &h, &trusted_v4()),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
     }
 }

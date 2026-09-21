@@ -820,6 +820,14 @@ fn finish(
 ) -> Result<ProxyEntry, String> {
     super::reject_line_breaks("sing-box: server", &host)?;
     super::reject_line_breaks("sing-box: credential", &credential)?;
+    // JSON strings may contain `\n`, and the URI serializers emit these
+    // fields verbatim (see `parsers::reject_line_breaks`).
+    for param in &params {
+        super::reject_line_breaks(
+            &format!("sing-box: field {:?}", param.key),
+            &param.value,
+        )?;
+    }
     if params.len() > super::uri::MAX_QUERY_PARAMS {
         return Err(format!(
             "sing-box: {} parameters, over the {} cap",
@@ -1273,6 +1281,20 @@ mod tests {
     fn line_breaks_in_host_or_credential_are_rejected() {
         let result = parse_payload(
             r#"{"outbounds":[{"type":"trojan","tag":"evil","server":"h.example.com\nvless://X@9.9.9.9:443#inj","server_port":443,"password":"p"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 0);
+        assert_eq!(result.invalid, 1);
+    }
+
+    #[test]
+    fn line_breaks_in_query_param_value_are_rejected() {
+        // The host/credential reject already covers those two fields; this
+        // asserts the per-param.value loop catches a `\n` smuggled into a
+        // outbound's query-style param (sing-box params bypass parse_query
+        // and are emitted verbatim by the serializer).
+        let result = parse_payload(
+            r#"{"outbounds":[{"type":"trojan","tag":"evil","server":"h.example.com","server_port":443,"password":"p","network":"ws\nvless://SMUGGLED@7.7.7.7:443#pwn"}]}"#,
         )
         .unwrap();
         assert_eq!(result.entries.len(), 0);

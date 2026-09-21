@@ -7,6 +7,7 @@
 pub mod auth;
 mod dash_top_n;
 mod handlers;
+pub mod host_gate;
 pub mod i18n;
 pub(crate) mod pipeline_editor;
 pub mod security;
@@ -79,6 +80,10 @@ pub struct AdminState {
     pub login_limiter: Arc<auth::RateLimiter>,
     /// Per-IP rate limiter for the rest of `/admin/*`.
     pub admin_limiter: Arc<auth::RateLimiter>,
+    /// CIDRs of reverse proxies whose `X-Forwarded-For` / RFC 7239 `Forwarded:
+    /// for=…` are honored for the admin per-IP rate-limit key. Empty = never
+    /// honor forwarded headers.
+    pub trusted_cidrs: Vec<ipnet::IpNet>,
     /// UI message catalogs, loaded once at startup from `[admin].locales_dir`
     /// with the shipped ru/en catalogs embedded as fallback.
     pub locales: Arc<i18n::Locales>,
@@ -112,6 +117,7 @@ impl AdminState {
             &config.admin.locales_dir,
         )));
         let geo_full = Arc::new(fumox_core::geo::FullResolver::from_dir(&config.geo));
+        let trusted_cidrs = parse_trusted_cidrs(&config.admin.trust_proxy_ips);
         Self {
             pool,
             caches,
@@ -136,6 +142,7 @@ impl AdminState {
             csrf_key,
             login_limiter,
             admin_limiter,
+            trusted_cidrs,
             locales,
         }
     }
@@ -144,8 +151,18 @@ impl AdminState {
     /// the host the admin panel was opened on (Host header) with the
     /// public port from `[server].bind`, https when the admin request
     /// itself arrived over https (see `request_is_https`).
-    fn serve_base(&self, headers: &HeaderMap) -> String {
-        serve_base(self.server_bind, headers)
+    fn serve_base(
+        &self,
+        peer: SocketAddr,
+        headers: &HeaderMap,
+    ) -> Result<String, host_gate::HostRejected> {
+        serve_base(
+            self.server_bind,
+            peer,
+            headers,
+            &self.trusted_cidrs,
+            &self.admin.allowed_hosts,
+        )
     }
 
     /// Session TTL as a duration.
@@ -173,6 +190,21 @@ pub(crate) fn admin_next(params: &std::collections::HashMap<String, String>) -> 
         .filter(|next| next.starts_with("/admin") && !next.chars().any(|c| c.is_ascii_control()))
         .unwrap_or("/admin")
         .to_string()
+}
+
+/// Parse the operator-supplied list of trusted-proxy CIDRs. Bad entries
+/// are logged and dropped — a typo'd CIDR must never silently widen the
+/// trust boundary.
+pub(crate) fn parse_trusted_cidrs(raw: &[String]) -> Vec<ipnet::IpNet> {
+    raw.iter()
+        .filter_map(|s| match s.parse::<ipnet::IpNet>() {
+            Ok(net) => Some(net),
+            Err(err) => {
+                tracing::warn!(cidr = %s, %err, "ignoring invalid trust_proxy_ips entry");
+                None
+            }
+        })
+        .collect()
 }
 
 /// Build the admin router. Mounted only when the panel is active
@@ -346,53 +378,48 @@ async fn static_htmx() -> impl IntoResponse {
 /// public listener address and the request's `Host` header: the host the
 /// admin panel was opened on, with the public port from `[server].bind`.
 /// The default port (80/443 matching the scheme) is omitted.
-fn serve_base(bind: SocketAddr, headers: &HeaderMap) -> String {
-    let scheme = if request_is_https(headers) {
+fn serve_base(
+    bind: SocketAddr,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    trusted_cidrs: &[ipnet::IpNet],
+    allowed_hosts: &[String],
+) -> Result<String, host_gate::HostRejected> {
+    let scheme = if request_is_https(peer, headers, trusted_cidrs) {
         "https"
     } else {
         "http"
     };
-    let host = host_from_headers(bind, headers);
+    let host = host_gate::build_serve_link_host(bind, headers, allowed_hosts)?;
     let default_port =
         (scheme == "http" && bind.port() == 80) || (scheme == "https" && bind.port() == 443);
-    if default_port {
+    Ok(if default_port {
         format!("{scheme}://{host}")
     } else {
         format!("{scheme}://{host}:{}", bind.port())
-    }
-}
-
-/// Hostname for serve links: the host part of the request's `Host` header
-/// (admin port stripped, IPv6 brackets kept); without a usable header, the
-/// bound IP — unless it is unspecified, then loopback.
-fn host_from_headers(bind: SocketAddr, headers: &HeaderMap) -> String {
-    match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-        Some(h) if !h.is_empty() => {
-            if let Some(rest) = h.strip_prefix('[') {
-                format!("[{}]", rest.split(']').next().unwrap_or(rest))
-            } else {
-                h.rsplit_once(':')
-                    .map_or_else(|| h.to_string(), |(host, _)| host.to_string())
-            }
-        }
-        _ => {
-            let ip = bind.ip();
-            if ip.is_unspecified() {
-                "127.0.0.1".to_string()
-            } else if ip.is_ipv6() {
-                format!("[{ip}]")
-            } else {
-                ip.to_string()
-            }
-        }
-    }
+    })
 }
 
 /// True when the admin request itself arrived over https through a
 /// TLS-terminating reverse proxy: `X-Forwarded-Proto: https` (de facto
 /// standard) or an RFC 7239 `Forwarded: proto=https` element. Fumox never
 /// terminates TLS itself, so without such a header the scheme is http.
-fn request_is_https(headers: &HeaderMap) -> bool {
+///
+/// The header is only honored when the peer's source IP falls inside one of
+/// the configured `trusted_cidrs` — mirroring the trust gate that
+/// `auth::client_key` uses for the per-IP rate-limit key, so the URL-scheme
+/// decision and the rate-limit key agree on what "peer" means. Empty
+/// `trusted_cidrs` ⇒ never honor forwarded headers (the safe default the
+/// empty `[admin].trust_proxy_ips` config advertises).
+fn request_is_https(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> bool {
+    // 1. No trusted proxies configured ⇒ never honor forwarded headers.
+    if trusted_cidrs.is_empty() {
+        return false;
+    }
+    // 2. Peer is not in any trusted CIDR ⇒ header is untrusted.
+    if !trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) {
+        return false;
+    }
     headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -422,26 +449,39 @@ mod tests {
     #[test]
     fn serve_base_uses_host_header_and_public_port() {
         let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
         let mut h = HeaderMap::new();
         h.insert(header::HOST, "vpn.example.com:8081".parse().unwrap());
-        assert_eq!(serve_base(bind, &h), "http://vpn.example.com:8080");
+        assert_eq!(
+            serve_base(bind, peer, &h, &[], &[]).unwrap(),
+            "http://vpn.example.com:8080"
+        );
 
         // Host without a port.
         let mut h = HeaderMap::new();
         h.insert(header::HOST, "vpn.example.com".parse().unwrap());
-        assert_eq!(serve_base(bind, &h), "http://vpn.example.com:8080");
+        assert_eq!(
+            serve_base(bind, peer, &h, &[], &[]).unwrap(),
+            "http://vpn.example.com:8080"
+        );
 
         // IPv6 keeps its brackets; the admin port is stripped.
         let mut h = HeaderMap::new();
         h.insert(header::HOST, "[::1]:8081".parse().unwrap());
-        assert_eq!(serve_base(bind, &h), "http://[::1]:8080");
+        assert_eq!(
+            serve_base(bind, peer, &h, &[], &[]).unwrap(),
+            "http://[::1]:8080"
+        );
 
         // No Host header: loopback for an unspecified bind address,
         // the bound IP itself when it is specific.
-        assert_eq!(serve_base(bind, &HeaderMap::new()), "http://127.0.0.1:8080");
+        assert_eq!(
+            serve_base(bind, peer, &HeaderMap::new(), &[], &[]).unwrap(),
+            "http://127.0.0.1:8080"
+        );
         let bind: SocketAddr = "192.168.1.5:8080".parse().unwrap();
         assert_eq!(
-            serve_base(bind, &HeaderMap::new()),
+            serve_base(bind, peer, &HeaderMap::new(), &[], &[]).unwrap(),
             "http://192.168.1.5:8080"
         );
     }
@@ -449,42 +489,168 @@ mod tests {
     #[test]
     fn serve_base_switches_to_https_behind_tls_proxy() {
         let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let trusted_peer: SocketAddr = "2.2.2.2:41000".parse().unwrap();
+        let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
+        let trusted: Vec<ipnet::IpNet> = vec!["2.2.2.2/32".parse().unwrap()];
 
+        // Empty allowlist: the forwarded header is *always* ignored — the
+        // safe default the empty `[admin].trust_proxy_ips` config advertises.
         let mut h = HeaderMap::new();
         h.insert(header::HOST, "vpn.example.com".parse().unwrap());
         h.insert(
             header::HeaderName::from_static("x-forwarded-proto"),
             "https".parse().unwrap(),
         );
-        assert_eq!(serve_base(bind, &h), "https://vpn.example.com:8080");
+        assert_eq!(
+            serve_base(bind, trusted_peer, &h, &[], &[]).unwrap(),
+            "http://vpn.example.com:8080",
+            "empty allowlist must not honor forwarded headers"
+        );
 
-        // RFC 7239 Forwarded header.
+        // Trusted peer + X-Forwarded-Proto: https ⇒ https.
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        h.insert(
+            header::HeaderName::from_static("x-forwarded-proto"),
+            "https".parse().unwrap(),
+        );
+        assert_eq!(
+            serve_base(bind, trusted_peer, &h, &trusted, &[]).unwrap(),
+            "https://vpn.example.com:8080",
+            "trusted peer + XFP=https ⇒ https"
+        );
+
+        // Untrusted peer: the forwarded header is dropped, scheme is http.
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        h.insert(
+            header::HeaderName::from_static("x-forwarded-proto"),
+            "https".parse().unwrap(),
+        );
+        assert_eq!(
+            serve_base(bind, untrusted_peer, &h, &trusted, &[]).unwrap(),
+            "http://vpn.example.com:8080",
+            "untrusted peer + XFP=https ⇒ http (header dropped)"
+        );
+
+        // Trusted peer + RFC 7239 Forwarded: proto=https ⇒ https.
         let mut h = HeaderMap::new();
         h.insert(header::HOST, "vpn.example.com".parse().unwrap());
         h.insert(
             header::FORWARDED,
             "for=10.0.0.1;proto=https".parse().unwrap(),
         );
-        assert_eq!(serve_base(bind, &h), "https://vpn.example.com:8080");
+        assert_eq!(
+            serve_base(bind, trusted_peer, &h, &trusted, &[]).unwrap(),
+            "https://vpn.example.com:8080",
+            "trusted peer + RFC 7239 Forwarded proto=https ⇒ https"
+        );
 
-        // Explicit http stays http.
+        // Trusted peer + explicit X-Forwarded-Proto: http ⇒ http wins.
         let mut h = HeaderMap::new();
         h.insert(header::HOST, "vpn.example.com".parse().unwrap());
         h.insert(
             header::HeaderName::from_static("x-forwarded-proto"),
             "http".parse().unwrap(),
         );
-        assert_eq!(serve_base(bind, &h), "http://vpn.example.com:8080");
+        assert_eq!(
+            serve_base(bind, trusted_peer, &h, &trusted, &[]).unwrap(),
+            "http://vpn.example.com:8080",
+            "explicit XFP=http wins"
+        );
 
-        // A default port matching the scheme is omitted from the URL.
+        // Default-port strip on :443 still applies for the trusted-https
+        // branch.
         let mut h = HeaderMap::new();
         h.insert(header::HOST, "vpn.example.com".parse().unwrap());
         h.insert(
             header::HeaderName::from_static("x-forwarded-proto"),
             "https".parse().unwrap(),
         );
-        let bind: SocketAddr = "0.0.0.0:443".parse().unwrap();
-        assert_eq!(serve_base(bind, &h), "https://vpn.example.com");
+        let bind_443: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        assert_eq!(
+            serve_base(bind_443, trusted_peer, &h, &trusted, &[]).unwrap(),
+            "https://vpn.example.com",
+            "default-port strip on :443"
+        );
+
+        // Allowlist set: non-matching host ⇒ Err.
+        let allowed = vec!["vpn.example.com".to_string()];
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "evil.example".parse().unwrap());
+        assert!(serve_base(bind, trusted_peer, &h, &trusted, &allowed).is_err());
+    }
+
+    /// Direct unit tests for `request_is_https`. These pin the trust gate
+    /// without going through `serve_base` / host_header parsing — every
+    /// assertion is "given this peer + these headers + this allowlist,
+    /// `request_is_https` returns X".
+    fn xfp_https() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::HeaderName::from_static("x-forwarded-proto"),
+            "https".parse().unwrap(),
+        );
+        h
+    }
+    fn xfp_http() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::HeaderName::from_static("x-forwarded-proto"),
+            "http".parse().unwrap(),
+        );
+        h
+    }
+    fn fwd_proto_https() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::FORWARDED,
+            "for=10.0.0.1;proto=https".parse().unwrap(),
+        );
+        h
+    }
+    fn trusted_v4() -> Vec<ipnet::IpNet> {
+        vec!["2.2.2.2/32".parse().unwrap()]
+    }
+    fn trusted_peer() -> SocketAddr {
+        "2.2.2.2:41000".parse().unwrap()
+    }
+    fn untrusted_peer() -> SocketAddr {
+        "9.9.9.9:41000".parse().unwrap()
+    }
+
+    #[test]
+    fn request_is_https_empty_allowlist_never_honors_xfp() {
+        assert!(!request_is_https(trusted_peer(), &xfp_https(), &[]));
+    }
+
+    #[test]
+    fn request_is_https_empty_allowlist_never_honors_forwarded_proto() {
+        assert!(!request_is_https(trusted_peer(), &fwd_proto_https(), &[]));
+    }
+
+    #[test]
+    fn request_is_https_trusted_peer_honors_xfp() {
+        assert!(request_is_https(trusted_peer(), &xfp_https(), &trusted_v4()));
+    }
+
+    #[test]
+    fn request_is_https_trusted_peer_honors_forwarded_proto() {
+        assert!(request_is_https(
+            trusted_peer(),
+            &fwd_proto_https(),
+            &trusted_v4()
+        ));
+    }
+
+    #[test]
+    fn request_is_https_untrusted_peer_drops_xfp() {
+        assert!(!request_is_https(untrusted_peer(), &xfp_https(), &trusted_v4()));
+    }
+
+    #[test]
+    fn request_is_https_trusted_peer_with_explicit_http_stays_http() {
+        assert!(!request_is_https(trusted_peer(), &xfp_http(), &trusted_v4()));
     }
 
     fn admin_config(admin_limit: u32) -> fumox_core::config::AdminConfig {
@@ -530,7 +696,11 @@ mod tests {
             admin,
             ..Default::default()
         };
-        let fetcher = Fetcher::new(config.fetch.clone(), config.admin.allow_private_urls);
+        let fetcher = Fetcher::new(
+            config.fetch.clone(),
+            config.admin.allow_private_urls,
+            config.geo.dns_timeout(),
+        );
         AdminState::new(
             pool,
             crate::cache::Caches::new(),
@@ -843,6 +1013,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// End-to-end check that the shared `client_key` helper plumbs through
+    /// `AdminState::trusted_cidrs`: a trusted proxy's `X-Forwarded-For` claim
+    /// must drive the per-IP rate-limit key, so the same claimed client IP
+    /// fills its window while a different claim against the same peer stays
+    /// unblocked.
+    #[tokio::test]
+    async fn rate_limit_uses_xff_ip_for_trusted_peer() {
+        let mut state = test_state(1).await;
+        state.trusted_cidrs = vec!["2.2.2.2/32".parse().unwrap()];
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+
+        let req_with_xff = |xff: &str| {
+            let mut r = request("GET", "/admin", "", Some(&cookie));
+            r.headers_mut()
+                .insert("x-forwarded-for", xff.parse().unwrap());
+            // Override the ConnectInfo peer to a trusted CIDR address.
+            r.extensions_mut().insert(ConnectInfo::<SocketAddr>(
+                "2.2.2.2:41000".parse().unwrap(),
+            ));
+            r
+        };
+
+        // 1 of 1 window slots for claimed client 1.2.3.4.
+        let response = app.clone().oneshot(req_with_xff("1.2.3.4")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app.clone().oneshot(req_with_xff("1.2.3.4")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Same trusted peer, different claimed client: fresh window.
+        let response = app.clone().oneshot(req_with_xff("5.5.5.5")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// Vendored assets and HEAD requests bypass the admin rate limiter:
@@ -2043,7 +2248,11 @@ mod tests {
             geo: geo_cfg,
             ..Default::default()
         };
-        let fetcher = Fetcher::new(config.fetch.clone(), config.admin.allow_private_urls);
+        let fetcher = Fetcher::new(
+            config.fetch.clone(),
+            config.admin.allow_private_urls,
+            config.geo.dns_timeout(),
+        );
         let state = AdminState::new(
             pool.clone(),
             crate::cache::Caches::new(),

@@ -81,6 +81,29 @@ weekly.
 
 ---
 
+## 🔒 Security
+
+`[admin].token` is the only critical secret on a fresh install — change it
+before exposing the admin panel to anything other than `127.0.0.1`. **Behind
+a reverse proxy, two config keys must be set** so the per-IP rate limit and
+the `Host`-header allowlist behave correctly:
+
+- `[server].trust_proxy_ips` and `[admin].trust_proxy_ips`: the proxy's
+  CIDR (e.g. `["127.0.0.1/32"]` for nginx on the same host). Without
+  these, every request shares the proxy's IP and the rate limit collapses
+  to one budget.
+- `[server].allowed_hosts` and `[admin].allowed_hosts`: your public
+  hostname (e.g. `["fumox.example.com"]`). Without these, the `Host`
+  header is honored as-is for the alive/ready export token URLs and the
+  rendered admin URLs — an attacker that can poison `Host` reaching the
+  listener can render URLs pointing at a host they control.
+
+Both keys default to `[]` to preserve the historical behavior behind a
+direct connection. See the [User Guide](./USERGUIDE.md#8-configuration-reference)
+configuration reference and the production checklist for context.
+
+---
+
 ## 📖 Documentation
 
 The **[User Guide](./USERGUIDE.md)** is the place to start: what Fumox is,

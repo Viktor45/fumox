@@ -88,13 +88,19 @@ pub struct SsrfRejection {
 pub struct Fetcher {
     config: FetchConfig,
     allow_private_urls: bool,
+    pub(crate) dns_timeout: Duration,
 }
 
 impl Fetcher {
-    pub fn new(config: FetchConfig, allow_private_urls: bool) -> Self {
+    pub fn new(
+        config: FetchConfig,
+        allow_private_urls: bool,
+        dns_timeout: Duration,
+    ) -> Self {
         Self {
             config,
             allow_private_urls,
+            dns_timeout,
         }
     }
 
@@ -303,7 +309,7 @@ impl Fetcher {
     /// to, constrained to `family` (first IPv4 when available for `Any`).
     /// IP literals skip DNS.
     async fn resolve_and_vet(&self, host: &str, family: IpFamily) -> Result<IpAddr, SsrfRejection> {
-        vet_host(host, self.allow_private_urls, family).await
+        vet_host(host, self.allow_private_urls, family, self.dns_timeout).await
     }
 }
 
@@ -365,28 +371,22 @@ fn family_label(family: IpFamily) -> &'static str {
     }
 }
 
-/// Pick the connect address from an already-vetted list: first IPv4 with an
-/// IPv6 fallback for `Any` (the historical behavior), otherwise the first
-/// address of the requested family. `None` = no usable address.
-fn pick_address(addrs: &[IpAddr], family: IpFamily) -> Option<IpAddr> {
-    match family {
-        IpFamily::Any => addrs
-            .iter()
-            .find(|ip| ip.is_ipv4())
-            .or_else(|| addrs.first())
-            .copied(),
-        IpFamily::Ipv4 => addrs.iter().copied().find(|ip| ip.is_ipv4()),
-        IpFamily::Ipv6 => addrs.iter().copied().find(|ip| ip.is_ipv6()),
-    }
-}
+/// Pick the connect address from an already-vetted list. Re-exported from
+/// `fumox_core::ssrf::pick_vetted` so the fetcher tests stay local.
+pub(crate) use fumox_core::ssrf::pick_vetted as pick_address;
 
 /// Resolve a host and vet every address against the SSRF policy, then pick
 /// the connect address constrained to `family`. Shared by the fetch path
 /// and the save-time check ([`vet_url`]).
+///
+/// `dns_timeout` is the operator-supplied upper bound for the async DNS
+/// resolution step. A hostile resolver can otherwise pin the runtime
+/// worker for the OS resolver's default timeout (~30 s+).
 pub async fn vet_host(
     host: &str,
     allow_private_urls: bool,
     family: IpFamily,
+    dns_timeout: Duration,
 ) -> Result<IpAddr, SsrfRejection> {
     let addrs: Vec<IpAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
         // The literal fixes the family; a source pinned to the other one
@@ -402,13 +402,11 @@ pub async fn vet_host(
         }
         vec![ip]
     } else {
-        let lookup = tokio::net::lookup_host((host, 0))
+        let lookup = fumox_core::ssrf::lookup_with_timeout(host, dns_timeout)
             .await
-            .map_err(|e| SsrfRejection {
-                reason: format!("DNS resolution failed for {host}: {e}"),
-            })?;
+            .map_err(|e| SsrfRejection { reason: e })?;
         let addrs: Vec<IpAddr> = lookup
-            .map(|addr| addr.ip())
+            .into_iter()
             .filter(|ip| family_matches(*ip, family))
             .collect();
         if addrs.is_empty() {
@@ -486,6 +484,7 @@ pub async fn vet_url(
     url: &str,
     allow_private_urls: bool,
     family: IpFamily,
+    dns_timeout: Duration,
 ) -> Result<(), UrlIssue> {
     validate_url(url)?;
     if allow_private_urls {
@@ -499,7 +498,7 @@ pub async fn vet_url(
         key: "val.url_no_host",
         args: Vec::new(),
     })?;
-    vet_host(host, false, family)
+    vet_host(host, false, family, dns_timeout)
         .await
         .map(|_| ())
         .map_err(|e| UrlIssue {
@@ -546,7 +545,7 @@ mod tests {
 
     #[test]
     fn backoff_delay_is_capped_and_never_overflows() {
-        let fetcher = Fetcher::new(FetchConfig::default(), true);
+        let fetcher = Fetcher::new(FetchConfig::default(), true, Duration::from_secs(5));
         assert_eq!(fetcher.backoff_delay(0), Duration::from_millis(500));
         assert_eq!(fetcher.backoff_delay(1), Duration::from_millis(1000));
         // An absurd max_retries must saturate into the cap, not overflow
@@ -557,7 +556,7 @@ mod tests {
             retry_base_backoff_ms: u64::MAX,
             ..FetchConfig::default()
         };
-        let fetcher = Fetcher::new(huge, true);
+        let fetcher = Fetcher::new(huge, true, Duration::from_secs(5));
         assert_eq!(fetcher.backoff_delay(0), Duration::from_secs(60));
     }
 
@@ -689,16 +688,42 @@ mod tests {
         // A private URL would normally be vetted with allow_private=false,
         // but the family check fires before the private-range check either
         // way; use public test-net addresses to exercise both orders.
-        let v4 = vet_host("203.0.113.10", true, IpFamily::Ipv6)
+        let v4 = vet_host("203.0.113.10", true, IpFamily::Ipv6, Duration::from_secs(5))
             .await
             .unwrap_err();
         assert!(v4.reason.contains("IPv4"), "{}", v4.reason);
-        let v6 = vet_host("2001:db8::1", true, IpFamily::Ipv4)
+        let v6 = vet_host("2001:db8::1", true, IpFamily::Ipv4, Duration::from_secs(5))
             .await
             .unwrap_err();
         assert!(v6.reason.contains("IPv6"), "{}", v6.reason);
         // The matching family passes.
-        assert!(vet_host("2001:db8::1", true, IpFamily::Ipv6).await.is_ok());
+        assert!(
+            vet_host("2001:db8::1", true, IpFamily::Ipv6, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn vet_host_returns_timeout_or_resolution_error() {
+        // On macOS the OS resolver short-circuits `.invalid` synchronously
+        // with a "DNS resolution failed" error; on glibc with a hostile
+        // resolver the wrapper returns "timed out". Both prove the call
+        // returns quickly under the operator's `dns_timeout` knob.
+        let rejection = vet_host(
+            "this-host-does-not-exist.invalid",
+            false,
+            IpFamily::Any,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            rejection.reason.contains("timed out")
+                || rejection.reason.contains("DNS resolution failed"),
+            "expected timeout or resolution-failure, got: {}",
+            rejection.reason
+        );
     }
 
     /// Minimal HTTP/1.1 responder on 127.0.0.1; serves any number of
@@ -774,7 +799,7 @@ mod tests {
         // loopback listener in the test), but the hop is re-vetted strictly.
         let redirector = spawn_redirector(format!("http://{internal}/meta-data")).await;
 
-        let strict = Fetcher::new(FetchConfig::default(), false);
+        let strict = Fetcher::new(FetchConfig::default(), false, Duration::from_secs(5));
         let err = strict
             .fetch(
                 &format!("http://{redirector}/sub"),
@@ -791,7 +816,7 @@ mod tests {
 
         // With private URLs allowed the same chain succeeds, which proves the
         // loop followed the redirect manually rather than erroring out.
-        let lenient = Fetcher::new(FetchConfig::default(), true);
+        let lenient = Fetcher::new(FetchConfig::default(), true, Duration::from_secs(5));
         let payload = lenient
             .fetch(
                 &format!("http://{redirector}/sub"),
@@ -809,7 +834,7 @@ mod tests {
     async fn source_headers_do_not_survive_a_cross_origin_redirect() {
         let echo = spawn_header_echo().await;
         let redirector = spawn_redirector(format!("http://{echo}/collect")).await;
-        let fetcher = Fetcher::new(FetchConfig::default(), true);
+        let fetcher = Fetcher::new(FetchConfig::default(), true, Duration::from_secs(5));
         let headers = std::collections::BTreeMap::from([(
             "X-Subscription-Token".to_string(),
             "SECRET".to_string(),
@@ -865,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_respects_the_ip_family_constraint() {
         let addr = spawn_v4_listener().await;
-        let fetcher = Fetcher::new(FetchConfig::default(), true);
+        let fetcher = Fetcher::new(FetchConfig::default(), true, Duration::from_secs(5));
         let url = format!("http://{addr}/sub");
 
         // Default (Any) reaches the IPv4-only endpoint...

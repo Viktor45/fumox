@@ -20,13 +20,14 @@ use crate::alive_export::{self, export_date};
 use crate::fetcher;
 use crate::pipeline::CompiledPipeline;
 use askama::Template;
-use axum::extract::{Form, State};
+use axum::extract::{ConnectInfo, Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::models::{self, Encoding, InputFormat, IpFamily, OutputFormat, Scheme};
 use fumox_core::repo::{profiles, proxies, sources};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::SocketAddr;
 
 use super::caps;
 
@@ -243,6 +244,7 @@ async fn render_page(
     state: &AdminState,
     lang: Lang,
     theme: Theme,
+    peer: SocketAddr,
     headers: &HeaderMap,
     status: StatusCode,
     errors: Vec<String>,
@@ -260,7 +262,10 @@ async fn render_page(
         Ok(count) => count,
         Err(err) => return super::server_error(lang, &err),
     };
-    let base = state.serve_base(headers);
+    let base = match state.serve_base(peer, headers) {
+        Ok(b) => b,
+        Err(err) => return super::server_error(lang, &fumox_core::Error::Config(err.to_string())),
+    };
     let alive_url = format!("{base}/export/alive/{token}");
     let ready_url = format!("{base}/export/ready/{token}");
     render_html(
@@ -283,13 +288,18 @@ async fn render_page(
 }
 
 /// `GET /admin/import` — the import/export screen.
-pub async fn import_form(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+pub async fn import_form(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
     render_page(
         &state,
         lang,
         theme,
+        peer,
         &headers,
         StatusCode::OK,
         Vec::new(),
@@ -301,6 +311,7 @@ pub async fn import_form(State(state): State<AdminState>, headers: HeaderMap) ->
 /// `POST /admin/import` — validate then create-new.
 pub async fn import_submit(
     State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(ImportPayloadForm { payload }): Form<ImportPayloadForm>,
 ) -> Response {
@@ -316,6 +327,7 @@ pub async fn import_submit(
                 &state,
                 lang,
                 theme,
+                peer,
                 &headers,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 errors,
@@ -333,6 +345,7 @@ pub async fn import_submit(
             &state,
             lang,
             theme,
+            peer,
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             errors,
@@ -348,6 +361,7 @@ pub async fn import_submit(
             &state,
             lang,
             theme,
+            peer,
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             errors,
@@ -367,6 +381,7 @@ pub async fn import_submit(
                 &state,
                 lang,
                 theme,
+                peer,
                 &headers,
                 StatusCode::OK,
                 Vec::new(),
@@ -453,7 +468,9 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
                 }
             } else if dns_budget > 0 {
                 dns_budget -= 1;
-                if let Err(issue) = fetcher::vet_url(&s.url, false, family).await {
+                if let Err(issue) =
+                    fetcher::vet_url(&s.url, false, family, state.fetcher.dns_timeout).await
+                {
                     errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
                 }
             } else {
@@ -828,7 +845,11 @@ mod tests {
         let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
         std::mem::forget(refresh_rx);
         let config = fumox_core::AppConfig::default();
-        let fetcher = crate::fetcher::Fetcher::new(config.fetch.clone(), false);
+        let fetcher = crate::fetcher::Fetcher::new(
+            config.fetch.clone(),
+            false,
+            config.geo.dns_timeout(),
+        );
         let state = crate::admin::AdminState::new(
             pool,
             crate::cache::Caches::new(),

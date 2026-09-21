@@ -47,6 +47,14 @@ pub struct AppState {
     /// Public-listener rate limiters (`[server].rate_limit` /
     /// `[server].auth_fail_rate_limit`).
     pub limits: PublicRateLimits,
+    /// CIDRs of reverse proxies whose `X-Forwarded-For` / RFC 7239 `Forwarded:
+    /// for=…` are honored for the per-IP rate-limit key. Empty = never honor
+    /// forwarded headers (any caller can otherwise spoof the key).
+    pub trusted_cidrs: Vec<ipnet::IpNet>,
+    /// Hostnames / IPs allowed to reach the public listener. Empty = accept
+    /// any host (today's behavior); setting this locks the alive-export
+    /// endpoint to the operator's own hostname.
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Per-IP rate limiters of the public listener: a generous ceiling for
@@ -115,13 +123,11 @@ pub fn router(state: AppState) -> Router {
 /// bare `SocketAddr` here would silently match nothing and disable the whole
 /// limiter (regression fixed 2026-09-11).
 async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let Some(ip) = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|info| info.0.ip().to_string())
-    else {
+    let Some(connect) = req.extensions().get::<ConnectInfo<SocketAddr>>().cloned() else {
         return next.run(req).await;
     };
+    let ip = crate::admin::auth::client_key(connect.0, req.headers(), &state.trusted_cidrs)
+        .to_string();
     if !state.limits.all.allow(&ip).await {
         return error_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -761,6 +767,8 @@ mod tests {
             geo: Arc::new(GeoResolver::new(&geo_cfg)),
             refresh_tx,
             limits,
+            trusted_cidrs: Vec::new(),
+            allowed_hosts: Vec::new(),
         }
     }
 

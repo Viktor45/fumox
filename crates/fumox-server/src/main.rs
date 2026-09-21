@@ -87,7 +87,11 @@ async fn main() -> anyhow::Result<()> {
     geo_download::ensure_geo_databases(&config).await;
 
     // Background source refresh loop: fetch → parse → reconcile → journal.
-    let fetcher = Fetcher::new(config.fetch.clone(), config.admin.allow_private_urls);
+    let fetcher = Fetcher::new(
+        config.fetch.clone(),
+        config.admin.allow_private_urls,
+        config.geo.dns_timeout(),
+    );
     let scheduler_state = SchedulerState::new(config.fetch.max_concurrency);
     let caches = Caches::new();
     let geo = Arc::new(fumox_core::geo::GeoResolver::new(&config.geo));
@@ -128,6 +132,8 @@ async fn main() -> anyhow::Result<()> {
         geo: geo.clone(),
         refresh_tx: refresh_tx.clone(),
         limits: serve::PublicRateLimits::from_config(&config.server),
+        trusted_cidrs: admin::parse_trusted_cidrs(&config.server.trust_proxy_ips),
+        allowed_hosts: config.server.allowed_hosts.clone(),
     };
     let app = serve::router(state).route("/healthz", get(|| async { "ok\n" }));
 

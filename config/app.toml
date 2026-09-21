@@ -16,6 +16,19 @@
 # Публичный слушатель для GET /sub/{id} и GET /src/{id}.
 # Public listener for GET /sub/{id} and GET /src/{id}.
 bind = "0.0.0.0:8080"
+# CIDRs reverse-proxy, чьи X-Forwarded-For / Forwarded for=… принимаются для
+# ключа per-IP rate-limit. Пусто = не доверять forwarded-заголовкам (любой
+# клиент иначе мог бы подменить ключ).
+# Reverse-proxy CIDRs whose X-Forwarded-For / Forwarded for=… are honored for
+# the per-IP rate-limit key. Empty = never trust forwarded headers (any
+# caller can otherwise spoof the key).
+trust_proxy_ips = []
+# Hostnames/IPs, которым разрешено обращаться к публичному слушателю.
+# Пусто = принять любой Host (текущее поведение); задайте значение, чтобы
+# привязать /export/alive/… к своему домену.
+# Hostnames/IPs allowed to reach the public listener. Empty = accept any
+# Host (current behavior); set this to pin /export/alive/… to your domain.
+allowed_hosts = []
 
 [database]
 # SQLite (WAL) — единственный источник истины.
@@ -117,6 +130,15 @@ login_rate_limit = "5/min"    # POST /admin/login
 # каталог переводов админки (<код>.toml); новый файл = новый язык после рестарта
 # admin UI translation catalogs (<code>.toml); a new file adds a language after restart
 locales_dir = "locales"
+# CIDRs reverse-proxy для per-IP ключа админки. Пусто = forwarded-заголовки
+# игнорируются.
+# Reverse-proxy CIDRs for the admin per-IP rate-limit key. Empty = ignore
+# forwarded headers.
+trust_proxy_ips = []
+# Hostnames/IPs, которым разрешено обращаться к админ-слушателю. Пусто =
+# принять любой Host.
+# Hostnames/IPs allowed to reach the admin listener. Empty = accept any Host.
+allowed_hosts = []
 
 [probe]
 # Демон проверки живучести прокси.

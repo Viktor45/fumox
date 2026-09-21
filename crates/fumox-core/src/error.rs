@@ -11,10 +11,16 @@ pub enum Error {
     Parse(String),
 
     #[error("database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(String),
 
     #[error("database migration error: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
+}
+
+impl From<sqlx::Error> for Error {
+    fn from(err: sqlx::Error) -> Self {
+        Error::Database(err.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

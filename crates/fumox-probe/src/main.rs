@@ -269,15 +269,13 @@ async fn run_t1_checks(
 /// Async because the underlying DNS lookup is async — keeping the call
 /// async end-to-end means the runtime worker is never blocked while the
 /// OS resolver runs.
-async fn vet_target(ctx: &Context, host: &str) -> Result<(), String> {
-    fumox_core::ssrf::vet_probe_host(host, ctx.config.probe.allow_private_targets).await
-}
-
-/// Same gate as [`vet_target`], returning the vetted addresses: T1 dials
-/// those exact IPs instead of re-resolving the hostname, so a rebinding
-/// DNS answer cannot steer the connect elsewhere between vet and dial.
 async fn vet_target_addrs(ctx: &Context, host: &str) -> Result<Vec<std::net::IpAddr>, String> {
-    fumox_core::ssrf::vet_probe_host_addrs(host, ctx.config.probe.allow_private_targets).await
+    fumox_core::ssrf::vet_probe_host_addrs(
+        host,
+        ctx.config.probe.allow_private_targets,
+        ctx.config.geo.dns_timeout(),
+    )
+    .await
 }
 
 /// A vet-refused target is a *failed check*, not a skip: the policy blocks exactly what a dead proxy looks like —
@@ -607,13 +605,27 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     )
     .unwrap_or(0);
     let mut blocked = 0usize;
+    let mut pins: std::collections::HashMap<String, std::net::IpAddr> =
+        std::collections::HashMap::new();
     for row in rows {
         let scheme = row.scheme.parse::<Scheme>().ok();
         if !scheme.is_some_and(clash::is_supported) {
             continue;
         }
-        match vet_target(&ctx, &row.host).await {
-            Ok(()) => batch.push(row),
+        match vet_target_addrs(&ctx, &row.host).await {
+            Ok(vetted) => {
+                if let Some(ip) =
+                    fumox_core::ssrf::pick_vetted(&vetted, fumox_core::models::IpFamily::Any)
+                {
+                    // The probe batch is deduplicated by `row.id` upstream
+                    // (`proxies::select_t2_candidates`), so two rows that
+                    // share a hostname overwrite the same pin map entry —
+                    // operator intent is unambiguous and the result is the
+                    // same vetted IP.
+                    pins.insert(row.host.clone(), ip);
+                }
+                batch.push(row);
+            }
             Err(reason) => {
                 tracing::warn!(id = row.id, %reason, "T2 target blocked by the private-address policy, journaled as a failed check");
                 blocked += 1;
@@ -641,7 +653,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
         return Ok(batch.len() + blocked);
     }
 
-    let (yaml, included) = clash::generate(&batch)?;
+    let (yaml, included) = clash::generate(&batch, &pins)?;
     let config_path = &ctx.config.meow.config_path;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;

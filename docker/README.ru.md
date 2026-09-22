@@ -92,6 +92,18 @@ cp config/GeoLite2-*.mmdb ~/fumox/config/   # опционально: гео-о�
 <http://127.0.0.1:8081/admin> (на хост публикуется только loopback, как и в
 compose). Логи: `journalctl --user -u fumox-server -u fumox-probe -u fumox-meow -f`.
 
+### Правка `app.toml` из админки
+
+`fumox-server.container` монтирует каталог конфига как `:rw,Z` — страница
+*Edit settings* (`/admin/settings/edit`) пишет `/app/config/app.toml` на
+месте через `toml_edit`-редактор. Комментарии переживают каждое
+сохранение; ENV-переменные `FUMOX_SECTION__KEY` сохраняют приоритет по
+merge figment; после сохранения нужно перезапустить server и probe.
+`fumox-probe.container` остаётся read-only — probe только читает файл
+при старте и никогда в него не пишет. Чтобы выключить редактор — поменяйте
+в server-юните `:rw,Z` на `:ro,Z`; страница отрендерится с заблокированными
+контролами и красным баннером `set.edit_unwritable`.
+
 ## Вариант B: `kube/`
 
 1. Образы — как выше.

@@ -32,7 +32,12 @@ Environment=FUMOX_GEO__DB_DIR=/shared
 
 # Left side: a directory with app.toml (and optional GeoLite2-*.mmdb).
 # %h expands to your home dir; point it at the repo's config/ if you prefer.
-Volume=%h/fumox/config:/app/config:ro,Z
+#
+# Writable: the admin *Edit settings* page writes /app/config/app.toml
+# in place via the toml_edit-backed editor (see USERGUIDE §7). If you
+# want config edits off, drop the `:rw` and the editor renders disabled
+# with the `set.edit_unwritable` banner.
+Volume=%h/fumox/config:/app/config:rw,Z
 Volume=fumox-data.volume:/app/data
 Volume=fumox-shared.volume:/shared
 

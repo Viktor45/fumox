@@ -56,7 +56,11 @@ services:
       # (source URLs may then point at private/loopback addresses).
       FUMOX_ADMIN__ALLOW_PRIVATE_URLS: ${FUMOX_ADMIN__ALLOW_PRIVATE_URLS:-false}
     volumes:
-      - ./config:/app/config:ro,z
+      # Writable: the admin *Edit settings* page writes /app/config/app.toml
+      # in place via the toml_edit-backed editor (see USERGUIDE §7). If you
+      # want config edits off, drop the `:rw` (server) and the editor
+      # renders disabled with the `set.edit_unwritable` banner.
+      - ./config:/app/config:rw,z
       - fumox-data:/app/data
       - meow-shared:/shared
     ports:
@@ -97,6 +101,9 @@ services:
       # Override in .env if the default test URL is blocked in your region.
       FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-http://www.gstatic.com/generate_204}
     volumes:
+      # Probe only reads app.toml at startup — never writes. Read-only mount
+      # means a buggy probe can never mangle the config the server is also
+      # editing.
       - ./config:/app/config:ro,z
       - fumox-data:/app/data
       - meow-shared:/shared

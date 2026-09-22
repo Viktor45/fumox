@@ -29,8 +29,14 @@ test*.txt
 *.md
 
 # Local runtime config: GeoLite2 binaries are gitignored large files and
-# app.toml may carry secrets. Mount them into /app/config at run time instead.
-config
+# the runtime app.toml may carry secrets. Mount them into /app/config at run
+# time instead. The reference config/app.toml is the exception — it is
+# `include_str!`-embedded by crates/fumox-core/src/config_writer.rs to back
+# the admin panel's *Create from defaults* button, so it MUST be in the
+# build context (the runtime /app/config/app.toml at run time is a separate
+# file the operator owns).
+config/*
+!config/app.toml
 
 # Editor / OS noise
 .DS_Store

@@ -50,9 +50,12 @@ spec:
           hostIP: "127.0.0.1" # loopback-only admin, like the compose mapping
           protocol: TCP
       volumeMounts:
+        # Writable on the server: the admin *Edit settings* page writes
+        # /app/config/app.toml in place via the toml_edit-backed editor
+        # (USERGUIDE §7). Set `readOnly: true` here if you want edits off,
+        # and the editor will render disabled with `set.edit_unwritable`.
         - name: config
           mountPath: /app/config
-          readOnly: true
         - name: data
           mountPath: /app/data
         - name: shared
@@ -74,6 +77,9 @@ spec:
         - secretRef:
             name: fumox-env
       volumeMounts:
+        # Probe reads app.toml at startup — never writes. Read-only mounts
+        # are independent per container in a Pod, so the server can stay
+        # writable while the probe stays read-only.
         - name: config
           mountPath: /app/config
           readOnly: true

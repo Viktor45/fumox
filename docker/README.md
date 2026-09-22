@@ -92,6 +92,18 @@ Check: `curl -s http://127.0.0.1:8080/healthz` → `ok`; admin panel at
 <http://127.0.0.1:8081/admin> (only loopback is published to the host, same
 as compose). Logs: `journalctl --user -u fumox-server -u fumox-probe -u fumox-meow -f`.
 
+### Editing `app.toml` from the admin panel
+
+`fumox-server.container` mounts the config directory as `:rw,Z` — the
+admin *Edit settings* page (`/admin/settings/edit`) writes
+`/app/config/app.toml` in place through the `toml_edit`-backed editor.
+Comments survive every save; ENV overrides (`FUMOX_SECTION__KEY`) keep
+winning per the figment merge; both server and probe must be restarted
+after a save. `fumox-probe.container` stays read-only — the probe only
+reads the file at startup and never writes it. If you prefer the editor
+off entirely, change the server mount to `:ro,Z`; the page will render
+disabled with a red `set.edit_unwritable` banner explaining why.
+
 ## Variant B: `kube/`
 
 1. Images — as above.

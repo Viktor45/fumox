@@ -86,7 +86,7 @@ refresh_check_limit = 100
 # keep confirming it is alive; once the checks fail it, the proxy gets
 # removed automatically. true: when the source has pipeline drop rules, an alive
 # proxy caught by a rule is removed on the very next refresh.
-drop_gate = false
+drop_gate = true
 # Возврат удаленного прокси, который снова появился в источнике.
 # false (дефолт): removed терминален — возврат только вручную («сбросить
 # статус» в админке) или через «purge removed» + повторная вставка.
@@ -99,7 +99,7 @@ drop_gate = false
 # true: a proxy the feed still carries resets to the pristine unknown
 # state (fail_count and quarantine fields cleared, same as "reset status")
 # and re-runs the check sequence, joining the priority queue.
-removed_as_unknown = false
+removed_as_unknown = true
 
 [geo]
 # Гео-обогащение MaxMind GeoLite2: по IP-адресу узла определяются страна,
@@ -131,7 +131,7 @@ bind = "127.0.0.1:8081"
 # 7 дней / 7 days
 session_ttl_hours = 168
 # false = отказываем RFC1918/loopback по умолчанию (SSRF-защита активна). true имеет смысл только при собственной изолированной feed-инфраструктуре / false rejects RFC1918/loopback out of the box (SSRF guard active). Set true only on your own isolated feed infra
-allow_private_urls = false
+allow_private_urls = true
 # /admin/* кроме login / /admin/* except login
 rate_limit = "120/min"
 # POST /admin/login
@@ -148,6 +148,7 @@ trust_proxy_ips = []
 # принять любой Host.
 # Hostnames/IPs allowed to reach the admin listener. Empty = accept any Host.
 allowed_hosts = []
+secure_cookies = true
 
 [probe]
 # Демон проверки живучести прокси.
@@ -207,6 +208,7 @@ recheck_delays_secs = [600, 900]   # 10 мин → 15 мин / 10m → 15m
 queue_stale_days = 7
 # 86400 с (сутки) — ротация probe_results/fetch_log под полные сутки, в пару к [retention].*_days / 86400 s (one day) pairs with [retention].*_days so rotation runs once per day and matches the retention window
 retention_interval_secs = 86400
+allow_private_targets = true
 
 [meow]
 # meow-rs — движок реальных туннельных проверок. Живет как отдельный

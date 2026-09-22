@@ -25,8 +25,15 @@ pub enum ConfigWriteError {
     /// `toml_edit` could not parse the file on disk.
     Parse { path: PathBuf, message: String },
     /// `set` was called with a key whose section does not correspond to
-    /// any `[section]` block in the file and could not be created.
+    /// any `[section]` block in the file and could not be created, or
+    /// could not be dived through because the parent slot is occupied
+    /// by a non-table value.
     UnknownSection(String),
+    /// `set` was called with a malformed dotted key: empty, leading /
+    /// trailing `.`, or containing `..`. Empty segments would write
+    /// keys with no name into the file and toml_edit would parse them
+    /// back fine, but the operator cannot have meant to do that.
+    InvalidKey(String),
     /// I/O error during save (read, write, rename).
     Io(std::io::Error),
 }
@@ -39,6 +46,7 @@ impl std::fmt::Display for ConfigWriteError {
                 write!(f, "parse error in {}: {}", path.display(), message)
             }
             Self::UnknownSection(s) => write!(f, "unknown section: {s}"),
+            Self::InvalidKey(s) => write!(f, "invalid dotted key: {s:?}"),
             Self::Io(e) => write!(f, "i/o error: {e}"),
         }
     }
@@ -120,10 +128,22 @@ impl EditableConfig {
     /// Set the leaf at `dotted` to `value`. Auto-creates any missing
     /// intermediate `[section]` tables and the leaf itself, so callers
     /// can write a brand-new key without first inserting scaffolding.
+    ///
+    /// `dotted` must be a non-empty string of non-empty segments
+    /// separated by exactly one `.` — no leading / trailing dot, no
+    /// `..`. Empty or doubled segments are rejected with
+    /// [`ConfigWriteError::InvalidKey`].
     pub fn set(&mut self, dotted: &str, value: Item) -> Result<(), ConfigWriteError> {
+        if dotted.is_empty()
+            || dotted.starts_with('.')
+            || dotted.ends_with('.')
+            || dotted.contains("..")
+        {
+            return Err(ConfigWriteError::InvalidKey(dotted.into()));
+        }
         let segments: Vec<&str> = dotted.split('.').collect();
-        if segments.is_empty() {
-            return Err(ConfigWriteError::UnknownSection(dotted.into()));
+        if segments.iter().any(|s| s.is_empty()) {
+            return Err(ConfigWriteError::InvalidKey(dotted.into()));
         }
 
         // Walk into the parent table, creating intermediates if needed.
@@ -137,20 +157,32 @@ impl EditableConfig {
         Ok(())
     }
 
-    /// Atomic save: write to `<path>.tmp.<pid>` in the same directory
-    /// and rename over the original. Falls back to direct `write` on
+    /// Atomic save: write to a sibling `<name>.tmp.<pid>.<n>` and
+    /// rename over the original. Falls back to direct `write` on
     /// filesystems that reject `rename` (some NFS / SMB mounts).
+    ///
+    /// Tmp-file uniqueness: process id alone is not enough, because two
+    /// concurrent saves from the same admin server process (a
+    /// double-click on the form button, or a retry fire-and-forget)
+    /// would race for the same `<name>.<pid>`. The static counter is
+    /// bumped atomically on every call, so two overlapping saves from
+    /// the same process produce two distinct tmp files. Two different
+    /// processes differ on `<pid>`, so the union of the two makes the
+    /// name globally unique within the lifetime of the dir.
     pub fn save(&self) -> Result<(), ConfigWriteError> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| ConfigWriteError::Unwritable(self.path.clone()))?;
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let file_name = self
             .path
             .file_name()
             .ok_or_else(|| ConfigWriteError::Unwritable(self.path.clone()))?;
-        let tmp_name = format!("{}.tmp.{}", file_name.to_string_lossy(), std::process::id());
-        let tmp_path = parent.join(tmp_name);
+        let n = SAVE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_name = format!(
+            "{}.tmp.{}.{:x}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            n,
+        );
+        let tmp_path = parent.join(&tmp_name);
 
         let serialized = self.doc.to_string();
         std::fs::write(&tmp_path, serialized.as_bytes())?;
@@ -166,11 +198,25 @@ impl EditableConfig {
                 "atomic rename failed; falling back to direct write"
             );
             std::fs::write(&self.path, serialized.as_bytes())?;
-            let _ = std::fs::remove_file(&tmp_path);
+            if let Err(rm_err) = std::fs::remove_file(&tmp_path) {
+                // The tmp file leaked. Not fatal — the real config has
+                // been written — but the operator should know so they can
+                // clean up by hand.
+                tracing::warn!(
+                    error = %rm_err,
+                    tmp = %tmp_path.display(),
+                    "could not remove leftover tmp file after fallback write"
+                );
+            }
         }
         Ok(())
     }
 }
+
+/// Counter combined with PID/TID to keep concurrent `save()` calls
+/// from stepping on each other's tmp files when two requests hit the
+/// admin server at the same time.
+static SAVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Move `current` into the table at `segment`, creating an empty table
 /// if the slot was absent or held a non-table value.
@@ -194,6 +240,13 @@ fn enter_or_create_table<'a>(
 /// Can the OS let us modify `path`? Either the file exists and its
 /// permissions allow writes, or it does not exist and its parent
 /// directory is writable (a brand-new file can be created there).
+///
+/// **Advisory only.** The check inspects the inode's readonly flag and
+/// falls back to the parent's flag if the file does not exist; it does
+/// not consult POSIX mode bits or ACLs and is meaningless for `root`,
+/// which writes regardless. Use it to decide whether to render the
+/// editor with enabled or disabled controls, not as an access-control
+/// gate — `save()` re-checks errors at write time.
 pub fn is_writable(path: &Path) -> bool {
     let md = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -466,6 +519,53 @@ mod tests {
         assert!(cfg.get("probe.cycle_interval_secs").is_some());
         assert!(cfg.get("probe.unknown_key").is_none());
         assert!(cfg.get("missing.anything").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_rejects_empty_or_doubled_segments() {
+        let path = std::env::temp_dir().join("fumox-cfg-writer-nofile-needed.toml");
+        let mut cfg = EditableConfig::load(&path).unwrap();
+
+        for bad in ["", ".", ".foo", "foo.", "foo..bar", "foo...bar"] {
+            let err = cfg
+                .set(bad, item::string("x"))
+                .expect_err(&format!("key {bad:?} must be rejected"));
+            assert!(
+                matches!(err, ConfigWriteError::InvalidKey(_)),
+                "key {bad:?} returned wrong error: {err:?}"
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_uses_unique_tmp_per_call() {
+        // Five saves from the same process must end up with five
+        // distinct tmp names; otherwise concurrent admin submissions
+        // would race for the same file.
+        let dir = tmp_dir("unique-tmp");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
+
+        for i in 0..5 {
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            cfg.set("server.bind", item::string(format!("127.0.0.1:{i}")))
+                .unwrap();
+            cfg.save().unwrap();
+        }
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("127.0.0.1:4"), "final write must win");
+
+        // No leftover tmp files in the directory after the storm.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "tmp leaked: {leftover:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

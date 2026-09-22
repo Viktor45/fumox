@@ -509,7 +509,7 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 | **Fetch log**       | Journal of every source fetch: time, status, bytes, proxies found, error class                                                                                                                        |
 | **Probe**           | Health-check daemon status: heartbeat, meow-rs status, quarantine queue with scheduled second chances                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
-| **Settings**        | Read-only overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels — every `config/app.toml` knob except the admin token, which is never rendered |
+| **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels — every `config/app.toml` knob except the admin token, which is never rendered. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
 
 ### Times and timezones
 
@@ -921,6 +921,50 @@ state machine: the table above, plus `[server]`, `[database]`, `[geo]`,
 `[admin]` and `[log]` panels (rate limits in the canonical `N/unit` form,
 response caps human-readable, the legacy `[geo].db` marked as ignored). The
 admin token is the only value that never appears on the page.
+
+### Editing `config/app.toml` from the panel
+
+The overview links to `/admin/settings/edit`, a form-based editor backed by
+[`toml_edit`](https://crates.io/crates/toml_edit) that writes the file in
+place. Comments you wrote into `config/app.toml` (RU/EN pairs, banners,
+hints — every `#…` line) survive every save because the editor operates on
+the parsed document, not a regenerated one. Sections are grouped by owning
+process (Server / Probe / Shared) via CSS-only `<input type="radio">` tabs —
+no JavaScript required.
+
+Editing is **restart-required**: the panel saves the file, but server and
+probe re-read the file at startup, so both must be restarted for the
+changes to take effect. The save toast tells you so. `FUMOX_SECTION__KEY`
+environment variables keep winning over file values at runtime per the
+existing figment merge, so a transient ENV override is still the right
+tool for one-off adjustments.
+
+The editor is intentionally narrow on safety:
+
+- When `config/app.toml` is missing, **Edit** is hidden and **Create from
+  defaults** takes its place; the button writes a copy of the shipped
+  reference config so the server has something parseable to start with on
+  next restart. The editor opens on the new file.
+- When the existing file is **not writable** (read-only filesystem,
+  missing parent directory, owner mismatch), the editor renders but
+  every control is disabled and a red banner explains the cause; the
+  same banner appears on the overview.
+- Validation is one-shot per save: invalid `bind`, out-of-range
+  durations, unknown enum values, empty required lists all surface as
+  red field messages (`422`); nothing is written until every field is
+  valid. `bind` changes are checked with `SocketAddr::from_str`, the
+  recheck ladder is parsed as `Vec<i64>`, rate limits as `<N>/<unit>`.
+- The admin token field is a plain input — sending the empty string
+  keeps the current token (used by the encrypted digest over the
+  session cookie) so the panel never silently disables itself.
+  Changing the token invalidates every active session the next request.
+- The legacy `[geo].db` field is rendered disabled with a hint; it is
+  kept for parse compatibility and can no longer affect resolution.
+
+The write path is atomic: the editor writes to `<path>.tmp.<pid>` and
+`rename`s over the original; on filesystems that refuse cross-link
+renames the fallback is a direct `fs::write` with a warning log.
+Either way the original file is either fully replaced or fully intact.
 
 If meow-rs is down, T2 doesn't spam it: the probe backs off exponentially
 (60 s → doubling → capped at 15 min), and proxy statuses are left untouched:

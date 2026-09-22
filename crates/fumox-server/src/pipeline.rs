@@ -312,10 +312,7 @@ struct CompiledRename {
 #[derive(Debug, Clone)]
 enum CompiledDrop {
     /// Regex over a single `ProxyEntry` field (name / host / port / param).
-    Regex {
-        regex: Regex,
-        target: RenameTarget,
-    },
+    Regex { regex: Regex, target: RenameTarget },
     /// Discard when the proxy's resolved AS number is in `asns`. Missing
     /// ASN is not a hit (matches `filter.exclude_asns`).
     Asn { asns: Vec<u32> },
@@ -498,12 +495,9 @@ impl CompiledPipeline {
                         });
                     }
                     let target = parse_rename_target(&rule.target, &field, &mut errors);
-                    if let Some(regex) = compile_rule_regex(
-                        &rule.match_pattern,
-                        &rule.flags,
-                        &field,
-                        &mut errors,
-                    ) && let Some(target) = target
+                    if let Some(regex) =
+                        compile_rule_regex(&rule.match_pattern, &rule.flags, &field, &mut errors)
+                        && let Some(target) = target
                     {
                         compiled.drop.push(CompiledDrop::Regex { regex, target });
                     }
@@ -590,48 +584,48 @@ impl CompiledPipeline {
         out
     }
 
-/// Discard entries matching the `drop` rules (ingestion side
-/// step 3): a matching proxy is never stored, reconciled, geo-resolved
-/// or queued for probing. Only the drop step runs here — the pipeline's
-/// other sections are serving-side by design (a profile may override
-/// them, but profiles never take part in ingestion), and the drop
-/// selectors must see the original values exactly as the serving-side
-/// pass does.
-///
-/// `geo` carries the resolved ASN stamps parallel to `entries`
-/// (`geo.len() == entries.len()`); ASN-targeted rules consult this slice
-/// and a missing stamp is never a hit (matches `filter.exclude_asns`
-/// semantics). The caller resolves geo before calling this so the
-/// function itself does not need to be async.
-pub fn drop_entries(
-    &self,
-    entries: Vec<ProxyEntry>,
-    geo: &[Option<fumox_core::repo::proxies::GeoStamp>],
-) -> Vec<ProxyEntry> {
-    if self.drop.is_empty() {
-        return entries;
-    }
-    debug_assert_eq!(
-        entries.len(),
-        geo.len(),
-        "drop_entries: entries and geo must be parallel slices"
-    );
-    entries
-        .into_iter()
-        .zip(geo.iter())
-        .filter(|(entry, stamp)| {
-            !self.drop.iter().any(|rule| match rule {
-                CompiledDrop::Regex { regex, target } => matches_target(entry, regex, target),
-                CompiledDrop::Asn { asns } => stamp
-                    .as_ref()
-                    .and_then(|s| s.asn.as_deref())
-                    .and_then(stored_asn_number)
-                    .is_some_and(|n| asns.contains(&n)),
+    /// Discard entries matching the `drop` rules (ingestion side
+    /// step 3): a matching proxy is never stored, reconciled, geo-resolved
+    /// or queued for probing. Only the drop step runs here — the pipeline's
+    /// other sections are serving-side by design (a profile may override
+    /// them, but profiles never take part in ingestion), and the drop
+    /// selectors must see the original values exactly as the serving-side
+    /// pass does.
+    ///
+    /// `geo` carries the resolved ASN stamps parallel to `entries`
+    /// (`geo.len() == entries.len()`); ASN-targeted rules consult this slice
+    /// and a missing stamp is never a hit (matches `filter.exclude_asns`
+    /// semantics). The caller resolves geo before calling this so the
+    /// function itself does not need to be async.
+    pub fn drop_entries(
+        &self,
+        entries: Vec<ProxyEntry>,
+        geo: &[Option<fumox_core::repo::proxies::GeoStamp>],
+    ) -> Vec<ProxyEntry> {
+        if self.drop.is_empty() {
+            return entries;
+        }
+        debug_assert_eq!(
+            entries.len(),
+            geo.len(),
+            "drop_entries: entries and geo must be parallel slices"
+        );
+        entries
+            .into_iter()
+            .zip(geo.iter())
+            .filter(|(entry, stamp)| {
+                !self.drop.iter().any(|rule| match rule {
+                    CompiledDrop::Regex { regex, target } => matches_target(entry, regex, target),
+                    CompiledDrop::Asn { asns } => stamp
+                        .as_ref()
+                        .and_then(|s| s.asn.as_deref())
+                        .and_then(stored_asn_number)
+                        .is_some_and(|n| asns.contains(&n)),
+                })
             })
-        })
-        .map(|(entry, _)| entry)
-        .collect()
-}
+            .map(|(entry, _)| entry)
+            .collect()
+    }
 
     /// Whether any `drop` rule is configured. Reconciliation asks before a
     /// fetch: a source with drop rules never keeps lingering
@@ -1712,7 +1706,9 @@ mod tests {
         })));
         let issues = result.expect_err("missing asns must fail compile");
         assert!(
-            issues.iter().any(|i| i.key == "pipeline.asn_target_requires_asns"),
+            issues
+                .iter()
+                .any(|i| i.key == "pipeline.asn_target_requires_asns"),
             "expected requires-asns error, got {issues:?}"
         );
     }
@@ -1768,14 +1764,11 @@ mod tests {
         })))
         .expect_err("unknown target must fail");
         assert!(
-            issues
-                .iter()
-                .any(|i| i.key == "pipeline.unknown_target"),
+            issues.iter().any(|i| i.key == "pipeline.unknown_target"),
             "unknown_target error must be present: {issues:?}"
         );
-        let locales = crate::admin::i18n::Locales::load(std::path::Path::new(
-            "/nonexistent-locales-dir",
-        ));
+        let locales =
+            crate::admin::i18n::Locales::load(std::path::Path::new("/nonexistent-locales-dir"));
         for code in ["en", "ru"] {
             let lang = locales.resolve(code);
             let rendered = lang.t_args(
@@ -1821,7 +1814,9 @@ mod tests {
         drop_me.geo_asn = Some("AS24940".into());
         let mut unresolved = candidate("unresolved", Scheme::Vless, "h3.example.com");
         unresolved.geo_asn = None;
-        let out = compiled.apply(vec![keep, drop_me, unresolved], &inactive_geo()).await;
+        let out = compiled
+            .apply(vec![keep, drop_me, unresolved], &inactive_geo())
+            .await;
         let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
         assert_eq!(names, vec!["keep", "unresolved"]);
     }

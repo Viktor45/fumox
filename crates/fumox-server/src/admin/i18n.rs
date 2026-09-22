@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(locales.resolve("").code(), "ru");
         // Translation follows the resolved catalog.
         assert_eq!(locales.resolve("en").t("nav.dashboard"), "Dashboard");
-        assert_eq!(locales.resolve("fr").t("nav.dashboard"), "Дашборд");
+        assert_eq!(locales.resolve("fr").t("nav.dashboard"), "Обзор");
         // Unknown keys echo themselves.
         assert_eq!(locales.resolve("en").t("no.such.key"), "no.such.key");
     }

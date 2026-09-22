@@ -147,15 +147,21 @@ impl ProxyRow {
 /// then keeps whatever is already stored).
 ///
 /// `keep_alive_linger`: when the source has no `drop` rules,
-/// an `alive` proxy that vanished from the feed keeps its link — the probe
-/// stays the sole owner of its lifecycle, so a live node is not terminated
-/// by upstream churn. The next refresh to see it back re-stamps the link.
-/// `unknown`/`quarantine`/`removed` proxies are unlinked exactly as before:
-/// an unverified or dying lingerer would accumulate zombie rows. The
-/// admin's source deletion path (`mark_orphans_removed`) honours the
-/// `[ingest].drop_gate` flag instead — when it is `false`, a `ready` row
-/// is left alone (tunnel-verified, the click that deleted its source
-/// should not retire it); when it is `true`, every orphan retires.
+/// an `alive` *or* `ready` *or* `unknown` proxy that vanished from the
+/// feed keeps its link — the probe stays the sole owner of its lifecycle,
+/// so a live node and a not-yet-verified node are not terminated by
+/// upstream churn. The next refresh to see it back re-stamps the link.
+/// An `unknown` lingerer is not a zombie row: the priority queue
+/// (`probe_requests`) and the random T1 sample still pick it up via the
+/// `EXISTS (... link ...)` predicate, so the row gets its verdict
+/// eventually. `quarantine`/`removed` proxies are unlinked exactly as
+/// before: a dying lingerer would otherwise occupy the recheck ladder
+/// past its time. The admin's source deletion path
+/// (`mark_orphans_removed`) honours the `[ingest].drop_gate` flag
+/// instead — when it is `false`, `ready` and `unknown` rows are left
+/// alone (`ready` is tunnel-verified, `unknown` has not yet had its
+/// first verdict; the click that deleted the source should not retire
+/// either); when it is `true`, every orphan retires.
 pub async fn reconcile_source(
     pool: &DbPool,
     source_id: &str,
@@ -273,7 +279,7 @@ pub async fn reconcile_source(
         "DELETE FROM proxy_source_links
          WHERE source_id = ?
            AND seen_at < ?
-           AND proxy_id NOT IN (SELECT id FROM proxies WHERE status IN ('alive', 'ready'))"
+           AND proxy_id NOT IN (SELECT id FROM proxies WHERE status IN ('alive', 'ready', 'unknown'))"
     } else {
         "DELETE FROM proxy_source_links WHERE source_id = ? AND seen_at < ?"
     };
@@ -1596,9 +1602,10 @@ mod tests {
 
     #[tokio::test]
     async fn quarantined_linger_leaves_on_next_refresh() {
-        // Only `alive` lingers: once the probe quarantines the node, the
-        // next refresh unlinks it and the orphan is removed — a dying
-        // lingerer does not occupy the recheck ladder.
+        // `alive`/`ready`/`unknown` linger; `quarantine` does not: once
+        // the probe quarantines the node, the next refresh unlinks it
+        // and the orphan is removed — a dying lingerer does not occupy
+        // the recheck ladder.
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("dying", "h1.example.com", 443);
@@ -1629,9 +1636,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_lingers_until_next_seen_or_quarantined() {
+        // The probe queue gets the `unknown` row before the next refresh
+        // can drop it: with linger protection, a one-cycle miss in the
+        // feed must not retire a row the probe never had time to check.
+        // The link survives, the row stays `unknown`, and a later refresh
+        // that re-lists the proxy re-stamps the link cleanly.
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let e = entry("transient", "h1.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status_of(&pool, &e).await.0, "unknown");
+
+        // Source drops the proxy on the next refresh (entry omitted).
+        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
+            .await
+            .unwrap();
+        assert_eq!(stats.unlinked, 0, "unknown rows linger like alive/ready");
+        assert_eq!(stats.removed, 0);
+        assert_eq!(status_of(&pool, &e).await.0, "unknown");
+
+        // The reappearance stamps the link back; status is preserved.
+        let stats = reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            3000,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.updated, 1);
+        assert_eq!(status_of(&pool, &e).await.0, "unknown");
+
+        // And the quarantine transition ends the linger: once the probe
+        // gives it a verdict, the row drops out of the protected set and
+        // the next refresh unlinks it like any other dying row.
+        sqlx::query("UPDATE proxies SET status = 'quarantine' WHERE fingerprint = ?")
+            .bind(e.fingerprint())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 4000, true)
+            .await
+            .unwrap();
+        assert_eq!(stats.unlinked, 1, "quarantine ends the linger");
+        assert_eq!(stats.removed, 1);
+    }
+
+    #[tokio::test]
     async fn linger_is_per_proxy_not_per_batch() {
         // One alive, one dead-by-probe (quarantined) row vanish together:
         // only the alive one keeps its link in the same reconcile pass.
+        // The same per-row filter keeps `unknown` rows linked too.
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let alive = entry("alive", "h1.example.com", 443);
@@ -3106,8 +3173,15 @@ mod tests {
         let ready = bulk_test_row(&pool, "orphan-ready", "vless", "ready", None, None).await;
         let alive = bulk_test_row(&pool, "orphan-alive", "vless", "alive", None, None).await;
         let unknown = bulk_test_row(&pool, "orphan-unknown", "vless", "unknown", None, None).await;
-        let quarantined =
-            bulk_test_row(&pool, "orphan-quarantine", "vless", "quarantine", None, None).await;
+        let quarantined = bulk_test_row(
+            &pool,
+            "orphan-quarantine",
+            "vless",
+            "quarantine",
+            None,
+            None,
+        )
+        .await;
         // Detach every row from the source: the function only acts on rows
         // with no remaining links, exactly what happens after a source
         // delete.
@@ -3126,15 +3200,19 @@ mod tests {
         ] {
             let (status, _q, _l, removed_at) = bulk_status_of(&pool, id).await;
             assert_eq!(status, "removed", "{label} proxy must retire");
-            assert!(removed_at.unwrap_or(0) > 0, "{label} proxy must stamp removed_at");
+            assert!(
+                removed_at.unwrap_or(0) > 0,
+                "{label} proxy must stamp removed_at"
+            );
         }
     }
 
-    /// When the caller protects a status (admin source-delete path with
-    /// `drop_gate = false`), a link-less row in that status is left
-    /// untouched — the probe remains the only authority on its lifecycle.
-    /// Already-`removed` rows stay untouched regardless of the protected
-    /// list (idempotency).
+    /// When the caller protects statuses (admin source-delete path with
+    /// `drop_gate = false` passes `["ready", "unknown"]`), link-less rows
+    /// in those statuses are left untouched — the probe remains the only
+    /// authority on their lifecycle, and the priority queue the only
+    /// authority on a not-yet-verified row. Already-`removed` rows stay
+    /// untouched regardless of the protected list (idempotency).
     #[tokio::test]
     async fn mark_orphans_removed_protects_listed_statuses() {
         let pool = temp_pool().await;
@@ -3142,8 +3220,7 @@ mod tests {
 
         let ready = bulk_test_row(&pool, "protect-ready", "vless", "ready", None, None).await;
         let alive = bulk_test_row(&pool, "protect-alive", "vless", "alive", None, None).await;
-        let unknown =
-            bulk_test_row(&pool, "protect-unknown", "vless", "unknown", None, None).await;
+        let unknown = bulk_test_row(&pool, "protect-unknown", "vless", "unknown", None, None).await;
         // Already-removed row: keeps its removed_at untouched, the
         // protected list does not revive it.
         let already = bulk_test_row(&pool, "protect-gone", "vless", "removed", None, None).await;
@@ -3157,21 +3234,35 @@ mod tests {
             .await
             .unwrap();
 
-        let affected = mark_orphans_removed(&pool, &["ready"]).await.unwrap();
+        // The admin source-delete conservative mode passes both
+        // `ready` (tunnel-verified, the probe is its only authority) and
+        // `unknown` (not yet checked, the priority queue is its only
+        // authority). Both must survive the click.
+        let affected = mark_orphans_removed(&pool, &["ready", "unknown"])
+            .await
+            .unwrap();
         assert_eq!(
-            affected, 2,
-            "only the non-protected orphans (alive + unknown) retire"
+            affected, 1,
+            "only the non-protected orphan (alive) retires; ready and unknown are spared"
         );
         assert_eq!(
             bulk_status_of(&pool, ready).await.0,
             "ready",
             "a protected ready proxy keeps its tier"
         );
+        assert_eq!(
+            bulk_status_of(&pool, unknown).await.0,
+            "unknown",
+            "a protected unknown proxy keeps its status — the priority queue stays the only authority"
+        );
         assert_eq!(bulk_status_of(&pool, alive).await.0, "removed");
-        assert_eq!(bulk_status_of(&pool, unknown).await.0, "removed");
         assert_eq!(bulk_status_of(&pool, already).await.0, "removed");
         let (_status, _q, _l, removed_at) = bulk_status_of(&pool, already).await;
-        assert_eq!(removed_at, Some(1234), "an already-removed row is not re-stamped");
+        assert_eq!(
+            removed_at,
+            Some(1234),
+            "an already-removed row is not re-stamped"
+        );
     }
 
     /// Empty protected-status slice is the strict path; a non-empty slice
@@ -3183,8 +3274,7 @@ mod tests {
 
         let ready = bulk_test_row(&pool, "multi-ready", "vless", "ready", None, None).await;
         let alive = bulk_test_row(&pool, "multi-alive", "vless", "alive", None, None).await;
-        let unknown =
-            bulk_test_row(&pool, "multi-unknown", "vless", "unknown", None, None).await;
+        let unknown = bulk_test_row(&pool, "multi-unknown", "vless", "unknown", None, None).await;
         sqlx::query("DELETE FROM proxy_source_links")
             .execute(&pool)
             .await

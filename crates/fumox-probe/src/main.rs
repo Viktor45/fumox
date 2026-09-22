@@ -1475,12 +1475,11 @@ mod tests {
                 "alive engine must never escalate to abort; got {error}"
             );
         }
-        let (retry_at,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(value, '0') FROM meta WHERE key = 'meow_retry_at'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap_or((0,));
+        let (retry_at,): (i64,) =
+            sqlx::query_as("SELECT COALESCE(value, '0') FROM meta WHERE key = 'meow_retry_at'")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or((0,));
         assert_eq!(
             retry_at, 0,
             "no backoff engaged when the engine is alive and only delay checks fail"

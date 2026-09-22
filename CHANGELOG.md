@@ -112,6 +112,24 @@ CI plumbing) is omitted — it never changes the shipped image.
       text distinguishes `meow-rs transient error`, `meow-rs
       unavailable mid-batch`, and `aborted: meow-rs became unavailable
       mid-batch` accordingly.
+- `unknown` proxies now survive the same upstream churn that
+  `alive`/`ready` already do. The `keep_alive_linger` filter in
+  `reconcile_source` extended its protected set from `('alive',
+  'ready')` to `('alive', 'ready', 'unknown')`: an `unknown` row that
+  vanished from a single fetch is no longer retired in the same
+  transaction — the probe queue (`probe_requests`) and the random T1
+  sample still pick it up via the `EXISTS (... link ...)` predicate,
+  so the row gets its verdict eventually. A subsequent refresh that
+  re-lists the proxy re-stamps the link cleanly; a verdict that moves
+  the row to `quarantine` (or `ready`) ends the linger normally. The
+  admin *Delete source* action now also passes `unknown` alongside
+  `ready` to `mark_orphans_removed` when `[ingest].drop_gate = false`
+  (the default): with `drop_gate = true` the strict policy still
+  retires every orphan. The intent is symmetrical — the probe is the
+  only authority on the lifecycle of a verified proxy, the priority
+  queue is the only authority on a not-yet-checked one, and a single
+  upstream blip or a single admin click should not deny either of
+  them their verdict.
 
 ## 2026-09-20 · sha-47b8873
 

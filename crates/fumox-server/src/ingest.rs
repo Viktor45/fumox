@@ -121,17 +121,14 @@ pub async fn ingest_source(
             // resolution — see [`apply_drop_rules`]. They run before the
             // `removed_as_unknown` revival handoff so the revived set is
             // the same one that survives drop.
-            let (entries_after_drop, dropped_by_pipeline) = match apply_drop_rules(
-                source,
-                filtered.entries,
-                &geo_stamps,
-            ) {
-                Ok(pair) => pair,
-                Err(message) => {
-                    journal_parse_failure(pool, source, &payload, &message, now).await;
-                    return IngestOutcome::ParseFailed { message };
-                }
-            };
+            let (entries_after_drop, dropped_by_pipeline) =
+                match apply_drop_rules(source, filtered.entries, &geo_stamps) {
+                    Ok(pair) => pair,
+                    Err(message) => {
+                        journal_parse_failure(pool, source, &payload, &message, now).await;
+                        return IngestOutcome::ParseFailed { message };
+                    }
+                };
             let found = entries_after_drop.len();
             // Alive-linger. `[ingest].drop_gate` decides whether
             // a source's drop rules disable it: gated (true) — a rule added
@@ -248,19 +245,16 @@ pub async fn dry_run_source(
             // resolver is async-and-cached so a re-fetch in dry-run adds
             // at most one round-trip per unseen host.
             let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
-            let (kept_entries, dropped) = match apply_drop_rules(
-                source,
-                filtered.entries,
-                &geo_stamps,
-            ) {
-                Ok(pair) => pair,
-                Err(message) => {
-                    return DryRunOutcome::ParseFailed {
-                        http_status: payload.http_status,
-                        message,
+            let (kept_entries, dropped) =
+                match apply_drop_rules(source, filtered.entries, &geo_stamps) {
+                    Ok(pair) => pair,
+                    Err(message) => {
+                        return DryRunOutcome::ParseFailed {
+                            http_status: payload.http_status,
+                            message,
+                        };
                     }
-                }
-            };
+                };
             let sample = kept_entries
                 .iter()
                 .take(10)

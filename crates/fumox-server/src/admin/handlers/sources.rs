@@ -1187,9 +1187,17 @@ pub async fn source_delete(
     // reconciliation never resets it — a proxy that reappears in a fetch
     // keeps its state. With `drop_gate = false` the admin click is
     // intentionally conservative: a `ready` row is tunnel-verified and
-    // should not be retired just because its source went away — the probe
-    // is the only authority on the lifecycle of a verified proxy.
-    let protected: &[&str] = if state.ingest.drop_gate { &[] } else { &["ready"] };
+    // an `unknown` row has not yet had its first verdict — neither
+    // should be retired just because its source went away. The probe is
+    // the only authority on the lifecycle of a verified proxy, and the
+    // priority queue is the only authority on a not-yet-checked one.
+    // With `drop_gate = true` the strict policy applies and every
+    // orphan retires.
+    let protected: &[&str] = if state.ingest.drop_gate {
+        &[]
+    } else {
+        &["ready", "unknown"]
+    };
     match proxies::mark_orphans_removed(&state.pool, protected).await {
         Ok(orphans) if orphans > 0 => {
             tracing::info!(orphans, "orphaned proxies marked removed");

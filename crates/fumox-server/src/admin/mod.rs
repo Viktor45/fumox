@@ -829,7 +829,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        assert!(html.contains("Дашборд"));
+        assert!(html.contains("Обзор"));
 
         // Security headers are present on every admin response.
         let response = app
@@ -1764,7 +1764,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        assert!(html.contains("Probe"));
+        assert!(html.contains("Проверка"));
         assert!(html.contains("4242")); // pid from the heartbeat
         assert!(html.contains("sick-proxy")); // quarantine queue row
         assert!(html.contains("q.example.com"));
@@ -2203,7 +2203,7 @@ mod tests {
         let html = String::from_utf8_lossy(&html).into_owned();
 
         // The merged page renders every former stats panel.
-        assert!(html.contains("Дашборд"), "{html}");
+        assert!(html.contains("Обзор"), "{html}");
         assert!(html.contains("Прокси по источникам"), "{html}");
         assert!(html.contains("Самые готовые прокси"), "{html}");
         // The new Top-N picker renders the default 10 selected.
@@ -2841,7 +2841,7 @@ mod tests {
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
         assert!(html.contains("lang=\"ru\""));
-        assert!(html.contains("Дашборд"));
+        assert!(html.contains("Обзор"));
 
         // With fumox_lang=en the same page renders in English.
         let response = app
@@ -2858,7 +2858,7 @@ mod tests {
         let html = String::from_utf8_lossy(&html);
         assert!(html.contains("lang=\"en\""));
         assert!(html.contains("Dashboard"));
-        assert!(!html.contains("Дашборд"));
+        assert!(!html.contains("Обзор"));
     }
 
     #[tokio::test]
@@ -4094,10 +4094,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        let html = String::from_utf8_lossy(
-            &response.into_body().collect().await.unwrap().to_bytes(),
-        )
-        .into_owned();
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
         assert!(html.contains(r#"name="ped_drop_0_match""#), "{html}");
         assert!(!html.contains(r#"name="ped_drop_0_asns""#), "{html}");
 
@@ -4119,11 +4118,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        let html = String::from_utf8_lossy(
-            &response.into_body().collect().await.unwrap().to_bytes(),
-        )
-        .into_owned();
-        assert!(html.contains(r#"name="ped_drop_0_asns" value="24940""#), "{html}");
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(
+            html.contains(r#"name="ped_drop_0_asns" value="24940""#),
+            "{html}"
+        );
         assert!(
             !html.contains(r#"name="ped_drop_0_match""#),
             "ASN-mode row must not carry a match input: {html}"
@@ -4156,12 +4157,14 @@ mod tests {
             ))
             .await
             .unwrap();
-        let html = String::from_utf8_lossy(
-            &response.into_body().collect().await.unwrap().to_bytes(),
-        )
-        .into_owned();
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
         assert!(html.contains(r#"name="ped_drop_0_asns""#), "{html}");
-        assert!(html.contains(r#"name="ped_drop_1_match" value="\.cn$""#), "{html}");
+        assert!(
+            html.contains(r#"name="ped_drop_1_match" value="\.cn$""#),
+            "{html}"
+        );
         assert!(html.contains(r#"name="ped_drop_1_target""#), "{html}");
     }
 
@@ -4193,11 +4196,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        let html = String::from_utf8_lossy(
-            &response.into_body().collect().await.unwrap().to_bytes(),
-        )
-        .into_owned();
-        assert!(html.contains(r#"name="ped_drop_1_match""#), "expected an appended row: {html}");
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(
+            html.contains(r#"name="ped_drop_1_match""#),
+            "expected an appended row: {html}"
+        );
 
         // With `?render=1` — round-trip without append.
         let response = app
@@ -4210,10 +4215,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        let html = String::from_utf8_lossy(
-            &response.into_body().collect().await.unwrap().to_bytes(),
-        )
-        .into_owned();
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
         assert!(html.contains(r#"name="ped_drop_0_match""#), "{html}");
         assert!(
             !html.contains(r#"name="ped_drop_1_match""#),

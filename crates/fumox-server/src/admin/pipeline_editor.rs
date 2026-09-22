@@ -2274,18 +2274,18 @@ mod tests {
         let state = BuilderState::new();
         let view = BuilderView::new(&state);
         let widget = WidgetFragment {
-                lang: lang.clone(),
-                builder: view,
-                csrf: "csrf-token".into(),
-                mode: "builder",
-                pipeline_value: String::new(),
-                preview_html: "<p>placeholder</p>".into(),
-                raw_warning: false,
-                error: None,
-                profile: false,
-            }
-            .render()
-            .unwrap_or_default();
+            lang: lang.clone(),
+            builder: view,
+            csrf: "csrf-token".into(),
+            mode: "builder",
+            pipeline_value: String::new(),
+            preview_html: "<p>placeholder</p>".into(),
+            raw_warning: false,
+            error: None,
+            profile: false,
+        }
+        .render()
+        .unwrap_or_default();
         // The preview wrapper listens for both `change` and `input` with a
         // 300ms debounce.
         assert!(

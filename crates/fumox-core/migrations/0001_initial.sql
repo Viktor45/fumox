@@ -1,4 +1,4 @@
--- Fumox initial schema — transcribed from docs/DATABASE.md v0.4.
+-- Fumox initial schema.
 --
 -- Connection-level PRAGMAs (journal_mode=WAL, foreign_keys=ON, busy_timeout)
 -- are applied by fumox_core::db::connect_pool on every connection and are
@@ -19,13 +19,13 @@ CREATE TABLE sources (
     protocols       TEXT,                        -- JSON array of scheme names, NULL = auto-detect
     cache_ttl_seconds INTEGER NOT NULL DEFAULT 3600,
     tags            TEXT,                        -- JSON array of strings
-    pipeline        TEXT,                        -- JSON: processing rules (SPEC §5)
+    pipeline        TEXT,                        -- JSON: per-source processing rules (admin pipeline editor)
     headers         TEXT,                        -- JSON: extra HTTP headers for fetch
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
     last_fetched_at INTEGER,                     -- last successful fetch
     last_error      TEXT,                        -- last fetch error message
-    error_class     TEXT                         -- 'network'|'http_server'|'http_client'|'parse_error' (NULL = success; SPEC §10.2)
+    error_class     TEXT                         -- 'network'|'http_server'|'http_client'|'parse_error' (NULL = success)
 );
 CREATE INDEX idx_sources_enabled ON sources(enabled);
 
@@ -35,7 +35,7 @@ CREATE INDEX idx_sources_enabled ON sources(enabled);
 CREATE TABLE profiles (
     id              TEXT PRIMARY KEY,            -- nanoid(12); doubles as the /sub/{id} token when slug is unset
     slug            TEXT UNIQUE,                 -- human-readable identifier (for /sub/{slug})
-    access_token    TEXT,                        -- optional /sub access token (NULL = public; SPEC §10.1)
+    access_token    TEXT,                        -- optional /sub access token; NULL means the profile is served without authentication
     name            TEXT NOT NULL,
     output_format   TEXT NOT NULL DEFAULT 'uri_list', -- uri_list|base64|clash|sing_box
     pipeline        TEXT,                        -- JSON: rule overrides
@@ -56,7 +56,7 @@ CREATE TABLE profile_sources (
 -- ─────────────────────────────────────────────
 CREATE TABLE proxies (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint     TEXT NOT NULL UNIQUE,        -- stable dedup key (DATABASE.md «Fingerprint»)
+    fingerprint     TEXT NOT NULL UNIQUE,        -- stable dedup key (per-scheme hash of the connection line)
     scheme          TEXT NOT NULL,               -- vless|vmess|trojan|ss|hysteria2|tuic|mieru|socks5|naive
     name            TEXT NOT NULL DEFAULT '',    -- display name (fragment / ps)
     host            TEXT NOT NULL,
@@ -117,7 +117,7 @@ CREATE TABLE probe_results (
     ok          INTEGER NOT NULL,                -- 0/1
     latency_ms  INTEGER,                         -- NULL when unreachable
     error       TEXT,                            -- error text on failure
-    probe_kind  TEXT NOT NULL DEFAULT 'tcp'      -- 'tcp' | 'tls' | 't2' | (later 'speed'); t2 = real check via meow-rs (SPEC §8.1)
+    probe_kind  TEXT NOT NULL DEFAULT 'tcp'      -- 'tcp' or 'tls' for T1 (TCP/TLS reachability); 't2' for a real tunnel check via meow-rs; 'speed' reserved for a future speed test
 );
 CREATE INDEX idx_probe_proxy_time ON probe_results(proxy_id, checked_at);
 CREATE INDEX idx_probe_time ON probe_results(checked_at); -- history retention
@@ -150,7 +150,7 @@ CREATE TABLE fetch_log (
     bytes       INTEGER,
     proxies_found INTEGER,                       -- how many proxies were recognized
     error       TEXT,
-    error_class TEXT                          -- 'network'|'http_server'|'http_client'|'parse_error' (NULL = success; SPEC §10.2)
+    error_class TEXT                          -- 'network'|'http_server'|'http_client'|'parse_error' (NULL = success)
 );
 CREATE INDEX idx_fetch_source_time ON fetch_log(source_id, fetched_at);
 CREATE INDEX idx_fetch_time ON fetch_log(fetched_at); -- admin journal (time ordering)

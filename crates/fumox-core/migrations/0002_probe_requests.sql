@@ -1,5 +1,5 @@
 -- ─────────────────────────────────────────────
--- Probe priority queue (SPEC §8.3): fumox-server enqueues freshly ingested
+-- Probe priority queue: fumox-server enqueues freshly ingested
 -- `unknown` proxies of T1-probeable schemes at source-refresh time (bounded
 -- by [probe].refresh_check_limit); fumox-probe drains the queue at the start
 -- of every cycle, newest first, then falls back to the random sample.

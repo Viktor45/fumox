@@ -285,8 +285,10 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         Err(err) => return server_error(lang, &err),
     };
 
-    // Longest-living alive proxies: oldest `created_at` first — the ones
-    // that have been in the base the longest while still alive.
+    // Longest-living ready proxies: oldest `created_at` first — the
+    // tunnel-verified tier (`ready`) is a strict subset of `alive`, set
+    // only by a successful T2, so showing the top-N there surfaces the
+    // proxies that have stayed end-to-end working the longest.
     let top_alive: Vec<TopAliveRow> = match sqlx::query_as(
         "SELECT p.id, p.name, p.scheme, p.host, p.port, p.latency_ms, p.geo_country,
                 p.created_at,
@@ -294,7 +296,7 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
          FROM proxies p
          JOIN proxy_source_links l ON l.proxy_id = p.id
          JOIN sources s ON s.id = l.source_id
-         WHERE p.status = 'alive'
+         WHERE p.status = 'ready'
          GROUP BY p.id
          ORDER BY p.created_at ASC, p.id ASC
          LIMIT ?",

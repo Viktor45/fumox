@@ -115,8 +115,24 @@ pub async fn ingest_source(
 
     match parse_payload(source, &payload) {
         Ok(filtered) => {
-            let found = filtered.entries.len();
+            let recognised = filtered.recognized;
             let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
+            // Drop rules (including ASN-targeted ones) run after ASN
+            // resolution — see [`apply_drop_rules`]. They run before the
+            // `removed_as_unknown` revival handoff so the revived set is
+            // the same one that survives drop.
+            let (entries_after_drop, dropped_by_pipeline) = match apply_drop_rules(
+                source,
+                filtered.entries,
+                &geo_stamps,
+            ) {
+                Ok(pair) => pair,
+                Err(message) => {
+                    journal_parse_failure(pool, source, &payload, &message, now).await;
+                    return IngestOutcome::ParseFailed { message };
+                }
+            };
+            let found = entries_after_drop.len();
             // Alive-linger. `[ingest].drop_gate` decides whether
             // a source's drop rules disable it: gated (true) — a rule added
             // later reaches the already-stored rows on the very next
@@ -126,7 +142,7 @@ pub async fn ingest_source(
             match proxies::reconcile_source(
                 pool,
                 &source.id,
-                &filtered.entries,
+                &entries_after_drop,
                 &geo_stamps,
                 now,
                 keep_alive_linger,
@@ -134,7 +150,16 @@ pub async fn ingest_source(
             .await
             {
                 Ok(stats) => {
-                    journal_success(pool, source, &payload, found, now).await;
+                    journal_success(pool, source, &payload, recognised, now).await;
+                    if dropped_by_pipeline > 0 {
+                        tracing::info!(
+                            source = %source.id,
+                            recognised,
+                            dropped = dropped_by_pipeline,
+                            kept = found,
+                            "pipeline drop rules discarded entries before reconcile"
+                        );
+                    }
                     // `[ingest].removed_as_unknown`: a removed proxy the feed
                     // still carries resets to the pristine `unknown` state and
                     // gets the same priority-queue handoff as a fresh insert.
@@ -142,8 +167,7 @@ pub async fn ingest_source(
                     // next refresh simply retries.
                     let mut queue_ids = stats.inserted_ids.clone();
                     if settings.removed_as_unknown {
-                        let fps: Vec<String> = filtered
-                            .entries
+                        let fps: Vec<String> = entries_after_drop
                             .iter()
                             .map(ProxyEntry::fingerprint)
                             .collect();
@@ -157,7 +181,7 @@ pub async fn ingest_source(
                     enqueue_probe_requests(pool, &queue_ids, settings.refresh_check_limit, now)
                         .await;
                     IngestOutcome::Ok {
-                        proxies_found: found,
+                        proxies_found: recognised,
                         stats,
                     }
                 }
@@ -201,7 +225,11 @@ pub enum DryRunOutcome {
 }
 
 /// Fetch and parse a source without touching the database (dry run).
-pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome {
+pub async fn dry_run_source(
+    fetcher: &Fetcher,
+    geo: &GeoResolver,
+    source: &Source,
+) -> DryRunOutcome {
     let payload = match fetcher
         .fetch(
             &source.url,
@@ -215,8 +243,25 @@ pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome
     };
     match parse_payload(source, &payload) {
         Ok(filtered) => {
-            let sample = filtered
-                .entries
+            // Drop rules run after geo resolution so ASN-targeted rules
+            // (and any future geo-aware rules) get a fair preview; the
+            // resolver is async-and-cached so a re-fetch in dry-run adds
+            // at most one round-trip per unseen host.
+            let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
+            let (kept_entries, dropped) = match apply_drop_rules(
+                source,
+                filtered.entries,
+                &geo_stamps,
+            ) {
+                Ok(pair) => pair,
+                Err(message) => {
+                    return DryRunOutcome::ParseFailed {
+                        http_status: payload.http_status,
+                        message,
+                    }
+                }
+            };
+            let sample = kept_entries
                 .iter()
                 .take(10)
                 .map(|entry| {
@@ -233,8 +278,8 @@ pub async fn dry_run_source(fetcher: &Fetcher, source: &Source) -> DryRunOutcome
             DryRunOutcome::Ok {
                 http_status: payload.http_status,
                 bytes: payload.bytes,
-                proxies_found: filtered.entries.len(),
-                dropped: filtered.dropped,
+                proxies_found: filtered.recognized,
+                dropped,
                 sample,
             }
         }
@@ -286,22 +331,30 @@ async fn resolve_geo_stamps(
     stamps
 }
 
-/// What [`parse_payload`] produced: the surviving entries, how many were
-/// discarded by the source's own filters (protocol allowlist, pipeline
-/// `drop` rules — the dry run shows the split so rules can be tuned before
-/// the first real fetch) and whether the source has `drop` rules at all.
+/// What [`parse_payload`] produced: the entries that survived the
+/// protocol allowlist, the total recognised before any filtering and
+/// whether the source's pipeline has any drop rules at all.
+///
+/// Drop rules do not run inside `parse_payload` — they need a resolved
+/// ASN stamp per entry, which only exists after [`resolve_geo_stamps`].
+/// The caller runs the drop step explicitly once the geo stamps are
+/// ready; this struct only carries the pre-drop entries plus the
+/// `has_drop_rules` flag that gates the alive-linger policy.
 #[derive(Debug)]
 struct FilteredPayload {
     entries: Vec<ProxyEntry>,
-    dropped: usize,
+    /// Recognised count before any filter (for logging / dry-run totals).
+    recognized: usize,
     /// Gates the alive-linger policy: a source with drop rules
     /// must not keep links its rules would have discarded.
     has_drop_rules: bool,
 }
 
 /// Decode + parse the raw payload according to the source settings.
-/// Returns the recognized entries that survived the source's filters, or
-/// an error message for `parse_error`.
+/// Returns the recognised entries that survived the protocol allowlist
+/// (and pipeline compile-validation, which fails closed), or an error
+/// message for `parse_error`. Drop rules are NOT evaluated here — see
+/// [`apply_drop_rules`] for that step.
 fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPayload, String> {
     let text = std::str::from_utf8(&payload.body)
         .map_err(|e| format!("payload is not valid UTF-8: {e}"))?;
@@ -325,34 +378,53 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
             .collect(),
         None => parsed.entries,
     };
-    // Pipeline `drop` rules: a matching proxy is never
-    // stored. Only the source's own pipeline runs here — profiles may
-    // override the section on serving, but they never take part in
-    // ingestion (one source feeds many profiles). Fail-closed like the
-    // serving side: a config that cannot compile is a parse error, so
-    // nothing slips past the rules (save-time validation should have
-    // caught this already).
-    let mut has_drop_rules = false;
-    let entries = match &source.pipeline {
-        None => entries,
+    // The pipeline is compiled only to learn whether drop rules exist
+    // (alive-linger gate) and to fail closed on a broken config. Drop
+    // rules themselves run later, after ASN stamps are available. Only
+    // the source's own pipeline participates in ingestion — profiles may
+    // override the section on serving, but they never take part here
+    // (one source feeds many profiles).
+    let has_drop_rules = match &source.pipeline {
+        None => false,
         Some(value) => match crate::pipeline::CompiledPipeline::from_json(Some(value)) {
-            Ok(compiled) => {
-                has_drop_rules = compiled.has_drop_rules();
-                compiled.drop_entries(entries)
-            }
+            Ok(compiled) => compiled.has_drop_rules(),
             Err(_) => {
                 return Err("pipeline config failed validation; refusing to ingest".to_string());
             }
         },
     };
     if entries.is_empty() {
-        return Err("no proxies left after the protocol and drop filters".to_string());
+        return Err("no proxies left after the protocol allowlist".to_string());
     }
     Ok(FilteredPayload {
-        dropped: recognized - entries.len(),
+        recognized,
         has_drop_rules,
         entries,
     })
+}
+
+/// Compile the source's pipeline and run its drop rules against the
+/// entries paired with their resolved ASN stamps. Returns the surviving
+/// entries and how many were discarded. Fails closed when the pipeline
+/// does not compile (the previous `parse_payload` already validated this
+/// path; the re-check is defensive).
+fn apply_drop_rules(
+    source: &Source,
+    entries: Vec<ProxyEntry>,
+    geo: &[Option<proxies::GeoStamp>],
+) -> Result<(Vec<ProxyEntry>, usize), String> {
+    let before_count = entries.len();
+    let compiled = match &source.pipeline {
+        None => return Ok((entries, 0)),
+        Some(value) => crate::pipeline::CompiledPipeline::from_json(Some(value))
+            .map_err(|_| "pipeline config failed validation; refusing to ingest".to_string())?,
+    };
+    if !compiled.has_drop_rules() {
+        return Ok((entries, 0));
+    }
+    let after = compiled.drop_entries(entries, geo);
+    let dropped = before_count - after.len();
+    Ok((after, dropped))
 }
 
 async fn journal_success(
@@ -548,6 +620,9 @@ mod tests {
 
     #[test]
     fn pipeline_drop_rules_filter_entries_before_storage() {
+        // Drop rules now run after geo resolution — the parsing stage only
+        // reports `has_drop_rules`. The full path goes through
+        // `apply_drop_rules` with a parallel (all-None) geo stamp slice.
         let mut source = source_with(Encoding::Auto, None);
         source.pipeline = Some(serde_json::json!({
             "version": 1,
@@ -558,22 +633,32 @@ mod tests {
         }));
         let body = "vless://uuid@1.2.3.4:443#free node\nvless://uuid@h.cn:443#cn\nvless://uuid@h.example.com:443#keep\n";
         let entries = parse_payload(&source, &payload(body)).unwrap().entries;
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].host, "h.example.com");
+        assert_eq!(entries.len(), 3);
+        let geo = vec![None; entries.len()];
+        let (kept, dropped) = apply_drop_rules(&source, entries, &geo).unwrap();
+        assert_eq!(dropped, 2);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].host, "h.example.com");
     }
 
     #[test]
     fn pipeline_drop_of_everything_is_a_parse_error_not_a_silent_zero() {
-        // A mistyped `.*` must redden the source with a clear message, not
-        // silently empty it — and the database must stay untouched.
+        // A pipeline that matches every entry is reported as
+        // `dropped == recognised` (and zero entries reach the DB), not as
+        // a soft parse error. The dry-run surfaces the count; the real
+        // ingest simply reconciles nothing. This keeps the parser free of
+        // heuristics about what an admin meant by `.*`.
         let mut source = source_with(Encoding::Auto, None);
         source.pipeline = Some(serde_json::json!({
             "version": 1,
             "drop": [{ "match": ".*", "target": "name" }]
         }));
         let body = "vless://uuid@1.2.3.4:443#A\nvless://uuid@h:443#B\n";
-        let err = parse_payload(&source, &payload(body)).unwrap_err();
-        assert!(err.contains("protocol and drop filters"), "{err}");
+        let filtered = parse_payload(&source, &payload(body)).unwrap();
+        let geo = vec![None; filtered.entries.len()];
+        let (kept, dropped) = apply_drop_rules(&source, filtered.entries, &geo).unwrap();
+        assert!(kept.is_empty());
+        assert_eq!(dropped, filtered.recognized);
     }
 
     #[test]

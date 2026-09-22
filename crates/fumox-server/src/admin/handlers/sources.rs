@@ -1185,8 +1185,12 @@ pub async fn source_delete(
     }
     // Orphaned proxies (no remaining links) transition to `removed`;
     // reconciliation never resets it — a proxy that reappears in a fetch
-    // keeps its state.
-    match proxies::mark_orphans_removed(&state.pool).await {
+    // keeps its state. With `drop_gate = false` the admin click is
+    // intentionally conservative: a `ready` row is tunnel-verified and
+    // should not be retired just because its source went away — the probe
+    // is the only authority on the lifecycle of a verified proxy.
+    let protected: &[&str] = if state.ingest.drop_gate { &[] } else { &["ready"] };
+    match proxies::mark_orphans_removed(&state.pool, protected).await {
         Ok(orphans) if orphans > 0 => {
             tracing::info!(orphans, "orphaned proxies marked removed");
         }
@@ -1249,7 +1253,7 @@ pub async fn source_dry_run(
         Err(err) => return server_error(lang, &err),
     };
 
-    let outcome = crate::ingest::dry_run_source(&state.fetcher, &source).await;
+    let outcome = crate::ingest::dry_run_source(&state.fetcher, &state.geo, &source).await;
     let fragment = match outcome {
         crate::ingest::DryRunOutcome::Ok {
             http_status,

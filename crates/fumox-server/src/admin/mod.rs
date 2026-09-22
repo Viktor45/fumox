@@ -2108,6 +2108,14 @@ mod tests {
                 Some("DE"),
             ),
             (
+                "fp-veteran-ready",
+                "srcS0000001",
+                "ready",
+                500_000,
+                Some(80),
+                Some("DE"),
+            ),
+            (
                 "fp-fast",
                 "srcS0000001",
                 "alive",
@@ -2197,7 +2205,7 @@ mod tests {
         // The merged page renders every former stats panel.
         assert!(html.contains("Дашборд"), "{html}");
         assert!(html.contains("Прокси по источникам"), "{html}");
-        assert!(html.contains("Самые живые прокси"), "{html}");
+        assert!(html.contains("Самые готовые прокси"), "{html}");
         // The new Top-N picker renders the default 10 selected.
         assert!(html.contains("Показать топ:"), "{html}");
         // The new Top Failure Reasons panel renders even when empty.

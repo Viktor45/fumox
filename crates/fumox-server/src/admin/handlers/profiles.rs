@@ -440,7 +440,7 @@ async fn build_profile_from_form(
     // from the widget fields server-side (a stale `pipeline` textarea, if
     // any, is ignored); in raw mode the textarea is the input, as before.
     // The tri-state radios let a profile explicitly reset a source's
-    // section to the SPEC defaults by emitting an empty section.
+    // section to the built-in defaults by emitting an empty section.
     let pipeline = if get("pipeline_mode") == "builder" {
         let generated = BuilderState::from_form(form).emit();
         match generated {

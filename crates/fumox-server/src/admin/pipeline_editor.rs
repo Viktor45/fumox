@@ -52,11 +52,16 @@ pub(crate) struct DropRow {
     pub flags: String,
     pub target: String,
     pub param_key: String,
+    /// AS numbers for `target: "asn"`. Free-text comma-separated input;
+    /// the validator parses and the JSON section emits an array. Empty
+    /// outside the ASN target — ASN rules carry no `match` field.
+    pub asns: String,
 }
 
 impl DropRow {
     /// The rule's `target` JSON value — the same recombination semantics
-    /// as [`emit_rename_target`].
+    /// as [`emit_rename_target`], with an extra `asn` literal that
+    /// signals the ASN-list branch (no `param:` prefix).
     fn target_value(&self) -> Option<String> {
         match self.target.trim() {
             "" | "name" => None,
@@ -74,7 +79,7 @@ impl DropRow {
 /// The `*_defaults` flags are the profile tri-state: a
 /// profile section replaces the source's section wholesale, so besides "not
 /// set" (inherit the source's rule) and "set" there is "explicit defaults" —
-/// an empty section that resets the source's rule to the SPEC defaults.
+/// an empty section that resets the source's rule to the built-in defaults.
 /// `rename_skip` is the "not set" choice for rename, whose only state
 /// besides the rules themselves is the empty `[]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -102,7 +107,7 @@ pub(crate) struct BuilderState {
     pub geo_set: bool,
     pub geo_defaults: bool,
     pub geo_enabled: bool,
-    /// Empty means the SPEC default template (never emitted, see [`emit`]).
+    /// Empty means the built-in default template (never emitted, see [`emit`]).
     pub geo_template: String,
     pub health_set: bool,
     pub health_defaults: bool,
@@ -164,7 +169,7 @@ pub(crate) fn preset(name: &str) -> BuilderState {
 }
 
 impl BuilderState {
-    /// A fresh state: every section unset, checkboxes at their SPEC defaults.
+    /// A fresh state: every section unset, checkboxes at their built-in defaults.
     pub(crate) fn new() -> Self {
         Self {
             forbid_insecure: true,
@@ -236,6 +241,7 @@ impl BuilderState {
                     "flags" => row.flags = value,
                     "target" => row.target = value,
                     "key" => row.param_key = value,
+                    "asns" => row.asns = value,
                     _ => {}
                 }
             }
@@ -355,25 +361,48 @@ impl BuilderState {
             // An explicit `[]`: a profile resets the source's drop rules.
             map.insert("drop".into(), serde_json::Value::Array(Vec::new()));
         } else if !self.drop_skip {
-            // Same work-in-progress contract as rename: empty `match` lines
-            // never reach the JSON.
+            // Two flavours per row:
+            //  * `target == "asn"` → ASN-list rule (no `match`).
+            //  * any other target → regex rule with optional `match` /
+            //    `flags`. The "work-in-progress" filter is on `match` for
+            //    regex rows and on `asns` for ASN rows.
             let rules: Vec<serde_json::Value> = self
                 .drop
                 .iter()
-                .filter(|row| !row.match_pattern.is_empty())
+                .filter(|row| {
+                    if row.target.trim() == "asn" {
+                        !row.asns.trim().is_empty()
+                    } else {
+                        !row.match_pattern.is_empty()
+                    }
+                })
                 .map(|row| {
-                    let mut rule = serde_json::Map::new();
-                    rule.insert(
-                        "match".into(),
-                        serde_json::Value::from(row.match_pattern.as_str()),
-                    );
-                    if !row.flags.is_empty() {
-                        rule.insert("flags".into(), serde_json::Value::from(row.flags.as_str()));
+                    if row.target.trim() == "asn" {
+                        let asns: Vec<serde_json::Value> = row
+                            .asns
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(serde_json::Value::from)
+                            .collect();
+                        serde_json::json!({ "target": "asn", "asns": asns })
+                    } else {
+                        let mut rule = serde_json::Map::new();
+                        rule.insert(
+                            "match".into(),
+                            serde_json::Value::from(row.match_pattern.as_str()),
+                        );
+                        if !row.flags.is_empty() {
+                            rule.insert(
+                                "flags".into(),
+                                serde_json::Value::from(row.flags.as_str()),
+                            );
+                        }
+                        if let Some(target) = row.target_value() {
+                            rule.insert("target".into(), serde_json::Value::from(target));
+                        }
+                        serde_json::Value::Object(rule)
                     }
-                    if let Some(target) = row.target_value() {
-                        rule.insert("target".into(), serde_json::Value::from(target));
-                    }
-                    serde_json::Value::Object(rule)
                 })
                 .collect();
             if !rules.is_empty() {
@@ -543,12 +572,13 @@ impl BuilderState {
         }
         // Same raw-guard for drop: an empty `match` discards everything —
         // a real rule the widget cannot express (its empty line means
-        // "not typed yet").
-        if config
-            .drop
-            .as_ref()
-            .is_some_and(|rules| rules.iter().any(|r| r.match_pattern.is_empty()))
-        {
+        // "not typed yet"). ASN-targeted rules carry no pattern by
+        // design; the `asns` field is the source of truth.
+        if config.drop.as_ref().is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|r| r.target.as_deref() != Some("asn") && r.match_pattern.is_empty())
+        }) {
             return Ingest::Raw;
         }
         let mut state = Self::new();
@@ -611,9 +641,17 @@ impl BuilderState {
                 state.drop = rules
                     .into_iter()
                     .map(|rule: DropRule| {
-                        // The same target split as rename rows.
+                        // ASN rules: round-trip the JSON array back into a
+                        // comma-separated free-text field. Other targets
+                        // follow the existing rename split.
+                        let asns = rule
+                            .asns
+                            .as_ref()
+                            .map(|list| list.join(", "))
+                            .unwrap_or_default();
                         let (target, param_key) = match rule.target.as_deref() {
                             None | Some("name") => (String::new(), String::new()),
+                            Some("asn") => ("asn".to_string(), String::new()),
                             Some(raw) => match raw.strip_prefix("param:") {
                                 Some(key) => ("param".to_string(), key.to_string()),
                                 None => (raw.to_string(), String::new()),
@@ -624,6 +662,7 @@ impl BuilderState {
                             flags: rule.flags,
                             target,
                             param_key,
+                            asns,
                         }
                     })
                     .collect();
@@ -636,7 +675,7 @@ impl BuilderState {
             if has_values {
                 state.geo_set = true;
                 state.geo_enabled = geo.enabled;
-                // The SPEC default template is shown as the empty value: the
+                // The built-in default template is shown as the empty value: the
                 // field's placeholder carries it and emit never writes it out.
                 if template != DEFAULT_GEO_TEMPLATE {
                     state.geo_template = geo.template;
@@ -1319,12 +1358,14 @@ mod tests {
                 target: String::new(), // name — implicit
                 param_key: String::new(),
                 flags: "i".into(),
+                asns: String::new(),
             },
             DropRow {
                 match_pattern: "\\.cn$".into(),
                 target: "host".into(),
                 param_key: String::new(),
                 flags: String::new(),
+                asns: String::new(),
             },
         ];
         assert_eq!(
@@ -1345,6 +1386,61 @@ mod tests {
         };
         assert_eq!(rebuilt.drop, s.drop);
         assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_ok());
+    }
+
+    #[test]
+    fn drop_section_emits_and_ingests_back_with_asn_target() {
+        // ASN-targeted rule round-trips: state → JSON → validator → state
+        // is identity, and the emitted JSON matches what the validator
+        // expects.
+        let mut s = state();
+        s.drop = vec![DropRow {
+            match_pattern: String::new(),
+            flags: String::new(),
+            target: "asn".into(),
+            param_key: String::new(),
+            asns: "24940, AS13335".into(),
+        }];
+        assert_eq!(
+            s.emit(),
+            Some(json!({
+                "version": 1,
+                "drop": [{ "target": "asn", "asns": ["24940", "AS13335"] }]
+            }))
+        );
+        let Some(json) = s.emit() else {
+            panic!("must emit")
+        };
+        // Validator accepts it and produces an ASN-list compiled drop.
+        assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_ok());
+        // Round-trip: ingest back into a fresh state and compare.
+        let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
+            panic!("must parse");
+        };
+        assert_eq!(rebuilt.drop, s.drop);
+    }
+
+    #[test]
+    fn drop_asn_target_emit_skips_match_and_flags() {
+        // Even if the user typed something into the match field of an
+        // ASN row by accident, the JSON emit must not include it — the
+        // validator rejects `match` on ASN rules, so emitting it would
+        // fail the save-time validation.
+        let mut s = state();
+        s.drop = vec![DropRow {
+            match_pattern: "accidental-typing".into(),
+            flags: "i".into(),
+            target: "asn".into(),
+            param_key: String::new(),
+            asns: "24940".into(),
+        }];
+        assert_eq!(
+            s.emit(),
+            Some(json!({
+                "version": 1,
+                "drop": [{ "target": "asn", "asns": ["24940"] }]
+            }))
+        );
     }
 
     #[test]
@@ -1390,12 +1486,14 @@ mod tests {
                     flags: "i".into(),
                     target: "param".into(),
                     param_key: "fp".into(),
+                    asns: String::new(),
                 },
                 DropRow {
                     match_pattern: "\\.cn$".into(),
                     flags: String::new(),
                     target: "host".into(),
                     param_key: String::new(),
+                    asns: String::new(),
                 },
             ]
         );
@@ -1681,7 +1779,7 @@ mod tests {
         assert!(!s.forbid_insecure && !s.geo_enabled && !s.sort_desc);
         assert!(s.rename.is_empty());
         assert_eq!(s.emit(), None);
-        // A rendered widget starts from different defaults — the SPEC ones.
+        // A rendered widget starts from different defaults — the built-in ones.
         let fresh = BuilderState::new();
         assert!(fresh.forbid_insecure && fresh.geo_enabled);
         assert_eq!(fresh.exclude_statuses, ["quarantine", "removed"]);
@@ -2082,6 +2180,7 @@ mod tests {
                 target: "host".into(),
                 param_key: String::new(),
                 flags: String::new(),
+                asns: String::new(),
             }],
             ..BuilderState::new()
         };
@@ -2453,7 +2552,7 @@ mod tests {
             ("ped_rename_0_flags".into(), "i".into()),
             ("ped_geo_enabled".into(), "".into()),
             ("ped_geo_template".into(), "{asn} · {name}".into()),
-            // override SPEC default exclude_statuses (q+r) so the
+            // override the built-in default exclude_statuses (q+r) so the
             // builder emits the section
             ("ped_health_exclude".into(), "removed".into()),
             ("ped_health_exclude".into(), "quarantine".into()),
@@ -2488,7 +2587,7 @@ mod tests {
 
     /// Every section's `defaults` branch on the profile form must produce
     /// an explicit empty block in JSON. This is the "profile resets the
-    /// source's section to SPEC defaults" affordance — without the
+    /// source's section to the built-in defaults" affordance — without the
     /// explicit `{}`/`[]`/`null`, the merge would inherit instead of
     /// reset.
     #[test]

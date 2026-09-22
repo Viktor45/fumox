@@ -185,17 +185,32 @@ pub(crate) enum RenameTarget {
 /// mirror of [`RenameRule`] minus `replace` — the field is absent on purpose
 /// (`deny_unknown_fields` rejects a copy-pasted rewrite rule), a drop rule
 /// only selects.
+///
+/// Two flavours share one rule shape:
+/// - regex over `name` / `host` / `port` / `param:KEY` (the rename-style
+///   selectors), with `match` + optional `flags`;
+/// - ASN list against `target: "asn"`, with `asns` carrying the
+///   numbers. The two flavours are mutually exclusive at validation time
+///   — `match` is meaningless against an ASN and `asns` is meaningless
+///   against a regex.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DropRule {
-    #[serde(rename = "match")]
+    /// Regex pattern (regex targets only). Required for every non-ASN
+    /// target; must be empty (or absent) for `target == "asn"`.
+    #[serde(rename = "match", default)]
     pub(crate) match_pattern: String,
     #[serde(default)]
     pub(crate) flags: String,
-    /// Same selector set as rename: `name` (default), `host`, `port`,
-    /// `param:KEY`.
+    /// Selector name: `name` (default), `host`, `port`, `param:KEY`,
+    /// or `asn` (see `asns`).
     #[serde(default)]
     pub(crate) target: Option<String>,
+    /// AS numbers for `target: "asn"`. Accepts both bare (`24940`) and
+    /// prefixed (`AS24940`) spellings, normalised at validation. Required
+    /// when `target == "asn"`; forbidden otherwise.
+    #[serde(default)]
+    pub(crate) asns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -291,11 +306,19 @@ struct CompiledRename {
     target: RenameTarget,
 }
 
-/// A discard rule with its regex compiled at validation time.
+/// A discard rule with its matcher compiled at validation time. The two
+/// variants share one position in [`CompiledPipeline::drop`]: a single
+/// pipeline can mix regex rules and ASN rules.
 #[derive(Debug, Clone)]
-struct CompiledDrop {
-    regex: Regex,
-    target: RenameTarget,
+enum CompiledDrop {
+    /// Regex over a single `ProxyEntry` field (name / host / port / param).
+    Regex {
+        regex: Regex,
+        target: RenameTarget,
+    },
+    /// Discard when the proxy's resolved AS number is in `asns`. Missing
+    /// ASN is not a hit (matches `filter.exclude_asns`).
+    Asn { asns: Vec<u32> },
 }
 
 /// A fully validated, ready-to-run pipeline.
@@ -433,12 +456,57 @@ impl CompiledPipeline {
         if let Some(rules) = config.drop {
             for (idx, rule) in rules.iter().enumerate() {
                 let field = format!("drop[{idx}]");
-                let target = parse_rename_target(&rule.target, &field, &mut errors);
-                if let Some(regex) =
-                    compile_rule_regex(&rule.match_pattern, &rule.flags, &field, &mut errors)
-                    && let Some(target) = target
-                {
-                    compiled.drop.push(CompiledDrop { regex, target });
+                if rule.target.as_deref() == Some("asn") {
+                    // ASN target: `match`/`flags` are meaningless, `asns`
+                    // is required and non-empty. Each entry must parse
+                    // through `asn_number` (the same normaliser the
+                    // serving-side `filter.asns` uses).
+                    if !rule.match_pattern.is_empty() || !rule.flags.is_empty() {
+                        errors.push(PipelineIssue {
+                            key: "pipeline.asn_target_rejects_match",
+                            args: vec![field.clone()],
+                        });
+                    }
+                    match &rule.asns {
+                        Some(raw) if !raw.is_empty() => {
+                            let mut parsed_asns = Vec::with_capacity(raw.len());
+                            for raw_asn in raw {
+                                match asn_number(raw_asn) {
+                                    Some(n) => parsed_asns.push(n),
+                                    None => errors.push(PipelineIssue {
+                                        key: "pipeline.unknown_asn",
+                                        args: vec![field.clone(), raw_asn.clone()],
+                                    }),
+                                }
+                            }
+                            if parsed_asns.len() == raw.len() {
+                                compiled.drop.push(CompiledDrop::Asn { asns: parsed_asns });
+                            }
+                        }
+                        _ => errors.push(PipelineIssue {
+                            key: "pipeline.asn_target_requires_asns",
+                            args: vec![field],
+                        }),
+                    }
+                } else {
+                    // Regex target: existing machinery, with the extra
+                    // guard that `asns` is not allowed here.
+                    if rule.asns.is_some() {
+                        errors.push(PipelineIssue {
+                            key: "pipeline.non_asn_target_rejects_asns",
+                            args: vec![field.clone()],
+                        });
+                    }
+                    let target = parse_rename_target(&rule.target, &field, &mut errors);
+                    if let Some(regex) = compile_rule_regex(
+                        &rule.match_pattern,
+                        &rule.flags,
+                        &field,
+                        &mut errors,
+                    ) && let Some(target) = target
+                    {
+                        compiled.drop.push(CompiledDrop::Regex { regex, target });
+                    }
                 }
             }
         }
@@ -522,27 +590,48 @@ impl CompiledPipeline {
         out
     }
 
-    /// Discard entries matching the `drop` rules (ingestion side
-    /// step 3): a matching proxy is never stored, reconciled, geo-resolved
-    /// or queued for probing. Only the drop step runs here — the pipeline's
-    /// other sections are serving-side by design (a profile may override
-    /// them, but profiles never take part in ingestion), and the drop
-    /// selectors must see the original values exactly as the serving-side
-    /// pass does.
-    pub fn drop_entries(&self, entries: Vec<ProxyEntry>) -> Vec<ProxyEntry> {
-        if self.drop.is_empty() {
-            return entries;
-        }
-        entries
-            .into_iter()
-            .filter(|entry| {
-                !self
-                    .drop
-                    .iter()
-                    .any(|rule| matches_target(entry, &rule.regex, &rule.target))
-            })
-            .collect()
+/// Discard entries matching the `drop` rules (ingestion side
+/// step 3): a matching proxy is never stored, reconciled, geo-resolved
+/// or queued for probing. Only the drop step runs here — the pipeline's
+/// other sections are serving-side by design (a profile may override
+/// them, but profiles never take part in ingestion), and the drop
+/// selectors must see the original values exactly as the serving-side
+/// pass does.
+///
+/// `geo` carries the resolved ASN stamps parallel to `entries`
+/// (`geo.len() == entries.len()`); ASN-targeted rules consult this slice
+/// and a missing stamp is never a hit (matches `filter.exclude_asns`
+/// semantics). The caller resolves geo before calling this so the
+/// function itself does not need to be async.
+pub fn drop_entries(
+    &self,
+    entries: Vec<ProxyEntry>,
+    geo: &[Option<fumox_core::repo::proxies::GeoStamp>],
+) -> Vec<ProxyEntry> {
+    if self.drop.is_empty() {
+        return entries;
     }
+    debug_assert_eq!(
+        entries.len(),
+        geo.len(),
+        "drop_entries: entries and geo must be parallel slices"
+    );
+    entries
+        .into_iter()
+        .zip(geo.iter())
+        .filter(|(entry, stamp)| {
+            !self.drop.iter().any(|rule| match rule {
+                CompiledDrop::Regex { regex, target } => matches_target(entry, regex, target),
+                CompiledDrop::Asn { asns } => stamp
+                    .as_ref()
+                    .and_then(|s| s.asn.as_deref())
+                    .and_then(stored_asn_number)
+                    .is_some_and(|n| asns.contains(&n)),
+            })
+        })
+        .map(|(entry, _)| entry)
+        .collect()
+}
 
     /// Whether any `drop` rule is configured. Reconciliation asks before a
     /// fetch: a source with drop rules never keeps lingering
@@ -602,13 +691,21 @@ impl CompiledPipeline {
         // `rename`: both this serving-side pass and the ingestion-side one
         // must see the original values, or the two would disagree; a
         // rewrite must never decide whether a proxy is stored. Any rule
-        // matching discards the proxy (rules are OR-ed).
+        // matching discards the proxy (rules are OR-ed). ASN-targeted rules
+        // use the candidate's stored `geo_asn`; missing ASN is not a hit
+        // (the same lenient contract as `filter.exclude_asns`).
         if !self.drop.is_empty() {
             candidates.retain(|c| {
-                !self
-                    .drop
-                    .iter()
-                    .any(|rule| matches_target(&c.entry, &rule.regex, &rule.target))
+                !self.drop.iter().any(|rule| match rule {
+                    CompiledDrop::Regex { regex, target } => {
+                        matches_target(&c.entry, regex, target)
+                    }
+                    CompiledDrop::Asn { asns } => c
+                        .geo_asn
+                        .as_deref()
+                        .and_then(stored_asn_number)
+                        .is_some_and(|n| asns.contains(&n)),
+                })
             });
         }
 
@@ -1133,6 +1230,21 @@ mod tests {
         c
     }
 
+    /// Build a `ProxyEntry` for ingestion-side tests: scheme is fixed,
+    /// credential too — the drop rules only look at the chosen fields.
+    fn entry(name: &str, host: &str) -> ProxyEntry {
+        ProxyEntry {
+            scheme: Scheme::Vless,
+            name: name.to_string(),
+            host: host.to_string(),
+            port: 443,
+            credential: "cred".to_string(),
+            params: Vec::new(),
+            raw_path: String::new(),
+            raw_line: String::new(),
+        }
+    }
+
     #[tokio::test]
     async fn asns_allowlist_keeps_only_listed_and_drops_unresolved() {
         let compiled = CompiledPipeline::from_json(Some(&json!({
@@ -1464,6 +1576,254 @@ mod tests {
         let out = compiled.apply(candidates, &inactive_geo()).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].entry.name, "b");
+    }
+
+    #[test]
+    fn drop_by_asn_discards_matching_proxies() {
+        // The pipeline-level helper (`drop_entries`) runs before any DB
+        // interaction, so it is the cheapest place to exercise ASN drop.
+        // Geo stamps are passed in parallel; an empty stamp is "unknown".
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{ "target": "asn", "asns": ["24940"] }]
+        })))
+        .unwrap();
+        let entries = vec![
+            entry("as24940", "h1.example.com"),
+            entry("as13335", "h2.example.com"),
+            entry("as24940-via-prefix", "h3.example.com"),
+        ];
+        let stamps = vec![
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS24940".into()),
+                ..Default::default()
+            }),
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS13335".into()),
+                ..Default::default()
+            }),
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS24940".into()),
+                ..Default::default()
+            }),
+        ];
+        let after = compiled.drop_entries(entries.clone(), &stamps);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].host, "h2.example.com");
+        // Verify the geometry contract: empty stamps leave entries alone.
+        let no_geo = vec![None; entries.len()];
+        let untouched = compiled.drop_entries(entries, &no_geo);
+        assert_eq!(untouched.len(), 3, "missing ASN is not a hit");
+    }
+
+    #[test]
+    fn drop_by_asn_accepts_both_with_and_without_prefix() {
+        // `24940` and `AS24940` in the same `asns` list both match a
+        // stored `AS24940` — the validator normalises through
+        // `asn_number`.
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{ "target": "asn", "asns": ["24940", "AS13335"] }]
+        })))
+        .unwrap();
+        let entries = vec![
+            entry("a", "h1.example.com"),
+            entry("b", "h2.example.com"),
+            entry("c", "h3.example.com"),
+        ];
+        let stamps = vec![
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS24940".into()),
+                ..Default::default()
+            }),
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS13335".into()),
+                ..Default::default()
+            }),
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS99999".into()),
+                ..Default::default()
+            }),
+        ];
+        let after = compiled.drop_entries(entries, &stamps);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].host, "h3.example.com");
+    }
+
+    #[test]
+    fn drop_by_asn_keeps_unresolved_proxies() {
+        // Missing ASN stamp is not a hit (matches `filter.exclude_asns`).
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{ "target": "asn", "asns": ["24940"] }]
+        })))
+        .unwrap();
+        let entries = vec![entry("n", "h.example.com")];
+        let stamps = vec![None];
+        let after = compiled.drop_entries(entries, &stamps);
+        assert_eq!(after.len(), 1);
+    }
+
+    #[test]
+    fn drop_with_text_and_asn_rules_combined() {
+        // Regex over `host` plus ASN list — the same `drop` array holds
+        // both flavours and both fire on a matching entry.
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [
+                { "match": "\\.cn$", "target": "host" },
+                { "target": "asn", "asns": ["24940"] }
+            ]
+        })))
+        .unwrap();
+        let entries = vec![
+            entry("china", "h.cn"),
+            entry("blocked-asn", "h.example.com"),
+            entry("kept", "h.example.com"),
+        ];
+        let stamps = vec![
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS99999".into()),
+                ..Default::default()
+            }),
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS24940".into()),
+                ..Default::default()
+            }),
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS99999".into()),
+                ..Default::default()
+            }),
+        ];
+        let after = compiled.drop_entries(entries, &stamps);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].host, "h.example.com");
+        assert_eq!(after[0].name, "kept");
+    }
+
+    #[test]
+    fn drop_asn_target_requires_asns() {
+        // An ASN rule without `asns` is a field error, never a silent
+        // match-all. The compile path fails closed: no `CompiledPipeline`
+        // is produced.
+        let result = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{ "target": "asn" }]
+        })));
+        let issues = result.expect_err("missing asns must fail compile");
+        assert!(
+            issues.iter().any(|i| i.key == "pipeline.asn_target_requires_asns"),
+            "expected requires-asns error, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn drop_asn_target_rejects_match_field() {
+        let result = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{
+                "target": "asn",
+                "match": "x",
+                "flags": "i",
+                "asns": ["24940"]
+            }]
+        })));
+        let issues = result.expect_err("match/flags on asn rule must fail");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.key == "pipeline.asn_target_rejects_match"),
+            "expected rejects-match error, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn non_asn_target_rejects_asns() {
+        let result = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{
+                "target": "name",
+                "match": "free",
+                "asns": ["24940"]
+            }]
+        })));
+        let issues = result.expect_err("asns on non-asn rule must fail");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.key == "pipeline.non_asn_target_rejects_asns"),
+            "expected non-asn-rejects-asns error, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_target_message_lists_asn_alongside_other_values() {
+        // The rendered text for an unknown target must include `asn` in
+        // the allowed list — admins see the full picture from one
+        // message. We exercise the runtime translator to make sure both
+        // catalogs (en, ru) have been updated, not just the validator.
+        let issues = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{ "target": "foo", "match": "." }]
+        })))
+        .expect_err("unknown target must fail");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.key == "pipeline.unknown_target"),
+            "unknown_target error must be present: {issues:?}"
+        );
+        let locales = crate::admin::i18n::Locales::load(std::path::Path::new(
+            "/nonexistent-locales-dir",
+        ));
+        for code in ["en", "ru"] {
+            let lang = locales.resolve(code);
+            let rendered = lang.t_args(
+                "pipeline.unknown_target",
+                &["drop[0]".to_string(), "foo".to_string()],
+            );
+            assert!(
+                rendered.contains("asn"),
+                "{code} locale must mention asn in allowed targets; got: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_by_asn_invalid_asn_number_is_a_field_error() {
+        // `asns` accepts only digits with optional `AS` prefix. A typo
+        // becomes `pipeline.unknown_asn` and skips the rule rather than
+        // partially compiling it.
+        let result = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{ "target": "asn", "asns": ["24940", "not-a-number"] }]
+        })));
+        let issues = result.expect_err("invalid ASN must fail");
+        assert!(
+            issues.iter().any(|i| i.key == "pipeline.unknown_asn"),
+            "expected unknown_asn error, got {issues:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_by_asn_applies_on_serving_side_too() {
+        // The serving-side drop pass must also fire on ASN-targeted
+        // rules. Build candidates with explicit `geo_asn` and check the
+        // post-apply list.
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{ "target": "asn", "asns": ["24940"] }]
+        })))
+        .unwrap();
+        let mut keep = candidate("keep", Scheme::Vless, "h1.example.com");
+        keep.geo_asn = Some("AS99999".into());
+        let mut drop_me = candidate("drop", Scheme::Vless, "h2.example.com");
+        drop_me.geo_asn = Some("AS24940".into());
+        let mut unresolved = candidate("unresolved", Scheme::Vless, "h3.example.com");
+        unresolved.geo_asn = None;
+        let out = compiled.apply(vec![keep, drop_me, unresolved], &inactive_geo()).await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, vec!["keep", "unresolved"]);
     }
 
     #[tokio::test]

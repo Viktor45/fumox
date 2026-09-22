@@ -387,7 +387,7 @@ pub async fn import_submit(
                 summary: None,
             },
         )
-            .await;
+        .await;
     }
 
     match apply_import(&state, &lang, file).await {

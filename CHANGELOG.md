@@ -51,6 +51,24 @@ CI plumbing) is omitted — it never changes the shipped image.
   shown in the canonical `N/unit` form, response caps human-readable,
   the legacy `[geo].db` is marked as ignored — and the admin token is
   never rendered.
+- The admin *Sources → Delete* action is now conservative on `ready`
+  proxies when `[ingest].drop_gate = false` (the default): a tunnel-
+  verified row is left alone instead of being retired just because its
+  source was removed — the probe keeps being the only authority on its
+  lifecycle. With `drop_gate = true` the strict policy applies and
+  every orphan retires, including `ready`. `mark_orphans_removed` now
+  takes a list of protected statuses; the admin path passes `["ready"]`
+  in the conservative mode and an empty list in the strict one.
+- Pipeline `drop` rules now accept `target: "asn"` with an `asns`
+  array: a proxy whose resolved autonomous-system number matches any
+  listed AS (with or without the `AS` prefix) is discarded at
+  ingestion and from `/sub` output. Unresolved ASNs are kept, matching
+  the existing `filter.exclude_asns` semantics. Drop rules now run
+  after ASN resolution, so the dry-run previews ASN-driven discards
+  too. The pipeline editor's drop section exposes the new target as a
+  fifth dropdown option; the `match`/`flags`/`key` fields are hidden
+  on ASN rows and replaced by a single AS-number input. Regex and ASN
+  rules live side by side in the same `drop` array.
 
 ## 2026-09-20 · sha-47b8873
 

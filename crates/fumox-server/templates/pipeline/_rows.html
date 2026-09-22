@@ -8,6 +8,27 @@
    has no `replace` field: a discard rule only selects, never rewrites. #}
 {% if section == "drop" %}
   {% for row in builder.state.drop %}
+  {% if row.target == "asn" %}
+  <div class="ped-row">
+    <input type="text" name="ped_drop_{{ loop.index0 }}_asns" value="{{ row.asns }}"
+           placeholder="{{ self.t("ped.drop_asns_placeholder") }}" aria-label="{{ self.t("ped.target_asn") }}">
+    <select name="ped_drop_{{ loop.index0 }}_target" aria-label="{{ self.t("ped.rename_target") }}">
+      <option value="asn" selected>{{ self.t("ped.target_asn") }}</option>
+      <option value="name">{{ self.t("ped.target_name") }}</option>
+      <option value="host">{{ self.t("ped.target_host") }}</option>
+      <option value="port">{{ self.t("ped.target_port") }}</option>
+      <option value="param">{{ self.t("ped.target_param") }}</option>
+      {% if row.target != "" && row.target != "name" && row.target != "host" && row.target != "port" && row.target != "param" && row.target != "asn" %}
+      <option value="{{ row.target }}" selected>{{ row.target }}</option>
+      {% endif %}
+    </select>
+    <button class="btn small" type="button"
+            hx-post="/admin/pipeline/rows?section=drop&amp;remove={{ loop.index0 }}"
+            hx-target="#ped-drop-rows" hx-swap="innerHTML"
+            hx-include="[name^='ped_'], [name='_csrf']"
+            title="{{ self.t("ped.rename_remove") }}">✕</button>
+  </div>
+  {% else %}
   <div class="ped-row">
     <input type="text" name="ped_drop_{{ loop.index0 }}_match" value="{{ row.match_pattern }}"
            placeholder="{{ self.t("ped.rename_match") }}" aria-label="{{ self.t("ped.rename_match") }}">
@@ -18,7 +39,8 @@
       <option value="host" {% if row.target == "host" %}selected{% endif %}>{{ self.t("ped.target_host") }}</option>
       <option value="port" {% if row.target == "port" %}selected{% endif %}>{{ self.t("ped.target_port") }}</option>
       <option value="param" {% if row.target == "param" %}selected{% endif %}>{{ self.t("ped.target_param") }}</option>
-      {% if row.target != "" && row.target != "name" && row.target != "host" && row.target != "port" && row.target != "param" %}
+      <option value="asn">{{ self.t("ped.target_asn") }}</option>
+      {% if row.target != "" && row.target != "name" && row.target != "host" && row.target != "port" && row.target != "param" && row.target != "asn" %}
       <option value="{{ row.target }}" selected>{{ row.target }}</option>
       {% endif %}
     </select>
@@ -30,6 +52,7 @@
             hx-include="[name^='ped_'], [name='_csrf']"
             title="{{ self.t("ped.rename_remove") }}">✕</button>
   </div>
+  {% endif %}
   {% endfor %}
 {% else %}
   {% for row in builder.state.rename %}

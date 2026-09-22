@@ -96,8 +96,8 @@ pub struct ProxyRow {
     pub speed_mbps: Option<f64>,
     /// When the most recent T2 attempt failed; NULL means either no T2
     /// attempt yet or a successful T2 since. Filters T1 candidates
-    /// ([`select_t1_candidates`], SPEC §8.3) so a proxy waits out T1 until
-    /// its next T2 succeeds.
+    /// ([`select_t1_candidates`]) so a proxy waits out T1 until its next
+    /// T2 succeeds.
     pub last_t2_failed_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -152,7 +152,10 @@ impl ProxyRow {
 /// by upstream churn. The next refresh to see it back re-stamps the link.
 /// `unknown`/`quarantine`/`removed` proxies are unlinked exactly as before:
 /// an unverified or dying lingerer would accumulate zombie rows. The
-/// admin's source deletion path (`mark_orphans_removed`) ignores linger.
+/// admin's source deletion path (`mark_orphans_removed`) honours the
+/// `[ingest].drop_gate` flag instead — when it is `false`, a `ready` row
+/// is left alone (tunnel-verified, the click that deleted its source
+/// should not retire it); when it is `true`, every orphan retires.
 pub async fn reconcile_source(
     pool: &DbPool,
     source_id: &str,
@@ -667,16 +670,40 @@ pub async fn count_by_status_for_source(
 /// fetch keeps its state — the ways back are the admin "reset status"
 /// action or purge removed followed by a re-insert). Returns how many
 /// proxies were affected.
-pub async fn mark_orphans_removed(pool: &DbPool) -> crate::Result<u64> {
-    let result = sqlx::query(
+///
+/// `protected_statuses` lists the lifecycle states the caller does not
+/// want to retire just because their last source link vanished: a row in
+/// one of these statuses is left untouched, link-less, until the probe
+/// decides for itself. The admin source-delete handler passes `["ready"]`
+/// when `[ingest].drop_gate = false` — a `ready` proxy was tunnel-verified
+/// by hand, so retiring it from a single click would be too aggressive.
+/// Pass an empty slice to retire every orphan (the strict policy).
+pub async fn mark_orphans_removed(
+    pool: &DbPool,
+    protected_statuses: &[&str],
+) -> crate::Result<u64> {
+    // sqlx's `query` with no bound values still uses a fixed query — the
+    // protected-status list only widens the WHERE clause when non-empty
+    // (so the no-protection path keeps the original single-statement
+    // shape). The slice is built from caller-controlled literals; we
+    // expand it into a parameterised `IN (?, ?, …)` list rather than
+    // concatenating it into SQL.
+    let mut sql = String::from(
         "UPDATE proxies SET status = 'removed', removed_at = ?, updated_at = ?
          WHERE status != 'removed'
            AND id NOT IN (SELECT proxy_id FROM proxy_source_links)",
-    )
-    .bind(crate::models::now_ts())
-    .bind(crate::models::now_ts())
-    .execute(pool)
-    .await?;
+    );
+    if !protected_statuses.is_empty() {
+        let placeholders = vec!["?"; protected_statuses.len()].join(", ");
+        sql.push_str(&format!(" AND status NOT IN ({placeholders})"));
+    }
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(crate::models::now_ts())
+        .bind(crate::models::now_ts());
+    for status in protected_statuses {
+        query = query.bind(*status);
+    }
+    let result = query.execute(pool).await?;
     Ok(result.rows_affected())
 }
 
@@ -2512,7 +2539,7 @@ mod tests {
     }
 
     /// A `last_t2_failed_at` stamp excludes the proxy from the T1 sample:
-    /// the only path back to T1 is a successful T2 (SPEC §8.3).
+    /// the only path back to T1 is a successful T2.
     #[tokio::test]
     async fn t1_candidates_skip_proxies_with_recent_t2_failure() {
         let pool = temp_pool().await;
@@ -3066,5 +3093,109 @@ mod tests {
         assert_eq!(bulk_status_of(&pool, mieru).await.0, "removed");
         assert_eq!(bulk_status_of(&pool, vless_unknown).await.0, "unknown");
         assert_eq!(bulk_status_of(&pool, tuic_alive).await.0, "alive");
+    }
+
+    /// `mark_orphans_removed` with no protected statuses is the strict
+    /// policy: every link-less proxy retires, no matter the tier — this is
+    /// what `drop_gate = true` asks for from the admin source-delete path.
+    #[tokio::test]
+    async fn mark_orphans_removed_retires_every_status_by_default() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcO0000000").await;
+
+        let ready = bulk_test_row(&pool, "orphan-ready", "vless", "ready", None, None).await;
+        let alive = bulk_test_row(&pool, "orphan-alive", "vless", "alive", None, None).await;
+        let unknown = bulk_test_row(&pool, "orphan-unknown", "vless", "unknown", None, None).await;
+        let quarantined =
+            bulk_test_row(&pool, "orphan-quarantine", "vless", "quarantine", None, None).await;
+        // Detach every row from the source: the function only acts on rows
+        // with no remaining links, exactly what happens after a source
+        // delete.
+        sqlx::query("DELETE FROM proxy_source_links")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let affected = mark_orphans_removed(&pool, &[]).await.unwrap();
+        assert_eq!(affected, 4, "every orphan must retire under strict policy");
+        for (label, id) in [
+            ("ready", ready),
+            ("alive", alive),
+            ("unknown", unknown),
+            ("quarantine", quarantined),
+        ] {
+            let (status, _q, _l, removed_at) = bulk_status_of(&pool, id).await;
+            assert_eq!(status, "removed", "{label} proxy must retire");
+            assert!(removed_at.unwrap_or(0) > 0, "{label} proxy must stamp removed_at");
+        }
+    }
+
+    /// When the caller protects a status (admin source-delete path with
+    /// `drop_gate = false`), a link-less row in that status is left
+    /// untouched — the probe remains the only authority on its lifecycle.
+    /// Already-`removed` rows stay untouched regardless of the protected
+    /// list (idempotency).
+    #[tokio::test]
+    async fn mark_orphans_removed_protects_listed_statuses() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcO0000001").await;
+
+        let ready = bulk_test_row(&pool, "protect-ready", "vless", "ready", None, None).await;
+        let alive = bulk_test_row(&pool, "protect-alive", "vless", "alive", None, None).await;
+        let unknown =
+            bulk_test_row(&pool, "protect-unknown", "vless", "unknown", None, None).await;
+        // Already-removed row: keeps its removed_at untouched, the
+        // protected list does not revive it.
+        let already = bulk_test_row(&pool, "protect-gone", "vless", "removed", None, None).await;
+        sqlx::query("DELETE FROM proxy_source_links")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET removed_at = 1234 WHERE id = ?")
+            .bind(already)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let affected = mark_orphans_removed(&pool, &["ready"]).await.unwrap();
+        assert_eq!(
+            affected, 2,
+            "only the non-protected orphans (alive + unknown) retire"
+        );
+        assert_eq!(
+            bulk_status_of(&pool, ready).await.0,
+            "ready",
+            "a protected ready proxy keeps its tier"
+        );
+        assert_eq!(bulk_status_of(&pool, alive).await.0, "removed");
+        assert_eq!(bulk_status_of(&pool, unknown).await.0, "removed");
+        assert_eq!(bulk_status_of(&pool, already).await.0, "removed");
+        let (_status, _q, _l, removed_at) = bulk_status_of(&pool, already).await;
+        assert_eq!(removed_at, Some(1234), "an already-removed row is not re-stamped");
+    }
+
+    /// Empty protected-status slice is the strict path; a non-empty slice
+    /// with multiple statuses protects every row in any of them.
+    #[tokio::test]
+    async fn mark_orphans_removed_accepts_multiple_protected_statuses() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcO0000002").await;
+
+        let ready = bulk_test_row(&pool, "multi-ready", "vless", "ready", None, None).await;
+        let alive = bulk_test_row(&pool, "multi-alive", "vless", "alive", None, None).await;
+        let unknown =
+            bulk_test_row(&pool, "multi-unknown", "vless", "unknown", None, None).await;
+        sqlx::query("DELETE FROM proxy_source_links")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let affected = mark_orphans_removed(&pool, &["ready", "alive"])
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "only the non-protected orphan retires");
+        assert_eq!(bulk_status_of(&pool, ready).await.0, "ready");
+        assert_eq!(bulk_status_of(&pool, alive).await.0, "alive");
+        assert_eq!(bulk_status_of(&pool, unknown).await.0, "removed");
     }
 }

@@ -1,4 +1,6 @@
--- T2 recency-priority sample (SPEC §8.2, owner decision 2026-09-06).
+-- T2 recency-priority sample: never-checked proxies first, then the oldest
+-- last-T2 attempt. Replaces the old ORDER BY RANDOM() T2 batch which could
+-- leave a proxy tunnel-unverified for months in a large pool.
 --
 -- The T2 batch used to be ORDER BY RANDOM(): in a large pool a proxy could
 -- stay tunnel-unverified for months while its `alive` status rested on T1

@@ -379,8 +379,8 @@ async fn apply_regular_failure(ctx: &Context, id: i64, now: i64) {
     let spread_secs =
         i64::try_from(probe.second_chance_spread_hours.saturating_mul(3600)).unwrap_or(0);
     // T1 failure: a closed TCP/TLS port says nothing about the tunnel and
-    // must not trigger the T1-suppression flag (SPEC §8.3, see
-    // `proxies::check_failed`).
+    // must not trigger the T1-suppression flag — see `proxies::check_failed`,
+    // which takes an explicit `mark_t2_failed` argument for that reason.
     match proxies::check_failed(
         &ctx.pool,
         id,
@@ -1506,7 +1506,7 @@ mod tests {
         // Exactly one successful T1: the cycle-2 batch is skipped because
         // the cycle-1 T2 outage stamped `last_t2_failed_at`, and T2 itself
         // is still under the meow backoff. The proxy waits in the recency
-        // queue for the next T2 verdict (SPEC §8.3 T1 suppression).
+        // queue for the next T2 verdict (T1 suppression after a T2 failure).
         let (ok_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND ok = 1")
                 .bind(live)

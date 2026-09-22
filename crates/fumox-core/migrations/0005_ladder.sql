@@ -1,4 +1,4 @@
--- Generic quarantine ladder (configurable recheck steps, SPEC §8.3a).
+-- Generic quarantine ladder with configurable recheck steps.
 --
 -- The fixed `second_chance_at` + `recheck_15m_at`/`recheck_30m_at`/
 -- `recheck_1h_at` columns encoded a hard-coded ladder of exactly three

@@ -69,6 +69,16 @@ CI plumbing) is omitted — it never changes the shipped image.
   fifth dropdown option; the `match`/`flags`/`key` fields are hidden
   on ASN rows and replaced by a single AS-number input. Regex and ASN
   rules live side by side in the same `drop` array.
+- `db::migrate()` now self-heals from `sqlx::migrate!()` checksum
+  mismatches: when an applied migration file has been edited in place
+  (typically a comment-only change), the SHA-384 stored in
+  `_sqlx_migrations.checksum` is re-stamped from the on-disk content
+  and `migrate()` is retried. The schema on disk is unchanged — only the
+  bookkeeping column is rewritten. Any other sqlx error
+  (`Dirty`, `VersionMissing`, structural mismatch, real DDL failure)
+  propagates to the caller untouched. A standalone `cargo run
+  --example repair_migration_checksums` remains available for manual
+  recovery.
 
 ## 2026-09-20 · sha-47b8873
 

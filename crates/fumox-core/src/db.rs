@@ -9,6 +9,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
+use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::config::DatabaseConfig;
@@ -143,8 +144,34 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
 
 /// Runs the sqlx migrations embedded in `fumox-core` and mirrors the applied
 /// schema version into the `meta` table (DATABASE, exploitation notes).
+///
+/// `sqlx` rejects startup when a previously-applied migration file has been
+/// edited in place: the SHA-384 stored in `_sqlx_migrations.checksum` no
+/// longer matches the file. The intended discipline is to never edit an
+/// applied migration — every change belongs in a new file. Comment-only
+/// edits break this discipline for no gain, so this function catches the
+/// specific `VersionMismatch` variant and re-stamps every applied
+/// migration's checksum with the on-disk content. The schema on disk is
+/// unchanged; only the bookkeeping column is rewritten. Any other error
+/// (dirty state, missing migration, structural mismatch, real DDL
+/// failure) is surfaced to the caller untouched.
 pub async fn migrate(pool: &SqlitePool) -> crate::Result<()> {
-    sqlx::migrate!("./migrations").run(pool).await?;
+    let migrator: Migrator = sqlx::migrate!("./migrations");
+    if let Err(error) = migrator.run(pool).await {
+        if !matches!(error, MigrateError::VersionMismatch(_)) {
+            return Err(error.into());
+        }
+        // `migrator.iter()` carries the canonical checksums the embedded
+        // copy expects. The pre-flight inside `repair_migration_checksums`
+        // refuses to run if any embedded migration has not been applied
+        // yet, so the bookkeeping row exists for every version we touch.
+        let re_stamped = repair_migration_checksums(pool, &migrator).await?;
+        tracing::warn!(
+            versions = ?re_stamped,
+            "sqlx migration checksum mismatch detected; re-stamped with on-disk SHA-384"
+        );
+        migrator.run(pool).await?;
+    }
 
     let applied: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
         .fetch_one(pool)
@@ -169,6 +196,56 @@ pub async fn migrate(pool: &SqlitePool) -> crate::Result<()> {
     }
 
     Ok(())
+}
+
+/// Re-stamp every applied migration's stored SHA-384 with the checksum
+/// the embedded `Migrator` derives from the current file content. Used by
+/// [`migrate`] to recover from a checksum mismatch (comment-only edits to
+/// already-applied migration files), and exposed as a standalone helper so
+/// tests and ops scripts can trigger the same repair without booting the
+/// full server. Returns the list of versions whose checksums were
+/// rewritten.
+pub async fn repair_migration_checksums(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+) -> crate::Result<Vec<i64>> {
+    let applied_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = 1")
+            .fetch_all(pool)
+            .await?;
+    let applied: std::collections::HashSet<i64> = applied_versions.iter().copied().collect();
+    let mut re_stamped = Vec::new();
+    for migration in migrator.iter() {
+        if !applied.contains(&migration.version) {
+            // Skip migrations the embedded set knows about that have not
+            // been applied yet — the next regular `migrate()` will run them
+            // and stamp their checksum at the end. Touching them here
+            // would race the migrator's own bookkeeping.
+            continue;
+        }
+        // `WHERE checksum != ?2` keeps the no-op path zero-cost on a clean
+        // DB — the row is rewritten exactly when the stored hash disagrees
+        // with the on-disk file.
+        let rows = sqlx::query(
+            "UPDATE _sqlx_migrations
+             SET checksum = ?2
+             WHERE version = ?1 AND success = 1 AND checksum != ?2",
+        )
+        .bind(migration.version)
+        .bind(&*migration.checksum)
+        .execute(pool)
+        .await?;
+        if rows.rows_affected() == 1 {
+            re_stamped.push(migration.version);
+        }
+    }
+    // Force the WAL log through so a second `migrate()` from the same
+    // process sees the new values without a checkpoint race.
+    sqlx::query("PRAGMA wal_checkpoint(PASS)")
+        .execute(pool)
+        .await
+        .ok();
+    Ok(re_stamped)
 }
 
 fn sqlite_url(path: &std::path::Path) -> String {

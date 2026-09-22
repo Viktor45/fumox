@@ -2215,6 +2215,90 @@ mod tests {
     }
 
     #[test]
+    fn rows_target_select_carries_htmx_change_trigger() {
+        // Picking a different `target` must re-render the rows container
+        // so the row layout follows (regex ↔ ASN switch). The htmx
+        // attributes are baked into the rendered HTML so the new instance
+        // a future swap produces wires itself up automatically.
+        let lang = test_lang();
+        let s = BuilderState {
+            rename: vec![RenameRow::default()],
+            drop: vec![
+                DropRow {
+                    target: "host".into(),
+                    ..DropRow::default()
+                },
+                DropRow::default(),
+            ],
+            ..BuilderState::new()
+        };
+        let html = RowsFragment::for_section(lang.clone(), BuilderView::new(&s), "drop")
+            .render()
+            .unwrap_or_default();
+        // Every drop row's target select carries the htmx wiring — note the
+        // `&render=1` flag: a target change must NOT append a fresh row,
+        // which is what the explicit "+ правило" button does.
+        assert!(
+            html.contains("name=\"ped_drop_0_target\"")
+                && html.contains("hx-post=\"/admin/pipeline/rows?section=drop&amp;render=1\"")
+                && html.contains("hx-trigger=\"change\"")
+                && html.contains("hx-target=\"#ped-drop-rows\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("name=\"ped_drop_1_target\""),
+            "second row's target select also exists: {html}"
+        );
+
+        // Rename rows do the same — different endpoint, different
+        // container id.
+        let html = RowsFragment::for_section(lang, BuilderView::new(&s), "rename")
+            .render()
+            .unwrap_or_default();
+        assert!(
+            html.contains("name=\"ped_rename_0_target\"")
+                && html.contains("hx-post=\"/admin/pipeline/rows?render=1\"")
+                && html.contains("hx-trigger=\"change\"")
+                && html.contains("hx-target=\"#ped-rows\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn preview_wrapper_triggers_on_both_change_and_input() {
+        // The preview must update on every form change. `change` covers
+        // selects/radios/checkboxes; `input` covers text/ASN fields as
+        // the administrator types — `change` alone only fires on blur for
+        // text inputs, so the preview would otherwise stay stale.
+        let lang = test_lang();
+        let state = BuilderState::new();
+        let view = BuilderView::new(&state);
+        let widget = WidgetFragment {
+                lang: lang.clone(),
+                builder: view,
+                csrf: "csrf-token".into(),
+                mode: "builder",
+                pipeline_value: String::new(),
+                preview_html: "<p>placeholder</p>".into(),
+                raw_warning: false,
+                error: None,
+                profile: false,
+            }
+            .render()
+            .unwrap_or_default();
+        // The preview wrapper listens for both `change` and `input` with a
+        // 300ms debounce.
+        assert!(
+            widget.contains("hx-post=\"/admin/pipeline/preview\""),
+            "{widget}"
+        );
+        assert!(
+            widget.contains("hx-trigger=\"change, input delay:300ms\""),
+            "preview must react to text typing, not only field blur: {widget}"
+        );
+    }
+
+    #[test]
     fn widget_builder_mode_renders_with_preview_and_raw_mode_with_warning() {
         let lang = test_lang();
         let mut s = state();

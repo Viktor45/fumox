@@ -20,7 +20,7 @@ mod t1;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
@@ -34,6 +34,56 @@ use tokio::sync::Semaphore;
 
 /// `probe_results.probe_kind` of the tunnel check.
 const T2_KIND: &str = "t2";
+
+/// Number of consecutive in-batch `ServiceUnavailable` outcomes that
+/// escalate from "per-request blip" to "engine outage". Below this, every
+/// task still contacts meow-rs; at-or-above, the rest of the batch is
+/// skipped via the `aborted` flag and `backoff_meow` is engaged. Three
+/// is a deliberately tight floor: a single transport blip on one request
+/// does not abort a batch, but any pattern that survives retry and ping
+/// verification on three tasks in a row is a real engine problem.
+const MEOW_ABORT_THRESHOLD: usize = 3;
+
+/// Per-batch decision state shared across the parallel T2 tasks. Replaces
+/// the previous `Arc<AtomicBool>`: a single `ServiceUnavailable` no longer
+/// drops the whole batch — only a sustained pattern of consecutive
+/// failures does.
+struct BatchGuard {
+    consecutive: AtomicUsize,
+    aborted: AtomicBool,
+    threshold: usize,
+}
+
+impl BatchGuard {
+    fn new(threshold: usize) -> Self {
+        Self {
+            consecutive: AtomicUsize::new(0),
+            aborted: AtomicBool::new(false),
+            threshold,
+        }
+    }
+
+    /// Record one failure. Returns `true` iff this call crossed the
+    /// threshold and is the first to flip `aborted` — the caller backs
+    /// off meow on that exact transition, never again within the batch.
+    fn record_failure(&self) -> bool {
+        let n = self.consecutive.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= self.threshold && !self.aborted.swap(true, Ordering::Relaxed) {
+            return true;
+        }
+        false
+    }
+
+    /// Record a successful or proxy-failed outcome. Resets the consecutive
+    /// counter so a recovered engine immediately gets a fresh budget.
+    fn record_recovered(&self) {
+        self.consecutive.store(0, Ordering::Relaxed);
+    }
+
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Relaxed)
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "fumox-probe", version, about = "Fumox health-check daemon")]
@@ -705,7 +755,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     // Set by the first task to see the engine fail mid-batch: every proxy
     // still due a check in this batch then gets an aborted-failure record
     // without hammering a dying meow-rs with further requests.
-    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let batch_guard = Arc::new(BatchGuard::new(MEOW_ABORT_THRESHOLD));
     let mut tasks = tokio::task::JoinSet::new();
     for row in batch {
         // Rows that never made it into the generated config (their entry
@@ -722,7 +772,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
             continue;
         }
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
-        let aborted = aborted.clone();
+        let batch_guard = batch_guard.clone();
         tasks.spawn(async move {
             // The semaphore lives in this scope until `collect_tasks`
             // returns; a closed semaphore here is structurally impossible.
@@ -730,7 +780,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                 Ok(permit) => permit,
                 Err(_) => return,
             };
-            if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+            if batch_guard.is_aborted() {
                 journal_and_fail(
                     &ctx,
                     row.id,
@@ -741,8 +791,18 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
             }
             let name = clash::proxy_name(row.id);
             let now = now_ts();
-            match ctx.meow.check_delay(&name).await {
+            // Retry transient `ServiceUnavailable` (transport blip, one
+            // malformed payload, single 5xx on a flapping connection):
+            // re-asking the same request absorbs most of them and keeps
+            // them off the abort counter, which is now reserved for
+            // patterns the engine cannot recover from within the cycle.
+            let outcome = ctx
+                .meow
+                .check_delay_with_retry(&name, 2, Duration::from_millis(100))
+                .await;
+            match outcome {
                 DelayOutcome::Ok(delay) => {
+                    batch_guard.record_recovered();
                     let latency = i64::try_from(delay).unwrap_or(i64::MAX);
                     journal(
                         &ctx,
@@ -772,6 +832,11 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                     }
                 }
                 DelayOutcome::ProxyFailed(message) => {
+                    // The engine answered authoritatively — the proxy's
+                    // tunnel died, but the engine itself is alive. Reset
+                    // the consecutive counter so a single 4xx never
+                    // poisons the abort budget for the rest of the batch.
+                    batch_guard.record_recovered();
                     journal(
                         &ctx,
                         ProbeResultEntry {
@@ -805,20 +870,51 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                     }
                 }
                 DelayOutcome::ServiceUnavailable(error) => {
-                    // The engine failed mid-batch: from this moment the
-                    // whole batch is failed on the ladder — this record included — and the rest of
-                    // the tasks journal an aborted-failure without calling
-                    // meow-rs again. Back off regardless of which task saw
-                    // it first (idempotent).
-                    tracing::warn!(%error, "meow-rs became unavailable mid-batch, failing the rest of the T2 batch");
-                    aborted.store(true, std::sync::atomic::Ordering::Relaxed);
-                    ctx.backoff_meow();
-                    journal_and_fail(
-                        &ctx,
-                        row.id,
-                        &format!("meow-rs unavailable mid-batch: {error}"),
-                    )
-                    .await;
+                    // Two paths reach here: (a) the retry budget was
+                    // exhausted, meaning meow answered badly twice in a
+                    // row for the same proxy, and (b) the failure was
+                    // already bad enough that retrying would just delay
+                    // the verdict (5xx with no transport layer involved).
+                    // Either way, the request itself is settled — the
+                    // question is whether the engine as a whole is down.
+                    // A cheap `/version` ping distinguishes the two: if
+                    // meow is alive, this is a per-request blip that
+                    // does not justify aborting the batch; if meow is
+                    // down, the consecutive counter (and the abort flag
+                    // once it crosses the threshold) reflects a real
+                    // outage.
+                    let engine_alive = ctx.meow.ping().await.is_ok();
+                    if engine_alive {
+                        tracing::debug!(
+                            id = row.id,
+                            %error,
+                            "meow-rs answered /version after a failed delay check; treating as per-request blip"
+                        );
+                        journal_and_fail(
+                            &ctx,
+                            row.id,
+                            &format!("meow-rs transient error: {error}"),
+                        )
+                        .await;
+                    } else {
+                        if batch_guard.record_failure() {
+                            // Threshold crossed exactly once per batch;
+                            // subsequent failures find the flag already
+                            // set and skip the backoff. Idempotent.
+                            tracing::warn!(
+                                consecutive = MEOW_ABORT_THRESHOLD,
+                                %error,
+                                "meow-rs became unavailable mid-batch, failing the rest of the T2 batch"
+                            );
+                            ctx.backoff_meow();
+                        }
+                        journal_and_fail(
+                            &ctx,
+                            row.id,
+                            &format!("meow-rs unavailable mid-batch: {error}"),
+                        )
+                        .await;
+                    }
                 }
             }
         });
@@ -1199,18 +1295,42 @@ mod tests {
     }
 
     /// Engine failure (engine-failure branch 2): meow dies
-    /// mid-batch — the first delay request sees the failure, the rest of
-    /// the batch gets aborted-failure records without further meow calls.
+    /// mid-batch — the pre-flight ping succeeded (so `reload_config` and
+    /// the fan-out began), but every delay request and the follow-up
+    /// `/version` ping now fail. The connected-engine check therefore
+    /// reports `engine_alive = false` for every task, the consecutive
+    /// counter crosses the threshold on the first task to record a
+    /// failure, and the rest of the tasks see the abort flag and journal
+    /// an aborted-failure record without further meow calls.
     #[tokio::test]
     async fn t2_engine_failure_mid_batch_aborts_the_rest() {
         let pool = temp_pool().await;
 
-        // Mock meow-rs: healthy /version and /configs, but every delay
-        // request answers 500 (the engine is broken for real checks).
+        // The pre-flight at L662 calls /version first, so the handler
+        // returns 200 on that call and 500 on every subsequent one. This
+        // models "engine crashed after the pre-flight passed".
+        let version_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let version_calls_inner = version_calls.clone();
         let app = Router::new()
             .route(
                 "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+                get(move || {
+                    let version_calls = version_calls_inner.clone();
+                    async move {
+                        let n = version_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if n == 0 {
+                            (
+                                axum::http::StatusCode::OK,
+                                Json(serde_json::json!({"version":"mock"})),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"message":"engine crashed"})),
+                            )
+                        }
+                    }
+                }),
             )
             .route("/configs", put(|| async { Json(serde_json::json!({})) }))
             .route(
@@ -1228,8 +1348,15 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
+        // Four proxies: with threshold=3 the first three tasks record a
+        // failure (engine_alive = false) and the third one flips the
+        // abort flag. The fourth task, whichever side of the L733 check
+        // it lands on, gets either a "mid-batch" record or an "aborted:"
+        // record — both are engine-outage texts.
         let a = seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
         let b = seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
+        let c = seed_proxy(&pool, "vmess", "127.0.0.1", 443, "alive").await;
+        let d = seed_proxy(&pool, "ss", "127.0.0.1", 443, "alive").await;
         let config_path = std::env::temp_dir().join(format!(
             "fumox-probe-test-{}.yaml",
             fumox_core::models::new_id()
@@ -1240,12 +1367,13 @@ mod tests {
 
         run_cycle(ctx).await.unwrap();
 
-        // Every proxy of the batch carries a journaled t2 failure: one
-        // with the mid-batch reason, the other with the aborted marker —
-        // both are engine-outage texts, not proxy-dead texts.
+        // Every proxy of the batch carries a journaled t2 failure:
+        // either the mid-batch reason (the task that crossed the
+        // threshold) or the aborted marker (a task that arrived after
+        // the flag was set). Both are engine-outage texts.
         let mut aborted = 0;
         let mut mid_batch = 0;
-        for id in [a, b] {
+        for id in [a, b, c, d] {
             let (error,): (String,) = sqlx::query_as(
                 "SELECT COALESCE(error, '') FROM probe_results
                  WHERE proxy_id = ? AND ok = 0 AND probe_kind = 't2'",
@@ -1269,9 +1397,176 @@ mod tests {
             // the engine failure — fail_count counts both.
             assert_eq!(row.fail_count, 2);
         }
-        // With concurrency 4 both requests may race past the aborted flag;
-        // the invariant is only that every proxy got a failure record.
-        assert_eq!(aborted + mid_batch, 2);
+        // With concurrency 4 the exact split between "mid_batch" and
+        // "aborted:" depends on the semaphore; the invariant is that
+        // every proxy got a failure record and at least one task
+        // crossed it (otherwise we would not have entered the threshold
+        // branch at all).
+        assert_eq!(aborted + mid_batch, 4);
+        assert!(
+            mid_batch >= 1,
+            "at least one task must have crossed the threshold"
+        );
+    }
+
+    /// Per-request blip: every delay check fails with 5xx, but /version
+    /// keeps answering 200 — the engine is alive, the proxy names are
+    /// just bad. The ping-on-failure check must therefore skip the abort
+    /// counter and the batch keeps running: every proxy gets a "meow-rs
+    /// transient error" record instead of an "aborted:" one.
+    #[tokio::test]
+    async fn t2_per_request_blip_with_alive_engine_does_not_abort() {
+        let pool = temp_pool().await;
+
+        let app = Router::new()
+            .route(
+                "/version",
+                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+            )
+            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/proxies/{name}/delay",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"message":"proxy not found"})),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let meow_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let a = seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
+        let b = seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
+        let c = seed_proxy(&pool, "vmess", "127.0.0.1", 443, "alive").await;
+        let d = seed_proxy(&pool, "ss", "127.0.0.1", 443, "alive").await;
+        let config_path = std::env::temp_dir().join(format!(
+            "fumox-probe-test-{}.yaml",
+            fumox_core::models::new_id()
+        ));
+        let mut config = test_config(3, &meow_addr, config_path);
+        config.probe.allow_private_targets = true;
+        let ctx = Arc::new(Context::new(config, pool.clone()));
+
+        run_cycle(ctx).await.unwrap();
+
+        // None of the four proxies crossed the abort threshold:
+        // /version answered 200 for every ping, so engine_alive was
+        // true for every task and the counter never advanced. No
+        // backoff was engaged either — meow_retry_at stays at 0.
+        for id in [a, b, c, d] {
+            let (error,): (String,) = sqlx::query_as(
+                "SELECT COALESCE(error, '') FROM probe_results
+                 WHERE proxy_id = ? AND ok = 0 AND probe_kind = 't2'",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                error.contains("meow-rs transient error"),
+                "alive engine, bad delay → transient error text; got {error}"
+            );
+            assert!(
+                !error.contains("aborted:") && !error.contains("mid-batch"),
+                "alive engine must never escalate to abort; got {error}"
+            );
+        }
+        let (retry_at,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(value, '0') FROM meta WHERE key = 'meow_retry_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or((0,));
+        assert_eq!(
+            retry_at, 0,
+            "no backoff engaged when the engine is alive and only delay checks fail"
+        );
+    }
+
+    /// The retry absorbs a single transient 5xx on a per-proxy basis:
+    /// the first delay request 5xxes, the second succeeds, so the task
+    /// reports `Ok` and never touches the abort counter. The batch
+    /// keeps running for the rest of the proxies.
+    #[tokio::test]
+    async fn t2_retry_recovers_a_flaky_proxy() {
+        let pool = temp_pool().await;
+
+        // Delay handler: first call per name returns 500, second returns 200.
+        let delay_calls: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let delay_calls_inner = delay_calls.clone();
+        let app = Router::new()
+            .route(
+                "/version",
+                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+            )
+            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/proxies/{name}/delay",
+                get(move |Path(name): Path<String>| {
+                    let delay_calls = delay_calls_inner.clone();
+                    async move {
+                        let mut guard = delay_calls.lock().unwrap();
+                        let n = guard.entry(name.clone()).or_insert(0);
+                        *n += 1;
+                        let attempt = *n;
+                        drop(guard);
+                        if attempt == 1 {
+                            (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"message":"blip"})),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::OK,
+                                Json(serde_json::json!({"delay": 42})),
+                            )
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let meow_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // One flaky proxy; the second proxy is there to confirm the
+        // batch keeps running and reports a clean Ok.
+        let flaky = seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
+        let stable = seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
+        let config_path = std::env::temp_dir().join(format!(
+            "fumox-probe-test-{}.yaml",
+            fumox_core::models::new_id()
+        ));
+        let mut config = test_config(3, &meow_addr, config_path);
+        config.probe.allow_private_targets = true;
+        let ctx = Arc::new(Context::new(config, pool.clone()));
+
+        run_cycle(ctx).await.unwrap();
+
+        // The flaky proxy survived: the retry absorbed the first 5xx and
+        // the second attempt returned Ok. The row becomes `ready`.
+        let row = proxies::get_by_id(&pool, flaky).await.unwrap().unwrap();
+        assert_eq!(
+            row.status, "ready",
+            "retry should have rescued the flaky proxy from a transient blip"
+        );
+        let (ok_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND ok = 1")
+                .bind(flaky)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ok_count, 1, "exactly one successful T2 for the flaky proxy");
+
+        // The stable proxy was not touched by the abort counter at all.
+        let row = proxies::get_by_id(&pool, stable).await.unwrap().unwrap();
+        assert_eq!(row.status, "ready");
     }
 
     /// The `ready` tier is demoted by every failed T2 outcome (owner

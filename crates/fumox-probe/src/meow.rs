@@ -161,6 +161,37 @@ impl MeowClient {
             DelayOutcome::ServiceUnavailable(format!("{status}: {message}"))
         }
     }
+
+    /// Same as `check_delay` but retries `ServiceUnavailable` up to
+    /// `attempts` times with `backoff` between tries. `Ok` and
+    /// `ProxyFailed` are returned on first sight — the engine spoke
+    /// authoritatively in those branches and re-asking the same request
+    /// does not help. Only transport-level glitches (connection drops,
+    /// transient 5xx, one-shot malformed payloads) are absorbed here, so
+    /// the caller's `ServiceUnavailable` handling now sees a strictly
+    /// smaller set of cases — most of them genuine engine outages.
+    pub async fn check_delay_with_retry(
+        &self,
+        name: &str,
+        attempts: u8,
+        backoff: Duration,
+    ) -> DelayOutcome {
+        debug_assert!(attempts >= 1, "attempts must be at least 1");
+        let mut last_error = String::new();
+        for attempt in 0..attempts {
+            match self.check_delay(name).await {
+                ok @ DelayOutcome::Ok(_) => return ok,
+                pf @ DelayOutcome::ProxyFailed(_) => return pf,
+                DelayOutcome::ServiceUnavailable(err) => {
+                    last_error = err;
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+        }
+        DelayOutcome::ServiceUnavailable(last_error)
+    }
 }
 
 #[cfg(test)]
@@ -327,5 +358,114 @@ mod tests {
         };
         let picked: HashSet<&str> = (0..100).map(|_| client.pick_test_url(&mut rng)).collect();
         assert_eq!(picked, HashSet::from(["a", "b", "c"]));
+    }
+
+    /// A flaky proxy fails the first request and succeeds the second —
+    /// `check_delay_with_retry` absorbs the transient blip and returns
+    /// `Ok`. Without the retry the caller would see `ServiceUnavailable`
+    /// and abort the rest of the batch on the first failure.
+    #[tokio::test]
+    async fn check_delay_with_retry_recovers_from_transient_5xx() {
+        let attempts: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let attempts_inner = attempts.clone();
+        let app = Router::new()
+            .route(
+                "/version",
+                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+            )
+            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/proxies/{name}/delay",
+                get(move |Path(_name): Path<String>| {
+                    let attempts = attempts_inner.clone();
+                    async move {
+                        let n = attempts.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"message":"blip"})),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::OK,
+                                Json(serde_json::json!({"delay": 17})),
+                            )
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = MeowConfig {
+            api_addr: addr,
+            config_path: std::env::temp_dir().join("fumox-meow-retry.yaml"),
+            test_url: vec!["http://cp.cloudflare.com".to_string()],
+            timeout_secs: 5,
+            backoff_initial_secs: 60,
+            backoff_max_secs: 900,
+        };
+        let client = MeowClient::new(&config);
+        // Two attempts, 50ms between — first fails, second succeeds.
+        match client
+            .check_delay_with_retry("fumox-flaky", 2, Duration::from_millis(50))
+            .await
+        {
+            DelayOutcome::Ok(delay) => assert_eq!(delay, 17),
+            other => panic!("expected Ok after retry, got {other:?}"),
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// `ProxyFailed` (4xx — the engine tried and the tunnel died) is not
+    /// retried: the engine's answer is final, asking again would just
+    /// pile more load on a dying tunnel.
+    #[tokio::test]
+    async fn check_delay_with_retry_does_not_retry_proxy_failed() {
+        let attempts: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let attempts_inner = attempts.clone();
+        let app = Router::new()
+            .route(
+                "/version",
+                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+            )
+            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/proxies/{name}/delay",
+                get(move |Path(_name): Path<String>| {
+                    let attempts = attempts_inner.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"message":"dial tcp: timeout"})),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = MeowConfig {
+            api_addr: addr,
+            config_path: std::env::temp_dir().join("fumox-meow-retry.yaml"),
+            test_url: vec!["http://cp.cloudflare.com".to_string()],
+            timeout_secs: 5,
+            backoff_initial_secs: 60,
+            backoff_max_secs: 900,
+        };
+        let client = MeowClient::new(&config);
+        match client
+            .check_delay_with_retry("fumox-dead", 3, Duration::from_millis(10))
+            .await
+        {
+            DelayOutcome::ProxyFailed(msg) => assert!(msg.contains("timeout"), "{msg}"),
+            other => panic!("expected ProxyFailed, got {other:?}"),
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

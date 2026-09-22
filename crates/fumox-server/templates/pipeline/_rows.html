@@ -5,14 +5,24 @@
    add/remove endpoint's ?section=. The target selector markup is
    duplicated across the two branches — askama macros cannot be shared
    from an included file, and the block is small and stable. A drop line
-   has no `replace` field: a discard rule only selects, never rewrites. #}
+   has no `replace` field: a discard rule only selects, never rewrites.
+   Every `target` select carries htmx attributes so changing it (e.g. to
+   `asn`) re-renders the rows container — without the round-trip the
+   row keeps its previous layout and the ASN row would still show the
+   regex inputs. `hx-include` pulls the whole `ped_*` form so the server
+   rebuilds state from the full document, not just the select that
+   fired. #}
 {% if section == "drop" %}
   {% for row in builder.state.drop %}
   {% if row.target == "asn" %}
   <div class="ped-row">
     <input type="text" name="ped_drop_{{ loop.index0 }}_asns" value="{{ row.asns }}"
            placeholder="{{ self.t("ped.drop_asns_placeholder") }}" aria-label="{{ self.t("ped.target_asn") }}">
-    <select name="ped_drop_{{ loop.index0 }}_target" aria-label="{{ self.t("ped.rename_target") }}">
+    <select name="ped_drop_{{ loop.index0 }}_target"
+            hx-post="/admin/pipeline/rows?section=drop&amp;render=1"
+            hx-trigger="change" hx-target="#ped-drop-rows" hx-swap="innerHTML"
+            hx-include="[name^='ped_'], [name='_csrf']"
+            aria-label="{{ self.t("ped.rename_target") }}">
       <option value="asn" selected>{{ self.t("ped.target_asn") }}</option>
       <option value="name">{{ self.t("ped.target_name") }}</option>
       <option value="host">{{ self.t("ped.target_host") }}</option>
@@ -34,7 +44,11 @@
            placeholder="{{ self.t("ped.rename_match") }}" aria-label="{{ self.t("ped.rename_match") }}">
     <input type="text" class="mono" name="ped_drop_{{ loop.index0 }}_flags" value="{{ row.flags }}" maxlength="3"
            placeholder="{{ self.t("ped.rename_flags") }}" aria-label="{{ self.t("ped.rename_flags") }}">
-    <select name="ped_drop_{{ loop.index0 }}_target" aria-label="{{ self.t("ped.rename_target") }}">
+    <select name="ped_drop_{{ loop.index0 }}_target"
+            hx-post="/admin/pipeline/rows?section=drop&amp;render=1"
+            hx-trigger="change" hx-target="#ped-drop-rows" hx-swap="innerHTML"
+            hx-include="[name^='ped_'], [name='_csrf']"
+            aria-label="{{ self.t("ped.rename_target") }}">
       <option value="name" {% if row.target == "name" || row.target == "" %}selected{% endif %}>{{ self.t("ped.target_name") }}</option>
       <option value="host" {% if row.target == "host" %}selected{% endif %}>{{ self.t("ped.target_host") }}</option>
       <option value="port" {% if row.target == "port" %}selected{% endif %}>{{ self.t("ped.target_port") }}</option>
@@ -64,7 +78,11 @@
            placeholder="{{ self.t("ped.rename_replace") }}" aria-label="{{ self.t("ped.rename_replace") }}">
     <input type="text" class="mono" name="ped_rename_{{ loop.index0 }}_flags" value="{{ row.flags }}" maxlength="3"
            placeholder="{{ self.t("ped.rename_flags") }}" aria-label="{{ self.t("ped.rename_flags") }}">
-    <select name="ped_rename_{{ loop.index0 }}_target" aria-label="{{ self.t("ped.rename_target") }}">
+    <select name="ped_rename_{{ loop.index0 }}_target"
+            hx-post="/admin/pipeline/rows?render=1"
+            hx-trigger="change" hx-target="#ped-rows" hx-swap="innerHTML"
+            hx-include="[name^='ped_'], [name='_csrf']"
+            aria-label="{{ self.t("ped.rename_target") }}">
       <option value="name" {% if row.target == "name" || row.target == "" %}selected{% endif %}>{{ self.t("ped.target_name") }}</option>
       <option value="host" {% if row.target == "host" %}selected{% endif %}>{{ self.t("ped.target_host") }}</option>
       <option value="port" {% if row.target == "port" %}selected{% endif %}>{{ self.t("ped.target_port") }}</option>

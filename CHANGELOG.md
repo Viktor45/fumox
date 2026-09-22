@@ -69,6 +69,18 @@ CI plumbing) is omitted — it never changes the shipped image.
   fifth dropdown option; the `match`/`flags`/`key` fields are hidden
   on ASN rows and replaced by a single AS-number input. Regex and ASN
   rules live side by side in the same `drop` array.
+- The pipeline editor's row layout now follows the `target` selector
+  live: changing `name` / `host` / `port` / `param` / `asn` in a drop
+  or rename row fires an htmx round-trip that swaps the row in place,
+  so the regex ↔ ASN switch is immediate and the asns input appears
+  without an explicit add button. The round-trip carries `?render=1` so
+  it never grows the row count — only the explicit `+ правило` /
+  `+ правило отбрасывания` buttons append.
+- The pipeline preview now updates on every keystroke. The wrapper
+  around the JSON preview listens for `change, input` events with a
+  300 ms debounce, so typing into the `match`, `replace`, `asns`, or
+  filter fields updates the validation verdict and the generated JSON
+  live instead of waiting for the field to lose focus.
 - `db::migrate()` now self-heals from `sqlx::migrate!()` checksum
   mismatches: when an applied migration file has been edited in place
   (typically a comment-only change), the SHA-384 stored in
@@ -79,6 +91,27 @@ CI plumbing) is omitted — it never changes the shipped image.
   propagates to the caller untouched. A standalone `cargo run
   --example repair_migration_checksums` remains available for manual
   recovery.
+- T2 batch abort is now reserved for real engine outages. Three
+  independent guards collapse the "first `ServiceUnavailable` kills the
+  whole batch" failure mode that surfaced as `aborted: meow-rs became
+  unavailable mid-batch` on the `probe_results` rows:
+  (a) `check_delay_with_retry` re-issues `ServiceUnavailable` outcomes
+      once after a 100 ms backoff, so transport blips and one-shot
+      malformed payloads never reach the abort counter;
+  (b) every `ServiceUnavailable` is followed by a cheap `/version` ping,
+      and a healthy engine — `engine_alive = true` — leaves the proxy
+      with a `meow-rs transient error` record and the rest of the batch
+      untouched;
+  (c) the in-batch `AtomicBool` is replaced by a `BatchGuard` carrying a
+      consecutive-failure counter and a 3-strike threshold, so only a
+      sustained outage pattern flips the abort flag and engages
+      `backoff_meow`, and only on that exact transition. With these
+      guards, a single bad delay response on one proxy no longer
+      abandons the rest of the cycle; genuine engine crashes still
+      abort and back off, and the operator-visible `probe_results.error`
+      text distinguishes `meow-rs transient error`, `meow-rs
+      unavailable mid-batch`, and `aborted: meow-rs became unavailable
+      mid-batch` accordingly.
 
 ## 2026-09-20 · sha-47b8873
 

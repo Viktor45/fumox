@@ -4067,6 +4067,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipeline_rows_renders_asn_mode_when_target_changes() {
+        // Switching a drop row's target to `asn` via the rows endpoint
+        // re-renders that row in ASN-mode (only the `asns` input, no
+        // `match`/`flags`/`key`); reverting flips the row back. This is
+        // the endpoint every `hx-trigger="change"` on a target select
+        // fires — the round-trip must produce the right row layout.
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // Start in regex mode (target=host, match=\\.ua).
+        let regex_form = urlencoded(&[
+            ("_csrf", &csrf),
+            ("ped_drop_0_match", "\\.ua"),
+            ("ped_drop_0_target", "host"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/rows?section=drop",
+                &regex_form,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .into_owned();
+        assert!(html.contains(r#"name="ped_drop_0_match""#), "{html}");
+        assert!(!html.contains(r#"name="ped_drop_0_asns""#), "{html}");
+
+        // Switch the same row to target=asn with asns=24940 — the
+        // response must carry only the ASN-mode row (no `match` field).
+        let asn_form = urlencoded(&[
+            ("_csrf", &csrf),
+            ("ped_drop_0_match", "\\.ua"),
+            ("ped_drop_0_target", "asn"),
+            ("ped_drop_0_asns", "24940"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/rows?section=drop",
+                &asn_form,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .into_owned();
+        assert!(html.contains(r#"name="ped_drop_0_asns" value="24940""#), "{html}");
+        assert!(
+            !html.contains(r#"name="ped_drop_0_match""#),
+            "ASN-mode row must not carry a match input: {html}"
+        );
+        assert!(
+            !html.contains(r#"name="ped_drop_0_flags""#),
+            "ASN-mode row must not carry a flags input: {html}"
+        );
+        assert!(
+            !html.contains(r#"name="ped_drop_0_key""#),
+            "ASN-mode row must not carry a param key: {html}"
+        );
+
+        // The same round-trip preserves a sibling row in regex mode —
+        // changing one row's target must not silently rewrite others.
+        let mixed_form = urlencoded(&[
+            ("_csrf", &csrf),
+            ("ped_drop_0_target", "asn"),
+            ("ped_drop_0_asns", "24940, AS13335"),
+            ("ped_drop_1_match", "\\.cn$"),
+            ("ped_drop_1_target", "host"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/rows?section=drop",
+                &mixed_form,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .into_owned();
+        assert!(html.contains(r#"name="ped_drop_0_asns""#), "{html}");
+        assert!(html.contains(r#"name="ped_drop_1_match" value="\.cn$""#), "{html}");
+        assert!(html.contains(r#"name="ped_drop_1_target""#), "{html}");
+    }
+
+    #[tokio::test]
+    async fn pipeline_rows_render_query_does_not_append() {
+        // The change-trigger on a target select calls the rows endpoint
+        // with `?render=1` — the round-trip must NOT append a fresh empty
+        // row, otherwise every target switch would grow the row count by
+        // one. The explicit `+` button keeps its append behaviour.
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+
+        // One existing drop row.
+        let form = urlencoded(&[
+            ("_csrf", &csrf),
+            ("ped_drop_0_match", "\\.ua"),
+            ("ped_drop_0_target", "host"),
+        ]);
+        // No `?render=1` — the legacy `+`-button semantics: append.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/rows?section=drop",
+                &form,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .into_owned();
+        assert!(html.contains(r#"name="ped_drop_1_match""#), "expected an appended row: {html}");
+
+        // With `?render=1` — round-trip without append.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/pipeline/rows?section=drop&render=1",
+                &form,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .into_owned();
+        assert!(html.contains(r#"name="ped_drop_0_match""#), "{html}");
+        assert!(
+            !html.contains(r#"name="ped_drop_1_match""#),
+            "render=1 must not append: {html}"
+        );
+    }
+
+    #[tokio::test]
     async fn source_form_saves_the_builder_state_as_pipeline_json() {
         let state = test_state(1000).await;
         let app = router(state.clone());

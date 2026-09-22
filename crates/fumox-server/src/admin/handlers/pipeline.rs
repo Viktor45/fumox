@@ -50,19 +50,26 @@ pub async fn pipeline_rows(
     let index = params
         .get("remove")
         .and_then(|index| index.parse::<usize>().ok());
-    match (params.get("section").map(String::as_str), index) {
-        (Some("drop"), Some(index)) => {
+    // `?render=1` is the change-trigger from a target select — the
+    // browser already has the row count it wants, the round-trip only
+    // has to repaint the row layout (regex ↔ ASN switch). Without this
+    // flag every change would append a fresh empty row, exactly like the
+    // explicit "+ правило" button does.
+    let append = !params.contains_key("render");
+    match (params.get("section").map(String::as_str), index, append) {
+        (Some("drop"), Some(index), _) => {
             if index < built.drop.len() {
                 built.drop.remove(index);
             }
         }
-        (Some("drop"), None) => built.drop.push(Default::default()),
-        (_, Some(index)) => {
+        (Some("drop"), None, true) => built.drop.push(Default::default()),
+        (_, Some(index), _) => {
             if index < built.rename.len() {
                 built.rename.remove(index);
             }
         }
-        (_, None) => built.rename.push(Default::default()),
+        (_, None, true) => built.rename.push(Default::default()),
+        _ => {}
     }
     let section = params.get("section").cloned().unwrap_or_default();
     let fragment = RowsFragment::for_section(lang.clone(), BuilderView::new(&built), &section);

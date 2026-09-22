@@ -65,7 +65,7 @@
 
 <div id="ped-builder"
      hx-post="/admin/pipeline/preview"
-     hx-trigger="change delay:300ms"
+     hx-trigger="change, input delay:300ms"
      hx-target="#ped-preview"
      hx-swap="innerHTML"
      hx-include="[name^='ped_'], [name='_csrf']">

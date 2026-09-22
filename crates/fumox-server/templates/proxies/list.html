@@ -6,9 +6,9 @@
 <div class="page-head">
   <h1>{{ self.t("nav.proxies") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
   <div class="row-actions">
-    <button class="btn" type="button" onclick="document.getElementById('revive-dialog').showModal()">{{ self.t("px.revive_button") }}</button>
-    <button class="btn danger" type="button" onclick="document.getElementById('cleanup-dialog').showModal()">{{ self.t("px.cleanup_button") }}</button>
-    <button class="btn danger" type="button" onclick="document.getElementById('purge-dialog').showModal()">{{ self.t("px.purge_button") }}</button>
+    <button class="btn" type="button" onclick="document.getElementById('revive-dialog').showModal()" aria-haspopup="dialog" aria-controls="revive-dialog">{{ self.t("px.revive_button") }}</button>
+    <button class="btn danger" type="button" onclick="document.getElementById('cleanup-dialog').showModal()" aria-haspopup="dialog" aria-controls="cleanup-dialog">{{ self.t("px.cleanup_button") }}</button>
+    <button class="btn danger" type="button" onclick="document.getElementById('purge-dialog').showModal()" aria-haspopup="dialog" aria-controls="purge-dialog">{{ self.t("px.purge_button") }}</button>
   </div>
 </div>
 
@@ -28,7 +28,7 @@
             <strong>{{ self.t("px.cleanup_quarantine_title") }}</strong>
             <p class="muted small">{{ self.t("px.cleanup_quarantine_desc") }}</p>
           </div>
-          <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+          <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_quarantine_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
         </div>
       </form>
     </li>
@@ -40,7 +40,7 @@
             <strong>{{ self.t("px.cleanup_no_country_title") }}</strong>
             <p class="muted small">{{ self.t("px.cleanup_no_country_desc") }}</p>
           </div>
-          <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+          <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_no_country_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
         </div>
       </form>
     </li>
@@ -54,7 +54,7 @@
           </div>
           <div class="inline-controls">
             <input type="text" name="asn" placeholder="AS24940" inputmode="numeric" autocomplete="off">
-            <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+            <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_asn_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
           </div>
         </div>
       </form>
@@ -74,7 +74,7 @@
                 <option value="{{ country }}">{{ country }}</option>
               {% endfor %}
             </select>
-            <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+            <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_country_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
           </div>
         </div>
       </form>
@@ -87,7 +87,7 @@
             <strong>{{ self.t("px.cleanup_unprobeable_title") }}</strong>
             <p class="muted small">{{ self.t("px.cleanup_unprobeable_desc") }}</p>
           </div>
-          <button class="btn danger small" type="submit">{{ self.t("px.cleanup_apply") }}</button>
+          <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_unprobeable_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
         </div>
       </form>
     </li>
@@ -132,7 +132,7 @@
                 <option value="{{ country }}">{{ country }}</option>
               {% endfor %}
             </select>
-            <button class="btn small" type="submit">{{ self.t("px.revive_apply") }}</button>
+            <button class="btn small" type="submit" aria-label="{{ self.t("px.revive_apply_country_aria") }}">{{ self.t("px.revive_apply") }}</button>
           </div>
         </div>
       </form>
@@ -147,7 +147,7 @@
           </div>
           <div class="inline-controls">
             <input type="text" name="asn" placeholder="AS24940" inputmode="numeric" autocomplete="off">
-            <button class="btn small" type="submit">{{ self.t("px.revive_apply") }}</button>
+            <button class="btn small" type="submit" aria-label="{{ self.t("px.revive_apply_asn_aria") }}">{{ self.t("px.revive_apply") }}</button>
           </div>
         </div>
       </form>
@@ -160,7 +160,7 @@
             <strong>{{ self.t("px.revive_no_history_title") }}</strong>
             <p class="muted small">{{ self.t("px.revive_no_history_desc") }}</p>
           </div>
-          <button class="btn small" type="submit">{{ self.t("px.revive_apply") }}</button>
+          <button class="btn small" type="submit" aria-label="{{ self.t("px.revive_apply_no_history_aria") }}">{{ self.t("px.revive_apply") }}</button>
         </div>
       </form>
     </li>
@@ -172,7 +172,7 @@
             <strong>{{ self.t("px.revive_quarantine_title") }}</strong>
             <p class="muted small">{{ self.t("px.revive_quarantine_desc") }}</p>
           </div>
-          <button class="btn small" type="submit">{{ self.t("px.revive_apply") }}</button>
+          <button class="btn small" type="submit" aria-label="{{ self.t("px.revive_apply_quarantine_aria") }}">{{ self.t("px.revive_apply") }}</button>
         </div>
       </form>
     </li>

@@ -22,7 +22,7 @@
             hx-post="/admin/pipeline/rows?section=drop&amp;render=1"
             hx-trigger="change" hx-target="#ped-drop-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
-            aria-label="{{ self.t("ped.rename_target") }}">
+            aria-label="{{ self.t("ped.drop_target") }}">
       <option value="asn" selected>{{ self.t("ped.target_asn") }}</option>
       <option value="name">{{ self.t("ped.target_name") }}</option>
       <option value="host">{{ self.t("ped.target_host") }}</option>
@@ -36,19 +36,19 @@
             hx-post="/admin/pipeline/rows?section=drop&amp;remove={{ loop.index0 }}"
             hx-target="#ped-drop-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
-            title="{{ self.t("ped.rename_remove") }}">✕</button>
+            title="{{ self.t("ped.drop_remove") }}" aria-label="{{ self.t("ped.drop_remove") }}">✕</button>
   </div>
   {% else %}
   <div class="ped-row">
     <input type="text" name="ped_drop_{{ loop.index0 }}_match" value="{{ row.match_pattern }}"
-           placeholder="{{ self.t("ped.rename_match") }}" aria-label="{{ self.t("ped.rename_match") }}">
+           placeholder="{{ self.t("ped.drop_match") }}" aria-label="{{ self.t("ped.drop_match") }}">
     <input type="text" class="mono" name="ped_drop_{{ loop.index0 }}_flags" value="{{ row.flags }}" maxlength="3"
-           placeholder="{{ self.t("ped.rename_flags") }}" aria-label="{{ self.t("ped.rename_flags") }}">
+           placeholder="{{ self.t("ped.drop_flags") }}" aria-label="{{ self.t("ped.drop_flags") }}">
     <select name="ped_drop_{{ loop.index0 }}_target"
             hx-post="/admin/pipeline/rows?section=drop&amp;render=1"
             hx-trigger="change" hx-target="#ped-drop-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
-            aria-label="{{ self.t("ped.rename_target") }}">
+            aria-label="{{ self.t("ped.drop_target") }}">
       <option value="name" {% if row.target == "name" || row.target == "" %}selected{% endif %}>{{ self.t("ped.target_name") }}</option>
       <option value="host" {% if row.target == "host" %}selected{% endif %}>{{ self.t("ped.target_host") }}</option>
       <option value="port" {% if row.target == "port" %}selected{% endif %}>{{ self.t("ped.target_port") }}</option>
@@ -64,7 +64,7 @@
             hx-post="/admin/pipeline/rows?section=drop&amp;remove={{ loop.index0 }}"
             hx-target="#ped-drop-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
-            title="{{ self.t("ped.rename_remove") }}">✕</button>
+            title="{{ self.t("ped.drop_remove") }}" aria-label="{{ self.t("ped.drop_remove") }}">✕</button>
   </div>
   {% endif %}
   {% endfor %}
@@ -97,7 +97,7 @@
             hx-post="/admin/pipeline/rows?remove={{ loop.index0 }}"
             hx-target="#ped-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
-            title="{{ self.t("ped.rename_remove") }}">✕</button>
+            title="{{ self.t("ped.rename_remove") }}" aria-label="{{ self.t("ped.rename_remove") }}">✕</button>
   </div>
   {% endfor %}
 {% endif %}

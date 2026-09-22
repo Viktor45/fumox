@@ -1697,7 +1697,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
 
-        // Reappearance is seamless: the link is re-stamped, status kept.
+        // Reappearance: the link is re-stamped, status kept.
         let stats = reconcile_source(
             &pool,
             "srcA0000000",

@@ -1,14 +1,14 @@
 # Fumox — конфигурация приложения.
 # Файл перечисляет ВСЕ доступные ключи со значениями по умолчанию — правьте
 # только то, что нужно изменить. Каждый ключ имеет дефолт: файл можно урезать
-# до нужных секций или вовсе не создавать — сервис запустится «из коробки».
+# до нужных секций или вовсе не создавать — сервис работает на встроенных дефолтах.
 # Переопределение через окружение: FUMOX_СЕКЦИЯ__КЛЮЧ, например
 # FUMOX_ADMIN__TOKEN=secret (двойное подчеркивание разделяет секции).
 #
 # Fumox — application configuration.
 # The file lists EVERY available key at its default value — change only what
 # you need. Every key has a default: the file may be trimmed down to the
-# sections you need or omitted entirely — the service runs out of the box.
+# sections you need or omitted entirely — the service runs on built-in defaults.
 # Environment overrides: FUMOX_SECTION__KEY, e.g. FUMOX_ADMIN__TOKEN=secret
 # (a double underscore separates the section from the key).
 
@@ -46,7 +46,7 @@ connect_timeout_secs = 10
 read_timeout_secs = 30
 # 10 МиБ; защита от decompression-bomb / 10 MiB; decompression-bomb guard
 max_response_bytes = 10485760
-# семафор параллельных загрузок / concurrency semaphore for fetches
+# 4 = потолок параллельных загрузок на процесс: выше — источники начинают отвечать 429, ниже — слишком долгий прогон фидов с десятками URL / 4 caps parallel HTTP fetches per process: higher values trigger 429s, lower ones stall feeds with dozens of URLs
 max_concurrency = 4
 # только для устранимых классов (network, http_server)
 # retries apply only to recoverable error classes (network, http_server)
@@ -78,13 +78,13 @@ ip_family = "any"
 refresh_check_limit = 100
 # Как поступать с живым прокси, исчезнувшим из выдачи источника.
 # false (дефолт): прокси остается за источником, пока проверки подтверждают,
-# что он жив; как только проверки завалят его — прокси сам уйдет из базы.
+# что он жив; как только проверки завалят его — прокси удаляется из базы автоматически.
 # true: если у источника есть правила отбрасывания (drop) в pipeline, живой
 # прокси под таким правилом убирается уже на ближайшем обновлении.
 # What happens to an alive proxy that vanished from a source feed.
 # false (the default): the proxy stays linked to the source while checks
-# keep confirming it is alive; once the checks fail it, the proxy leaves
-# on its own. true: when the source has pipeline drop rules, an alive
+# keep confirming it is alive; once the checks fail it, the proxy gets
+# removed automatically. true: when the source has pipeline drop rules, an alive
 # proxy caught by a rule is removed on the very next refresh.
 drop_gate = false
 # Возврат удаленного прокси, который снова появился в источнике.
@@ -98,7 +98,7 @@ drop_gate = false
 # admin "reset status" action or «purge removed» plus a re-insert.
 # true: a proxy the feed still carries resets to the pristine unknown
 # state (fail_count and quarantine fields cleared, same as "reset status")
-# and walks the checks again, joining the priority queue.
+# and re-runs the check sequence, joining the priority queue.
 removed_as_unknown = false
 
 [geo]
@@ -111,12 +111,12 @@ removed_as_unknown = false
 # city and autonomous system — ALL databases in db_dir are opened and their
 # facts merged, so {country}, {city} and {asn} work in one name template.
 # The .mmdb files are never committed; at startup the server downloads
-# missing/stale databases into db_dir on its own, provided the directory
+# missing/stale databases into db_dir automatically, provided the directory
 # is writable.
 enabled = true
-# каталог с GeoLite2-{City,ASN}.mmdb / directory holding GeoLite2-{City,ASN}.mmdb
+# «config» — дефолт рядом с бинарником: удобно для dev-сборки и одиночного запуска. В проде задайте абсолютный путь к read-only тому с актуальными .mmdb / "config" is the default next to the binary, convenient for dev. In prod set an absolute path to a read-only volume with fresh .mmdb
 db_dir = "config"
-# кэш host→geo (moka) / host→geo cache (moka)
+# 16384 = потолок записей in-memory кэша moka: каждая запись маленькая (страна/город/AS), итого пара мегабайт; поднимите, если в вашем фиде заметно больше уникальных хостов / 16384 caps the in-memory moka cache; entries are small (country/city/AS) — a couple of MB total; raise this if your feed holds noticeably more unique hosts
 cache_max_entries = 16384
 dns_timeout_secs = 5
 
@@ -130,7 +130,7 @@ token = "change-me"
 bind = "127.0.0.1:8081"
 # 7 дней / 7 days
 session_ttl_hours = 168
-# SSRF-защита источников / SSRF guard for source URLs
+# false = отказываем RFC1918/loopback по умолчанию (SSRF-защита активна). true имеет смысл только при собственной изолированной feed-инфраструктуре / false rejects RFC1918/loopback out of the box (SSRF guard active). Set true only on your own isolated feed infra
 allow_private_urls = false
 # /admin/* кроме login / /admin/* except login
 rate_limit = "120/min"
@@ -152,7 +152,7 @@ allowed_hosts = []
 [probe]
 # Демон проверки живучести прокси.
 # Proxy health-check daemon.
-# период цикла планирования / scheduling cycle period
+# 60 с — компромисс между задержкой прогона приоритетной выборки probe и нагрузкой на исходящие коннекты / 60 s balances probe responsiveness (priority sample turnaround) against outbound connect load
 cycle_interval_secs = 60
 # случайная выборка прокси за цикл (без всплесков) / random proxy sample per cycle (no bursts)
 sample_size = 50
@@ -171,7 +171,7 @@ fail_limit = 2
 # Refuse to dial private addresses coming from feeds: with this flag unset
 # the daemon never connects to loopback/RFC1918/link-local/CGNAT targets —
 # a feed can plant a «proxy» pointing inside your network. A refusal is
-# journaled as a *failed check*: the blocked target walks the ordinary fail
+# journaled as a *failed check*: the blocked target goes through the ordinary fail
 # ladder instead of clogging the queues forever.
 # allow_private_targets = false
 # T1: TCP-connect
@@ -179,7 +179,7 @@ connect_timeout_secs = 5
 # T1: TLS-handshake
 tls_timeout_secs = 5
 concurrency = 8
-# meta-ключ probe_heartbeat для админки / probe_heartbeat meta key consumed by the admin panel
+# 30 с — куда реже probe просто молчит, не присылая heartbeat; значение меньше 15с расходится с обычной задержкой пуша meta-ключа и не несёт пользы / 30 s = how long a silent probe can stay silent before the admin UI notices; going under 15s is no faster than the meta-key push cadence and buys nothing
 heartbeat_interval_secs = 30
 # Второй шанс для прокси в карантине: повторная проверка в случайный момент
 # окна [1ч, 3ч) после карантина — окно задается как min + случайная
@@ -205,7 +205,7 @@ recheck_delays_secs = [600, 900]   # 10 мин → 15 мин / 10m → 15m
 # удаляются (ежедневная задача ротации).
 # Priority-queue entries (probe_requests) older than this are purged.
 queue_stale_days = 7
-# период ротации истории / history rotation period
+# 86400 с (сутки) — ротация probe_results/fetch_log под полные сутки, в пару к [retention].*_days / 86400 s (one day) pairs with [retention].*_days so rotation runs once per day and matches the retention window
 retention_interval_secs = 86400
 
 [meow]
@@ -216,7 +216,7 @@ retention_interval_secs = 86400
 # system service: Fumox does not manage it, it only calls its REST API
 # and reloads its config via PUT /configs.
 api_addr = "127.0.0.1:9090"
-# Clash YAML, генерируется probe / Clash YAML generated by the probe
+# /shared/meow.yaml — путь, на который meow-rs настроен в типовом docker-compose; подмените, когда раскладка томов иная / /shared/meow.yaml is where meow-rs expects its config in the typical docker-compose layout; override if your volume layout differs
 config_path = "/shared/meow.yaml"
 # Адрес(а) T2-проверки задержки через туннель: probe случайно выбирает один
 # из списка на каждую проверку — выход одного адреса из строя не ломает T2.

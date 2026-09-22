@@ -7,7 +7,7 @@
   <h1>{{ self.t("nav.settings") }}</h1>
   <div class="row-actions">
     {% if !self.has_config_file() %}
-      <form method="post" action="/admin/settings/create" style="display:inline">
+      <form method="post" action="/admin/settings/create" class="row-actions-form">
         <input type="hidden" name="_csrf" value="{{ csrf }}">
         <button class="btn primary" type="submit">{{ self.t("set.create_from_defaults") }}</button>
       </form>

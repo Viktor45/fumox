@@ -9,11 +9,13 @@
   <button type="button" class="btn small{% if mode == "builder" %} ped-active{% endif %}"
           hx-post="/admin/pipeline/mode?to=builder{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
-          hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']">{{ self.t("ped.mode_builder") }}</button>
+          hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']"
+          aria-pressed="{% if mode == "builder" %}true{% else %}false{% endif %}">{{ self.t("ped.mode_builder") }}</button>
   <button type="button" class="btn small{% if mode == "raw" %} ped-active{% endif %}"
           hx-post="/admin/pipeline/mode?to=raw{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
-          hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']">{{ self.t("ped.mode_json") }}</button>
+          hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']"
+          aria-pressed="{% if mode == "raw" %}true{% else %}false{% endif %}">{{ self.t("ped.mode_json") }}</button>
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <input type="hidden" name="pipeline_mode" value="{{ mode }}">
 </div>
@@ -23,7 +25,7 @@
   {% if raw_warning %}
   <div class="hint error-text">{{ self.t("ped.raw_mode") }}</div>
   {% endif %}
-  <label>JSON pipeline v1</label>
+  <label for="pipeline-field">{{ self.t("ped.json_label") }}</label>
   <textarea class="mono" id="pipeline-field" name="pipeline" rows="8" placeholder='{ "version": 1, … }'>{{ pipeline_value }}</textarea>
   <div class="hint">{{ self.t("ped.pipeline_hint") }}</div>
   {% match error %}

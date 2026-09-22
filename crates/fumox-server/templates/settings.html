@@ -5,7 +5,24 @@
 {% block content %}
 <div class="page-head">
   <h1>{{ self.t("nav.settings") }}</h1>
+  <div class="row-actions">
+    {% if !self.has_config_file() %}
+      <form method="post" action="/admin/settings/create" style="display:inline">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <button class="btn primary" type="submit">{{ self.t("set.create_from_defaults") }}</button>
+      </form>
+    {% endif %}
+    <a class="btn" href="/admin/settings/edit">{{ self.t("set.edit_button") }}</a>
+  </div>
 </div>
+
+{% if !self.has_config_file() %}
+  <div class="flash error">
+    {{ self.t_args("set.no_file_banner", &[self.editing_path()][..]) }}
+  </div>
+{% else %}
+  <p class="small muted">{{ self.t_args("set.editing_path", &[self.editing_path()][..]) }}</p>
+{% endif %}
 
 <p class="small muted">{{ self.t("set.banner") }}</p>
 

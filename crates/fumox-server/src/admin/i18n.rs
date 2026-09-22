@@ -263,6 +263,10 @@ macro_rules! impl_i18n {
                 self.lang.t(key)
             }
             #[allow(dead_code)]
+            fn t_args(&self, key: &str, args: &[String]) -> String {
+                self.lang.t_args(key, args)
+            }
+            #[allow(dead_code)]
             fn lang_code(&self) -> &str {
                 self.lang.code()
             }

@@ -142,27 +142,22 @@ impl Context {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let config = AppConfig::load(cli.config.as_deref())?;
+    let loaded = fumox_core::config::load(cli.config.as_deref())?;
+    let config = loaded.config;
     fumox_core::logging::init_tracing(config.log.probe);
 
     // The loader cannot log (its own level comes from the config); report
     // the file actually used once tracing is up.
-    match fumox_core::config::resolve_config_path(cli.config.as_deref()) {
-        Ok(fumox_core::config::ResolvedConfigPath::Loaded(file)) => {
+    match &loaded.path {
+        fumox_core::config::ResolvedConfigPath::Loaded(file) => {
             tracing::info!(config = %file.display(), "config file loaded");
         }
-        Ok(fumox_core::config::ResolvedConfigPath::Missing) => {
+        fumox_core::config::ResolvedConfigPath::Missing => {
             tracing::info!(
                 "no config file found (looked at {} or {}); using built-in defaults",
                 fumox_core::config::CONFIG_PATH_ENV,
                 fumox_core::DEFAULT_CONFIG_PATH
             );
-        }
-        Err(already_reported) => {
-            // load() failed on the same resolution a moment ago — this
-            // arm is unreachable, but a misreported startup is worse than
-            // a redundant line.
-            tracing::warn!(%already_reported, "config file resolution failed");
         }
     }
     let pool = fumox_core::db::connect_pool(&config.database).await?;

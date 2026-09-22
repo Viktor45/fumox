@@ -22,8 +22,9 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::config::{
     AdminConfig, DatabaseConfig, FetchConfig, GeoConfig, IngestConfig, LogConfig, MeowConfig,
-    ProbeConfig, RetentionConfig, ServerConfig,
+    ProbeConfig, ResolvedConfigPath, RetentionConfig, ServerConfig,
 };
+use fumox_core::config_writer::is_writable;
 use fumox_core::db::DbPool;
 use fumox_core::geo::GeoResolver;
 use i18n::Lang;
@@ -87,6 +88,15 @@ pub struct AdminState {
     /// UI message catalogs, loaded once at startup from `[admin].locales_dir`
     /// with the shipped ru/en catalogs embedded as fallback.
     pub locales: Arc<i18n::Locales>,
+    /// TOML file actually merged at startup. `Loaded(path)` means an
+    /// editable file exists; `Missing` means the server is running on
+    /// built-in defaults and there is no file on disk yet. The admin
+    /// panel *Edit settings* page writes back to this path.
+    pub config_path: ResolvedConfigPath,
+    /// Cached answer to `is_writable(config_path)`. Computed once at
+    /// startup — covers the "parent directory writable, file missing"
+    /// case so the *Create from defaults* button can still appear.
+    pub config_writable: bool,
 }
 
 impl AdminState {
@@ -102,6 +112,7 @@ impl AdminState {
         events: EventBus,
         fetcher: Fetcher,
         config: fumox_core::AppConfig,
+        config_path: ResolvedConfigPath,
     ) -> Self {
         let session_key = auth::derive_key(b"fumox-admin-session", &config.admin.token);
         let csrf_key = auth::derive_key(b"fumox-admin-csrf", &config.admin.token);
@@ -118,6 +129,17 @@ impl AdminState {
         )));
         let geo_full = Arc::new(fumox_core::geo::FullResolver::from_dir(&config.geo));
         let trusted_cidrs = parse_trusted_cidrs(&config.admin.trust_proxy_ips);
+        // The *Edit settings* page writes to this exact path; compute
+        // writability once so the button state and the read-only banner
+        // stay in sync. `Missing` means the file is absent on disk and
+        // we fall back to checking the default's parent directory so
+        // the *Create from defaults* button can still be offered.
+        let config_writable = match &config_path {
+            ResolvedConfigPath::Loaded(p) => is_writable(p),
+            ResolvedConfigPath::Missing => {
+                is_writable(std::path::Path::new(fumox_core::DEFAULT_CONFIG_PATH))
+            }
+        };
         Self {
             pool,
             caches,
@@ -144,6 +166,8 @@ impl AdminState {
             admin_limiter,
             trusted_cidrs,
             locales,
+            config_path,
+            config_writable,
         }
     }
 
@@ -301,6 +325,9 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/logs/fetch", get(handlers::fetch_logs))
         .route("/probe", get(handlers::probe_overview))
         .route("/settings", get(handlers::settings_overview))
+        .route("/settings/edit", get(handlers::settings_edit))
+        .route("/settings/create", post(handlers::settings_create))
+        .route("/settings/update", post(handlers::settings_update))
         // Pipeline builder widget: server-side generation
         // and validation inside the same auth+CSRF envelope as every POST.
         .route("/pipeline/preview", post(handlers::pipeline_preview))
@@ -740,6 +767,7 @@ mod tests {
             EventBus::new(),
             fetcher,
             config,
+            ResolvedConfigPath::Missing,
         )
     }
 
@@ -2302,6 +2330,7 @@ mod tests {
             EventBus::new(),
             fetcher,
             config,
+            ResolvedConfigPath::Missing,
         );
         let has_dbs = state.geo_full.is_active();
 

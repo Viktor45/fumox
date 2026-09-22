@@ -5,6 +5,7 @@
 //! encoders used by both `fumox-server` and `fumox-probe`.
 
 pub mod config;
+pub mod config_writer;
 pub mod db;
 pub mod error;
 pub mod fingerprint;

@@ -63,10 +63,10 @@ pub struct AppConfig {
 }
 
 /// Where the TOML config file was looked for, as resolved by
-/// [`AppConfig::load`] — lets the binaries log the truth (the loader
+/// [`load`] — lets the binaries log the truth (the loader
 /// itself cannot: the tracing subscriber is not installed until after the
 /// config, which carries the log level, is loaded).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedConfigPath {
     /// The file at this path was merged into the configuration.
     Loaded(PathBuf),
@@ -121,35 +121,6 @@ pub fn resolve_config_path(path: Option<&Path>) -> crate::Result<ResolvedConfigP
 }
 
 impl AppConfig {
-    /// Loads configuration from defaults, an optional TOML file and the
-    /// environment.
-    ///
-    /// The file location is resolved by [`resolve_config_path`]: the
-    /// explicit `path` (the `--config` flag) → the [`CONFIG_PATH_ENV`]
-    /// environment variable → [`DEFAULT_CONFIG_PATH`] against the CWD.
-    /// Every key has a default, so a missing default file runs the
-    /// service out of the box.
-    pub fn load(path: Option<&Path>) -> crate::Result<Self> {
-        let mut figment = Figment::from(Serialized::defaults(Self::default()));
-
-        if let ResolvedConfigPath::Loaded(file) = resolve_config_path(path)? {
-            figment = figment.merge(Toml::file(file));
-        }
-
-        // Environment overrides: FUMOX_SECTION__KEY (double underscore splits
-        // the section path). FUMOX_CONFIG itself is the file pointer handled
-        // above, not a config key — keep it out of the value layer.
-        figment = figment.merge(
-            Env::prefixed("FUMOX_")
-                .split("__")
-                .ignore(&[CONFIG_PATH_KEY]),
-        );
-
-        let config: Self = figment.extract()?;
-        config.validate()?;
-        Ok(config)
-    }
-
     /// Cross-field checks serde cannot express on individual fields.
     fn validate(&self) -> crate::Result<()> {
         if self.meow.backoff_max_secs < self.meow.backoff_initial_secs {
@@ -159,6 +130,55 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+/// Result of [`load`]: the merged configuration together with the file
+/// that was actually read. The path is what the admin panel uses as the
+/// round-trip target for the *Edit settings* page — see
+/// [`crate::config_writer`].
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: AppConfig,
+    pub path: ResolvedConfigPath,
+}
+
+/// Loads configuration from defaults, an optional TOML file and the
+/// environment.
+///
+/// The file location is resolved by [`resolve_config_path`]: the
+/// explicit `path` (the `--config` flag) → the [`CONFIG_PATH_ENV`]
+/// environment variable → [`DEFAULT_CONFIG_PATH`] against the CWD.
+/// Every key has a default, so a missing default file runs the
+/// service out of the box.
+pub fn load(path: Option<&Path>) -> crate::Result<LoadedConfig> {
+    let mut figment = Figment::from(Serialized::defaults(AppConfig::default()));
+    let resolved = resolve_config_path(path)?;
+
+    if let ResolvedConfigPath::Loaded(file) = &resolved {
+        figment = figment.merge(Toml::file(file));
+    }
+
+    // Environment overrides: FUMOX_SECTION__KEY (double underscore splits
+    // the section path). FUMOX_CONFIG itself is the file pointer handled
+    // above, not a config key — keep it out of the value layer.
+    figment = figment.merge(
+        Env::prefixed("FUMOX_")
+            .split("__")
+            .ignore(&[CONFIG_PATH_KEY]),
+    );
+
+    let config: AppConfig = figment.extract()?;
+    config.validate()?;
+    Ok(LoadedConfig {
+        config,
+        path: resolved,
+    })
+}
+
+/// Shorthand for callers that only need the merged config and do not
+/// care which file (if any) was loaded — tests and one-shot helpers.
+pub fn load_config(path: Option<&Path>) -> crate::Result<AppConfig> {
+    Ok(load(path)?.config)
 }
 
 /// Public HTTP listener serving `/sub/{id}` and `/src/{id}`.
@@ -1002,7 +1022,7 @@ mod tests {
         // through the same lock.
         unsafe { std::env::remove_var(CONFIG_PATH_ENV) };
 
-        let cfg = AppConfig::load(None).expect("defaults must load");
+        let cfg = load_config(None).expect("defaults must load");
         assert_eq!(cfg.admin.bind.to_string(), "127.0.0.1:8081");
         assert_eq!(cfg.database.busy_timeout_ms, 5000);
         assert_eq!(cfg.retention.probe_results_days, 14);
@@ -1026,16 +1046,16 @@ mod tests {
             "[ingest]\ndrop_gate = true\nrefresh_check_limit = 10\n",
         )
         .unwrap();
-        let cfg = AppConfig::load(Some(&file)).expect("ingest section must load");
+        let cfg = load_config(Some(&file)).expect("ingest section must load");
         assert!(cfg.ingest.drop_gate);
         assert_eq!(cfg.ingest.refresh_check_limit, 10);
 
         // The keys moved house: the old spellings are rejected so nobody
         // silently runs on defaults.
         std::fs::write(&file, "[probe]\nrefresh_check_limit = 10\n").unwrap();
-        assert!(AppConfig::load(Some(&file)).is_err());
+        assert!(load_config(Some(&file)).is_err());
         std::fs::write(&file, "[server]\ndrop_gate = true\n").unwrap();
-        assert!(AppConfig::load(Some(&file)).is_err());
+        assert!(load_config(Some(&file)).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1046,16 +1066,16 @@ mod tests {
         let file = dir.join("app.toml");
         std::fs::write(&file, "[log]\nserver = \"warn\"\nprobe = \"debug\"\n").unwrap();
 
-        let cfg = AppConfig::load(Some(&file)).expect("log levels must load");
+        let cfg = load_config(Some(&file)).expect("log levels must load");
         assert_eq!(cfg.log.server, LogLevel::Warn);
         assert_eq!(cfg.log.probe, LogLevel::Debug);
 
         std::fs::write(&file, "[log]\nserver = \"loud\"\n").unwrap();
-        let err = AppConfig::load(Some(&file)).unwrap_err();
+        let err = load_config(Some(&file)).unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
 
         std::fs::write(&file, "[log]\nlevel = \"warn\"\n").unwrap();
-        let err = AppConfig::load(Some(&file)).unwrap_err();
+        let err = load_config(Some(&file)).unwrap_err();
         assert!(
             matches!(err, crate::Error::Config(_)),
             "unknown key rejected"
@@ -1066,7 +1086,7 @@ mod tests {
 
     #[test]
     fn missing_explicit_path_is_an_error() {
-        let err = AppConfig::load(Some(Path::new("/nonexistent/app.toml"))).unwrap_err();
+        let err = load_config(Some(Path::new("/nonexistent/app.toml"))).unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
 
@@ -1093,7 +1113,7 @@ mod tests {
         // serialized by `env_mutex`; other threads read the variable only
         // through the same lock.
         unsafe { std::env::set_var(CONFIG_PATH_ENV, &file) };
-        let cfg = AppConfig::load(None).expect("env-pointed file must load");
+        let cfg = load_config(None).expect("env-pointed file must load");
         assert_eq!(cfg.retention.probe_results_days, 7);
         assert_eq!(
             cfg.retention.fetch_log_days, 30,
@@ -1103,14 +1123,14 @@ mod tests {
         // The explicit flag outranks the variable.
         let flag_file = dir.join("flag.toml");
         std::fs::write(&flag_file, "[retention]\nprobe_results_days = 5\n").unwrap();
-        let cfg = AppConfig::load(Some(&flag_file)).expect("the flag must outrank the env pointer");
+        let cfg = load_config(Some(&flag_file)).expect("the flag must outrank the env pointer");
         assert_eq!(cfg.retention.probe_results_days, 5);
 
         // A variable naming a missing file is an operator typo — loud.
         // SAFETY: see above.
         let missing = dir.join("missing.toml");
         unsafe { std::env::set_var(CONFIG_PATH_ENV, &missing) };
-        let err = AppConfig::load(None).unwrap_err();
+        let err = load_config(None).unwrap_err();
         assert!(
             err.to_string().contains(CONFIG_PATH_ENV),
             "the error names the variable: {err}"
@@ -1120,7 +1140,7 @@ mod tests {
         // location applies again, exactly like without the variable.
         // SAFETY: see above.
         unsafe { std::env::set_var(CONFIG_PATH_ENV, "   ") };
-        let cfg = AppConfig::load(None).expect("empty pointer behaves as unset");
+        let cfg = load_config(None).expect("empty pointer behaves as unset");
         assert_eq!(cfg.retention.probe_results_days, 14);
 
         // SAFETY: see above.
@@ -1228,7 +1248,7 @@ probe_results_days = 7
         )
         .unwrap();
 
-        let cfg = AppConfig::load(Some(&file)).expect("toml must load");
+        let cfg = load_config(Some(&file)).expect("toml must load");
         assert_eq!(cfg.server.bind.to_string(), "127.0.0.1:9999");
         assert!(!cfg.admin.is_active(), "empty token disables the admin");
         assert_eq!(cfg.retention.probe_results_days, 7);
@@ -1247,7 +1267,7 @@ probe_results_days = 7
         let file = dir.join("app.toml");
         std::fs::write(&file, "[admin]\ntokn = \"oops\"\n").unwrap();
 
-        let err = AppConfig::load(Some(&file)).unwrap_err();
+        let err = load_config(Some(&file)).unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
 
         std::fs::remove_dir_all(&dir).ok();

@@ -45,6 +45,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 serde_norway = "0.9"
 figment = { version = "0.10", features = ["toml", "env"] }
 toml = "1"
+# Round-trip TOML editing: keeps every existing comment in config/app.toml
+# when the admin panel writes a single field back. Used only by
+# fumox-core::config_writer (admin editor path).
+toml_edit = { version = "0.22", features = ["display"] }
 
 # Database
 # sqlx 0.9: query*() takes `impl SqlSafeStr` — `&'static str` directly,

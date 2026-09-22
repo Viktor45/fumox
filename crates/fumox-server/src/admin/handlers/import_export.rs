@@ -878,6 +878,7 @@ mod tests {
             crate::events::EventBus::new(),
             fetcher,
             config,
+            fumox_core::config::ResolvedConfigPath::Missing,
         );
         let lang = state.locales.default_lang();
 

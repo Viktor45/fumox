@@ -14,6 +14,21 @@ CI plumbing) is omitted — it never changes the shipped image.
 
 ### Added
 
+- Admin *Edit settings* page at `/admin/settings/edit`: a form-based
+  editor backed by `toml_edit` that round-trips `config/app.toml` in
+  place and preserves every existing comment (RU/EN pairs, banners,
+  hints). Operates through a single POST that writes the file
+  atomically (`<path>.tmp.<pid>` + rename, with a direct-write
+  fallback for filesystems that reject `rename`). ENV overrides
+  (`FUMOX_SECTION__KEY`) keep winning at runtime per the existing
+  figment merge. Sections are grouped by owning process (Server /
+  Probe / Shared) via CSS-only tabs (no JS). Disabled when the file
+  is missing or not writable; a separate *Create from defaults*
+  button on the overview generates the file from the embedded
+  reference copy when absent. All edits are restart-required (probe
+  must be restarted alongside server). No runtime-config DB overlay
+  is introduced — that would not help probe, which still re-reads
+  the file at startup.
 - `[ingest].removed_as_unknown` (default `false`): a `removed` proxy the
   feed still carries can be revived — the row resets to the pristine
   `unknown` state (fail count and quarantine fields cleared) and walks

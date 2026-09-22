@@ -274,6 +274,24 @@ pub fn router(state: AdminState) -> axum::Router {
             "/proxies/remove-unprobeable",
             post(handlers::proxies_remove_unprobeable),
         )
+        // Bulk revival: inverse of cleanup — moves rows back to `unknown`.
+        // Literal segments must precede `/{id}` for the same reason.
+        .route(
+            "/proxies/revive-removed-by-country",
+            post(handlers::proxies_revive_removed_by_country),
+        )
+        .route(
+            "/proxies/revive-removed-by-asn",
+            post(handlers::proxies_revive_removed_by_asn),
+        )
+        .route(
+            "/proxies/revive-removed-no-history",
+            post(handlers::proxies_revive_removed_no_history),
+        )
+        .route(
+            "/proxies/revive-quarantine",
+            post(handlers::proxies_revive_quarantine),
+        )
         .route("/proxies/{id}", get(handlers::proxy_detail))
         .route("/proxies/{id}/reset", post(handlers::proxy_reset))
         .route(

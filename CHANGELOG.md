@@ -31,6 +31,19 @@ CI plumbing) is omitted — it never changes the shipped image.
   admin listener.
 - `[admin].allowed_hosts` (default `[]`): same semantics on the admin
   listener.
+- Admin *Revival* panel on `/admin/proxies`: a fourth dialog mirroring
+  the existing *Cleanup* panel, but moving rows in the opposite
+  direction. Operators can return `removed` proxies of a chosen
+  country, `removed` proxies of a chosen AS, `removed` proxies that
+  never received a probe verdict, and every `quarantine` proxy back to
+  `unknown`. Each action resets the lifecycle fields (`fail_count=0`,
+  `quarantined_at` / `ladder_at` / `removed_at=NULL`, `ladder_step=0`)
+  the same way `revive_removed` already does for the ingest-driven
+  `[ingest].removed_as_unknown` path, and the returned ids are
+  enqueued into `probe_requests` so the probe picks them up on the
+  next cycle rather than waiting for the random sample to come around.
+  Nothing is physically deleted — the *Purge removed* button stays the
+  only hard-delete. Locale strings `px.revive_*` mirror `px.cleanup_*`.
 
 ### Changed
 

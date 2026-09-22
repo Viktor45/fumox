@@ -640,6 +640,118 @@ pub async fn revive_removed(
     Ok(revived)
 }
 
+/// Bulk revival (admin *Revival* panel): bring every `removed` proxy of
+/// the given country back to `unknown`. The SQL is the same shape as
+/// [`revive_removed`], but the WHERE filter keys on `geo_country`
+/// instead of a fingerprint IN-list — the admin acts on the whole
+/// filtered population in one statement, no fingerprint enumeration
+/// needed. Returns the revived ids so the caller can hand them to the
+/// priority-probe queue.
+pub async fn revive_removed_by_country(
+    pool: &DbPool,
+    code: &str,
+    now: i64,
+) -> crate::Result<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "UPDATE proxies SET
+             status = 'unknown',
+             fail_count = 0,
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             removed_at = NULL,
+             updated_at = ?
+         WHERE status = 'removed' AND geo_country = ?
+         RETURNING id",
+    )
+    .bind(now)
+    .bind(code)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Bulk revival (admin *Revival* panel): bring every `removed` proxy of
+/// the given autonomous system back to `unknown`. `asn` is the bare
+/// number (`"24940"` or `"AS24940"`) — the canonical `AS{n}` form is
+/// what `geo_asn` stores, so we build it once here. Returns the
+/// revived ids for enqueueing.
+pub async fn revive_removed_by_asn(pool: &DbPool, asn: &str, now: i64) -> crate::Result<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "UPDATE proxies SET
+             status = 'unknown',
+             fail_count = 0,
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             removed_at = NULL,
+             updated_at = ?
+         WHERE status = 'removed' AND geo_asn = ?
+         RETURNING id",
+    )
+    .bind(now)
+    .bind(format!("AS{asn}"))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Bulk revival (admin *Revival* panel): bring every `removed` proxy
+/// that never received a probe verdict back to `unknown`. The
+/// `NOT EXISTS` predicate is the historical record — any row in
+/// `probe_results` for the proxy means the probe at least got to it,
+/// which is a stronger signal than the source ever did. Rows that
+/// survived the cleanup *without* ever being probed are exactly the
+/// population the operator is trying to surface here. Returns the
+/// revived ids for enqueueing.
+pub async fn revive_removed_without_probe_history(
+    pool: &DbPool,
+    now: i64,
+) -> crate::Result<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "UPDATE proxies SET
+             status = 'unknown',
+             fail_count = 0,
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             removed_at = NULL,
+             updated_at = ?
+         WHERE status = 'removed'
+           AND NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = proxies.id)
+         RETURNING id",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Bulk revival (admin *Revival* panel): bring every `quarantine` proxy
+/// back to `unknown`, skipping the recheck ladder. Symmetric to
+/// [`quarantine_to_removed`]. The lifecycle fields that
+/// `quarantine_to_removed` clears are the same ones `revive_removed`
+/// clears — `quarantined_at`, `ladder_at`, `ladder_step`, `fail_count`.
+/// `removed_at` stays NULL because quarantined rows never had a
+/// `removed_at`. Returns the revived ids for enqueueing.
+pub async fn revive_quarantine(pool: &DbPool, now: i64) -> crate::Result<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "UPDATE proxies SET
+             status = 'unknown',
+             fail_count = 0,
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             updated_at = ?
+         WHERE status = 'quarantine'
+         RETURNING id",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 /// Sources currently linking a proxy, with the last-seen timestamp.
 pub async fn links_for_proxy(pool: &DbPool, proxy_id: i64) -> crate::Result<Vec<(String, i64)>> {
     let rows: Vec<(String, i64)> = sqlx::query_as(
@@ -3287,5 +3399,175 @@ mod tests {
         assert_eq!(bulk_status_of(&pool, ready).await.0, "ready");
         assert_eq!(bulk_status_of(&pool, alive).await.0, "alive");
         assert_eq!(bulk_status_of(&pool, unknown).await.0, "removed");
+    }
+
+    /// `revive_removed_by_country` resets matching `removed` rows back to
+    /// `unknown` and clears every lifecycle field — symmetric to
+    /// `remove_alive_by_country`. Rows outside the country stay `removed`.
+    #[tokio::test]
+    async fn revive_removed_by_country_returns_unknown_and_clears_lifecycle() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcR0000000").await;
+        let de = bulk_test_row(&pool, "revive-de", "vless", "removed", Some("DE"), None).await;
+        let us = bulk_test_row(&pool, "revive-us", "vless", "removed", Some("US"), None).await;
+        let now = crate::models::now_ts();
+        // Stamp a non-zero ladder / quarantine / fail_count on DE to
+        // confirm the revival clears them.
+        sqlx::query(
+            "UPDATE proxies SET quarantined_at = 100, ladder_at = 200, ladder_step = 2,
+                  fail_count = 5, removed_at = 300 WHERE id = ?",
+        )
+        .bind(de)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ids = revive_removed_by_country(&pool, "DE", now).await.unwrap();
+        assert_eq!(ids, vec![de], "only the DE row revives; US stays removed");
+
+        let (status, q, l, removed_at) = bulk_status_of(&pool, de).await;
+        assert_eq!(status, "unknown");
+        assert_eq!(q, None, "quarantined_at must be cleared");
+        assert_eq!(l, None, "ladder_at must be cleared");
+        assert_eq!(removed_at, None, "removed_at must be cleared");
+        assert_eq!(bulk_status_of(&pool, us).await.0, "removed");
+    }
+
+    /// `revive_removed_by_country` only acts on `status = 'removed'`;
+    /// every other tier is left untouched even when the country matches.
+    #[tokio::test]
+    async fn revive_removed_by_country_ignores_other_statuses() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcR0000001").await;
+        let alive = bulk_test_row(&pool, "revive-alive", "vless", "alive", Some("DE"), None).await;
+        let q = bulk_test_row(&pool, "revive-q", "vless", "quarantine", Some("DE"), None).await;
+        let unknown = bulk_test_row(
+            &pool,
+            "revive-unknown",
+            "vless",
+            "unknown",
+            Some("DE"),
+            None,
+        )
+        .await;
+        let now = crate::models::now_ts();
+
+        let ids = revive_removed_by_country(&pool, "DE", now).await.unwrap();
+        assert!(ids.is_empty(), "no row matches status='removed' + DE");
+        assert_eq!(bulk_status_of(&pool, alive).await.0, "alive");
+        assert_eq!(bulk_status_of(&pool, q).await.0, "quarantine");
+        assert_eq!(bulk_status_of(&pool, unknown).await.0, "unknown");
+    }
+
+    /// `revive_removed_by_asn` accepts both `24940` and `AS24940`,
+    /// matches the canonical `AS24940` form stored in `geo_asn`, and
+    /// leaves rows of other ASes alone.
+    #[tokio::test]
+    async fn revive_removed_by_asn_matches_canonical_prefix() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcR0000002").await;
+        let yes = bulk_test_row(&pool, "revive-asn-yes", "vless", "removed", None, None).await;
+        let no = bulk_test_row(&pool, "revive-asn-no", "vless", "removed", None, None).await;
+        sqlx::query("UPDATE proxies SET geo_asn = 'AS24940' WHERE id IN (?, ?)")
+            .bind(yes)
+            .bind(no)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET geo_asn = 'AS13335' WHERE id = ?")
+            .bind(no)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = crate::models::now_ts();
+
+        let ids = revive_removed_by_asn(&pool, "24940", now).await.unwrap();
+        assert_eq!(ids, vec![yes], "bare number and AS-prefix both work");
+        assert_eq!(bulk_status_of(&pool, yes).await.0, "unknown");
+        assert_eq!(bulk_status_of(&pool, no).await.0, "removed");
+    }
+
+    /// `revive_removed_without_probe_history` only revives `removed` rows
+    /// with no `probe_results` entry — a row that the probe once got to
+    /// (even if it failed) stays removed.
+    #[tokio::test]
+    async fn revive_removed_without_probe_history_targets_only_historyless_rows() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcR0000003").await;
+        let lonely = bulk_test_row(&pool, "revive-lonely", "vless", "removed", None, None).await;
+        let tried = bulk_test_row(&pool, "revive-tried", "vless", "removed", None, None).await;
+        sqlx::query("INSERT INTO probe_results (proxy_id, probe_kind, ok, checked_at) VALUES (?, 't1', 0, 1)")
+            .bind(tried)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = crate::models::now_ts();
+
+        let ids = revive_removed_without_probe_history(&pool, now)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![lonely]);
+        assert_eq!(bulk_status_of(&pool, lonely).await.0, "unknown");
+        assert_eq!(bulk_status_of(&pool, tried).await.0, "removed");
+    }
+
+    /// `revive_quarantine` moves every quarantined row back to `unknown`
+    /// and clears `quarantined_at` / `ladder_at` / `ladder_step` /
+    /// `fail_count`. The recheck-ladder schedule is dropped — the probe
+    /// picks the row up via the priority queue (the caller enqueues
+    /// the returned ids) and runs T1 from scratch.
+    #[tokio::test]
+    async fn revive_quarantine_returns_unknown_and_clears_ladder_fields() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcR0000004").await;
+        let q = bulk_test_row(
+            &pool,
+            "revive-q-only",
+            "vless",
+            "quarantine",
+            Some("DE"),
+            None,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE proxies SET quarantined_at = 1500, ladder_at = 1700, ladder_step = 2,
+                  fail_count = 4 WHERE id = ?",
+        )
+        .bind(q)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = crate::models::now_ts();
+
+        let ids = revive_quarantine(&pool, now).await.unwrap();
+        assert_eq!(ids, vec![q]);
+        let (status, quarantined_at, ladder_at, removed_at) = bulk_status_of(&pool, q).await;
+        assert_eq!(status, "unknown");
+        assert_eq!(quarantined_at, None);
+        assert_eq!(ladder_at, None);
+        assert_eq!(
+            removed_at, None,
+            "removed_at was never set on a quarantine row"
+        );
+    }
+
+    /// `revive_quarantine` only acts on `status = 'quarantine'`; every
+    /// other tier (including `removed` itself) stays put.
+    #[tokio::test]
+    async fn revive_quarantine_leaves_alive_and_removed_alone() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcR0000005").await;
+        let alive = bulk_test_row(&pool, "revive-alive-skip", "vless", "alive", None, None).await;
+        let removed =
+            bulk_test_row(&pool, "revive-removed-skip", "vless", "removed", None, None).await;
+        let unknown =
+            bulk_test_row(&pool, "revive-unknown-skip", "vless", "unknown", None, None).await;
+        let now = crate::models::now_ts();
+
+        let ids = revive_quarantine(&pool, now).await.unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(bulk_status_of(&pool, alive).await.0, "alive");
+        assert_eq!(bulk_status_of(&pool, removed).await.0, "removed");
+        assert_eq!(bulk_status_of(&pool, unknown).await.0, "unknown");
     }
 }

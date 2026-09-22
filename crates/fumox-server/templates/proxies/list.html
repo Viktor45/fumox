@@ -6,6 +6,7 @@
 <div class="page-head">
   <h1>{{ self.t("nav.proxies") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
   <div class="row-actions">
+    <button class="btn" type="button" onclick="document.getElementById('revive-dialog').showModal()">{{ self.t("px.revive_button") }}</button>
     <button class="btn danger" type="button" onclick="document.getElementById('cleanup-dialog').showModal()">{{ self.t("px.cleanup_button") }}</button>
     <button class="btn danger" type="button" onclick="document.getElementById('purge-dialog').showModal()">{{ self.t("px.purge_button") }}</button>
   </div>
@@ -106,6 +107,79 @@
       <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
     </div>
   </form>
+</dialog>
+
+<!-- Bulk revival: inverse of cleanup — every action here moves rows
+     back to `unknown`, not to `removed`. Revived ids are enqueued for
+     priority probing so the daemon picks them up on its next cycle
+     instead of waiting for the random sample. -->
+<dialog id="revive-dialog">
+  <h2>{{ self.t("px.revive_title") }}</h2>
+  <p class="muted small">{{ self.t("px.revive_note") }}</p>
+  <ul class="cleanup-ops">
+    <li>
+      <form method="post" action="/admin/proxies/revive-removed-by-country">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.revive_country_title") }}</strong>
+            <p class="muted small">{{ self.t("px.revive_country_desc") }}</p>
+          </div>
+          <div class="inline-controls">
+            <select name="country">
+              <option value="">{{ self.t("common.choose") }}</option>
+              {% for country in countries %}
+                <option value="{{ country }}">{{ country }}</option>
+              {% endfor %}
+            </select>
+            <button class="btn small" type="submit">{{ self.t("px.revive_apply") }}</button>
+          </div>
+        </div>
+      </form>
+    </li>
+    <li>
+      <form method="post" action="/admin/proxies/revive-removed-by-asn">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.revive_asn_title") }}</strong>
+            <p class="muted small">{{ self.t("px.revive_asn_desc") }}</p>
+          </div>
+          <div class="inline-controls">
+            <input type="text" name="asn" placeholder="AS24940" inputmode="numeric" autocomplete="off">
+            <button class="btn small" type="submit">{{ self.t("px.revive_apply") }}</button>
+          </div>
+        </div>
+      </form>
+    </li>
+    <li>
+      <form method="post" action="/admin/proxies/revive-removed-no-history">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.revive_no_history_title") }}</strong>
+            <p class="muted small">{{ self.t("px.revive_no_history_desc") }}</p>
+          </div>
+          <button class="btn small" type="submit">{{ self.t("px.revive_apply") }}</button>
+        </div>
+      </form>
+    </li>
+    <li>
+      <form method="post" action="/admin/proxies/revive-quarantine">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.revive_quarantine_title") }}</strong>
+            <p class="muted small">{{ self.t("px.revive_quarantine_desc") }}</p>
+          </div>
+          <button class="btn small" type="submit">{{ self.t("px.revive_apply") }}</button>
+        </div>
+      </form>
+    </li>
+  </ul>
+  <div class="form-actions">
+    <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
+  </div>
 </dialog>
 
 <form class="filters panel" method="get" action="/admin/proxies">

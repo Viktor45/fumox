@@ -15,8 +15,8 @@ use askama::Template;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use fumox_core::models::Scheme;
-use fumox_core::repo::proxies;
+use fumox_core::models::{Scheme, now_ts};
+use fumox_core::repo::{probe as probe_repo, proxies};
 
 /// Recognized sort orders of the list screen (whitelist — the value is
 /// interpolated into SQL, so anything else falls back to the default).
@@ -791,6 +791,168 @@ pub async fn proxies_remove_alive_by_country(
         &lang
             .t("px.cleanup_moved_toast")
             .replace("{}", &moved.to_string()),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Bulk revival
+//
+// Every action below moves rows *back* to `unknown` — the inverse of the
+// cleanup panel. Revived ids are enqueued into `probe_requests` so the probe
+// daemon picks them up on its next cycle (the same handoff the ingest path
+// uses for `[ingest].removed_as_unknown`).
+// ---------------------------------------------------------------------------
+
+/// Enqueue revived ids for priority probing. Failures are logged and
+/// never fail the revival: the proxy sits in the random sample until
+/// `select_t1_candidates` happens to draw it. The reverse is not true
+/// — `enqueue_checks` silently drops ids whose status drifted away
+/// from `unknown`, so a successful enqueue is a stronger guarantee
+/// than a missed one.
+async fn enqueue_revived(state: &AdminState, ids: &[i64]) {
+    if ids.is_empty() {
+        return;
+    }
+    let limit = state.ingest.refresh_check_limit;
+    if let Err(err) = probe_repo::enqueue_checks(&state.pool, ids, limit, now_ts()).await {
+        tracing::warn!(error = %err, "failed to enqueue revived proxies");
+    }
+}
+
+/// Shared tail of the parameterless revival handlers: run the repo
+/// transition (which returns the revived ids), enqueue them for
+/// priority probing, log the count, answer with the badge + toast.
+macro_rules! bulk_revival_handler {
+    ($name:ident, $repo_fn:ident, $log_msg:literal, $rows_key:literal) => {
+        pub async fn $name(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+            let lang = state.locales.lang_from_headers(&headers);
+            let ids = match proxies::$repo_fn(&state.pool, now_ts()).await {
+                Ok(ids) => ids,
+                Err(err) => return server_error(lang, &err),
+            };
+            let revived = ids.len();
+            tracing::info!(revived, $log_msg);
+            enqueue_revived(&state, &ids).await;
+            let fragment = format!(
+                "<span class=\"badge unknown\">{}</span>",
+                lang.t($rows_key).replace("{}", &revived.to_string())
+            );
+            action_response(
+                is_htmx(&headers),
+                "/admin/proxies",
+                fragment,
+                &lang
+                    .t("px.revive_moved_toast")
+                    .replace("{}", &revived.to_string()),
+            )
+        }
+    };
+}
+
+bulk_revival_handler!(
+    proxies_revive_removed_no_history,
+    revive_removed_without_probe_history,
+    "revived removed proxies without probe history",
+    "px.revive_no_history_rows"
+);
+bulk_revival_handler!(
+    proxies_revive_quarantine,
+    revive_quarantine,
+    "revived quarantined proxies to unknown",
+    "px.revive_quarantine_rows"
+);
+
+/// Move every `removed` proxy of one autonomous system back to
+/// `unknown` (revival panel). The form field `asn` accepts `24940`
+/// and `AS24940`; the canonical `AS{n}` form is built once before the
+/// SQL.
+pub async fn proxies_revive_removed_by_asn(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Form(form): Form<Vec<(String, String)>>,
+) -> Response {
+    let lang = state.locales.lang_from_headers(&headers);
+    let raw = form
+        .iter()
+        .find(|(k, _)| k == "asn")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or_default();
+    let Some(asn) = normalize_asn(raw) else {
+        tracing::info!("revival by ASN rejected: invalid input");
+        return action_response_err(
+            is_htmx(&headers),
+            "/admin/proxies",
+            String::new(),
+            lang.t("val.asn_format"),
+        );
+    };
+    let ids = match proxies::revive_removed_by_asn(&state.pool, &asn, now_ts()).await {
+        Ok(ids) => ids,
+        Err(err) => return server_error(lang, &err),
+    };
+    let revived = ids.len();
+    tracing::info!(asn = %asn, revived, "revived removed proxies by ASN");
+    enqueue_revived(&state, &ids).await;
+    let fragment = format!(
+        "<span class=\"badge unknown\">{}</span>",
+        lang.t("px.revive_asn_rows")
+            .replace("{}", &revived.to_string())
+            .replace("{asn}", &asn),
+    );
+    action_response(
+        is_htmx(&headers),
+        "/admin/proxies",
+        fragment,
+        &lang
+            .t("px.revive_moved_toast")
+            .replace("{}", &revived.to_string()),
+    )
+}
+
+/// Move every `removed` proxy of one country back to `unknown` (revival
+/// panel). The form field `country` must be a 2-letter ISO code offered
+/// by the country dropdown.
+pub async fn proxies_revive_removed_by_country(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Form(form): Form<Vec<(String, String)>>,
+) -> Response {
+    let lang = state.locales.lang_from_headers(&headers);
+    let raw = form
+        .iter()
+        .find(|(k, _)| k == "country")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or_default();
+    let code = raw.trim().to_ascii_uppercase();
+    if code.len() != 2 || !code.bytes().all(|b| b.is_ascii_alphabetic()) {
+        tracing::info!("revival by country rejected: invalid input");
+        return action_response_err(
+            is_htmx(&headers),
+            "/admin/proxies",
+            String::new(),
+            &lang.t("val.country_format").replace("{}", &code),
+        );
+    }
+    let ids = match proxies::revive_removed_by_country(&state.pool, &code, now_ts()).await {
+        Ok(ids) => ids,
+        Err(err) => return server_error(lang, &err),
+    };
+    let revived = ids.len();
+    tracing::info!(country = %code, revived, "revived removed proxies by country");
+    enqueue_revived(&state, &ids).await;
+    let fragment = format!(
+        "<span class=\"badge unknown\">{}</span>",
+        lang.t("px.revive_country_rows")
+            .replace("{}", &revived.to_string())
+            .replace("{country}", &code),
+    );
+    action_response(
+        is_htmx(&headers),
+        "/admin/proxies",
+        fragment,
+        &lang
+            .t("px.revive_moved_toast")
+            .replace("{}", &revived.to_string()),
     )
 }
 

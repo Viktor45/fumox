@@ -96,8 +96,7 @@ impl ProbeTemplate {
         fmt_opt_ts_element(row.ladder_at)
     }
 
-    /// Ladder step label: «второй шанс» or «повтор N» / "second chance" or
-    /// "recheck N".
+    /// Ladder step label: *second chance* or *recheck N*.
     fn step_label(&self, row: &QuarantineRow) -> String {
         if row.ladder_step < 1 {
             self.lang.t("probe.step_second_chance").to_string()

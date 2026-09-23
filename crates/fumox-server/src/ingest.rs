@@ -61,8 +61,8 @@ pub struct IngestSettings {
 ///
 /// With `force = false` a still-fresh raw snapshot (younger than the
 /// source TTL) short-circuits the HTTP fetch — the database is already
-/// reconciled from that payload. Forced refreshes
-/// ("обновить сейчас" from the admin panel) always hit the network.
+/// reconciled from that payload. Forced refreshes (the admin
+/// *Refresh now* button) always hit the network.
 ///
 /// Geo facts are resolved per proxy host while the raw payload is already
 /// parsed (the resolver caches both DNS and lookups) and persisted onto the

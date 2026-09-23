@@ -1,6 +1,6 @@
 //! Source screens: list with filters, create/edit form with full
 //! validation, card with aggregates and fetch log,
-//! toggle / "обновить сейчас" / delete actions.
+//! toggle / *Refresh now* / delete actions.
 
 use super::{
     FormMap, action_response, caps, clamp_limit, fmt_bytes, fmt_opt_ts_element, fmt_ts_element,
@@ -790,7 +790,7 @@ pub async fn source_update(
     if let Err(err) = sources::update(&state.pool, &source).await {
         return server_error(lang, &err);
     }
-    // "Сохранил → сразу действует".
+    // Saved → effective immediately.
     state.caches.invalidate_source(&source.id).await;
     tracing::info!(source = %source.id, "source updated");
     if is_htmx(&headers) {
@@ -1058,7 +1058,7 @@ pub async fn source_toggle(
     )
 }
 
-/// "Обновить сейчас": enqueue an immediate fetch.
+/// *Refresh now*: enqueue an immediate fetch.
 /// The scheduler's per-source guard deduplicates concurrent requests.
 pub async fn source_refresh(
     State(state): State<AdminState>,

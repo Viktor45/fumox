@@ -43,7 +43,7 @@ pub struct AdminState {
     pub geo_full: Arc<fumox_core::geo::FullResolver>,
     /// Immediate-refresh channel into the scheduler (source ids).
     pub refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
-    /// Scheduler handle: in-flight status for "обновить сейчас" fragments.
+    /// Scheduler handle: in-flight status for *Refresh now* fragments.
     pub scheduler: SchedulerState,
     /// Event bus feeding the SSE endpoint (`/admin/events`).
     pub events: EventBus,
@@ -97,6 +97,16 @@ pub struct AdminState {
     /// startup — covers the "parent directory writable, file missing"
     /// case so the *Create from defaults* button can still appear.
     pub config_writable: bool,
+    /// Figment-merged config (defaults → file → `FUMOX_*` env) refreshed
+    /// after every successful `settings_update` / `settings_create` so
+    /// the *Settings* overview and any handler that reads from it sees
+    /// the post-save state instead of the startup snapshot. The
+    /// destructured fields above (`admin`, `server`, …) keep their
+    /// startup values; handlers that want fresh values call
+    /// [`AdminState::with_fresh_config`] (or [`AdminState::live`]) before
+    /// rendering. ENV overrides keep their priority because `load()`
+    /// re-merges them on every refresh.
+    pub live_config: Arc<std::sync::RwLock<fumox_core::AppConfig>>,
 }
 
 impl AdminState {
@@ -154,12 +164,12 @@ impl AdminState {
             probe: config.probe.clone(),
             meow: config.meow.clone(),
             retention: config.retention.clone(),
-            ingest: config.ingest,
-            fetch: config.fetch,
-            server: config.server,
-            database: config.database,
-            geo_config: config.geo,
-            log: config.log,
+            ingest: config.ingest.clone(),
+            fetch: config.fetch.clone(),
+            server: config.server.clone(),
+            database: config.database.clone(),
+            geo_config: config.geo.clone(),
+            log: config.log.clone(),
             session_key,
             csrf_key,
             login_limiter,
@@ -168,7 +178,60 @@ impl AdminState {
             locales,
             config_path,
             config_writable,
+            live_config: Arc::new(std::sync::RwLock::new(config)),
         }
+    }
+
+    /// Snapshot of the latest figment-merged config. Cheap: clones the
+    /// held `AppConfig`. Handlers that need post-save values (the
+    /// *Settings* overview, anything that prints effective values) read
+    /// from this rather than from the destructured fields frozen at
+    /// startup.
+    pub fn live(&self) -> fumox_core::AppConfig {
+        self.live_config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Return a clone of `self` with the destructured config-derived
+    /// fields refreshed from the live figment-merged view. The
+    /// `server_bind` socket address and the HMAC keys derived from the
+    /// admin token are intentionally kept: rebinding the listener and
+    /// silently invalidating every active session would be a footgun.
+    /// Templates and tests that need a consistent view should clone
+    /// via this helper before rendering.
+    pub fn with_fresh_config(&self) -> Self {
+        let live = self.live();
+        let mut clone = self.clone();
+        clone.server = live.server;
+        clone.database = live.database;
+        clone.fetch = live.fetch;
+        clone.ingest = live.ingest;
+        clone.geo_config = live.geo;
+        clone.admin = live.admin;
+        clone.probe = live.probe;
+        clone.meow = live.meow;
+        clone.retention = live.retention;
+        clone.log = live.log;
+        clone
+    }
+
+    /// Reload the on-disk config via the figment merge
+    /// (defaults → TOML → `FUMOX_*` env) and swap it into the live
+    /// view. Cheap (a single small file read); called from
+    /// `settings_update` and `settings_create` after every successful
+    /// write so subsequent GETs render the fresh values. Returns the
+    /// underlying `config::Error` so the caller can surface it through
+    /// a banner; the in-memory view is left untouched on failure.
+    pub fn refresh_live_config(&self, path: &std::path::Path) -> fumox_core::Result<()> {
+        let loaded = fumox_core::config::load(Some(path))?;
+        let mut guard = self
+            .live_config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = loaded.config;
+        Ok(())
     }
 
     /// Base URL for the serve links shown on the source/profile cards:
@@ -4647,5 +4710,68 @@ mod tests {
             html.contains(&format!(r#"hx-get="/admin/sources/{}/log""#, source.id)),
             "log-live polling missing on the source card"
         );
+    }
+
+    /// Regression: after `settings_update` writes the form, `state.live_config` must be refreshed so `state.live()` and `state.with_fresh_config()` see the new values, not the startup snapshot.
+    #[tokio::test]
+    async fn live_config_refresh_picks_up_post_save_state() {
+        let state = test_state(1000).await;
+
+        // The starting snapshot reflects `AppConfig::default()`; the
+        // toggle is *off* and the public listener sits on 8080.
+        assert!(!state.live().ingest.drop_gate);
+        assert!(!state.with_fresh_config().ingest.drop_gate);
+        assert!(!state.ingest.drop_gate);
+        assert_eq!(state.live().server.bind.port(), 8080);
+
+        // Drop a config file on disk that flips the bool and rebinds
+        // the public listener. The file is missing fields the defaults
+        // supply (`probe.*`, `meow.*`, `database.*`, …) — `figment`
+        // fills them in via the `Serialized::defaults` layer.
+        let dir = std::env::temp_dir().join(format!(
+            "fumox-live-refresh-{}",
+            fumox_core::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.toml");
+        std::fs::write(
+            &path,
+            "[ingest]\ndrop_gate = true\n[server]\nbind = \"127.0.0.1:9999\"\n",
+        )
+        .unwrap();
+
+        state
+            .refresh_live_config(&path)
+            .expect("file we just wrote must load cleanly");
+
+        // The live figment-merged view reflects the file.
+        let live = state.live();
+        assert!(live.ingest.drop_gate, "live.ingest.drop_gate");
+        assert_eq!(live.server.bind.port(), 9999, "live.server.bind");
+        // Figment-merged defaults are written back into the in-memory view.
+        assert_eq!(live.probe.fail_limit, fumox_core::config::ProbeConfig::default().fail_limit);
+        assert_eq!(live.fetch.user_agent, fumox_core::config::FetchConfig::default().user_agent);
+
+        // `with_fresh_config` returns a clone with the destructured
+        // fields refreshed from the live view — this is what the
+        // *Settings* overview template now sees.
+        let fresh = state.with_fresh_config();
+        assert!(fresh.ingest.drop_gate, "fresh.ingest.drop_gate");
+        assert_eq!(fresh.server.bind.port(), 9999, "fresh.server.bind");
+
+        // The original destructured fields stay frozen at startup —
+        // the socket is still bound to 8080, the admin toggle is
+        // still off. This is the load-bearing invariant: re-binding
+        // the listener and silently invalidating sessions would be a
+        // footgun, so `with_fresh_config` is explicit about what it
+        // does and does not touch.
+        assert!(!state.ingest.drop_gate, "state.ingest.drop_gate (frozen)");
+        assert_eq!(
+            state.server.bind.port(),
+            8080,
+            "state.server.bind (frozen)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

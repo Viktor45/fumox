@@ -22,7 +22,7 @@ use askama::Template;
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use fumox_core::config::{DEFAULT_CONFIG_PATH, GeoDbKind, RateLimit, ResolvedConfigPath};
+use fumox_core::config::{AppConfig, DEFAULT_CONFIG_PATH, GeoDbKind, RateLimit, ResolvedConfigPath};
 use fumox_core::config_writer::{EditableConfig, item};
 use fumox_core::models::IpFamily;
 
@@ -111,13 +111,20 @@ impl_i18n!(SettingsTemplate);
 
 pub async fn settings_overview(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
+    // The overview prints the effective config (every panel under
+    // *Settings*). Pull from the figment-merged live view so an edit
+    // that landed between two page loads is visible without a restart
+    // — destructured `state.admin` / `state.fetch` / … stay frozen at
+    // startup, only `state.live_config` is refreshed by
+    // `settings_update`.
+    let state = state.with_fresh_config();
     let template = SettingsTemplate {
         langs: state.locales.choices().to_vec(),
         theme: theme::from_headers(&headers),
         lang,
         active: "settings",
         csrf: state.csrf_for(&headers),
-        state: state.clone(),
+        state,
     };
     render_html(template.lang.clone(), &template, StatusCode::OK)
 }
@@ -195,19 +202,44 @@ fn editing_target(state: &AdminState) -> PathBuf {
     }
 }
 
-/// Build the edit template's `raw` map from the current `AppConfig`,
-/// using the canonical render of every field. Booleans become `"on"`
-/// when true, absent otherwise; enums become their short name.
-fn raw_from_state(state: &AdminState) -> HashMap<String, String> {
+/// Reassemble the full `AppConfig` from the destructured fields the
+/// `AdminState` carries. Used by the unwritable / load-error fallback
+/// paths, where reading the file on disk is not an option but the form
+/// still needs sensible values to render.
+fn state_appconfig(state: &AdminState) -> AppConfig {
+    AppConfig {
+        server: state.server.clone(),
+        database: state.database.clone(),
+        fetch: state.fetch.clone(),
+        ingest: state.ingest.clone(),
+        geo: state.geo_config.clone(),
+        admin: state.admin.clone(),
+        probe: state.probe.clone(),
+        meow: state.meow.clone(),
+        retention: state.retention.clone(),
+        log: state.log.clone(),
+    }
+}
+
+/// Build the edit template's `raw` map from an `AppConfig`, using the
+/// canonical render of every field. Booleans become `"on"` when true,
+/// absent otherwise; enums become their short name.
+///
+/// Loaded from the file on every `GET /admin/settings/edit` so the
+/// form reflects the just-saved state — `state.config` is frozen at
+/// startup and would otherwise lag behind every admin save. ENV
+/// overrides keep their priority because `AppConfig::load` already
+/// merges them on top of the file.
+fn raw_from_config(c: &AppConfig) -> HashMap<String, String> {
     let mut raw = HashMap::new();
-    let c = &state.admin;
-    let s = &state.server;
-    let db = &state.database;
-    let f = &state.fetch;
-    let g = &state.geo_config;
-    let p = &state.probe;
-    let m = &state.meow;
-    let r = &state.retention;
+    let admin = &c.admin;
+    let s = &c.server;
+    let db = &c.database;
+    let f = &c.fetch;
+    let g = &c.geo;
+    let p = &c.probe;
+    let m = &c.meow;
+    let r = &c.retention;
 
     raw.insert("server.bind".into(), s.bind.to_string());
     raw.insert(
@@ -258,15 +290,12 @@ fn raw_from_state(state: &AdminState) -> HashMap<String, String> {
 
     raw.insert(
         "ingest.refresh_check_limit".into(),
-        state.ingest.refresh_check_limit.to_string(),
+        c.ingest.refresh_check_limit.to_string(),
     );
-    raw.insert(
-        "ingest.drop_gate".into(),
-        bool_to_raw(state.ingest.drop_gate),
-    );
+    raw.insert("ingest.drop_gate".into(), bool_to_raw(c.ingest.drop_gate));
     raw.insert(
         "ingest.removed_as_unknown".into(),
-        bool_to_raw(state.ingest.removed_as_unknown),
+        bool_to_raw(c.ingest.removed_as_unknown),
     );
 
     raw.insert("geo.enabled".into(), bool_to_raw(g.enabled));
@@ -281,23 +310,26 @@ fn raw_from_state(state: &AdminState) -> HashMap<String, String> {
         g.dns_timeout_secs.to_string(),
     );
 
-    raw.insert("admin.enabled".into(), bool_to_raw(c.enabled));
-    raw.insert("admin.bind".into(), c.bind.to_string());
-    raw.insert("admin.token".into(), c.token.clone());
+    raw.insert("admin.enabled".into(), bool_to_raw(admin.enabled));
+    raw.insert("admin.bind".into(), admin.bind.to_string());
+    raw.insert("admin.token".into(), admin.token.clone());
     raw.insert(
         "admin.session_ttl_hours".into(),
-        c.session_ttl_hours.to_string(),
+        admin.session_ttl_hours.to_string(),
     );
     raw.insert(
         "admin.allow_private_urls".into(),
-        bool_to_raw(c.allow_private_urls),
+        bool_to_raw(admin.allow_private_urls),
     );
-    rate_into(&mut raw, "admin.rate_limit", &c.rate_limit);
-    rate_into(&mut raw, "admin.login_rate_limit", &c.login_rate_limit);
-    raw.insert("admin.secure_cookies".into(), bool_to_raw(c.secure_cookies));
-    raw.insert("admin.locales_dir".into(), c.locales_dir.clone());
-    raw.insert("admin.trust_proxy_ips".into(), c.trust_proxy_ips.join("\n"));
-    raw.insert("admin.allowed_hosts".into(), c.allowed_hosts.join("\n"));
+    rate_into(&mut raw, "admin.rate_limit", &admin.rate_limit);
+    rate_into(&mut raw, "admin.login_rate_limit", &admin.login_rate_limit);
+    raw.insert("admin.secure_cookies".into(), bool_to_raw(admin.secure_cookies));
+    raw.insert("admin.locales_dir".into(), admin.locales_dir.clone());
+    raw.insert(
+        "admin.trust_proxy_ips".into(),
+        admin.trust_proxy_ips.join("\n"),
+    );
+    raw.insert("admin.allowed_hosts".into(), admin.allowed_hosts.join("\n"));
 
     raw.insert("probe.fail_limit".into(), p.fail_limit.to_string());
     raw.insert(
@@ -372,8 +404,8 @@ fn raw_from_state(state: &AdminState) -> HashMap<String, String> {
         r.fetch_log_days.to_string(),
     );
 
-    raw.insert("log.server".into(), state.log.server.as_str().into());
-    raw.insert("log.probe".into(), state.log.probe.as_str().into());
+    raw.insert("log.server".into(), c.log.server.as_str().into());
+    raw.insert("log.probe".into(), c.log.probe.as_str().into());
 
     raw
 }
@@ -398,8 +430,13 @@ fn bool_to_raw(b: bool) -> String {
 fn ip_family_str(f: IpFamily) -> &'static str {
     match f {
         IpFamily::Any => "any",
-        IpFamily::Ipv4 => "v4",
-        IpFamily::Ipv6 => "v6",
+        // These strings are the SAME ones `IpFamily::from_str` accepts on
+        // startup (crates/fumox-core/src/models.rs). If they ever drift,
+        // admin saves silently revert on the next restart because the
+        // parser falls back to the default. Keep them locked together —
+        // `apply_all_ip_family_round_trip` in this file proves the pair.
+        IpFamily::Ipv4 => "ipv4",
+        IpFamily::Ipv6 => "ipv6",
     }
 }
 
@@ -413,10 +450,19 @@ fn geo_db_str(d: GeoDbKind) -> &'static str {
 
 pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
+
+    // Reload the file on every GET so the form reflects the last save
+    // (the in-memory `state.config` is frozen at startup and would lag
+    // behind every admin write). ENV overrides still win — `AppConfig::load`
+    // merges them on top of the file.
+    let target = editing_target(&state);
+    let raw = match fumox_core::config::load(Some(&target)) {
+        Ok(loaded) => raw_from_config(&loaded.config),
+        Err(_) => raw_from_config(&state_appconfig(&state)),
+    };
+
     let banner = if !state.config_writable {
-        Some(Banner::Unwritable(
-            editing_target(&state).display().to_string(),
-        ))
+        Some(Banner::Unwritable(target.display().to_string()))
     } else {
         None
     };
@@ -427,7 +473,7 @@ pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) 
         active: "settings",
         csrf: state.csrf_for(&headers),
         state: state.clone(),
-        raw: raw_from_state(&state),
+        raw,
         errors: Vec::new(),
         banner,
     };
@@ -504,6 +550,15 @@ pub async fn settings_update(
     let path = cfg.path().display().to_string();
     tracing::info!(path = %path, "settings saved");
 
+    // Refresh the figment-merged in-memory view so the next request to
+    // /admin/settings (or any handler that calls `state.with_fresh_config`)
+    // renders the values the operator just wrote, instead of the startup
+    // snapshot. ENV overrides are re-applied by `config::load` itself, so
+    // `FUMOX_*` env vars keep winning on top of the file.
+    if let Err(err) = state.refresh_live_config(Path::new(&path)) {
+        tracing::warn!(error = %err, path = %path, "live config refresh skipped");
+    }
+
     let toast = lang.t_args("set.edit_saved_toast", &[path]);
     if headers.get("HX-Request").is_some() {
         return htmx_redirect_with_toast("/admin/settings", &toast);
@@ -537,7 +592,7 @@ fn settings_edit_unwritable(state: &AdminState, headers: &HeaderMap) -> Response
         active: "settings",
         csrf: state.csrf_for(headers),
         state: state.clone(),
-        raw: raw_from_state(state),
+        raw: raw_from_config(&state_appconfig(state)),
         errors: Vec::new(),
         banner: Some(Banner::Unwritable(
             editing_target(state).display().to_string(),
@@ -560,7 +615,7 @@ fn settings_edit_load_error(state: &AdminState, headers: &HeaderMap, message: St
         active: "settings",
         csrf: state.csrf_for(headers),
         state: state.clone(),
-        raw: raw_from_state(state),
+        raw: raw_from_config(&state_appconfig(state)),
         errors: vec![("".into(), format!("{internal}: {message}"))],
         banner: None,
     };
@@ -589,6 +644,14 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
     if let Err(err) = std::fs::write(&target, fumox_core::config_writer::REFERENCE_CONFIG) {
         tracing::error!(error = %err, path = %target.display(), "failed to write reference config");
         return settings_edit_load_error(&state, &headers, err.to_string());
+    }
+
+    // The file was just materialised from the embedded reference copy;
+    // pull the freshly-merged view into the in-memory cache so the next
+    // GET to /admin/settings/edit (and the *Settings* overview) renders
+    // every default rather than the empty startup snapshot.
+    if let Err(err) = state.refresh_live_config(&target) {
+        tracing::warn!(error = %err, path = %target.display(), "live config refresh after create skipped");
     }
 
     let path = target.display().to_string();
@@ -757,11 +820,11 @@ fn apply_all(
         "fetch.ip_family",
         cfg,
         "fetch.ip_family",
-        &["any", "v4", "v6"],
+        &["any", "ipv4", "ipv6"],
         |s| match s {
             "any" => Some("any".to_string()),
-            "v4" => Some("v4".to_string()),
-            "v6" => Some("v6".to_string()),
+            "ipv4" => Some("ipv4".to_string()),
+            "ipv6" => Some("ipv6".to_string()),
             _ => None,
         },
         lang,
@@ -1526,6 +1589,51 @@ mod tests {
     }
 
     #[test]
+    fn apply_all_ip_family_round_trips_through_parser() {
+        // The dropdown values must match IpFamily::from_str, otherwise
+        // the admin save writes a value that the canonical parser
+        // refuses on the next restart, silently reverting to default.
+        use std::str::FromStr;
+
+        let dir = temp_dir("ip-roundtrip");
+        let path = write_minimal_config(&dir);
+
+        for family in [IpFamily::Any, IpFamily::Ipv4, IpFamily::Ipv6] {
+            let mut raw = HashMap::new();
+            raw.insert(
+                "fetch.ip_family".into(),
+                super::ip_family_str(family).into(),
+            );
+
+            let lang = test_lang();
+            let mut errors = Vec::new();
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            assert!(
+                errors.is_empty(),
+                "save produced errors for {family:?}: {errors:?}"
+            );
+
+            let serialized = cfg.doc().to_string();
+            let parsed = IpFamily::from_str(
+                super::ip_family_str(family),
+            )
+            .expect("ip_family_str must produce a value IpFamily accepts");
+            assert_eq!(parsed, family, "round-trip drifted for {family:?}");
+
+            // toml_edit serialises the leaf under its `[fetch]` section
+            // header, so the on-disk text contains the bare key
+            // (`ip_family = "ipv4"`) rather than the dotted form.
+            assert!(
+                serialized.contains(&format!("ip_family = \"{}\"", super::ip_family_str(family))),
+                "saved config missing the literal for {family:?}: {serialized}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn apply_all_handles_meow_backoff_cross_check() {
         let dir = temp_dir("cross");
         let path = write_minimal_config(&dir);
@@ -1606,5 +1714,54 @@ mod tests {
     fn writer_helper_compiles() {
         let s = String::from("ok");
         assert_eq!(s, "ok");
+    }
+
+    /// Regression for the *Edit settings* bug where the page re-rendered
+    /// stale `state.config` instead of reading the file the editor just
+    /// wrote to. After `EditableConfig::save()`, a subsequent reload
+    /// must hand the form the new on-disk values, not the in-memory
+    /// snapshot frozen at startup.
+    #[test]
+    fn raw_from_config_reflects_post_save_file_state() {
+        use fumox_core::config::load_config;
+
+        let dir = std::env::temp_dir().join(format!(
+            "fumox-edit-postsave-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.toml");
+
+        std::fs::write(
+            &path,
+            "[ingest]\ndrop_gate = false\n[admin]\nsecure_cookies = true\n",
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(&path)).expect("initial load must work");
+        let raw = raw_from_config(&cfg);
+        // `drop_gate = false` in the file → key present with empty value
+        // (template's `bool_value` returns `!v.is_empty()`, so empty ==
+        // unchecked).
+        assert_eq!(raw.get("ingest.drop_gate").map(String::as_str), Some(""));
+        // `secure_cookies = true` → "on".
+        assert_eq!(raw.get("admin.secure_cookies").map(String::as_str), Some("on"));
+
+        // Simulate the admin save: flip the bool values in the file.
+        std::fs::write(
+            &path,
+            "[ingest]\ndrop_gate = true\n[admin]\nsecure_cookies = false\n",
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(&path)).expect("post-save load must work");
+        let raw = raw_from_config(&cfg);
+        // The fresh load must see the *new* file values, not the
+        // startup snapshot — this is the regression for the bug where
+        // the edit page re-rendered stale in-memory state.
+        assert_eq!(raw.get("ingest.drop_gate").map(String::as_str), Some("on"));
+        assert_eq!(raw.get("admin.secure_cookies").map(String::as_str), Some(""));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

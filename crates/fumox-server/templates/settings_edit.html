@@ -374,8 +374,8 @@
         <label for="fetch-ip">{{ self.t("set.fetch_ip_family") }}</label>
         <select id="fetch-ip" name="fetch.ip_family">
           <option value="any" {% if self.raw_value("fetch.ip_family") == "any" %}selected{% endif %}>any</option>
-          <option value="v4" {% if self.raw_value("fetch.ip_family") == "v4" %}selected{% endif %}>v4</option>
-          <option value="v6" {% if self.raw_value("fetch.ip_family") == "v6" %}selected{% endif %}>v6</option>
+          <option value="ipv4" {% if self.raw_value("fetch.ip_family") == "ipv4" %}selected{% endif %}>ipv4</option>
+          <option value="ipv6" {% if self.raw_value("fetch.ip_family") == "ipv6" %}selected{% endif %}>ipv6</option>
         </select>
       </div>
     </div>

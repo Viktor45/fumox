@@ -270,10 +270,10 @@ macro_rules! impl_i18n {
             fn lang_code(&self) -> &str {
                 self.lang.code()
             }
-            /// Localized display label for a proxy status ("alive" →
-            /// «живые» / "alive") so every status badge renders in the page
-            /// language, including htmx-swapped fragments. Unknown values
-            /// fall through to "unknown", mirroring the template chains.
+            /// Localized display label for a proxy status (e.g. *alive*),
+            /// so every status badge renders in the page language,
+            /// including htmx-swapped fragments. Unknown values fall
+            /// through to *unknown*, mirroring the template chains.
             #[allow(dead_code)]
             fn status_label(&self, status: &str) -> String {
                 let key = match status {

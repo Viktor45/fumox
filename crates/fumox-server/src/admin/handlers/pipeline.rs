@@ -50,11 +50,11 @@ pub async fn pipeline_rows(
     let index = params
         .get("remove")
         .and_then(|index| index.parse::<usize>().ok());
-    // `?render=1` is the change-trigger from a target select — the
+    // `?render=1` is the change-trigger from a target select: the
     // browser already has the row count it wants, the round-trip only
     // has to repaint the row layout (regex ↔ ASN switch). Without this
     // flag every change would append a fresh empty row, exactly like the
-    // explicit "+ правило" button does.
+    // explicit *Add rule* button does.
     let append = !params.contains_key("render");
     match (params.get("section").map(String::as_str), index, append) {
         (Some("drop"), Some(index), _) => {

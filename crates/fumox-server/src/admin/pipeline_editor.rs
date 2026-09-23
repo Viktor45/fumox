@@ -2235,9 +2235,9 @@ mod tests {
         let html = RowsFragment::for_section(lang.clone(), BuilderView::new(&s), "drop")
             .render()
             .unwrap_or_default();
-        // Every drop row's target select carries the htmx wiring — note the
-        // `&render=1` flag: a target change must NOT append a fresh row,
-        // which is what the explicit "+ правило" button does.
+        // Every drop row's target select carries the htmx wiring: note the
+        // `&render=1` flag — a target change must NOT append a fresh row,
+        // which is what the explicit *Add rule* button does.
         assert!(
             html.contains("name=\"ped_drop_0_target\"")
                 && html.contains("hx-post=\"/admin/pipeline/rows?section=drop&amp;render=1\"")

@@ -1343,4 +1343,82 @@ probe_results_days = 7
         };
         assert_eq!(cfg.dns_timeout(), std::time::Duration::from_secs(7));
     }
+
+    /// `FUMOX_ADMIN__TOKEN` must outrank the value written to
+    /// `config/app.toml` — env overrides are how operators rotate the
+    /// admin token without editing the file (regression for the
+    /// figment-merge case that silently left the file value in place).
+    #[test]
+    fn env_admin_token_overrides_file() {
+        let _guard = env_mutex().lock();
+
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-envtoken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.toml");
+        std::fs::write(&file, "[admin]\ntoken = \"from-file\"\n").unwrap();
+
+        // SAFETY: every touch of FUMOX_ADMIN__TOKEN across the test suite is
+        // serialized by `env_mutex`; other threads read the variable only
+        // through the same lock.
+        unsafe { std::env::set_var("FUMOX_ADMIN__TOKEN", "from-env") };
+        let cfg = load_config(Some(&file)).expect("env override must load");
+        assert_eq!(
+            cfg.admin.token, "from-env",
+            "FUMOX_ADMIN__TOKEN must outrank [admin].token from the file"
+        );
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("FUMOX_ADMIN__TOKEN");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Env must override the file for every type the loader handles —
+    /// not just `String`. `Env::split` in figment 0.10 does a string
+    /// replace, so the merge path is the same for every leaf, but
+    /// guarding each type catches regressions in a single place.
+    /// `Vec<String>` overrides need a JSON array (figment's default
+    /// sequence deserializer), not a comma-separated string — that
+    /// comma-split support lives in `de_test_urls` and is opt-in.
+    #[test]
+    fn env_overrides_file_for_every_type() {
+        let _guard = env_mutex().lock();
+
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-envtypes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.toml");
+        std::fs::write(
+            &file,
+            "[admin]\ntoken = \"file-token\"\n\
+             [ingest]\ndrop_gate = false\n\
+             [probe]\ncycle_interval_secs = 60\n\
+             [server]\ntrust_proxy_ips = [\"file-cidr\"]\n",
+        )
+        .unwrap();
+
+        // SAFETY: every touch of FUMOX_* across the test suite is
+        // serialized by `env_mutex`; other threads read the variable only
+        // through the same lock.
+        unsafe {
+            std::env::set_var("FUMOX_ADMIN__TOKEN", "env-token");
+            std::env::set_var("FUMOX_INGEST__DROP_GATE", "true");
+            std::env::set_var("FUMOX_PROBE__CYCLE_INTERVAL_SECS", "7");
+            std::env::set_var("FUMOX_SERVER__TRUST_PROXY_IPS", "[\"env-cidr\"]");
+        }
+        let cfg = load_config(Some(&file)).expect("env overrides must load");
+        assert_eq!(cfg.admin.token, "env-token");
+        assert!(cfg.ingest.drop_gate);
+        assert_eq!(cfg.probe.cycle_interval_secs, 7);
+        assert_eq!(cfg.server.trust_proxy_ips, ["env-cidr"]);
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("FUMOX_ADMIN__TOKEN");
+            std::env::remove_var("FUMOX_INGEST__DROP_GATE");
+            std::env::remove_var("FUMOX_PROBE__CYCLE_INTERVAL_SECS");
+            std::env::remove_var("FUMOX_SERVER__TRUST_PROXY_IPS");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
 }

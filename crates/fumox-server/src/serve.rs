@@ -40,8 +40,8 @@ pub struct AppState {
     pub pool: DbPool,
     pub caches: Caches,
     pub geo: Arc<GeoResolver>,
-    /// Immediate-refresh channel into the scheduler (source ids); the
-    /// admin "обновить сейчас" handler posts here (Phase 2.5).
+    /// Immediate-refresh channel into the scheduler (source ids);
+    /// posted to by the admin *Refresh now* handler.
     #[allow(dead_code)]
     pub refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Public-listener rate limiters (`[server].rate_limit` /

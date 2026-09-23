@@ -588,6 +588,12 @@ Three layers, later wins:
    FUMOX_MEOW__API_ADDR=meow:9090     # [meow] api_addr
    ```
 
+   Env overrides outrank the file at every leaf — `String`, `bool`, integers
+   and `SocketAddr` accept the env value as-is. `Vec<String>` overrides need
+   a JSON array (e.g. `FUMOX_SERVER__TRUST_PROXY_IPS='["10.0.0.0/8"]'`),
+   not a comma-separated string, except where a custom deserializer is
+   wired in (e.g. `[meow].test_url`, which accepts both).
+
 The annotated reference file shipped with the repo is
 [`config/app.toml`](./config/app.toml). Below is the same information in table
 form.

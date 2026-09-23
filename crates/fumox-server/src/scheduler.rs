@@ -104,7 +104,7 @@ pub struct IngestEnv {
 /// Run the scheduler until the process shuts down.
 ///
 /// `refresh_rx` carries source ids that must be refreshed immediately
-/// ("обновить сейчас" from the admin panel).
+/// (admin *Refresh now*).
 pub async fn run(
     env: IngestEnv,
     state: SchedulerState,

@@ -46,7 +46,10 @@ connect_timeout_secs = 10
 read_timeout_secs = 30
 # 10 МиБ; защита от decompression-bomb / 10 MiB; decompression-bomb guard
 max_response_bytes = 10485760
-# 4 = потолок параллельных загрузок на процесс: выше — источники начинают отвечать 429, ниже — слишком долгий прогон фидов с десятками URL / 4 caps parallel HTTP fetches per process: higher values trigger 429s, lower ones stall feeds with dozens of URLs
+# 4 = потолок параллельных загрузок на процесс: выше — источники начинают отвечать 429,
+# ниже — слишком долгий прогон фидов с десятками URL 
+# 4 caps parallel HTTP fetches per process: higher values trigger 429s,
+# lower ones stall feeds with dozens of URLs
 max_concurrency = 4
 # только для устранимых классов (network, http_server)
 # retries apply only to recoverable error classes (network, http_server)
@@ -114,9 +117,15 @@ removed_as_unknown = true
 # missing/stale databases into db_dir automatically, provided the directory
 # is writable.
 enabled = true
-# «config» — дефолт рядом с бинарником: удобно для dev-сборки и одиночного запуска. В проде задайте абсолютный путь к read-only тому с актуальными .mmdb / "config" is the default next to the binary, convenient for dev. In prod set an absolute path to a read-only volume with fresh .mmdb
+# «config» — дефолт рядом с бинарником: удобно для dev-сборки и одиночного запуска.
+# В проде задайте абсолютный путь к read-only тому с актуальными .mmdb 
+# "config" is the default next to the binary, convenient for dev.
+# In prod set an absolute path to a read-only volume with fresh .mmdb
 db_dir = "config"
-# 16384 = потолок записей in-memory кэша moka: каждая запись маленькая (страна/город/AS), итого пара мегабайт; поднимите, если в вашем фиде заметно больше уникальных хостов / 16384 caps the in-memory moka cache; entries are small (country/city/AS) — a couple of MB total; raise this if your feed holds noticeably more unique hosts
+# 16384 = потолок записей in-memory кэша moka: каждая запись маленькая (страна/город/AS),
+# итого пара мегабайт; поднимите, если в вашем фиде заметно больше уникальных хостов
+# 16384 caps the in-memory moka cache; entries are small (country/city/AS) — a couple of MB total;
+# raise this if your feed holds noticeably more unique hosts
 cache_max_entries = 16384
 dns_timeout_secs = 5
 
@@ -130,7 +139,10 @@ token = "change-me"
 bind = "127.0.0.1:8081"
 # 7 дней / 7 days
 session_ttl_hours = 168
-# false = отказываем RFC1918/loopback по умолчанию (SSRF-защита активна). true имеет смысл только при собственной изолированной feed-инфраструктуре / false rejects RFC1918/loopback out of the box (SSRF guard active). Set true only on your own isolated feed infra
+# false = отказываем RFC1918/loopback по умолчанию (SSRF-защита активна).
+# true имеет смысл только при собственной изолированной feed-инфраструктуре 
+# false rejects RFC1918/loopback out of the box (SSRF guard active).
+# Set true only on your own isolated feed infra
 allow_private_urls = true
 # /admin/* кроме login / /admin/* except login
 rate_limit = "120/min"
@@ -148,12 +160,14 @@ trust_proxy_ips = []
 # принять любой Host.
 # Hostnames/IPs allowed to reach the admin listener. Empty = accept any Host.
 allowed_hosts = []
-secure_cookies = true
+secure_cookies = false
 
 [probe]
 # Демон проверки живучести прокси.
 # Proxy health-check daemon.
-# 60 с — компромисс между задержкой прогона приоритетной выборки probe и нагрузкой на исходящие коннекты / 60 s balances probe responsiveness (priority sample turnaround) against outbound connect load
+# 60 с — компромисс между задержкой прогона приоритетной выборки probe и нагрузкой
+# на исходящие коннекты 
+# 60 s balances probe responsiveness (priority sample turnaround) against outbound connect load
 cycle_interval_secs = 60
 # случайная выборка прокси за цикл (без всплесков) / random proxy sample per cycle (no bursts)
 sample_size = 50
@@ -180,7 +194,10 @@ connect_timeout_secs = 5
 # T1: TLS-handshake
 tls_timeout_secs = 5
 concurrency = 8
-# 30 с — куда реже probe просто молчит, не присылая heartbeat; значение меньше 15с расходится с обычной задержкой пуша meta-ключа и не несёт пользы / 30 s = how long a silent probe can stay silent before the admin UI notices; going under 15s is no faster than the meta-key push cadence and buys nothing
+# 30 с — куда реже probe просто молчит, не присылая heartbeat; значение меньше 15с
+# расходится с обычной задержкой пуша meta-ключа и не несёт пользы
+# 30 s = how long a silent probe can stay silent before the admin UI notices;
+# going under 15s is no faster than the meta-key push cadence and buys nothing
 heartbeat_interval_secs = 30
 # Второй шанс для прокси в карантине: повторная проверка в случайный момент
 # окна [1ч, 3ч) после карантина — окно задается как min + случайная
@@ -206,7 +223,8 @@ recheck_delays_secs = [600, 900]   # 10 мин → 15 мин / 10m → 15m
 # удаляются (ежедневная задача ротации).
 # Priority-queue entries (probe_requests) older than this are purged.
 queue_stale_days = 7
-# 86400 с (сутки) — ротация probe_results/fetch_log под полные сутки, в пару к [retention].*_days / 86400 s (one day) pairs with [retention].*_days so rotation runs once per day and matches the retention window
+# 86400 с (сутки) — ротация probe_results/fetch_log под полные сутки, в пару к [retention].*_days 
+# 86400 s (one day) pairs with [retention].*_days so rotation runs once per day and matches the retention window
 retention_interval_secs = 86400
 allow_private_targets = true
 
@@ -218,7 +236,10 @@ allow_private_targets = true
 # system service: Fumox does not manage it, it only calls its REST API
 # and reloads its config via PUT /configs.
 api_addr = "127.0.0.1:9090"
-# /shared/meow.yaml — путь, на который meow-rs настроен в типовом docker-compose; подмените, когда раскладка томов иная / /shared/meow.yaml is where meow-rs expects its config in the typical docker-compose layout; override if your volume layout differs
+# /shared/meow.yaml — путь, на который meow-rs настроен в типовом docker-compose;
+# подмените, когда раскладка томов иная 
+# /shared/meow.yaml is where meow-rs expects its config in the typical docker-compose layout;
+# override if your volume layout differs
 config_path = "/shared/meow.yaml"
 # Адрес(а) T2-проверки задержки через туннель: probe случайно выбирает один
 # из списка на каждую проверку — выход одного адреса из строя не ломает T2.

@@ -51,6 +51,11 @@ services:
     environment:
       FUMOX_CONFIG: ${FUMOX_CONFIG:-/app/config/app.toml}
       FUMOX_ADMIN__TOKEN: ${FUMOX_ADMIN__TOKEN:?set FUMOX_ADMIN__TOKEN in .env}
+      # Add `; Secure` to the admin session cookie. Set true when the panel is
+      # reached through an HTTPS front (reverse proxy with TLS); leave false
+      # for plain-HTTP localhost access (browsers drop Secure cookies on
+      # http://). The shipped config/app.toml has this on; override via .env.
+      FUMOX_ADMIN__SECURE_COOKIES: ${FUMOX_ADMIN__SECURE_COOKIES:-true}
       FUMOX_GEO__DB_DIR: /shared
       # SSRF guard: set true in .env only for trusted local test setups
       # (source URLs may then point at private/loopback addresses).

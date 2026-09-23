@@ -11,11 +11,11 @@
 </div>
 
 {% match self.banner_html() %}
-  {% when Some with (banner) %}<div class="flash error">{{ banner }}</div>
+  {% when Some with (banner) %}<div class="flash error" role="alert">{{ banner }}</div>
   {% when None %}
 {% endmatch %}
 
-<p class="muted small">{{ self.t_args("set.edit_intro", &[self.editing_path_str()][..]) }}</p>
+<p class="muted small">{{ self.t_named("set.edit_intro", &[("path", self.editing_path_str())][..]) }}</p>
 
 <form method="post" action="/admin/settings/update">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
@@ -24,13 +24,19 @@
   <input type="radio" name="settings-tab" id="tab-probe" class="tab-input">
   <input type="radio" name="settings-tab" id="tab-shared" class="tab-input">
 
-  <nav class="tabs">
-    <label for="tab-server">{{ self.t("set.tab_server") }}</label>
-    <label for="tab-probe">{{ self.t("set.tab_probe") }}</label>
-    <label for="tab-shared">{{ self.t("set.tab_shared") }}</label>
+  {# CSS-only tabs: three sibling radio inputs drive the visible pane via
+     `:checked`. The radio is hidden (`opacity: 0; pointer-events: none`)
+     but remains a real focusable input, so a keyboard user can switch
+     panes with Tab + Space without any JavaScript. The labels act as the
+     tab strip; `aria-selected` mirrors the checked state for assistive
+     tech. #}
+  <nav class="tabs" role="tablist">
+    <label for="tab-server" role="tab" aria-controls="pane-server" aria-selected="true">{{ self.t("set.tab_server") }}</label>
+    <label for="tab-probe" role="tab" aria-controls="pane-probe" aria-selected="false">{{ self.t("set.tab_probe") }}</label>
+    <label for="tab-shared" role="tab" aria-controls="pane-shared" aria-selected="false">{{ self.t("set.tab_shared") }}</label>
   </nav>
 
-  <section id="pane-server" class="tab-pane">
+  <section id="pane-server" role="tabpanel" aria-labelledby="tab-server" class="tab-pane">
     <div class="panel">
       <h2>{{ self.t("set.ingest") }} <span class="badge neutral">server</span></h2>
       <div class="field">
@@ -229,7 +235,7 @@
     </div>
   </section>
 
-  <section id="pane-probe" class="tab-pane">
+  <section id="pane-probe" role="tabpanel" aria-labelledby="tab-probe" class="tab-pane">
     <div class="panel">
       <h2>{{ self.t("set.state_machine") }} <span class="badge neutral">probe</span></h2>
       <div class="field">
@@ -339,7 +345,7 @@
     </div>
   </section>
 
-  <section id="pane-shared" class="tab-pane">
+  <section id="pane-shared" role="tabpanel" aria-labelledby="tab-shared" class="tab-pane">
     <div class="panel">
       <h2>{{ self.t("set.fetch") }} <span class="badge neutral">server</span></h2>
       <div class="field">

@@ -183,10 +183,7 @@ impl SettingsEditTemplate {
 
     fn banner_html(&self) -> Option<String> {
         let Banner::Unwritable(path) = self.banner.as_ref()?;
-        Some(
-            self.lang
-                .t_args("set.edit_unwritable", std::slice::from_ref(path)),
-        )
+        Some(self.lang.t_named("set.edit_unwritable", &[("path", path.clone())]))
     }
 }
 
@@ -559,7 +556,7 @@ pub async fn settings_update(
         tracing::warn!(error = %err, path = %path, "live config refresh skipped");
     }
 
-    let toast = lang.t_args("set.edit_saved_toast", &[path]);
+    let toast = lang.t_named("set.edit_saved_toast", &[("path", path)]);
     if headers.get("HX-Request").is_some() {
         return htmx_redirect_with_toast("/admin/settings", &toast);
     }
@@ -655,7 +652,7 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
     }
 
     let path = target.display().to_string();
-    let msg = lang.t_args("set.file_created_toast", &[path]);
+    let msg = lang.t_named("set.file_created_toast", &[("path", path)]);
     redirect_after_create(&target, msg)
 }
 

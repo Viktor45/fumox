@@ -15,13 +15,13 @@
          catalog loaded from the locales directory is offered with its
          native name. #}
       <div class="login-prefs">
-        <span class="lang-switch login-lang">
+        <span class="lang-switch login-lang" role="group" aria-label="{{ self.lang_code() }}">
           {% for (code, label) in langs %}
           <a href="/admin/login?lang={{ code }}"
              {% if self.lang_code() == code.as_str() %}class="active"{% endif %}>{{ label }}</a>
           {% endfor %}
         </span>
-        <span class="lang-switch login-lang theme-switch">
+        <span class="lang-switch login-lang theme-switch" role="group" aria-label="{{ self.t("theme.light") }} / {{ self.t("theme.dark") }}">
           <a href="/admin/set-theme?theme=light&next=/admin/login"
              aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
              {% if theme.is_light() %}class="active"{% endif %}>
@@ -39,7 +39,7 @@
       <h2 style="margin-top:0">{{ self.t("login.heading") }}</h2>
       {% match error %}
         {% when Some with (message) %}
-          <div class="flash error">{{ message }}</div>
+          <div class="flash error" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
       <form method="post" action="/admin/login" class="stack">

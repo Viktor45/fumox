@@ -18,10 +18,10 @@
 
 {% if !self.has_config_file() %}
   <div class="flash error">
-    {{ self.t_args("set.no_file_banner", &[self.editing_path()][..]) }}
+    {{ self.t_named("set.no_file_banner", &[("path", self.editing_path())][..]) }}
   </div>
 {% else %}
-  <p class="small muted">{{ self.t_args("set.editing_path", &[self.editing_path()][..]) }}</p>
+  <p class="small muted">{{ self.t_named("set.editing_path", &[("path", self.editing_path())][..]) }}</p>
 {% endif %}
 
 <p class="small muted">{{ self.t("set.banner") }}</p>

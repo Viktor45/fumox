@@ -10,6 +10,197 @@ The categories follow [Keep a Changelog](https://keepachangelog.com/);
 `Docs` covers the user guide and READMEs, `Internal` (dependency bumps,
 CI plumbing) is omitted — it never changes the shipped image.
 
+## 2026-09-23 · sha-b72b03f
+
+### Fixed
+
+- *Edit settings* page: the page used to render stale `state.config`
+  (frozen at startup) instead of the just-saved file, so every
+  checkbox / select / spinbutton reverted to the value the running
+  server loaded an hour ago even when the file on disk held the new
+  value. The handler now calls `AppConfig::load(path)` on every
+  `GET /admin/settings/edit` — `raw_from_state(state)` is replaced
+  by `raw_from_config(&cfg)`, with a `state_appconfig(state)`
+  fallback for the unwritable / load-error paths. ENV overrides
+  keep their priority because figment merges them on top of the
+  file in `AppConfig::load`. Regression guarded by the unit test
+  `raw_from_config_reflects_post_save_file_state`.
+- *Settings* overview and any handler that wants the effective
+  config now pick up the just-saved values without a server
+  restart. `AdminState` carries a fresh
+  `live_config: Arc<RwLock<AppConfig>>` populated from
+  `AppConfig::load(path)` (figment-merge: defaults → file →
+  `FUMOX_*` env); `settings_update` and `settings_create` call
+  `refresh_live_config(path)` after every successful write so the
+  next `GET /admin/settings` (which clones via `with_fresh_config`)
+  renders the post-save state, with the destructured `state.admin`
+  / `state.fetch` / … fields refreshed on the spot. Defaults from
+  the `Serialized::defaults` figment layer are written back into
+  the in-memory view (so e.g. a page that never set
+  `[ingest].removed_as_unknown` still shows its default value),
+  and ENV overrides keep winning on top because the figment merge
+  runs every refresh. The destructured fields frozen at startup
+  are intentionally left alone — `server_bind` socket address and
+  the HMAC keys derived from the admin token stay put (silently
+  rebinding the listener or invalidating every active session
+  would be a footgun). Regression guarded by the unit test
+  `live_config_refresh_picks_up_post_save_state`.
+
+## 2026-09-22 · sha-61fc56c
+
+### Added
+
+- Admin *Edit settings* page at `/admin/settings/edit`: a
+  form-based editor backed by `toml_edit` that round-trips
+  `config/app.toml` in place and preserves every existing comment
+  (RU/EN pairs, banners, hints). Operates through a single POST
+  that writes the file atomically (`<path>.tmp.<pid>` + rename,
+  with a direct-write fallback for filesystems that reject
+  `rename`). ENV overrides (`FUMOX_SECTION__KEY`) keep winning at
+  runtime per the existing figment merge. Sections are grouped by
+  owning process (Server / Probe / Shared) via CSS-only tabs (no
+  JS). Disabled when the file is missing or not writable; a
+  separate *Create from defaults* button on the overview
+  generates the file from the embedded reference copy when
+  absent. All edits are restart-required (probe must be restarted
+  alongside server). No runtime-config DB overlay is introduced —
+  that would not help probe, which still re-reads the file at
+  startup.
+- Pipeline editor gained a `target: "asn"` drop-rule option: a
+  proxy whose resolved autonomous-system number matches any AS
+  listed in the rule's `asns` array (with or without the `AS`
+  prefix) is discarded at ingestion and from `/sub` output.
+  Unresolved ASNs are kept, matching the existing
+  `filter.exclude_asns` semantics. Drop rules now run after ASN
+  resolution, so the dry-run previews ASN-driven discards too.
+  The pipeline editor's drop section exposes the new target as a
+  fifth dropdown option; the `match`/`flags`/`key` fields are
+  hidden on ASN rows and replaced by a single AS-number input.
+  Regex and ASN rules live side by side in the same `drop`
+  array.
+- Admin *Revival* panel on `/admin/proxies`: a fourth dialog
+  mirroring the existing *Cleanup* panel, but moving rows in the
+  opposite direction. Operators can return `removed` proxies of
+  a chosen country, `removed` proxies of a chosen AS, `removed`
+  proxies that never received a probe verdict, and every
+  `quarantine` proxy back to `unknown`. Each action resets the
+  lifecycle fields (`fail_count=0`,
+  `quarantined_at` / `ladder_at` / `removed_at=NULL`,
+  `ladder_step=0`) the same way `revive_removed` already does
+  for the ingest-driven `[ingest].removed_as_unknown` path, and
+  the returned ids are enqueued into `probe_requests` so the
+  probe picks them up on the next cycle rather than waiting for
+  the random sample to come around. Nothing is physically deleted
+  — the *Purge removed* button stays the only hard-delete.
+
+### Changed
+
+- T1 checks are now suppressed after a T2 failure: when a proxy's
+  most recent T2 attempt fails (bad credentials, meow-rs
+  unreachable, the target hit the SSRF policy, or a
+  `ServiceUnavailable` from the engine), subsequent T1 checks
+  for that proxy are skipped until the next successful T2 — the
+  T2 recency selector is the only path back into the T1 rotation.
+  A T1 failure (a closed TCP port) does not trigger the
+  suppression because it is not a property of the tunnel.
+- Pipeline editor's row layout now follows the `target` selector
+  live: changing `name` / `host` / `port` / `param` / `asn` in a
+  drop or rename row fires an htmx round-trip that swaps the row
+  in place, so the regex ↔ ASN switch is immediate and the `asns`
+  input appears without an explicit add button. The round-trip
+  carries `?render=1` so it never grows the row count — only the
+  explicit *Add rule* / *Add drop rule* buttons append.
+- Pipeline preview now updates on every keystroke. The wrapper
+  around the JSON preview listens for `change, input` events
+  with a 300 ms debounce, so typing into the `match`, `replace`,
+  `asns`, or filter fields updates the validation verdict and the
+  generated JSON live instead of waiting for the field to lose
+  focus.
+- Admin *Sources → Delete* action is now conservative on `ready`
+  proxies when `[ingest].drop_gate = false` (the default): a
+  tunnel-verified row is left alone instead of being retired
+  just because its source was removed — the probe keeps being
+  the only authority on its lifecycle. With `drop_gate = true`
+  the strict policy applies and every orphan retires, including
+  `ready`.
+- T2 batch abort is now reserved for real engine outages. Three
+  independent guards collapse the "first `ServiceUnavailable`
+  kills the whole batch" failure mode: `check_delay_with_retry`
+  re-issues `ServiceUnavailable` outcomes once after a 100 ms
+  backoff; every `ServiceUnavailable` is followed by a cheap
+  `/version` ping and a healthy engine leaves the rest of the
+  batch untouched; the in-batch `AtomicBool` is replaced by a
+  `BatchGuard` carrying a consecutive-failure counter and a
+  3-strike threshold. Genuine engine crashes still abort and
+  back off.
+- `unknown` proxies now survive the same upstream churn that
+  `alive`/`ready` already do. The `keep_alive_linger` filter in
+  `reconcile_source` extended its protected set from
+  `('alive', 'ready')` to `('alive', 'ready', 'unknown')`: an
+  `unknown` row that vanished from a single fetch is no longer
+  retired in the same transaction. The admin *Delete source*
+  action passes `unknown` alongside `ready` to
+  `mark_orphans_removed` when `[ingest].drop_gate = false` (the
+  default); with `drop_gate = true` the strict policy still
+  retires every orphan.
+- `db::migrate()` now self-heals from `sqlx::migrate!()`
+  checksum mismatches: when an applied migration file has been
+  edited in place (typically a comment-only change), the SHA-384
+  stored in `_sqlx_migrations.checksum` is re-stamped from the
+  on-disk content and `migrate()` is retried. The schema on disk
+  is unchanged — only the bookkeeping column is rewritten. Any
+  other sqlx error (`Dirty`, `VersionMissing`, structural
+  mismatch, real DDL failure) propagates to the caller untouched.
+
+### Fixed
+
+- `db` migration on existing databases: the checksum repair now
+  runs cleanly on first start after the bookkeeping column
+  rewrite, and the migration order is verified end-to-end.
+- Pipeline UI: the live preview of a drop / rename row no longer
+  leaves a stale regex block in place after the operator
+  switches the row's `target` to ASN, and the ASN `asns` input
+  feeds straight into the JSON preview.
+- Meow-rs batch processing: a single bad delay response on one
+  proxy no longer abandons the rest of the cycle. The operator-
+  visible `probe_results.error` text distinguishes `meow-rs
+  transient error`, `meow-rs unavailable mid-batch`, and
+  `aborted: meow-rs became unavailable mid-batch` accordingly.
+- *Save source* for proxies still in `unknown`: the previous
+  code path threw on missing T1/T2 rows; the handler now writes
+  through and lets the next probe cycle fill the verdict.
+- *Settings* UI: the operator-facing strings now carry the
+  explanation of how the file editor and ENV overrides
+  interact, so the page renders `FUMOX_SECTION__KEY` precedence
+  inline instead of leaving the operator to read the source.
+- Docker CI: image build pipeline changes for the new config
+  editor (the editor needs `toml_edit` and the
+  `EditableConfig::save()` atomic-rename path), the `.dockerignore`
+  now excludes the editor's scratch artifacts, and a follow-up
+  plumbing fix landed on the same day.
+
+## 2026-09-21 · sha-e998d5c
+
+### Added
+
+- Trusted-proxy CIDRs for both public and admin listeners:
+  `[server].trust_proxy_ips` and `[admin].trust_proxy_ips`
+  (default `[]`). When the request comes from a CIDR listed in
+  either array, `X-Forwarded-For` and RFC 7239 `Forwarded: for=…`
+  are honored for the per-IP rate-limit key. Empty disables
+  forwarded-header trust (the historical behavior behind a
+  direct connection) — any caller can otherwise spoof the key.
+  This closes a security audit finding.
+
+### Changed
+
+- Probe state machine: when a proxy's most recent T2 attempt
+  fails, subsequent T1 checks for that proxy are skipped until
+  the next successful T2. The T2 recency selector is the only
+  path back into the T1 rotation. A T1 failure (a closed TCP
+  port) does not trigger the suppression because it is not a
+  property of the tunnel.
+
 ## 2026-09-20 · sha-47b8873
 
 ### Added

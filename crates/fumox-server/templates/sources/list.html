@@ -10,23 +10,22 @@
 
 <form class="filters panel" method="get" action="/admin/sources">
   <div class="field">
-    <label>{{ self.t("common.state") }}</label>
-    <select name="enabled">
+    <label for="src-enabled">{{ self.t("common.state") }}</label>
+    <select id="src-enabled" name="enabled">
       <option value="">{{ self.t("common.all") }}</option>
       <option value="on" {% if f_enabled == "on" %}selected{% endif %}>{{ self.t("common.enabled") }}</option>
       <option value="off" {% if f_enabled == "off" %}selected{% endif %}>{{ self.t("common.disabled") }}</option>
     </select>
   </div>
   <div class="field">
-    <label>{{ self.t("src.errors_label") }}</label>
     <span class="check-row">
-      <input type="checkbox" name="err" value="1" {% if f_error %}checked{% endif %}>
-      <label>{{ self.t("src.only_with_errors") }}</label>
+      <input type="checkbox" name="err" value="1" id="src-errors-only" {% if f_error %}checked{% endif %}>
+      <label for="src-errors-only">{{ self.t("src.only_with_errors") }}</label>
     </span>
   </div>
   <div class="field">
-    <label>{{ self.t("src.tag") }}</label>
-    <select name="tag">
+    <label for="src-tag">{{ self.t("src.tag") }}</label>
+    <select id="src-tag" name="tag">
       <option value="">{{ self.t("common.all") }}</option>
       {% for tag in tags %}
         <option value="{{ tag }}" {% if self.tag_selected(tag) %}selected{% endif %}>{{ tag }}</option>
@@ -34,8 +33,8 @@
     </select>
   </div>
   <div class="field">
-    <label>{{ self.t("common.search") }}</label>
-    <input type="text" name="q" value="{{ f_q }}" placeholder="{{ self.t("src.search_placeholder") }}">
+    <label for="src-q">{{ self.t("common.search") }}</label>
+    <input type="text" id="src-q" name="q" value="{{ f_q }}" placeholder="{{ self.t("src.search_placeholder") }}">
   </div>
   <button class="btn" type="submit">{{ self.t("common.apply") }}</button>
 </form>

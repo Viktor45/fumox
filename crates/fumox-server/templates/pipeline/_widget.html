@@ -5,7 +5,7 @@
    targets #ped-widget in the forms). All generation and validation happen
    on the server (solution 13); without JS the widget stays in its rendered
    mode and still submits everything the form needs (pipeline_mode). #}
-<div class="ped-modes">
+<div class="ped-modes" role="group" aria-label="{{ self.t("ped.mode_builder") }} / {{ self.t("ped.mode_json") }}">
   <button type="button" class="btn small{% if mode == "builder" %} ped-active{% endif %}"
           hx-post="/admin/pipeline/mode?to=builder{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
@@ -34,8 +34,8 @@
   {% endmatch %}
 </div>
 {% else %}
-<div class="ped-presets">
-  <span class="hint">{{ self.t("ped.presets") }}</span>
+<div class="ped-presets" role="group" aria-labelledby="ped-presets-label">
+  <span id="ped-presets-label" class="hint">{{ self.t("ped.presets") }}</span>
   <button type="button" class="btn small"
           hx-post="/admin/pipeline/preset?name=workers{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
@@ -73,8 +73,8 @@
      hx-include="[name^='ped_'], [name='_csrf']">
 
   <div class="field" data-ped-section="filter">
-    <label>{{ self.t("ped.section_filter") }}</label>
-    <div class="ped-modes3">
+    <h3 class="ped-section-heading" id="ped-section-filter">{{ self.t("ped.section_filter") }}</h3>
+    <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-filter">
       <span class="check-row">
         <input type="radio" name="ped_filter" value="skip" id="ped-filter-skip" {% if !builder.state.filter_set && !builder.state.filter_defaults %}checked{% endif %}>
         <label for="ped-filter-skip">{{ self.t("ped.mode_skip") }}</label>
@@ -134,9 +134,9 @@
   </div>
 
   <div class="field">
-    <label>{{ self.t("ped.section_rename") }}</label>
+    <h3 class="ped-section-heading" id="ped-section-rename">{{ self.t("ped.section_rename") }}</h3>
     {% if profile %}
-    <div class="ped-modes3">
+    <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-rename">
       <span class="check-row">
         <input type="radio" name="ped_rename" value="skip" id="ped-rename-skip" {% if builder.state.rename_skip && !builder.state.rename_defaults %}checked{% endif %}>
         <label for="ped-rename-skip">{{ self.t("ped.mode_skip") }}</label>
@@ -161,9 +161,9 @@
   </div>
 
   <div class="field">
-    <label>{{ self.t("ped.section_drop") }}</label>
+    <h3 class="ped-section-heading" id="ped-section-drop">{{ self.t("ped.section_drop") }}</h3>
     {% if profile %}
-    <div class="ped-modes3">
+    <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-drop">
       <span class="check-row">
         <input type="radio" name="ped_drop" value="skip" id="ped-drop-skip" {% if builder.state.drop_skip && !builder.state.drop_defaults %}checked{% endif %}>
         <label for="ped-drop-skip">{{ self.t("ped.mode_skip") }}</label>
@@ -189,8 +189,8 @@
   </div>
 
   <div class="field" data-ped-section="geo">
-    <label>{{ self.t("ped.section_geo") }}</label>
-    <div class="ped-modes3">
+    <h3 class="ped-section-heading" id="ped-section-geo">{{ self.t("ped.section_geo") }}</h3>
+    <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-geo">
       <span class="check-row">
         <input type="radio" name="ped_geo" value="skip" id="ped-geo-skip" {% if !builder.state.geo_set && !builder.state.geo_defaults %}checked{% endif %}>
         <label for="ped-geo-skip">{{ self.t("ped.mode_skip") }}</label>
@@ -217,8 +217,8 @@
   </div>
 
   <div class="field" data-ped-section="health">
-    <label>{{ self.t("ped.section_health") }}</label>
-    <div class="ped-modes3">
+    <h3 class="ped-section-heading" id="ped-section-health">{{ self.t("ped.section_health") }}</h3>
+    <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-health">
       <span class="check-row">
         <input type="radio" name="ped_health" value="skip" id="ped-health-skip" {% if !builder.state.health_set && !builder.state.health_defaults %}checked{% endif %}>
         <label for="ped-health-skip">{{ self.t("ped.mode_skip") }}</label>
@@ -244,8 +244,8 @@
   </div>
 
   <div class="field" data-ped-section="sort">
-    <label>{{ self.t("ped.section_sort") }}</label>
-    <div class="ped-modes3">
+    <h3 class="ped-section-heading" id="ped-section-sort">{{ self.t("ped.section_sort") }}</h3>
+    <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-sort">
       <span class="check-row">
         <input type="radio" name="ped_sort" value="skip" id="ped-sort-skip" {% if !builder.state.sort_set && !builder.state.sort_defaults %}checked{% endif %}>
         <label for="ped-sort-skip">{{ self.t("ped.mode_skip") }}</label>
@@ -274,8 +274,8 @@
   </div>
 
   <div class="field" data-ped-section="limit">
-    <label>{{ self.t("ped.limit_label") }}</label>
-    <div class="ped-modes3">
+    <h3 class="ped-section-heading" id="ped-section-limit">{{ self.t("ped.limit_label") }}</h3>
+    <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-limit">
       <span class="check-row">
         <input type="radio" name="ped_limit" value="skip" id="ped-limit-skip" {% if !builder.state.limit_set && !builder.state.limit_defaults %}checked{% endif %}>
         <label for="ped-limit-skip">{{ self.t("ped.mode_skip") }}</label>

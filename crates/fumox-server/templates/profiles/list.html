@@ -11,6 +11,7 @@
 <div class="panel">
   {% if rows.is_empty() %}
     <p class="muted">{{ self.t("prof.empty") }}</p>
+    <p><a class="btn" href="/admin/profiles/new">{{ self.t("prof.add") }}</a></p>
   {% else %}
     <div class="table-scroll">
       <table class="data">

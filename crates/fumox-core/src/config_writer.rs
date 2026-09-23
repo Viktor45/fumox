@@ -14,6 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+#[cfg(all(unix, test))]
+use std::os::unix::fs::PermissionsExt;
+
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 /// Failure mode of [`EditableConfig`] operations.
@@ -241,23 +244,65 @@ fn enter_or_create_table<'a>(
 /// permissions allow writes, or it does not exist and its parent
 /// directory is writable (a brand-new file can be created there).
 ///
-/// **Advisory only.** The check inspects the inode's readonly flag and
-/// falls back to the parent's flag if the file does not exist; it does
-/// not consult POSIX mode bits or ACLs and is meaningless for `root`,
-/// which writes regardless. Use it to decide whether to render the
-/// editor with enabled or disabled controls, not as an access-control
-/// gate — `save()` re-checks errors at write time.
+/// The fast path checks the inode's `readonly` flag; the slow path
+/// actually attempts an open-for-write (or a probe file in the parent
+/// when the target is missing) so a read-only filesystem mount — the
+/// docker `:ro` case, where metadata still looks writable but the
+/// kernel rejects every write with `EROFS` — is detected too.
+///
+/// **Advisory only.** The check does not consult POSIX mode bits or
+/// ACLs and is meaningless for `root`, which writes regardless. Use
+/// it to decide whether to render the editor with enabled or disabled
+/// controls, not as an access-control gate — `save()` re-checks errors
+/// at write time.
 pub fn is_writable(path: &Path) -> bool {
-    let md = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => {
-            return path
-                .parent()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .is_some_and(|m| !m.permissions().readonly());
+    match std::fs::metadata(path) {
+        Ok(md) => {
+            if md.permissions().readonly() {
+                return false;
+            }
+            // Open for write — Linux returns `EROFS` on a read-only mount
+            // (e.g. docker `:ro`) without performing any I/O. macOS returns
+            // `EROFS` for the same case at the VFS layer. Treat any open
+            // failure as "not writable from this process".
+            std::fs::OpenOptions::new().write(true).open(path).is_ok()
         }
-    };
-    !md.permissions().readonly()
+        Err(_) => {
+            // File missing — the target's parent must accept new files.
+            let Some(parent) = path.parent() else {
+                return false;
+            };
+            let Ok(md) = std::fs::metadata(parent) else {
+                return false;
+            };
+            if md.permissions().readonly() {
+                return false;
+            }
+            // Drop a probe file in the parent to surface a read-only mount
+            // (otherwise we could miss a `:ro` filesystem with no existing
+            // file in it). The probe is opened with `create_new(true)` so
+            // we never overwrite a real file.
+            let probe = parent.join(format!(
+                ".fumox-write-probe-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+    }
 }
 
 /// The reference `config/app.toml` shipped in the repository. Embedded
@@ -491,6 +536,30 @@ mod tests {
         std::fs::set_permissions(&path, perms).unwrap();
 
         assert!(!is_writable(&path));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: a docker `:ro` mount on a directory that has no file in
+    /// it yet (the *Create from defaults* path) must surface as not
+    /// writable so the button can be disabled. Modeled with a parent
+    /// directory whose mode strips write — on Linux this is the same
+    /// code path a docker `:ro` mount goes through (the kernel rejects
+    /// the open with `EROFS`); on macOS the permission-mode rejection
+    /// arrives as `EACCES` and the test still covers the contract.
+    #[test]
+    fn is_writable_returns_false_when_probe_in_ro_parent_fails() {
+        let dir = tmp_dir("ro-parent-probe");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let path = dir.join("app.toml");
+        assert!(!path.exists());
+
+        let result = is_writable(&path);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !result,
+            "is_writable must report false when a probe write in the parent fails"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

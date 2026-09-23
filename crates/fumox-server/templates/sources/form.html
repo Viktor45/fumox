@@ -95,8 +95,8 @@
       {% endmatch %}
     </div>
 
-    <div class="field">
-      <label>{{ self.t("src.protocols_label") }}</label>
+    <fieldset class="field">
+      <legend>{{ self.t("src.protocols_label") }}</legend>
       <div class="hint">{{ self.t("src.protocols_hint") }}</div>
       {% for (protocol, selected) in all_protocols %}
         <span class="check-row">
@@ -108,7 +108,7 @@
         {% when Some with (message) %}<div class="error-text">{{ message }}</div>
         {% when None %}
       {% endmatch %}
-    </div>
+    </fieldset>
 
     <div class="field">
       <label for="src-ttl">{{ self.t("src.ttl_label") }}</label>

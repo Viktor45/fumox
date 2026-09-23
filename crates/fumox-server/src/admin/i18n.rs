@@ -243,6 +243,20 @@ impl Lang {
         }
         text
     }
+
+    /// Translate a message key and substitute named arguments `{name}`,
+    /// `{path}`… translators can address by role instead of by index.
+    /// Unknown names leave their `{…}` placeholder visible. Used by
+    /// templates where the rendered phrase carries a single contextual
+    /// argument (e.g. the file path on the settings screens); positional
+    /// `t_args` is the right tool when the phrase lists several values.
+    pub fn t_named(&self, key: &str, args: &[(&str, String)]) -> String {
+        let mut text = self.t(key).to_string();
+        for (name, value) in args {
+            text = text.replace(&format!("{{{name}}}"), value);
+        }
+        text
+    }
 }
 
 /// `Set-Cookie` header value persisting the language choice.
@@ -265,6 +279,10 @@ macro_rules! impl_i18n {
             #[allow(dead_code)]
             fn t_args(&self, key: &str, args: &[String]) -> String {
                 self.lang.t_args(key, args)
+            }
+            #[allow(dead_code)]
+            fn t_named(&self, key: &str, args: &[(&str, String)]) -> String {
+                self.lang.t_named(key, args)
             }
             #[allow(dead_code)]
             fn lang_code(&self) -> &str {
@@ -390,6 +408,31 @@ mod tests {
         // Unknown keys echo themselves, arguments still substituted.
         assert_eq!(
             locales.resolve("en").t_args("no.such.key", &args),
+            "no.such.key"
+        );
+    }
+
+    #[test]
+    fn t_named_substitutes_named_arguments() {
+        let locales = Locales::load(Path::new("/nonexistent-locales-dir"));
+        let path: String = "/etc/fumox/app.toml".to_string();
+        // The settings screens address the edited file by `{path}` so the
+        // Russian and English copy can reorder around the value without
+        // breaking the binding; a positional substitution would leave
+        // `{path}` visible on the rendered page.
+        let args: Vec<(&str, String)> = vec![("path", path)];
+        let en = locales.resolve("en").t_named("set.editing_path", &args);
+        assert_eq!(en, "Editing: /etc/fumox/app.toml");
+        // Missing arguments leave their placeholder visible — same contract
+        // as `t_args`, so a missing translation or a refactor that drops a
+        // placeholder is obvious instead of silently blank.
+        assert_eq!(
+            locales.resolve("en").t_named("set.editing_path", &[]),
+            "Editing: {path}"
+        );
+        // Unknown keys echo themselves, names still substituted.
+        assert_eq!(
+            locales.resolve("en").t_named("no.such.key", &args),
             "no.such.key"
         );
     }

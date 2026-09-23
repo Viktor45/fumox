@@ -104,6 +104,20 @@ reads the file at startup and never writes it. If you prefer the editor
 off entirely, change the server mount to `:ro,Z`; the page will render
 disabled with a red `set.edit_unwritable` banner explaining why.
 
+### Cookie security on plain HTTP
+
+Quadlet (and the compose variant) default to publishing the admin panel
+on `127.0.0.1:8081` over plain HTTP. `[admin].secure_cookies` therefore
+must stay `false` — otherwise the browser silently drops the `Secure`
+session cookie, every login attempt looks like a successful
+`admin logged in` in `journalctl` followed by a permanent redirect to
+`/admin/login`. Override only when TLS is terminated at a reverse proxy:
+add `FUMOX_ADMIN__SECURE_COOKIES=true` to `fumox.env` (env wins over the
+file, the same figment merge that powers the rest of the override
+hierarchy). Rotating `[admin].token` or flipping `secure_cookies`
+invalidates every active session on the next request — plan token
+rotations for a quiet window.
+
 ## Variant B: `kube/`
 
 1. Images — as above.

@@ -102,6 +102,14 @@ Both keys default to `[]` to preserve the historical behavior behind a
 direct connection. See the [User Guide](./USERGUIDE.md#8-configuration-reference)
 configuration reference and the production checklist for context.
 
+- `[admin].secure_cookies` (or the matching `FUMOX_ADMIN__SECURE_COOKIES`
+  env override): keep `false` when the panel is reached over plain HTTP
+  (the `docker-compose.yml` default — `http://127.0.0.1:8081`). Browsers
+  silently drop `Secure` cookies on `http://`, so a successful login
+  (`admin logged in` in logs) gets followed by a permanent redirect to
+  `/admin/login`. Set `true` only when TLS is terminated at a reverse
+  proxy.
+
 ---
 
 ## 📖 Documentation

@@ -4749,8 +4749,14 @@ mod tests {
         assert!(live.ingest.drop_gate, "live.ingest.drop_gate");
         assert_eq!(live.server.bind.port(), 9999, "live.server.bind");
         // Figment-merged defaults are written back into the in-memory view.
-        assert_eq!(live.probe.fail_limit, fumox_core::config::ProbeConfig::default().fail_limit);
-        assert_eq!(live.fetch.user_agent, fumox_core::config::FetchConfig::default().user_agent);
+        assert_eq!(
+            live.probe.fail_limit,
+            fumox_core::config::ProbeConfig::default().fail_limit
+        );
+        assert_eq!(
+            live.fetch.user_agent,
+            fumox_core::config::FetchConfig::default().user_agent
+        );
 
         // `with_fresh_config` returns a clone with the destructured
         // fields refreshed from the live view — this is what the
@@ -4766,11 +4772,7 @@ mod tests {
         // footgun, so `with_fresh_config` is explicit about what it
         // does and does not touch.
         assert!(!state.ingest.drop_gate, "state.ingest.drop_gate (frozen)");
-        assert_eq!(
-            state.server.bind.port(),
-            8080,
-            "state.server.bind (frozen)"
-        );
+        assert_eq!(state.server.bind.port(), 8080, "state.server.bind (frozen)");
 
         std::fs::remove_dir_all(&dir).ok();
     }

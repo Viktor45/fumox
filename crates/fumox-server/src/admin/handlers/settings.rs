@@ -22,7 +22,9 @@ use askama::Template;
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use fumox_core::config::{AppConfig, DEFAULT_CONFIG_PATH, GeoDbKind, RateLimit, ResolvedConfigPath};
+use fumox_core::config::{
+    AppConfig, DEFAULT_CONFIG_PATH, GeoDbKind, RateLimit, ResolvedConfigPath,
+};
 use fumox_core::config_writer::{EditableConfig, item};
 use fumox_core::models::IpFamily;
 
@@ -183,7 +185,10 @@ impl SettingsEditTemplate {
 
     fn banner_html(&self) -> Option<String> {
         let Banner::Unwritable(path) = self.banner.as_ref()?;
-        Some(self.lang.t_named("set.edit_unwritable", &[("path", path.clone())]))
+        Some(
+            self.lang
+                .t_named("set.edit_unwritable", &[("path", path.clone())]),
+        )
     }
 }
 
@@ -320,7 +325,10 @@ fn raw_from_config(c: &AppConfig) -> HashMap<String, String> {
     );
     rate_into(&mut raw, "admin.rate_limit", &admin.rate_limit);
     rate_into(&mut raw, "admin.login_rate_limit", &admin.login_rate_limit);
-    raw.insert("admin.secure_cookies".into(), bool_to_raw(admin.secure_cookies));
+    raw.insert(
+        "admin.secure_cookies".into(),
+        bool_to_raw(admin.secure_cookies),
+    );
     raw.insert("admin.locales_dir".into(), admin.locales_dir.clone());
     raw.insert(
         "admin.trust_proxy_ips".into(),
@@ -1612,10 +1620,8 @@ mod tests {
             );
 
             let serialized = cfg.doc().to_string();
-            let parsed = IpFamily::from_str(
-                super::ip_family_str(family),
-            )
-            .expect("ip_family_str must produce a value IpFamily accepts");
+            let parsed = IpFamily::from_str(super::ip_family_str(family))
+                .expect("ip_family_str must produce a value IpFamily accepts");
             assert_eq!(parsed, family, "round-trip drifted for {family:?}");
 
             // toml_edit serialises the leaf under its `[fetch]` section
@@ -1722,10 +1728,7 @@ mod tests {
     fn raw_from_config_reflects_post_save_file_state() {
         use fumox_core::config::load_config;
 
-        let dir = std::env::temp_dir().join(format!(
-            "fumox-edit-postsave-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("fumox-edit-postsave-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("app.toml");
 
@@ -1742,7 +1745,10 @@ mod tests {
         // unchecked).
         assert_eq!(raw.get("ingest.drop_gate").map(String::as_str), Some(""));
         // `secure_cookies = true` → "on".
-        assert_eq!(raw.get("admin.secure_cookies").map(String::as_str), Some("on"));
+        assert_eq!(
+            raw.get("admin.secure_cookies").map(String::as_str),
+            Some("on")
+        );
 
         // Simulate the admin save: flip the bool values in the file.
         std::fs::write(
@@ -1757,7 +1763,10 @@ mod tests {
         // startup snapshot — this is the regression for the bug where
         // the edit page re-rendered stale in-memory state.
         assert_eq!(raw.get("ingest.drop_gate").map(String::as_str), Some("on"));
-        assert_eq!(raw.get("admin.secure_cookies").map(String::as_str), Some(""));
+        assert_eq!(
+            raw.get("admin.secure_cookies").map(String::as_str),
+            Some("")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

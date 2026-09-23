@@ -658,7 +658,7 @@ form.
 | `allow_private_urls` | `false`            | SSRF guard: when false, source URLs may not resolve to loopback, RFC1918, link-local or cloud-metadata addresses (checked at save *and* at every fetch)                            |
 | `rate_limit`         | `"120/min"`        | Per-IP limit for admin routes                                                                                                                                                        |
 | `login_rate_limit`   | `"5/min"`          | Per-IP limit for the login form                                                                                                                                                      |
-| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy                                                                               |
+| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy. Plain-HTTP deployments must keep it `false` — browsers silently drop `Secure` cookies on `http://`, which looks like a successful login (`admin logged in` in logs) followed by a permanent redirect to `/admin/login`. Override per-deploy with `FUMOX_ADMIN__SECURE_COOKIES=true` in `.env` (env wins over the file). |
 | `trust_proxy_ips`    | `[]`               | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the admin per-IP rate-limit and rendered URL scheme. Empty = never trust forwarded headers                   |
 | `allowed_hosts`      | `[]`               | Hostnames / IPs allowed to reach the admin listener. Empty = accept any `Host` value. Set this when serving the admin from a fixed domain name (e.g. reverse-proxied to `fumox.local`) |
 | `locales_dir`        | `"locales"`        | Directory with UI translation catalogs (`<code>.toml`)                                                                                                                               |
@@ -944,6 +944,12 @@ changes to take effect. The save toast tells you so. `FUMOX_SECTION__KEY`
 environment variables keep winning over file values at runtime per the
 existing figment merge, so a transient ENV override is still the right
 tool for one-off adjustments.
+
+Rotating `[admin].token` or flipping `[admin].secure_cookies` invalidates
+every active session on the next request — the panel reads the new value
+on startup, so cookies signed under the old token stop verifying and
+existing users get signed out without notice. Plan such changes for a
+quiet window, and warn anyone who is logged in.
 
 The editor is intentionally narrow on safety:
 

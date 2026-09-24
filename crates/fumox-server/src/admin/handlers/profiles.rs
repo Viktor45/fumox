@@ -38,11 +38,14 @@ struct ProfileListRow {
     enabled: bool,
     protected: bool,
     sources_count: i64,
-    /// Live proxies reachable through the profile's sources: `status` ∈
-    /// {alive, quarantine, unknown}. `removed` is terminal and
-    /// is excluded, matching the proxy counts shown elsewhere in the admin
-    /// panel. A proxy reachable through more than one source in the same
-    /// profile is counted once (`DISTINCT p.id`).
+    /// Ready proxies reachable through the profile's sources: `status =
+    /// 'ready'` — i.e. the set the `/sub/{slug}` endpoint would actually
+    /// emit right now (the pipeline has vetted them and the probe is done
+    /// with the second-chance ladder). Pre-ready statuses (`alive`,
+    /// `quarantine`, `unknown`) and terminal `removed` are excluded, since
+    /// none of those would show up in the live subscription output.
+    /// A proxy reachable through more than one source in the same profile
+    /// is counted once (`DISTINCT px.id`).
     proxies_count: i64,
 }
 
@@ -71,7 +74,7 @@ pub async fn profiles_list(State(state): State<AdminState>, headers: HeaderMap) 
                  JOIN proxy_source_links l ON l.source_id = ps.source_id
                  JOIN proxies px ON px.id = l.proxy_id
                  WHERE ps.profile_id = p.id
-                   AND px.status IN ('alive', 'quarantine', 'unknown')) AS proxies_count
+                   AND px.status = 'ready') AS proxies_count
          FROM profiles p
          ORDER BY p.created_at",
     )

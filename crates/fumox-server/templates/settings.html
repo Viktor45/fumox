@@ -50,6 +50,7 @@
         <tr><th>{{ self.t("probe.tls_timeout") }}</th><td>{{ state.probe.tls_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><th>{{ self.t("probe.concurrency") }}</th><td>{{ state.probe.concurrency }}</td></tr>
         <tr><th>{{ self.t("probe.allow_private_targets") }}</th><td>{{ state.probe.allow_private_targets }}</td></tr>
+        <tr><th>{{ self.t("probe.backlog_target_drain") }}</th><td>{{ state.probe.backlog_target_drain_minutes }} {{ self.t("probe.mins_short") }}</td></tr>
         <tr><th>Heartbeat</th><td>{{ self.t("probe.every_n_sec").replace("{}", &state.probe.heartbeat_interval_secs.to_string()) }}</td></tr>
       </tbody>
     </table>

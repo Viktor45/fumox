@@ -1706,6 +1706,7 @@ mod tests {
                 recheck_delays_secs: vec![900, 1800, 3600],
                 queue_stale_days: 7,
                 retention_interval_secs: 86400,
+                backlog_target_drain_minutes: 60,
             },
             meow: fumox_core::config::MeowConfig {
                 api_addr: meow_addr.into(),

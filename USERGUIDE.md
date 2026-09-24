@@ -987,6 +987,56 @@ verification.
 All lifecycle state lives in SQLite, so the daemon is restart-safe: restart it
 anytime, schedules resume from the database.
 
+### Tuning probe throughput
+
+When the quarantine pool grows faster than the cycle drains it, the
+`/admin/probe` page surfaces a banner with the heuristic that fired and
+one or more concrete parameter changes. Three knobs drive the
+throughput:
+
+| Knob | Effect | When to touch |
+|------|--------|--------------|
+| `[probe].sample_size` | Rows taken per cycle, before concurrency. | First lever — main throughput control. |
+| `[probe].concurrency` | Parallel checks *within* a cycle. | Only when a single cycle exceeds `cycle_interval_secs` (i.e. `(sample_size / concurrency) × (connect_timeout_secs + tls_timeout_secs) > cycle_interval_secs`). |
+| `[probe].cycle_interval_secs` | How often a new cycle starts. | Tighten only after `sample_size` is already large. |
+
+Two formulas drive the recommendation math shown in the banner:
+
+```
+cycles_to_drain  = ceil(quarantine_count / sample_size)
+drain_minutes    = cycles_to_drain × cycle_interval_secs / 60
+```
+
+If `drain_minutes` exceeds `[probe].backlog_target_drain_minutes`
+(default 60), the banner suggests:
+
+- a new `sample_size = ceil(quarantine_count × cycle_interval_secs / (target_minutes × 60))`, capped at 500;
+- if the required sample would exceed 500, a shorter `cycle_interval_secs = max(5, target_minutes × 60 / cycles_to_drain)`;
+- if `current_cycle_secs > cycle_interval_secs`, a `concurrency = ceil(sample_size × (connect_timeout_secs + tls_timeout_secs) / cycle_interval_secs)`, capped at 64.
+
+**What does not help with backlog.** `fail_limit`, `recheck_delays_secs`,
+`second_chance_min_hours`, `second_chance_spread_hours`,
+`queue_stale_days`, and the `[meow]` backoff are all about *inflow*
+or external services — they cannot drain an existing queue faster.
+They are still useful for keeping new failures from piling up, but
+treat them as inflow controls, not throughput controls.
+
+**Worked example.** With defaults (`sample_size = 50`, `cycle_interval_secs = 60`,
+`concurrency = 8`, `target = 60 min`):
+
+| `quarantine_count` | cycles | drain | banner |
+|--------------------|-------:|------:|--------|
+| 800  | 16  |  16 min | silent |
+| 4 000 |  80 |  80 min | warning + `sample_size = 67` |
+| 10 000 | 200 | 200 min | warning + `sample_size = 167` |
+| 100 000 | 2 000 | 33 h | warning + `sample_size = 500` (capped) + `cycle_interval_secs = 18s` |
+
+Tightening `backlog_target_drain_minutes` to 15 in the last row makes
+the recommended `sample_size` jump to 500 (still capped) and the
+recommended `cycle_interval_secs` to 5 s (still floored) — i.e. the
+banner's `sample_size` only scales so far before you also have to
+shorten the cycle.
+
 ## 11. Geo enrichment
 
 Fumox can prepend geographic information to proxy display names using free

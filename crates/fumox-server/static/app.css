@@ -516,7 +516,15 @@ input.tab-input {
 
 .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; font-weight: 500; }
 .flash.ok { background: var(--ok-bg); color: var(--ok); }
+.flash.warning { background: var(--warn-bg); color: var(--warn); border-left: 3px solid var(--warn); }
+.flash.danger { background: var(--danger-bg); color: var(--danger); border-left: 3px solid var(--danger); }
 .flash.error { background: var(--danger-bg); color: var(--danger); }
+.backlog-banner .flash-title { font-weight: 600; margin-bottom: 6px; }
+.backlog-banner .factors,
+.backlog-banner .recs { margin: 6px 0 6px 18px; padding: 0; }
+.backlog-banner .recs li { margin-bottom: 3px; }
+.backlog-banner .recs code { font-size: 12px; }
+.backlog-banner .recs-head { margin-top: 8px; font-weight: 500; }
 
 /* Import errors list (import.html): compact, danger-colored via .error-text
    on the items themselves. */

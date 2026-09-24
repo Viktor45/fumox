@@ -542,6 +542,11 @@ pub struct ProbeConfig {
     /// How often the retention rotation task runs.
     #[serde(default = "defaults::retention_interval_secs")]
     pub retention_interval_secs: u64,
+    /// Target drain time (minutes) used by the `/admin/probe` backlog
+    /// banner when computing suggested `[probe]` values. Range 5..=1440
+    /// (5 min..=24 h). Default 60.
+    #[serde(default = "defaults::backlog_target_drain_minutes")]
+    pub backlog_target_drain_minutes: u64,
 }
 
 impl Default for ProbeConfig {
@@ -560,6 +565,7 @@ impl Default for ProbeConfig {
             recheck_delays_secs: defaults::recheck_delays_secs(),
             queue_stale_days: defaults::queue_stale_days(),
             retention_interval_secs: defaults::retention_interval_secs(),
+            backlog_target_drain_minutes: defaults::backlog_target_drain_minutes(),
         }
     }
 }
@@ -969,6 +975,12 @@ mod defaults {
     }
     pub const fn queue_stale_days() -> u64 {
         7
+    }
+    /// Target drain time used by the `/admin/probe` backlog banner when
+    /// computing recommended `[probe]` values. 60 minutes by default —
+    /// 5..=1440 minutes (5 min..=24 h).
+    pub const fn backlog_target_drain_minutes() -> u64 {
+        60
     }
     pub const fn meow_backoff_initial_secs() -> u64 {
         60

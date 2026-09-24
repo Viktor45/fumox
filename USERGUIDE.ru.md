@@ -1000,6 +1000,56 @@ Fumox прекрасно работает без meow-rs, просто без т
 Все состояние жизненного цикла живет в SQLite, поэтому демон restart-safe:
 перезапускайте его когда угодно, расписания возобновятся из базы.
 
+### Тюнинг производительности probe
+
+Когда пул карантина растёт быстрее, чем цикл его осушает, страница
+`/admin/probe` показывает баннер с эвристикой и конкретными значениями
+параметров, которые стоит изменить. За пропускную способность
+отвечают три ручки:
+
+| Ручка | Эффект | Когда крутить |
+|-------|--------|--------------|
+| `[probe].sample_size` | Сколько строк берётся за цикл до параллелизации. | Первая ручка — основной рычаг пропускной способности. |
+| `[probe].concurrency` | Параллельных проверок *внутри* цикла. | Только когда один цикл не укладывается в `cycle_interval_secs` (т.е. `(sample_size / concurrency) × (connect_timeout_secs + tls_timeout_secs) > cycle_interval_secs`). |
+| `[probe].cycle_interval_secs` | Как часто стартует новый цикл. | Уменьшать только после того, как `sample_size` уже большой. |
+
+Две формулы лежат в основе рекомендаций баннера:
+
+```
+cycles_to_drain  = ceil(quarantine_count / sample_size)
+drain_minutes    = cycles_to_drain × cycle_interval_secs / 60
+```
+
+Если `drain_minutes` больше `[probe].backlog_target_drain_minutes`
+(по умолчанию 60), баннер предлагает:
+
+- новый `sample_size = ceil(quarantine_count × cycle_interval_secs / (target_minutes × 60))`, ограничен 500;
+- если требуемая выборка превышает 500, более короткий `cycle_interval_secs = max(5, target_minutes × 60 / cycles_to_drain)`;
+- если `current_cycle_secs > cycle_interval_secs`, `concurrency = ceil(sample_size × (connect_timeout_secs + tls_timeout_secs) / cycle_interval_secs)`, ограничен 64.
+
+**Что не помогает при бэклоге.** `fail_limit`, `recheck_delays_secs`,
+`second_chance_min_hours`, `second_chance_spread_hours`,
+`queue_stale_days` и бэкофф `[meow]` управляют *притоком* или
+внешними сервисами — осушить уже существующую очередь они не могут.
+Они по-прежнему полезны, чтобы новые фейлы не копились, но это ручки
+притока, а не пропускной способности.
+
+**Пример расчёта.** С дефолтами (`sample_size = 50`, `cycle_interval_secs = 60`,
+`concurrency = 8`, `target = 60 мин`):
+
+| `quarantine_count` | cycles | drain | баннер |
+|--------------------|-------:|------:|--------|
+| 800  | 16  |  16 мин | молчит |
+| 4 000 |  80 |  80 мин | warning + `sample_size = 67` |
+| 10 000 | 200 | 200 мин | warning + `sample_size = 167` |
+| 100 000 | 2 000 | 33 ч | warning + `sample_size = 500` (потолок) + `cycle_interval_secs = 18с` |
+
+Ужесточение `backlog_target_drain_minutes` до 15 в последней строке
+поднимает рекомендуемый `sample_size` до 500 (всё ещё потолок), а
+рекомендуемый `cycle_interval_secs` — до 5 с (всё ещё пол). То есть
+`sample_size` масштабируется только до потолка, после чего нужно
+укорачивать цикл.
+
 ## 11. Гео-обогащение
 
 Fumox может добавлять географическую информацию к отображаемым именам прокси,

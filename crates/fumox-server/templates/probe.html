@@ -7,6 +7,36 @@
   <h1>{{ self.t("nav.probe") }}</h1>
 </div>
 
+{% if let Some(b) = backlog %}
+  <div class="flash {{ self.backlog_level_class() }} backlog-banner" role="alert">
+    <div class="flash-title">
+      {{ self.t_args("probe.backlog_title", &[self.backlog_level_label()][..]) }}
+    </div>
+    <ul class="factors">
+      {% for factor in b.factors %}
+        <li>{{ self.backlog_factor_text(loop.index0) | safe }}</li>
+      {% endfor %}
+    </ul>
+    {% if !b.recs.is_empty() %}
+      <div class="recs-head">
+        {{ self.t_args("probe.recs_head", &[b.target_drain_minutes.to_string()][..]) }}
+      </div>
+      <ul class="recs">
+        {% for rec in b.recs %}
+          <li><code>{{ self.backlog_rec_label(loop.index0) | safe }}</code></li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+    <div class="muted small">
+      {{ self.t_args("probe.config_snapshot", &[
+        b.due_capacity.to_string(),
+        probe_view.cycle_interval_secs.to_string(),
+        probe_view.concurrency.to_string(),
+      ][..]) }}
+    </div>
+  </div>
+{% endif %}
+
 <div class="grid cols-4">
   <div class="panel stat-card">
     <div class="num">{{ self.proxy_total() }}</div>

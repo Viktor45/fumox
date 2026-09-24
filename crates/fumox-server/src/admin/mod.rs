@@ -1700,14 +1700,15 @@ mod tests {
         }
     }
 
-    /// The Profiles list shows a per-row count of "live" proxies reachable
-    /// through the profile's sources: `status` ∈ {alive, quarantine,
-    /// unknown}. `removed` is excluded, and proxies
-    /// reachable only through sources **not** in the profile are excluded.
-    /// A proxy reachable through more than one profile source is counted
-    /// once (`DISTINCT p.id`).
+    /// The Profiles list shows a per-row count of **ready** proxies
+    /// reachable through the profile's sources — i.e. the set
+    /// `/sub/{slug}` would emit right now. Pre-ready statuses (`alive`,
+    /// `quarantine`, `unknown`) and terminal `removed` are excluded.
+    /// Proxies reachable only through sources **not** in the profile are
+    /// excluded. A proxy reachable through more than one profile source
+    /// is counted once (`DISTINCT px.id`).
     #[tokio::test]
-    async fn profiles_list_shows_live_proxy_count_per_row() {
+    async fn profiles_list_shows_ready_proxy_count_per_row() {
         let state = test_state(1000).await;
         let pool = state.pool.clone();
         let now = fumox_core::models::now_ts();
@@ -1717,7 +1718,7 @@ mod tests {
         // that source must not show up in the count.
         sqlx::query(
             "INSERT INTO profiles (id, name, output_format, enabled, created_at, updated_at)
-             VALUES ('p-live', 'live-count', 'uri_list', 1, ?, ?)",
+             VALUES ('p-ready', 'ready-count', 'uri_list', 1, ?, ?)",
         )
         .bind(now)
         .bind(now)
@@ -1737,43 +1738,43 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO profile_sources (profile_id, source_id, position) VALUES ('p-live', 's-in', 0)",
+            "INSERT INTO profile_sources (profile_id, source_id, position) VALUES ('p-ready', 's-in', 0)",
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        // Proxies reachable through `s-in` (in the profile): two alive,
-        // one quarantine, one unknown, one removed — the removed one is
-        // excluded.
-        sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-             VALUES
-                ('fp-a1', 'vless', 'a1', 'h1.example', 1, 'c', 'alive',      ?, ?),
-                ('fp-a2', 'vless', 'a2', 'h2.example', 1, 'c', 'alive',      ?, ?),
-                ('fp-q1', 'vless', 'q1', 'h3.example', 1, 'c', 'quarantine', ?, ?),
-                ('fp-u1', 'vless', 'u1', 'h4.example', 1, 'c', 'unknown',    ?, ?),
-                ('fp-r1', 'vless', 'r1', 'h5.example', 1, 'c', 'removed',    ?, ?)",
-        )
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Proxies reachable through `s-in` (in the profile): two ready,
+        // one alive, one quarantine, one unknown, one removed. Only the
+        // two ready rows contribute to the count.
+        for (fp, host_no, status) in [
+            ("fp-r1", 1i64, "ready"),
+            ("fp-r2", 2, "ready"),
+            ("fp-a1", 3, "alive"),
+            ("fp-q1", 4, "quarantine"),
+            ("fp-u1", 5, "unknown"),
+            ("fp-m1", 6, "removed"),
+        ] {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+                 VALUES (?, 'vless', ?, ?, 1, 'c', ?, ?, ?)",
+            )
+            .bind(fp)
+            .bind(fp)            // name reuses the fingerprint for the row label
+            .bind(format!("h{host_no}.example"))
+            .bind(status)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
-        // One extra alive proxy reachable only through `s-out` (not in the
+        // One extra ready proxy reachable only through `s-out` (not in the
         // profile). Must not count toward the profile's total.
         sqlx::query(
             "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-             VALUES ('fp-x1', 'vless', 'x1', 'hx.example', 1, 'c', 'alive', ?, ?)",
+             VALUES ('fp-x1', 'vless', 'x1', 'hx.example', 1, 'c', 'ready', ?, ?)",
         )
         .bind(now)
         .bind(now)
@@ -1781,11 +1782,11 @@ mod tests {
         .await
         .unwrap();
 
-        // And one alive proxy reachable through **both** sources — it must
-        // be counted once (DISTINCT p.id).
+        // And one ready proxy reachable through **both** sources — it must
+        // be counted once (DISTINCT px.id).
         sqlx::query(
             "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-             VALUES ('fp-both', 'vless', 'both', 'hb.example', 1, 'c', 'alive', ?, ?)",
+             VALUES ('fp-both', 'vless', 'both', 'hb.example', 1, 'c', 'ready', ?, ?)",
         )
         .bind(now)
         .bind(now)
@@ -1796,11 +1797,12 @@ mod tests {
         sqlx::query(
             "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
              SELECT p.id, s.id, ? FROM proxies p CROSS JOIN sources s
-             WHERE (p.fingerprint = 'fp-a1' AND s.id = 's-in')
-                OR (p.fingerprint = 'fp-a2' AND s.id = 's-in')
+             WHERE (p.fingerprint = 'fp-r1' AND s.id = 's-in')
+                OR (p.fingerprint = 'fp-r2' AND s.id = 's-in')
+                OR (p.fingerprint = 'fp-a1' AND s.id = 's-in')
                 OR (p.fingerprint = 'fp-q1' AND s.id = 's-in')
                 OR (p.fingerprint = 'fp-u1' AND s.id = 's-in')
-                OR (p.fingerprint = 'fp-r1' AND s.id = 's-in')
+                OR (p.fingerprint = 'fp-m1' AND s.id = 's-in')
                 OR (p.fingerprint = 'fp-x1' AND s.id = 's-out')
                 OR (p.fingerprint = 'fp-both' AND s.id IN ('s-in', 's-out'))",
         )
@@ -1819,17 +1821,21 @@ mod tests {
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
 
-        // Profile "live-count" row: 2 alive + 1 quarantine + 1 unknown +
-        // 1 alive (in both sources, counted once) = 5. The removed one and
-        // the proxy reachable only through `s-out` are excluded.
-        assert!(html.contains(">live-count<"), "profile row missing: {html}");
+        // Profile "ready-count" row: 2 ready + 1 ready (in both sources,
+        // counted once) = 3. The alive/quarantine/unknown/removed rows
+        // and the proxy reachable only through `s-out` are excluded.
+        assert!(
+            html.contains(">ready-count<"),
+            "profile row missing: {html}"
+        );
         // Sources count is 1 (only `s-in` is attached). Proxies count is
-        // 5 (the live-only count). They sit in two adjacent `<td class="num">`
-        // cells — the same pattern the rest of the table uses.
-        let needle = "<td class=\"num\">1</td>\n            <td class=\"num\">5</td>";
+        // 3 (the ready-only count). They sit in two adjacent
+        // `<td class="num">` cells — the same pattern the rest of the
+        // table uses.
+        let needle = "<td class=\"num\">1</td>\n            <td class=\"num\">3</td>";
         assert!(
             html.contains(needle),
-            "expected sources_count=1 and proxies_count=5 adjacent: {html}"
+            "expected sources_count=1 and proxies_count=3 adjacent: {html}"
         );
     }
 
@@ -2005,6 +2011,274 @@ mod tests {
                 "missing link for {bucket}: {html}"
             );
         }
+    }
+
+    /// A handful of quarantined rows (well below `sample_size × 20`)
+    /// means no heuristic fires, so the page renders without any
+    /// backlog banner at all.
+    #[tokio::test]
+    async fn probe_screen_silent_when_queue_small() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        for i in 0..5 {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
+                                      quarantined_at, ladder_at, created_at, updated_at)
+                 VALUES (?, 'vless', ?, ?, 443, 'c', 'quarantine', ?, ?, 1, 1)",
+            )
+            .bind(format!("fp-silent-{i}"))
+            .bind(format!("q{i}"))
+            .bind(format!("h{i}.example"))
+            .bind(now - 3600)
+            .bind(now + 3600)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let html = render_get_html(&app, "/admin/probe", &cookie).await;
+
+        assert!(
+            !html.contains("backlog-banner"),
+            "no banner expected: {html}"
+        );
+        assert!(
+            !html.contains("flash warning") && !html.contains("flash danger"),
+            "no flash variant expected: {html}"
+        );
+    }
+
+    /// `quarantine_count > sample_size × 20` lights the `deep_queue`
+    /// factor and, when drain time exceeds the target, surfaces a
+    /// concrete `[probe].sample_size` recommendation.
+    #[tokio::test]
+    async fn probe_screen_warns_on_deep_queue_with_recommendation() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        // 4000 quarantined rows; all due now (ladder_at <= now). With
+        // default sample_size=50 and cycle=60s, drain takes 80 min —
+        // over the 60-min target, so a recommendation must show.
+        sqlx::query(
+            "INSERT INTO proxies
+                 (fingerprint, scheme, name, host, port, credential, status,
+                  quarantined_at, ladder_at, created_at, updated_at)
+             SELECT 'fp-deep-' || x, 'vless', 'd' || x, 'h' || x || '.example',
+                    443, 'c', 'quarantine', ?, ?, 1, 1
+             FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 4000)
+                   SELECT n AS x FROM seq)",
+        )
+        .bind(now - 3600)
+        .bind(now - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let html = render_get_html(&app, "/admin/probe", &cookie).await;
+
+        assert!(
+            html.contains("flash warning") && html.contains("backlog-banner"),
+            "warning banner expected: {html}"
+        );
+        assert!(html.contains("Очередь probe:"), "title missing: {html}");
+        assert!(
+            html.contains("В карантине 4000"),
+            "deep_queue factor missing: {html}"
+        );
+        assert!(
+            html.contains("Рекомендации, чтобы осушить за ~60 мин:"),
+            "recs head missing: {html}"
+        );
+        // required_sample = 4000 × 60 / (60 × 60) = 67
+        assert!(
+            html.contains("[probe].sample_size = 67"),
+            "sample_size recommendation missing or wrong: {html}"
+        );
+        assert!(
+            html.contains("(current 50)"),
+            "current value should appear in rec: {html}"
+        );
+    }
+
+    /// One quarantined row that's older than `queue_stale_days × 0.8`
+    /// triggers a `danger` banner with the `stale_oldest` factor.
+    #[tokio::test]
+    async fn probe_screen_danger_on_stale_oldest_row() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
+                                  quarantined_at, ladder_at, created_at, updated_at)
+             VALUES ('fp-stale-1', 'vless', 'stale', 's.example', 443, 'c', 'quarantine',
+                     ?, ?, 1, 1)",
+        )
+        .bind(now - 30 * 86_400) // 30 days ago
+        .bind(now + 86_400)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let html = render_get_html(&app, "/admin/probe", &cookie).await;
+
+        assert!(
+            html.contains("flash danger") && html.contains("backlog-banner"),
+            "danger banner expected: {html}"
+        );
+        assert!(
+            html.contains("устаревает после 7"),
+            "stale_oldest factor with limit=7 missing: {html}"
+        );
+    }
+
+    /// 300 quarantined rows that are all *due now* trip the
+    /// `due_overflow` heuristic (300 > 50 × 5). The total is below
+    /// the `deep_queue` threshold, so only `due_overflow` should fire.
+    #[tokio::test]
+    async fn probe_screen_warns_on_due_overflow() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        sqlx::query(
+            "INSERT INTO proxies
+                 (fingerprint, scheme, name, host, port, credential, status,
+                  quarantined_at, ladder_at, created_at, updated_at)
+             SELECT 'fp-due-' || x, 'vless', 'd' || x, 'h' || x || '.example',
+                    443, 'c', 'quarantine', ?, ?, 1, 1
+             FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 300)
+                   SELECT n AS x FROM seq)",
+        )
+        .bind(now - 3600)
+        .bind(now - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let html = render_get_html(&app, "/admin/probe", &cookie).await;
+
+        assert!(html.contains("backlog-banner"), "banner expected: {html}");
+        assert!(
+            html.contains("Готово к проверке 300"),
+            "due_overflow factor missing: {html}"
+        );
+        assert!(
+            html.contains("за цикл берётся 50"),
+            "sample value in due_overflow missing: {html}"
+        );
+        // Drain time at 300/50 × 60s = 6 min, comfortably below the
+        // 60-min target — no recommendations block.
+        assert!(
+            !html.contains("Рекомендации"),
+            "no recs expected at this depth: {html}"
+        );
+    }
+
+    /// The recommended `[probe].sample_size` scales down as the target
+    /// drain time goes up — operators tightening the target get bigger
+    /// numbers.
+    #[tokio::test]
+    async fn probe_screen_recommendation_scales_with_target_minutes() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        sqlx::query(
+            "INSERT INTO proxies
+                 (fingerprint, scheme, name, host, port, credential, status,
+                  quarantined_at, ladder_at, created_at, updated_at)
+             SELECT 'fp-tune-' || x, 'vless', 't' || x, 'h' || x || '.example',
+                    443, 'c', 'quarantine', ?, ?, 1, 1
+             FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 4000)
+                   SELECT n AS x FROM seq)",
+        )
+        .bind(now - 3600)
+        .bind(now - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // First render with the default 60-min target — required
+        // sample = 4000 × 60 / (60 × 60) = 67.
+        let mut state_a = state;
+        let app = router(state_a.clone());
+        let cookie_a = login(&app).await;
+        let html_a = render_get_html(&app, "/admin/probe", &cookie_a).await;
+        assert!(
+            html_a.contains("[probe].sample_size = 67"),
+            "target=60 should yield sample_size=67: {html_a}"
+        );
+
+        // Tighten the target to 15 min — required sample grows to 267.
+        state_a.probe.backlog_target_drain_minutes = 15;
+        let app = router(state_a);
+        let cookie_b = login(&app).await;
+        let html_b = render_get_html(&app, "/admin/probe", &cookie_b).await;
+        assert!(
+            html_b.contains("[probe].sample_size = 267"),
+            "target=15 should yield sample_size=267: {html_b}"
+        );
+        assert!(
+            html_b.contains("~15 мин"),
+            "recs head should mention the new target: {html_b}"
+        );
+    }
+
+    /// No heartbeat for 600 s (> `heartbeat_interval_secs × 3 = 90 s`)
+    /// trips the `heartbeat_dead` danger factor.
+    #[tokio::test]
+    async fn probe_screen_warns_on_dead_heartbeat() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        fumox_core::repo::meta_set(
+            &pool,
+            "probe_heartbeat",
+            &format!(r#"{{"ts":{},"pid":1,"version":"x"}}"#, now - 600),
+        )
+        .await
+        .unwrap();
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let html = render_get_html(&app, "/admin/probe", &cookie).await;
+
+        assert!(
+            html.contains("flash danger") && html.contains("backlog-banner"),
+            "danger banner expected: {html}"
+        );
+        assert!(
+            html.contains("Heartbeat probe отсутствует 600 с"),
+            "heartbeat_dead factor missing: {html}"
+        );
+    }
+
+    /// GET helper — runs a request through the router and returns the
+    /// collected body as a UTF-8 string. The probe tests only need the
+    /// body, so this trims the boilerplate around `oneshot` /
+    /// `into_body().collect()`.
+    async fn render_get_html(app: &axum::Router, uri: &str, cookie: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(request("GET", uri, "", Some(cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&body).into_owned()
     }
 
     /// The proxy browser filters by check-coverage bucket and renders the

@@ -1099,6 +1099,36 @@ pub async fn select_t2_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
     .await?;
     Ok(rows)
 }
+
+/// Number of quarantined proxies whose `ladder_at <= now` — i.e. the
+/// rows the probe will consider on its very next quarantine pass, before
+/// the `sample_size` cap clamps the actual fetch. Used by the
+/// `/admin/probe` backlog banner to detect the *due* queue growing
+/// faster than the cycle can consume it.
+pub async fn count_due_quarantine(pool: &DbPool, now: i64) -> crate::Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM proxies
+         WHERE status = 'quarantine'
+           AND ladder_at IS NOT NULL
+           AND ladder_at <= ?",
+    )
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Oldest `quarantined_at` across the whole quarantine pool, or `None`
+/// if the pool is empty. Used by the `/admin/probe` backlog banner to
+/// flag rows that have been waiting longer than `[probe].queue_stale_days`.
+pub async fn oldest_quarantined_at(pool: &DbPool) -> crate::Result<Option<i64>> {
+    let row: (Option<i64>,) =
+        sqlx::query_as("SELECT MIN(quarantined_at) FROM proxies WHERE status = 'quarantine'")
+            .fetch_one(pool)
+            .await?;
+    Ok(row.0)
+}
+
 /// the recheck ladder) is due at `now`: every `quarantine` row
 /// carries exactly one `ladder_at` (NULL only while a check is in flight),
 /// so a single comparison suffices and the failed step travels in
@@ -3569,5 +3599,111 @@ mod tests {
         assert_eq!(bulk_status_of(&pool, alive).await.0, "alive");
         assert_eq!(bulk_status_of(&pool, removed).await.0, "removed");
         assert_eq!(bulk_status_of(&pool, unknown).await.0, "unknown");
+    }
+
+    /// Empty quarantine → no due rows.
+    #[tokio::test]
+    async fn count_due_quarantine_returns_zero_when_empty() {
+        let pool = temp_pool().await;
+        let now = crate::models::now_ts();
+        let n = count_due_quarantine(&pool, now).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// `count_due_quarantine` only counts rows whose `ladder_at` has
+    /// passed — both NULL-ladder (in-flight) and future-ladder rows
+    /// stay out of the count.
+    #[tokio::test]
+    async fn count_due_quarantine_counts_only_due() {
+        let pool = temp_pool().await;
+        let now = crate::models::now_ts();
+        let due = bulk_test_row(&pool, "due-c1", "vless", "quarantine", None, None).await;
+        let due2 = bulk_test_row(&pool, "due-c2", "vless", "quarantine", None, None).await;
+        let future = bulk_test_row(&pool, "due-c3", "vless", "quarantine", None, None).await;
+        let null_ladder = bulk_test_row(&pool, "due-c4", "vless", "quarantine", None, None).await;
+
+        sqlx::query("UPDATE proxies SET quarantined_at = ?, ladder_at = ? WHERE id = ?")
+            .bind(now - 3600)
+            .bind(now - 1)
+            .bind(due)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET quarantined_at = ?, ladder_at = ? WHERE id = ?")
+            .bind(now - 7200)
+            .bind(now - 60)
+            .bind(due2)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // future: ladder_at is in the future
+        sqlx::query("UPDATE proxies SET quarantined_at = ?, ladder_at = ? WHERE id = ?")
+            .bind(now - 3600)
+            .bind(now + 3600)
+            .bind(future)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // null_ladder: keeps ladder_at NULL (the bulk insert sets it to NULL
+        // for non-quarantine; for quarantine it's whatever default — verify)
+        let (ladder_at,): (Option<i64>,) =
+            sqlx::query_as("SELECT ladder_at FROM proxies WHERE id = ?")
+                .bind(null_ladder)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // Force NULL ladder_at so the row is excluded.
+        if ladder_at.is_some() {
+            sqlx::query("UPDATE proxies SET ladder_at = NULL WHERE id = ?")
+                .bind(null_ladder)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let n = count_due_quarantine(&pool, now).await.unwrap();
+        assert_eq!(n, 2, "only `due` and `due2` have ladder_at <= now");
+    }
+
+    /// Empty quarantine → `None` (the banner uses this to skip the
+    /// staleness factor without a SQL error).
+    #[tokio::test]
+    async fn oldest_quarantined_at_returns_none_when_empty() {
+        let pool = temp_pool().await;
+        let v = oldest_quarantined_at(&pool).await.unwrap();
+        assert!(v.is_none());
+    }
+
+    /// `oldest_quarantined_at` returns the minimum `quarantined_at` and
+    /// ignores non-quarantine rows.
+    #[tokio::test]
+    async fn oldest_quarantined_at_returns_min() {
+        let pool = temp_pool().await;
+        let now = crate::models::now_ts();
+        let q1 = bulk_test_row(&pool, "old-q1", "vless", "quarantine", None, None).await;
+        let q2 = bulk_test_row(&pool, "old-q2", "vless", "quarantine", None, None).await;
+        let alive = bulk_test_row(&pool, "old-alive", "vless", "alive", None, None).await;
+        // q1 oldest, q2 newer, alive with even older quarantined_at must be ignored.
+        sqlx::query("UPDATE proxies SET quarantined_at = ? WHERE id = ?")
+            .bind(now - 30 * 86_400)
+            .bind(q1)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET quarantined_at = ? WHERE id = ?")
+            .bind(now - 7 * 86_400)
+            .bind(q2)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET quarantined_at = ? WHERE id = ?")
+            .bind(now - 365 * 86_400)
+            .bind(alive)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let v = oldest_quarantined_at(&pool).await.unwrap();
+        assert_eq!(v, Some(now - 30 * 86_400));
     }
 }

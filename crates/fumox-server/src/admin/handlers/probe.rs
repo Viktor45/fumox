@@ -26,14 +26,12 @@ const STATS_INTERVAL: Duration = Duration::from_secs(30);
 /// keepalive pings, a slow-loris client that
 /// never reads from the stream would otherwise sit on a per-IP admin slot
 /// forever. Note the cap is a fixed connection lifetime, not an idle
-/// timeout — the stream closes 10 minutes after connect regardless of
+/// timeout, the stream closes 10 minutes after connect regardless of
 /// traffic. The browser-side `EventSource` reconnects on its own when the
 /// socket closes, so this is harmless to the UI.
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
-// ---------------------------------------------------------------------------
-// Overview screen
-// ---------------------------------------------------------------------------
+// Overview screen.
 
 #[derive(Debug, sqlx::FromRow)]
 struct QuarantineRow {
@@ -68,7 +66,7 @@ struct ProbeTemplate {
     heartbeat: Option<Heartbeat>,
     meow_last_ok: Option<i64>,
     /// Check-coverage buckets (`none`/`t1_only`/`t2_only`/`both`), fixed
-    /// order, zero-filled — each links into the filtered proxy browser.
+    /// order, zero-filled, each links into the filtered proxy browser.
     coverage: Vec<(String, i64)>,
     /// True count of proxies in `status = 'quarantine'` (from
     /// `proxy_counts`). The `queue` table view is truncated to 50 rows,
@@ -80,11 +78,11 @@ struct ProbeTemplate {
     /// banner always sees the same config the rest of the page would.
     probe_view: ProbeView,
     /// Backlog diagnostic for the banner. `None` when no heuristic
-    /// fired — the template skips the entire block.
+    /// fired, the template skips the entire block.
     backlog: Option<BacklogDiagnostic>,
 }
 
-/// Read-only DTO of the `[probe]` block — only the fields the
+/// Read-only DTO of the `[probe]` block: only the fields the
 /// `/admin/probe` page actually surfaces. Decouples the template from
 /// `ProbeConfig`'s serde internals.
 #[derive(Clone, Copy, Debug)]
@@ -110,9 +108,11 @@ impl ProbeView {
 }
 
 /// Severity of a single trigger. The banner picks the highest severity
-/// across all triggers.
+/// across all triggers. `Ok` is the positive state shown when no
+/// heuristic fired and the current drain fits in the target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BacklogLevel {
+    Ok,
     Warning,
     Danger,
 }
@@ -120,9 +120,10 @@ enum BacklogLevel {
 impl BacklogLevel {
     /// CSS modifier suffix appended to `.flash`. `None` would also
     /// work, but the existing `.flash` style is reserved for neutral
-    /// info bars — every diagnostic lands in a warning/danger variant.
+    /// info bars, every diagnostic lands in a warning/danger variant.
     fn css_class(self) -> &'static str {
         match self {
+            BacklogLevel::Ok => "ok",
             BacklogLevel::Warning => "warning",
             BacklogLevel::Danger => "danger",
         }
@@ -130,16 +131,17 @@ impl BacklogLevel {
     /// `probe.level_*` key for the level label inside the title.
     fn i18n_key(self) -> &'static str {
         match self {
+            BacklogLevel::Ok => "probe.level_ok",
             BacklogLevel::Warning => "probe.level_warning",
             BacklogLevel::Danger => "probe.level_danger",
         }
     }
     /// Pick the highest severity across `self` and `other`.
     fn escalate(self, other: BacklogLevel) -> BacklogLevel {
-        if other == BacklogLevel::Danger || self == BacklogLevel::Danger {
-            BacklogLevel::Danger
-        } else {
-            other
+        match (self, other) {
+            (BacklogLevel::Danger, _) | (_, BacklogLevel::Danger) => BacklogLevel::Danger,
+            (BacklogLevel::Warning, _) | (_, BacklogLevel::Warning) => BacklogLevel::Warning,
+            _ => BacklogLevel::Ok,
         }
     }
 }
@@ -165,7 +167,7 @@ struct TuningRec {
     label: String,
 }
 
-/// Bundle of facts the banner needs to render. Carried in `Option` —
+/// Bundle of facts the banner needs to render. Carried in `Option`:
 /// `None` skips the block entirely.
 #[derive(Clone, Debug)]
 struct BacklogDiagnostic {
@@ -180,7 +182,7 @@ struct BacklogDiagnostic {
 }
 
 /// Heuristics + recommendation math for the backlog banner. Pure
-/// function — no I/O — so the test suite can hit every branch without
+/// function, no I/O, so the test suite can hit every branch without
 /// seeding a database.
 ///
 /// `oldest_quarantined_age_secs` = `now - MIN(quarantined_at)` if any
@@ -227,12 +229,10 @@ fn compute_backlog(
             });
         }
     }
-    // `heartbeat_dead` only fires when we've seen a heartbeat at some
-    // point and it has now gone stale — otherwise a freshly started
-    // daemon that hasn't written its first beat yet would trigger the
-    // banner before the cycle even begins. The same condition is
-    // already surfaced on the dedicated daemon card with a softer
-    // "no heartbeat received yet" message.
+    // `heartbeat_dead` requires a recorded heartbeat, otherwise a
+    // freshly started daemon would trigger the banner before its
+    // first beat (already surfaced as "no heartbeat" on the daemon
+    // card).
     if heartbeat_age_secs.is_some() && !heartbeat_alive {
         level = level.escalate(BacklogLevel::Danger);
         factors.push(BacklogFactor {
@@ -250,13 +250,31 @@ fn compute_backlog(
     }
 
     if factors.is_empty() {
-        return None;
+        // No heuristic fired: surface the green OK banner only when
+        // the current drain also fits the target; otherwise stay silent.
+        let target_minutes = cfg.backlog_target_drain_minutes.max(1);
+        let cycles_to_drain = (quarantine_count.max(1) + sample_size - 1) / sample_size.max(1);
+        let drain_minutes_now: u64 = ((cycles_to_drain * cycle as i64 + 59) / 60).max(1) as u64;
+        if drain_minutes_now > target_minutes {
+            return None;
+        }
+        return Some(BacklogDiagnostic {
+            level: BacklogLevel::Ok,
+            factors: vec![BacklogFactor {
+                key: "all_ok",
+                severity: BacklogLevel::Ok,
+            }],
+            recs: Vec::new(),
+            target_drain_minutes: target_minutes,
+            quarantine_count,
+            due_count,
+            due_capacity: cfg.sample_size,
+            oldest_quarantined_age_secs,
+        });
     }
 
-    // Recommendation math. Only meaningful when the queue actually
-    // exceeds what the current config can drain in the operator's
-    // target window; otherwise the banner shows just the factors
-    // ("here's what's wrong") without prescriptive knobs.
+    // Recommendations only when drain exceeds the target; otherwise
+    // the banner shows the factors without prescriptive knobs.
     let target_minutes = cfg.backlog_target_drain_minutes.max(1);
     let cycles_to_drain = (quarantine_count.max(1) + sample_size - 1) / sample_size.max(1);
     let drain_seconds = cycles_to_drain * cycle as i64;
@@ -288,7 +306,7 @@ fn compute_backlog(
 
 /// Build up to three concrete suggestions. Returns an empty Vec when
 /// the operator's settings are already inside the target window. Each
-/// suggestion's `label` is the localized text the template renders —
+/// suggestion's `label` is the localized text the template renders ,
 /// the `target_value` field is what tests assert against.
 fn compute_recs(
     cfg: &ProbeConfig,
@@ -301,8 +319,8 @@ fn compute_recs(
     let target_minutes = cfg.backlog_target_drain_minutes.max(1);
     let target_seconds = (target_minutes as i64).saturating_mul(60);
 
-    // Required sample_size to drain the queue in `target_minutes`
-    // minutes at the current cycle interval. Capped at 500.
+    // Required sample_size to drain in `target_minutes` at the current
+    // cycle, capped at 500.
     let cycles_needed =
         (quarantine_count.max(1) + sample_size as i64 - 1) / sample_size.max(1) as i64;
     let required_sample_raw =
@@ -317,8 +335,8 @@ fn compute_recs(
         });
     }
 
-    // Cycle-interval knob — only when sample_size is already huge or
-    // would have to be > 500.
+    // Cycle-interval knob: only when sample_size is already huge or
+    // the required sample exceeds the cap.
     let cycle_cap_hit = required_sample_raw > 500;
     if cycle_cap_hit || sample_size >= 400 {
         let required_cycle_secs =
@@ -334,9 +352,8 @@ fn compute_recs(
         }
     }
 
-    // Concurrency — only when each individual cycle exceeds the
-    // interval (i.e. the sample isn't getting through fast enough
-    // and parallelism is the actual bottleneck).
+    // Concurrency: only when each cycle exceeds the interval, i.e.
+    // parallelism is the bottleneck, not throughput.
     let worst_case_check_secs = (cfg.connect_timeout_secs + cfg.tls_timeout_secs).max(1) as i64;
     let current_cycle_secs = ((sample_size as i64 + concurrency as i64 - 1) / concurrency as i64)
         * worst_case_check_secs;
@@ -400,7 +417,8 @@ impl ProbeTemplate {
         self.lang.t(key).to_string()
     }
 
-    /// CSS modifier for the backlog banner — `warning` or `danger`.
+    ///
+    /// CSS modifier for the backlog banner: `ok`, `warning`, or `danger`.
     fn backlog_level_class(&self) -> &'static str {
         match self.backlog {
             Some(ref b) => b.level.css_class(),
@@ -466,6 +484,20 @@ impl ProbeTemplate {
                     .map(|hb| (fumox_core::models::now_ts() - hb.ts).max(0))
                     .unwrap_or(0);
                 self.lang.t_named(&key, &[("secs", secs.to_string())])
+            }
+            "all_ok" => {
+                let sample = self.probe_view.sample_size.max(1) as i64;
+                let cycle = self.probe_view.cycle_interval_secs.max(1) as i64;
+                let cycles = (b.quarantine_count.max(1) + sample - 1) / sample;
+                let drain = ((cycles * cycle) + 59) / 60;
+                self.lang.t_named(
+                    &key,
+                    &[
+                        ("count", b.quarantine_count.to_string()),
+                        ("drain", drain.to_string()),
+                        ("target", b.target_drain_minutes.to_string()),
+                    ],
+                )
             }
             _ => self.lang.t(&key).to_string(),
         }
@@ -554,7 +586,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
         .map(|(_, count)| *count)
         .unwrap_or(0);
 
-    // Backlog-banner inputs. Two extra SQL queries — both are index hits
+    // Backlog-banner inputs. Two extra SQL queries, both are index hits
     // on `proxies(status, ladder_at)` and `proxies(status, quarantined_at)`
     // and run once per page render (not per row).
     let now = fumox_core::models::now_ts();
@@ -604,9 +636,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     )
 }
 
-// ---------------------------------------------------------------------------
-// SSE stream
-// ---------------------------------------------------------------------------
+// SSE stream.
 
 /// SSE endpoint: forwards scheduler fetch events from the
 /// event bus and interleaves periodic `probe.stats` / `heartbeat` events
@@ -669,7 +699,7 @@ pub async fn events_stream(
                 }
                 // Connection lifetime cap:
                 // the stream never outlives SSE_IDLE_TIMEOUT (10 min) even
-                // under steady traffic — the interval is not reset on
+                // under steady traffic, the interval is not reset on
                 // activity, so this is a hard cap, not an idle timeout.
                 // The browser's EventSource reconnects on its own, and the
                 // reconnect passes auth again.

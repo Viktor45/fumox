@@ -51,7 +51,7 @@ pub fn canonical_request_host(headers: &HeaderMap) -> String {
 /// Internal helper: lowercase, strip port, strip IPv6 brackets. Bare IPv6
 /// (multiple colons, no brackets) is wrapped in brackets and lowercased so
 /// every IPv6 input shape canonicalizes to `[x]`. A literal `@` anywhere in
-/// the input is rejected outright — `vpn.example.com:8080@evil.com` would
+/// the input is rejected outright, `vpn.example.com:8080@evil.com` would
 /// otherwise return `vpn.example.com` after the single-colon port strip, and
 /// the rejected host (after the gate's `canonicalize_host_str` call) hides
 /// the attacker payload from the `err.host` logged on rejection. Both the
@@ -63,7 +63,7 @@ fn canonicalize_host_str(raw: &str) -> String {
         return String::new();
     }
     if let Some(rest) = raw.strip_prefix('[') {
-        // IPv6 literal: `[::1]` or `[::1]:port` — keep the inside stripped of brackets.
+        // IPv6 literal: `[::1]` or `[::1]:port`, keep the inside stripped of brackets.
         let inside = rest.split(']').next().unwrap_or(rest);
         format!("[{}]", inside.to_ascii_lowercase())
     } else if raw.matches(':').count() == 1 {
@@ -72,7 +72,7 @@ fn canonicalize_host_str(raw: &str) -> String {
         }
         raw.to_ascii_lowercase()
     } else if raw.matches(':').count() > 1 {
-        // Bare IPv6 — wrap in brackets so the canonical form matches
+        // Bare IPv6, wrap in brackets so the canonical form matches
         // `[2001:db8::1]`.
         format!("[{}]", raw.to_ascii_lowercase())
     } else {
@@ -87,7 +87,7 @@ fn canonicalize_host_str(raw: &str) -> String {
 /// (today's behavior, opt-in).
 ///
 /// An empty canonical host is never in a non-empty allowlist, so a missing
-/// `Host` header is rejected whenever an allowlist is configured — this is
+/// `Host` header is rejected whenever an allowlist is configured, this is
 /// the desired deny-by-default semantic.
 pub fn validate_request_host(
     headers: &HeaderMap,
@@ -146,7 +146,7 @@ fn port_stripped_host(headers: &HeaderMap) -> Option<String> {
 
 fn strip_port(raw: &str) -> String {
     if let Some(rest) = raw.strip_prefix('[') {
-        // IPv6 literal: `[::1]` or `[::1]:port` — keep brackets intact.
+        // IPv6 literal: `[::1]` or `[::1]:port`, keep brackets intact.
         if let Some((inside, _rest)) = rest.split_once(']') {
             let mut out = String::with_capacity(raw.len());
             out.push('[');
@@ -156,7 +156,7 @@ fn strip_port(raw: &str) -> String {
         }
         raw.to_string()
     } else if raw.matches(':').count() > 1 {
-        // Bare IPv6 — wrap in brackets so the URL host stays well-formed.
+        // Bare IPv6, wrap in brackets so the URL host stays well-formed.
         format!("[{raw}]")
     } else if let Some((host, _port)) = raw.rsplit_once(':') {
         host.to_string()
@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(canonicalize_host_str("2001:db8::1"), "[2001:db8::1]");
         assert_eq!(canonicalize_host_str("2001:DB8::1"), "[2001:db8::1]");
         // The trailing-port form is no longer the broken `rsplit_once(':')`
-        // result — the gate and the link-builder must agree.
+        // result, the gate and the link-builder must agree.
         assert_eq!(
             canonicalize_host_str("2001:db8::1:8080"),
             "[2001:db8::1:8080]"
@@ -294,7 +294,7 @@ mod tests {
     fn build_serve_link_host_returns_canonical_when_in_allowlist() {
         let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let allowed = vec!["vpn.example.com".to_string()];
-        // The port is stripped for the URL host component — the caller
+        // The port is stripped for the URL host component, the caller
         // appends the public port from `[server].bind`.
         let out = build_serve_link_host(bind, &host("vpn.example.com:8081"), &allowed).unwrap();
         assert_eq!(out, "vpn.example.com");

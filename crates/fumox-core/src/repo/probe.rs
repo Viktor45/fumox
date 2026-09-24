@@ -72,7 +72,7 @@ pub async fn last_failed_kind(pool: &DbPool, proxy_id: i64) -> crate::Result<Opt
 ///
 /// `since_ts` is the lower bound on `checked_at` (Unix seconds, inclusive);
 /// `limit` caps the returned rows. Errors with `NULL` reason text are
-/// excluded — they are uninformative aggregates of successful probes that
+/// excluded, they are uninformative aggregates of successful probes that
 /// stored no diagnostic.
 pub async fn top_failure_reasons(
     pool: &DbPool,
@@ -97,7 +97,7 @@ pub async fn top_failure_reasons(
 
 /// Enqueue up to `limit` of `candidate_ids` for priority checking. Only
 /// T1-probeable schemes are accepted (unprobeable schemes would clog the
-/// queue forever); the row itself must still be `unknown`. Idempotent —
+/// queue forever); the row itself must still be `unknown`. Idempotent ,
 /// an id already queued is left untouched (`INSERT OR IGNORE`). Returns the
 /// number of newly queued ids.
 pub async fn enqueue_checks(
@@ -125,7 +125,7 @@ pub async fn enqueue_checks(
              ORDER BY p.id DESC LIMIT ?"
         );
         // sqlx 0.9 SqlSafeStr: the format! only expands `?` placeholder
-        // lists — all data flows through .bind().
+        // lists, all data flows through .bind().
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(now);
         for id in chunk {
             query = query.bind(id);

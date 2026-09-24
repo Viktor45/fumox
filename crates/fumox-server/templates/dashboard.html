@@ -58,7 +58,7 @@
 </div>
 
 <div class="grid cols-4">
-  <div class="panel stat-card">
+  <div class="panel stat-card stat-card-sources">
     <div class="num">{{ sources_enabled }} / {{ sources_total }}</div>
     <div class="label">{{ self.t("dash.sources_enabled") }}</div>
     {% if sources_with_errors > 0 %}
@@ -67,11 +67,11 @@
       <div class="sub">{{ self.t("dash.no_errors") }}</div>
     {% endif %}
   </div>
-  <div class="panel stat-card">
+  <div class="panel stat-card stat-card-profiles">
     <div class="num">{{ profiles_total }}</div>
     <div class="label">{{ self.t("dash.profiles") }}</div>
   </div>
-  <div class="panel stat-card">
+  <div class="panel stat-card stat-card-proxies">
     <div class="num">{{ self.proxy_total() }}</div>
     <div class="label">{{ self.t("dash.proxies_total") }}</div>
     <div class="sub">
@@ -80,21 +80,21 @@
       {% endfor %}
     </div>
   </div>
-  <div class="panel stat-card">
+  <div class="panel stat-card stat-card-fetches">
     <div class="num">{{ fetch_ok_24h }} / {{ fetch_total_24h }}</div>
     <div class="label">{{ self.t("dash.fetches_24h") }}</div>
   </div>
 </div>
 
 <div class="grid cols-4">
-  <div class="panel stat-card">
+  <div class="panel stat-card stat-card-probes">
     <div class="num">{{ probes_ok_24h }} / {{ probes_total_24h }}</div>
     <div class="label">{{ self.t("stats.probes_24h") }}</div>
     {% if probes_total_24h > 0 %}
       <div class="sub">{{ self.pct(probes_ok_24h, probes_total_24h) }}% {{ self.t("stats.success_rate") }}</div>
     {% endif %}
   </div>
-  <div class="panel stat-card">
+  <div class="panel stat-card stat-card-latency">
     <div class="num">
       {% match latency_median %}
         {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
@@ -109,12 +109,12 @@
         {% when Some with (ms) %}{{ self.t("stats.latency_avg") }} {{ ms }} {{ self.t("common.ms") }}{% when None %}{% endmatch %}
     </div>
   </div>
-  <div class="panel stat-card">
+  <div class="panel stat-card stat-card-quarantine">
     <div class="num">{{ in_quarantine }}</div>
     <div class="label">{{ self.t("stats.in_quarantine") }}</div>
     <div class="sub">{{ self.t("stats.awaiting_second_chance").replace("{}", &quarantine_second_chance.to_string()) }}</div>
   </div>
-  <div class="panel stat-card">
+  <div class="panel stat-card stat-card-never">
     <div class="num">{{ never_checked }}</div>
     <div class="label">{{ self.t("stats.never_checked") }}</div>
     <div class="sub">{{ self.t("stats.unprobeable_count").replace("{}", &unprobeable.to_string()) }}</div>
@@ -167,7 +167,7 @@
   {% endif %}
 </div>
 
-{# Top-N probe failure reasons over the rolling 24h window — the
+{# Top-N probe failure reasons over the rolling 24h window, the
    operator's most actionable signal: "what kind of failure is hitting
    the proxy pool right now?". Respects the configurable top_n. #}
 <div class="panel">
@@ -204,12 +204,12 @@
   {% else %}
     <div class="stat-bars">
       {% for (day, created) in ingest_days %}
-      <div class="stat-bar" title="{{ created }}">
-        <div class="stat-bar-col">
+      <div class="stat-bar" role="img" aria-label="{{ created }} {{ self.t("stats.ingest_day_label") }} {{ self.ts(day) | safe }}">
+        <div class="stat-bar-col" aria-hidden="true">
           <div class="stat-bar-fill" style="height: {{ self.bar_width(created, ingest_max) }}%"></div>
         </div>
-        <div class="stat-bar-num">{{ created }}</div>
-        <div class="stat-bar-label">{{ self.ts(day) | safe }}</div>
+        <div class="stat-bar-num" aria-hidden="true">{{ created }}</div>
+        <div class="stat-bar-label" aria-hidden="true">{{ self.ts(day) | safe }}</div>
       </div>
       {% endfor %}
     </div>
@@ -241,7 +241,7 @@
             <td class="muted rank">{{ loop.index }}</td>
             <td class="mono small">{{ row.scheme }}</td>
             <td class="mono small addr">{{ row.host }}:<wbr>{{ row.port }}</td>
-            <td class="small">{{ self.flag(row.geo_country) }}
+            <td class="small"><span aria-hidden="true">{{ self.flag(row.geo_country) }}</span>
               {% match row.geo_country %}
                 {% when Some with (country) %}{{ country }}
                 {% when None %}<span class="muted">–</span>
@@ -276,7 +276,7 @@
         {% for row in schemes %}
         <div class="stat-split-row">
           <div class="stat-split-name mono">{{ row.value }}</div>
-          <div class="stat-split-bar">
+          <div class="stat-split-bar" aria-hidden="true">
             {% if row.alive > 0 %}
               <span class="stat-split-seg alive" style="--w: {{ self.bar_width(row.alive, row.total) }}%"></span>
             {% endif %}
@@ -317,13 +317,13 @@
         {% for row in countries %}
         {% if loop.index as i64 <= top_n.as_i64() %}
         <div class="stat-split-row">
-          <div class="stat-split-name">{{ self.flag(row.value) }}
+          <div class="stat-split-name"><span aria-hidden="true">{{ self.flag(row.value) }}</span>
             {% match row.value %}
               {% when Some with (country) %}{{ country }}
               {% when None %}<span class="muted">{{ self.t("stats.no_country") }}</span>
             {% endmatch %}
           </div>
-          <div class="stat-split-bar">
+          <div class="stat-split-bar" aria-hidden="true">
             {% if row.alive > 0 %}
               <span class="stat-split-seg alive" style="--w: {{ self.bar_width(row.alive, row.total) }}%"></span>
             {% endif %}

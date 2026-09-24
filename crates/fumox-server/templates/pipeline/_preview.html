@@ -15,7 +15,7 @@
   {% endif %}
   {% when None %}
   {# "Empty" is the pass-through config: the stored field stays NULL and the
-     built-in defaults apply — all protocols kept, parameters normalized,
+     built-in defaults apply, all protocols kept, parameters normalized,
      quarantined/removed excluded, dedup by fingerprint. #}
   <div class="hint">{{ self.t("ped.preview_empty") }}</div>
 {% endmatch %}

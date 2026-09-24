@@ -3,7 +3,7 @@
 //! The scheduler publishes fetch lifecycle events here; the SSE endpoint
 //! (`GET /admin/events`) subscribes and forwards them to the browser,
 //! interleaving periodic `probe.stats` / `heartbeat` events read from the
-//! database. Polling fragments keep working as the no-JS fallback — SSE is
+//! database. Polling fragments keep working as the no-JS fallback, SSE is
 //! a pure enhancement.
 
 use tokio::sync::broadcast;

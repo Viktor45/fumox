@@ -2,10 +2,10 @@
 //!
 //! Two JSON dialects share the `outbounds` key and are both accepted:
 //!
-//! * **sing-box native** — outbounds carry `type`/`server`/`server_port`;
+//! * **sing-box native**, outbounds carry `type`/`server`/`server_port`;
 //!   the mapping is the exact inverse of the [`crate::formats::singbox`]
 //!   output encoder, so `parse ∘ encode_singbox` round-trips;
-//! * **Xray/v2ray-core ("vnext")** — outbounds carry
+//! * **Xray/v2ray-core ("vnext")**, outbounds carry
 //!   `protocol`/`settings.vnext`/`streamSettings`. The payload may also be
 //!   a bare array of such configs (the v2rayN share format), and the
 //!   per-config keys sing-box ignores (`dns`, `routing`, `remarks`, …) are
@@ -182,7 +182,7 @@ fn native_vmess(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, Stri
     let credential = required_str(map, "uuid")?;
     let mut params = Vec::new();
     // vmess JSON spells the cipher `security` internally (`scy`) and TLS as
-    // `tls: "tls"` — same convention as the vmess URI parser.
+    // `tls: "tls"`, same convention as the vmess URI parser.
     if let Some(scy) = str_field(map, "security") {
         push_param(&mut params, true, "scy", scy);
     }
@@ -974,7 +974,7 @@ mod tests {
 
     /// The strong output→input guarantee: the sing-box encoder output
     /// parses back to a proxy with the same identity, re-encodes to the
-    /// identical document (the mapped TLS/transport fields survive — a lost
+    /// identical document (the mapped TLS/transport fields survive, a lost
     /// field would change the document), and the parsed entry itself
     /// round-trips through its URI form unchanged. Parameters the output
     /// schema cannot represent (unknown transports, client-side knobs)

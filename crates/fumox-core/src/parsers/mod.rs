@@ -2,10 +2,10 @@
 //!
 //! Public surface:
 //!
-//! * [`parse_line`] — parse a single URI line (log-and-skip contract: it
+//! * [`parse_line`], parse a single URI line (log-and-skip contract: it
 //!   never panics, unrecognized lines are reported, not fatal);
-//! * [`serialize`] — turn a [`ProxyEntry`] back into its canonical line;
-//! * [`parse_subscription`] — decode + auto-detect a whole payload
+//! * [`serialize`], turn a [`ProxyEntry`] back into its canonical line;
+//! * [`parse_subscription`], decode + auto-detect a whole payload
 //!   (URI list / Clash YAML / sing-box JSON / base64-wrapped) and parse
 //!   every line.
 //!
@@ -29,7 +29,7 @@ pub enum LineOutcome {
     Parsed(ProxyEntry),
     /// Recognized format that is deliberately dropped (`happ://`).
     Discarded,
-    /// Unknown scheme or malformed line — counted and skipped.
+    /// Unknown scheme or malformed line, counted and skipped.
     Unrecognized,
 }
 
@@ -38,7 +38,7 @@ pub enum LineOutcome {
 pub fn parse_line(line: &str) -> LineOutcome {
     // Line-size cap: `raw_line` is
     // persisted verbatim onto every stored row, so an oversized line is a
-    // storage bomb — the caller's log-and-skip path drops it like any other
+    // storage bomb, the caller's log-and-skip path drops it like any other
     // malformed line.
     if line.len() > uri::MAX_LINE_BYTES {
         tracing::debug!(
@@ -87,7 +87,7 @@ fn parsed(result: Result<ProxyEntry, String>) -> LineOutcome {
 /// Reject a field value that would break the one-proxy-per-line contract.
 ///
 /// The URI serializers emit `host`, `credential` and parameter values
-/// verbatim — only `name` goes through [`uri::encode_fragment`] — so a line
+/// verbatim, only `name` goes through [`uri::encode_fragment`], so a line
 /// break inside any of them splits one stored proxy into several output
 /// lines. A crafted Clash YAML or legacy-`ss` feed could smuggle a proxy of
 /// an entirely different scheme past a source's protocol allowlist that way,
@@ -95,7 +95,7 @@ fn parsed(result: Result<ProxyEntry, String>) -> LineOutcome {
 ///
 /// URI-list input cannot reach this: `parse_uri_list` iterates over
 /// `str::lines`. The vectors are the formats whose fields are not
-/// line-delimited — Clash YAML scalars, vmess JSON `\n` escapes and the
+/// line-delimited, Clash YAML scalars, vmess JSON `\n` escapes and the
 /// base64 blob of a legacy `ss` line.
 pub(crate) fn reject_line_breaks(field: &str, value: &str) -> Result<(), String> {
     if value.contains(['\n', '\r']) {
@@ -170,7 +170,7 @@ fn sanitize_for_output(entry: &ProxyEntry) -> Option<ProxyEntry> {
     }
     tracing::warn!(
         host = %entry.host.replace(['\n', '\r'], "\\n"),
-        "proxy entry carries line breaks — sanitizing before output"
+        "proxy entry carries line breaks, sanitizing before output"
     );
     let strip = |value: &str| value.replace(['\n', '\r'], " ");
     let mut clean = entry.clone();
@@ -237,7 +237,7 @@ pub fn parse_subscription(
 /// Unwrap the transport encoding. `auto` base64-decodes only when the payload
 /// cannot already be a plain subscription (no `://` marker) and decodes to
 /// something that looks like one: a URI list, Clash YAML, or a JSON config
-/// (object or array — the v2rayN share format).
+/// (object or array, the v2rayN share format).
 fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<String> {
     match encoding {
         Encoding::Plain => Ok(payload.to_string()),
@@ -529,7 +529,7 @@ mod tests {
     fn fixture_authority_and_query_round_trip_byte_exact() {
         // Hard invariant for the URI schemes: everything before the fragment
         // (scheme, credential, host, port, path, query) must serialize back
-        // byte-for-byte. vmess/ss are excluded — they normalize their
+        // byte-for-byte. vmess/ss are excluded, they normalize their
         // transport encoding by design (see module docs).
         let mut checked = 0usize;
         let Some(lines) = fixture_lines() else {
@@ -599,7 +599,7 @@ mod tests {
         for line in &unrecognized[..unrecognized.len().min(5)] {
             eprintln!("  unrecognized: {line}");
         }
-        // Goal (TODO 1.2): at least 99% of lines recognized. The current
+        // Goal: at least 99% of lines recognized. The current
         // sample (Sept 2026) parses at 100% minus one ss2022 line whose
         // userinfo is plain text rather than base64 (SIP002 requires base64);
         // happ:// lines, when present, are deliberately discarded.
@@ -643,10 +643,10 @@ mod tests {
     fn fixture_byte_round_trip_rate() {
         // Observational guard. Full-line byte-exact round-trip holds for
         // percent-encoded lines; it intentionally does NOT hold when:
-        //   * the original fragment was raw UTF-8 (~half of real feeds) —
+        //   * the original fragment was raw UTF-8 (~half of real feeds) ,
         //     the serializer emits the canonical percent-encoded form, which
         //     decodes to the identical name;
-        //   * vmess/ss lines — their transport encoding (JSON field order,
+        //   * vmess/ss lines, their transport encoding (JSON field order,
         //     base64 padding) is normalized by design.
         // Authority/query fidelity is asserted strictly by
         // `fixture_authority_and_query_round_trip_byte_exact`; here we only
@@ -675,7 +675,7 @@ mod tests {
             "fixture byte round-trip: {exact}/{total} = {:.1}%",
             rate * 100.0
         );
-        // Floor for the current sample: 51/387 ≈ 13% — it is dominated by
+        // Floor for the current sample: 51/387 ≈ 13%, it is dominated by
         // raw-UTF-8 names and vmess/ss normalization (all semantically
         // verified). Keep a margin: 0.10 for this sample shape, 0.40 held
         // for the previous percent-encoded-heavy sample.
@@ -709,7 +709,7 @@ mod tests {
         // Different servers must never collapse into one fingerprint: the
         // sample is expected to yield a unique fingerprint per distinct
         // server (some earlier samples carried name-only duplicates that
-        // legitimately collapsed — "the collapse happens" is covered by the
+        // legitimately collapsed, "the collapse happens" is covered by the
         // fingerprint unit tests in fingerprint.rs, this guard pins the
         // no-false-merge side against the real-world data).
         assert!(

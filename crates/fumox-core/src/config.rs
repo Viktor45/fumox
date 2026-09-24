@@ -5,7 +5,7 @@
 //! `FUMOX_` prefix and `__` as the section separator
 //! (e.g. `FUMOX_ADMIN__TOKEN=secret`).
 //!
-//! Every key has a default so the service runs out of the box (PLAN, gap 13).
+//! Every key has a default so the service runs out of the box.
 //! Unknown keys are rejected to catch typos early.
 //!
 //! The TOML file itself is located by (strongest first): the `--config`
@@ -27,11 +27,11 @@ use crate::models::IpFamily;
 /// Default location of the TOML config file, resolved against the CWD.
 pub const DEFAULT_CONFIG_PATH: &str = "config/app.toml";
 
-/// Environment variable pointing at the TOML config file — the middle
+/// Environment variable pointing at the TOML config file, the middle
 /// layer between the `--config` flag (strongest) and the default location.
 pub const CONFIG_PATH_ENV: &str = "FUMOX_CONFIG";
 
-/// Key of [`CONFIG_PATH_ENV`] after the `FUMOX_` prefix is stripped — the
+/// Key of [`CONFIG_PATH_ENV`] after the `FUMOX_` prefix is stripped, the
 /// value provider must ignore it, or `deny_unknown_fields` rejects the
 /// pointer as an unknown top-level `config` key.
 const CONFIG_PATH_KEY: &str = "config";
@@ -63,14 +63,14 @@ pub struct AppConfig {
 }
 
 /// Where the TOML config file was looked for, as resolved by
-/// [`load`] — lets the binaries log the truth (the loader
+/// [`load`], lets the binaries log the truth (the loader
 /// itself cannot: the tracing subscriber is not installed until after the
 /// config, which carries the log level, is loaded).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedConfigPath {
     /// The file at this path was merged into the configuration.
     Loaded(PathBuf),
-    /// No file anywhere — the service runs on built-in defaults plus env
+    /// No file anywhere, the service runs on built-in defaults plus env
     /// overrides. The default location may legitimately be absent
     /// (out-of-the-box run), so this is not an error.
     Missing,
@@ -78,7 +78,7 @@ pub enum ResolvedConfigPath {
 
 /// Resolve the TOML file location by priority: the explicit `path` (the
 /// `--config` flag) → [`CONFIG_PATH_ENV`] → [`DEFAULT_CONFIG_PATH`] against
-/// the CWD. An explicitly requested file (flag or env) must exist — a typo
+/// the CWD. An explicitly requested file (flag or env) must exist, a typo
 /// must fail loudly, not silently fall back to defaults. An empty env
 /// value counts as unset.
 pub fn resolve_config_path(path: Option<&Path>) -> crate::Result<ResolvedConfigPath> {
@@ -94,7 +94,7 @@ pub fn resolve_config_path(path: Option<&Path>) -> crate::Result<ResolvedConfigP
             }
         }
         None => {
-            // No CLI flag — the env pointer, if set, wins over the default
+            // No CLI flag, the env pointer, if set, wins over the default
             // location. An empty value counts as unset.
             let from_env = std::env::var(CONFIG_PATH_ENV)
                 .ok()
@@ -134,7 +134,7 @@ impl AppConfig {
 
 /// Result of [`load`]: the merged configuration together with the file
 /// that was actually read. The path is what the admin panel uses as the
-/// round-trip target for the *Edit settings* page — see
+/// round-trip target for the *Edit settings* page, see
 /// [`crate::config_writer`].
 #[derive(Debug)]
 pub struct LoadedConfig {
@@ -160,7 +160,7 @@ pub fn load(path: Option<&Path>) -> crate::Result<LoadedConfig> {
 
     // Environment overrides: FUMOX_SECTION__KEY (double underscore splits
     // the section path). FUMOX_CONFIG itself is the file pointer handled
-    // above, not a config key — keep it out of the value layer.
+    // above, not a config key, keep it out of the value layer.
     figment = figment.merge(
         Env::prefixed("FUMOX_")
             .split("__")
@@ -176,7 +176,7 @@ pub fn load(path: Option<&Path>) -> crate::Result<LoadedConfig> {
 }
 
 /// Shorthand for callers that only need the merged config and do not
-/// care which file (if any) was loaded — tests and one-shot helpers.
+/// care which file (if any) was loaded, tests and one-shot helpers.
 pub fn load_config(path: Option<&Path>) -> crate::Result<AppConfig> {
     Ok(load(path)?.config)
 }
@@ -189,10 +189,10 @@ pub struct ServerConfig {
     #[serde(default = "defaults::server_bind")]
     pub bind: SocketAddr,
     /// Per-IP fixed-window limit for every public request (`/sub`, `/src`,
-    /// `/export/alive`) — a generous ceiling against scraping and floods.
+    /// `/export/alive`), a generous ceiling against scraping and floods.
     #[serde(default = "defaults::public_rate_limit")]
     pub rate_limit: RateLimit,
-    /// Per-IP limit fed by failed access-token checks (HTTP 403 on `/sub`) —
+    /// Per-IP limit fed by failed access-token checks (HTTP 403 on `/sub`) ,
     /// the brute-force signal for protected profiles.
     #[serde(default = "defaults::auth_fail_rate_limit")]
     pub auth_fail_rate_limit: RateLimit,
@@ -235,7 +235,7 @@ pub struct IngestConfig {
     /// Whether pipeline `drop` rules switch off the alive-linger link
     /// policy for their source. `true`: an alive proxy of
     /// a source with drop rules leaves on the next refresh after the rule
-    /// catches it. `false` (the default): the probe alone retires proxies —
+    /// catches it. `false` (the default): the probe alone retires proxies ,
     /// every source lingers, even ones with drop rules, so a rule added
     /// later only stops new matches, never stored ones.
     #[serde(default = "defaults::drop_gate")]
@@ -244,7 +244,7 @@ pub struct IngestConfig {
     /// refresh of a source containing it, the row resets to the pristine
     /// `unknown` state (fail_count and quarantine schedules cleared, same
     /// as the admin "reset status" action) and re-enters the probe cycle.
-    /// `false` (the default) keeps `removed` terminal — the only ways back
+    /// `false` (the default) keeps `removed` terminal, the only ways back
     /// are the admin "reset status" action or «purge removed» followed by
     /// a re-insert from a fetch.
     #[serde(default = "defaults::removed_as_unknown")]
@@ -288,7 +288,7 @@ impl Default for DatabaseConfig {
     }
 }
 
-/// Source fetcher behaviour (PLAN, gaps 4–5, 12).
+/// Source fetcher behaviour.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FetchConfig {
@@ -316,7 +316,7 @@ pub struct FetchConfig {
     pub user_agent: String,
     /// Default IP protocol family for fetching source URLs. A source
     /// without its own `ip_family` inherits this. `any` = dual-stack (first
-    /// IPv4 wins, IPv6 fallback); `ipv4` / `ipv6` are strict — no address of
+    /// IPv4 wins, IPv6 fallback); `ipv4` / `ipv6` are strict, no address of
     /// that family means the fetch fails.
     #[serde(default)]
     pub ip_family: IpFamily,
@@ -338,7 +338,7 @@ impl Default for FetchConfig {
 }
 
 /// Geo enrichment via MaxMind GeoLite2. Every database found in
-/// `db_dir` is opened and all of them contribute facts — a name template
+/// `db_dir` is opened and all of them contribute facts, a name template
 /// can mix `{country}`, `{city}` and `{asn}` placeholders freely.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -347,7 +347,7 @@ pub struct GeoConfig {
     #[serde(default = "defaults::geo_enabled")]
     pub enabled: bool,
     /// Legacy selector from the one-database era. No longer affects
-    /// resolution — every database in `db_dir` is merged — but the key is
+    /// resolution, every database in `db_dir` is merged, but the key is
     /// still accepted so existing configs keep parsing.
     #[serde(default)]
     pub db: GeoDbKind,
@@ -675,7 +675,7 @@ pub struct LogConfig {
 }
 
 /// `[meow].test_url`: a single URL, a comma-separated string, or a sequence
-/// of URLs. Blank entries are dropped, and the list must not end up empty —
+/// of URLs. Blank entries are dropped, and the list must not end up empty ,
 /// the T2 check has nothing to fetch otherwise.
 fn de_test_urls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
@@ -838,7 +838,7 @@ impl<'de> Deserialize<'de> for RateLimit {
     }
 }
 
-/// Built-in default values. Every config key has one (PLAN, gap 13).
+/// Built-in default values. Every config key has one.
 mod defaults {
     use super::*;
 
@@ -846,7 +846,7 @@ mod defaults {
         "0.0.0.0:8080".parse().expect("valid socket address")
     }
 
-    /// Alive-linger for everyone by default — the probe is the sole owner
+    /// Alive-linger for everyone by default, the probe is the sole owner
     /// of a live proxy's lifecycle.
     pub const fn drop_gate() -> bool {
         false
@@ -920,13 +920,13 @@ mod defaults {
     pub fn admin_locales_dir() -> String {
         "locales".to_string()
     }
-    /// Empty by default — fumox is exposed directly without a reverse proxy
+    /// Empty by default, fumox is exposed directly without a reverse proxy
     /// in most deployments, so honoring `X-Forwarded-For` would let any
     /// caller spoof the per-IP rate-limit key.
     pub fn trust_proxy_ips() -> Vec<String> {
         Vec::new()
     }
-    /// Empty by default — the Host header is accepted verbatim, matching the
+    /// Empty by default, the Host header is accepted verbatim, matching the
     /// historical behavior. Operators behind a reverse proxy that rewrites
     /// Host should enumerate the expected hosts here to lock the
     /// alive-export endpoint to the proxy's own hostname.
@@ -977,7 +977,7 @@ mod defaults {
         7
     }
     /// Target drain time used by the `/admin/probe` backlog banner when
-    /// computing recommended `[probe]` values. 60 minutes by default —
+    /// computing recommended `[probe]` values. 60 minutes by default ,
     /// 5..=1440 minutes (5 min..=24 h).
     pub const fn backlog_target_drain_minutes() -> u64 {
         60
@@ -1138,7 +1138,7 @@ mod tests {
         let cfg = load_config(Some(&flag_file)).expect("the flag must outrank the env pointer");
         assert_eq!(cfg.retention.probe_results_days, 5);
 
-        // A variable naming a missing file is an operator typo — loud.
+        // A variable naming a missing file is an operator typo, loud.
         // SAFETY: see above.
         let missing = dir.join("missing.toml");
         unsafe { std::env::set_var(CONFIG_PATH_ENV, &missing) };
@@ -1148,7 +1148,7 @@ mod tests {
             "the error names the variable: {err}"
         );
 
-        // Empty (or whitespace) value counts as unset — the default
+        // Empty (or whitespace) value counts as unset, the default
         // location applies again, exactly like without the variable.
         // SAFETY: see above.
         unsafe { std::env::set_var(CONFIG_PATH_ENV, "   ") };
@@ -1195,10 +1195,10 @@ mod tests {
             serde_json::from_str(r#"{"test_url": "http://www.gstatic.com/generate_204"}"#).unwrap();
         assert_eq!(single.test_url, ["http://www.gstatic.com/generate_204"]);
 
-        // A plain string may carry several URLs comma-separated — this is how
+        // A plain string may carry several URLs comma-separated, this is how
         // the FUMOX_MEOW__TEST_URL env override can configure rotation.
         let csv: MeowConfig =
-            serde_json::from_str(r#"{"test_url": "http://a/204, http://b/204 , ,http://c/204"}"#)
+            serde_json::from_str(r#"{"test_url": "http://a/204, http://b/204 ,http://c/204"}"#)
                 .unwrap();
         assert_eq!(
             csv.test_url,
@@ -1288,7 +1288,7 @@ probe_results_days = 7
     /// The shipped `config/app.toml` is the full reference of every available
     /// key at its default value (owner request 2026-08-30). Guard it against
     /// rot: whenever a config struct gains a field, the file must gain the
-    /// key too, or this test fails. Values are intentionally not compared —
+    /// key too, or this test fails. Values are intentionally not compared ,
     /// the file doubles as a working deployment config and may override them.
     #[test]
     fn shipped_app_toml_covers_every_key() {
@@ -1357,7 +1357,7 @@ probe_results_days = 7
     }
 
     /// `FUMOX_ADMIN__TOKEN` must outrank the value written to
-    /// `config/app.toml` — env overrides are how operators rotate the
+    /// `config/app.toml`, env overrides are how operators rotate the
     /// admin token without editing the file (regression for the
     /// figment-merge case that silently left the file value in place).
     #[test]
@@ -1386,12 +1386,12 @@ probe_results_days = 7
         }
     }
 
-    /// Env must override the file for every type the loader handles —
+    /// Env must override the file for every type the loader handles ,
     /// not just `String`. `Env::split` in figment 0.10 does a string
     /// replace, so the merge path is the same for every leaf, but
     /// guarding each type catches regressions in a single place.
     /// `Vec<String>` overrides need a JSON array (figment's default
-    /// sequence deserializer), not a comma-separated string — that
+    /// sequence deserializer), not a comma-separated string, that
     /// comma-split support lives in `de_test_urls` and is opt-in.
     #[test]
     fn env_overrides_file_for_every_type() {

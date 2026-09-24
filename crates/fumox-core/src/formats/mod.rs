@@ -11,13 +11,13 @@ pub mod singbox;
 use std::collections::{HashMap, HashSet};
 
 /// Resolve duplicate names by suffixing later occurrences with « (2)»,
-/// « (3)» and so on (PLAN gap 14). The first occurrence keeps its name
+/// « (3)» and so on. The first occurrence keeps its name
 /// unchanged; suffixes themselves are checked against the taken set, so a
 /// literal «name (2)» in the input cannot shadow a generated one.
 ///
 /// The per-name counter is remembered across occurrences and never rewinds:
 /// restarting the probe at 1 for every entry made this O(k²) in the number of
-/// proxies sharing a name, and names come straight from an untrusted feed —
+/// proxies sharing a name, and names come straight from an untrusted feed ,
 /// 20 000 identical names cost 36 s of CPU inside a `/sub` render (security
 /// audit, 2026-09-05).
 pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -45,7 +45,7 @@ pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String>
 /// Whether the entry carries a truthy insecure toggle under any of its
 /// spelling aliases. Output formats only ever *reflect* an entry's own
 /// request: the entry's original spelling is kept verbatim.
-/// The underscore `allow_insecure` form is deliberately not here — it
+/// The underscore `allow_insecure` form is deliberately not here, it
 /// never arrives from parsed feeds that these writers target.
 pub(crate) fn is_insecure(params: &[crate::models::Param]) -> bool {
     const ALIASES: [&str; 3] = ["insecure", "allowinsecure", "skip-cert-verify"];
@@ -66,7 +66,7 @@ pub(crate) fn param_value(entry: &crate::models::ProxyEntry, key: &str) -> Optio
 }
 
 /// Whether the parameter is present with a truthy value (`1`/`true`/`yes`/
-/// `on`, case-insensitive) — how Clash YAML booleans land in params.
+/// `on`, case-insensitive), how Clash YAML booleans land in params.
 pub(crate) fn param_truthy(entry: &crate::models::ProxyEntry, key: &str) -> bool {
     entry.param_ignore_case(key).is_some_and(|v| {
         matches!(
@@ -143,7 +143,7 @@ fn capitalize(key: &str) -> String {
 }
 
 /// Resolved transport network: the scheme's native URI key first (`type` for
-/// vless/trojan, `net` for vmess — passed by the caller), then the mihomo
+/// vless/trojan, `net` for vmess, passed by the caller), then the mihomo
 /// spelling `network` used by Clash input. Lower-cased.
 pub(crate) fn network_of(entry: &crate::models::ProxyEntry, uri_key: &str) -> Option<String> {
     param_value(entry, uri_key)

@@ -30,13 +30,13 @@
      panes with Tab + Space without any JavaScript. The labels act as the
      tab strip; `aria-selected` mirrors the checked state for assistive
      tech. #}
-  <nav class="tabs" role="tablist">
-    <label for="tab-server" role="tab" aria-controls="pane-server" aria-selected="true">{{ self.t("set.tab_server") }}</label>
-    <label for="tab-probe" role="tab" aria-controls="pane-probe" aria-selected="false">{{ self.t("set.tab_probe") }}</label>
-    <label for="tab-shared" role="tab" aria-controls="pane-shared" aria-selected="false">{{ self.t("set.tab_shared") }}</label>
-  </nav>
+  <div class="tabs" role="tablist">
+    <label for="tab-server" id="tab-server-label" role="tab" aria-controls="pane-server" aria-selected="true">{{ self.t("set.tab_server") }}</label>
+    <label for="tab-probe" id="tab-probe-label" role="tab" aria-controls="pane-probe" aria-selected="false">{{ self.t("set.tab_probe") }}</label>
+    <label for="tab-shared" id="tab-shared-label" role="tab" aria-controls="pane-shared" aria-selected="false">{{ self.t("set.tab_shared") }}</label>
+  </div>
 
-  <section id="pane-server" role="tabpanel" aria-labelledby="tab-server" class="tab-pane">
+  <section id="pane-server" role="tabpanel" aria-labelledby="tab-server-label" class="tab-pane">
     <div class="panel">
       <h2>{{ self.t("set.ingest") }} <span class="badge neutral">server</span></h2>
       <div class="field">
@@ -235,7 +235,7 @@
     </div>
   </section>
 
-  <section id="pane-probe" role="tabpanel" aria-labelledby="tab-probe" class="tab-pane">
+  <section id="pane-probe" role="tabpanel" aria-labelledby="tab-probe-label" class="tab-pane">
     <div class="panel">
       <h2>{{ self.t("set.state_machine") }} <span class="badge neutral">probe</span></h2>
       <div class="field">
@@ -288,6 +288,12 @@
       <div class="field">
         <label for="probe-conc">{{ self.t("set.concurrency") }}</label>
         <input type="number" id="probe-conc" name="probe.concurrency" min="1" max="1024" value="{{ self.raw_value("probe.concurrency") }}">
+      </div>
+      <div class="field">
+        <label for="probe-target-drain">{{ self.t("probe.backlog_target_drain") }}</label>
+        <input type="number" id="probe-target-drain" name="probe.backlog_target_drain_minutes" min="5" max="1440" value="{{ self.raw_value("probe.backlog_target_drain_minutes") }}">
+        <div class="hint">{{ self.t("probe.backlog_target_drain_hint") }}</div>
+        {% match self.error_for("probe.backlog_target_drain_minutes") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <span class="check-row">
@@ -345,7 +351,7 @@
     </div>
   </section>
 
-  <section id="pane-shared" role="tabpanel" aria-labelledby="tab-shared" class="tab-pane">
+  <section id="pane-shared" role="tabpanel" aria-labelledby="tab-shared-label" class="tab-pane">
     <div class="panel">
       <h2>{{ self.t("set.fetch") }} <span class="badge neutral">server</span></h2>
       <div class="field">

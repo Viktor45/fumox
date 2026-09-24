@@ -4,7 +4,7 @@
 //! the rest with its defaults. An empty profile yields a valid
 //! `{"outbounds": []}` document.
 //! Outbound tags must be unique, so duplicate names get the same « (2)»
-//! suffixes as Clash output (PLAN gap 14).
+//! suffixes as Clash output.
 
 use crate::models::{ProxyEntry, Scheme};
 use serde_json::{Map, Value};

@@ -3,7 +3,7 @@
 //! Ingestion resolves geo facts for every proxy it upserts, but rows that
 //! entered the database before a geo database was available (or while the
 //! server ran with `[geo].enabled = false`) have all three columns NULL.
-//! On every start — after the resolver has been built — this module walks
+//! On every start, after the resolver has been built, this module walks
 //! those rows once, oldest id first, resolves each host and stores the
 //! facts. Rows the resolver cannot answer (DNS dead, no data in the
 //! database) are left NULL; the next server start tries again.
@@ -20,7 +20,7 @@ const BATCH: i64 = 500;
 /// call sites spawn it as a background task.
 pub async fn backfill_missing_geo(pool: DbPool, geo: Arc<GeoResolver>) {
     if !geo.is_active() {
-        tracing::debug!("geo resolver inactive — skipping geo backfill");
+        tracing::debug!("geo resolver inactive, skipping geo backfill");
         return;
     }
     let mut cursor = 0i64;
@@ -44,7 +44,7 @@ pub async fn backfill_missing_geo(pool: DbPool, geo: Arc<GeoResolver>) {
                 .await
                 .map(|info| GeoStamp::from_info(&info))
             else {
-                continue; // unresolvable — stays NULL, retried next start
+                continue; // unresolvable, stays NULL, retried next start
             };
             if stamp.is_empty() {
                 continue;
@@ -92,7 +92,7 @@ mod tests {
         pool
     }
 
-    /// GeoLite2-City from the workspace `config/` directory (gitignored —
+    /// GeoLite2-City from the workspace `config/` directory (gitignored ,
     /// the test skips itself when the file is absent, like the geo tests).
     fn geo_resolver() -> Option<Arc<GeoResolver>> {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

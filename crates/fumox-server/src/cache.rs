@@ -1,12 +1,12 @@
 //! In-memory cache layers.
 //!
-//! Two layers, both acceleration only — SQLite stays the source of truth:
+//! Two layers, both acceleration only, SQLite stays the source of truth:
 //!
-//! 1. **Raw cache** — the last successfully fetched payload per source.
+//! 1. **Raw cache**, the last successfully fetched payload per source.
 //!    Freshness is `fetched_at + source.cache_ttl_seconds`; a fresh entry
 //!    lets an on-demand revalidation skip the HTTP fetch entirely (the DB
 //!    is already reconciled from that payload).
-//! 2. **Processed cache** — the rendered subscription output per endpoint
+//! 2. **Processed cache**, the rendered subscription output per endpoint
 //!    key (`sub:{profile_id}` / `src:{source_id}`). Entries carry their
 //!    own `fresh_until`; a stale entry is still served
 //!    (stale-while-revalidate) while a background re-render is scheduled.
@@ -67,7 +67,7 @@ impl Rendered {
 pub struct Caches {
     raw: Cache<String, Arc<RawSnapshot>>,
     processed: Cache<String, Arc<Rendered>>,
-    /// Processed keys currently being revalidated in the background — keeps
+    /// Processed keys currently being revalidated in the background, keeps
     /// concurrent stale requests from spawning duplicate re-renders.
     revalidating: Arc<Mutex<HashSet<String>>>,
 }
@@ -144,7 +144,7 @@ impl Caches {
 
     /// Source data refreshed (a successful ingest reconciled at least one
     /// row): drop every rendered output that contains the source so clients
-    /// see the new proxies immediately. The raw snapshot is kept — the ingest
+    /// see the new proxies immediately. The raw snapshot is kept, the ingest
     /// that triggers this just wrote it.
     pub async fn invalidate_processed_for_source(&self, source_id: &str) {
         let affected: Vec<String> = self

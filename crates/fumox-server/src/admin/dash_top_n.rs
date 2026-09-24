@@ -6,7 +6,7 @@
 //! page with a fresh `Set-Cookie`. Mirrors the `fumox_theme` pattern from
 //! `theme.rs`.
 //!
-//! The only recognised values are `[5, 10, 15, 25, 50]` — anything else
+//! The only recognised values are `[5, 10, 15, 25, 50]`, anything else
 //! (including `0`, negative numbers, non-numeric) collapses to the default
 //! `10`. The dashboard widgets respect this limit when paging
 //! `recent_errors`, `top_alive`, `top_failures`, and the country split.
@@ -24,7 +24,7 @@ pub const TOP_N_COOKIE: &str = "fumox_dash_top_n";
 const TOP_N_MAX_AGE_SECS: u64 = 365 * 24 * 3600;
 
 /// Allowed values for the picker. Order does not have to match the menu
-/// order — the picker template iterates `ALLOWED` in declaration order.
+/// order, the picker template iterates `ALLOWED` in declaration order.
 pub const ALLOWED: &[i64] = &[5, 10, 15, 25, 50];
 
 /// Default Top-N when the cookie is missing, garbled, or carries an
@@ -87,7 +87,7 @@ pub fn top_n_cookie(value: DashTopN) -> String {
 }
 
 /// Top-N picker setter: persists the choice in the cookie and redirects back
-/// to `next` (validated by `super::admin_next` — admin-surface paths only,
+/// to `next` (validated by `super::admin_next`, admin-surface paths only,
 /// no open redirect, no control characters). Mounted outside the auth/CSRF
 /// layers so the picker also works on a freshly installed system before the
 /// operator has logged in.

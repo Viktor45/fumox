@@ -4,7 +4,7 @@
 //! Error classification follows the single `error_class` vocabulary:
 //! `network` / `http_server` are recoverable and retried;
 //! `http_client` is not. An SSRF-blocked URL is reported as `http_client`
-//! with status 403 — the source configuration is at fault and retrying
+//! with status 403, the source configuration is at fault and retrying
 //! cannot help.
 
 use fumox_core::config::FetchConfig;
@@ -30,7 +30,7 @@ pub struct FetchedPayload {
     pub body: Vec<u8>,
 }
 
-/// Classified fetch failure — maps 1:1 onto the `error_class` vocabulary.
+/// Classified fetch failure, maps 1:1 onto the `error_class` vocabulary.
 #[derive(Debug, thiserror::Error)]
 pub enum FetchFailure {
     #[error("network error: {message}")]
@@ -110,7 +110,7 @@ impl Fetcher {
     ///
     /// reqwest exposes DNS override only on `ClientBuilder`, so the client
     /// is constructed per request with the vetted address pinned via
-    /// `resolve()` — this is what closes the DNS-rebinding window between
+    /// `resolve()`, this is what closes the DNS-rebinding window between
     /// the SSRF check and the connect. Construction cost is negligible
     /// against network latency at the scheduler's fetch rate.
     ///
@@ -118,9 +118,9 @@ impl Fetcher {
     /// layer would consume the 3xx internally and hand back only the final
     /// response, which silently skips the per-hop SSRF vetting in
     /// [`Self::fetch_once`]. `resolve()` does
-    /// not contain an automatic follow — it is a per-hostname DNS override,
+    /// not contain an automatic follow, it is a per-hostname DNS override,
     /// ignored outright for IP literals and overridden by a port in the
-    /// redirect target — so the loop must see every hop itself.
+    /// redirect target, so the loop must see every hop itself.
     fn build_client(
         &self,
         host: &str,
@@ -191,7 +191,7 @@ impl Fetcher {
         family: IpFamily,
     ) -> Result<FetchedPayload, FetchFailure> {
         // Redirects are followed manually (up to MAX_REDIRECTS hops) because
-        // every hop must pass the full SSRF vetting again — an automatic
+        // every hop must pass the full SSRF vetting again, an automatic
         // redirect policy would let a public URL bounce the client into a
         // private or metadata address. `build_client` therefore pins
         // `Policy::none()`; see the note there.
@@ -224,7 +224,7 @@ impl Fetcher {
                 message: "URL has no host".to_string(),
             })?;
             let pinned = self.resolve_and_vet(host, family).await.map_err(|e| {
-                // The URL may carry userinfo credentials — never log it raw.
+                // The URL may carry userinfo credentials, never log it raw.
                 tracing::warn!(url = %redact_url(&current), reason = %e, "SSRF protection blocked the fetch");
                 FetchFailure::HttpClient { status: 403 }
             })?;
@@ -248,7 +248,7 @@ impl Fetcher {
             } else if !headers.is_empty() {
                 tracing::warn!(
                     url = %redact_url(&current),
-                    "redirect left the configured origin — source headers withheld"
+                    "redirect left the configured origin, source headers withheld"
                 );
             }
 
@@ -296,7 +296,7 @@ impl Fetcher {
                 body,
             });
         }
-        // Redirect chain longer than MAX_REDIRECTS — a persistent server
+        // Redirect chain longer than MAX_REDIRECTS, a persistent server
         // misconfiguration, reported as 508 Loop Detected.
         Err(FetchFailure::HttpClient { status: 508 })
     }
@@ -310,7 +310,7 @@ impl Fetcher {
 }
 
 /// Strip userinfo (`user:pass@`) from a URL string. Applied on every path
-/// where a URL — or an error text embedding one — reaches the tracing log,
+/// where a URL, or an error text embedding one, reaches the tracing log,
 /// `fetch_log` or `sources.last_error`.
 fn redact_url(url: &str) -> String {
     match Url::parse(url) {
@@ -319,14 +319,14 @@ fn redact_url(url: &str) -> String {
             let _ = parsed.set_password(None);
             parsed.to_string()
         }
-        // Not a URL (the error text embedded something else) — nothing to leak.
+        // Not a URL (the error text embedded something else), nothing to leak.
         Err(_) => url.to_string(),
     }
 }
 
 /// Scheme + host + effective port, the scope source headers are confined to.
 /// A redirect that changes any of the three is a different origin, even when
-/// only the port moved — the pinned DNS override does not constrain the port.
+/// only the port moved, the pinned DNS override does not constrain the port.
 fn origin_of(url: &Url) -> (String, String, u16) {
     let port = url
         .port_or_known_default()
@@ -425,7 +425,7 @@ pub async fn vet_host(
 /// A static URL-validation problem: a catalog key plus positional `{0}`,
 /// `{1}`… arguments. The admin layer renders it with `Lang::t_args` in the
 /// panel language; embedded diagnostics (URL-parser and SSRF-rejection
-/// details) stay technical English — only the sentence around them is
+/// details) stay technical English, only the sentence around them is
 /// localized.
 #[derive(Debug, Clone)]
 pub struct UrlIssue {
@@ -805,7 +805,7 @@ mod tests {
             .await
             .unwrap_err();
         // The very first hop is already private here, so vetting rejects it
-        // before any redirect — assert the class, then prove the hop itself
+        // before any redirect, assert the class, then prove the hop itself
         // is seen by a lenient fetcher below.
         assert_eq!(err.error_class(), ErrorClass::HttpClient);
         assert!(!err.is_recoverable());

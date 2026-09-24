@@ -1,5 +1,5 @@
 //! Proxy browser: server-side filtered and paginated
-//! list (thousands of rows — never "show all"), detail card with lifecycle
+//! list (thousands of rows, never "show all"), detail card with lifecycle
 //! timeline, probe history and source links, and the manual "reset status"
 //! action.
 
@@ -18,13 +18,13 @@ use axum::response::Response;
 use fumox_core::models::{Scheme, now_ts};
 use fumox_core::repo::{probe as probe_repo, proxies};
 
-/// Recognized sort orders of the list screen (whitelist — the value is
+/// Recognized sort orders of the list screen (whitelist, the value is
 /// interpolated into SQL, so anything else falls back to the default).
 const SORT_UPDATED: &str = "p.updated_at DESC, p.id DESC";
 const SORT_LATENCY: &str = "p.latency_ms IS NULL ASC, p.latency_ms ASC, p.id DESC";
 const SORT_NAME: &str = "p.name COLLATE NOCASE ASC, p.id DESC";
 
-/// Recognized check-coverage filter buckets (whitelist — the value decides
+/// Recognized check-coverage filter buckets (whitelist, the value decides
 /// which fixed SQL fragment is appended). T1 is `probe_kind IN ('tcp','tls')`,
 /// T2 is `probe_kind = 't2'`; the same buckets power the probe screen panel.
 const COVERAGE_SQL: &[(&str, &str)] = &[
@@ -173,7 +173,7 @@ impl ProxiesListTemplate {
             (true, true) => "T1+T2".to_string(),
             (true, false) => "T1".to_string(),
             (false, true) => "T2".to_string(),
-            (false, false) => "—".to_string(),
+            (false, false) => ",".to_string(),
         }
     }
 }
@@ -192,7 +192,7 @@ pub async fn proxies_list(
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
     // `status` may repeat (multi-select); the rest are single-valued. This
-    // needs QueryPairs — a HashMap would keep only the last value.
+    // needs QueryPairs, a HashMap would keep only the last value.
     let f_statuses: Vec<String> = params
         .all("status")
         .filter(|v| ["unknown", "alive", "ready", "quarantine", "removed"].contains(&v.as_str()))
@@ -206,7 +206,7 @@ pub async fn proxies_list(
         .get("sort")
         .cloned()
         .unwrap_or_else(|| "updated".into());
-    // Coverage bucket: whitelist — a garbage value means "no filter", the
+    // Coverage bucket: whitelist, a garbage value means "no filter", the
     // same tolerance the scheme/country selects show.
     let f_coverage = params
         .get("coverage")
@@ -444,11 +444,11 @@ pub async fn proxy_detail(
     };
 
     // Opening the card refreshes the geo facts from every available
-    // GeoLite2 database (City/ASN included) — no button to click.
+    // GeoLite2 database (City/ASN included), no button to click.
     refresh_geo(&state, &mut proxy).await;
 
     // Every value is server-generated (statuses, counters, timestamps,
-    // numbers) — the template renders them with askama's `| safe` so the
+    // numbers), the template renders them with askama's `| safe` so the
     // timestamp entries can carry their `<time>` elements.
     let lifecycle: Vec<(String, String)> = vec![
         (lang.t("common.status").into(), proxy.status.clone()),
@@ -490,14 +490,14 @@ pub async fn proxy_detail(
             proxy
                 .latency_ms
                 .map(|ms| format!("{ms} {}", lang.t("common.ms")))
-                .unwrap_or_else(|| "—".into()),
+                .unwrap_or_else(|| ",".into()),
         ),
         (
             lang.t("px.speed").into(),
             proxy
                 .speed_mbps
                 .map(|mbps| format!("{mbps:.1} {}", lang.t("px.speed_unit")))
-                .unwrap_or_else(|| "—".into()),
+                .unwrap_or_else(|| ",".into()),
         ),
     ];
 
@@ -640,7 +640,7 @@ pub async fn proxies_purge_removed(
 // ---------------------------------------------------------------------------
 // Bulk cleanup
 //
-// Every action below transitions rows into the terminal `removed` status —
+// Every action below transitions rows into the terminal `removed` status ,
 // they never delete. The physical cleanup stays the single «purge removed»
 // button, so each action is reversible via the per-proxy «reset status»
 // until purged.
@@ -797,7 +797,7 @@ pub async fn proxies_remove_alive_by_country(
 // ---------------------------------------------------------------------------
 // Bulk revival
 //
-// Every action below moves rows *back* to `unknown` — the inverse of the
+// Every action below moves rows *back* to `unknown`, the inverse of the
 // cleanup panel. Revived ids are enqueued into `probe_requests` so the probe
 // daemon picks them up on its next cycle (the same handoff the ingest path
 // uses for `[ingest].removed_as_unknown`).
@@ -806,7 +806,7 @@ pub async fn proxies_remove_alive_by_country(
 /// Enqueue revived ids for priority probing. Failures are logged and
 /// never fail the revival: the proxy sits in the random sample until
 /// `select_t1_candidates` happens to draw it. The reverse is not true
-/// — `enqueue_checks` silently drops ids whose status drifted away
+///, `enqueue_checks` silently drops ids whose status drifted away
 /// from `unknown`, so a successful enqueue is a stronger guarantee
 /// than a missed one.
 async fn enqueue_revived(state: &AdminState, ids: &[i64]) {
@@ -987,11 +987,11 @@ pub async fn proxy_reset(
     )
 }
 
-/// Refresh the geo facts of one proxy (Country, City, ASN — every GeoLite2
+/// Refresh the geo facts of one proxy (Country, City, ASN, every GeoLite2
 /// database in `[geo].db_dir` contributes, the same merge the pipeline
 /// resolver uses). Called while rendering the card, so opening the page is
 /// enough and no button is needed. A host that does not resolve keeps its
-/// stored facts — an empty stamp must never wipe them; the resolver's
+/// stored facts, an empty stamp must never wipe them; the resolver's
 /// DNS+lookup cache makes repeat opens cheap.
 async fn refresh_geo(state: &AdminState, proxy: &mut proxies::ProxyRow) {
     if !state.geo_full.is_active() {

@@ -5,19 +5,19 @@
 //! still linked to a source as a plain url_list, so the link can be pasted
 //! straight into a client or used as an upstream source by another fumox.
 //! `GET /export/ready/{token}` is the verified twin: it ships only the
-//! `ready` tier — proxies whose latest T2 tunnel check succeeded. The tiers
+//! `ready` tier, proxies whose latest T2 tunnel check succeeded. The tiers
 //! are disjoint: alive = T1-alive without a fresh successful T2; ready =
 //! the same proxy plus a confirmed tunnel.
 //!
 //! Both links share one capability token, a `nanoid(12)` generated on first
-//! startup and kept in the `meta` table — the links are stable across
-//! restarts — and the admin Import/Export screen displays them and can
+//! startup and kept in the `meta` table, the links are stable across
+//! restarts, and the admin Import/Export screen displays them and can
 //! rotate the token (both links die immediately: one secret, one rotation,
 //! a shared fate by design).
 //!
 //! These are dedicated endpoints rather than synthetic source rows: a real
 //! source would be picked up by the fetch scheduler, editable in the admin
-//! CRUD, selectable into profiles and included in the config export — each
+//! CRUD, selectable into profiles and included in the config export, each
 //! of which would need special-casing. The token in `meta` has none of
 //! those interactions.
 
@@ -62,7 +62,7 @@ pub(crate) fn export_date() -> String {
         .unwrap_or_else(|_| "export".to_string())
 }
 
-/// `GET /export/alive/{token}` — the url_list of all alive proxies, or 404
+/// `GET /export/alive/{token}`, the url_list of all alive proxies, or 404
 /// for an unknown token (the endpoint does not disclose whether the link
 /// ever existed). `?download=1` attaches the body as a file.
 pub async fn serve(
@@ -74,7 +74,7 @@ pub async fn serve(
     serve_tier(state, headers, token, params, "alive").await
 }
 
-/// `GET /export/ready/{token}` — the url_list of all ready (T2-verified)
+/// `GET /export/ready/{token}`, the url_list of all ready (T2-verified)
 /// proxies, the tunnel-verified twin of [`serve`].
 pub async fn serve_ready(
     State(state): State<AppState>,
@@ -87,7 +87,7 @@ pub async fn serve_ready(
 
 /// Shared body of both export links. `tier` is a fixed route literal
 /// ("alive" | "ready") that selects the backing query and the response
-/// labels — it never carries user input.
+/// labels, it never carries user input.
 async fn serve_tier(
     state: AppState,
     headers: HeaderMap,
@@ -272,8 +272,8 @@ mod tests {
     }
 
     /// Two distinct failure modes (bad host vs bad token) must yield
-    /// byte-identical responses — same status, same body, same
-    /// Content-Type — so an attacker cannot probe the link to learn
+    /// byte-identical responses, same status, same body, same
+    /// Content-Type, so an attacker cannot probe the link to learn
     /// whether the host check or the token check rejected the request.
     #[tokio::test]
     async fn bad_host_and_bad_token_return_byte_equal_bodies_and_content_type() {
@@ -329,7 +329,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// The host gate must run before the `?format=` branch — a malformed
+    /// The host gate must run before the `?format=` branch, a malformed
     /// format on a rejected host must not widen the response to 400 or
     /// 500 (both would tell the attacker the host was checked at all).
     #[tokio::test]

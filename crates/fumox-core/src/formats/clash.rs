@@ -10,7 +10,7 @@
 //! `ws-opts`/`grpc-opts`/`h2-opts`/`http-opts` blocks mihomo actually reads.
 //! URI parameters travel under their native keys (`type` for the network of
 //! vless/trojan, `net` for vmess), while Clash-input entries already carry
-//! the mihomo keys (`network`, `ws-path`, structured YAML opts) — both
+//! the mihomo keys (`network`, `ws-path`, structured YAML opts), both
 //! spellings are accepted everywhere.
 //!
 //! This is also the mapping used by the probe's T2 generator, which only
@@ -167,7 +167,7 @@ fn security_is(entry: &ProxyEntry, want: &str) -> bool {
 
 /// `reality-opts: {public-key, short-id}` from URI `pbk`/`sid` params or a
 /// Clash-input `reality-opts` block. Emitted only when at least one key is
-/// present — an empty block would make mihomo reject the proxy.
+/// present, an empty block would make mihomo reject the proxy.
 fn put_reality_opts(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
     let pbk = super::reality_public_key(entry);
     let sid = super::reality_short_id(entry);
@@ -489,7 +489,7 @@ fn yaml_list(map: &Option<Mapping>, key: &str) -> Option<Vec<String>> {
 }
 
 /// Encode the final candidate list as a Clash YAML document. Duplicate
-/// names are suffixed « (2)», « (3)»… (PLAN gap 14).
+/// names are suffixed « (2)», « (3)»…
 pub fn encode_clash(entries: &[ProxyEntry]) -> String {
     let supported: Vec<&ProxyEntry> = entries.iter().filter(|e| is_supported(e.scheme)).collect();
     let names = super::dedupe_names(supported.iter().map(|e| e.name.as_str()));
@@ -610,7 +610,7 @@ mod tests {
             ws.get(Value::from("path")).and_then(Value::as_str),
             Some("/ws")
         );
-        // No insecure toggle on the entry — no skip-cert-verify.
+        // No insecure toggle on the entry, no skip-cert-verify.
         assert!(field(&v, "skip-cert-verify").is_none());
     }
 

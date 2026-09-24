@@ -3,12 +3,12 @@
 //! The admin panel's *Edit settings* page must write back individual
 //! fields without destroying the comments the operator put in the file
 //! (every section of `config/app.toml` carries RU/EN pair comments).
-//! `toml_edit` is built for exactly that — its `DocumentMut` keeps the
+//! `toml_edit` is built for exactly that, its `DocumentMut` keeps the
 //! decoration around every key.
 //!
 //! Atomic save: write to a sibling `<name>.tmp.<pid>`, then rename.
 //! If `rename` fails (some network filesystems do not support it), fall
-//! back to a direct write and surface the failure in the log — losing
+//! back to a direct write and surface the failure in the log, losing
 //! atomicity is better than losing the change.
 
 use std::path::{Path, PathBuf};
@@ -133,7 +133,7 @@ impl EditableConfig {
     /// can write a brand-new key without first inserting scaffolding.
     ///
     /// `dotted` must be a non-empty string of non-empty segments
-    /// separated by exactly one `.` — no leading / trailing dot, no
+    /// separated by exactly one `.`, no leading / trailing dot, no
     /// `..`. Empty or doubled segments are rejected with
     /// [`ConfigWriteError::InvalidKey`].
     pub fn set(&mut self, dotted: &str, value: Item) -> Result<(), ConfigWriteError> {
@@ -192,7 +192,7 @@ impl EditableConfig {
 
         if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
             // Atomic rename is not universally supported. If it fails,
-            // do a plain write and remove the tmp — losing atomicity is
+            // do a plain write and remove the tmp, losing atomicity is
             // preferable to losing the change. The user gets a warning
             // in the logs and may decide to back the file up first.
             tracing::warn!(
@@ -202,8 +202,8 @@ impl EditableConfig {
             );
             std::fs::write(&self.path, serialized.as_bytes())?;
             if let Err(rm_err) = std::fs::remove_file(&tmp_path) {
-                // The tmp file leaked. Not fatal — the real config has
-                // been written — but the operator should know so they can
+                // The tmp file leaked. Not fatal, the real config has
+                // been written, but the operator should know so they can
                 // clean up by hand.
                 tracing::warn!(
                     error = %rm_err,
@@ -246,14 +246,14 @@ fn enter_or_create_table<'a>(
 ///
 /// The fast path checks the inode's `readonly` flag; the slow path
 /// actually attempts an open-for-write (or a probe file in the parent
-/// when the target is missing) so a read-only filesystem mount — the
+/// when the target is missing) so a read-only filesystem mount, the
 /// docker `:ro` case, where metadata still looks writable but the
-/// kernel rejects every write with `EROFS` — is detected too.
+/// kernel rejects every write with `EROFS`, is detected too.
 ///
 /// **Advisory only.** The check does not consult POSIX mode bits or
 /// ACLs and is meaningless for `root`, which writes regardless. Use
 /// it to decide whether to render the editor with enabled or disabled
-/// controls, not as an access-control gate — `save()` re-checks errors
+/// controls, not as an access-control gate, `save()` re-checks errors
 /// at write time.
 pub fn is_writable(path: &Path) -> bool {
     match std::fs::metadata(path) {
@@ -261,14 +261,14 @@ pub fn is_writable(path: &Path) -> bool {
             if md.permissions().readonly() {
                 return false;
             }
-            // Open for write — Linux returns `EROFS` on a read-only mount
+            // Open for write, Linux returns `EROFS` on a read-only mount
             // (e.g. docker `:ro`) without performing any I/O. macOS returns
             // `EROFS` for the same case at the VFS layer. Treat any open
             // failure as "not writable from this process".
             std::fs::OpenOptions::new().write(true).open(path).is_ok()
         }
         Err(_) => {
-            // File missing — the target's parent must accept new files.
+            // File missing, the target's parent must accept new files.
             let Some(parent) = path.parent() else {
                 return false;
             };
@@ -360,7 +360,7 @@ mod tests {
     fn load_preserves_comments_in_reference_config() {
         // `config/app.toml` ships with RU/EN banner comments. Loading it
         // through `DocumentMut` must keep at least the top-of-file
-        // banner — that is the whole point of round-tripping through
+        // banner, that is the whole point of round-tripping through
         // `toml_edit`.
         let doc = DocumentMut::from_str(super::REFERENCE_CONFIG).expect("reference must parse");
         let rendered = doc.to_string();
@@ -542,7 +542,7 @@ mod tests {
     /// Regression: a docker `:ro` mount on a directory that has no file in
     /// it yet (the *Create from defaults* path) must surface as not
     /// writable so the button can be disabled. Modeled with a parent
-    /// directory whose mode strips write — on Linux this is the same
+    /// directory whose mode strips write, on Linux this is the same
     /// code path a docker `:ro` mount goes through (the kernel rejects
     /// the open with `EROFS`); on macOS the permission-mode rejection
     /// arrives as `EACCES` and the test still covers the contract.

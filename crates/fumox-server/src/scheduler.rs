@@ -45,7 +45,7 @@ impl SchedulerState {
     ///
     /// Releasing through `Drop` rather than an explicit call matters: tokio
     /// mutexes do not poison, so a panic anywhere in `ingest_source` used to
-    /// unwind past the release and pin the id in `in_flight` forever — that
+    /// unwind past the release and pin the id in `in_flight` forever, that
     /// source could never be refreshed again until a restart, and the
     /// `JoinSet` sweep swallows the `JoinError` silently.
     async fn acquire_source(&self, source_id: &str) -> Option<InFlightGuard> {
@@ -120,7 +120,7 @@ pub async fn run(
             }
             maybe_id = refresh_rx.recv() => {
                 let Some(source_id) = maybe_id else {
-                    break; // channel closed — shutting down
+                    break; // channel closed, shutting down
                 };
                 if let Ok(Some(source)) = sources::get(&env.pool, &source_id).await {
                     // Explicit "refresh now": always hit the network.

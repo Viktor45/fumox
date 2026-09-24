@@ -30,7 +30,7 @@ impl CheckKind {
 /// trojan/naive always negotiate TLS; vless/vmess do so only when their
 /// `security` parameter is `tls` or `reality`; ss/socks5 are plain TCP.
 /// QUIC schemes (hysteria2) and the unprobeable ones (tuic, mieru) never
-/// reach T1 — they are filtered out by the candidate query — so the
+/// reach T1, they are filtered out by the candidate query, so the
 /// fallback branch is defensive only.
 pub fn check_kind(scheme: Scheme, params_json: Option<&str>) -> CheckKind {
     match scheme {
@@ -136,7 +136,7 @@ pub struct Target<'a> {
 /// vet_probe_host_addrs` returned for `target.host` moments ago. Connecting
 /// to those exact IPs (instead of re-resolving the hostname) closes the
 /// DNS-rebinding window between vet and dial, and sidesteps the IPv6
-/// `host:port` formatting trap entirely — a `SocketAddr` needs no brackets.
+/// `host:port` formatting trap entirely, a `SocketAddr` needs no brackets.
 pub async fn run(
     target: &Target<'_>,
     connect_timeout: Duration,
@@ -240,7 +240,7 @@ mod tests {
         assert!(result.is_ok(), "expected a successful connect: {result:?}");
     }
 
-    /// An IPv6-literal host connects fine when dialed as a `SocketAddr` —
+    /// An IPv6-literal host connects fine when dialed as a `SocketAddr` ,
     /// the previous `format!("{host}:{port}")` produced an unparseable
     /// `2001:db8::1:443` string and every IPv6 proxy failed T1.
     #[tokio::test]

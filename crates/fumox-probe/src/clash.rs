@@ -38,7 +38,7 @@ fn num(value: i64) -> Value {
 /// the ids of the rows actually included in it.
 ///
 /// Rows whose entry cannot be serialized are skipped (`None` from
-/// [`proxy_to_value`]) and their ids stay out of the returned list — the
+/// [`proxy_to_value`]) and their ids stay out of the returned list, the
 /// caller must journal them explicitly, otherwise the engine later answers
 /// "proxy not found" for them and the journal shows a misleading reason.
 ///
@@ -81,7 +81,7 @@ pub fn generate(
 }
 
 /// Map one DB row onto a Clash proxy definition; returns `None` for
-/// unsupported schemes (they are skipped, never fatal — log+skip policy).
+/// unsupported schemes (they are skipped, never fatal, log+skip policy).
 ///
 /// When `pins` contains an entry for the row's host, the entry is cloned with
 /// `host` replaced by the pinned IP literal before being serialized. This

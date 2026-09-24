@@ -2,7 +2,7 @@
 //!
 //! SQLite in WAL mode is the single shared source of truth between
 //! `fumox-server` and `fumox-probe`. Every connection enables WAL, foreign
-//! keys and `busy_timeout` — without the latter, concurrent upserts from two
+//! keys and `busy_timeout`, without the latter, concurrent upserts from two
 //! processes produce `SQLITE_BUSY` (DATABASE, exploitation notes).
 
 use std::str::FromStr;
@@ -20,7 +20,7 @@ pub type DbPool = SqlitePool;
 /// Opens a connection pool configured for multi-process WAL access.
 ///
 /// The database file is created with `0600` permissions on Unix because it
-/// stores proxy credentials in plain text (PLAN, gap 11).
+/// stores proxy credentials in plain text.
 ///
 /// Pre-create race story (Unix):
 /// - Process A: pre-creates with `OpenOptions::create_new(true).mode(0o600)`
@@ -29,7 +29,7 @@ pub type DbPool = SqlitePool;
 ///   into the "present" branch → opens the existing file with mode already
 ///   `0o600` (set by A) → `restrict_file_permissions` is a no-op
 ///   confirmation.
-/// - The window during which the file exists without `0o600` is *zero* — the
+/// - The window during which the file exists without `0o600` is *zero*, the
 ///   OS sets the mode atomically at create time.
 ///
 /// On non-Unix platforms the pre-create step is a no-op (NTFS DACLs govern
@@ -129,7 +129,7 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
                 }
             }
         } else {
-            // File exists from a previous boot — open read-only to confirm
+            // File exists from a previous boot, open read-only to confirm
             // it is accessible, no chmod here (we'd be racing the other
             // process if any).
             let _ = std::fs::OpenOptions::new().read(true).open(path);
@@ -148,7 +148,7 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
 /// `sqlx` rejects startup when a previously-applied migration file has been
 /// edited in place: the SHA-384 stored in `_sqlx_migrations.checksum` no
 /// longer matches the file. The intended discipline is to never edit an
-/// applied migration — every change belongs in a new file. Comment-only
+/// applied migration, every change belongs in a new file. Comment-only
 /// edits break this discipline for no gain, so this function catches the
 /// specific `VersionMismatch` variant and re-stamps every applied
 /// migration's checksum with the on-disk content. The schema on disk is
@@ -218,13 +218,13 @@ pub async fn repair_migration_checksums(
     for migration in migrator.iter() {
         if !applied.contains(&migration.version) {
             // Skip migrations the embedded set knows about that have not
-            // been applied yet — the next regular `migrate()` will run them
+            // been applied yet, the next regular `migrate()` will run them
             // and stamp their checksum at the end. Touching them here
             // would race the migrator's own bookkeeping.
             continue;
         }
         // `WHERE checksum != ?2` keeps the no-op path zero-cost on a clean
-        // DB — the row is rewritten exactly when the stored hash disagrees
+        // DB, the row is rewritten exactly when the stored hash disagrees
         // with the on-disk file.
         let rows = sqlx::query(
             "UPDATE _sqlx_migrations
@@ -255,7 +255,7 @@ fn sqlite_url(path: &std::path::Path) -> String {
 /// Test-only switch: when set, the inner `set_permissions` call inside
 /// `restrict_file_permissions` short-circuits with a `PermissionDenied`
 /// error. The OS only denies chmod when the process lacks ownership of the
-/// file — a state tests cannot arrange portably — so this flag is the
+/// file, a state tests cannot arrange portably, so this flag is the
 /// smallest indirection that exercises the chmod-fail branch. Guarded by a
 /// `ChmodFailGuard` whose `Drop` resets it so a panic between `store(true)`
 /// and the assertion cannot leak into subsequent tests in the same process.
@@ -265,7 +265,7 @@ static SIMULATE_CHMOD_FAIL: std::sync::atomic::AtomicBool =
 
 /// Serializes the chmod-fail test against the two existing chmod-touching
 /// tests. `SIMULATE_CHMOD_FAIL` is process-global, and `cargo test` runs
-/// `#[tokio::test]`s in parallel by default — without this mutex the
+/// `#[tokio::test]`s in parallel by default, without this mutex the
 /// `connect_pool_returns_err_when_chmod_fails` test would race the other
 /// two and leak a transient `true` into their `connect_pool` calls.
 #[cfg(all(test, unix))]
@@ -345,7 +345,7 @@ mod unix_db_tests {
     async fn connect_pool_restores_0600_on_existing_file_with_wrong_mode() {
         let _serial = chmod_test_mutex().lock().await;
         let (_dir, path) = fresh_db_path("db-wrong");
-        // Pre-create the file with permissive mode — restrict_file_permissions
+        // Pre-create the file with permissive mode, restrict_file_permissions
         // must succeed (chmod it back to 0600) and the pool must open.
         std::fs::write(&path, b"").unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
@@ -391,7 +391,7 @@ mod unix_db_tests {
         };
         let err = connect_pool(&cfg).await.unwrap_err();
         // The Database wrapper for the chmod path is named "set 0600" in
-        // `restrict_file_permissions` — pin that wording so a future
+        // `restrict_file_permissions`, pin that wording so a future
         // refactor of the message does not silently break the error
         // contract.
         assert!(
@@ -402,7 +402,7 @@ mod unix_db_tests {
 
     /// Pins the atomicity of `OpenOptions::create_new(true).mode(0o600)`:
     /// right after `pre_create_db_file` returns, the file must exist with
-    /// mode `0o600` — there is no window during which it exists with a
+    /// mode `0o600`, there is no window during which it exists with a
     /// permissive mode. Reaching `pre_create_db_file` directly avoids the
     /// need for a true concurrent race to exercise the property.
     #[cfg(unix)]

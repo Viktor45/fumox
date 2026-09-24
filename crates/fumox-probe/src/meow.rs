@@ -24,7 +24,7 @@ pub enum DelayOutcome {
     Ok(u64),
     /// meow-rs answered, but the proxy failed the tunnel test.
     ProxyFailed(String),
-    /// meow-rs itself is unreachable or misbehaving — the batch must be
+    /// meow-rs itself is unreachable or misbehaving, the batch must be
     /// aborted without touching proxy statuses.
     ServiceUnavailable(String),
 }
@@ -43,7 +43,7 @@ impl MeowClient {
                 .unwrap_or_else(|_| {
                     // The builder above cannot fail with static settings,
                     // but a plain `Client::new()` fallback would defeat the
-                    // whole timeout floor — carry the timeouts into the
+                    // whole timeout floor, carry the timeouts into the
                     // fallback too.
                     reqwest::Client::builder()
                         .connect_timeout(Duration::from_secs(5))
@@ -66,7 +66,7 @@ impl MeowClient {
             .expect("meow.test_url is never empty (guaranteed by the config deserializer)")
     }
 
-    /// `GET /version` — cheap liveness probe of the REST API.
+    /// `GET /version`, cheap liveness probe of the REST API.
     pub async fn ping(&self) -> Result<String, String> {
         let response = self
             .http
@@ -89,7 +89,7 @@ impl MeowClient {
             .to_string())
     }
 
-    /// `PUT /configs` — hot-reload the generated Clash YAML without
+    /// `PUT /configs`, hot-reload the generated Clash YAML without
     /// restarting the meow-rs process.
     pub async fn reload_config(&self, path: &std::path::Path) -> Result<(), String> {
         let response = self
@@ -108,12 +108,12 @@ impl MeowClient {
         Err(format!("PUT /configs returned {status}: {body}"))
     }
 
-    /// `GET /proxies/{name}/delay` — run one real tunnel check.
+    /// `GET /proxies/{name}/delay`, run one real tunnel check.
     ///
     /// Distinguishes "the proxy is dead" (meow answered with a failure)
     /// from "meow itself is down" (transport error / 5xx). Both are
     /// *failures* for the proxy as far as the ladder is concerned (owner
-    /// decision, 2026-09-10) — the split only decides the error text and
+    /// decision, 2026-09-10), the split only decides the error text and
     /// whether the batch keeps hammering a dying engine: a
     /// `ServiceUnavailable` aborts the remaining checks, while a
     /// `ProxyFailed` lets the batch continue.
@@ -164,12 +164,12 @@ impl MeowClient {
 
     /// Same as `check_delay` but retries `ServiceUnavailable` up to
     /// `attempts` times with `backoff` between tries. `Ok` and
-    /// `ProxyFailed` are returned on first sight — the engine spoke
+    /// `ProxyFailed` are returned on first sight, the engine spoke
     /// authoritatively in those branches and re-asking the same request
     /// does not help. Only transport-level glitches (connection drops,
     /// transient 5xx, one-shot malformed payloads) are absorbed here, so
     /// the caller's `ServiceUnavailable` handling now sees a strictly
-    /// smaller set of cases — most of them genuine engine outages.
+    /// smaller set of cases, most of them genuine engine outages.
     pub async fn check_delay_with_retry(
         &self,
         name: &str,
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(picked, HashSet::from(["a", "b", "c"]));
     }
 
-    /// A flaky proxy fails the first request and succeeds the second —
+    /// A flaky proxy fails the first request and succeeds the second ,
     /// `check_delay_with_retry` absorbs the transient blip and returns
     /// `Ok`. Without the retry the caller would see `ServiceUnavailable`
     /// and abort the rest of the batch on the first failure.
@@ -408,7 +408,7 @@ mod tests {
             backoff_max_secs: 900,
         };
         let client = MeowClient::new(&config);
-        // Two attempts, 50ms between — first fails, second succeeds.
+        // Two attempts, 50ms between, first fails, second succeeds.
         match client
             .check_delay_with_retry("fumox-flaky", 2, Duration::from_millis(50))
             .await
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
-    /// `ProxyFailed` (4xx — the engine tried and the tunnel died) is not
+    /// `ProxyFailed` (4xx, the engine tried and the tunnel died) is not
     /// retried: the engine's answer is final, asking again would just
     /// pile more load on a dying tunnel.
     #[tokio::test]

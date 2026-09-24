@@ -2,8 +2,8 @@
 //!
 //! Two line formats exist in the wild:
 //!
-//! * **SIP002** — `ss://base64(method:password)@host:port[/?query][#name]`;
-//! * **legacy** — `ss://base64(method:password@host:port)[#name]`, where the
+//! * **SIP002**, `ss://base64(method:password)@host:port[/?query][#name]`;
+//! * **legacy**, `ss://base64(method:password@host:port)[#name]`, where the
 //!   whole server definition is inside the base64 blob.
 //!
 //! The credential is stored decoded (`method:password`): it is the semantic
@@ -87,7 +87,7 @@ fn parse_legacy(before_query: &str) -> Result<(String, String, u16, String), Str
     Ok((credential.to_string(), host, port, String::new()))
 }
 
-/// Serialize back to the SIP002 form with unpadded standard base64 — the
+/// Serialize back to the SIP002 form with unpadded standard base64, the
 /// dominant style in real feeds.
 pub fn serialize(entry: &ProxyEntry) -> String {
     let blob = base64::engine::general_purpose::STANDARD_NO_PAD.encode(entry.credential.as_bytes());

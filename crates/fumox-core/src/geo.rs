@@ -1,7 +1,7 @@
-//! Geo enrichment (MaxMind GeoLite2) —
+//! Geo enrichment (MaxMind GeoLite2) ,
 //!
 //! Pipeline: `host` → (async DNS if it is a domain) → IP → MaxMind lookup →
-//! merged geo facts (country + city from City, ASN from ASN — every unique
+//! merged geo facts (country + city from City, ASN from ASN, every unique
 //! database present in `[geo].db_dir` contributes; the Country database is
 //! redundant, City carries all of its facts, and is not read) applied to
 //! the display name through a template (default `"{flag} {country} ·
@@ -13,7 +13,7 @@
 //! hosts are not re-queried on every pipeline run.
 //!
 //! The `.mmdb` files are never committed. When no database file can be
-//! opened the resolver degrades to a no-op with a warning — geo enrichment
+//! opened the resolver degrades to a no-op with a warning, geo enrichment
 //! is an optional enhancement, not a startup requirement.
 
 use crate::config::{GeoConfig, GeoDbKind};
@@ -61,7 +61,7 @@ pub fn flag_emoji(iso_code: &str) -> Option<String> {
 ///
 /// Placeholders: `{flag}`, `{country}`, `{city}`, `{asn}`, `{asn_org}`,
 /// `{name}`. The original name is returned unchanged only when there is no
-/// geo data at all (no country, no city, no ASN) — a template with empty
+/// geo data at all (no country, no city, no ASN), a template with empty
 /// substitutions would only produce dangling separators. Individual missing
 /// values substitute as empty strings, and the result is then collapsed
 /// (whitespace runs → single space, trimmed), so `"{flag} {country} {city} ·
@@ -114,7 +114,7 @@ fn collapse_whitespace(text: &str) -> String {
 
 /// Every GeoLite2 database that carries unique facts and is found in
 /// `[geo].db_dir`: City (country + city) and ASN (autonomous system). The
-/// Country database is deliberately not read — City carries every fact it
+/// Country database is deliberately not read, City carries every fact it
 /// has (a leftover `GeoLite2-Country.mmdb` is simply ignored). Missing
 /// kinds contribute no facts; a directory with only `GeoLite2-ASN.mmdb`
 /// still resolves AS numbers.
@@ -129,7 +129,7 @@ impl Backends {
             let path = dir.join(kind.file_name());
             match Reader::open_readfile(&path) {
                 Ok(reader) => Some(reader),
-                // missing file — contributing no facts is the documented
+                // missing file, contributing no facts is the documented
                 // behavior for an absent database, not an error
                 Err(_) if !path.exists() => None,
                 Err(err) => {
@@ -164,7 +164,7 @@ pub struct GeoResolver {
 
 impl GeoResolver {
     /// Build a resolver from config. Every GeoLite2 database found in
-    /// `[geo].db_dir` is opened and all of them contribute facts — a name
+    /// `[geo].db_dir` is opened and all of them contribute facts, a name
     /// template can mix `{country}`, `{city}` and `{asn}` freely. Returns a
     /// no-op resolver (with a warning logged) when geo is disabled or no
     /// database file could be opened.
@@ -268,15 +268,15 @@ fn first_ip(lookup: impl Iterator<Item = std::net::SocketAddr>) -> Option<IpAddr
 
 /// On-demand enrichment over **every** GeoLite2 database found in
 /// `[geo].db_dir` (admin proxy-card "resolve City/ASN" action). Same
-/// resolution semantics as [`GeoResolver`] — both open and merge all
-/// databases — kept as a thin wrapper so the admin panel can hold its own
+/// resolution semantics as [`GeoResolver`], both open and merge all
+/// databases, kept as a thin wrapper so the admin panel can hold its own
 /// resolver instance (with its own cache) next to the pipeline one.
 pub struct FullResolver {
     inner: GeoResolver,
 }
 
 impl FullResolver {
-    /// Open every database present in `db_dir` — regardless of
+    /// Open every database present in `db_dir`, regardless of
     /// `[geo].enabled`, which gates the pipeline's own resolver (the card
     /// enrichment is independent of the pipeline). Missing files are
     /// skipped silently: the caller decides what to report when nothing
@@ -289,7 +289,7 @@ impl FullResolver {
         }
     }
 
-    /// Whether any database loaded at all — `false` means there is nothing
+    /// Whether any database loaded at all, `false` means there is nothing
     /// to enrich with and the UI should not offer the action.
     pub fn is_active(&self) -> bool {
         self.inner.is_active()
@@ -350,7 +350,7 @@ mod tests {
     use crate::config::GeoConfig;
 
     /// The workspace `config/` directory with the gitignored GeoLite2 files
-    /// (tests skip themselves when it is empty — CI runs without them).
+    /// (tests skip themselves when it is empty, CI runs without them).
     fn workspace_db_dir() -> Option<std::path::PathBuf> {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
         let has_any = [GeoDbKind::City, GeoDbKind::Asn]
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(info.country_code.as_deref(), Some("US"));
         assert_eq!(info.ip, "8.8.8.8");
         // Whichever of City/ASN loaded contributes its fact. 8.8.8.8 is anycast
-        // Google DNS — the City database legitimately has no city for it, so
+        // Google DNS, the City database legitimately has no city for it, so
         // the ASN database is the one carrying a fact here.
         if workspace_db_dir()
             .unwrap()
@@ -396,7 +396,7 @@ mod tests {
         if let Some(info) = resolver.resolve("81.19.44.10").await
             && info.country_code.is_some()
         {
-            // only assert the shape — the specific city varies by build
+            // only assert the shape, the specific city varies by build
             assert!(info.city_name.is_some() || info.asn.is_some());
         }
     }
@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(info.country_code.as_deref(), Some("US"));
         // 8.8.8.8 is anycast Google DNS: City has no city for it, but when
         // the ASN database is present its facts must merge in alongside the
-        // country — impossible in the one-database era.
+        // country, impossible in the one-database era.
         if mmdb_path(GeoDbKind::Asn).is_some() {
             assert_eq!(info.asn, Some(15169), "Google ASN expected: {info:?}");
             assert_eq!(info.asn_org.as_deref(), Some("Google LLC"));
@@ -442,7 +442,7 @@ mod tests {
             return;
         };
         // Literal IP: no DNS round-trip. 8.8.8.8 is US/AS15169 with no
-        // city (anycast) — the template must render country and ASN in one
+        // city (anycast), the template must render country and ASN in one
         // pass, with the missing city collapsing away.
         let info = resolver.resolve("8.8.8.8").await.expect("8.8.8.8 known");
         assert_eq!(info.country_code.as_deref(), Some("US"));
@@ -655,7 +655,7 @@ mod tests {
             eprintln!("skipped: GeoLite2-City.mmdb not present");
             return;
         };
-        // TEST-NET-1 address: valid IP, typically without geo data — the
+        // TEST-NET-1 address: valid IP, typically without geo data, the
         // negative result must be cached and stable across calls.
         let first = resolver.resolve("192.0.2.1").await;
         let second = resolver.resolve("192.0.2.1").await;

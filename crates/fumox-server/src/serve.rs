@@ -59,7 +59,7 @@ pub struct AppState {
 
 /// Per-IP rate limiters of the public listener: a generous ceiling for
 /// every request and a strict one for failed access-token checks (HTTP
-/// 403) — the brute-force signal for protected profiles.
+/// 403), the brute-force signal for protected profiles.
 #[derive(Clone)]
 pub struct PublicRateLimits {
     all: Arc<RateLimiter>,
@@ -119,7 +119,7 @@ pub fn router(state: AppState) -> Router {
 /// connect info (unit tests, embedded runtimes) pass through uncounted.
 ///
 /// The listener installs `into_make_service_with_connect_info::<SocketAddr>()`,
-/// which stores the peer address as `ConnectInfo<SocketAddr>` — reading the
+/// which stores the peer address as `ConnectInfo<SocketAddr>`, reading the
 /// bare `SocketAddr` here would silently match nothing and disable the whole
 /// limiter (regression fixed 2026-09-11).
 async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
@@ -136,7 +136,7 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
     }
     let response = next.run(req).await;
     if response.status() == StatusCode::FORBIDDEN && !state.limits.auth_failures.allow(&ip).await {
-        // The failure window rejected the request — give the hit back to the
+        // The failure window rejected the request, give the hit back to the
         // generous window so one brute-force attempt does not cost the
         // caller two windows.
         state.limits.all.refund(&ip).await;
@@ -371,7 +371,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     // Profile-level country allowlist: when the profile lists
     // countries, only proxies whose stored geo fact matches are served.
     // Proxies without a determined country stay out while the filter is
-    // active — "only these countries" means confirmed facts, not guesses.
+    // active, "only these countries" means confirmed facts, not guesses.
     let allowed_countries: Option<std::collections::HashSet<String>> =
         if profile.countries.is_empty() {
             None
@@ -412,7 +412,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     }
     // "All proxies quarantined/removed" verdict: the profile
     // does hold proxies, but every one of them was dropped by a health
-    // filter. `ready` counts as served-tier too — a verified proxy is
+    // filter. `ready` counts as served-tier too, a verified proxy is
     // not part of the "everything is hidden" story.
     let all_quarantined = !loaded_statuses.is_empty()
         && all.is_empty()
@@ -502,7 +502,7 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
     // /src serves only health-checked, currently-live proxies: rows that
     // were never probed (unknown), quarantined or removed stay out even
     // when the pipeline's health filter would let them through. `ready`
-    // (the tunnel-verified tier) is a live tier too — a verified proxy
+    // (the tunnel-verified tier) is a live tier too, a verified proxy
     // must not vanish from client output the
     // moment T2 promotes it.
     candidates.retain(|c| matches!(c.status, ProxyStatus::Alive | ProxyStatus::Ready));
@@ -537,9 +537,9 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
     })
 }
 
-/// In-process preview of a profile's output for the admin card —
+/// In-process preview of a profile's output for the admin card ,
 /// renders exactly what `/sub` would serve, without an
-/// HTTP round trip to self — and returns the first `max_lines` lines.
+/// HTTP round trip to self, and returns the first `max_lines` lines.
 /// Base64 output is decoded so the preview stays readable.
 pub(crate) async fn preview_sub(
     state: &AppState,
@@ -644,7 +644,7 @@ fn uri_lines(candidates: &[Candidate]) -> String {
 /// Metadata header block prefixed to every plain url_list output (`/sub`
 /// with uri_list format, `/src`, the alive export): the HTTP headers
 /// `profile-title`/`profile-update-interval` carry the same facts, but a
-/// copy-pasted or downloaded file loses them — the comment lines survive.
+/// copy-pasted or downloaded file loses them, the comment lines survive.
 /// Key names follow the de-facto subscription-header convention (mihomo,
 /// Stash, subconverter); URI-list parsers skip `#` lines, so the block is
 /// inert for clients (and for another fumox consuming it as a source).
@@ -772,7 +772,7 @@ mod tests {
         }
     }
 
-    /// Perform one GET carrying a peer-address extension — the public
+    /// Perform one GET carrying a peer-address extension, the public
     /// rate-limit middleware keys on it. The extension is inserted exactly
     /// the way `into_make_service_with_connect_info` does in production
     /// (`ConnectInfo<SocketAddr>`), so the test fails if the middleware
@@ -895,7 +895,7 @@ mod tests {
             get_with_ip(app.clone(), &bad, "10.2.2.2").await,
             StatusCode::FORBIDDEN
         );
-        // Third failure: the failure window is done — 429, and the hit it
+        // Third failure: the failure window is done, 429, and the hit it
         // consumed in the generous window comes back.
         assert_eq!(
             get_with_ip(app.clone(), &bad, "10.2.2.2").await,
@@ -1125,7 +1125,7 @@ mod tests {
         assert!(!body.contains("de1.example.com"), "{body:?}");
         assert!(!body.contains("xx.example.com"), "{body:?}");
 
-        // Changing the list changes the output — codes are case-insensitive.
+        // Changing the list changes the output, codes are case-insensitive.
         profile.countries = vec!["de".into()];
         profile.updated_at = fumox_core::models::now_ts();
         profiles::update(&state.pool, &profile).await.unwrap();
@@ -1442,7 +1442,7 @@ mod tests {
     }
 
     /// The ready export link: the same shared
-    /// token, but only the tunnel-verified `ready` tier is served — an
+    /// token, but only the tunnel-verified `ready` tier is served, an
     /// `alive` (unverified) proxy stays out, and rotation kills both links.
     #[tokio::test]
     async fn ready_export_link_serves_only_the_verified_tier() {
@@ -1473,7 +1473,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("export/ready"), "title block: {body:?}");
         assert!(body.contains("h2.example.com"), "{body:?}");
-        // The plain alive tier stays out — the links are disjoint.
+        // The plain alive tier stays out, the links are disjoint.
         assert!(!body.contains("h1.example.com"), "{body:?}");
 
         // The same token opens the alive link with the complementary set.
@@ -1486,7 +1486,7 @@ mod tests {
         let (status, _, _) = get(router(state.clone()), "/export/ready/zzzzzzzzzzzz").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        // Rotation kills both links — one secret, one rotation.
+        // Rotation kills both links, one secret, one rotation.
         let fresh = crate::alive_export::rotate_token(&state.pool)
             .await
             .unwrap();

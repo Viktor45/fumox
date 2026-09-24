@@ -1,14 +1,14 @@
-# Fumox — конфигурация приложения.
-# Файл перечисляет ВСЕ доступные ключи со значениями по умолчанию — правьте
+# Fumox, конфигурация приложения.
+# Файл перечисляет ВСЕ доступные ключи со значениями по умолчанию, правьте
 # только то, что нужно изменить. Каждый ключ имеет дефолт: файл можно урезать
-# до нужных секций или вовсе не создавать — сервис работает на встроенных дефолтах.
+# до нужных секций или вовсе не создавать, сервис работает на встроенных дефолтах.
 # Переопределение через окружение: FUMOX_СЕКЦИЯ__КЛЮЧ, например
 # FUMOX_ADMIN__TOKEN=secret (двойное подчеркивание разделяет секции).
 #
-# Fumox — application configuration.
-# The file lists EVERY available key at its default value — change only what
+# Fumox, application configuration.
+# The file lists EVERY available key at its default value, change only what
 # you need. Every key has a default: the file may be trimmed down to the
-# sections you need or omitted entirely — the service runs on built-in defaults.
+# sections you need or omitted entirely, the service runs on built-in defaults.
 # Environment overrides: FUMOX_SECTION__KEY, e.g. FUMOX_ADMIN__TOKEN=secret
 # (a double underscore separates the section from the key).
 
@@ -31,8 +31,8 @@ trust_proxy_ips = []
 allowed_hosts = []
 
 [database]
-# SQLite (WAL) — единственный источник истины.
-# SQLite (WAL) — the single source of truth.
+# SQLite (WAL), единственный источник истины.
+# SQLite (WAL), the single source of truth.
 path = "fumox.db"
 # обязателен: пишут два процесса (server и probe)
 # required: two processes write to the database (server and probe)
@@ -46,8 +46,8 @@ connect_timeout_secs = 10
 read_timeout_secs = 30
 # 10 МиБ; защита от decompression-bomb / 10 MiB; decompression-bomb guard
 max_response_bytes = 10485760
-# 4 = потолок параллельных загрузок на процесс: выше — источники начинают отвечать 429,
-# ниже — слишком долгий прогон фидов с десятками URL 
+# 4 = потолок параллельных загрузок на процесс: выше, источники начинают отвечать 429,
+# ниже, слишком долгий прогон фидов с десятками URL 
 # 4 caps parallel HTTP fetches per process: higher values trigger 429s,
 # lower ones stall feeds with dozens of URLs
 max_concurrency = 4
@@ -57,15 +57,15 @@ max_retries = 2
 # экспоненциальный backoff от этой базы / exponential backoff base for retries
 retry_base_backoff_ms = 500
 # Встроенный дефолт генерируется из версии бинарника (сейчас fumox/0.1.0):
-# удалите строку — подставится актуальная версия при сборке. headers
+# удалите строку, подставится актуальная версия при сборке. headers
 # конкретного источника важнее этого значения.
 # The built-in default is derived from the binary version (fumox/0.1.0 now):
 # remove the line to inherit it at compile time. Per-source headers win.
 user_agent = "fumox/0.1.0"
 # Семейство IP-протоколов по умолчанию для загрузки источников: any | ipv4 | ipv6.
-# Источник без своего ip_family наследует это значение. any — dual-stack:
+# Источник без своего ip_family наследует это значение. any, dual-stack:
 # первый IPv4-адрес, иначе IPv6. Выбранное семейство строгое: нет адреса
-# нужного семейства — загрузка с ошибкой. Переопределение:
+# нужного семейства, загрузка с ошибкой. Переопределение:
 # FUMOX_FETCH__IP_FAMILY.
 # Default IP protocol family for source fetching: any | ipv4 | ipv6. Sources
 # without their own ip_family inherit this. any = dual-stack (first IPv4
@@ -81,7 +81,7 @@ ip_family = "any"
 refresh_check_limit = 100
 # Как поступать с живым прокси, исчезнувшим из выдачи источника.
 # false (дефолт): прокси остается за источником, пока проверки подтверждают,
-# что он жив; как только проверки завалят его — прокси удаляется из базы автоматически.
+# что он жив; как только проверки завалят его, прокси удаляется из базы автоматически.
 # true: если у источника есть правила отбрасывания (drop) в pipeline, живой
 # прокси под таким правилом убирается уже на ближайшем обновлении.
 # What happens to an alive proxy that vanished from a source feed.
@@ -89,42 +89,42 @@ refresh_check_limit = 100
 # keep confirming it is alive; once the checks fail it, the proxy gets
 # removed automatically. true: when the source has pipeline drop rules, an alive
 # proxy caught by a rule is removed on the very next refresh.
-drop_gate = true
+drop_gate = false
 # Возврат удаленного прокси, который снова появился в источнике.
-# false (дефолт): removed терминален — возврат только вручную («сбросить
+# false (дефолт): removed терминален, возврат только вручную («сбросить
 # статус» в админке) или через «purge removed» + повторная вставка.
 # true: прокси, все еще приходящий из фида, сбрасывается в статус
 # unknown (fail_count и карантинные поля очищены, как после «сброса
 # статуса») и заново проходит проверки, вставая в приоритет-очередь.
 # Revive a removed proxy that reappears in a source feed.
-# false (the default): removed stays terminal — the only ways back are the
+# false (the default): removed stays terminal, the only ways back are the
 # admin "reset status" action or «purge removed» plus a re-insert.
 # true: a proxy the feed still carries resets to the pristine unknown
 # state (fail_count and quarantine fields cleared, same as "reset status")
 # and re-runs the check sequence, joining the priority queue.
-removed_as_unknown = true
+removed_as_unknown = false
 
 [geo]
 # Гео-обогащение MaxMind GeoLite2: по IP-адресу узла определяются страна,
-# город и автономная система — открываются ВСЕ базы в db_dir и их факты
+# город и автономная система, открываются ВСЕ базы в db_dir и их факты
 # объединяются, поэтому {country}, {city} и {asn} работают в одном шаблоне
 # имени. Файлы .mmdb не коммитятся; при старте сервер сам скачивает
 # отсутствующие/устаревшие базы в db_dir, если каталог доступен для записи.
 # MaxMind GeoLite2 geo enrichment: a node's IP resolves to its country,
-# city and autonomous system — ALL databases in db_dir are opened and their
+# city and autonomous system, ALL databases in db_dir are opened and their
 # facts merged, so {country}, {city} and {asn} work in one name template.
 # The .mmdb files are never committed; at startup the server downloads
 # missing/stale databases into db_dir automatically, provided the directory
 # is writable.
 enabled = true
-# «config» — дефолт рядом с бинарником: удобно для dev-сборки и одиночного запуска.
+# «config», дефолт рядом с бинарником: удобно для dev-сборки и одиночного запуска.
 # В проде задайте абсолютный путь к read-only тому с актуальными .mmdb 
 # "config" is the default next to the binary, convenient for dev.
 # In prod set an absolute path to a read-only volume with fresh .mmdb
 db_dir = "config"
 # 16384 = потолок записей in-memory кэша moka: каждая запись маленькая (страна/город/AS),
 # итого пара мегабайт; поднимите, если в вашем фиде заметно больше уникальных хостов
-# 16384 caps the in-memory moka cache; entries are small (country/city/AS) — a couple of MB total;
+# 16384 caps the in-memory moka cache; entries are small (country/city/AS), a couple of MB total;
 # raise this if your feed holds noticeably more unique hosts
 cache_max_entries = 16384
 dns_timeout_secs = 5
@@ -134,7 +134,7 @@ dns_timeout_secs = 5
 # Admin panel. An empty token disables the panel (it answers 404).
 enabled = true
 token = "change-me"
-# отдельный слушатель; наружу — reverse-proxy/SSH-туннель
+# отдельный слушатель; наружу, reverse-proxy/SSH-туннель
 # a separate listener; expose it through a reverse proxy or an SSH tunnel
 bind = "127.0.0.1:8081"
 # 7 дней / 7 days
@@ -165,7 +165,7 @@ secure_cookies = false
 [probe]
 # Демон проверки живучести прокси.
 # Proxy health-check daemon.
-# 60 с — компромисс между задержкой прогона приоритетной выборки probe и нагрузкой
+# 60 с, компромисс между задержкой прогона приоритетной выборки probe и нагрузкой
 # на исходящие коннекты 
 # 60 s balances probe responsiveness (priority sample turnaround) against outbound connect load
 cycle_interval_secs = 60
@@ -179,12 +179,12 @@ sample_size = 50
 # the same counter. Lower it to stop spending T1 time on dead proxies.
 fail_limit = 2
 # Запрет диала приватных адресов из фидов: без этого флага демон не
-# подключается к loopback/RFC1918/link-local/CGNAT целям — фид может
+# подключается к loopback/RFC1918/link-local/CGNAT целям, фид может
 # подсунуть «прокси» с адресом внутренней сети. Отказ регистрируется как
 # проваленная проверка: заблокированная цель проходит обычную лестницу
 # фейлов, а не зависает в очередях навсегда.
 # Refuse to dial private addresses coming from feeds: with this flag unset
-# the daemon never connects to loopback/RFC1918/link-local/CGNAT targets —
+# the daemon never connects to loopback/RFC1918/link-local/CGNAT targets ,
 # a feed can plant a «proxy» pointing inside your network. A refusal is
 # journaled as a *failed check*: the blocked target goes through the ordinary fail
 # ladder instead of clogging the queues forever.
@@ -194,16 +194,16 @@ connect_timeout_secs = 5
 # T1: TLS-handshake
 tls_timeout_secs = 5
 concurrency = 8
-# 30 с — куда реже probe просто молчит, не присылая heartbeat; значение меньше 15с
+# 30 с, куда реже probe просто молчит, не присылая heartbeat; значение меньше 15с
 # расходится с обычной задержкой пуша meta-ключа и не несёт пользы
 # 30 s = how long a silent probe can stay silent before the admin UI notices;
 # going under 15s is no faster than the meta-key push cadence and buys nothing
 heartbeat_interval_secs = 30
 # Второй шанс для прокси в карантине: повторная проверка в случайный момент
-# окна [1ч, 3ч) после карантина — окно задается как min + случайная
+# окна [1ч, 3ч) после карантина, окно задается как min + случайная
 # добавка от 0 до spread (UTC, момент фиксируется в базе при карантине).
 # A quarantined proxy's second chance: rechecked at a random moment of the
-# [1h, 3h) window after quarantine — the window is min plus a random
+# [1h, 3h) window after quarantine, the window is min plus a random
 # addition from 0 to spread (UTC, the moment is fixed in the database when
 # quarantined).
 second_chance_min_hours = 2
@@ -223,34 +223,41 @@ recheck_delays_secs = [600, 900]   # 10 мин → 15 мин / 10m → 15m
 # удаляются (ежедневная задача ротации).
 # Priority-queue entries (probe_requests) older than this are purged.
 queue_stale_days = 7
-# 86400 с (сутки) — ротация probe_results/fetch_log под полные сутки, в пару к [retention].*_days 
+# Целевое время (мин), за которое чекер на /admin/probe пытается
+# осушить текущий карантин. Если затраты при текущих настройках превышает
+# это число, чекер предложит конкретные [probe].sample_size /
+# cycle_interval_secs / concurrency. 5..=1440.
+# Target drain time (min) used by the /admin/probe backlog banner when
+# computing suggested [probe] values. 5..=1440.
+backlog_target_drain_minutes = 60
+# 86400 с (сутки), ротация probe_results/fetch_log под полные сутки, в пару к [retention].*_days 
 # 86400 s (one day) pairs with [retention].*_days so rotation runs once per day and matches the retention window
 retention_interval_secs = 86400
 allow_private_targets = true
 
 [meow]
-# meow-rs — движок реальных туннельных проверок. Живет как отдельный
+# meow-rs, движок реальных туннельных проверок. Живет как отдельный
 # системный сервис: Fumox им не управляет, только дергает его REST API
 # и перезагружает конфиг через PUT /configs.
-# meow-rs — the engine behind real tunnel checks. It runs as a separate
+# meow-rs, the engine behind real tunnel checks. It runs as a separate
 # system service: Fumox does not manage it, it only calls its REST API
 # and reloads its config via PUT /configs.
 api_addr = "127.0.0.1:9090"
-# /shared/meow.yaml — путь, на который meow-rs настроен в типовом docker-compose;
+# /shared/meow.yaml, путь, на который meow-rs настроен в типовом docker-compose;
 # подмените, когда раскладка томов иная 
 # /shared/meow.yaml is where meow-rs expects its config in the typical docker-compose layout;
 # override if your volume layout differs
 config_path = "/shared/meow.yaml"
 # Адрес(а) T2-проверки задержки через туннель: probe случайно выбирает один
-# из списка на каждую проверку — выход одного адреса из строя не ломает T2.
+# из списка на каждую проверку, выход одного адреса из строя не ломает T2.
 # Можно задать один адрес, TOML-массив или строку с адресами через запятую
-# (удобно для FUMOX_MEOW__TEST_URL). Ниже — актуальные адресы captive-проверки
+# (удобно для FUMOX_MEOW__TEST_URL). Ниже, актуальные адресы captive-проверки
 # Android (проверены вживую 2026-08-29, все отвечают HTTP 204); уберите
 # недоступные в вашем регионе. HTTPS-варианты (www.google.com,
 # connectivitycheck.gstatic.com, play.googleapis.com) тоже живы, но дают
 # лишний TLS-handshake внутри туннеля.
 # Test URL(s) of the T2 tunnel delay check: the probe picks one at random
-# per check — a dead endpoint no longer breaks T2. Accepts a single URL, a
+# per check, a dead endpoint no longer breaks T2. Accepts a single URL, a
 # TOML array, or a comma-separated string (handy for FUMOX_MEOW__TEST_URL).
 # Below are the current Android captive-portal endpoints (verified live
 # 2026-08-29, all answer HTTP 204); drop the ones unreachable in your region.
@@ -290,8 +297,8 @@ fetch_log_days = 7
 
 [log]
 # Уровень консольных логов каждого процесса: error | warn | info | debug | trace.
-# Оба процесса читают этот файл, поэтому ключ свой у каждого: server — для
-# fumox-server, probe — для fumox-probe (probe на info пишет строку «probe
+# Оба процесса читают этот файл, поэтому ключ свой у каждого: server, для
+# fumox-server, probe, для fumox-probe (probe на info пишет строку «probe
 # cycle done» каждый цикл; warn ее убирает). Полные директивы EnvFilter в
 # RUST_LOG имеют приоритет над конфигом (например RUST_LOG=fumox_core=debug,info).
 # Console log level per process: error | warn | info | debug | trace. Both

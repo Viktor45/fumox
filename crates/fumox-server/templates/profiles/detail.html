@@ -5,7 +5,7 @@
 {% block content %}
 <div class="page-head">
   <h1>{{ profile.name }}</h1>
-  <span id="enabled-badge">
+  <span id="enabled-badge" aria-live="polite" aria-atomic="true">
     {% if profile.enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
   </span>
   <span class="spacer"></span>
@@ -14,9 +14,9 @@
     <form id="toggle-form" method="post" action="/admin/profiles/{{ profile.id }}/toggle"
           hx-post="/admin/profiles/{{ profile.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
-      <button class="btn" type="submit">{% if profile.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
+      <button class="btn" type="submit" aria-pressed="{% if profile.enabled %}true{% else %}false{% endif %}">{% if profile.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
     </form>
-    <button class="btn danger" type="button" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
+    <button class="btn danger" type="button" aria-haspopup="dialog" aria-controls="delete-dialog" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
   </div>
 </div>
 

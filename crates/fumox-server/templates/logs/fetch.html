@@ -107,7 +107,7 @@
           {% if *p == 0 %}
             <span class="page gap">…</span>
           {% else if current %}
-            <span class="page current">{{ p }}</span>
+            <span class="page current" aria-current="page">{{ p }}</span>
           {% else %}
             <a class="page" href="/admin/logs/fetch?page={{ p }}&amp;per_page={{ per_page }}{{ self.query_suffix() }}">{{ p }}</a>
           {% endif %}

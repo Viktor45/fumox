@@ -10,15 +10,15 @@
 <body>
   <div class="topbar">
     <span class="brand">Fumox</span>
-    <nav>
-      <a href="/admin" {% if active == "dashboard" %}class="active"{% endif %}>{{ self.t("nav.dashboard") }}</a>
-      <a href="/admin/sources" {% if active == "sources" %}class="active"{% endif %}>{{ self.t("nav.sources") }}</a>
-      <a href="/admin/profiles" {% if active == "profiles" %}class="active"{% endif %}>{{ self.t("nav.profiles") }}</a>
-      <a href="/admin/proxies" {% if active == "proxies" %}class="active"{% endif %}>{{ self.t("nav.proxies") }}</a>
-      <a href="/admin/probe" {% if active == "probe" %}class="active"{% endif %}>{{ self.t("nav.probe") }}</a>
-      <a href="/admin/settings" {% if active == "settings" %}class="active"{% endif %}>{{ self.t("nav.settings") }}</a>
-      <a href="/admin/logs/fetch" {% if active == "logs" %}class="active"{% endif %}>{{ self.t("nav.logs") }}</a>
-      <a href="/admin/import" {% if active == "import" %}class="active"{% endif %}>{{ self.t("nav.import") }}</a>
+    <nav aria-label="Primary">
+      <a href="/admin" {% if active == "dashboard" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.dashboard") }}</a>
+      <a href="/admin/sources" {% if active == "sources" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.sources") }}</a>
+      <a href="/admin/profiles" {% if active == "profiles" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.profiles") }}</a>
+      <a href="/admin/proxies" {% if active == "proxies" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.proxies") }}</a>
+      <a href="/admin/probe" {% if active == "probe" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.probe") }}</a>
+      <a href="/admin/settings" {% if active == "settings" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.settings") }}</a>
+      <a href="/admin/logs/fetch" {% if active == "logs" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.logs") }}</a>
+      <a href="/admin/import" {% if active == "import" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.import") }}</a>
     </nav>
     <span class="spacer"></span>
     {# Theme switcher (day/night): the choice is stored in the fumox_theme
@@ -27,17 +27,19 @@
        same as the language switcher below. On narrow screens CSS swaps the
        text labels for the inline SVG sun/moon icons so the whole first
        topbar row fits. #}
-    <span class="lang-switch theme-switch">
+    <span class="lang-switch theme-switch" role="group" aria-label="{{ self.t("nav.theme") }}">
       <a href="/admin/set-theme?theme=light"
          aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
-         onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
+         aria-pressed="{% if theme.is_light() %}true{% else %}false{% endif %}"
+         onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
          {% if theme.is_light() %}class="active"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
         <span class="theme-label">{{ self.t("theme.light") }}</span>
       </a>
       <a href="/admin/set-theme?theme=dark"
          aria-label="{{ self.t("theme.dark") }}" title="{{ self.t("theme.dark") }}"
-         onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
+         aria-pressed="{% if theme.is_dark() %}true{% else %}false{% endif %}"
+         onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
          {% if theme.is_dark() %}class="active"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
         <span class="theme-label">{{ self.t("theme.dark") }}</span>
@@ -47,11 +49,11 @@
        languages appear automatically. The onclick appends the current path
        as `next` so the user lands back on the same page; without JS the
        redirect falls back to the dashboard. #}
-    <span class="lang-switch">
+    <span class="lang-switch" role="group" aria-label="{{ self.t("nav.language") }}">
       {% for (code, _label) in langs %}
       <a href="/admin/set-lang?lang={{ code }}"
-         onclick="this.href += '&amp;next=' + encodeURIComponent(location.pathname + location.search);"
-         {% if self.lang_code() == code.as_str() %}class="active"{% endif %}>{{ code | upper }}</a>
+         onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
+         {% if self.lang_code() == code.as_str() %}class="active" aria-current="true"{% endif %}>{{ code | upper }}</a>
       {% endfor %}
     </span>
     <form method="post" action="/admin/logout" class="inline">
@@ -65,7 +67,7 @@
   <div class="toast-wrap" id="toast-wrap"></div>
   <script>
     // Flash/toast: handlers send HX-Trigger: {"toast": {"message": ..., "level": ...}}.
-    // The message travels percent-encoded — header bytes are Latin-1 on the
+    // The message travels percent-encoded, header bytes are Latin-1 on the
     // wire, raw UTF-8 would arrive as mojibake.
     document.body.addEventListener('toast', function (e) {
       var wrap = document.getElementById('toast-wrap');
@@ -88,7 +90,7 @@
     // SSE: push updates from the server. Each event is
     // re-broadcast on <body> as a namespaced DOM event so HTMX fragments
     // can react with hx-trigger="fumox:*". Polling fragments remain the
-    // no-JS fallback — SSE is a pure enhancement.
+    // no-JS fallback, SSE is a pure enhancement.
     (function () {
       if (!window.EventSource) return;
       var es = new EventSource('/admin/events');
@@ -116,7 +118,7 @@
     // Local time: the server emits every
     // timestamp as <time class="ts" datetime="RFC3339 UTC">UTC text</time>.
     // The browser rewrites the text into the user's timezone, formatted in
-    // the panel language (<html lang>) — without JS the UTC text stays.
+    // the panel language (<html lang>), without JS the UTC text stays.
     // Re-run after every HTMX swap: fragments carry <time> elements too.
     // Idempotent: the text is always rebuilt from the datetime attribute.
     (function () {
@@ -187,7 +189,7 @@
         if (section) syncSection(section);
       });
       // The widget is re-rendered by HTMX on preset / mode / preview
-      // refresh — re-run after every settle so the initial state matches
+      // refresh, re-run after every settle so the initial state matches
       // the rendered radios.
       document.body.addEventListener('htmx:afterSettle', function () {
         syncAll(document);

@@ -212,7 +212,7 @@ pub async fn source_form(State(state): State<AdminState>, headers: HeaderMap) ->
         cache_ttl_seconds: "3600".into(),
         ..Default::default()
     };
-    // New source: nothing stored yet — an empty builder widget.
+    // New source: nothing stored yet, an empty builder widget.
     let widget_html = widget_from_stored(
         lang.clone(),
         &state.csrf_for(&headers),
@@ -492,7 +492,7 @@ async fn build_source_from_form(
     };
 
     // Headers: "Key: value" lines. Masked values from the edit form are
-    // kept as-is only when unchanged — a masked placeholder means "keep the
+    // kept as-is only when unchanged, a masked placeholder means "keep the
     // stored secret"; we re-read it from the DB below.
     let headers_raw = get("headers");
     let mut headers_map: std::collections::BTreeMap<String, String> =
@@ -1031,7 +1031,7 @@ pub async fn source_toggle(
         is_htmx(&headers),
         &format!("/admin/sources/{id}"),
         // The wrapper id must survive the swap (the form's hx-target points
-        // at it), and the toggle button must flip with the state — it lives
+        // at it), and the toggle button must flip with the state, it lives
         // outside the badge, so it travels along as an out-of-band swap.
         format!(
             r##"<span id="enabled-badge"><span class="badge {}">{}</span></span>
@@ -1184,10 +1184,10 @@ pub async fn source_delete(
         Err(err) => return server_error(lang, &err),
     }
     // Orphaned proxies (no remaining links) transition to `removed`;
-    // reconciliation never resets it — a proxy that reappears in a fetch
+    // reconciliation never resets it, a proxy that reappears in a fetch
     // keeps its state. With `drop_gate = false` the admin click is
     // intentionally conservative: a `ready` row is tunnel-verified and
-    // an `unknown` row has not yet had its first verdict — neither
+    // an `unknown` row has not yet had its first verdict, neither
     // should be retired just because its source went away. The probe is
     // the only authority on the lifecycle of a verified proxy, and the
     // priority queue is the only authority on a not-yet-checked one.
@@ -1240,7 +1240,7 @@ impl DryRunFragment {
     fn fmt_bytes(&self, bytes: &Option<u64>) -> String {
         bytes
             .map(|b| fmt_bytes(&self.lang, b as i64))
-            .unwrap_or_else(|| "—".into())
+            .unwrap_or_else(|| ",".into())
     }
 }
 
@@ -1329,7 +1329,7 @@ impl SourceDetailTemplate {
     }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|n| fmt_bytes(&self.lang, n))
-            .unwrap_or_else(|| "—".into())
+            .unwrap_or_else(|| ",".into())
     }
 }
 
@@ -1339,6 +1339,6 @@ impl SourceLogFragment {
     }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|n| fmt_bytes(&self.lang, n))
-            .unwrap_or_else(|| "—".into())
+            .unwrap_or_else(|| ",".into())
     }
 }

@@ -39,7 +39,7 @@ struct ProfileListRow {
     protected: bool,
     sources_count: i64,
     /// Ready proxies reachable through the profile's sources: `status =
-    /// 'ready'` — i.e. the set the `/sub/{slug}` endpoint would actually
+    /// 'ready'`, i.e. the set the `/sub/{slug}` endpoint would actually
     /// emit right now (the pipeline has vetted them and the probe is done
     /// with the second-chance ladder). Pre-ready statuses (`alive`,
     /// `quarantine`, `unknown`) and terminal `removed` are excluded, since
@@ -245,7 +245,7 @@ pub async fn profile_form(State(state): State<AdminState>, headers: HeaderMap) -
             formats,
             source_picks: picks,
             token_masked_note: false,
-            // New profile: nothing stored yet — an empty builder widget.
+            // New profile: nothing stored yet, an empty builder widget.
             widget_html: widget_from_stored(
                 lang,
                 &state.csrf_for(&headers),
@@ -884,7 +884,7 @@ pub async fn profile_toggle(
         is_htmx(&headers),
         &format!("/admin/profiles/{id}"),
         // The wrapper id must survive the swap (the form's hx-target points
-        // at it), and the toggle button must flip with the state — it lives
+        // at it), and the toggle button must flip with the state, it lives
         // outside the badge, so it travels along as an out-of-band swap.
         format!(
             r##"<span id="enabled-badge"><span class="badge {}">{}</span></span>

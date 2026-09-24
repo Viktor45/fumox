@@ -3,15 +3,15 @@
 //! Fumox never ships the `.mmdb` files (they are gitignored). Until
 //! now the operator had to fetch them by hand; this module closes that gap:
 //! before the listeners bind, each GeoLite2 database in `[geo].db_dir` is
-//! checked and — when missing, implausible (a truncated or broken download
-//! from an earlier attempt) or older than [`MAX_AGE`] — re-downloaded from
+//! checked and, when missing, implausible (a truncated or broken download
+//! from an earlier attempt) or older than [`MAX_AGE`], re-downloaded from
 //! the fixed public mirrors into a temporary file that is atomically
 //! renamed into place. The resolver therefore always finds either a
 //! complete file or nothing, never a half-written one, and a failed
 //! download simply retries on the next start.
 //!
 //! Everything here is best-effort: a failure (unwritable directory, no
-//! network, mirror down) is logged and skipped — geo enrichment is an
+//! network, mirror down) is logged and skipped, geo enrichment is an
 //! optional enhancement, never a startup requirement.
 
 use fumox_core::config::{AppConfig, GeoDbKind};
@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Connect timeout for one download.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Overall budget for one download — the City database is ~70 MB.
+/// Overall budget for one download, the City database is ~70 MB.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Redirect hops allowed between the shortlink and the release asset.
 const MAX_REDIRECTS: usize = 5;
@@ -62,17 +62,17 @@ fn all_files() -> [GeoFile; 2] {
 pub async fn ensure_geo_databases(config: &AppConfig) {
     let geo = &config.geo;
     if !geo.enabled {
-        tracing::debug!("geo enrichment disabled — skipping GeoLite2 database download");
+        tracing::debug!("geo enrichment disabled, skipping GeoLite2 database download");
         return;
     }
     if geo.db_dir.as_os_str().is_empty() {
-        tracing::debug!("[geo].db_dir is empty — skipping GeoLite2 database download");
+        tracing::debug!("[geo].db_dir is empty, skipping GeoLite2 database download");
         return;
     }
     if !ensure_writable_dir(&geo.db_dir) {
         tracing::warn!(
             dir = %geo.db_dir.display(),
-            "directory is not writable — skipping GeoLite2 database download; \
+            "directory is not writable, skipping GeoLite2 database download; \
              provide the .mmdb files manually"
         );
         return;
@@ -117,14 +117,14 @@ async fn ensure_one(dir: &Path, file: &GeoFile, user_agent: &str) -> Outcome {
 }
 
 /// Whether the file must be (re-)downloaded: absent, implausible (empty or
-/// without the MaxMind metadata marker — e.g. a broken earlier download) or
+/// without the MaxMind metadata marker, e.g. a broken earlier download) or
 /// older than [`MAX_AGE`].
 fn needs_download(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return true; // absent
     };
     if !meta.is_file() || !plausible_mmdb(path) {
-        return true; // broken content — refresh regardless of age
+        return true; // broken content, refresh regardless of age
     }
     // A future mtime (clock skew) counts as fresh: it cannot be a month old.
     match SystemTime::now().duration_since(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)) {
@@ -163,7 +163,7 @@ fn twoway_find(haystack: &[u8]) -> Option<usize> {
 }
 
 /// Create `dir` when missing and probe that we can actually write to it
-/// (mode bits alone do not decide — ACLs, read-only mounts and root do).
+/// (mode bits alone do not decide, ACLs, read-only mounts and root do).
 fn ensure_writable_dir(dir: &Path) -> bool {
     if let Err(err) = std::fs::create_dir_all(dir) {
         tracing::warn!(dir = %dir.display(), error = %err, "cannot create db_dir");
@@ -265,7 +265,7 @@ async fn download_body_capped(
             total += chunk.len() as u64;
             if total > max_bytes {
                 return Err(format!(
-                    "download exceeds the {max_bytes} byte cap — not a GeoLite2 database"
+                    "download exceeds the {max_bytes} byte cap, not a GeoLite2 database"
                 ));
             }
             file.write_all(&chunk)
@@ -330,7 +330,7 @@ mod tests {
         std::fs::write(&path, fake_mmdb(b"db-body")).unwrap();
         assert!(!needs_download(&path));
 
-        // Older than a month — refresh.
+        // Older than a month, refresh.
         let month_ago = SystemTime::now() - Duration::from_secs(31 * 24 * 3600);
         std::fs::File::options()
             .write(true)

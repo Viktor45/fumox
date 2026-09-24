@@ -2,7 +2,7 @@
 //!
 //! Free async functions grouped by table family; every multi-statement
 //! operation runs in its own transaction. Rows are mapped onto the domain
-//! models from [`crate::models`] manually — the schema stores booleans as
+//! models from [`crate::models`] manually, the schema stores booleans as
 //! integers and structured fields as JSON text, so the mapping is explicit.
 
 pub mod fetch_log;

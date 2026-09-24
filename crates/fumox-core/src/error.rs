@@ -1,7 +1,7 @@
 //! Core error type shared across the workspace.
 
 /// Core error enum. Variants are added as functionality lands; keep the
-/// log-and-skip principle in mind — parse/fetch failures must never panic.
+/// log-and-skip principle in mind, parse/fetch failures must never panic.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("configuration error: {0}")]

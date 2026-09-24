@@ -95,7 +95,7 @@ impl SettingsTemplate {
         }
     }
 
-    /// The path actually written by the editor — `Missing` reads as the
+    /// The path actually written by the editor, `Missing` reads as the
     /// default location for the "would be" message.
     fn editing_path(&self) -> String {
         match &self.state.config_path {
@@ -116,7 +116,7 @@ pub async fn settings_overview(State(state): State<AdminState>, headers: HeaderM
     // The overview prints the effective config (every panel under
     // *Settings*). Pull from the figment-merged live view so an edit
     // that landed between two page loads is visible without a restart
-    // — destructured `state.admin` / `state.fetch` / … stay frozen at
+    //, destructured `state.admin` / `state.fetch` / … stay frozen at
     // startup, only `state.live_config` is refreshed by
     // `settings_update`.
     let state = state.with_fresh_config();
@@ -131,9 +131,7 @@ pub async fn settings_overview(State(state): State<AdminState>, headers: HeaderM
     render_html(template.lang.clone(), &template, StatusCode::OK)
 }
 
-// ---------------------------------------------------------------------------
-// Edit page
-// ---------------------------------------------------------------------------
+// Edit page.
 
 /// Edit-page template: holds the raw form values and the per-field
 /// errors so the view can re-render on validation failure.
@@ -228,7 +226,7 @@ fn state_appconfig(state: &AdminState) -> AppConfig {
 /// absent otherwise; enums become their short name.
 ///
 /// Loaded from the file on every `GET /admin/settings/edit` so the
-/// form reflects the just-saved state — `state.config` is frozen at
+/// form reflects the just-saved state, `state.config` is frozen at
 /// startup and would otherwise lag behind every admin save. ENV
 /// overrides keep their priority because `AppConfig::load` already
 /// merges them on top of the file.
@@ -383,6 +381,10 @@ fn raw_from_config(c: &AppConfig) -> HashMap<String, String> {
         "probe.heartbeat_interval_secs".into(),
         p.heartbeat_interval_secs.to_string(),
     );
+    raw.insert(
+        "probe.backlog_target_drain_minutes".into(),
+        p.backlog_target_drain_minutes.to_string(),
+    );
 
     raw.insert("meow.api_addr".into(), m.api_addr.clone());
     raw.insert(
@@ -438,7 +440,7 @@ fn ip_family_str(f: IpFamily) -> &'static str {
         // These strings are the SAME ones `IpFamily::from_str` accepts on
         // startup (crates/fumox-core/src/models.rs). If they ever drift,
         // admin saves silently revert on the next restart because the
-        // parser falls back to the default. Keep them locked together —
+        // parser falls back to the default. Keep them locked together ,
         // `apply_all_ip_family_round_trip` in this file proves the pair.
         IpFamily::Ipv4 => "ipv4",
         IpFamily::Ipv6 => "ipv6",
@@ -458,7 +460,7 @@ pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) 
 
     // Reload the file on every GET so the form reflects the last save
     // (the in-memory `state.config` is frozen at startup and would lag
-    // behind every admin write). ENV overrides still win — `AppConfig::load`
+    // behind every admin write). ENV overrides still win, `AppConfig::load`
     // merges them on top of the file.
     let target = editing_target(&state);
     let raw = match fumox_core::config::load(Some(&target)) {
@@ -499,7 +501,7 @@ pub async fn settings_update(
 
     // Build a fresh `EditableConfig` so we can fail-and-replay the form
     // before touching disk. The validator only reads `raw` and the
-    // language catalog — no side effects.
+    // language catalog, no side effects.
     let mut cfg = match EditableConfig::load(&editing_target(&state)) {
         Ok(c) => c,
         Err(err) => return settings_edit_load_error(&state, &headers, err.to_string()),
@@ -680,11 +682,9 @@ fn redirect_after_create(target: &Path, toast: String) -> Response {
         .into_response()
 }
 
-// ---------------------------------------------------------------------------
-// Validation / application
-// ---------------------------------------------------------------------------
+// Validation / application.
 
-/// Walk every supported setting. Each field is parsed in isolation —
+/// Walk every supported setting. Each field is parsed in isolation ,
 /// errors accumulate without short-circuiting so the operator sees
 /// every problem on a single submit.
 fn apply_all(
@@ -1090,6 +1090,16 @@ fn apply_all(
         lang,
         errors,
     );
+    u64_field(
+        raw,
+        "probe.backlog_target_drain_minutes",
+        cfg,
+        "probe.backlog_target_drain_minutes",
+        5,
+        24 * 60,
+        lang,
+        errors,
+    );
 
     // --- meow ---
     string_field(raw, "meow.api_addr", cfg, "meow.api_addr", lang, errors);
@@ -1194,10 +1204,10 @@ fn apply_all(
     }
 }
 
-// -- Field helpers ---------------------------------------------------------
+// Field helpers.
 
 /// Return the value at `field` only when the form actually carried it.
-/// Missing fields are skipped silently — the editor only writes the
+/// Missing fields are skipped silently, the editor only writes the
 /// sections the operator touched, preserving every other setting as it
 /// is on disk. Required-only-on-write validation lives in the per-field
 /// helpers (empty string is an error, no string at all is not).
@@ -1332,7 +1342,7 @@ fn bool_field(
     target: &str,
     errors: &mut Vec<(String, String)>,
 ) {
-    // Booleans default to `false` when the checkbox was absent — the
+    // Booleans default to `false` when the checkbox was absent, the
     // browser drops unchecked checkboxes from the form submission.
     let v = raw_get(raw, field).unwrap_or("");
     let b = match v {
@@ -1429,7 +1439,7 @@ fn rate_limit(
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
-    // Both halves of the pair must be present — leaving one out means
+    // Both halves of the pair must be present, leaving one out means
     // the form was incomplete.
     let Some(limit_str) = raw_get(raw, &format!("{prefix}.limit")) else {
         return;
@@ -1760,7 +1770,7 @@ mod tests {
         let cfg = load_config(Some(&path)).expect("post-save load must work");
         let raw = raw_from_config(&cfg);
         // The fresh load must see the *new* file values, not the
-        // startup snapshot — this is the regression for the bug where
+        // startup snapshot, this is the regression for the bug where
         // the edit page re-rendered stale in-memory state.
         assert_eq!(raw.get("ingest.drop_gate").map(String::as_str), Some("on"));
         assert_eq!(

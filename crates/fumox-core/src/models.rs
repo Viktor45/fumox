@@ -98,7 +98,7 @@ impl FromStr for Scheme {
 ///
 /// `ready` is the tunnel-verified tier: it is
 /// assigned only while the latest T2 check succeeded and demoted back to
-/// `alive` by any failed T2 outcome. The tiers do not overlap — `alive`
+/// `alive` by any failed T2 outcome. The tiers do not overlap, `alive`
 /// means T1-alive without a fresh successful T2, `ready` means alive plus
 /// the confirmed tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -112,7 +112,7 @@ pub enum ProxyStatus {
 }
 
 impl ProxyStatus {
-    /// Every status in schema order — the source for admin UI option lists
+    /// Every status in schema order, the source for admin UI option lists
     /// (pipeline editor health filter).
     pub const ALL: [ProxyStatus; 5] = [
         ProxyStatus::Unknown,
@@ -160,7 +160,7 @@ impl FromStr for ProxyStatus {
 }
 
 /// Fetch error classification (`sources.error_class`, `fetch_log.error_class`).
-/// This is the only permitted vocabulary — the legacy
+/// This is the only permitted vocabulary, the legacy
 /// `stale|unreachable|…` set is removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -224,7 +224,7 @@ pub struct Param {
     pub known: bool,
 }
 
-/// A parsed, normalized proxy record — the unit of deduplication and of the
+/// A parsed, normalized proxy record, the unit of deduplication and of the
 /// processing pipeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProxyEntry {
@@ -327,7 +327,7 @@ pub struct Source {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Preferred IP protocol family for fetching the URL.
     /// `None` inherits the deployment default (`[fetch] ip_family`); a set
-    /// family is strict — without an address of that family the fetch fails.
+    /// family is strict, without an address of that family the fetch fails.
     pub ip_family: Option<IpFamily>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -378,7 +378,7 @@ impl FromStr for IpFamily {
     }
 }
 
-/// Profile — a named combination of sources plus output rules (`profiles`).
+/// Profile, a named combination of sources plus output rules (`profiles`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     /// `nanoid(12)`; doubles as the `/sub/{id}` token when `slug` is unset.
@@ -392,7 +392,7 @@ pub struct Profile {
     pub pipeline: Option<serde_json::Value>,
     /// Country allowlist for `/sub`: ISO 3166-1 alpha-2 codes, uppercase.
     /// Empty = every country; while set, proxies with no determined country
-    /// stay out — the filter passes confirmed geo facts only.
+    /// stay out, the filter passes confirmed geo facts only.
     pub countries: Vec<String>,
     pub enabled: bool,
     pub created_at: i64,
@@ -514,7 +514,7 @@ impl FromStr for OutputFormat {
     }
 }
 
-/// Identifier alphabet for `nanoid(12)` (PLAN invariant).
+/// Identifier alphabet for `nanoid(12)`.
 pub const ID_ALPHABET: &[char; 64] = &[
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
     'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
@@ -527,7 +527,7 @@ pub fn new_id() -> String {
     nanoid::nanoid!(12, ID_ALPHABET)
 }
 
-/// Current Unix timestamp in seconds (UTC) — the timestamp convention used
+/// Current Unix timestamp in seconds (UTC), the timestamp convention used
 /// across the schema.
 pub fn now_ts() -> i64 {
     std::time::SystemTime::now()

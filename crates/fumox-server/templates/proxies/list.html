@@ -109,7 +109,7 @@
   </form>
 </dialog>
 
-<!-- Bulk revival: inverse of cleanup — every action here moves rows
+<!-- Bulk revival: inverse of cleanup, every action here moves rows
      back to `unknown`, not to `removed`. Revived ids are enqueued for
      priority probing so the daemon picks them up on its next cycle
      instead of waiting for the random sample. -->
@@ -308,7 +308,7 @@
           {% if *p == 0 %}
             <span class="page gap">…</span>
           {% else if current %}
-            <span class="page current">{{ p }}</span>
+            <span class="page current" aria-current="page">{{ p }}</span>
           {% else %}
             <a class="page" href="/admin/proxies?page={{ p }}&amp;per_page={{ per_page }}{{ self.query_suffix() }}">{{ p }}</a>
           {% endif %}

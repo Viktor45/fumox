@@ -1,4 +1,4 @@
-//! Proxy fingerprinting — the deduplication key (`proxies.fingerprint`).
+//! Proxy fingerprinting, the deduplication key (`proxies.fingerprint`).
 //!
 //! ```text
 //! fingerprint = sha256(
@@ -105,7 +105,7 @@ fn canonical_security_params(entry: &ProxyEntry) -> String {
 /// `skip-cert-verify`) into a single canonical `insecure` flag.
 ///
 /// A falsy or absent toggle means the same thing (verification on), so falsy
-/// values are dropped entirely — `allowInsecure=0`, `insecure=false` and no
+/// values are dropped entirely, `allowInsecure=0`, `insecure=false` and no
 /// toggle at all produce identical fingerprints.
 fn normalize_insecure_alias(key: &str, value: &str) -> Option<(String, String)> {
     if matches!(key, "insecure" | "allowinsecure" | "skip-cert-verify") {

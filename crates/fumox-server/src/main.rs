@@ -1,4 +1,4 @@
-//! fumox-server — public subscription endpoints and the admin panel.
+//! fumox-server, public subscription endpoints and the admin panel.
 //!
 //! Loads configuration, opens the database, runs the background source
 //! refresh scheduler, serves `/sub` and `/src` on the public listener and
@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     fumox_core::logging::init_tracing(config.log.server);
 
     // Security audit (2026-08-30): running the panel with the built-in
-    // default token is almost certainly a misconfiguration — say so loudly.
+    // default token is almost certainly a misconfiguration, say so loudly.
     if config.admin.is_active() && config.admin.token == fumox_core::config::DEFAULT_ADMIN_TOKEN {
         tracing::warn!(
             "admin token equals the built-in default; \
@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     let app = serve::router(state).route("/healthz", get(|| async { "ok\n" }));
 
     // Admin listener: a separate loopback interface. With
-    // an empty token or enabled=false the panel is inert — the listener
+    // an empty token or enabled=false the panel is inert, the listener
     // still binds and answers 404 to everything.
     let admin_router = if config.admin.is_active() {
         let admin_state = admin::AdminState::new(

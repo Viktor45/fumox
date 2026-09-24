@@ -4,12 +4,13 @@
     base.html on fetch.done/fetch.failed; when finished it shows the result. -#}
 {% if busy %}
 <span id="refresh-status" data-busy="1"
+      aria-live="polite" aria-atomic="true"
       hx-get="/admin/sources/{{ source_id }}/refresh-status"
       hx-trigger="every 2s, fumox:refresh" hx-swap="outerHTML">
   <span class="badge neutral">{{ self.t("common.refreshing") }}</span>
 </span>
 {% else %}
-<span id="refresh-status">
+<span id="refresh-status" aria-live="polite" aria-atomic="true">
   {% if ok %}
     <span class="badge on">{{ self.t("common.done") }}</span>
   {% else %}

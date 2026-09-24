@@ -195,7 +195,7 @@ pub async fn set_sources(
     sources: &[(String, i64)],
 ) -> crate::Result<()> {
     // BEGIN IMMEDIATE: grabs the WAL write lock up front instead of a
-    // deferred read→write upgrade (which busy_timeout cannot cover — the
+    // deferred read→write upgrade (which busy_timeout cannot cover, the
     // upgrade fails with SQLITE_BUSY_SNAPSHOT when another process
     // committed since our snapshot; see proxies::reconcile_source).
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;

@@ -4,7 +4,7 @@
 //! security review v2).
 //!
 //! Proxy hosts and ports arrive from remote subscription feeds and were
-//! previously dialed by the probe with no vetting at all — a feed line like
+//! previously dialed by the probe with no vetting at all, a feed line like
 //! `vless://uuid@169.254.169.254:80#x` turned the daemon into an internal
 //! port scanner. Both call sites now run every candidate through
 //! [`check_ip`] with the same blocklist.
@@ -33,7 +33,7 @@ pub fn pick_vetted(addrs: &[IpAddr], family: IpFamily) -> Option<IpAddr> {
 }
 
 /// Async DNS resolution with an operator-supplied timeout. Async DNS has no
-/// built-in timeout — a hostile authoritative resolver can pin the runtime
+/// built-in timeout, a hostile authoritative resolver can pin the runtime
 /// worker for the OS resolver's default (~30 s+). The single
 /// `tokio::net::lookup_host` wrapper is preferred over per-family A/AAAA
 /// split because the latter would double wire DNS traffic on every
@@ -108,7 +108,7 @@ pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
                 return Err("unique-local address".into());
             }
             // NAT64 well-known prefix 64:ff9b::/96: the low 32 bits are an
-            // IPv4 address — vet the embedded address, not the wrapper
+            // IPv4 address, vet the embedded address, not the wrapper
             // (2001:db8::/32-only U64 prefix 64:ff9b:1::/48 is public space
             // and falls through).
             if segments[0] == 0x0064
@@ -140,9 +140,9 @@ fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
 
 /// Whether a proxy host may be dialed by the probe: IP literals are vetted
 /// directly; hostnames are rejected when they cannot be resolved to a
-/// vetted address (fail closed — an unresolvable name must never become a
+/// vetted address (fail closed, an unresolvable name must never become a
 /// probe target). Returns the full list of vetted addresses so the caller
-/// can dial them directly instead of re-resolving the hostname — a second
+/// can dial them directly instead of re-resolving the hostname, a second
 /// DNS lookup between vet and connect would reopen the rebinding window
 /// the first lookup just closed.
 ///
@@ -150,7 +150,7 @@ fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
 /// every caller is on a Tokio task, and the previous synchronous
 /// `std::net::ToSocketAddrs` blocked the runtime worker for the full
 /// resolver timeout. The timeout is the operator's `[geo].dns_timeout_secs`
-/// knob — see [`lookup_with_timeout`] for the rationale.
+/// knob, see [`lookup_with_timeout`] for the rationale.
 pub async fn vet_probe_host_addrs(
     host: &str,
     allow_private: bool,
@@ -175,7 +175,7 @@ pub async fn vet_probe_host_addrs(
 }
 
 /// Same policy as [`vet_probe_host_addrs`], discarding the resolved
-/// addresses — for dial paths that cannot pin the IP (e.g. a tunnel engine
+/// addresses, for dial paths that cannot pin the IP (e.g. a tunnel engine
 /// resolving the host itself).
 pub async fn vet_probe_host(
     host: &str,
@@ -335,7 +335,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        // A public literal yields exactly itself — the caller dials this
+        // A public literal yields exactly itself, the caller dials this
         // address instead of re-resolving the hostname.
         let addrs = vet_probe_host_addrs("8.8.8.8", false, Duration::from_secs(5))
             .await
@@ -363,7 +363,7 @@ mod tests {
         assert!(err.contains("DNS resolution failed"), "{err}");
     }
 
-    /// The localhost loopback must fail closed under the default policy —
+    /// The localhost loopback must fail closed under the default policy ,
     /// this is the exact primitive the F1 fix removes (a feed steering the
     /// probe at the host's own services).
     #[tokio::test]

@@ -1,21 +1,21 @@
 {# Pipeline widget: the mode switch (builder ⇄ raw), the
-   presets, the builder fields with their live preview — or the raw JSON
+   presets, the builder fields with their live preview, or the raw JSON
    textarea. Rendered by the editor module into the source/profile forms and
    swapped by POST /admin/pipeline/mode and /admin/pipeline/preset (htmx
    targets #ped-widget in the forms). All generation and validation happen
    on the server (solution 13); without JS the widget stays in its rendered
    mode and still submits everything the form needs (pipeline_mode). #}
-<div class="ped-modes" role="group" aria-label="{{ self.t("ped.mode_builder") }} / {{ self.t("ped.mode_json") }}">
+<div class="ped-modes" role="radiogroup" aria-label="{{ self.t("ped.mode_builder") }} / {{ self.t("ped.mode_json") }}">
   <button type="button" class="btn small{% if mode == "builder" %} ped-active{% endif %}"
-          hx-post="/admin/pipeline/mode?to=builder{% if profile %}&amp;profile=1{% endif %}"
+          hx-post="/admin/pipeline/mode?to=builder{% if profile %}&profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
           hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']"
-          aria-pressed="{% if mode == "builder" %}true{% else %}false{% endif %}">{{ self.t("ped.mode_builder") }}</button>
+          role="radio" aria-checked="{% if mode == "builder" %}true{% else %}false{% endif %}">{{ self.t("ped.mode_builder") }}</button>
   <button type="button" class="btn small{% if mode == "raw" %} ped-active{% endif %}"
-          hx-post="/admin/pipeline/mode?to=raw{% if profile %}&amp;profile=1{% endif %}"
+          hx-post="/admin/pipeline/mode?to=raw{% if profile %}&profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
           hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']"
-          aria-pressed="{% if mode == "raw" %}true{% else %}false{% endif %}">{{ self.t("ped.mode_json") }}</button>
+          role="radio" aria-checked="{% if mode == "raw" %}true{% else %}false{% endif %}">{{ self.t("ped.mode_json") }}</button>
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <input type="hidden" name="pipeline_mode" value="{{ mode }}">
 </div>
@@ -56,7 +56,7 @@
 {% if profile %}
 {# The tri-state hint (ped.tri_state_hint) explains section override
    semantics in user-facing words; the merge rule itself is
-   `pipeline::merge_configs` — the profile's top-level sections replace the
+   `pipeline::merge_configs`, the profile's top-level sections replace the
    source's, absent sections pass the source's rules through unchanged. #}
 <div class="hint">{{ self.t("ped.tri_state_hint") }}</div>
 {% endif %}

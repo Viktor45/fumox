@@ -38,7 +38,7 @@ pub struct AdminState {
     pub caches: Caches,
     pub geo: Arc<GeoResolver>,
     /// On-demand enrichment for the proxy card over every GeoLite2 database
-    /// in `[geo].db_dir` — an instance independent of the pipeline resolver
+    /// in `[geo].db_dir`, an instance independent of the pipeline resolver
     /// (own cache), unaffected by `[geo].enabled` gating the pipeline.
     pub geo_full: Arc<fumox_core::geo::FullResolver>,
     /// Immediate-refresh channel into the scheduler (source ids).
@@ -94,7 +94,7 @@ pub struct AdminState {
     /// panel *Edit settings* page writes back to this path.
     pub config_path: ResolvedConfigPath,
     /// Cached answer to `is_writable(config_path)`. Computed once at
-    /// startup — covers the "parent directory writable, file missing"
+    /// startup, covers the "parent directory writable, file missing"
     /// case so the *Create from defaults* button can still appear.
     pub config_writable: bool,
     /// Figment-merged config (defaults → file → `FUMOX_*` env) refreshed
@@ -266,7 +266,7 @@ impl AdminState {
 
 /// Validated `?next=` target shared by the preference setters (`set-lang`,
 /// `set-theme`, `set-dash-top-n`): the redirect must stay on the admin
-/// surface and must not carry control characters — a percent-decoded CR/LF
+/// surface and must not carry control characters, a percent-decoded CR/LF
 /// (e.g. `next=%2Fadmin%0D%0Ax`) would make the `Location` header value
 /// invalid and axum answers 500 instead of redirecting. Anything invalid
 /// falls back to `/admin`.
@@ -280,7 +280,7 @@ pub(crate) fn admin_next(params: &std::collections::HashMap<String, String>) -> 
 }
 
 /// Parse the operator-supplied list of trusted-proxy CIDRs. Bad entries
-/// are logged and dropped — a typo'd CIDR must never silently widen the
+/// are logged and dropped, a typo'd CIDR must never silently widen the
 /// trust boundary.
 pub(crate) fn parse_trusted_cidrs(raw: &[String]) -> Vec<ipnet::IpNet> {
     raw.iter()
@@ -361,7 +361,7 @@ pub fn router(state: AdminState) -> axum::Router {
             "/proxies/remove-unprobeable",
             post(handlers::proxies_remove_unprobeable),
         )
-        // Bulk revival: inverse of cleanup — moves rows back to `unknown`.
+        // Bulk revival: inverse of cleanup, moves rows back to `unknown`.
         // Literal segments must precede `/{id}` for the same reason.
         .route(
             "/proxies/revive-removed-by-country",
@@ -471,7 +471,7 @@ async fn static_css() -> impl IntoResponse {
     )
 }
 
-/// Vendored htmx (fixed version, no CDN — works offline).
+/// Vendored htmx (fixed version, no CDN, works offline).
 async fn static_htmx() -> impl IntoResponse {
     (
         [(
@@ -514,7 +514,7 @@ fn serve_base(
 /// terminates TLS itself, so without such a header the scheme is http.
 ///
 /// The header is only honored when the peer's source IP falls inside one of
-/// the configured `trusted_cidrs` — mirroring the trust gate that
+/// the configured `trusted_cidrs`, mirroring the trust gate that
 /// `auth::client_key` uses for the per-IP rate-limit key, so the URL-scheme
 /// decision and the rate-limit key agree on what "peer" means. Empty
 /// `trusted_cidrs` ⇒ never honor forwarded headers (the safe default the
@@ -601,7 +601,7 @@ mod tests {
         let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
         let trusted: Vec<ipnet::IpNet> = vec!["2.2.2.2/32".parse().unwrap()];
 
-        // Empty allowlist: the forwarded header is *always* ignored — the
+        // Empty allowlist: the forwarded header is *always* ignored, the
         // safe default the empty `[admin].trust_proxy_ips` config advertises.
         let mut h = HeaderMap::new();
         h.insert(header::HOST, "vpn.example.com".parse().unwrap());
@@ -690,7 +690,7 @@ mod tests {
     }
 
     /// Direct unit tests for `request_is_https`. These pin the trust gate
-    /// without going through `serve_base` / host_header parsing — every
+    /// without going through `serve_base` / host_header parsing, every
     /// assertion is "given this peer + these headers + this allowlist,
     /// `request_is_https` returns X".
     fn xfp_https() -> HeaderMap {
@@ -1073,7 +1073,7 @@ mod tests {
     /// from `DefaultBodyLimit::max(1 MiB)` (a `413 Payload Too Large`) is
     /// acceptable; a `400` from the CSRF layer's own `to_bytes` cap is
     /// also acceptable. What is *not* acceptable: the request slipping
-    /// through to a `403` CSRF failure — that would mean the binary body
+    /// through to a `403` CSRF failure, that would mean the binary body
     /// was parsed as urlencoded and silently treated as a missing `_csrf`.
     #[tokio::test]
     async fn oversized_binary_body_is_rejected_before_csrf() {
@@ -1082,7 +1082,7 @@ mod tests {
         let cookie = login(&app).await;
         let csrf = csrf_for(&state, &cookie);
 
-        // 1 MiB + 1 byte of arbitrary binary — invalid UTF-8 too, so even
+        // 1 MiB + 1 byte of arbitrary binary, invalid UTF-8 too, so even
         // if the CSRF layer ran, it could not match `_csrf` against it.
         let mut body = Vec::with_capacity((1 << 20) + 1);
         body.extend_from_slice(&vec![0xFFu8; (1 << 20) + 1]);
@@ -1110,7 +1110,7 @@ mod tests {
             "binary body must not be parsed as urlencoded and silently fail CSRF"
         );
 
-        // The genuine CSRF token is in the body already — even if a
+        // The genuine CSRF token is in the body already, even if a
         // hypothetical parser guessed it, the body cap is the only
         // load-bearing protection.
         let _ = csrf;
@@ -1172,7 +1172,7 @@ mod tests {
 
     /// Vendored assets and HEAD requests bypass the admin rate limiter:
     /// they must stay servable even after the
-    /// per-IP window is exhausted — a page hit by 429 still needs its CSS
+    /// per-IP window is exhausted, a page hit by 429 still needs its CSS
     /// to render the rate-limit message.
     #[tokio::test]
     async fn static_assets_and_head_bypass_the_rate_limit() {
@@ -1332,7 +1332,7 @@ mod tests {
     }
 
     /// F7: unbounded form fields used to be
-    /// stored verbatim — a megabyte pipeline or a hundred tags degraded
+    /// stored verbatim, a megabyte pipeline or a hundred tags degraded
     /// every later render. The caps reject the submission.
     #[tokio::test]
     async fn oversized_form_fields_are_rejected() {
@@ -1701,7 +1701,7 @@ mod tests {
     }
 
     /// The Profiles list shows a per-row count of **ready** proxies
-    /// reachable through the profile's sources — i.e. the set
+    /// reachable through the profile's sources, i.e. the set
     /// `/sub/{slug}` would emit right now. Pre-ready statuses (`alive`,
     /// `quarantine`, `unknown`) and terminal `removed` are excluded.
     /// Proxies reachable only through sources **not** in the profile are
@@ -1714,7 +1714,7 @@ mod tests {
         let now = fumox_core::models::now_ts();
 
         // Profile with one source. A second source exists in the DB but
-        // is not attached to the profile — proxies reachable only through
+        // is not attached to the profile, proxies reachable only through
         // that source must not show up in the count.
         sqlx::query(
             "INSERT INTO profiles (id, name, output_format, enabled, created_at, updated_at)
@@ -1782,7 +1782,7 @@ mod tests {
         .await
         .unwrap();
 
-        // And one ready proxy reachable through **both** sources — it must
+        // And one ready proxy reachable through **both** sources, it must
         // be counted once (DISTINCT px.id).
         sqlx::query(
             "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
@@ -1830,7 +1830,7 @@ mod tests {
         );
         // Sources count is 1 (only `s-in` is attached). Proxies count is
         // 3 (the ready-only count). They sit in two adjacent
-        // `<td class="num">` cells — the same pattern the rest of the
+        // `<td class="num">` cells, the same pattern the rest of the
         // table uses.
         let needle = "<td class=\"num\">1</td>\n            <td class=\"num\">3</td>";
         assert!(
@@ -1908,7 +1908,7 @@ mod tests {
         let pool = state.pool.clone();
         let now = fumox_core::models::now_ts();
 
-        // 60 quarantined proxies — enough to overflow the LIMIT 50 on the
+        // 60 quarantined proxies, enough to overflow the LIMIT 50 on the
         // queue view. The card must still read 60.
         for i in 0..60 {
             sqlx::query(
@@ -2014,10 +2014,11 @@ mod tests {
     }
 
     /// A handful of quarantined rows (well below `sample_size × 20`)
-    /// means no heuristic fires, so the page renders without any
-    /// backlog banner at all.
+    /// means no heuristic fires; with the default 60-min target the
+    /// queue fits comfortably, so the page renders the green "fits the
+    /// target" banner.
     #[tokio::test]
-    async fn probe_screen_silent_when_queue_small() {
+    async fn probe_screen_shows_ok_banner_when_queue_fits_target() {
         let state = test_state(1000).await;
         let pool = state.pool.clone();
         let now = fumox_core::models::now_ts();
@@ -2028,7 +2029,7 @@ mod tests {
                                       quarantined_at, ladder_at, created_at, updated_at)
                  VALUES (?, 'vless', ?, ?, 443, 'c', 'quarantine', ?, ?, 1, 1)",
             )
-            .bind(format!("fp-silent-{i}"))
+            .bind(format!("fp-ok-{i}"))
             .bind(format!("q{i}"))
             .bind(format!("h{i}.example"))
             .bind(now - 3600)
@@ -2043,12 +2044,70 @@ mod tests {
         let html = render_get_html(&app, "/admin/probe", &cookie).await;
 
         assert!(
-            !html.contains("backlog-banner"),
-            "no banner expected: {html}"
+            html.contains("flash ok") && html.contains("backlog-banner"),
+            "green ok banner expected: {html}"
         );
         assert!(
+            html.contains("Очередь probe: в норме"),
+            "level label missing: {html}"
+        );
+        // 5 quarantined, sample 50, cycle 60s → drain is 1 min, well
+        // inside the 60-min default target.
+        assert!(
+            html.contains("drain ~1 мин"),
+            "current drain not mentioned: {html}"
+        );
+        assert!(
+            html.contains("цель: 60 мин"),
+            "target not mentioned: {html}"
+        );
+        // No warning or danger variants on this page.
+        assert!(
             !html.contains("flash warning") && !html.contains("flash danger"),
-            "no flash variant expected: {html}"
+            "no warning/danger expected: {html}"
+        );
+        assert!(
+            !html.contains("Рекомендации"),
+            "no recommendations block expected: {html}"
+        );
+    }
+
+    /// With the target tightened so low that even the smallest queue
+    /// cannot drain in time, the green banner disappears and the
+    /// page renders no flash at all.
+    #[tokio::test]
+    async fn probe_screen_no_banner_when_target_unreachable() {
+        let mut state = test_state(1000).await;
+        state.probe.backlog_target_drain_minutes = 1;
+        let pool = state.pool.clone();
+        let now = fumox_core::models::now_ts();
+
+        // 51 quarantined → ceil(51/50)=2 cycles × 60s = 2 min drain,
+        // which exceeds the 1-min target. None of the heuristic
+        // thresholds fire at this size, so the page should stay silent.
+        for i in 0..51 {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
+                                      quarantined_at, ladder_at, created_at, updated_at)
+                 VALUES (?, 'vless', ?, ?, 443, 'c', 'quarantine', ?, ?, 1, 1)",
+            )
+            .bind(format!("fp-tight-{i}"))
+            .bind(format!("t{i}"))
+            .bind(format!("h{i}.example"))
+            .bind(now - 3600)
+            .bind(now + 3600)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = router(state);
+        let cookie = login(&app).await;
+        let html = render_get_html(&app, "/admin/probe", &cookie).await;
+
+        assert!(
+            !html.contains("backlog-banner"),
+            "no banner expected when target unreachable: {html}"
         );
     }
 
@@ -2062,7 +2121,7 @@ mod tests {
         let now = fumox_core::models::now_ts();
 
         // 4000 quarantined rows; all due now (ladder_at <= now). With
-        // default sample_size=50 and cycle=60s, drain takes 80 min —
+        // default sample_size=50 and cycle=60s, drain takes 80 min ,
         // over the 60-min target, so a recommendation must show.
         sqlx::query(
             "INSERT INTO proxies
@@ -2179,7 +2238,7 @@ mod tests {
             "sample value in due_overflow missing: {html}"
         );
         // Drain time at 300/50 × 60s = 6 min, comfortably below the
-        // 60-min target — no recommendations block.
+        // 60-min target, no recommendations block.
         assert!(
             !html.contains("Рекомендации"),
             "no recs expected at this depth: {html}"
@@ -2187,7 +2246,7 @@ mod tests {
     }
 
     /// The recommended `[probe].sample_size` scales down as the target
-    /// drain time goes up — operators tightening the target get bigger
+    /// drain time goes up: operators tightening the target get bigger
     /// numbers.
     #[tokio::test]
     async fn probe_screen_recommendation_scales_with_target_minutes() {
@@ -2210,7 +2269,7 @@ mod tests {
         .await
         .unwrap();
 
-        // First render with the default 60-min target — required
+        // First render with the default 60-min target, required
         // sample = 4000 × 60 / (60 × 60) = 67.
         let mut state_a = state;
         let app = router(state_a.clone());
@@ -2221,7 +2280,7 @@ mod tests {
             "target=60 should yield sample_size=67: {html_a}"
         );
 
-        // Tighten the target to 15 min — required sample grows to 267.
+        // Tighten the target to 15 min, required sample grows to 267.
         state_a.probe.backlog_target_drain_minutes = 15;
         let app = router(state_a);
         let cookie_b = login(&app).await;
@@ -2266,7 +2325,7 @@ mod tests {
         );
     }
 
-    /// GET helper — runs a request through the router and returns the
+    /// GET helper, runs a request through the router and returns the
     /// collected body as a UTF-8 string. The probe tests only need the
     /// body, so this trims the boilerplate around `oneshot` /
     /// `into_body().collect()`.
@@ -2439,14 +2498,14 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(log.server.as_str()), "{html}");
-        // The admin token is a secret — it must never reach the page.
+        // The admin token is a secret, it must never reach the page.
         assert!(!html.contains(&admin.token), "token leaked: {html}");
     }
 
     /// Two sources with proxies in every status plus probe history; the
     /// dashboard (the former stats screen merged in) must render the
     /// per-source health counters, the
-    /// longest-living top and the 24h probe success rate — with the
+    /// longest-living top and the 24h probe success rate, with the
     /// source-errors block above everything else and no "recent fetches"
     /// table anymore.
     #[tokio::test]
@@ -2627,7 +2686,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let geo_cfg = fumox_core::config::GeoConfig {
-            enabled: false, // pipeline resolver stays inactive — irrelevant here
+            enabled: false, // pipeline resolver stays inactive, irrelevant here
             db_dir: db_dir.clone(),
             ..Default::default()
         };
@@ -2687,7 +2746,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Opening the card is the whole interaction — no button, no POST.
+        // Opening the card is the whole interaction, no button, no POST.
         let app = router(state);
         let cookie = login(&app).await;
         let response = app
@@ -2723,7 +2782,7 @@ mod tests {
             let asn = row
                 .geo_asn
                 .clone()
-                .expect("ASN database present — ASN expected");
+                .expect("ASN database present, ASN expected");
             assert!(asn.starts_with("AS"), "asn format: {asn}");
             assert!(html.contains("AS"), "card shows the ASN: {html}");
             assert!(html.contains("8.8.8.8"), "card shows the IP: {html}");
@@ -2943,7 +3002,7 @@ mod tests {
         assert_eq!(status_by_fp(&pool, "fp-asno").await, "alive");
 
         // Regression (2026-09-11): the HTMX badge fragment substitutes the
-        // `{asn}` placeholder — the catalogs read "removed by AS{asn}" and a
+        // `{asn}` placeholder, the catalogs read "removed by AS{asn}" and a
         // mismatch used to render the literal "AS{n}" to the operator.
         seed_cleanup_proxy(
             &pool,
@@ -3033,7 +3092,7 @@ mod tests {
         seed_cleanup_proxy(&pool, "fp-mieru", "mieru", "unknown", None, None).await;
         seed_cleanup_proxy(&pool, "fp-vlessu", "vless", "unknown", None, None).await;
         // tuic-alive carries a country so the no-country action above
-        // cannot touch it — it must survive both actions.
+        // cannot touch it, it must survive both actions.
         seed_cleanup_proxy(&pool, "fp-tuica", "tuic", "alive", Some("US"), None).await;
 
         let app = router(state.clone());
@@ -3368,7 +3427,7 @@ mod tests {
     /// H4: an attacker-controlled `lang=`
     /// must never reach `Set-Cookie`, `Location`, or any other header. The
     /// `lang_cookie` builder only ever sees a code that came out of
-    /// `Locales::resolve`, which falls back to the default catalog code —
+    /// `Locales::resolve`, which falls back to the default catalog code ,
     /// a fixed literal in the locales TOML, never the raw input.
     #[tokio::test]
     async fn attacker_controlled_lang_does_not_leak_into_any_response_header() {
@@ -3578,7 +3637,7 @@ mod tests {
         assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
 
         // A percent-decoded CR/LF inside `next` (invalid Location header
-        // value — axum would answer 500) falls back to /admin as well.
+        // value, axum would answer 500) falls back to /admin as well.
         let response = app
             .clone()
             .oneshot(request(
@@ -3676,7 +3735,7 @@ mod tests {
             .expect("per-source table heading must render after errors");
         let errors_html = &html[..errors_panel_end];
         // The first 5 source IDs (most recent last_fetched_at) are the
-        // top 5 — they MUST show up in the errors panel; the remaining
+        // top 5, they MUST show up in the errors panel; the remaining
         // IDs MUST NOT show up here. The seed assigns `last_fetched_at =
         // now - idx`, so the most recent is srcT0000000 (idx=0),
         // descending to srcT0000011 (idx=11).
@@ -3698,7 +3757,7 @@ mod tests {
             "5 should be the selected option"
         );
 
-        // Default behaviour (no top-n cookie): top_n=10 — the picker
+        // Default behaviour (no top-n cookie): top_n=10, the picker
         // shows "10" selected and the errors panel renders ≤10 rows.
         let response = app
             .oneshot(request("GET", "/admin", "", Some(&cookie)))
@@ -4456,7 +4515,7 @@ mod tests {
         // re-renders that row in ASN-mode (only the `asns` input, no
         // `match`/`flags`/`key`); reverting flips the row back. This is
         // the endpoint every `hx-trigger="change"` on a target select
-        // fires — the round-trip must produce the right row layout.
+        // fires, the round-trip must produce the right row layout.
         let state = test_state(1000).await;
         let app = router(state.clone());
         let cookie = login(&app).await;
@@ -4484,7 +4543,7 @@ mod tests {
         assert!(html.contains(r#"name="ped_drop_0_match""#), "{html}");
         assert!(!html.contains(r#"name="ped_drop_0_asns""#), "{html}");
 
-        // Switch the same row to target=asn with asns=24940 — the
+        // Switch the same row to target=asn with asns=24940, the
         // response must carry only the ASN-mode row (no `match` field).
         let asn_form = urlencoded(&[
             ("_csrf", &csrf),
@@ -4522,7 +4581,7 @@ mod tests {
             "ASN-mode row must not carry a param key: {html}"
         );
 
-        // The same round-trip preserves a sibling row in regex mode —
+        // The same round-trip preserves a sibling row in regex mode ,
         // changing one row's target must not silently rewrite others.
         let mixed_form = urlencoded(&[
             ("_csrf", &csrf),
@@ -4555,7 +4614,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_rows_render_query_does_not_append() {
         // The change-trigger on a target select calls the rows endpoint
-        // with `?render=1` — the round-trip must NOT append a fresh empty
+        // with `?render=1`, the round-trip must NOT append a fresh empty
         // row, otherwise every target switch would grow the row count by
         // one. The explicit `+` button keeps its append behaviour.
         let state = test_state(1000).await;
@@ -4569,7 +4628,7 @@ mod tests {
             ("ped_drop_0_match", "\\.ua"),
             ("ped_drop_0_target", "host"),
         ]);
-        // No `?render=1` — the legacy `+`-button semantics: append.
+        // No `?render=1`, the legacy `+`-button semantics: append.
         let response = app
             .clone()
             .oneshot(request(
@@ -4588,7 +4647,7 @@ mod tests {
             "expected an appended row: {html}"
         );
 
-        // With `?render=1` — round-trip without append.
+        // With `?render=1`, round-trip without append.
         let response = app
             .clone()
             .oneshot(request(
@@ -4930,7 +4989,7 @@ mod tests {
 
         let app = router(state.clone());
         let cookie = login(&app).await;
-        // The dashboard no longer carries a fetches table — it moved to the logs screen only, so the wrapping
+        // The dashboard no longer carries a fetches table, it moved to the logs screen only, so the wrapping
         // cell is asserted wherever the error column exists. The source card
         // renders the same _log fragment inline, so it carries the journal
         // table too.
@@ -5000,7 +5059,7 @@ mod tests {
 
         // Drop a config file on disk that flips the bool and rebinds
         // the public listener. The file is missing fields the defaults
-        // supply (`probe.*`, `meow.*`, `database.*`, …) — `figment`
+        // supply (`probe.*`, `meow.*`, `database.*`, …), `figment`
         // fills them in via the `Serialized::defaults` layer.
         let dir = std::env::temp_dir().join(format!(
             "fumox-live-refresh-{}",
@@ -5033,13 +5092,13 @@ mod tests {
         );
 
         // `with_fresh_config` returns a clone with the destructured
-        // fields refreshed from the live view — this is what the
+        // fields refreshed from the live view, this is what the
         // *Settings* overview template now sees.
         let fresh = state.with_fresh_config();
         assert!(fresh.ingest.drop_gate, "fresh.ingest.drop_gate");
         assert_eq!(fresh.server.bind.port(), 9999, "fresh.server.bind");
 
-        // The original destructured fields stay frozen at startup —
+        // The original destructured fields stay frozen at startup ,
         // the socket is still bound to 8080, the admin toggle is
         // still off. This is the load-bearing invariant: re-binding
         // the listener and silently invalidating sessions would be a

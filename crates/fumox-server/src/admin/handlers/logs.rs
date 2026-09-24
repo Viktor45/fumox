@@ -1,6 +1,6 @@
 //! Global fetch journal screen: `fetch_log` across all
 //! sources with ok/error, error-class and source filters plus pagination.
-//! Probe history intentionally has no page of its own — it lives on the
+//! Probe history intentionally has no page of its own, it lives on the
 //! proxy card.
 
 use super::{
@@ -52,7 +52,7 @@ impl FetchLogsTemplate {
     }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|bytes| fmt_bytes(&self.lang, bytes))
-            .unwrap_or_else(|| "—".into())
+            .unwrap_or_else(|| ",".into())
     }
 
     fn source_selected(&self, id: &str) -> bool {

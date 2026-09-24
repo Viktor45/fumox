@@ -1,12 +1,12 @@
-//! fumox-probe — health-check daemon.
+//! fumox-probe, health-check daemon.
 //!
 //! Every scheduling cycle runs three passes:
 //!
-//! 1. **Quarantine dues** — second chances and recheck-ladder steps whose
+//! 1. **Quarantine dues**, second chances and recheck-ladder steps whose
 //!    scheduled moment has arrived;
-//! 2. **T1** — a random sample of TCP-connect / TLS-handshake checks over
+//! 2. **T1**, a random sample of TCP-connect / TLS-handshake checks over
 //!    the `unknown`/`alive` population;
-//! 3. **T2** — real tunnel checks for `alive` proxies through the meow-rs
+//! 3. **T2**, real tunnel checks for `alive` proxies through the meow-rs
 //!    REST API, skipped with backoff when meow-rs is down.
 //!    The batch is recency-prioritized: proxies without a single T2
 //!    attempt first, then the ones whose last T2 check is the oldest.
@@ -46,7 +46,7 @@ const MEOW_ABORT_THRESHOLD: usize = 3;
 
 /// Per-batch decision state shared across the parallel T2 tasks. Replaces
 /// the previous `Arc<AtomicBool>`: a single `ServiceUnavailable` no longer
-/// drops the whole batch — only a sustained pattern of consecutive
+/// drops the whole batch, only a sustained pattern of consecutive
 /// failures does.
 struct BatchGuard {
     consecutive: AtomicUsize,
@@ -64,7 +64,7 @@ impl BatchGuard {
     }
 
     /// Record one failure. Returns `true` iff this call crossed the
-    /// threshold and is the first to flip `aborted` — the caller backs
+    /// threshold and is the first to flip `aborted`, the caller backs
     /// off meow on that exact transition, never again within the batch.
     fn record_failure(&self) -> bool {
         let n = self.consecutive.fetch_add(1, Ordering::Relaxed) + 1;
@@ -130,7 +130,7 @@ impl Context {
             .store(now_ts().saturating_add(backoff), Ordering::Relaxed);
     }
 
-    /// meow-rs answered — clear the backoff.
+    /// meow-rs answered, clear the backoff.
     fn meow_recovered(&self) {
         let initial =
             i64::try_from(self.config.meow.backoff_initial_secs.max(1)).unwrap_or(i64::MAX);
@@ -183,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Main scheduling loop: heartbeat and retention run on their own timers,
-/// probe cycles on the configured period. Errors are logged, never fatal —
+/// probe cycles on the configured period. Errors are logged, never fatal ,
 /// a bad cycle must not take down the daemon.
 async fn run(ctx: Arc<Context>) -> anyhow::Result<()> {
     tokio::spawn(heartbeat_loop(ctx.clone()));
@@ -307,11 +307,11 @@ async fn run_t1_checks(
 
 /// SSRF gate for every dial target:
 /// proxy hosts come from remote feeds, so each candidate must pass the
-/// shared address policy before the daemon opens a connection to it —
+/// shared address policy before the daemon opens a connection to it ,
 /// loopback, RFC1918, link-local (cloud metadata), CGNAT and unique-local
 /// addresses are refused unless `[probe].allow_private_targets` is set.
 ///
-/// Async because the underlying DNS lookup is async — keeping the call
+/// Async because the underlying DNS lookup is async, keeping the call
 /// async end-to-end means the runtime worker is never blocked while the
 /// OS resolver runs.
 async fn vet_target_addrs(ctx: &Context, host: &str) -> Result<Vec<std::net::IpAddr>, String> {
@@ -323,8 +323,8 @@ async fn vet_target_addrs(ctx: &Context, host: &str) -> Result<Vec<std::net::IpA
     .await
 }
 
-/// A vet-refused target is a *failed check*, not a skip: the policy blocks exactly what a dead proxy looks like —
-/// unresolvable names and internal addresses — so the attempt is journaled
+/// A vet-refused target is a *failed check*, not a skip: the policy blocks exactly what a dead proxy looks like ,
+/// unresolvable names and internal addresses, so the attempt is journaled
 /// into `probe_results` with the refusal reason and the fail ladder runs.
 /// Silently skipping these let blocked rows clog the head of the T2
 /// recency queue forever (they never got a t2 row to advance past).
@@ -373,7 +373,7 @@ async fn perform_t1_check(ctx: &Context, id: i64, target: &t1::Target<'_>) {
             .await;
             // Strict T2 priority: a
             // T1 success must not wipe the fail counter accumulated from T2
-            // tunnel failures — the counter clears only via a T2 success or
+            // tunnel failures, the counter clears only via a T2 success or
             // the quarantine ladder. Conservative on lookup errors: keep it.
             let reset = match probe_repo::last_failed_kind(&ctx.pool, id).await {
                 Ok(kind) => kind.as_deref() != Some(T2_KIND),
@@ -424,7 +424,7 @@ async fn apply_regular_failure(ctx: &Context, id: i64, now: i64) {
     let spread_secs =
         i64::try_from(probe.second_chance_spread_hours.saturating_mul(3600)).unwrap_or(0);
     // T1 failure: a closed TCP/TLS port says nothing about the tunnel and
-    // must not trigger the T1-suppression flag — see `proxies::check_failed`,
+    // must not trigger the T1-suppression flag, see `proxies::check_failed`,
     // which takes an explicit `mark_t2_failed` argument for that reason.
     match proxies::check_failed(
         &ctx.pool,
@@ -513,7 +513,7 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
 }
 
 /// The quarantine-ladder counterpart of [`apply_vet_block`]: a vet-refused
-/// recheck is a failed recheck — journaled
+/// recheck is a failed recheck, journaled
 /// with the refusal reason, the ladder advances (or the proxy is removed
 /// after the last configured step).
 async fn apply_quarantine_vet_block(
@@ -626,7 +626,7 @@ async fn perform_quarantine_check(
 /// through a real tunnel.
 ///
 /// Success is strict: only a tunnel that came
-/// up *and* answered with a measured `delay` counts — anything else the
+/// up *and* answered with a measured `delay` counts, anything else the
 /// engine reports is a failure. A meow-rs outage is likewise a *failed*
 /// check for every proxy that was due one (journaled as
 /// `probe_kind='t2'`, fail ladder runs): a silent skip left the head of
@@ -677,7 +677,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                 {
                     // The probe batch is deduplicated by `row.id` upstream
                     // (`proxies::select_t2_candidates`), so two rows that
-                    // share a hostname overwrite the same pin map entry —
+                    // share a hostname overwrite the same pin map entry ,
                     // operator intent is unambiguous and the result is the
                     // same vetted IP.
                     pins.insert(row.host.clone(), ip);
@@ -716,7 +716,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // The YAML carries every proxy credential of the batch in plain text —
+    // The YAML carries every proxy credential of the batch in plain text ,
     // same exposure as the SQLite database, same 0600 answer (the DB chmod
     // rationale lives in fumox-core/src/db.rs). The mode is set at creation
     // time so the file is never briefly world-readable.
@@ -755,7 +755,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     for row in batch {
         // Rows that never made it into the generated config (their entry
         // could not be serialized, `clash::generate` skipped them) must get
-        // the real reason journaled — routing them through the engine would
+        // the real reason journaled, routing them through the engine would
         // produce a misleading "proxy not found" failure.
         if !included.contains(&row.id) {
             journal_and_fail(
@@ -827,7 +827,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                     }
                 }
                 DelayOutcome::ProxyFailed(message) => {
-                    // The engine answered authoritatively — the proxy's
+                    // The engine answered authoritatively, the proxy's
                     // tunnel died, but the engine itself is alive. Reset
                     // the consecutive counter so a single 4xx never
                     // poisons the abort budget for the rest of the batch.
@@ -870,7 +870,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                     // row for the same proxy, and (b) the failure was
                     // already bad enough that retrying would just delay
                     // the verdict (5xx with no transport layer involved).
-                    // Either way, the request itself is settled — the
+                    // Either way, the request itself is settled, the
                     // question is whether the engine as a whole is down.
                     // A cheap `/version` ping distinguishes the two: if
                     // meow is alive, this is a per-request blip that
@@ -918,8 +918,8 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     Ok(done + blocked)
 }
 
-/// Journal one failed T2 attempt and run the fail ladder: a proxy that could not get its tunnel check — whether the
-/// tunnel itself failed, the target was vet-refused, or meow-rs was down —
+/// Journal one failed T2 attempt and run the fail ladder: a proxy that could not get its tunnel check, whether the
+/// tunnel itself failed, the target was vet-refused, or meow-rs was down ,
 /// receives a `probe_kind='t2'` failure record, which is also what moves
 /// it forward in the recency queue.
 async fn journal_and_fail(ctx: &Context, id: i64, reason: &str) {
@@ -961,7 +961,7 @@ async fn journal_and_fail(ctx: &Context, id: i64, reason: &str) {
 
 /// Fail every proxy of a batch on the ladder with the same engine-outage
 /// reason: a meow-rs outage at ping/reload
-/// time means every due proxy went unverified this cycle — an unrecorded
+/// time means every due proxy went unverified this cycle, an unrecorded
 /// skip is indistinguishable from an empty pool and pins the head of the
 /// recency queue for the whole outage.
 async fn journal_engine_failure(ctx: &Context, batch: &[proxies::ProxyRow], reason: &str) {
@@ -1059,7 +1059,7 @@ async fn journal(ctx: &Context, entry: ProbeResultEntry<'_>) {
 }
 
 /// Await all spawned check tasks; returns how many completed. Panics are
-/// reported as warnings — one bad task must not kill the cycle.
+/// reported as warnings, one bad task must not kill the cycle.
 async fn collect_tasks(tasks: &mut tokio::task::JoinSet<()>) -> usize {
     let mut completed = 0;
     while let Some(result) = tasks.join_next().await {
@@ -1112,7 +1112,7 @@ mod tests {
 
     /// Hardening: with
     /// the default policy the daemon must refuse to *dial* loopback feed
-    /// targets — but the refusal itself is now a journaled failed check
+    /// targets, but the refusal itself is now a journaled failed check
     /// (the fail ladder runs), so a blocked proxy cannot clog the queues
     /// forever. A live loopback listener stays untouched, and the blocked
     /// proxy collects a failure record instead of silence.
@@ -1174,7 +1174,7 @@ mod tests {
 
     /// The T2 counterpart: a vet-refused T2
     /// candidate is journaled as a failed `t2` check even when meow-rs is
-    /// completely down — the journal row is what un-sticks the head of the
+    /// completely down, the journal row is what un-sticks the head of the
     /// recency queue (the selector orders by the last t2 attempt).
     #[tokio::test]
     async fn t2_vet_block_is_journaled_even_without_meow() {
@@ -1182,7 +1182,7 @@ mod tests {
 
         // A private host that would never pass the gate; the proxy is
         // `alive`, and the T1 pass blocks it too (same policy, same host)
-        // — so the cycle must journal both a failed tcp and a failed t2
+        //, so the cycle must journal both a failed tcp and a failed t2
         // attempt. A high fail_limit keeps the row out of quarantine so
         // both lanes get to record their refusal.
         let id = seed_proxy(&pool, "vless", "127.0.0.1", 1, "alive").await;
@@ -1198,7 +1198,7 @@ mod tests {
 
         run_cycle(ctx).await.unwrap();
 
-        // The failed t2 row exists — exactly what keeps the recency
+        // The failed t2 row exists, exactly what keeps the recency
         // selector moving past blocked rows.
         let (t2_rows, error): (i64, String) = sqlx::query_as(
             "SELECT COUNT(*), COALESCE(MAX(error), '') FROM probe_results
@@ -1221,7 +1221,7 @@ mod tests {
     }
 
     /// Engine failure (engine-failure branch 1): meow answers
-    /// /version but rejects the config reload — every proxy of the batch
+    /// /version but rejects the config reload, every proxy of the batch
     /// gets a journaled failed t2 check (outage reason, fail ladder) and
     /// the recency queue head cannot pin during the outage.
     #[tokio::test]
@@ -1275,7 +1275,7 @@ mod tests {
             assert!(error.contains("meow-rs unavailable"), "id {id}: {error}");
             let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
             // Both lanes failed: the T1 dial (nothing listens on 443) and
-            // the journaled engine outage — fail_count counts both.
+            // the journaled engine outage, fail_count counts both.
             assert_eq!(row.fail_count, 2);
         }
 
@@ -1290,7 +1290,7 @@ mod tests {
     }
 
     /// Engine failure (engine-failure branch 2): meow dies
-    /// mid-batch — the pre-flight ping succeeded (so `reload_config` and
+    /// mid-batch, the pre-flight ping succeeded (so `reload_config` and
     /// the fan-out began), but every delay request and the follow-up
     /// `/version` ping now fail. The connected-engine check therefore
     /// reports `engine_alive = false` for every task, the consecutive
@@ -1347,7 +1347,7 @@ mod tests {
         // failure (engine_alive = false) and the third one flips the
         // abort flag. The fourth task, whichever side of the L733 check
         // it lands on, gets either a "mid-batch" record or an "aborted:"
-        // record — both are engine-outage texts.
+        // record, both are engine-outage texts.
         let a = seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
         let b = seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
         let c = seed_proxy(&pool, "vmess", "127.0.0.1", 443, "alive").await;
@@ -1389,7 +1389,7 @@ mod tests {
             }
             let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
             // Both lanes failed: the T1 dial (nothing listens on 443) and
-            // the engine failure — fail_count counts both.
+            // the engine failure, fail_count counts both.
             assert_eq!(row.fail_count, 2);
         }
         // With concurrency 4 the exact split between "mid_batch" and
@@ -1405,7 +1405,7 @@ mod tests {
     }
 
     /// Per-request blip: every delay check fails with 5xx, but /version
-    /// keeps answering 200 — the engine is alive, the proxy names are
+    /// keeps answering 200, the engine is alive, the proxy names are
     /// just bad. The ping-on-failure check must therefore skip the abort
     /// counter and the batch keeps running: every proxy gets a "meow-rs
     /// transient error" record instead of an "aborted:" one.
@@ -1451,7 +1451,7 @@ mod tests {
         // None of the four proxies crossed the abort threshold:
         // /version answered 200 for every ping, so engine_alive was
         // true for every task and the counter never advanced. No
-        // backoff was engaged either — meow_retry_at stays at 0.
+        // backoff was engaged either, meow_retry_at stays at 0.
         for id in [a, b, c, d] {
             let (error,): (String,) = sqlx::query_as(
                 "SELECT COALESCE(error, '') FROM probe_results
@@ -1564,7 +1564,7 @@ mod tests {
     }
 
     /// The `ready` tier is demoted by every failed T2 outcome (owner
-    /// decision, 2026-09-10) — here, by the meow outage itself: the proxy
+    /// decision, 2026-09-10), here, by the meow outage itself: the proxy
     /// was due a tunnel check, the engine was down, so the verification
     /// no longer holds.
     #[tokio::test]
@@ -1747,7 +1747,7 @@ mod tests {
         let dying = seed_proxy(&pool, "vless", "127.0.0.1", dead_port, "unknown").await;
 
         // meow-rs is absent: its T2 lane fails the due proxies on the
-        // ladder — the live proxy collects
+        // ladder, the live proxy collects
         // one engine-outage failure per cycle, not a silent skip.
         let config = test_config(
             2,
@@ -1789,7 +1789,7 @@ mod tests {
         assert_eq!(row.ladder_step, 0);
 
         // The live proxy stayed alive: cycle 2 hit the meow backoff window
-        // (60s after the cycle-1 outage), so T2 slept silently — the
+        // (60s after the cycle-1 outage), so T2 slept silently, the
         // outage is journaled once per backoff window, not every cycle.
         let row = proxies::get_by_id(&pool, live).await.unwrap().unwrap();
         assert_eq!(row.status, "alive");
@@ -1901,7 +1901,7 @@ mod tests {
         assert!(yaml.contains("fumox-1"));
         assert!(yaml.contains("fumox-2"));
 
-        // Good proxy: T2 confirmed the tunnel — it reaches the
+        // Good proxy: T2 confirmed the tunnel, it reaches the
         // tunnel-verified `ready` tier,
         // latency from the tunnel test.
         let row = proxies::get_by_id(&pool, good).await.unwrap().unwrap();
@@ -1909,7 +1909,7 @@ mod tests {
         assert_eq!(row.fail_count, 0);
         assert_eq!(row.latency_ms, Some(42));
 
-        // Bad proxy: port is open (T1 green) but the tunnel failed —
+        // Bad proxy: port is open (T1 green) but the tunnel failed ,
         // exactly the case T2 exists for. It stays in the plain tier with
         // the fail counted.
         let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
@@ -1934,7 +1934,7 @@ mod tests {
     }
 
     /// Strict T2 priority: a tunnel-dead proxy
-    /// that keeps passing T1 must still reach quarantine — the T1 success of
+    /// that keeps passing T1 must still reach quarantine, the T1 success of
     /// every cycle must not wipe the fail counter accumulated by T2.
     #[tokio::test]
     async fn t1_success_cannot_rescue_proxies_failing_t2() {
@@ -1986,7 +1986,7 @@ mod tests {
         let config = test_config(3, &meow_addr, config_path.clone());
         let ctx = Arc::new(Context::new(config, pool.clone()));
 
-        // Cycle 1: T1 success (no failures yet — counter resets), T2 fail → 1.
+        // Cycle 1: T1 success (no failures yet, counter resets), T2 fail → 1.
         // Cycle 2: T1 success must NOT touch the T2 counter, T2 fail → 2.
         for cycle in 1..=2i64 {
             run_cycle(ctx.clone()).await.unwrap();
@@ -2004,7 +2004,7 @@ mod tests {
 
         // Quarantined rows are sampled by nothing (T1 takes unknown/alive,
         // T2 takes alive; the second chance is ~24h out): further cycles
-        // leave the proxy alone — no T1 success can revive it.
+        // leave the proxy alone, no T1 success can revive it.
         run_cycle(ctx).await.unwrap();
         let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
         assert_eq!(row.status, "quarantine");

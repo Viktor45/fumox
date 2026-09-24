@@ -77,7 +77,7 @@ struct DashboardTemplate {
     ingest_days: Vec<(i64, i64)>,
     /// Largest per-day value of `ingest_days` (bar scale).
     ingest_max: i64,
-    /// Configurable Top-N from the `fumox_dash_top_n` cookie — drives the
+    /// Configurable Top-N from the `fumox_dash_top_n` cookie, drives the
     /// `recent_errors`, `top_alive`, `top_failures` widgets and the country
     /// split's display cap.
     top_n: DashTopN,
@@ -285,7 +285,7 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         Err(err) => return server_error(lang, &err),
     };
 
-    // Longest-living ready proxies: oldest `created_at` first — the
+    // Longest-living ready proxies: oldest `created_at` first, the
     // tunnel-verified tier (`ready`) is a strict subset of `alive`, set
     // only by a successful T2, so showing the top-N there surfaces the
     // proxies that have stayed end-to-end working the longest.
@@ -377,7 +377,7 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
             Err(err) => return server_error(lang, &err),
         };
 
-    // Top failure reasons over the rolling 24h window — the operator's
+    // Top failure reasons over the rolling 24h window, the operator's
     // most actionable signal after the source-errors block at the top:
     // "what kind of probe failure is happening most often right now?"
     let top_failures: Vec<(String, i64)> =
@@ -552,7 +552,7 @@ fn fmt_ts_attr(ts: i64) -> String {
 /// RFC 3339 form, the text keeps the UTC `YYYY-MM-DD HH:MM:SS` fallback. The
 /// admin JS (base.html) rewrites the text into the user's timezone and
 /// re-runs after every HTMX swap; without JS the UTC text stays readable.
-/// The output is HTML — templates must render it through askama's `| safe`.
+/// The output is HTML, templates must render it through askama's `| safe`.
 /// Only server-generated digits and punctuation are interpolated, so it is
 /// safe to trust.
 pub fn fmt_ts_element(ts: i64) -> String {
@@ -566,7 +566,7 @@ pub fn fmt_ts_element(ts: i64) -> String {
 /// [`fmt_ts_element`] for optional timestamps; `None` renders the em dash
 /// used across the admin tables (plain text, no element).
 pub fn fmt_opt_ts_element(ts: Option<i64>) -> String {
-    ts.map(fmt_ts_element).unwrap_or_else(|| "—".into())
+    ts.map(fmt_ts_element).unwrap_or_else(|| ",".into())
 }
 
 /// Human-readable byte size for fetch logs (units follow the UI language).
@@ -634,7 +634,7 @@ pub fn not_found(lang: Lang, what_key: &str) -> Response {
 
 /// Percent-encode a string into unreserved ASCII so it can travel inside a
 /// response header. Header bytes are decoded by the browser as Latin-1
-/// (isomorphic decode), so raw UTF-8 — e.g. a Russian toast message — would
+/// (isomorphic decode), so raw UTF-8, e.g. a Russian toast message, would
 /// arrive as mojibake; percent-encoded UTF-8 survives the wire intact and is
 /// restored client-side with `decodeURIComponent`.
 pub(super) fn header_safe(value: &str) -> String {
@@ -714,7 +714,7 @@ pub type FormMap = std::collections::HashMap<String, String>;
 /// Query parameters that keep duplicates and their original order.
 ///
 /// [`FormMap`] is a `HashMap`, so a repeating key silently collapses to the
-/// last value — which broke the proxy list's multi-select status filter
+/// last value, which broke the proxy list's multi-select status filter
 /// (`?status=alive&status=quarantine` filtered on one status only; security
 /// audit, 2026-09-05). Screens with a multi-select filter extract this.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -741,7 +741,7 @@ pub const MAX_PAGE_SIZE: i64 = 200;
 /// Field/count caps for admin-stored input. A single POST is bounded by
 /// the CSRF buffer (1 MiB) and the
 /// router-wide `DefaultBodyLimit`; these caps keep what actually reaches
-/// SQLite — and every later re-render of it — proportionate to what the
+/// SQLite, and every later re-render of it, proportionate to what the
 /// forms legitimately hold.
 pub mod caps {
     /// Source/profile URL length (matches the fetcher's `MAX_URL_LEN`).
@@ -855,7 +855,7 @@ mod tests {
             "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
         );
 
-        assert_eq!(fmt_opt_ts_element(None), "—");
+        assert_eq!(fmt_opt_ts_element(None), ",");
         assert_eq!(
             fmt_opt_ts_element(Some(1_700_000_000)),
             "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
@@ -872,7 +872,7 @@ mod tests {
     fn toast_header_is_ascii_and_decodes_to_the_message() {
         // Russian text (raw UTF-8 would mojibake in a Latin-1 header) plus
         // JSON-breaking characters.
-        let message = "источник включён — \"quote\" \\ backslash";
+        let message = "источник включён, \"quote\" \\ backslash";
         let response = action_response(true, "/admin/sources/x", String::new(), message);
 
         let header = response
@@ -971,7 +971,7 @@ mod tests {
         // A single page renders nothing (the templates check len > 1).
         assert_eq!(pagination_pages(1, 7, 50), vec![(1, true)]);
         // A page beyond the end clamps to the last page; the window then
-        // covers everything up to it — no gap needed for four pages.
+        // covers everything up to it, no gap needed for four pages.
         let window = pagination_pages(i64::MAX, 40, 10);
         assert_eq!(window, vec![(1, false), (2, false), (3, false), (4, true)]);
     }

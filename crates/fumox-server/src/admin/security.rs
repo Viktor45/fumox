@@ -3,7 +3,7 @@
 //! Content-Security-Policy. The panel renders
 //! with server-side askama escaping and ships its script (htmx) and the
 //! inline bootstrap scripts/styles from itself, so `'unsafe-inline'` for
-//! script/style is the current floor — no external origins are allowed.
+//! script/style is the current floor, no external origins are allowed.
 
 use axum::extract::Request;
 use axum::http::{HeaderValue, header};

@@ -1,10 +1,10 @@
 //! Admin panel internationalization.
 //!
-//! Message catalogs live in external TOML files — one file per language,
+//! Message catalogs live in external TOML files, one file per language,
 //! file name (without extension) is the language code: `locales/ru.toml`,
 //! `locales/en.toml`, … The directory is `[admin].locales_dir` (default
 //! `locales/`, relative to the working directory). Dropping a new file into
-//! the directory and restarting the server adds a language — no rebuild.
+//! the directory and restarting the server adds a language, no rebuild.
 //!
 //! The shipped `ru`/`en` catalogs are also compiled into the binary as a
 //! fallback, so a bare binary without a locales directory still renders the
@@ -304,7 +304,7 @@ macro_rules! impl_i18n {
                 self.lang.t(key).to_string()
             }
             /// Display name of a proxy: the source-provided name, or the
-            /// server address when the source sent none — an empty name
+            /// server address when the source sent none, an empty name
             /// would render an empty, unclickable-looking link. Whitespace
             /// only counts as empty: it displays as nothing.
             #[allow(dead_code)]
@@ -423,7 +423,7 @@ mod tests {
         let args: Vec<(&str, String)> = vec![("path", path)];
         let en = locales.resolve("en").t_named("set.editing_path", &args);
         assert_eq!(en, "Editing: /etc/fumox/app.toml");
-        // Missing arguments leave their placeholder visible — same contract
+        // Missing arguments leave their placeholder visible, same contract
         // as `t_args`, so a missing translation or a refactor that drops a
         // placeholder is obvious instead of silently blank.
         assert_eq!(

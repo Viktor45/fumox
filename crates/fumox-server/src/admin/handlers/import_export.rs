@@ -119,7 +119,7 @@ struct ExportProfile {
 // Export
 // ---------------------------------------------------------------------------
 
-/// `GET /admin/export` — download the whole configuration as JSON.
+/// `GET /admin/export`, download the whole configuration as JSON.
 pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
 
@@ -227,7 +227,7 @@ struct ImportTemplate {
     alive_url: String,
     /// Alive+linked proxy count right now (button context).
     alive_count: i64,
-    /// Absolute public URL of the «all ready» export link — the same
+    /// Absolute public URL of the «all ready» export link, the same
     /// shared token, the verified tier.
     ready_url: String,
     /// Ready+linked proxy count right now.
@@ -236,7 +236,7 @@ struct ImportTemplate {
 
 impl_i18n!(ImportTemplate);
 
-/// Inputs for [`render_page`] — bundled to keep the call sites compact
+/// Inputs for [`render_page`], bundled to keep the call sites compact
 /// and the function's signature below clippy's argument-count cap.
 struct RenderArgs<'a> {
     lang: Lang,
@@ -299,7 +299,7 @@ async fn render_page(state: &AdminState, args: RenderArgs<'_>) -> Response {
     )
 }
 
-/// `GET /admin/import` — the import/export screen.
+/// `GET /admin/import`, the import/export screen.
 pub async fn import_form(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -322,7 +322,7 @@ pub async fn import_form(
     .await
 }
 
-/// `POST /admin/import` — validate then create-new.
+/// `POST /admin/import`, validate then create-new.
 pub async fn import_submit(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -415,7 +415,7 @@ pub async fn import_submit(
     }
 }
 
-/// `POST /admin/import/alive-token` — issue a fresh token for the «all
+/// `POST /admin/import/alive-token`, issue a fresh token for the «all
 /// alive» export link; the previous link stops working immediately.
 pub async fn rotate_alive_token(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
@@ -458,7 +458,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
 
     // DNS-vet window: `vet_url` resolves every URL
     // inside the request; past the window the URLs are only statically
-    // validated — the fetch path re-vets every request anyway, so this is
+    // validated, the fetch path re-vets every request anyway, so this is
     // latency/DNS-traffic hygiene, not a security hole.
     let mut dns_budget = caps::IMPORT_DNS_VET;
     let mut dns_capped = false;
@@ -483,7 +483,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
                 .ip_family
                 .unwrap_or_else(|| state.fetcher.default_family());
             if state.admin.allow_private_urls {
-                // Nothing to reject at the DNS level — the fetch path still
+                // Nothing to reject at the DNS level, the fetch path still
                 // re-vets on every request.
                 if let Err(issue) = fetcher::validate_url(&s.url) {
                     errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
@@ -573,7 +573,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         }
         // Imported access tokens: a third-party file
         // must not plant a guessable secret on a public endpoint. Tokens
-        // shorter than the floor are hard errors — silently regenerating
+        // shorter than the floor are hard errors, silently regenerating
         // them would change what the operator expects the file to contain.
         if let Some(token) = p.access_token.as_deref()
             && !token.is_empty()
@@ -850,7 +850,7 @@ mod tests {
     }
 
     /// F7/F8: import row caps and the
-    /// access-token floor are hard errors — nothing is written.
+    /// access-token floor are hard errors, nothing is written.
     #[tokio::test]
     async fn import_rejects_row_floods_and_short_tokens() {
         // A minimal admin state (tests in admin::mod keep their own; this

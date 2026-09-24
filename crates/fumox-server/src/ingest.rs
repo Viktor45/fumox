@@ -5,8 +5,8 @@
 //! (`last_fetched_at` / `last_error` / `error_class`).
 //!
 //! Parse failures are soft: HTTP 200 with unrecognizable content is
-//! classified `parse_error` — including the "zero recognized
-//! lines" case — and never panics.
+//! classified `parse_error`, including the "zero recognized
+//! lines" case, and never panics.
 //!
 //! Reconciliation keeps alive-linger links for sources without `drop`
 //! rules: a probe-verified proxy missing from the feed stays
@@ -41,7 +41,7 @@ impl IngestOutcome {
     }
 }
 
-/// Fixed ingest settings from the config — everything not per-source.
+/// Fixed ingest settings from the config, everything not per-source.
 #[derive(Debug, Clone, Copy)]
 pub struct IngestSettings {
     /// `[ingest].refresh_check_limit`: how many newly inserted unknown
@@ -60,7 +60,7 @@ pub struct IngestSettings {
 /// Fetch, parse and reconcile one source; journal the result.
 ///
 /// With `force = false` a still-fresh raw snapshot (younger than the
-/// source TTL) short-circuits the HTTP fetch — the database is already
+/// source TTL) short-circuits the HTTP fetch, the database is already
 /// reconciled from that payload. Forced refreshes (the admin
 /// *Refresh now* button) always hit the network.
 ///
@@ -118,7 +118,7 @@ pub async fn ingest_source(
             let recognised = filtered.recognized;
             let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
             // Drop rules (including ASN-targeted ones) run after ASN
-            // resolution — see [`apply_drop_rules`]. They run before the
+            // resolution, see [`apply_drop_rules`]. They run before the
             // `removed_as_unknown` revival handoff so the revived set is
             // the same one that survives drop.
             let (entries_after_drop, dropped_by_pipeline) =
@@ -131,9 +131,9 @@ pub async fn ingest_source(
                 };
             let found = entries_after_drop.len();
             // Alive-linger. `[ingest].drop_gate` decides whether
-            // a source's drop rules disable it: gated (true) — a rule added
+            // a source's drop rules disable it: gated (true), a rule added
             // later reaches the already-stored rows on the very next
-            // refresh; ungated (false, the default) — the probe alone
+            // refresh; ungated (false, the default), the probe alone
             // retires live proxies, drop rules only stop new matches.
             let keep_alive_linger = !(settings.drop_gate && filtered.has_drop_rules);
             match proxies::reconcile_source(
@@ -160,7 +160,7 @@ pub async fn ingest_source(
                     // `[ingest].removed_as_unknown`: a removed proxy the feed
                     // still carries resets to the pristine `unknown` state and
                     // gets the same priority-queue handoff as a fresh insert.
-                    // A failure is logged and never fails the ingest — the
+                    // A failure is logged and never fails the ingest, the
                     // next refresh simply retries.
                     let mut queue_ids = stats.inserted_ids.clone();
                     if settings.removed_as_unknown {
@@ -183,7 +183,7 @@ pub async fn ingest_source(
                     }
                 }
                 Err(err) => {
-                    // Database failure during reconciliation — treat as a
+                    // Database failure during reconciliation, treat as a
                     // server-side (recoverable) problem.
                     let failure = FetchFailure::HttpServer { status: 500 };
                     tracing::error!(error = %err, source = %source.id, "reconciliation failed");
@@ -200,7 +200,7 @@ pub async fn ingest_source(
 }
 
 /// Result of an admin dry-run fetch: everything a real
-/// ingestion does up to parsing — same SSRF vetting, same decode/parse —
+/// ingestion does up to parsing, same SSRF vetting, same decode/parse ,
 /// but nothing is reconciled or journaled.
 #[derive(Debug)]
 pub enum DryRunOutcome {
@@ -263,7 +263,7 @@ pub async fn dry_run_source(
                         format!("{}://{}:{}", entry.scheme, entry.host, entry.port)
                     } else {
                         format!(
-                            "{}://{}:{} — {}",
+                            "{}://{}:{}, {}",
                             entry.scheme, entry.host, entry.port, entry.name
                         )
                     }
@@ -287,7 +287,7 @@ pub async fn dry_run_source(
 /// Priority-check handoff: enqueue up to `limit` of the pass's
 /// newly inserted (and, with `[ingest].removed_as_unknown`, revived)
 /// proxies (repo-side filtering keeps only T1-probeable
-/// `unknown` rows). A failure is logged and never fails the ingest — the
+/// `unknown` rows). A failure is logged and never fails the ingest, the
 /// random sample covers those proxies anyway.
 async fn enqueue_probe_requests(pool: &DbPool, ids: &[i64], limit: u32, now: i64) {
     if limit == 0 || ids.is_empty() {
@@ -329,7 +329,7 @@ async fn resolve_geo_stamps(
 /// protocol allowlist, the total recognised before any filtering and
 /// whether the source's pipeline has any drop rules at all.
 ///
-/// Drop rules do not run inside `parse_payload` — they need a resolved
+/// Drop rules do not run inside `parse_payload`, they need a resolved
 /// ASN stamp per entry, which only exists after [`resolve_geo_stamps`].
 /// The caller runs the drop step explicitly once the geo stamps are
 /// ready; this struct only carries the pre-drop entries plus the
@@ -347,7 +347,7 @@ struct FilteredPayload {
 /// Decode + parse the raw payload according to the source settings.
 /// Returns the recognised entries that survived the protocol allowlist
 /// (and pipeline compile-validation, which fails closed), or an error
-/// message for `parse_error`. Drop rules are NOT evaluated here — see
+/// message for `parse_error`. Drop rules are NOT evaluated here, see
 /// [`apply_drop_rules`] for that step.
 fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPayload, String> {
     let text = std::str::from_utf8(&payload.body)
@@ -375,7 +375,7 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     // The pipeline is compiled only to learn whether drop rules exist
     // (alive-linger gate) and to fail closed on a broken config. Drop
     // rules themselves run later, after ASN stamps are available. Only
-    // the source's own pipeline participates in ingestion — profiles may
+    // the source's own pipeline participates in ingestion, profiles may
     // override the section on serving, but they never take part here
     // (one source feeds many profiles).
     let has_drop_rules = match &source.pipeline {
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn pipeline_drop_rules_filter_entries_before_storage() {
-        // Drop rules now run after geo resolution — the parsing stage only
+        // Drop rules now run after geo resolution, the parsing stage only
         // reports `has_drop_rules`. The full path goes through
         // `apply_drop_rules` with a parallel (all-None) geo stamp slice.
         let mut source = source_with(Encoding::Auto, None);
@@ -677,14 +677,14 @@ mod tests {
         let body = "vless://uuid@1.2.3.4:443#A\nvless://uuid@h:443#B\n";
         let entries = parse_payload(&source, &payload(body)).unwrap().entries;
         assert_eq!(entries.len(), 2);
-        // Rename is serving-side only — the stored entries keep their names.
+        // Rename is serving-side only, the stored entries keep their names.
         assert_eq!(entries[0].name, "A");
     }
 
     #[test]
     fn drop_rules_gate_off_the_alive_linger() {
         // + `[ingest].drop_gate`: the linger decision is
-        // `!(drop_gate && has_drop_rules)` — has_drop_rules alone never
+        // `!(drop_gate && has_drop_rules)`, has_drop_rules alone never
         // disables linger when the config leaves the gate off (the
         // default: the probe alone retires live proxies, drop rules only
         // stop new matches).

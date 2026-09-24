@@ -1,25 +1,8 @@
-# Fumox 🥋⚡
+# Fumox
 
 *Русская версия: [README.ru.md](./README.ru.md)*
 
-`Fumox` is a blazing-fast, lightweight tool built for **real-time subscription data filtering and refinement**.
-
-It takes messy proxy lists from many sources, filters and refines them in real time, and serves clean, structured subscriptions to clients.
-
----
-
-## 💡 What's in a Name?
-
-The name **Fumox** represents an optimized, modern fusion of Eastern discipline and ancient Roman speed:
-
-* **Fu** *(Chinese 工夫)* — Meaning *"mastery"* or *"skill attained through discipline"*. This stands for the stealth-like efficiency, routing accuracy, and precision of our filtering algorithms.
-* **Mox** *(Latin)* — Meaning *"immediately"*, *"instantly"*, or *"at once"*. This reflects the absolute **real-time** nature of the stream engine.
-
-### The Four Pillars of Fumox:
-1. **The Prism (Clarity)** — It slices and refracts incoming massive datasets into clean, isolated subscription topics.
-2. **The Forge (Power)** — It instantly melts down invalid payloads and recasts broken logs into strict, predictable schemas before they hit subscribers.
-3. **The Trampoline (Velocity)** — It catches real-time events and instantly launches targeted updates directly to active webhooks or consumers with zero lag.
-4. **The Pompon (Softness)** — It acts as a gentle, soft buffer that smooths out extreme data spikes and traffic surges, preventing subscribers from being overwhelmed.
+Fumox fetches proxy lists from many sources, filters and refines them in real time, and serves clean, structured subscriptions to clients.
 
 ---
 
@@ -81,7 +64,7 @@ weekly.
 
 ---
 
-## 🔒 Security
+## Security
 
 `[admin].token` is the only critical secret on a fresh install — change it
 before exposing the admin panel to anything other than `127.0.0.1`. **Behind
@@ -112,7 +95,7 @@ configuration reference and the production checklist for context.
 
 ---
 
-## 📖 Documentation
+## Documentation
 
 The **[User Guide](./USERGUIDE.md)** is the place to start: what Fumox is,
 how it works, deployment (Docker Compose / image / source), the full

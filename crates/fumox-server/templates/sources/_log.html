@@ -1,6 +1,6 @@
 {#- Fragment: recent fetches of one source. Rendered standalone for the
     live hx-get refresh of #log-live (source card) and included by
-    sources/detail.html for the initial server render — the markup lives
+    sources/detail.html for the initial server render, the markup lives
     here exactly once. -#}
 {% if log.is_empty() %}
   <p class="muted">{{ self.t("dash.no_fetches") }}</p>

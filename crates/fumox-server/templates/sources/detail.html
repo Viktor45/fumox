@@ -5,21 +5,21 @@
 {% block content %}
 <div class="page-head">
   <h1>{{ source.name }}</h1>
-  <span id="enabled-badge">
+  <span id="enabled-badge" aria-live="polite" aria-atomic="true">
     {% if source.enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
   </span>
   {% match source.error_class %}
     {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
     {% when None %}
   {% endmatch %}
-  <span id="refresh-status"></span>
+  <span id="refresh-status" aria-live="polite" aria-atomic="true"></span>
   <span class="spacer"></span>
   <div class="row-actions">
     <a class="btn" href="/admin/sources/{{ source.id }}/edit">{{ self.t("common.edit") }}</a>
     <form id="toggle-form" method="post" action="/admin/sources/{{ source.id }}/toggle"
           hx-post="/admin/sources/{{ source.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
-      <button class="btn" type="submit">{% if source.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
+      <button class="btn" type="submit" aria-pressed="{% if source.enabled %}true{% else %}false{% endif %}">{% if source.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
     </form>
     <form method="post" action="/admin/sources/{{ source.id }}/refresh"
           hx-post="/admin/sources/{{ source.id }}/refresh" hx-target="#refresh-status" hx-swap="outerHTML">
@@ -31,11 +31,11 @@
       <input type="hidden" name="_csrf" value="{{ csrf }}">
       <button class="btn" type="submit">{{ self.t("src.dry_run") }}<span class="htmx-indicator">&nbsp;…</span></button>
     </form>
-    <button class="btn danger" type="button" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
+    <button class="btn danger" type="button" aria-haspopup="dialog" aria-controls="delete-dialog" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
   </div>
 </div>
 
-<div id="dryrun-target"></div>
+<div id="dryrun-target" aria-live="polite"></div>
 
 <div class="grid cols-2">
   <div class="panel">
@@ -114,9 +114,10 @@
   <h2>{{ self.t("src.fetch_log_title") }}</h2>
   {#- Live refresh: the same fragment the source card renders inline is
       re-fetched every 15 s and on the SSE fetch.done/fetch.failed events
-      (base.html re-broadcasts them as fumox:refresh) — the same pattern as
+      (base.html re-broadcasts them as fumox:refresh), the same pattern as
       the probe history on the proxy card. -#}
   <div id="log-live"
+       aria-live="polite" aria-atomic="false"
        hx-get="/admin/sources/{{ source.id }}/log"
        hx-trigger="every 15s, fumox:refresh" hx-swap="innerHTML">
     {% include "sources/_log.html" %}
@@ -127,7 +128,7 @@
         {% if *p == 0 %}
           <span class="page gap">…</span>
         {% else if current %}
-          <span class="page current">{{ p }}</span>
+          <span class="page current" aria-current="page">{{ p }}</span>
         {% else %}
           <a class="page" href="/admin/sources/{{ source.id }}?page={{ p }}">{{ p }}</a>
         {% endif %}

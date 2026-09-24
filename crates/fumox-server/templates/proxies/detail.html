@@ -5,14 +5,14 @@
 {% block content %}
 <div class="page-head">
   <h1 class="mono">{{ proxy.scheme }}:// {{ proxy.host }}:<wbr>{{ proxy.port }}</h1>
-  <span id="status-badge">
+  <span id="status-badge" aria-live="polite" aria-atomic="true">
     {% if proxy.status == "alive" %}<span class="badge alive">{{ self.t("common.status_alive") }}</span>
     {% else if proxy.status == "quarantine" %}<span class="badge quarantine">{{ self.t("common.status_quarantine") }}</span>
     {% else if proxy.status == "removed" %}<span class="badge removed">{{ self.t("common.status_removed") }}</span>
     {% else %}<span class="badge unknown">{{ self.t("common.status_unknown") }}</span>{% endif %}
   </span>
   {# Unprobeable: UDP-based schemes the probe daemon cannot health-check
-     (tuic, mieru — meow-rs cannot tunnel through them); they stay `unknown`
+     (tuic, mieru, meow-rs cannot tunnel through them); they stay `unknown`
      permanently. #}
   {% if unprobeable %}
     <span class="badge neutral" title="{{ self.t("px.unprobeable_title") }}">{{ self.t("px.unprobeable") }}</span>
@@ -36,13 +36,13 @@
       <tr><th>{{ self.t("px.address") }}</th><td class="mono small">{{ proxy.host }}:<wbr>{{ proxy.port }}</td></tr>
       {# The credential is shown in the open: the card also renders the raw
          subscription line and the parsed params JSON below, both of which
-         carry the same secret — masking just this row was a false comfort. #}
+         carry the same secret, masking just this row was a false comfort. #}
       <tr><th>{{ self.t("px.credential") }}</th><td class="mono small">{{ proxy.credential }}</td></tr>
       <tr><th>{{ self.t("px.fingerprint") }}</th><td class="mono small">{{ proxy.fingerprint }}</td></tr>
     </table>
 
     {# Opening the card auto-refreshes these facts from every available
-       GeoLite2 database (the server does it while rendering the row) —
+       GeoLite2 database (the server does it while rendering the row) ,
        Country/City/ASN and the resolved IP are always current. #}
     <h3>{{ self.t("px.geography") }}</h3>
     <table class="kv">
@@ -77,7 +77,7 @@
     <h2>{{ self.t("px.lifecycle") }}</h2>
     <table class="kv">
       {#- Every lifecycle value is server-generated (statuses, counters,
-          `<time>` timestamps, numbers) — hence `| safe`. -#}
+          `<time>` timestamps, numbers), hence `| safe`. -#}
       {% for (label, value) in lifecycle %}
         <tr><th>{{ label }}</th><td class="small">{{ value | safe }}</td></tr>
       {% endfor %}
@@ -137,6 +137,7 @@
   {#- Live refresh: the same fragment is re-fetched every 10 s. Works with
       plain HTMX; without JS the initial server render is shown. -#}
   <div id="probe-history"
+       aria-live="polite" aria-atomic="false"
        hx-get="/admin/proxies/{{ proxy.id }}/probe-history"
        hx-trigger="every 10s" hx-swap="innerHTML">
     {% include "proxies/_history.html" %}

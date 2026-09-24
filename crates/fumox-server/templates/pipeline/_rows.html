@@ -3,11 +3,11 @@
    _rows_drop.html) sets `section` ("rename" | "drop"), which selects the
    row set, the field prefix (`ped_rename_<i>_` / `ped_drop_<i>`) and the
    add/remove endpoint's ?section=. The target selector markup is
-   duplicated across the two branches — askama macros cannot be shared
+   duplicated across the two branches, askama macros cannot be shared
    from an included file, and the block is small and stable. A drop line
    has no `replace` field: a discard rule only selects, never rewrites.
    Every `target` select carries htmx attributes so changing it (e.g. to
-   `asn`) re-renders the rows container — without the round-trip the
+   `asn`) re-renders the rows container, without the round-trip the
    row keeps its previous layout and the ASN row would still show the
    regex inputs. `hx-include` pulls the whole `ped_*` form so the server
    rebuilds state from the full document, not just the select that

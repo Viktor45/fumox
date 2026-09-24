@@ -2,7 +2,7 @@
 //!
 //! Line format: `vmess://base64(JSON)[#fragment]`. The JSON object carries
 //! the whole proxy definition; the optional fragment is redundant advertising
-//! (it never matches `ps` in practice) and is ignored — the display name
+//! (it never matches `ps` in practice) and is ignored, the display name
 //! comes from `ps` per SPEC.
 //!
 //! Real feeds are inconsistent: `port`/`aid` appear as JSON numbers or

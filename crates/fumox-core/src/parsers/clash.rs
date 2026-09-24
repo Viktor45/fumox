@@ -3,7 +3,7 @@
 //! Clash subscriptions carry proxies as structured YAML items under the
 //! `proxies:` key. Only the proxy list is consumed; proxy groups and rules
 //! are irrelevant to Fumox. Supported item types: `ss`, `trojan`, `vmess`,
-//! `hysteria2`, `vless`, `socks5` — items of any other type are skipped and
+//! `hysteria2`, `vless`, `socks5`, items of any other type are skipped and
 //! counted, never fatal (log-and-skip principle).
 //!
 //! Entries parsed from Clash have no source line; their `raw_line` stays
@@ -177,7 +177,7 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     let credential = credential_parts.join(":");
 
     // A YAML scalar may legally contain a line break, but the URI
-    // serializers emit these two fields verbatim — one would split this proxy
+    // serializers emit these two fields verbatim, one would split this proxy
     // into several output lines and smuggle a foreign scheme past the
     // source's protocol allowlist. Reject the item; the caller counts it.
     // Parameter values are exempt: Clash keeps structured blocks (`ws-opts`,

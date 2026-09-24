@@ -11,7 +11,7 @@
 //! ingestion, health-filtering is expressed as a status exclusion list for
 //! the repository query (and re-applied here defensively), encode lives in
 //! the serving layer. The `drop` rules run at ingestion too (the source's
-//! own pipeline, via [`CompiledPipeline::drop_entries`]) — before
+//! own pipeline, via [`CompiledPipeline::drop_entries`]), before
 //! `rename`, so both sides see the original values. Speed-enrich is a stub
 //! until Phase 4.
 
@@ -64,7 +64,7 @@ pub(crate) struct FilterConfig {
     pub(crate) protocols: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) exclude_protocols: Option<Vec<String>>,
-    /// AS numbers to keep — bare digits (`"24940"`); the `AS24940` spelling
+    /// AS numbers to keep, bare digits (`"24940"`); the `AS24940` spelling
     /// is accepted and normalized to the number. null = no allowlist.
     #[serde(default)]
     pub(crate) asns: Option<Vec<String>>,
@@ -131,7 +131,7 @@ pub(crate) fn parse_rename_target(
 
 /// Compile one rule's regex (shared by rename and drop rules): the `i`/`m`/`s`
 /// flags, then the build. An unknown flag or an uncompilable pattern pushes
-/// the field error and yields `None` — the rule is skipped, every other rule
+/// the field error and yields `None`, the rule is skipped, every other rule
 /// still reports.
 fn compile_rule_regex(
     pattern: &str,
@@ -182,7 +182,7 @@ pub(crate) enum RenameTarget {
 }
 
 /// A discard rule: a proxy matching any rule is thrown away entirely. The
-/// mirror of [`RenameRule`] minus `replace` — the field is absent on purpose
+/// mirror of [`RenameRule`] minus `replace`, the field is absent on purpose
 /// (`deny_unknown_fields` rejects a copy-pasted rewrite rule), a drop rule
 /// only selects.
 ///
@@ -190,8 +190,8 @@ pub(crate) enum RenameTarget {
 /// - regex over `name` / `host` / `port` / `param:KEY` (the rename-style
 ///   selectors), with `match` + optional `flags`;
 /// - ASN list against `target: "asn"`, with `asns` carrying the
-///   numbers. The two flavours are mutually exclusive at validation time
-///   — `match` is meaningless against an ASN and `asns` is meaningless
+///   numbers. The two flavours are mutually exclusive at validation time:
+///   `match` is meaningless against an ASN and `asns` is meaningless
 ///   against a regex.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -286,7 +286,7 @@ pub(crate) struct SortConfig {
 /// Output-size cap. `count` is `i64` so that negative or
 /// fractional input fails with the field-level `pipeline.invalid_limit`
 /// error instead of an opaque serde type error; `null`/missing means "no
-/// cap" — the explicit-defaults reset of the profile tri-state.
+/// cap", the explicit-defaults reset of the profile tri-state.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LimitConfig {
@@ -379,7 +379,7 @@ pub struct PipelineIssue {
     /// Catalog key (`pipeline.*` section of `locales/*.toml`).
     pub key: &'static str,
     /// Positional arguments: field names and offending values. Embedded
-    /// diagnostics (serde/regex details) stay technical English — only the
+    /// diagnostics (serde/regex details) stay technical English, only the
     /// sentence around them is localized.
     pub args: Vec<String>,
 }
@@ -548,7 +548,7 @@ impl CompiledPipeline {
 
         if let Some(limit) = config.limit {
             // `null`/missing keeps the cap unset (the profile's explicit
-            // "defaults" reset); `0` and anything below is a field error —
+            // "defaults" reset); `0` and anything below is a field error ,
             // "no cap" is the absent section, not a magic number.
             match limit.count {
                 None => {}
@@ -569,7 +569,7 @@ impl CompiledPipeline {
         }
     }
 
-    /// Statuses this pipeline excludes — used by the admin preview and
+    /// Statuses this pipeline excludes, used by the admin preview and
     /// proxy browser queries.
     #[allow(dead_code)] // consumed by admin handlers in Phase 2.5
     pub fn exclude_statuses(&self) -> &[ProxyStatus] {
@@ -586,7 +586,7 @@ impl CompiledPipeline {
 
     /// Discard entries matching the `drop` rules (ingestion side
     /// step 3): a matching proxy is never stored, reconciled, geo-resolved
-    /// or queued for probing. Only the drop step runs here — the pipeline's
+    /// or queued for probing. Only the drop step runs here, the pipeline's
     /// other sections are serving-side by design (a profile may override
     /// them, but profiles never take part in ingestion), and the drop
     /// selectors must see the original values exactly as the serving-side
@@ -629,7 +629,7 @@ impl CompiledPipeline {
 
     /// Whether any `drop` rule is configured. Reconciliation asks before a
     /// fetch: a source with drop rules never keeps lingering
-    /// links, so a rule added later cannot be held off by still-alive rows —
+    /// links, so a rule added later cannot be held off by still-alive rows ,
     /// serving-side drop hides them instantly, the next refresh unlinks
     /// them for good.
     pub fn has_drop_rules(&self) -> bool {
@@ -653,7 +653,7 @@ impl CompiledPipeline {
             candidates.retain(|c| !excluded.contains(&c.entry.scheme));
         }
         // AS-number filter: the stored `geo_asn` is a
-        // confirmed fact, resolved when the proxy was ingested — the same
+        // confirmed fact, resolved when the proxy was ingested, the same
         // "only confirmed facts" contract as the profile country allowlist.
         // An allowlist drops proxies without a resolved ASN; an exclude
         // list only removes the named ASNs and keeps the unresolved ones.
@@ -674,14 +674,14 @@ impl CompiledPipeline {
             });
         }
 
-        // filter.forbid_insecure — drop proxies that allow insecure TLS in
+        // filter.forbid_insecure, drop proxies that allow insecure TLS in
         // any spelling. Falsy toggles (`insecure=0`) and
         // alias-free entries survive; the DB row is never touched.
         if self.forbid_insecure {
             candidates.retain(|c| !allows_insecure(&c.entry.params));
         }
 
-        // drop — discard rules. Deliberately before
+        // drop, discard rules. Deliberately before
         // `rename`: both this serving-side pass and the ingestion-side one
         // must see the original values, or the two would disagree; a
         // rewrite must never decide whether a proxy is stored. Any rule
@@ -703,12 +703,12 @@ impl CompiledPipeline {
             });
         }
 
-        // rename — rules apply in order. A rule's `target` picks the field:
+        // rename, rules apply in order. A rule's `target` picks the field:
         // the name (default, the classic behavior), the host, the port or a
         // parameter. Host/port results are guarded: a replacement that
         // would break the URI structure (empty host, non-numeric or
         // out-of-range port, URI delimiters in the host) is skipped with a
-        // WARN, leaving the original intact — a broken rule must not
+        // WARN, leaving the original intact, a broken rule must not
         // produce a broken subscription line for every proxy at once.
         for candidate in &mut candidates {
             for rule in &self.rename {
@@ -716,7 +716,7 @@ impl CompiledPipeline {
             }
         }
 
-        // geo-enrich — rewrite the display name from the template and keep
+        // geo-enrich, rewrite the display name from the template and keep
         // the country code for sorting. No-op when the resolver is inactive.
         if self.geo_enabled && geo.is_active() {
             for candidate in &mut candidates {
@@ -728,7 +728,7 @@ impl CompiledPipeline {
             }
         }
 
-        // health-filter — defensive re-check; the serving layer can load
+        // health-filter, defensive re-check; the serving layer can load
         // every status and rely on this step for exclusion.
         let excluded: HashSet<ProxyStatus> = self.exclude_statuses.iter().copied().collect();
         candidates.retain(|c| !excluded.contains(&c.status));
@@ -736,8 +736,8 @@ impl CompiledPipeline {
         candidates
     }
 
-    /// Post-merge steps: dedup by fingerprint — the first
-    /// occurrence wins, so the earlier source keeps the name it contributed —
+    /// Post-merge steps: dedup by fingerprint, the first
+    /// occurrence wins, so the earlier source keeps the name it contributed ,
     /// followed by the global sort. Speed-enrich is a stub until Phase 4:
     /// latency comes from probe results already stored on the row.
     pub fn finalize(&self, candidates: &mut Vec<Candidate>) {
@@ -745,7 +745,7 @@ impl CompiledPipeline {
         candidates.retain(|c| seen.insert(c.entry.fingerprint()));
         self.sort(candidates);
         // Output cap: applied after dedup and sorting, so
-        // the list keeps its top in the chosen order — `sort: latency`
+        // the list keeps its top in the chosen order, `sort: latency`
         // yields the N fastest, `sort: source` the first N of the feed.
         if let Some(limit) = self.limit_count {
             candidates.truncate(limit);
@@ -810,7 +810,7 @@ pub fn merge_configs(
 /// Whether a drop rule's regex matches its target on the entry. The same
 /// selector semantics as [`apply_rename_rule`]: the raw (percent-encoded)
 /// stored form, the first parameter on a case-insensitive key. A proxy that
-/// matches anywhere is discarded whole — the rule never rewrites anything.
+/// matches anywhere is discarded whole, the rule never rewrites anything.
 fn matches_target(entry: &ProxyEntry, regex: &Regex, target: &RenameTarget) -> bool {
     match target {
         RenameTarget::Name => regex.is_match(&entry.name),
@@ -826,8 +826,8 @@ fn matches_target(entry: &ProxyEntry, regex: &Regex, target: &RenameTarget) -> b
 /// Apply one rename rule to a proxy entry according to its target.
 ///
 /// Parameter values are stored percent-encoded (byte-faithful round-trip,
-/// models.rs `Param.value`); the regex matches that raw form — exactly what
-/// the admin sees in the URI — and the replacement is stored raw as well.
+/// models.rs `Param.value`); the regex matches that raw form, exactly what
+/// the admin sees in the URI, and the replacement is stored raw as well.
 /// This keeps `path=%2Fws` rewritable through its encoded spelling only,
 /// which is the honest, predictable contract (documented in USERGUIDE).
 fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) {
@@ -849,7 +849,7 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) {
                 tracing::warn!(
                     host = %host,
                     fingerprint = entry.fingerprint(),
-                    "rename rule produced an invalid host — keeping the original"
+                    "rename rule produced an invalid host, keeping the original"
                 );
             }
         }
@@ -860,13 +860,13 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) {
                 Err(_) => tracing::warn!(
                     port = %port,
                     fingerprint = entry.fingerprint(),
-                    "rename rule produced an invalid port — keeping the original"
+                    "rename rule produced an invalid port, keeping the original"
                 ),
             }
         }
         RenameTarget::Param(key) => {
             // Case-insensitive: feeds mix spellings (headerType/headertype).
-            // Only the first occurrence is rewritten — the parser also keeps
+            // Only the first occurrence is rewritten, the parser also keeps
             // the first on re-parse, so a rewritten later duplicate would be
             // silently dropped at the next ingest round-trip anyway.
             let Some(param) = entry
@@ -884,7 +884,7 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) {
 /// A rewritten host must survive the output URI verbatim: non-empty, no
 /// URI delimiters, no whitespace, no percent-encoding (the host is not
 /// encoded by the serializer, so a raw `%` would corrupt the address).
-/// A colon is legal only as part of an IPv6 literal — hosts are stored
+/// A colon is legal only as part of an IPv6 literal, hosts are stored
 /// unbracketed (`2001:db8::1`), so a colon-bearing rewrite must parse as
 /// a plain IPv6 address, not smuggle a port or userinfo in.
 fn valid_rewritten_host(host: &str) -> bool {
@@ -937,7 +937,7 @@ fn stored_asn_number(raw: &str) -> Option<u32> {
 /// Validate an ASN list field (`filter.asns` / `filter.exclude_asns`):
 /// every entry must be a plain AS number, bare (`24940`) or with the `AS`
 /// prefix (`AS24940`). Like [`parse_scheme_list`], `None` means "not set"
-/// while an empty array stays empty — an allowlist that keeps nothing.
+/// while an empty array stays empty, an allowlist that keeps nothing.
 fn parse_asn_list(
     raw: &Option<Vec<String>>,
     field: &str,
@@ -983,7 +983,7 @@ fn allows_insecure(params: &[fumox_core::models::Param]) -> bool {
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub entry: ProxyEntry,
-    /// `profile_sources.position` — the source order inside the profile.
+    /// `profile_sources.position`, the source order inside the profile.
     pub source_position: i64,
     pub status: ProxyStatus,
     pub latency_ms: Option<i64>,
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     /// Build a `ProxyEntry` for ingestion-side tests: scheme is fixed,
-    /// credential too — the drop rules only look at the chosen fields.
+    /// credential too, the drop rules only look at the chosen fields.
     fn entry(name: &str, host: &str) -> ProxyEntry {
         ProxyEntry {
             scheme: Scheme::Vless,
@@ -1289,7 +1289,7 @@ mod tests {
 
     #[test]
     fn empty_asns_allowlist_keeps_nothing_and_compiles() {
-        // An explicit empty allowlist means "output nothing" — a real
+        // An explicit empty allowlist means "output nothing", a real
         // config, kept (the editor routes it to raw mode).
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
@@ -1375,7 +1375,7 @@ mod tests {
             "version": 1,
             "rename": [
                 // A port value is not a host, an empty host would break the
-                // URI — both keep the original host.
+                // URI, both keep the original host.
                 { "match": ".*", "replace": "99999", "target": "host" }
             ]
         })))
@@ -1409,7 +1409,7 @@ mod tests {
     #[tokio::test]
     async fn rename_host_target_allows_ipv6_literals_only_as_whole_hosts() {
         // Hosts are stored unbracketed; a colon-bearing rewrite must be a
-        // plain IPv6 literal — this one is legal.
+        // plain IPv6 literal, this one is legal.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [
@@ -1437,7 +1437,7 @@ mod tests {
 
     #[test]
     fn drop_rules_reject_replace_and_unknown_keys() {
-        // A copied rewrite rule carries `replace` — the strict schema
+        // A copied rewrite rule carries `replace`, the strict schema
         // rejects it: a discard rule only selects, never rewrites.
         let err = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
@@ -1518,7 +1518,7 @@ mod tests {
         // The same pattern dropped on the name and rewritten by rename: the
         // drop sees the original name (matching), the rename never runs for
         // the discarded proxy. Ingest applies only the drop on the same
-        // original value — the two sides cannot disagree.
+        // original value, the two sides cannot disagree.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "match": "^free" }],
@@ -1545,7 +1545,7 @@ mod tests {
         .unwrap();
         let candidates = vec![
             // Feeds mix spellings; the value stays percent-encoded in
-            // storage — the rule matches the raw form, as documented.
+            // storage, the rule matches the raw form, as documented.
             candidate_with_params(
                 "a",
                 "h1.example.com",
@@ -1613,7 +1613,7 @@ mod tests {
     #[test]
     fn drop_by_asn_accepts_both_with_and_without_prefix() {
         // `24940` and `AS24940` in the same `asns` list both match a
-        // stored `AS24940` — the validator normalises through
+        // stored `AS24940`, the validator normalises through
         // `asn_number`.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
@@ -1660,7 +1660,7 @@ mod tests {
 
     #[test]
     fn drop_with_text_and_asn_rules_combined() {
-        // Regex over `host` plus ASN list — the same `drop` array holds
+        // Regex over `host` plus ASN list, the same `drop` array holds
         // both flavours and both fire on a matching entry.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
@@ -1755,7 +1755,7 @@ mod tests {
     #[test]
     fn unknown_target_message_lists_asn_alongside_other_values() {
         // The rendered text for an unknown target must include `asn` in
-        // the allowed list — admins see the full picture from one
+        // the allowed list, admins see the full picture from one
         // message. We exercise the runtime translator to make sure both
         // catalogs (en, ru) have been updated, not just the validator.
         let issues = CompiledPipeline::from_json(Some(&json!({
@@ -1891,7 +1891,7 @@ mod tests {
         assert!(geo.is_active());
 
         // The resolver merges every database in db_dir, so one template can
-        // draw country and ASN facts at once — the one-database era could
+        // draw country and ASN facts at once, the one-database era could
         // not render this. 8.8.8.8 is anycast (no city): the missing city
         // must collapse away, not break the name.
         let compiled = CompiledPipeline::from_json(Some(&json!({
@@ -2094,7 +2094,7 @@ mod tests {
                 .await;
             assert_eq!(out.len(), 1, "falsy {key}=0 must survive");
         }
-        // No alias at all — untouched by the filter.
+        // No alias at all, untouched by the filter.
         let plain = candidate("plain", Scheme::Vless, "plain.example.com");
         let out = CompiledPipeline::from_json(None)
             .unwrap()
@@ -2124,7 +2124,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_normalize_params_name_still_compiles_as_the_same_switch() {
-        // Old exports carry "normalize_params": false — the v1 name of the
+        // Old exports carry "normalize_params": false, the v1 name of the
         // switch, accepted via serde alias so imports keep working.
         let legacy = json!({
             "version": 1,

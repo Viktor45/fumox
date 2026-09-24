@@ -28,7 +28,7 @@
 
 <div class="grid cols-2">
   <div class="panel">
-    <h2>{{ self.t("set.state_machine") }} <span class="badge neutral">probe</span></h2>
+    <h2>{{ self.t("set.state_machine") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("probe.fail_limit") }}</th><td>{{ state.probe.fail_limit }}</td></tr>
@@ -41,7 +41,7 @@
   </div>
 
   <div class="panel">
-    <h2>{{ self.t("set.checking") }} <span class="badge neutral">probe</span></h2>
+    <h2>{{ self.t("set.checking") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("probe.cycle_period") }}</th><td>{{ state.probe.cycle_interval_secs }} {{ self.t("common.sec") }}</td></tr>
@@ -57,7 +57,7 @@
   </div>
 
   <div class="panel">
-    <h2>{{ self.t("set.ingest") }} <span class="badge neutral">server</span></h2>
+    <h2>{{ self.t("set.ingest") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("set.refresh_check_limit") }}</th><td>{{ state.ingest.refresh_check_limit }}</td></tr>
@@ -68,7 +68,7 @@
   </div>
 
   <div class="panel">
-    <h2>{{ self.t("set.fetch") }} <span class="badge neutral">server</span></h2>
+    <h2>{{ self.t("set.fetch") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("set.fetch_connect") }}</th><td>{{ state.fetch.connect_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
@@ -84,7 +84,7 @@
   </div>
 
   <div class="panel">
-    <h2>{{ self.t("set.public_listener") }} <span class="badge neutral">server</span></h2>
+    <h2>{{ self.t("set.public_listener") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("set.bind") }}</th><td class="mono small">{{ state.server.bind }}</td></tr>
@@ -95,7 +95,7 @@
   </div>
 
   <div class="panel">
-    <h2>{{ self.t("set.database") }} <span class="badge neutral">server</span></h2>
+    <h2>{{ self.t("set.database") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("set.db_path") }}</th><td class="mono small">{{ state.database.path.display() }}</td></tr>
@@ -106,7 +106,7 @@
   </div>
 
   <div class="panel">
-    <h2>{{ self.t("set.geo_panel") }} <span class="badge neutral">server</span></h2>
+    <h2>{{ self.t("set.geo_panel") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("set.enabled") }}</th><td>{{ state.geo_config.enabled }}</td></tr>
@@ -119,7 +119,7 @@
   </div>
 
   <div class="panel">
-    <h2>{{ self.t("set.admin_panel") }} <span class="badge neutral">server</span></h2>
+    <h2>{{ self.t("set.admin_panel") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("set.enabled") }}</th><td>{{ state.admin.enabled }}</td></tr>
@@ -135,7 +135,7 @@
   </div>
 
   <div class="panel">
-    <h2>{{ self.t("set.log_levels") }} <span class="badge neutral">server+probe</span></h2>
+    <h2>{{ self.t("set.log_levels") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>fumox-server</th><td>{{ state.log.server.as_str() }}</td></tr>
@@ -145,7 +145,7 @@
   </div>
 
   <div class="panel">
-    <h2>{{ self.t("probe.meow_title") }} <span class="badge neutral">probe</span></h2>
+    <h2>{{ self.t("probe.meow_title") }}</h2>
     <table class="kv">
       <tbody>
         <tr><th>REST API</th><td class="mono small">{{ state.meow.api_addr }}</td></tr>

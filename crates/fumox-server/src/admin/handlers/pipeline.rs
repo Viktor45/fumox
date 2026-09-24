@@ -3,7 +3,7 @@
 //! protected admin router, so session auth and the CSRF middleware apply
 //! exactly like to every other admin action; the builder fields ride in the
 //! urlencoded body (`ped_*` names, see [`crate::admin::pipeline_editor`]).
-//! Rendering itself (widget, preview, rows) lives in the editor module —
+//! Rendering itself (widget, preview, rows) lives in the editor module ,
 //! these handlers are HTTP glue only.
 
 use super::FormMap;
@@ -35,7 +35,7 @@ pub async fn pipeline_preview(
 }
 
 /// `#ped-rows` content: the rule lines after add/remove. `section` picks
-/// the container (`rename` — default — or `drop`), `remove` carries the
+/// the container (`rename`, default, or `drop`), `remove` carries the
 /// index of the line to delete; without `remove` a fresh empty line is
 /// appended. The whole container is re-rendered from the posted fields,
 /// so nothing the administrator typed into the other lines is lost.
@@ -77,7 +77,7 @@ pub async fn pipeline_rows(
 }
 
 /// Mode switch: the asymmetric builder ⇄ raw toggle.
-/// Builder → raw is always safe — the JSON is generated from the fields.
+/// Builder → raw is always safe, the JSON is generated from the fields.
 /// Raw → builder only when the textarea parses into the builder; otherwise
 /// the widget stays in raw mode with the warning and the JSON untouched.
 pub async fn pipeline_mode(

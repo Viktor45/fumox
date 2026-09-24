@@ -202,7 +202,35 @@ a:hover { text-decoration: underline; }
 .stat-card { text-align: left; }
 .stat-card .num { font-size: 26px; font-weight: 700; }
 .stat-card .label { color: var(--muted); font-size: 13px; }
-.stat-card .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.stat-card .sub {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+/* Per-category accent stripe (dashboard stat-cards): distinguishes the
+   otherwise identical `.panel.stat-card` shells by the metric family
+   they carry (sources / probes / latency / quarantine / never-checked).
+   The negative margins cancel the panel's 18 px / 20 px padding so the
+   stripe lands flush with the panel border. */
+.stat-card::before {
+  content: "";
+  display: block;
+  height: 3px;
+  margin: -18px -20px 12px;
+  background: var(--accent);
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+.stat-card-sources::before  { background: var(--accent); }
+.stat-card-profiles::before { background: var(--ready); }
+.stat-card-proxies::before  { background: var(--ok); }
+.stat-card-fetches::before  { background: var(--accent-hover); }
+.stat-card-probes::before   { background: var(--ok); }
+.stat-card-latency::before  { background: var(--warn); }
+.stat-card-quarantine::before { background: var(--warn); }
+.stat-card-never::before    { background: var(--muted); opacity: 0.6; }
 
 .page-head {
   display: flex;
@@ -443,6 +471,32 @@ input.tab-input {
   outline-offset: -2px;
   border-radius: 4px;
 }
+/* Global keyboard focus ring for interactive elements that have hover/active
+   state rules but no explicit focus-visible. :where() keeps specificity at
+   zero so the per-element hover/active styling keeps priority when not
+   focused. */
+:where(.btn,
+       .btn.primary, .btn.danger,
+       .topbar nav a,
+       .lang-switch a, .lang-switch.login-lang a,
+       .pagination a, .pagination span.page):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+/* Screen-reader-only heading (login page): visible focus on the heading
+   itself is unnecessary since the visible h2 below it carries the title. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
 #tab-server:checked ~ .tabs label[for="tab-server"],
 #tab-probe:checked ~ .tabs label[for="tab-probe"],
 #tab-shared:checked ~ .tabs label[for="tab-shared"] {
@@ -618,6 +672,11 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 }
 .cleanup-op p { margin: 4px 0 0; }
 .cleanup-op .inline-controls { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+/* Same row-of-controls pattern used outside the cleanup dialog (settings
+   edit: numeric input paired with a unit select) needs the flex parent
+   here — otherwise the children render as block boxes and the side-by-side
+   design intent is lost. */
+div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .cleanup-op input, .cleanup-op select { padding: 6px 8px; font-size: 13.5px; width: 120px; }
 /* The global `overflow-wrap: anywhere` would let a squeezed flex child
    break its label letter-by-letter; the action button must never shrink
@@ -876,6 +935,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   .filters .field input, .filters .field select { font-size: 16px; }
 
   /* Comfortable touch targets (44px) for small controls. */
+  .btn, .btn.primary, .btn.danger { min-height: 44px; padding-top: 9px; padding-bottom: 9px; }
   .btn.small { padding: 8px 12px; min-height: 44px; }
   .check-row { min-height: 44px; }
   .check-row input { width: 18px; height: 18px; }
@@ -962,6 +1022,10 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
   .panel { padding: 12px; }
   .page-head h1 { font-size: 18px; }
   .stat-card .num { font-size: 22px; }
+  /* On a 360 px viewport the 110 px floor on `.kv th` plus a long
+     `td.mono.small` value (full file path, full URL) can push the table
+     past the panel — drop the floor so the column shrinks with the text. */
+  .kv th { min-width: 0; }
   /* Wider stat-bars labels need more room than the 700 px breakpoint
      gave them; the per-day value stays visible (a title-only value is
      unreachable on touch), just smaller. */

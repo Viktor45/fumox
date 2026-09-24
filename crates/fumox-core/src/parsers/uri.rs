@@ -1,9 +1,9 @@
 //! Shared URI mechanics for the line-oriented proxy schemes
 //! (vless, trojan, hysteria2, tuic, mieru, socks5, naive).
 //!
-//! Subscription URIs in the wild routinely violate RFC 3986 — raw UTF-8
+//! Subscription URIs in the wild routinely violate RFC 3986, raw UTF-8
 //! fragments, raw `?` inside parameter values, mixed-case keys, junk
-//! parameters — so splitting is done by hand with tolerant rules instead of a
+//! parameters, so splitting is done by hand with tolerant rules instead of a
 //! standards-strict URL parser:
 //!
 //! * the name is everything after the **first** `#` (it may contain `?`/`#`);
@@ -110,7 +110,7 @@ pub static TUIC_SPEC: UriSchemeSpec = UriSchemeSpec {
 
 /// Render a host for a `host:port` context: an IPv6 literal must be
 /// bracketed (`[2001:db8::1]:443`) or the concatenation is not a parseable
-/// `host:port` at all — both directions of the round-trip and every
+/// `host:port` at all, both directions of the round-trip and every
 /// consumer of the subscription output rely on that. `parse_hostport`
 /// strips the brackets on input, so round-tripping stays byte-stable for
 /// bracketed feeds too. Everything else (hostnames, IPv4) passes through.
@@ -245,7 +245,7 @@ pub fn parse_hostport(s: &str) -> Result<(String, u16), String> {
 ///
 /// One `Param` costs ~56 bytes plus two heap allocations, and a query is
 /// split on every `&`, so a single 10 MiB line of `?&&&&…` expanded into
-/// ~1 GB of resident memory — a process-wide OOM, not a per-task failure.
+/// ~1 GB of resident memory, a process-wide OOM, not a per-task failure.
 /// Real feeds carry at most a dozen
 /// parameters; a line past this cap is malformed, and the caller's
 /// log-and-skip path drops it.
@@ -262,7 +262,7 @@ pub const MAX_PARAM_BYTES: usize = 8 * 1024;
 /// Upper bound on one subscription line, in bytes.
 ///
 /// `raw_line` is persisted verbatim onto every stored row, so an oversized
-/// line is a storage bomb, not just a parse cost — a full 10 MiB fetch of a
+/// line is a storage bomb, not just a parse cost, a full 10 MiB fetch of a
 /// single line became ~20 MiB of SQLite data per row per refresh (security
 /// audit v2, 2026-09-09, F13). Legitimate proxy lines are well under 4 KiB.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -342,7 +342,7 @@ pub fn serialize_query(params: &[Param]) -> String {
 
 /// Lenient percent-decoding: valid `%XX` escapes are decoded, anything else
 /// (including raw UTF-8 and stray `%`) passes through unchanged. Invalid
-/// UTF-8 sequences are replaced lossily — a display name is never worth
+/// UTF-8 sequences are replaced lossily, a display name is never worth
 /// failing the whole line.
 pub fn percent_decode(s: &str) -> String {
     percent_encoding::percent_decode_str(s)
@@ -353,7 +353,7 @@ pub fn percent_decode(s: &str) -> String {
 /// Percent-encode a display name for use as a URI fragment.
 ///
 /// Everything except the RFC 3986 unreserved set (`A-Za-z0-9-._~`) is
-/// encoded, UTF-8 bytes included, with upper-case hex — this matches the
+/// encoded, UTF-8 bytes included, with upper-case hex, this matches the
 /// dominant producer style in real feeds (`encodeURIComponent`-like), so
 /// already-encoded names round-trip byte-for-byte.
 pub fn encode_fragment(name: &str) -> String {
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn userinfo_split_at_last_at_sign() {
-        // base64 userinfo may contain `/` — the path split must not trigger.
+        // base64 userinfo may contain `/`, the path split must not trigger.
         let parts = split_uri("YWVz/x@host:8388/").unwrap();
         assert_eq!(parts.userinfo.as_deref(), Some("YWVz/x"));
         assert_eq!(parts.host, "host");
@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(pairs[1].value, "none");
     }
 
-    /// A 10 MiB line of `&` separators expanded into ~1 GB of `Param`s — a
+    /// A 10 MiB line of `&` separators expanded into ~1 GB of `Param`s, a
     /// process-wide OOM.
     #[test]
     fn oversized_query_is_rejected_not_truncated() {
@@ -538,7 +538,7 @@ mod tests {
     }
 
     /// One multi-megabyte parameter value rode a single line into the DB
-    /// twice (`raw_line` + params JSON, ~20 MiB per row) — the count cap
+    /// twice (`raw_line` + params JSON, ~20 MiB per row), the count cap
     /// alone never saw it.
     #[test]
     fn oversized_param_value_is_rejected() {
@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn oversized_line_is_skipped_entirely() {
         // One huge fragment keeps the line under the param-value cap but
-        // over the line cap — `parse_line` must drop it before anything is
+        // over the line cap, `parse_line` must drop it before anything is
         // stored.
         let name = "x".repeat(MAX_LINE_BYTES + 1);
         let line = format!("vless://u@h.example.com:443?security=reality#{name}");

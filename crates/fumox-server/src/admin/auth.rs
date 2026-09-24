@@ -30,7 +30,7 @@ pub const SESSION_COOKIE: &str = "fumox_session";
 /// The two early-return conditions stay as two distinct code paths (a single
 /// combined `if` would let a "trusted proxy, peer is the trusted CIDR" case
 /// fall through to header inspection when `trusted_cidrs` is empty by
-/// accident — easy bug, hard to catch in review).
+/// accident, easy bug, hard to catch in review).
 ///
 /// 1. No trusted proxies configured ⇒ never honor forwarded headers.
 /// 2. Peer is not in any trusted CIDR ⇒ the header is untrusted.
@@ -223,10 +223,10 @@ impl RateLimiter {
 
     /// Give one hit back to `key`'s window: the outer middleware counts
     /// every request up front, but a deeper rate-limiting layer may reject
-    /// the very same request too — without the refund the outer window pays
+    /// the very same request too, without the refund the outer window pays
     /// for hits the inner limiter already punished. Saturating: a refund for a key whose counter already
     /// expired with its window (or never existed) must never wrap below
-    /// zero — the wrap would blacklist the key for the whole window.
+    /// zero, the wrap would blacklist the key for the whole window.
     pub async fn refund(&self, key: &str) {
         let init = async { Ok::<_, std::convert::Infallible>(Arc::new(AtomicU64::new(0))) };
         if let Ok(counter) = self.counters.try_get_with(key.to_string(), init).await {
@@ -242,7 +242,7 @@ impl RateLimiter {
 ///
 /// `/admin/static/*` (the vendored CSS/htmx assets) and HEAD requests are
 /// exempt: they carry no state and answer identically for everyone, but
-/// each would otherwise burn the same per-IP window as a panel action — a
+/// each would otherwise burn the same per-IP window as a panel action, a
 /// page referencing them re-opens after a burst of fragment loads could be
 /// pushed to 429 by asset fetches alone, and an anonymous passer-by could
 /// exhaust someone else's NAT-shared window with cheap GETs of the CSS.
@@ -417,7 +417,7 @@ pub async fn login_submit(
 }
 
 /// Language switch: persists the choice in the `fumox_lang` cookie and
-/// redirects back to `next` (validated by `super::admin_next` — admin-surface
+/// redirects back to `next` (validated by `super::admin_next`, admin-surface
 /// paths only, no open redirect). Mounted outside the auth/CSRF layers so it
 /// works pre-auth.
 pub async fn set_lang(
@@ -553,7 +553,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limiter_refund_returns_the_hit_to_the_window() {
         let limiter = RateLimiter::new(2, Duration::from_secs(60));
-        // One request counted here, rejected deeper — the refund leaves
+        // One request counted here, rejected deeper, the refund leaves
         // the window exactly as it was before the request arrived.
         assert!(limiter.allow("ip1").await);
         limiter.refund("ip1").await;
@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn empty_trusted_list_never_honors_forwarded_headers() {
         // Even with XFF claiming 1.2.3.4, an unconfigured trust list must
-        // not let the header influence the rate-limit key — peer wins.
+        // not let the header influence the rate-limit key, peer wins.
         let h = xff("1.2.3.4");
         assert_eq!(client_key(peer(), &h, &[]), peer().ip());
         let h = fwd("for=1.2.3.4;proto=https");
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn chain_with_all_trusted_entries_falls_back_to_peer() {
-        // Both hops are inside the trusted CIDR — walking past them all
+        // Both hops are inside the trusted CIDR, walking past them all
         // leaves nothing usable, so the peer wins.
         let h = xff("2.2.2.2, 2.2.2.2");
         assert_eq!(client_key(peer(), &h, &trusted_v4()), peer().ip());
@@ -677,7 +677,7 @@ mod tests {
     }
 
     /// RFC 7239 §4 does not pin parameter ordering. A non-`for=` parameter
-    /// appearing before the `for=` must not abort the walk — only the `for=`
+    /// appearing before the `for=` must not abort the walk, only the `for=`
     /// parameter is load-bearing for the originating-client lookup. The
     /// audit's reported shape was `Forwarded: proto=https;for=1.2.3.4` and
     /// the pre-fix code bailed at `proto=https` (`?` on `strip_prefix`).

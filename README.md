@@ -77,8 +77,8 @@ the `Host`-header allowlist behave correctly:
   to one budget.
 - `[server].allowed_hosts` and `[admin].allowed_hosts`: your public
   hostname (e.g. `["fumox.example.com"]`). Without these, the `Host`
-  header is honored as-is for the alive/ready export token URLs and the
-  rendered admin URLs — an attacker that can poison `Host` reaching the
+  header is honored as-is for the `/export/alive/{token}` /
+  `/export/ready/{token}` export token URLs and the rendered admin URLs — an attacker that can poison `Host` reaching the
   listener can render URLs pointing at a host they control.
 
 Both keys default to `[]` to preserve the historical behavior behind a

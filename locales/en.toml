@@ -207,7 +207,7 @@
 "probe.hours_short" = "h"
 "probe.mins_short" = "m"
 "probe.last_contact" = "last contact:"
-"probe.meow_title" = "meow-rs and rotation (read-only)"
+"probe.meow_title" = "meow-rs and rotation"
 "probe.next_check" = "Next check"
 "probe.ladder_step" = "Ladder step"
 "probe.step_second_chance" = "Second chance"

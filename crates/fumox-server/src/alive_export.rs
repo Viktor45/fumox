@@ -75,7 +75,7 @@ pub async fn serve(
 }
 
 /// `GET /export/ready/{token}`, the url_list of all ready (T2-verified)
-/// proxies, the tunnel-verified twin of [`serve`].
+/// proxies, the tunnel-verified twin of [`serve()`].
 pub async fn serve_ready(
     State(state): State<AppState>,
     headers: HeaderMap,

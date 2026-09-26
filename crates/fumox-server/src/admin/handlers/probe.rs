@@ -250,13 +250,33 @@ fn compute_backlog(
     }
 
     if factors.is_empty() {
-        // No heuristic fired: surface the green OK banner only when
-        // the current drain also fits the target; otherwise stay silent.
+        // No heuristic fired: surface the green OK banner when the
+        // current drain fits the target; otherwise escalate to a
+        // warning so the operator notices the queue is accumulating
+        // even though no hard threshold has tripped yet.
         let target_minutes = cfg.backlog_target_drain_minutes.max(1);
         let cycles_to_drain = (quarantine_count.max(1) + sample_size - 1) / sample_size.max(1);
         let drain_minutes_now: u64 = ((cycles_to_drain * cycle as i64 + 59) / 60).max(1) as u64;
         if drain_minutes_now > target_minutes {
-            return None;
+            return Some(BacklogDiagnostic {
+                level: BacklogLevel::Warning,
+                factors: vec![BacklogFactor {
+                    key: "drain_over_target",
+                    severity: BacklogLevel::Warning,
+                }],
+                recs: compute_recs(
+                    cfg,
+                    quarantine_count,
+                    sample_size as u32,
+                    cycle,
+                    concurrency,
+                ),
+                target_drain_minutes: target_minutes,
+                quarantine_count,
+                due_count,
+                due_capacity: cfg.sample_size,
+                oldest_quarantined_age_secs,
+            });
         }
         return Some(BacklogDiagnostic {
             level: BacklogLevel::Ok,
@@ -484,6 +504,20 @@ impl ProbeTemplate {
                     .map(|hb| (fumox_core::models::now_ts() - hb.ts).max(0))
                     .unwrap_or(0);
                 self.lang.t_named(&key, &[("secs", secs.to_string())])
+            }
+            "drain_over_target" => {
+                let sample = self.probe_view.sample_size.max(1) as i64;
+                let cycle = self.probe_view.cycle_interval_secs.max(1) as i64;
+                let cycles = (b.quarantine_count.max(1) + sample - 1) / sample;
+                let drain = ((cycles * cycle) + 59) / 60;
+                self.lang.t_named(
+                    &key,
+                    &[
+                        ("count", b.quarantine_count.to_string()),
+                        ("drain", drain.to_string()),
+                        ("target", b.target_drain_minutes.to_string()),
+                    ],
+                )
             }
             "all_ok" => {
                 let sample = self.probe_view.sample_size.max(1) as i64;

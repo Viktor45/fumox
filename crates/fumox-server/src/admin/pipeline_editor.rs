@@ -1,7 +1,8 @@
 //! Pipeline builder state: the server-side half of the admin
-//! pipeline editor. `BuilderState` mirrors the widget's form fields; [`emit`]
-//! generates the pipeline JSON (validator semantics, only non-default values)
-//! and [`ingest`] rebuilds the state from a stored JSON or reports "raw
+//! pipeline editor. `BuilderState` mirrors the widget's form fields;
+//! [`BuilderState::emit`] generates the pipeline JSON (validator semantics,
+//! only non-default values) and [`BuilderState::ingest`] rebuilds the state
+//! from a stored JSON or reports "raw
 //! mode". The schema registry (`Schema`) sources every option list from the
 //! validator's own enums, so the builder can never offer a value the
 //! validator rejects out of hand. The widget itself (modes, presets,
@@ -17,7 +18,7 @@ use fumox_core::models::{ProxyStatus, Scheme};
 /// `target` mirrors the rule's `target` field in the compact UI form:
 /// `"name"`/`"host"`/`"port"` or `"param:KEY"`. The `param` key part is a
 /// separate free-text field in the widget (`_rows.html`), so `target`
-/// holds `"param"` and `param_key` the key; [`emit_rename_rule`] recombines
+/// holds `"param"` and `param_key` the key; [`emit_rename_target`] recombines
 /// them. Keeping them split avoids a regex round-trip between the form and
 /// the state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,7 +73,8 @@ impl DropRow {
 }
 
 /// Values of the builder widget, exactly as the form fields carry them.
-/// Section toggles (`*_set`) express the administrator's intent; [`emit`]
+/// Section toggles (`*_set`) express the administrator's intent;
+/// [`BuilderState::emit`]
 /// turns a set section into JSON only when it holds at least one value that
 /// differs from the defaults.
 ///
@@ -107,7 +109,8 @@ pub(crate) struct BuilderState {
     pub geo_set: bool,
     pub geo_defaults: bool,
     pub geo_enabled: bool,
-    /// Empty means the built-in default template (never emitted, see [`emit`]).
+    /// Empty means the built-in default template (never emitted, see
+    /// [`BuilderState::emit`]).
     pub geo_template: String,
     pub health_set: bool,
     pub health_defaults: bool,
@@ -2308,7 +2311,7 @@ mod tests {
         let html = widget.html();
         assert!(html.contains(r#"value="builder""#), "{html}");
         assert!(html.contains("ped_filter_protocols"), "{html}");
-        assert!(html.contains("Сгенерированный pipeline JSON"), "{html}");
+        assert!(html.contains("Сгенерированный конвейер JSON"), "{html}");
         assert!(
             html.contains("hx-post=\"/admin/pipeline/preview\""),
             "{html}"
@@ -2320,7 +2323,10 @@ mod tests {
         let html = widget.html();
         assert!(html.contains(r#"value="raw""#), "{html}");
         assert!(html.contains("id=\"pipeline-field\""), "{html}");
-        assert!(html.contains("конструктор не представляет"), "{html}");
+        assert!(
+            html.contains("невозможно представить в конструкторе"),
+            "{html}"
+        );
         assert!(!html.contains("ped_filter_protocols"), "{html}");
     }
 

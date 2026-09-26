@@ -132,7 +132,7 @@ fn parse_naive(transport: &str, rest: &str, line: &str) -> LineOutcome {
 
 /// Serialize an entry back into a subscription line.
 ///
-/// Guaranteed to return a single line: [`sanitize_for_output`] strips line
+/// Guaranteed to return a single line: `sanitize_for_output` strips line
 /// breaks from the fields the serializers emit verbatim. Parsers reject such
 /// values up front, so this only catches rows that predate the check or were
 /// written directly into SQLite.

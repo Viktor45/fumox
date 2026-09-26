@@ -281,6 +281,7 @@
 "probe.factor_all_ok" = "{count} quarantined, drain ~{drain} min (target {target} min)"
 "probe.factor_deep_queue" = "Quarantine depth is {count}, about {ratio}× the per-cycle sample"
 "probe.factor_due_overflow" = "{due} rows are due now, only {sample} can be checked per cycle"
+"probe.factor_drain_over_target" = "{count} quarantined, drain ~{drain} min exceeds target {target} min"
 "probe.factor_stale_oldest" = "Oldest quarantined row has waited {days} days (stale after {limit})"
 "probe.factor_heartbeat_dead" = "Probe heartbeat missing for {secs}s, queue is not draining"
 "probe.recs_head" = "Recommendations to drain in ~{0} min:"

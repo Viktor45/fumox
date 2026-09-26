@@ -281,6 +281,7 @@
 "probe.factor_all_ok" = "В карантине {count}, осушение за ~{drain} мин (цель: {target} мин)"
 "probe.factor_deep_queue" = "В карантине {count}, это примерно {ratio}× выборки за цикл"
 "probe.factor_due_overflow" = "Готово к проверке {due}, за цикл берётся {sample}"
+"probe.factor_drain_over_target" = "В карантине {count}, осушение за ~{drain} мин превышает цель {target} мин"
 "probe.factor_stale_oldest" = "Самая старая запись в карантине ждёт {days} дн. (устаревает после {limit})"
 "probe.factor_heartbeat_dead" = "Heartbeat чекера отсутствует {secs} с, очередь не осушивается"
 "probe.recs_head" = "Рекомендации, чтобы осушить за ~{0} мин:"

@@ -1879,7 +1879,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        assert!(html.contains("Проверка"));
+        assert!(html.contains("Чекер"));
         assert!(html.contains("4242")); // pid from the heartbeat
         assert!(html.contains("sick-proxy")); // quarantine queue row
         assert!(html.contains("q.example.com"));
@@ -2048,13 +2048,13 @@ mod tests {
             "green ok banner expected: {html}"
         );
         assert!(
-            html.contains("Очередь probe: в норме"),
+            html.contains("Очередь проверки: в норме"),
             "level label missing: {html}"
         );
         // 5 quarantined, sample 50, cycle 60s → drain is 1 min, well
         // inside the 60-min default target.
         assert!(
-            html.contains("drain ~1 мин"),
+            html.contains("осушение за ~1 мин"),
             "current drain not mentioned: {html}"
         );
         assert!(
@@ -2073,10 +2073,11 @@ mod tests {
     }
 
     /// With the target tightened so low that even the smallest queue
-    /// cannot drain in time, the green banner disappears and the
-    /// page renders no flash at all.
+    /// cannot drain in time, no hard heuristic trips but the page must
+    /// still show a warning banner with the `drain_over_target` factor
+    /// and a recommendation.
     #[tokio::test]
-    async fn probe_screen_no_banner_when_target_unreachable() {
+    async fn probe_screen_warns_when_drain_exceeds_target() {
         let mut state = test_state(1000).await;
         state.probe.backlog_target_drain_minutes = 1;
         let pool = state.pool.clone();
@@ -2084,7 +2085,8 @@ mod tests {
 
         // 51 quarantined → ceil(51/50)=2 cycles × 60s = 2 min drain,
         // which exceeds the 1-min target. None of the heuristic
-        // thresholds fire at this size, so the page should stay silent.
+        // thresholds fire at this size, so the banner is driven by the
+        // soft drain-vs-target check.
         for i in 0..51 {
             sqlx::query(
                 "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
@@ -2106,8 +2108,21 @@ mod tests {
         let html = render_get_html(&app, "/admin/probe", &cookie).await;
 
         assert!(
-            !html.contains("backlog-banner"),
-            "no banner expected when target unreachable: {html}"
+            html.contains("flash warning") && html.contains("backlog-banner"),
+            "warning banner expected when target unreachable: {html}"
+        );
+        assert!(
+            html.contains("flash danger") == false,
+            "danger banner is not warranted at this size: {html}"
+        );
+        assert!(html.contains("Очередь проверки:"), "title missing: {html}");
+        assert!(
+            html.contains("drain_over_target") || html.contains("превышает цель"),
+            "drain_over_target factor missing: {html}"
+        );
+        assert!(
+            html.contains("Рекомендации"),
+            "recommendations block expected: {html}"
         );
     }
 
@@ -2146,7 +2161,7 @@ mod tests {
             html.contains("flash warning") && html.contains("backlog-banner"),
             "warning banner expected: {html}"
         );
-        assert!(html.contains("Очередь probe:"), "title missing: {html}");
+        assert!(html.contains("Очередь проверки:"), "title missing: {html}");
         assert!(
             html.contains("В карантине 4000"),
             "deep_queue factor missing: {html}"
@@ -2320,7 +2335,7 @@ mod tests {
             "danger banner expected: {html}"
         );
         assert!(
-            html.contains("Heartbeat probe отсутствует 600 с"),
+            html.contains("Heartbeat чекера отсутствует 600 с"),
             "heartbeat_dead factor missing: {html}"
         );
     }
@@ -2464,7 +2479,7 @@ mod tests {
         // The full `[ingest]` trio: the revived-row toggle is shown with its
         // localized label next to the effective value.
         assert!(
-            html.contains("Возвращать удаленных прокси"),
+            html.contains("Возвращать удаленные прокси"),
             "the removed_as_unknown label: {html}"
         );
         assert!(
@@ -4263,7 +4278,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        assert!(html.contains("pipeline останется пустым"), "{html}");
+        assert!(html.contains("конвейер останется пустым"), "{html}");
     }
 
     #[tokio::test]
@@ -4328,7 +4343,10 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"<option value="name" selected>"#), "{html}");
-        assert!(!html.contains("конструктор не представляет"), "{html}");
+        assert!(
+            !html.contains("невозможно представить в конструкторе"),
+            "{html}"
+        );
 
         // Raw → builder with an unparseable JSON: stays raw with the warning.
         let body = urlencoded(&[
@@ -4351,7 +4369,10 @@ mod tests {
             html.contains(r#"name="pipeline_mode" value="raw""#),
             "{html}"
         );
-        assert!(html.contains("конструктор не представляет"), "{html}");
+        assert!(
+            html.contains("невозможно представить в конструкторе"),
+            "{html}"
+        );
     }
 
     #[tokio::test]
@@ -4402,7 +4423,7 @@ mod tests {
             .unwrap();
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        assert!(html.contains("pipeline останется пустым"), "{html}");
+        assert!(html.contains("конвейер останется пустым"), "{html}");
 
         // The profile flavor keeps the tri-state radios.
         let response = app
@@ -4913,7 +4934,10 @@ mod tests {
         assert!(html.contains(r#"<option value="name" selected>"#), "{html}");
         assert!(html.contains(r#"id="ped-sort-desc" checked"#), "{html}");
         // No raw-mode warning: the pipeline is fully representable.
-        assert!(!html.contains("конструктор не представляет"), "{html}");
+        assert!(
+            !html.contains("невозможно представить в конструкторе"),
+            "{html}"
+        );
 
         // A pipeline the builder cannot represent: raw-mode warning instead
         // of a prefill, the JSON itself kept in the textarea.
@@ -4935,7 +4959,10 @@ mod tests {
             .unwrap();
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        assert!(html.contains("конструктор не представляет"), "{html}");
+        assert!(
+            html.contains("невозможно представить в конструкторе"),
+            "{html}"
+        );
         assert!(
             html.contains(r#"name="pipeline_mode" value="raw""#),
             "{html}"

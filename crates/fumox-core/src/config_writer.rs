@@ -188,13 +188,15 @@ impl EditableConfig {
         let tmp_path = parent.join(&tmp_name);
 
         let serialized = self.doc.to_string();
-        std::fs::write(&tmp_path, serialized.as_bytes())?;
+        write_tmp_preserving_mode(&self.path, &tmp_path, serialized.as_bytes())?;
 
         if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
             // Atomic rename is not universally supported. If it fails,
             // do a plain write and remove the tmp, losing atomicity is
             // preferable to losing the change. The user gets a warning
             // in the logs and may decide to back the file up first.
+            // The direct write keeps the original inode, so the file's
+            // permissions survive this path without extra work.
             tracing::warn!(
                 error = %e,
                 path = %self.path.display(),
@@ -220,6 +222,39 @@ impl EditableConfig {
 /// from stepping on each other's tmp files when two requests hit the
 /// admin server at the same time.
 static SAVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write the tmp file with the original file's permission mode.
+///
+/// `save` commits by renaming the tmp over the original, which swaps the
+/// inode: whatever mode the operator put on the config file would
+/// silently decay to the umask default (typically 0644) on the first
+/// admin-panel save. The file carries `[admin].token` — the same class
+/// of plaintext secret for which `db.rs` deliberately hard-codes 0600 on
+/// the SQLite file — so a hardened 0600 `app.toml` becoming world-readable
+/// exposes the token to every local user (security review f5). The mode is
+/// applied at tmp creation, so the file holding the token is never briefly
+/// world-readable between a write and a chmod. A missing original (the
+/// *Create from defaults* path) falls back to 0644.
+#[cfg(unix)]
+fn write_tmp_preserving_mode(original: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mode = std::fs::metadata(original)
+        .map(|meta| meta.permissions().mode())
+        .unwrap_or(0o644);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(tmp)?;
+    file.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_tmp_preserving_mode(_original: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(tmp, bytes)
+}
 
 /// Move `current` into the table at `segment`, creating an empty table
 /// if the slot was absent or held a non-table value.
@@ -462,6 +497,40 @@ mod tests {
         assert!(on_disk.contains("127.0.0.1:9999"));
 
         // No stray tmp files left behind.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "tmp file leaked: {:?}", leftover);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression (security review f5): the save commits by renaming a
+    /// fresh tmp file over the original, which swaps the inode — a mode
+    /// the operator put on the file (0600 over the file that carries
+    /// `[admin].token`) used to silently decay to the umask default on
+    /// the first save.
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_the_original_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp_dir("save-mode");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        cfg.set("server.bind", item::string("127.0.0.1:9999"))
+            .unwrap();
+        cfg.save().unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "save() downgraded the file mode");
+        // The tmp file is created with the preserved mode directly, so no
+        // world-readable snapshot of the config ever exists next to it.
         let leftover: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)

@@ -171,8 +171,19 @@ pub async fn vet_probe_host_addrs(
     if addrs.is_empty() {
         return Err(format!("DNS resolution returned no addresses for {host}"));
     }
+    addrs.truncate(MAX_VETTED_ADDRESSES);
     Ok(addrs)
 }
+
+/// Upper bound on the vetted addresses returned per host. DNS can resolve
+/// a feed-supplied name to dozens of A/AAAA records, and every returned
+/// address becomes one dial attempt holding a probe concurrency permit
+/// (T1) or one pinned entry in a meow batch config (T2) — without the cap
+/// one hostname stretches a whole probe cycle by
+/// `count × connect_timeout` (security review f9). Real frontends resolve
+/// to a handful of addresses; the tail beyond the cap adds
+/// attacker-amplified work, not reachability.
+const MAX_VETTED_ADDRESSES: usize = 4;
 
 /// Same policy as [`vet_probe_host_addrs`], discarding the resolved
 /// addresses, for dial paths that cannot pin the IP (e.g. a tunnel engine

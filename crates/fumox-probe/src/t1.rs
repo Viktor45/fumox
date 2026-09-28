@@ -147,7 +147,11 @@ pub async fn run(
     // Try each vetted address in order; the first successful connect wins.
     // The timeout covers one dial attempt, mirroring the previous single-
     // address behaviour; a multi-address host costs at most
-    // `vetted.len() × connect_timeout`.
+    // `vetted.len() × connect_timeout`, and the list itself is capped by
+    // the vetting funnel (`fumox_core::ssrf::MAX_VETTED_ADDRESSES`), so
+    // the worst case per candidate stays `4 × connect_timeout` + the TLS
+    // handshake instead of growing with however many records a
+    // feed-supplied hostname resolves to (security review f9).
     let mut stream = None;
     let mut last_error = "no vetted address to connect to".to_string();
     for ip in target.vetted {

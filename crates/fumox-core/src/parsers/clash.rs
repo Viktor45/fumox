@@ -119,6 +119,11 @@ pub struct ClashParseResult {
 
 /// Parse a full Clash YAML subscription payload.
 pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
+    // Alias references are refused before parsing: the whole payload is
+    // attacker-controlled feed content and `serde_norway` re-materializes
+    // the anchor's subtree for every reference, an alias bomb amplifies
+    // quadratic memory out of a small payload (see `reject_yaml_aliases`).
+    super::reject_yaml_aliases(payload).map_err(|e| format!("clash: {e}"))?;
     let root: Value =
         serde_norway::from_str(payload).map_err(|e| format!("clash: invalid YAML: {e}"))?;
     let proxies = root

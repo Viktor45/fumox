@@ -34,8 +34,9 @@ pub const SESSION_COOKIE: &str = "fumox_session";
 ///
 /// 1. No trusted proxies configured ⇒ never honor forwarded headers.
 /// 2. Peer is not in any trusted CIDR ⇒ the header is untrusted.
-/// 3. Trusted peer: walk XFF left-to-right, take the first non-trusted IP.
-/// 4. Same left-to-right trust walk on RFC 7239 `Forwarded: for=…`.
+/// 3. Trusted peer: walk XFF right-to-left (from the peer), take the first
+///    non-trusted IP.
+/// 4. Same right-to-left walk on RFC 7239 `Forwarded: for=…`.
 /// 5. Nothing usable: fall back to the peer IP.
 pub fn client_key(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> IpAddr {
     // 1. No trusted proxies configured ⇒ never honor forwarded headers.
@@ -46,11 +47,11 @@ pub fn client_key(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet:
     if !trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) {
         return peer.ip();
     }
-    // 3. Trusted peer: walk XFF left-to-right, take the first non-trusted IP.
+    // 3. Trusted peer: walk XFF right-to-left, take the first non-trusted IP.
     if let Some(ip) = walk_xff(headers, trusted_cidrs) {
         return ip;
     }
-    // 4. Same left-to-right trust walk on RFC 7239 Forwarded: for=…
+    // 4. Same right-to-left walk on RFC 7239 Forwarded: for=…
     if let Some(ip) = walk_forwarded(headers, trusted_cidrs) {
         return ip;
     }
@@ -58,12 +59,22 @@ pub fn client_key(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet:
     peer.ip()
 }
 
-/// Walk `X-Forwarded-For` left-to-right: the left-most entry is the
-/// originating client per RFC 6. Take the first entry that parses as an IP
-/// AND is not in any trusted CIDR.
+/// Walk `X-Forwarded-For` right-to-left, starting at the entry next to the
+/// peer. A trusted proxy either appends the address it observed (nginx
+/// `$proxy_add_x_forwarded_for`) or overwrites the header wholesale, so the
+/// entry closest to the peer is the client IP as seen by the innermost
+/// trusted hop; scanning toward the left then skips further trusted hops
+/// and returns the first non-trusted IP.
+///
+/// The previous left-to-right walk took the left-most non-trusted entry,
+/// which is text the *client* chose whenever it sends its own XFF and the
+/// trusted proxy merely appends: every forged IP then got a fresh
+/// rate-limit window, voiding the login brute-force cap (security review
+/// f2). The right-to-left walk is the mirror image that only trusts what a
+/// trusted hop actually appended.
 fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Option<IpAddr> {
     let value = headers.get("x-forwarded-for")?.to_str().ok()?;
-    for raw in value.split(',') {
+    for raw in value.split(',').rev() {
         let candidate = raw.trim();
         let Ok(ip) = candidate.parse::<IpAddr>() else {
             continue;
@@ -75,11 +86,12 @@ fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Option<IpAdd
     None
 }
 
-/// Walk RFC 7239 `Forwarded: for=…` left-to-right (originating client first
-/// per §4). Bracket-strip IPv6 literals; skip `for=_hidden` and `for=unknown`.
+/// Walk RFC 7239 `Forwarded: for=…` right-to-left from the peer, the same
+/// direction [`walk_xff`] scans and for the same reason. Bracket-strip
+/// IPv6 literals; skip `for=_hidden` and `for=unknown`.
 fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Option<IpAddr> {
     let value = headers.get(axum::http::header::FORWARDED)?.to_str().ok()?;
-    for raw in value.split(',') {
+    for raw in value.split(',').rev() {
         let entry = raw.trim();
         // Each Forwarded element is a `;`-separated list of parameters.
         for param in entry.split(';') {
@@ -612,13 +624,41 @@ mod tests {
     }
 
     #[test]
-    fn trusted_peer_with_chain_walks_past_trusted_hops_left_to_right() {
-        // The trusted proxy is at the right; the originating client is at
-        // the left. Per RFC 6 the left-most is the originating client.
+    fn trusted_peer_with_chain_walks_past_trusted_hops_right_to_left() {
+        // Two trusted hops appended in order: the innermost observation is
+        // at the right, so the walk starts there, skips the trusted entry
+        // and lands on the client IP the first trusted proxy observed.
         let h = xff("1.1.1.1, 2.2.2.2");
         assert_eq!(
             client_key(peer(), &h, &trusted_v4()),
             "1.1.1.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// The attack from security review f2: the client sends its own XFF
+    /// prefix and a trusted proxy *appends* the real client IP (nginx
+    /// `$proxy_add_x_forwarded_for`). The left-most entry is attacker text;
+    /// only the right-most non-trusted entry is what the trusted hop saw.
+    /// The old left-to-right walk returned 6.6.6.6, giving every forged IP
+    /// a fresh rate-limit window.
+    #[test]
+    fn client_supplied_xff_prefix_cannot_pick_the_rate_limit_key() {
+        let h = xff("6.6.6.6, 9.9.9.9");
+        assert_eq!(
+            client_key(peer(), &h, &trusted_v4()),
+            "9.9.9.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// Same property on the RFC 7239 header: a client-supplied `for=` in
+    /// the left-most element is ignored when a trusted proxy appended its
+    /// own observation at the right.
+    #[test]
+    fn client_supplied_forwarded_prefix_cannot_pick_the_rate_limit_key() {
+        let h = fwd("for=6.6.6.6, for=9.9.9.9");
+        assert_eq!(
+            client_key(peer(), &h, &trusted_v4()),
+            "9.9.9.9".parse::<IpAddr>().unwrap()
         );
     }
 
@@ -656,10 +696,10 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_walks_left_to_right_past_trusted_for_entries() {
-        // The originating client is on the left (for=1.1.1.1); the trusted
-        // proxy is on the right (for=2.2.2.2). Per RFC 7239 §4 the walk
-        // must skip the trusted one and return 1.1.1.1.
+    fn forwarded_walks_right_to_left_past_trusted_for_entries() {
+        // The innermost trusted proxy's observation is on the right
+        // (for=2.2.2.2); the walk starts there, skips the trusted entry and
+        // returns the client IP the first trusted hop observed (1.1.1.1).
         let h = fwd("for=1.1.1.1, for=2.2.2.2");
         assert_eq!(
             client_key(peer(), &h, &trusted_v4()),

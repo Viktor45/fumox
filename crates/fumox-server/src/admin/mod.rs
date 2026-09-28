@@ -18,7 +18,9 @@ use crate::events::EventBus;
 use crate::fetcher::Fetcher;
 use crate::scheduler::SchedulerState;
 use askama::Template;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::config::{
     AdminConfig, DatabaseConfig, FetchConfig, GeoConfig, IngestConfig, LogConfig, MeowConfig,
@@ -294,6 +296,37 @@ pub(crate) fn parse_trusted_cidrs(raw: &[String]) -> Vec<ipnet::IpNet> {
         .collect()
 }
 
+/// Outermost admin middleware: enforce `[admin].allowed_hosts` at the
+/// edge, before rate limiting, auth, CSRF or any handler runs. An empty
+/// allowlist is a no-op (accept any host), the behavior for deployments
+/// that never configured the list.
+///
+/// The setting is documented as "hostnames / IPs allowed to reach the
+/// admin listener" and editable on the settings screen, but the
+/// request-time gate only ever ran for the public listener's alive-export
+/// links and the serve-link builder — no admin request passed through it
+/// (security review f3). Gating here also removes the inconsistent fail
+/// mode where a non-matching Host was served by every page except the
+/// three that render serve links, which answered 500 from
+/// `build_serve_link_host`: a host that reaches a handler is now always
+/// allowlisted.
+async fn enforce_allowed_hosts(
+    State(state): State<AdminState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Err(err) = host_gate::validate_request_host(req.headers(), &state.admin.allowed_hosts) {
+        tracing::warn!(error = %err, path = %req.uri().path(), "admin request host rejected");
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "request Host header is not allowed for the admin panel\n",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
 /// Build the admin router. Mounted only when the panel is active
 /// (enabled + non-empty token); otherwise the listener serves 404.
 pub fn router(state: AdminState) -> axum::Router {
@@ -437,6 +470,13 @@ pub fn router(state: AdminState) -> axum::Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::rate_limit,
+        ))
+        // Added last = outermost: a request whose Host is not allowlisted
+        // is rejected before it can burn a rate-limit window or reach any
+        // handler (see `enforce_allowed_hosts`).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            enforce_allowed_hosts,
         ))
         .with_state(state)
 }
@@ -1140,7 +1180,8 @@ mod tests {
     /// `AdminState::trusted_cidrs`: a trusted proxy's `X-Forwarded-For` claim
     /// must drive the per-IP rate-limit key, so the same claimed client IP
     /// fills its window while a different claim against the same peer stays
-    /// unblocked.
+    /// unblocked. The claim that counts is the entry a trusted proxy
+    /// appended (right-most), not the client-supplied left-most prefix.
     #[tokio::test]
     async fn rate_limit_uses_xff_ip_for_trusted_peer() {
         let mut state = test_state(1).await;
@@ -1168,6 +1209,76 @@ mod tests {
         // Same trusted peer, different claimed client: fresh window.
         let response = app.clone().oneshot(req_with_xff("5.5.5.5")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        // Append-mode proxy (security review f2): the client sends its own
+        // XFF prefix and the trusted proxy appends the observed client IP,
+        // so the header is "<client-forged>, 9.9.9.9". The right-most
+        // non-trusted entry — what the proxy appended — must key the
+        // window, and re-forging the prefix must not open a new one.
+        let response = app
+            .clone()
+            .oneshot(req_with_xff("1.2.3.4, 9.9.9.9"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(req_with_xff("1.2.3.4, 9.9.9.9"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The old left-to-right walk keyed on the forged left-most entry,
+        // every forged prefix got a fresh window and the login cap was
+        // void. The prefix is now ignored: same key, same exhausted window.
+        let response = app
+            .clone()
+            .oneshot(req_with_xff("6.6.6.6, 9.9.9.9"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// `[admin].allowed_hosts` is enforced at the edge of the admin router
+    /// (security review f3): a Host outside the allowlist is rejected with
+    /// 400 before auth or rate limiting, on every route including the
+    /// login form, while an allowlisted host serves normally. The port
+    /// suffix and letter case are canonicalized away by the gate.
+    #[tokio::test]
+    async fn admin_allowed_hosts_gates_every_route_at_the_edge() {
+        let mut admin = admin_config(1000);
+        admin.allowed_hosts = vec!["panel.example.com".to_string()];
+        let state = test_state_with_admin(admin).await;
+        let app = router(state);
+
+        let req_with_host = |host: &str| {
+            let mut r = request("GET", "/admin/login", "", None);
+            r.headers_mut().insert(header::HOST, host.parse().unwrap());
+            r
+        };
+
+        let response = app
+            .clone()
+            .oneshot(req_with_host("evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(req_with_host("Panel.Example.com:8081"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A missing Host header is rejected whenever an allowlist is set
+        // (deny by default), the gate's canonical empty host.
+        let response = app
+            .oneshot(request("GET", "/admin/login", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Vendored assets and HEAD requests bypass the admin rate limiter:

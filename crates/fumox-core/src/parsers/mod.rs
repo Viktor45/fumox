@@ -104,6 +104,154 @@ pub(crate) fn reject_line_breaks(field: &str, value: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Reject a YAML document that contains an alias reference (`*anchor`).
+///
+/// `serde_norway` resolves every alias by jumping to the anchor's event span
+/// and re-deserializing it into fresh owned values that are retained in the
+/// result tree; its only bound is a document-global jump counter that an
+/// alias bomb stays far under. One anchor of `s` events plus `k` references
+/// materializes ~`k×s` values from a payload of ~`k+s` events — quadratic
+/// memory amplification from a feed payload bounded only by the 10 MiB fetch
+/// cap (security review f4: 20 KiB → >1 GiB heap, allocation failure aborts
+/// the whole process). Feed content has no legitimate use for aliases, so
+/// the entire class is refused before parsing rather than budgeted.
+///
+/// The scan is a small YAML-token scanner, not a parser, and it is biased
+/// toward false positives: a missed alias is a security hole, a wrongly
+/// rejected payload is a visible parse error. It must therefore find every
+/// alias an attacker can write (in valid YAML a `*` at a token position is
+/// always an alias — plain scalars cannot start with an indicator), while
+/// not rejecting the quoted scalars and block scalars real configs carry
+/// (`password: pass*word` must keep parsing). Positions treated as literal
+/// text: double/single-quoted scalars (entered only at token boundaries,
+/// escapes honored, state carried across lines), comments (`#` after
+/// whitespace to end of line) and block scalars (`|`/`>` header, content
+/// skipped by indentation).
+pub(crate) fn reject_yaml_aliases(payload: &str) -> Result<(), String> {
+    let mut block_indent: Option<usize> = None;
+    let mut in_double = false;
+    let mut in_single = false;
+    for (idx, line) in payload.lines().enumerate() {
+        let indent = line.len() - line.trim_start().len();
+        if let Some(header_indent) = block_indent {
+            // Block-scalar content: blank lines and anything more indented
+            // than the header line is literal text, however alias-shaped.
+            if line.trim().is_empty() || indent > header_indent {
+                continue;
+            }
+            block_indent = None;
+        }
+        if scan_yaml_line(
+            line,
+            indent,
+            &mut in_double,
+            &mut in_single,
+            &mut block_indent,
+        ) {
+            return Err(format!(
+                "YAML alias reference (`*…`) on line {}: feed content must not use YAML \
+                 aliases, the parser re-materializes the anchor's whole subtree for every \
+                 reference and a small payload amplifies into quadratic memory",
+                idx + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Scan one line for alias references. Returns `true` when an alias was
+/// found. Quote state is carried across calls (multi-line quoted scalars
+/// are legal); a recognized block-scalar header stores its indentation so
+/// [`reject_yaml_aliases`] skips the literal content lines that follow.
+fn scan_yaml_line(
+    line: &str,
+    indent: usize,
+    in_double: &mut bool,
+    in_single: &mut bool,
+    block_indent: &mut Option<usize>,
+) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // A token boundary is the start of the line or a position after
+        // whitespace or a structural character. `:` counts even without a
+        // following space: block-context `key:*a` is a plain scalar, but a
+        // missed alias is a hole while a rejected odd scalar is only a
+        // parse error, so the boundary set is biased wide.
+        let boundary = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b',' | b'[' | b'{' | b':');
+        if *in_double {
+            match b {
+                // Escaped byte (possibly a quote): skip it.
+                b'\\' => i += 1,
+                b'"' => *in_double = false,
+                _ => {}
+            }
+        } else if *in_single {
+            if b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                i += 1; // '' is an escaped literal quote
+            } else if b == b'\'' {
+                *in_single = false;
+            }
+        } else if b == b'"' && boundary {
+            *in_double = true;
+        } else if b == b'\'' && boundary {
+            *in_single = true;
+        } else if b == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
+            // Comment to end of line.
+            break;
+        } else if b == b'*' && boundary {
+            // In valid YAML a `*` at a token position is always an alias:
+            // plain scalars cannot start with an indicator character.
+            return true;
+        } else if (b == b'|' || b == b'>')
+            && boundary
+            && is_block_scalar_header(&line[..i], &line[i..])
+        {
+            *block_indent = Some(indent);
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Does the `|`/`>` starting at `header` begin a block scalar? The header
+/// must sit at a value position — after `key:`, after a `-` entry marker,
+/// or alone on the line — and may only carry the indentation digit and
+/// chomping indicator before whitespace or a comment. Text like
+/// `key: a |` is a plain scalar ending in `|`; treating it as a header
+/// would swallow the alias-bearing lines that follow.
+fn is_block_scalar_header(prefix: &str, header: &str) -> bool {
+    let mut rest = prefix.trim();
+    while let Some(stripped) = rest.strip_prefix("- ") {
+        rest = stripped.trim_start();
+    }
+    if !rest.is_empty() && rest != "-" && !rest.ends_with(':') {
+        return false;
+    }
+    // Indicators after the `|`/`>` byte: one indentation digit and one
+    // chomping marker, in either order.
+    let bytes = header.as_bytes();
+    let mut i = 1;
+    let mut saw_indent = false;
+    let mut saw_chomp = false;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'0'..=b'9' if !saw_indent => {
+                saw_indent = true;
+                i += 1;
+            }
+            b'+' | b'-' if !saw_chomp => {
+                saw_chomp = true;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    let tail = header[i..].trim();
+    tail.is_empty() || tail.starts_with('#')
+}
+
 /// `naive+https` / `naive+quic`: the transport suffix is scheme identity and
 /// is preserved as the synthetic `naive_transport` parameter so the
 /// serializer can rebuild the exact prefix.
@@ -412,6 +560,62 @@ mod tests {
             parse_line(&format!("vmess://{b64}")),
             LineOutcome::Unrecognized
         ));
+    }
+
+    /// Every alias shape a feed can carry is refused. `key:*a` is a plain
+    /// scalar in block context, but the boundary set is deliberately wide:
+    /// a missed alias is a security hole, a rejected odd scalar is only a
+    /// parse error.
+    #[test]
+    fn yaml_alias_forms_are_rejected() {
+        for payload in [
+            "proxies: &a [*a]",
+            "proxies:\n  - *a\n",
+            "a: [*b, {c: *d}]\n",
+            "*anchor: value\n",
+            "key:*a\n",
+            "x: &a 1\ny: *a\n",
+            "folded: >\n  text\nnext: *a\n",
+        ] {
+            assert!(
+                reject_yaml_aliases(payload).is_err(),
+                "must reject: {payload:?}"
+            );
+        }
+    }
+
+    /// Quoted scalars, comments, block-scalar content and stars inside
+    /// plain scalars are literal text, real configs carrying them must
+    /// keep parsing. The quoted scalar spanning two lines carries its
+    /// state across lines, so a later alias-shaped line stays inside it.
+    #[test]
+    fn yaml_without_alias_references_still_parses() {
+        for payload in [
+            "name: \"*HK 01\"\n",
+            "password: pass*word\n",
+            "password: 'p*w'\n",
+            "# *a comment\nkey: v\n",
+            "script: |\n  echo *alias\nend: 1\n",
+            "folded: >-\n  a *b\n",
+            "- plain\n- list\n",
+            "a: \"line1\n  line2 *b\"\n",
+            "proxies:\n  - {name: n, type: trojan, server: h, port: 443, password: 'p*w'}\n",
+        ] {
+            assert!(
+                reject_yaml_aliases(payload).is_ok(),
+                "must accept: {payload:?}"
+            );
+        }
+    }
+
+    /// End to end: an alias bomb no longer reaches the YAML parser, the
+    /// source is marked failed with the rejection instead of amplifying.
+    #[test]
+    fn alias_bomb_is_rejected_at_parse_time() {
+        let bomb = "proxies: &a [0,0,0,0,0,0,0,0]\n".to_string() + &"*a, ".repeat(200) + "*a\n";
+        let err =
+            parse_subscription(&bomb, Encoding::Plain, Some(InputFormat::ClashYaml)).unwrap_err();
+        assert!(matches!(err, crate::Error::Parse(_)));
     }
 
     /// Defence in depth for rows that predate the parser check or were

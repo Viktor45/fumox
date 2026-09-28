@@ -83,7 +83,13 @@ pub(crate) fn param_list(entry: &crate::models::ProxyEntry, key: &str) -> Option
     if raw.trim().is_empty() {
         return None;
     }
-    if let Ok(serde_norway::Value::Sequence(seq)) = serde_norway::from_str(&raw) {
+    // Stored parameter values are feed-controlled and are re-parsed as YAML
+    // at serve time; refuse alias references first (quadratic memory
+    // amplification, see `parsers::reject_yaml_aliases`). A refused value
+    // falls through to the plain comma-split path, nothing else regresses.
+    if crate::parsers::reject_yaml_aliases(&raw).is_ok()
+        && let Ok(serde_norway::Value::Sequence(seq)) = serde_norway::from_str(&raw)
+    {
         let list: Vec<String> = seq
             .into_iter()
             .map(|v| match v {
@@ -114,6 +120,11 @@ pub(crate) fn param_map(
     key: &str,
 ) -> Option<serde_norway::Mapping> {
     let raw = entry.param_ignore_case(key)?;
+    // Same alias guard as `param_list`: the value is feed-controlled and
+    // re-parsed as YAML; on refusal the parameter keeps no mapping.
+    if crate::parsers::reject_yaml_aliases(raw.trim()).is_err() {
+        return None;
+    }
     match serde_norway::from_str(raw.trim()) {
         Ok(serde_norway::Value::Mapping(map)) if !map.is_empty() => Some(map),
         _ => None,

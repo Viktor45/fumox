@@ -996,23 +996,59 @@ throughput:
 
 | Knob | Effect | When to touch |
 |------|--------|--------------|
-| `[probe].sample_size` | Rows taken per cycle, before concurrency. | First lever — main throughput control. |
-| `[probe].concurrency` | Parallel checks *within* a cycle. | Only when a single cycle exceeds `cycle_interval_secs` (i.e. `(sample_size / concurrency) × (connect_timeout_secs + tls_timeout_secs) > cycle_interval_secs`). |
+| `[probe].sample_size` | Rows a cycle takes from the queue, before concurrency. | First lever — main throughput control. |
+| `[probe].concurrency` | Parallel checks *within* a cycle. | Only when one cycle no longer fits `cycle_interval_secs`. |
 | `[probe].cycle_interval_secs` | How often a new cycle starts. | Tighten only after `sample_size` is already large. |
 
-Two formulas drive the recommendation math shown in the banner:
+The banner derives every cycle number from a single model:
 
 ```
-cycles_to_drain  = ceil(quarantine_count / sample_size)
-drain_minutes    = cycles_to_drain × cycle_interval_secs / 60
+retire_per_cycle = min(sample_size, due_count)
+lane             = ceil(retire_per_cycle / concurrency)
+                   × (connect_timeout_secs + tls_timeout_secs)
+period           = max(cycle_interval_secs, lane)
+drain_minutes    = ceil(quarantine_count / retire_per_cycle) × period / 60
 ```
+
+`due_count` is how many quarantined rows have `ladder_at` in the past.
+It is the reason a big queue is not by itself a backlog: a row
+quarantined a minute ago is not due for another 12–16 h, so no cycle can
+retire it and no setting on that page changes it.
+
+`lane` sizes the quarantine lane only — the one lane that retires queue
+rows. A cycle also awaits the queued-checks, T1 sample and T2 batch
+lanes, and the estimate deliberately does not claim their work. `period`
+takes a `max` because the daemon's ticker skips missed ticks: a lane
+longer than the interval pushes the next start out by the work.
+
+When `retire_per_cycle` is 0 — usually because the second-chance window
+has not elapsed yet, or because `sample_size` is 0 — the cycle picks up
+nothing and there is no drain to estimate. The banner then reports what
+the cycle took and how much is due, instead of a figure it does not have.
+
+Two assumptions the figure rests on:
+
+- it assumes every due row *passes* and leaves quarantine. A failed
+  recheck is re-stamped by `recheck_delays_secs` and stays in the queue,
+  so on a sick queue the real drain is slower than the modelled one;
+- a recommendation is the smallest change the model can certify as an
+  improvement, not a promise to hit the target.
 
 If `drain_minutes` exceeds `[probe].backlog_target_drain_minutes`
-(default 60), the banner suggests:
+(default 60), the banner suggests — each one only when it can be shown
+to help, and evaluated in sequence so the whole set is consistent when
+applied together:
 
-- a new `sample_size = ceil(quarantine_count × cycle_interval_secs / (target_minutes × 60))`, capped at 500;
-- if the required sample would exceed 500, a shorter `cycle_interval_secs = max(5, target_minutes × 60 / cycles_to_drain)`;
-- if `current_cycle_secs > cycle_interval_secs`, a `concurrency = ceil(sample_size × (connect_timeout_secs + tls_timeout_secs) / cycle_interval_secs)`, capped at 64.
+- `sample_size`, capped at both 500 and the number of rows actually due
+  (a larger sample would retire exactly as many rows), and only when
+  `due_count > sample_size` plus a 20 % margin over the current value;
+- `concurrency`, only when the modelled lane exceeds the interval; the
+  value is the smallest `c ≤ 64` that brings the lane back inside it
+  **at the sample size in effect, or the one just recommended** — the
+  two recommendations are chained, so applying both keeps the cycle on
+  schedule;
+- `cycle_interval_secs`, only when the shortened period still fits the
+  modelled lane.
 
 **What does not help with backlog.** `fail_limit`, `recheck_delays_secs`,
 `second_chance_min_hours`, `second_chance_spread_hours`,
@@ -1022,20 +1058,26 @@ They are still useful for keeping new failures from piling up, but
 treat them as inflow controls, not throughput controls.
 
 **Worked example.** With defaults (`sample_size = 50`, `cycle_interval_secs = 60`,
-`concurrency = 8`, `target = 60 min`):
+`concurrency = 8`, `connect_timeout_secs + tls_timeout_secs = 20 s`,
+`target = 60 min`) and every row due:
 
-| `quarantine_count` | cycles | drain | banner |
-|--------------------|-------:|------:|--------|
-| 800  | 16  |  16 min | silent |
-| 4 000 |  80 |  80 min | warning + `sample_size = 67` |
-| 10 000 | 200 | 200 min | warning + `sample_size = 167` |
-| 100 000 | 2 000 | 33 h | warning + `sample_size = 500` (capped) + `cycle_interval_secs = 18s` |
+| quarantined | retire/cycle | period | drain | banner |
+|------------:|-------------:|-------:|------:|--------|
+| 800 | 50 | 140 s | 38 min | warning: `due_overflow`; the drain fits the target, so no recommendations |
+| 4 000 | 50 | 140 s | 187 min | warning + `sample_size = 156` + `concurrency = 52` |
+| 10 000 | 50 | 140 s | 467 min | warning + `sample_size = 389`, no concurrency rec — even at 64 the 389-row lane needs 980 s |
+| 100 000 | 50 | 140 s | 4 667 min | warning + `sample_size = 500` (capped), no concurrency rec, likewise |
 
-Tightening `backlog_target_drain_minutes` to 15 in the last row makes
-the recommended `sample_size` jump to 500 (still capped) and the
-recommended `cycle_interval_secs` to 5 s (still floored) — i.e. the
-banner's `sample_size` only scales so far before you also have to
-shorten the cycle.
+At `backlog_target_drain_minutes = 15` the 4 000-row queue asks for the
+500 cap and still lands at 168 min. With a 20 s worst case per check,
+throughput tops out at `concurrency / check` rows per second, so a
+tighter target is a throughput limit, not something scheduling can fix.
+
+**Two rules worth knowing.** The daemon card and the backlog banner both
+call a heartbeat dead after `max(heartbeat_interval_secs, 5) × 3`; the
+`.max(5)` mirrors the daemon's own beat period, so configuring a period
+below 5 s cannot make a healthy daemon look dead. And `queue_stale_days = 0`
+behaves as 1 in the banner, exactly as in the daemon's retention.
 
 ## 11. Geo enrichment
 

@@ -362,6 +362,23 @@ mod tests {
                 "lang.name missing in {code}"
             );
         }
+        // The probe banner's recommendation labels and the idle factor
+        // are resolved through the catalog, so every one of them must
+        // exist in both languages and actually be translated (an
+        // unresolved key echoes itself).
+        for key in [
+            "probe.rec_sample_size",
+            "probe.rec_cycle_interval_secs",
+            "probe.rec_concurrency",
+            "probe.factor_all_idle",
+        ] {
+            for (code, catalog) in &catalogs {
+                let text = catalog
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{key} missing in {code}"));
+                assert_ne!(text, key, "{key} is untranslated in {code}");
+            }
+        }
     }
 
     #[test]

@@ -1857,7 +1857,9 @@ mod tests {
             .await
             .unwrap();
 
-        // One quarantined proxy with a scheduled second chance.
+        // One quarantined proxy with a scheduled second chance: the
+        // ladder stamp is `quarantined_at + 12 h + [0, 4 h) jitter`
+        // (proxies.rs), so 1 h in quarantine puts it ~13 h out.
         sqlx::query(
             "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
                                   quarantined_at, ladder_at, created_at, updated_at)
@@ -1865,7 +1867,7 @@ mod tests {
                      ?, ?, 1, 1)",
         )
         .bind(now - 3600)
-        .bind(now + 86_400)
+        .bind(now + 43_200)
         .execute(&pool)
         .await
         .unwrap();
@@ -1921,7 +1923,7 @@ mod tests {
             .bind(format!("q{i}"))
             .bind(format!("h{i}.example.com"))
             .bind(now - 3600)
-            .bind(now + 86_400 + i)
+            .bind(now + 43_200 + i)
             .execute(&pool)
             .await
             .unwrap();
@@ -2023,6 +2025,12 @@ mod tests {
         let pool = state.pool.clone();
         let now = fumox_core::models::now_ts();
 
+        // The rows are due for a check, so the cycle can retire them,
+        // and a row is only due that early if it has been in quarantine
+        // at least the second-chance window: the stamp is
+        // `quarantined_at + 12 h + [0, 4 h) jitter` (proxies.rs), so
+        // 15 h in quarantine with the check just past is a pair the
+        // daemon produces, where `now - 3600` / `now - 1` is not.
         for i in 0..5 {
             sqlx::query(
                 "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
@@ -2032,8 +2040,8 @@ mod tests {
             .bind(format!("fp-ok-{i}"))
             .bind(format!("q{i}"))
             .bind(format!("h{i}.example"))
-            .bind(now - 3600)
-            .bind(now + 3600)
+            .bind(now - 54_000)
+            .bind(now - 1)
             .execute(&pool)
             .await
             .unwrap();
@@ -2051,8 +2059,10 @@ mod tests {
             html.contains("Очередь проверки: в норме"),
             "level label missing: {html}"
         );
-        // 5 quarantined, sample 50, cycle 60s → drain is 1 min, well
-        // inside the 60-min default target.
+        // 5 quarantined and 5 due: retire = min(50, 5) = 5 per cycle,
+        // lane = ceil(5/8) x 20s = 20s <= the 60s interval, so one
+        // cycle drains the queue - 1 min, well inside the 60-min
+        // default target.
         assert!(
             html.contains("осушение за ~1 мин"),
             "current drain not mentioned: {html}"
@@ -2083,10 +2093,11 @@ mod tests {
         let pool = state.pool.clone();
         let now = fumox_core::models::now_ts();
 
-        // 51 quarantined → ceil(51/50)=2 cycles × 60s = 2 min drain,
-        // which exceeds the 1-min target. None of the heuristic
-        // thresholds fire at this size, so the banner is driven by the
-        // soft drain-vs-target check.
+        // 51 rows *due*: retire = min(50, 51) = 50, lane =
+        // ceil(50/8) x 20s = 140s > the 60s interval, so the period
+        // is 140s and 2 cycles take 5 min against the 1-min target.
+        // None of the hard heuristic thresholds fire at this size, so
+        // the banner is driven by the soft drain-vs-target check.
         for i in 0..51 {
             sqlx::query(
                 "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
@@ -2096,8 +2107,8 @@ mod tests {
             .bind(format!("fp-tight-{i}"))
             .bind(format!("t{i}"))
             .bind(format!("h{i}.example"))
-            .bind(now - 3600)
-            .bind(now + 3600)
+            .bind(now - 54_000)
+            .bind(now - 1)
             .execute(&pool)
             .await
             .unwrap();
@@ -2112,7 +2123,7 @@ mod tests {
             "warning banner expected when target unreachable: {html}"
         );
         assert!(
-            html.contains("flash danger") == false,
+            !html.contains("flash danger"),
             "danger banner is not warranted at this size: {html}"
         );
         assert!(html.contains("Очередь проверки:"), "title missing: {html}");
@@ -2135,9 +2146,14 @@ mod tests {
         let pool = state.pool.clone();
         let now = fumox_core::models::now_ts();
 
-        // 4000 quarantined rows; all due now (ladder_at <= now). With
-        // default sample_size=50 and cycle=60s, drain takes 80 min ,
-        // over the 60-min target, so a recommendation must show.
+        // 4000 quarantined rows, all due (ladder_at <= now), and 15 h
+        // into quarantine so that pair is one the ladder produces: a
+        // fresh quarantine is stamped 12-16 h out, a row cannot be due
+        // one hour in. With the defaults (sample_size=50,
+        // concurrency=8, connect+tls=20s) the quarantine lane takes
+        // ceil(50/8) x 20s = 140s, past the 60s interval, so the period
+        // is 140s and 80 cycles take 187 min - over the 60-min target,
+        // so recommendations show.
         sqlx::query(
             "INSERT INTO proxies
                  (fingerprint, scheme, name, host, port, credential, status,
@@ -2147,7 +2163,7 @@ mod tests {
              FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 4000)
                    SELECT n AS x FROM seq)",
         )
-        .bind(now - 3600)
+        .bind(now - 54_000)
         .bind(now - 1)
         .execute(&pool)
         .await
@@ -2167,17 +2183,25 @@ mod tests {
             "deep_queue factor missing: {html}"
         );
         assert!(
-            html.contains("Рекомендации, чтобы осушить за ~60 мин:"),
+            html.contains("Рекомендации для осушения за ~60 мин"),
             "recs head missing: {html}"
         );
-        // required_sample = 4000 × 60 / (60 × 60) = 67
+        // required_sample = ceil(4000 × 140 / 3600) = 156, capped by the
+        // 4000 rows that can be due. The label is localized.
         assert!(
-            html.contains("[probe].sample_size = 67"),
+            html.contains("[probe].sample_size = 156"),
             "sample_size recommendation missing or wrong: {html}"
         );
         assert!(
-            html.contains("(current 50)"),
-            "current value should appear in rec: {html}"
+            html.contains("(сейчас 50)"),
+            "current value should appear in the localized rec: {html}"
+        );
+        // Chained on that sample: ceil(156/52) x 20s = 60s, which fits
+        // the 60s period, so applying both recs keeps the cycle on
+        // schedule.
+        assert!(
+            html.contains("[probe].concurrency = 52"),
+            "concurrency recommendation missing or wrong: {html}"
         );
     }
 
@@ -2196,7 +2220,7 @@ mod tests {
                      ?, ?, 1, 1)",
         )
         .bind(now - 30 * 86_400) // 30 days ago
-        .bind(now + 86_400)
+        .bind(now - 1) // its check came due long ago; the ladder re-stamps it
         .execute(&pool)
         .await
         .unwrap();
@@ -2233,7 +2257,7 @@ mod tests {
              FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 300)
                    SELECT n AS x FROM seq)",
         )
-        .bind(now - 3600)
+        .bind(now - 54_000)
         .bind(now - 1)
         .execute(&pool)
         .await
@@ -2260,11 +2284,15 @@ mod tests {
         );
     }
 
-    /// The recommended `[probe].sample_size` scales down as the target
-    /// drain time goes up: operators tightening the target get bigger
-    /// numbers.
+    /// A queue the ladder has not released yet is not a queue that
+    /// needs draining. 800 quarantined rows whose `ladder_at` is in the
+    /// future (a fresh quarantine is stamped 12-16 h out) make the
+    /// cycle pick up nothing, so the banner says so instead of
+    /// estimating a drain it cannot support or recommending a knob
+    /// that would change nothing. 800 rows is under the `deep_queue`
+    /// threshold, so the idle wording is the only state on offer.
     #[tokio::test]
-    async fn probe_screen_recommendation_scales_with_target_minutes() {
+    async fn probe_screen_drain_figure_ignores_rows_that_are_not_due() {
         let state = test_state(1000).await;
         let pool = state.pool.clone();
         let now = fumox_core::models::now_ts();
@@ -2273,40 +2301,37 @@ mod tests {
             "INSERT INTO proxies
                  (fingerprint, scheme, name, host, port, credential, status,
                   quarantined_at, ladder_at, created_at, updated_at)
-             SELECT 'fp-tune-' || x, 'vless', 't' || x, 'h' || x || '.example',
+             SELECT 'fp-notdue-' || x, 'vless', 'n' || x, 'h' || x || '.example',
                     443, 'c', 'quarantine', ?, ?, 1, 1
-             FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 4000)
+             FROM (WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 800)
                    SELECT n AS x FROM seq)",
         )
         .bind(now - 3600)
-        .bind(now - 1)
+        .bind(now + 43_200)
         .execute(&pool)
         .await
         .unwrap();
 
-        // First render with the default 60-min target, required
-        // sample = 4000 × 60 / (60 × 60) = 67.
-        let mut state_a = state;
-        let app = router(state_a.clone());
-        let cookie_a = login(&app).await;
-        let html_a = render_get_html(&app, "/admin/probe", &cookie_a).await;
-        assert!(
-            html_a.contains("[probe].sample_size = 67"),
-            "target=60 should yield sample_size=67: {html_a}"
-        );
+        let app = router(state);
+        let cookie = login(&app).await;
+        let html = render_get_html(&app, "/admin/probe", &cookie).await;
 
-        // Tighten the target to 15 min, required sample grows to 267.
-        state_a.probe.backlog_target_drain_minutes = 15;
-        let app = router(state_a);
-        let cookie_b = login(&app).await;
-        let html_b = render_get_html(&app, "/admin/probe", &cookie_b).await;
+        assert!(html.contains("backlog-banner"), "banner expected: {html}");
         assert!(
-            html_b.contains("[probe].sample_size = 267"),
-            "target=15 should yield sample_size=267: {html_b}"
+            html.contains("за цикл не берётся ни одной строки"),
+            "all_idle factor missing: {html}"
         );
         assert!(
-            html_b.contains("~15 мин"),
-            "recs head should mention the new target: {html_b}"
+            html.contains("800 в карантине"),
+            "quarantine count missing from the idle line: {html}"
+        );
+        assert!(
+            !html.contains("drain_over_target") && !html.contains("превышает цель"),
+            "no drain figure exists to exceed the target: {html}"
+        );
+        assert!(
+            !html.contains("Рекомендации"),
+            "no knob can drain a queue that is not due: {html}"
         );
     }
 

@@ -18,6 +18,12 @@
 //! successful ingest that reconciled new data clears every processed entry
 //! containing the source (but keeps the just-written raw snapshot), so clients
 //! see fresh proxies without waiting out the TTL.
+//!
+//! Every invalidation also bumps that key's generation. A background
+//! re-render reads the generation when it starts and its result is dropped
+//! when the generation moved meanwhile: that rendering was computed from
+//! pre-change rows and must not be stored with a full fresh TTL behind the
+//! change that invalidated it.
 
 use crate::fetcher::FetchedPayload;
 use moka::future::Cache;
@@ -67,6 +73,9 @@ impl Rendered {
 pub struct Caches {
     raw: Cache<String, Arc<RawSnapshot>>,
     processed: Cache<String, Arc<Rendered>>,
+    /// Invalidation counter per processed key, bumped on every invalidation
+    /// of that key. Bounded exactly like the processed layer it guards.
+    generations: Cache<String, u64>,
     /// Processed keys currently being revalidated in the background, keeps
     /// concurrent stale requests from spawning duplicate re-renders.
     revalidating: Arc<Mutex<HashSet<String>>>,
@@ -80,6 +89,10 @@ impl Caches {
                 .time_to_idle(ENTRY_IDLE_LIMIT)
                 .build(),
             processed: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_idle(ENTRY_IDLE_LIMIT)
+                .build(),
+            generations: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_idle(ENTRY_IDLE_LIMIT)
                 .build(),
@@ -125,10 +138,53 @@ impl Caches {
         arc
     }
 
+    /// Store the result of a background re-render started under
+    /// `generation` (the value [`Caches::try_start_revalidate`] handed out).
+    /// Returns whether it was stored.
+    ///
+    /// A rendering whose generation moved in the meantime was computed from
+    /// rows that an invalidation has already superseded: storing it with its
+    /// own fresh TTL would serve pre-change data as fresh for a whole TTL,
+    /// which is exactly what the invalidation was meant to end. Such a
+    /// rendering is dropped instead, the key stays empty and the next
+    /// request re-renders inline from the new rows.
+    pub async fn processed_put_revalidated(
+        &self,
+        key: &str,
+        rendered: Rendered,
+        generation: u64,
+    ) -> bool {
+        if self.generation(key).await != generation {
+            return false;
+        }
+        self.processed_put(key, rendered).await;
+        if self.generation(key).await != generation {
+            // An invalidation landed between the check and the insert and
+            // therefore did not see this entry; drop it by hand.
+            self.processed_invalidate(key).await;
+            return false;
+        }
+        true
+    }
+
     /// Called by the admin save handlers (Phase 2.5).
     #[allow(dead_code)]
     pub async fn processed_invalidate(&self, key: &str) {
+        self.bump_generation(key).await;
         self.processed.invalidate(&key.to_string()).await;
+    }
+
+    /// Current invalidation generation of a processed key; 0 = never
+    /// invalidated.
+    async fn generation(&self, key: &str) -> u64 {
+        self.generations.get(&key.to_string()).await.unwrap_or(0)
+    }
+
+    /// Mark every rendering of `key` produced up to now as superseded.
+    async fn bump_generation(&self, key: &str) {
+        let key = key.to_string();
+        let next = self.generation(&key).await + 1;
+        self.generations.insert(key, next).await;
     }
 
     // ---- invalidation ----
@@ -154,6 +210,7 @@ impl Caches {
             .map(|(key, _)| (*key).clone())
             .collect();
         for key in affected {
+            self.bump_generation(&key).await;
             self.processed.invalidate(&key).await;
         }
     }
@@ -177,9 +234,16 @@ impl Caches {
     /// served its stale snapshot and never re-rendered again.
     pub async fn try_start_revalidate(&self, key: &str) -> Option<RevalidateGuard> {
         let inserted = self.revalidating.lock().await.insert(key.to_string());
-        inserted.then(|| RevalidateGuard {
+        if !inserted {
+            return None;
+        }
+        // Read the generation before the caller starts the render, so any
+        // invalidation from here on is visible to the put.
+        let generation = self.generation(key).await;
+        Some(RevalidateGuard {
             revalidating: self.revalidating.clone(),
             key: key.to_string(),
+            generation,
         })
     }
 
@@ -195,6 +259,16 @@ impl Caches {
 pub struct RevalidateGuard {
     revalidating: Arc<Mutex<HashSet<String>>>,
     key: String,
+    /// Invalidation generation of the key at claim time; the rendering this
+    /// claim covers may only be stored while it still holds.
+    generation: u64,
+}
+
+impl RevalidateGuard {
+    /// Generation to hand back to [`Caches::processed_put_revalidated`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl Drop for RevalidateGuard {
@@ -361,5 +435,55 @@ mod tests {
         let now = fumox_core::models::now_ts();
         assert!(rendered(now + 1, &[]).is_fresh(now));
         assert!(!rendered(now, &[]).is_fresh(now));
+    }
+
+    /// A background re-render that started before an ingest commits must
+    /// not store its pre-commit rendering with a full fresh TTL behind the
+    /// ingest's invalidation: without the generation guard the put lands
+    /// after `invalidate_processed_for_source` and the old rows are served
+    /// as fresh until the TTL expires.
+    #[tokio::test]
+    async fn revalidation_started_before_an_ingest_does_not_store_its_rendering() {
+        let caches = Caches::new();
+        let now = fumox_core::models::now_ts();
+        caches
+            .processed_put("sub:p1", rendered(now - 1, &["s1"]))
+            .await;
+
+        // A stale request claims the key and starts re-rendering.
+        let claim = caches
+            .try_start_revalidate("sub:p1")
+            .await
+            .expect("stale entry is revalidatable");
+        let generation = claim.generation();
+
+        // The ingest commits while the render is still running.
+        caches.invalidate_processed_for_source("s1").await;
+
+        let stored = caches
+            .processed_put_revalidated("sub:p1", rendered(now + 3600, &["s1"]), generation)
+            .await;
+        assert!(!stored, "pre-ingest rendering must be refused");
+        assert!(
+            caches.processed_get("sub:p1").await.is_none(),
+            "the invalidated key must stay empty until it is re-rendered"
+        );
+    }
+
+    /// The guard must not block a re-render that no invalidation touched:
+    /// the common path still fills the cache.
+    #[tokio::test]
+    async fn revalidation_without_an_invalidation_still_stores() {
+        let caches = Caches::new();
+        let now = fumox_core::models::now_ts();
+        caches
+            .processed_put("sub:p1", rendered(now - 1, &["s1"]))
+            .await;
+        let claim = caches.try_start_revalidate("sub:p1").await.unwrap();
+        let stored = caches
+            .processed_put_revalidated("sub:p1", rendered(now + 3600, &["s1"]), claim.generation())
+            .await;
+        assert!(stored);
+        assert!(caches.processed_get("sub:p1").await.is_some());
     }
 }

@@ -7,6 +7,7 @@
   <h1 class="mono">{{ proxy.scheme }}:// {{ proxy.host }}:<wbr>{{ proxy.port }}</h1>
   <span id="status-badge" aria-live="polite" aria-atomic="true">
     {% if proxy.status == "alive" %}<span class="badge alive">{{ self.t("common.status_alive") }}</span>
+    {% else if proxy.status == "ready" %}<span class="badge ready">{{ self.t("common.status_ready") }}</span>
     {% else if proxy.status == "quarantine" %}<span class="badge quarantine">{{ self.t("common.status_quarantine") }}</span>
     {% else if proxy.status == "removed" %}<span class="badge removed">{{ self.t("common.status_removed") }}</span>
     {% else %}<span class="badge unknown">{{ self.t("common.status_unknown") }}</span>{% endif %}

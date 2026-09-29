@@ -117,6 +117,24 @@ pub fn validate_request_host(
     }
 }
 
+/// A `Host` header that cannot be read as text, is blank, or does not
+/// canonicalize (a literal `@`, the userinfo separator) never becomes a URL
+/// host component. The serve link carries a capability token, so
+/// `name@evil.com` would send the operator (and anyone who clicks the
+/// link) to `http://name@evil.com/export/alive/{token}` with the token as
+/// the query of an attacker-controlled host. The canonicalizer is the same
+/// one the gate uses, so the two consumers can never disagree about what a
+/// Host means, and the check runs even with an empty allowlist — that is
+/// exactly the configuration the gate skips.
+fn serve_link_host(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::HOST).and_then(|v| v.to_str().ok())?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let host = canonicalize_host_str(raw.trim());
+    (!host.is_empty()).then_some(host)
+}
+
 /// Link-builder for the admin panel: lowercases the host and matches it
 /// against the allowlist, returning the canonical host (port-stripped,
 /// IPv6 brackets preserved when present) on success or `HostRejected` on
@@ -127,42 +145,12 @@ pub fn build_serve_link_host(
     allowed_hosts: &[String],
 ) -> Result<String, HostRejected> {
     validate_request_host(headers, allowed_hosts)?;
-    if let Some(host) = port_stripped_host(headers) {
+    if let Some(host) = serve_link_host(headers) {
         return Ok(host);
     }
-    // No Host header: fall back to the bound IP (unspecified → loopback).
+    // No usable Host header: fall back to the bound IP (unspecified →
+    // loopback).
     Ok(fallback_host(bind))
-}
-
-/// Strip the port from the Host header for use as a URL host component.
-/// IPv6 literals keep their brackets so the URL stays well-formed.
-fn port_stripped_host(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(header::HOST).and_then(|v| v.to_str().ok())?;
-    if raw.is_empty() {
-        return None;
-    }
-    Some(strip_port(raw))
-}
-
-fn strip_port(raw: &str) -> String {
-    if let Some(rest) = raw.strip_prefix('[') {
-        // IPv6 literal: `[::1]` or `[::1]:port`, keep brackets intact.
-        if let Some((inside, _rest)) = rest.split_once(']') {
-            let mut out = String::with_capacity(raw.len());
-            out.push('[');
-            out.push_str(inside);
-            out.push(']');
-            return out;
-        }
-        raw.to_string()
-    } else if raw.matches(':').count() > 1 {
-        // Bare IPv6, wrap in brackets so the URL host stays well-formed.
-        format!("[{raw}]")
-    } else if let Some((host, _port)) = raw.rsplit_once(':') {
-        host.to_string()
-    } else {
-        raw.to_string()
-    }
 }
 
 fn fallback_host(bind: SocketAddr) -> String {
@@ -220,13 +208,26 @@ mod tests {
         );
     }
 
-    /// Same property on the link-builder side: bare IPv6 is wrapped in
-    /// brackets, with and without a trailing port, so the returned host is
-    /// a well-formed URL component.
+    /// The link-builder runs the same canonicalization as the gate even with
+    /// an empty allowlist, where the gate itself is a no-op: a `Host` holding
+    /// userinfo would otherwise land verbatim in a link that carries the
+    /// export token.
     #[test]
-    fn strip_port_handles_bare_ipv6() {
-        assert_eq!(strip_port("2001:db8::1"), "[2001:db8::1]");
-        assert_eq!(strip_port("2001:db8::1:8080"), "[2001:db8::1:8080]");
+    fn build_serve_link_host_never_emits_userinfo() {
+        let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        // `@` without a colon, the shape the gate's single-colon port strip
+        // used to leave untouched.
+        let out = build_serve_link_host(bind, &host("vpn.example.com@evil.com"), &[]).unwrap();
+        assert_eq!(out, "127.0.0.1", "{out}");
+        assert!(!out.contains('@'));
+        // Same with a port on the attacker side.
+        let out = build_serve_link_host(bind, &host("vpn.example.com:8080@evil.com"), &[]).unwrap();
+        assert!(!out.contains('@'), "{out}");
+        // An ordinary host still canonicalizes as before, allowlist or not.
+        assert_eq!(
+            build_serve_link_host(bind, &host("VPN.EXAMPLE.COM:8081"), &[]).unwrap(),
+            "vpn.example.com"
+        );
     }
 
     /// The single-colon rsplit branch would otherwise turn

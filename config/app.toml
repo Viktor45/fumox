@@ -29,6 +29,37 @@ trust_proxy_ips = []
 # Hostnames/IPs allowed to reach the public listener. Empty = accept any
 # Host (current behavior); set this to pin /export/alive/… to your domain.
 allowed_hosts = []
+# Потолок строк в одном теле /export/alive/… и /export/ready/… (LIMIT в SQL).
+# У этих ссылок нет своего ограничения сверху, в отличие от /sub и /src,
+# поэтому без него один публичный запрос читал и отдавал весь тир целиком.
+# Поднимите значение, если тир больше; в админке счётчик тира не урезан,
+# так что усечение всегда видно.
+# 0 НЕ значит «без ограничения»: значение поднимается вверх до 1 строки
+# (ноль или минус в LIMIT SQLite прочитала бы как бесконечность), поэтому
+# при 0 тело отдаст ровно один узел.
+# Тело кэшируется на 30 с, поэтому статус может доехать до ссылки с
+# задержкой до 30 с — выгрузка это снимок.
+# Row ceiling of one /export/alive/… and /export/ready/… body (LIMIT in SQL).
+# These two links have no upstream cap of their own, unlike /sub and /src, so
+# without one a single public request read and shipped the whole tier. Raise it
+# when the tier is bigger; the admin tier badge stays uncapped, so a truncated
+# export is always visible as smaller than the tier.
+# 0 does NOT mean unlimited: the value clamps up to 1 row (a zero or negative
+# LIMIT would otherwise read as unbounded in SQLite), so 0 serves one node.
+# The body is cached for 30 s, so a status change reaches the link with up to
+# that much delay — a download is a snapshot, and an expired one is re-rendered
+# rather than served stale.
+export_max_rows = 50000
+# Per-IP лимит на все публичные запросы (окно 60 с), общий потолок против
+# скрейпинга и флуда.
+# Per-IP limit for every public request (60 s window), a general ceiling
+# against scraping and floods.
+rate_limit = "300/min"
+# Per-IP лимит, пополняемый неудачными проверками access-token (HTTP 403 на
+# /sub) — сигнал перебора у защищённых профилей.
+# Per-IP limit fed by failed access-token checks (HTTP 403 on /sub), the
+# brute-force signal for protected profiles.
+auth_fail_rate_limit = "30/min"
 
 [database]
 # SQLite (WAL), единственный источник истины.
@@ -118,9 +149,16 @@ removed_as_unknown = false
 # is writable.
 enabled = true
 # «config», дефолт рядом с бинарником: удобно для dev-сборки и одиночного запуска.
-# В проде задайте абсолютный путь к read-only тому с актуальными .mmdb 
+# В проде задайте абсолютный путь к read-only тому с актуальными .mmdb
+# ВНИМАНИЕ: поставляемый стек Docker Compose переопределяет это на /shared
+# (переменная FUMOX_GEO__DB_DIR), а окружение приоритетнее файла, поэтому на
+# этом стеке значение из файла не применяется: базы кладите в том meow-shared.
 # "config" is the default next to the binary, convenient for dev.
 # In prod set an absolute path to a read-only volume with fresh .mmdb
+# NOTE: the shipped Docker Compose stack overrides this to /shared
+# (FUMOX_GEO__DB_DIR), and the environment outranks the file, so the value
+# here does not apply on that stack — put the databases in the meow-shared
+# volume instead.
 db_dir = "config"
 # 16384 = потолок записей in-memory кэша moka: каждая запись маленькая (страна/город/AS),
 # итого пара мегабайт; поднимите, если в вашем фиде заметно больше уникальных хостов
@@ -128,6 +166,18 @@ db_dir = "config"
 # raise this if your feed holds noticeably more unique hosts
 cache_max_entries = 16384
 dns_timeout_secs = 5
+# Сколько секунд старт ждет скачивания баз GeoLite2, прежде чем поднять
+# слушатели: медленное зеркало не должно держать /healthz недоступным.
+# По истечении бюджета загрузка продолжается в фоне, а текущий запуск
+# работает без гео-обогащения до следующего старта (файл ставится
+# атомарным rename, поэтому частичный .mmdb никто не увидит).
+# How many seconds startup waits for the GeoLite2 download before binding
+# the listeners, so a slow mirror cannot keep /healthz unreachable. Past
+# the budget the download continues in the background and this run serves
+# without geo enrichment until the next start (the file lands via an
+# atomic rename, so no partial .mmdb is ever visible). 0 = не ждать вовсе
+# / do not wait at all.
+startup_download_budget_secs = 60
 
 [admin]
 # Админка. Пустой token = админка отключена (отдает 404).

@@ -12,7 +12,11 @@
 //!    reconciliation) is the only exception);
 //! 2. `proxy_source_links.seen_at` is stamped for every proxy still present;
 //! 3. links of this source not stamped by the fetch are deleted; a proxy
-//!    with no remaining links is marked `removed`.
+//!    left without any link by that deletion is marked `removed`. Only
+//!    the proxies this pass unlinked: a row that was already link-less
+//!    (the admin source-delete path deliberately leaves the statuses it
+//!    protects behind, see [`mark_orphans_removed`]) is none of this
+//!    source's business and stays as it is.
 
 use crate::db::DbPool;
 use crate::geo::GeoInfo;
@@ -161,7 +165,9 @@ impl ProxyRow {
 /// instead, when it is `false`, `ready` and `unknown` rows are left
 /// alone (`ready` is tunnel-verified, `unknown` has not yet had its
 /// first verdict; the click that deleted the source should not retire
-/// either); when it is `true`, every orphan retires.
+/// either); when it is `true`, every orphan retires. The sweep below
+/// is scoped to the links *this* pass deletes, so a reconcile of an
+/// unrelated source never retires those rows behind the admin's back.
 pub async fn reconcile_source(
     pool: &DbPool,
     source_id: &str,
@@ -283,24 +289,52 @@ pub async fn reconcile_source(
     } else {
         "DELETE FROM proxy_source_links WHERE source_id = ? AND seen_at < ?"
     };
-    stats.unlinked = sqlx::query(sqlx::AssertSqlSafe(unlinked_sql))
+    // The retire sweep runs *before* the links go away and asks the
+    // question this pass is actually responsible for: "which proxies
+    // does the DELETE below leave with no link at all?" That is a
+    // per-proxy answer about this source, not a global one. The
+    // unscoped `NOT EXISTS (link)` version swept up every link-less row
+    // in the table, including the deliberate residue of the admin
+    // source-delete path: `mark_orphans_removed` protects `ready` and
+    // `unknown` rows under `drop_gate = false` and leaves them link-less
+    // on purpose, and the very next reconcile of any *other* source
+    // retired them, undoing the operator's choice. The protected rows
+    // have no link to this source, so they are not in the candidate set.
+    // Both EXISTS share the same arguments: a stale link of this source
+    // (about to be deleted) and no link that survives it.
+    let linger_filter = if keep_alive_linger {
+        "AND proxies.status NOT IN ('alive', 'ready', 'unknown')"
+    } else {
+        ""
+    };
+    let retire_sql = format!(
+        "UPDATE proxies
+         SET status = 'removed', removed_at = ?, updated_at = ?
+         WHERE status != 'removed'
+           AND EXISTS (SELECT 1 FROM proxy_source_links l
+                       WHERE l.proxy_id = proxies.id AND l.source_id = ? AND l.seen_at < ?)
+           AND NOT EXISTS (SELECT 1 FROM proxy_source_links l
+                           WHERE l.proxy_id = proxies.id
+                             AND NOT (l.source_id = ? AND l.seen_at < ?))
+           {linger_filter}"
+    );
+    stats.removed = sqlx::query(sqlx::AssertSqlSafe(retire_sql.as_str()))
+        .bind(now)
+        .bind(now)
+        .bind(source_id)
+        .bind(now)
         .bind(source_id)
         .bind(now)
         .execute(&mut *tx)
         .await?
         .rows_affected() as usize;
 
-    stats.removed = sqlx::query(
-        "UPDATE proxies
-         SET status = 'removed', removed_at = ?, updated_at = ?
-         WHERE status != 'removed'
-           AND NOT EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = proxies.id)",
-    )
-    .bind(now)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected() as usize;
+    stats.unlinked = sqlx::query(sqlx::AssertSqlSafe(unlinked_sql))
+        .bind(source_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() as usize;
 
     tx.commit().await?;
     Ok(stats)
@@ -516,37 +550,53 @@ pub async fn list_with_source(
     Ok(query.fetch_all(pool).await?)
 }
 
-/// Every currently-`alive` proxy still linked to at least one source, in
-/// stable id order, the backing query of the public «all alive» export
-/// link. Fingerprints are unique in the table, so the set is
+/// At most `limit` currently-`alive` proxies still linked to at least one
+/// source, in stable id order, the backing query of the public «all alive»
+/// export link. Fingerprints are unique in the table, so the set is
 /// already deduplicated; unlinked rows are excluded just like everywhere
 /// else proxies are served.
 ///
+/// The cap is applied in SQL, not by truncating a full read: the export
+/// serializes and ships every row it gets, so an unbounded `fetch_all`
+/// here is an unbounded render and an unbounded response body on a
+/// public, cacheable link. `limit` is a `u32` clamped into `1..=i64::MAX`,
+/// so a caller cannot turn it into a negative `LIMIT` (SQLite reads a
+/// negative limit as "no limit") or overflow the bind.
+///
+/// Truncation takes the lowest ids, i.e. the oldest rows, because the
+/// order is id-ascending. That is stable across requests but it is *not*
+/// health-ordered: a caller that needs a different slice (the admin
+/// browser, which pages) must not use this function.
+///
 /// Strictly `alive`: the tiers do not overlap
 ///, `ready` rows are served by [`list_ready`] and the ready export link.
-pub async fn list_alive(pool: &DbPool) -> crate::Result<Vec<ProxyRow>> {
+pub async fn list_alive(pool: &DbPool, limit: u32) -> crate::Result<Vec<ProxyRow>> {
     let rows: Vec<ProxyRow> = sqlx::query_as(
         "SELECT p.* FROM proxies p
          WHERE p.status = 'alive'
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
-         ORDER BY p.id",
+         ORDER BY p.id
+         LIMIT ?",
     )
+    .bind(i64::from(limit).clamp(1, i64::MAX))
     .fetch_all(pool)
     .await?;
     Ok(rows)
 }
 
-/// Every currently-`ready` proxy (tunnel-verified tier) still linked
-/// to at least one source, the backing query of
-/// the public `/export/ready/{token}` link, the verified twin of
-/// [`list_alive`].
-pub async fn list_ready(pool: &DbPool) -> crate::Result<Vec<ProxyRow>> {
+/// At most `limit` currently-`ready` proxies (tunnel-verified tier) still
+/// linked to at least one source, the verified twin of [`list_alive`],
+/// backing the public `/export/ready/{token}` link. Same cap semantics,
+/// same stable truncation.
+pub async fn list_ready(pool: &DbPool, limit: u32) -> crate::Result<Vec<ProxyRow>> {
     let rows: Vec<ProxyRow> = sqlx::query_as(
         "SELECT p.* FROM proxies p
          WHERE p.status = 'ready'
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
-         ORDER BY p.id",
+         ORDER BY p.id
+         LIMIT ?",
     )
+    .bind(i64::from(limit).clamp(1, i64::MAX))
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -578,11 +628,37 @@ pub async fn count_ready(pool: &DbPool) -> crate::Result<i64> {
 
 /// Manual "re-check as new" action from the admin panel:
 /// reset the lifecycle to a pristine `unknown`, clearing the fail counter
-/// and every quarantine / second-chance / recheck timestamp. The probe
-/// daemon stays the sole owner of the state machine, this only puts the
-/// proxy back at its starting square.
+/// and every quarantine / second-chance / recheck timestamp, and hand the
+/// id to the priority queue. The probe daemon stays the sole owner of the
+/// state machine, this only puts the proxy back at its starting square.
+///
+/// `last_t2_failed_at` is part of that starting square (a T2 failure is
+/// the only verdict that suppresses T1, and only a later T2 success may
+/// lift it): leaving it set would put the row in no probe lane at all.
+///
+/// The reset only runs on a row a probe lane can actually pick up, which
+/// is what the `true` return means. A row without a
+/// `proxy_source_links` entry is retired — reconciliation unlinks and
+/// retires in one transaction — and every lane filters on the link
+/// ([`select_t1_candidates`], [`crate::repo::probe::select_queued_checks`],
+/// [`select_t2_candidates`]), so resetting it would hand the operator a
+/// success toast for a row that then belongs to no lane: not probed, not
+/// served (`list_alive` excludes it too), and not revived by the
+/// `removed_as_unknown` path either, which requires the link as well.
+/// Worse for a `quarantine` row: the recheck ladder
+/// ([`select_due_quarantine`]) is the one lane without a link predicate,
+/// so a reset would cancel the last chance that row still had and strand
+/// it in `unknown` forever. Refusing keeps the row (and its schedule)
+/// intact until a feed brings the proxy back, at which point the revival
+/// paths own it. The unprobeable schemes are refused for the same reason:
+/// a `tuic`/`mieru` row is in no lane either (hysteria2 is T1-excluded
+/// but is the one scheme T2 offers while still `unknown`). A refused row
+/// is left completely untouched and the function reports `false`, the
+/// "nothing was reset" answer.
 pub async fn reset_status(pool: &DbPool, id: i64) -> crate::Result<bool> {
-    let result = sqlx::query(
+    let now = crate::models::now_ts();
+    let excluded = vec!["?"; T1_EXCLUDED_SCHEMES.len()].join(", ");
+    let sql = format!(
         "UPDATE proxies SET
              status = 'unknown',
              fail_count = 0,
@@ -590,25 +666,54 @@ pub async fn reset_status(pool: &DbPool, id: i64) -> crate::Result<bool> {
              ladder_at = NULL,
              ladder_step = 0,
              removed_at = NULL,
+             last_t2_failed_at = NULL,
              updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(crate::models::now_ts())
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+         WHERE id = ?
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = proxies.id)
+           AND (scheme NOT IN ({excluded}) OR scheme = 'hysteria2')"
+    );
+    // sqlx 0.9 SqlSafeStr: the format! only expands a `?` placeholder
+    // list, every value flows through .bind().
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(now)
+        .bind(id);
+    for scheme in T1_EXCLUDED_SCHEMES {
+        query = query.bind(scheme);
+    }
+    let result = query.execute(pool).await?;
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    super::probe::enqueue_checks(pool, &[id], 1, now).await?;
+    Ok(true)
 }
 
 /// Opt-in revival (`[ingest].removed_as_unknown`): a `removed` proxy the
 /// feed still carries returns to the probe state machine. Every row whose
-/// fingerprint is listed and whose status is `removed` resets to the same
-/// pristine state the admin "reset status" action leaves (`unknown`,
-/// `fail_count = 0`, quarantine schedules and `removed_at` cleared), so a
-/// later recheck or a source refresh that stops carrying the proxy behaves
-/// exactly as if the row had never been removed. Returns the ids of the
-/// revived rows, the caller hands them to the priority-probe queue like a
-/// fresh insert. Chunked by fingerprint like every other batch statement.
+/// fingerprint is listed, whose status is `removed` and that is still
+/// linked to a source resets to the same pristine state the admin "reset
+/// status" action leaves (`unknown`, `fail_count = 0`, quarantine
+/// schedules and `removed_at` cleared), so a later recheck or a source
+/// refresh that stops carrying the proxy behaves exactly as if the row had
+/// never been removed. Returns the ids of the revived rows, the caller
+/// hands them to the priority-probe queue like a fresh insert. Chunked by
+/// fingerprint like every other batch statement.
+///
+/// The link predicate is the point of the revival: the T1 lanes
+/// ([`select_t1_candidates`], [`crate::repo::probe::select_queued_checks`])
+/// and the T2 sample ([`select_t2_candidates`]) all need a live
+/// `proxy_source_links` row, so a link-less row moved back to `unknown`
+/// is a row the probe can never look at again — the panel would report
+/// it revived and the next reconcile would retire it once more. It is
+/// called right after reconciliation re-stamped the links of everything
+/// this fetch carried, so the predicate costs nothing there.
+///
+/// `last_t2_failed_at` goes with the rest of the lifecycle: a revival
+/// is an operator decision to re-check the row from scratch (the same
+/// one *Reset status* makes), and a row that keeps a stale T2 block is
+/// in no lane at all — the T1 sample and the priority queue both filter
+/// on `last_t2_failed_at IS NULL`, and the T2 sample wants `alive` or
+/// `ready` rows, not a fresh `unknown`.
 pub async fn revive_removed(
     pool: &DbPool,
     fingerprints: &[String],
@@ -625,8 +730,10 @@ pub async fn revive_removed(
                  ladder_at = NULL,
                  ladder_step = 0,
                  removed_at = NULL,
+                 last_t2_failed_at = NULL,
                  updated_at = ?
              WHERE status = 'removed' AND fingerprint IN ({placeholders})
+               AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = proxies.id)
              RETURNING id"
         );
         // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
@@ -646,7 +753,8 @@ pub async fn revive_removed(
 /// instead of a fingerprint IN-list, the admin acts on the whole
 /// filtered population in one statement, no fingerprint enumeration
 /// needed. Returns the revived ids so the caller can hand them to the
-/// priority-probe queue.
+/// priority-probe queue. A row with no source link is left `removed`:
+/// no probe lane would ever reach it (see [`revive_removed`]).
 pub async fn revive_removed_by_country(
     pool: &DbPool,
     code: &str,
@@ -660,8 +768,10 @@ pub async fn revive_removed_by_country(
              ladder_at = NULL,
              ladder_step = 0,
              removed_at = NULL,
+             last_t2_failed_at = NULL,
              updated_at = ?
          WHERE status = 'removed' AND geo_country = ?
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = proxies.id)
          RETURNING id",
     )
     .bind(now)
@@ -675,7 +785,8 @@ pub async fn revive_removed_by_country(
 /// the given autonomous system back to `unknown`. `asn` is the bare
 /// number (`"24940"` or `"AS24940"`), the canonical `AS{n}` form is
 /// what `geo_asn` stores, so we build it once here. Returns the
-/// revived ids for enqueueing.
+/// revived ids for enqueueing; link-less rows stay `removed` (see
+/// [`revive_removed`]).
 pub async fn revive_removed_by_asn(pool: &DbPool, asn: &str, now: i64) -> crate::Result<Vec<i64>> {
     let rows: Vec<(i64,)> = sqlx::query_as(
         "UPDATE proxies SET
@@ -685,8 +796,10 @@ pub async fn revive_removed_by_asn(pool: &DbPool, asn: &str, now: i64) -> crate:
              ladder_at = NULL,
              ladder_step = 0,
              removed_at = NULL,
+             last_t2_failed_at = NULL,
              updated_at = ?
          WHERE status = 'removed' AND geo_asn = ?
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = proxies.id)
          RETURNING id",
     )
     .bind(now)
@@ -703,7 +816,8 @@ pub async fn revive_removed_by_asn(pool: &DbPool, asn: &str, now: i64) -> crate:
 /// which is a stronger signal than the source ever did. Rows that
 /// survived the cleanup *without* ever being probed are exactly the
 /// population the operator is trying to surface here. Returns the
-/// revived ids for enqueueing.
+/// revived ids for enqueueing; link-less rows stay `removed` (see
+/// [`revive_removed`]).
 pub async fn revive_removed_without_probe_history(
     pool: &DbPool,
     now: i64,
@@ -716,9 +830,11 @@ pub async fn revive_removed_without_probe_history(
              ladder_at = NULL,
              ladder_step = 0,
              removed_at = NULL,
+             last_t2_failed_at = NULL,
              updated_at = ?
          WHERE status = 'removed'
            AND NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = proxies.id)
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = proxies.id)
          RETURNING id",
     )
     .bind(now)
@@ -733,7 +849,11 @@ pub async fn revive_removed_without_probe_history(
 /// `quarantine_to_removed` clears are the same ones `revive_removed`
 /// clears, `quarantined_at`, `ladder_at`, `ladder_step`, `fail_count`.
 /// `removed_at` stays NULL because quarantined rows never had a
-/// `removed_at`. Returns the revived ids for enqueueing.
+/// `removed_at`. Returns the revived ids for enqueueing; link-less rows
+/// stay `quarantine` (see [`revive_removed`] — a revived row with no
+/// source link is in no probe lane, the ladder it was on is exactly the
+/// one this call drops). `last_t2_failed_at` is cleared like everywhere
+/// else a revival happens, for the same reason.
 pub async fn revive_quarantine(pool: &DbPool, now: i64) -> crate::Result<Vec<i64>> {
     let rows: Vec<(i64,)> = sqlx::query_as(
         "UPDATE proxies SET
@@ -742,8 +862,10 @@ pub async fn revive_quarantine(pool: &DbPool, now: i64) -> crate::Result<Vec<i64
              quarantined_at = NULL,
              ladder_at = NULL,
              ladder_step = 0,
+             last_t2_failed_at = NULL,
              updated_at = ?
          WHERE status = 'quarantine'
+           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = proxies.id)
          RETURNING id",
     )
     .bind(now)
@@ -792,10 +914,12 @@ pub async fn count_by_status_for_source(
 /// `protected_statuses` lists the lifecycle states the caller does not
 /// want to retire just because their last source link vanished: a row in
 /// one of these statuses is left untouched, link-less, until the probe
-/// decides for itself. The admin source-delete handler passes `["ready"]`
-/// when `[ingest].drop_gate = false`, a `ready` proxy was tunnel-verified
-/// by hand, so retiring it from a single click would be too aggressive.
-/// Pass an empty slice to retire every orphan (the strict policy).
+/// decides for itself. The admin source-delete handler passes
+/// `["ready", "unknown"]` when `[ingest].drop_gate = false`, a `ready`
+/// proxy was tunnel-verified by hand and an `unknown` one has not yet had
+/// its first verdict, so retiring either from a single click would be too
+/// aggressive. Pass an empty slice to retire every orphan (the strict
+/// policy).
 pub async fn mark_orphans_removed(
     pool: &DbPool,
     protected_statuses: &[&str],
@@ -1164,6 +1288,18 @@ pub async fn select_due_quarantine(
 /// as one of two fixed SQL literals chosen by the caller's own enum ,
 /// never interpolated from untrusted input.
 ///
+/// `status_to` is also what identifies a T2 success, and a T2 success
+/// is the only thing that lifts `last_t2_failed_at` (migration 0007:
+/// a T2 failure suppresses T1 "until the next successful T2", and the
+/// T2 recency selector is the only way back). A T1 success — including
+/// a quarantine revival, which is a TCP/TLS connect too — leaves the
+/// flag alone; clearing it there would let a proxy that just failed its
+/// tunnel back into the T1 rotation on a plain TCP verdict, which is
+/// the case the flag exists to suppress. The revival paths
+/// ([`reset_status`], [`revive_removed`] and the bulk variants) clear
+/// it as part of putting the row back at its starting square, so a
+/// re-checked row is never stuck behind a stale flag.
+///
 /// `reset_fail_count` implements the strict T2 priority: a T1 success
 /// must not wipe the fail counter
 /// accumulated from T2 failures, the tunnel verdict stands until T2 itself
@@ -1188,6 +1324,11 @@ pub async fn check_succeeded(
         ProxyStatus::Ready => "'ready'",
         _ => "CASE WHEN status = 'ready' THEN 'ready' ELSE 'alive' END",
     };
+    // Only a T2 success is allowed to lift the T1 suppression flag, and
+    // `ready` is exactly the T2-success tier (the probe promotes to
+    // `ready` on a passing tunnel check, everything else lands on
+    // `alive`). The T1 lanes both filter on `last_t2_failed_at IS NULL`.
+    let clear_t2_failed = status_to == ProxyStatus::Ready;
     let sql = format!(
         "UPDATE proxies SET
              status = {status_expr},
@@ -1198,7 +1339,7 @@ pub async fn check_succeeded(
              quarantined_at = NULL,
              ladder_at = NULL,
              ladder_step = 0,
-             last_t2_failed_at = NULL,
+             last_t2_failed_at = CASE WHEN ? THEN NULL ELSE last_t2_failed_at END,
              updated_at = ?
          WHERE id = ? AND status != 'removed'"
     );
@@ -1207,6 +1348,7 @@ pub async fn check_succeeded(
         .bind(now)
         .bind(now)
         .bind(latency_ms)
+        .bind(clear_t2_failed)
         .bind(now)
         .bind(id)
         .execute(pool)
@@ -1237,6 +1379,18 @@ pub async fn check_succeeded(
 /// keep retrying on its own schedule. Set by [`check_failed`] callers
 /// that handle T2 outcomes (see [`crate::repo::probe`] / the probe
 /// daemon's `journal_and_fail`).
+///
+/// The read of `fail_count` and the write that acts on it run in one
+/// `BEGIN IMMEDIATE` transaction, and both writes repeat the
+/// `status IN ('unknown', 'alive', 'ready')` guard of the read. The
+/// counter is read-modified-write by nature, so splitting it into two
+/// pool-level statements loses an increment whenever two checks of the
+/// same row overlap; and the unguarded write would resurrect a row that
+/// left the eligible statuses in between (a `removed` row driven back
+/// into `quarantine` with a second chance scheduled, undoing a terminal
+/// retirement). The transaction makes the pair atomic, the guard makes
+/// the write a no-op on a row that is no longer ours to touch, and the
+/// returned [`Transition`] then reports what was actually written.
 pub async fn check_failed(
     pool: &DbPool,
     id: i64,
@@ -1249,11 +1403,17 @@ pub async fn check_failed(
     // rand 0.10: `random_range` moved from `Rng` to `RngExt`.
     use rand::RngExt;
 
+    // BEGIN IMMEDIATE: the read has to be inside the write transaction,
+    // a deferred one would fail the read→write upgrade with
+    // SQLITE_BUSY_SNAPSHOT, which busy_timeout does not cover (see
+    // `reconcile_source`).
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
     let row: Option<(i64,)> = sqlx::query_as(
         "SELECT fail_count FROM proxies WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some((fail_count,)) = row else {
         // Row vanished or left the regular-check states concurrently
@@ -1262,14 +1422,14 @@ pub async fn check_failed(
     };
 
     let new_count = fail_count + 1;
-    if new_count >= i64::from(fail_limit) {
+    let (transition, written) = if new_count >= i64::from(fail_limit) {
         let jitter = if second_chance_spread_secs > 0 {
             rand::rng().random_range(0..second_chance_spread_secs)
         } else {
             0
         };
         let second_chance_at = now + second_chance_min_secs + jitter;
-        sqlx::query(
+        let written = sqlx::query(
             "UPDATE proxies SET
                  status = 'quarantine',
                  fail_count = ?,
@@ -1279,7 +1439,7 @@ pub async fn check_failed(
                  ladder_step = 0,
                  last_t2_failed_at = CASE WHEN ? THEN ? ELSE last_t2_failed_at END,
                  updated_at = ?
-             WHERE id = ?",
+             WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
         )
         .bind(new_count)
         .bind(now)
@@ -1289,18 +1449,19 @@ pub async fn check_failed(
         .bind(now)
         .bind(now)
         .bind(id)
-        .execute(pool)
-        .await?;
-        Ok(Transition::Quarantined)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        (Transition::Quarantined, written)
     } else {
-        sqlx::query(
+        let written = sqlx::query(
             "UPDATE proxies SET
                  status = CASE WHEN status = 'ready' THEN 'alive' ELSE status END,
                  fail_count = ?,
                  last_checked_at = ?,
                  last_t2_failed_at = CASE WHEN ? THEN ? ELSE last_t2_failed_at END,
                  updated_at = ?
-             WHERE id = ?",
+             WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
         )
         .bind(new_count)
         .bind(now)
@@ -1308,10 +1469,64 @@ pub async fn check_failed(
         .bind(now)
         .bind(now)
         .bind(id)
-        .execute(pool)
-        .await?;
-        Ok(Transition::Unchanged)
-    }
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        (Transition::Unchanged, written)
+    };
+    tx.commit().await?;
+
+    // The guard refused the write (the row left the eligible statuses
+    // after all): report what happened, not what was attempted.
+    Ok(if written > 0 {
+        transition
+    } else {
+        Transition::Unchanged
+    })
+}
+
+/// Record a T2 attempt that never happened because the tunnel engine
+/// (meow-rs) was down: a ping, config-reload or mid-batch failure, i.e. a
+/// fault of *our* sidecar rather than a verdict about the proxy.
+///
+/// It keeps the two effects a T2 failure legitimately owns, the
+/// `last_t2_failed_at` stamp (a T2 verdict is outstanding, so T1 stays
+/// suppressed until a real T2 runs, [`check_succeeded`] is the only
+/// lifter) and the `ready` → `alive` demote (the tunnel-verified tier only
+/// lasts while the latest T2 was a success). It deliberately does **not**
+/// touch `fail_count` and never quarantines: the shipped `fail_limit` of 2
+/// would otherwise quarantine a fully healthy proxy after two outage
+/// cycles, dropping it out of both T2 selectors and out of
+/// `/export/alive` for a fault it did not cause. The outage itself is
+/// still visible: the probe journals the attempt, backs the engine off and
+/// logs the batch (see the probe's `journal_engine_fault`).
+///
+/// The write is a single statement, so no read-modify-write transaction is
+/// needed (nothing is computed from the current row). The status guard is
+/// the same one [`check_failed`] uses, a `quarantine`/`removed` row keeps
+/// its own schedule.
+///
+/// Returns whether the row was in a regular-check state and got stamped;
+/// `false` means it had left those states (quarantined or removed by
+/// somebody else) and was left alone, exactly the "report what was
+/// actually written" contract of [`check_failed`].
+pub async fn check_engine_unavailable(pool: &DbPool, id: i64, now: i64) -> crate::Result<bool> {
+    let written = sqlx::query(
+        "UPDATE proxies SET
+             status = CASE WHEN status = 'ready' THEN 'alive' ELSE status END,
+             last_checked_at = ?,
+             last_t2_failed_at = ?,
+             updated_at = ?
+         WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(written > 0)
 }
 
 /// Apply a failed quarantine check (second chance or a recheck ladder step).
@@ -2062,6 +2277,67 @@ mod tests {
         assert_eq!(status_of(&pool, &shared).await.0, "removed");
     }
 
+    /// The end-of-pass sweep answers one question: which proxies does
+    /// *this* pass leave without a link? A row that was already
+    /// link-less before the pass started is none of this source's
+    /// business — and that is exactly the residue the admin source
+    /// delete leaves behind under `drop_gate = false`, where
+    /// `mark_orphans_removed` protects `ready` and `unknown` rows on
+    /// purpose. Reconciling an unrelated source afterwards must not
+    /// retire them.
+    #[tokio::test]
+    async fn reconcile_of_another_source_leaves_protected_orphans_alone() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcD0000000").await;
+        let doomed_ready = entry("doomed-ready", "dr.example.com", 443);
+        let doomed_unknown = entry("doomed-unknown", "du.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcD0000000",
+            &[doomed_ready.clone(), doomed_unknown.clone()],
+            &[],
+            1_000,
+            true,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE proxies SET status = 'ready' WHERE fingerprint = ?")
+            .bind(doomed_ready.fingerprint())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The source is deleted: the click protects the verified and the
+        // not-yet-checked row, both stay behind without a link.
+        assert!(sources_repo::delete(&pool, "srcD0000000").await.unwrap());
+        assert_eq!(
+            mark_orphans_removed(&pool, &["ready", "unknown"])
+                .await
+                .unwrap(),
+            0
+        );
+
+        // An unrelated source is reconciled. Its own pass must not touch
+        // the two rows the delete left behind.
+        make_source(&pool, "srcD0000001").await;
+        let survivor = entry("survivor", "sv.example.com", 443);
+        let stats = reconcile_source(
+            &pool,
+            "srcD0000001",
+            std::slice::from_ref(&survivor),
+            &[],
+            2_000,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.removed, 0, "the pass retires only its own orphans");
+        assert_eq!(status_of(&pool, &doomed_ready).await.0, "ready");
+        assert_eq!(status_of(&pool, &doomed_unknown).await.0, "unknown");
+        assert_eq!(status_of(&pool, &survivor).await.0, "unknown");
+    }
+
     #[tokio::test]
     async fn duplicate_entries_in_one_batch_collapse() {
         let pool = temp_pool().await;
@@ -2212,7 +2488,7 @@ mod tests {
         }
 
         assert_eq!(count_alive(&pool).await.unwrap(), 1);
-        let hosts: Vec<String> = list_alive(&pool)
+        let hosts: Vec<String> = list_alive(&pool, 1_000)
             .await
             .unwrap()
             .into_iter()
@@ -2227,7 +2503,211 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count_alive(&pool).await.unwrap(), 0);
-        assert!(list_alive(&pool).await.unwrap().is_empty());
+        assert!(list_alive(&pool, 1_000).await.unwrap().is_empty());
+    }
+
+    /// The export backing query is bounded in SQL: it is the public
+    /// «all alive» link, and it serializes and ships every row it
+    /// returns, so an unbounded `fetch_all` there is an unbounded render
+    /// and an unbounded response body. The cap truncates the stable
+    /// id-ascending order, so it is deterministic, and the badge count
+    /// (`count_alive`) deliberately stays the full tier: the operator
+    /// must be able to see that the export is smaller than the tier.
+    #[tokio::test]
+    async fn list_alive_and_list_ready_apply_the_sql_cap() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let entries: Vec<_> = (0..5)
+            .map(|i| entry(&format!("cap{i}"), &format!("cap{i}.example.com"), 443))
+            .collect();
+        reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
+            .await
+            .unwrap();
+        for (i, e) in entries.iter().enumerate() {
+            let status = if i < 3 { "alive" } else { "ready" };
+            sqlx::query("UPDATE proxies SET status = ? WHERE fingerprint = ?")
+                .bind(status)
+                .bind(e.fingerprint())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(count_alive(&pool).await.unwrap(), 3);
+        assert_eq!(count_ready(&pool).await.unwrap(), 2);
+
+        // Under the cap the tier comes back whole.
+        assert_eq!(list_alive(&pool, 10).await.unwrap().len(), 3);
+        assert_eq!(list_ready(&pool, 10).await.unwrap().len(), 2);
+
+        // At the cap it is truncated to the lowest ids, deterministically
+        // across two reads.
+        let capped: Vec<i64> = list_alive(&pool, 2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let all: Vec<i64> = list_alive(&pool, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(capped, all[..2].to_vec());
+        assert_eq!(
+            list_alive(&pool, 2).await.unwrap().len(),
+            2,
+            "the cap is stable, not a random slice"
+        );
+
+        // A cap of 0 must not become "no limit" (SQLite reads a negative
+        // LIMIT as unbounded); it clamps up to one row.
+        assert_eq!(list_alive(&pool, 0).await.unwrap().len(), 1);
+        // An absurd cap does not overflow the bind.
+        assert_eq!(list_alive(&pool, u32::MAX).await.unwrap().len(), 3);
+    }
+
+    /// Admin *Reset status* is "check this proxy again from scratch", and
+    /// a from-scratch row carries no T2 block: both T1 lanes (the random
+    /// sample and the priority queue) filter on
+    /// `last_t2_failed_at IS NULL` and the T2 sample only offers
+    /// `alive`/`ready` rows, so a reset row that kept the stamp would
+    /// belong to no probe lane at all. The id is also queued for
+    /// priority checking, the handoff the bulk revival paths give their
+    /// callers (this function's caller only learns that the row exists).
+    #[tokio::test]
+    async fn reset_status_clears_the_t2_block_and_queues_a_check() {
+        let pool = temp_pool().await;
+        let id = seed_proxy(&pool, "vless", "reset.example.com").await;
+        sqlx::query(
+            "UPDATE proxies SET status = 'removed', fail_count = 7, removed_at = 900,
+                  quarantined_at = 800, last_t2_failed_at = 700 WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(reset_status(&pool, id).await.unwrap());
+
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "unknown");
+        assert_eq!(row.fail_count, 0);
+        assert_eq!(row.quarantined_at, None);
+        assert_eq!(row.removed_at, None);
+        assert_eq!(
+            row.last_t2_failed_at, None,
+            "a reset row must not stay behind a stale T2 block"
+        );
+
+        // The row is reachable by the probe again: both T1 lanes see it.
+        let queued: Vec<i64> = crate::repo::probe::select_queued_checks(&pool, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(queued, vec![id], "the reset row is queued for a check");
+        let sampled: Vec<i64> = select_t1_candidates(&pool, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(sampled.contains(&id));
+
+        // A missing id changes nothing and queues nothing.
+        assert!(!reset_status(&pool, id + 1_000).await.unwrap());
+        let (pending,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 1);
+    }
+
+    /// A reset that no probe lane can pick up must not report success and
+    /// must not half-apply. Two shapes reach the operator's button: a
+    /// reconcile-retired row (retired and unlinked in one transaction) and
+    /// a row whose scheme no lane judges (`tuic`, `mieru`; hysteria2 is
+    /// T1-excluded but T2 offers it while `unknown`). Before the guard such
+    /// a reset wrote the whole lifecycle and then enqueued nothing, so the
+    /// operator got a success toast and a row in no lane at all.
+    #[tokio::test]
+    async fn reset_status_refuses_a_row_no_probe_lane_can_reach() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+
+        // Retired and unlinked, the normal shape of a reconcile-retired
+        // row, carrying the T2 block the previous fix clears.
+        let (unlinked,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
+                                  status, fail_count, removed_at, last_t2_failed_at,
+                                  created_at, updated_at)
+             VALUES ('fp-unlinked', 'vless', 'n', 'retired.example.com', 443, 'c',
+                     'removed', 3, 900, 700, 1, 1)
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Linked, but a scheme neither T1 nor T2 will ever check.
+        let (tuic,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
+                                  status, fail_count, removed_at, last_t2_failed_at,
+                                  created_at, updated_at)
+             VALUES ('fp-tuic', 'tuic', 'n', 'tuic.example.com', 443, 'c',
+                     'removed', 4, 901, 701, 1, 1)
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, 'srcA0000000', 1)")
+            .bind(tuic)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for id in [unlinked, tuic] {
+            assert!(
+                !reset_status(&pool, id).await.unwrap(),
+                "id {id}: a row no lane can reach must not be reported as reset"
+            );
+            let row = get_by_id(&pool, id).await.unwrap().unwrap();
+            assert_eq!(row.status, "removed", "id {id}: left untouched");
+            assert_eq!(row.fail_count, 3 + i64::from(id == tuic), "id {id}");
+            assert_eq!(row.removed_at, Some(900 + i64::from(id == tuic)), "id {id}");
+            assert_eq!(
+                row.last_t2_failed_at,
+                Some(700 + i64::from(id == tuic)),
+                "id {id}: the T2 block stays, the row is where it was"
+            );
+        }
+
+        // Nothing was queued, so no lane offers either id either.
+        let (pending,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
+        for id in [unlinked, tuic] {
+            assert!(
+                !select_t1_candidates(&pool, 100)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.id == id),
+                "id {id} must stay out of the T1 sample"
+            );
+            assert!(
+                !select_t2_candidates(&pool, 100)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.id == id),
+                "id {id} must stay out of the T2 sample"
+            );
+        }
     }
 
     // Probe state machine.
@@ -2401,8 +2881,8 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let alive_rows = list_alive(&pool).await.unwrap();
-        let ready_rows = list_ready(&pool).await.unwrap();
+        let alive_rows = list_alive(&pool, 1_000).await.unwrap();
+        let ready_rows = list_ready(&pool, 1_000).await.unwrap();
         assert!(alive_rows.iter().all(|r| r.id != id));
         assert!(ready_rows.iter().all(|r| r.id != id));
     }
@@ -2462,6 +2942,36 @@ mod tests {
         }
     }
 
+    /// `check_failed` reads `fail_count` and writes back `fail_count + 1`:
+    /// a read-modify-write, so the read and the write have to be one
+    /// atomic step. Two checks of the same row in flight at once (the
+    /// probe can pick the same proxy up in two lanes, and the admin
+    /// actions write to the same table) must both count — split into a
+    /// read statement and a write statement, the second one writes back
+    /// the value it read before the first bump landed and the failure is
+    /// lost. Repeated: a single lost update is a scheduling accident,
+    /// five rounds make it a certainty.
+    #[tokio::test]
+    async fn check_failed_counts_every_overlapping_check() {
+        let pool = temp_pool().await;
+        for round in 0..5 {
+            let id = seed_proxy(&pool, "vless", &format!("race{}.example.com", round)).await;
+            let (first, second) = tokio::join!(
+                check_failed(&pool, id, 1_000, 100, 86_400, 0, false),
+                check_failed(&pool, id, 1_000, 100, 86_400, 0, false),
+            );
+            assert_eq!(first.unwrap(), Transition::Unchanged);
+            assert_eq!(second.unwrap(), Transition::Unchanged);
+
+            let row = get_by_id(&pool, id).await.unwrap().unwrap();
+            assert_eq!(
+                row.fail_count, 2,
+                "round {round}: two overlapping failures must both be counted"
+            );
+            assert_eq!(row.status, "unknown");
+        }
+    }
+
     #[tokio::test]
     async fn reaching_fail_limit_quarantines_with_jittered_second_chance() {
         let pool = temp_pool().await;
@@ -2489,6 +2999,94 @@ mod tests {
         assert!(sc < now + 2 * 86_400, "second chance too late: {sc}");
         assert_eq!(row.ladder_step, 0);
         assert_eq!(row.removed_at, None);
+    }
+
+    /// An engine outage (meow-rs down) is a fault of the sidecar, not a
+    /// verdict about the proxy: it must stamp the outstanding T2 verdict
+    /// and demote a `ready` row, but never touch the fail counter and
+    /// never quarantine. Repeated past the shipped `fail_limit` of 2, the
+    /// row would otherwise drop out of both T2 selectors and out of
+    /// `/export/alive` for an outage it did not cause.
+    #[tokio::test]
+    async fn engine_outage_stamps_t2_without_charging_the_fail_budget() {
+        let pool = temp_pool().await;
+        let id = seed_proxy(&pool, "vless", "outage.example.com").await;
+        // Tunnel-verified, one genuine T2 failure already on the counter.
+        check_succeeded(&pool, id, 1_000, Some(42), true, ProxyStatus::Ready)
+            .await
+            .unwrap();
+        check_failed(&pool, id, 2_000, 3, 86_400, 0, true)
+            .await
+            .unwrap();
+        check_succeeded(&pool, id, 3_000, Some(43), true, ProxyStatus::Ready)
+            .await
+            .unwrap();
+        let before = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(before.status, "ready");
+        assert_eq!(before.fail_count, 0);
+
+        // Three outage cycles, i.e. past the shipped fail_limit of 2.
+        for cycle in 1..=3 {
+            assert!(
+                check_engine_unavailable(&pool, id, 10_000 * cycle)
+                    .await
+                    .unwrap()
+            );
+        }
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(
+            row.fail_count, 0,
+            "an engine outage must not charge the proxy's fail budget"
+        );
+        assert_eq!(
+            row.status, "alive",
+            "a T2 verdict is outstanding, so the ready tier must not survive the outage"
+        );
+        assert_eq!(
+            row.last_t2_failed_at,
+            Some(30_000),
+            "the outstanding T2 verdict is stamped (T1 stays suppressed)"
+        );
+        assert_eq!(row.quarantined_at, None);
+        assert_eq!(row.ladder_at, None, "no second chance is scheduled");
+
+        // A genuine T2 failure after the outage still counts from zero.
+        assert_eq!(
+            check_failed(&pool, id, 40_000, 2, 86_400, 0, true)
+                .await
+                .unwrap(),
+            Transition::Unchanged
+        );
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.fail_count, 1);
+        assert_eq!(row.status, "alive");
+    }
+
+    /// The status guard is the one `check_failed` uses: a quarantined or
+    /// removed row keeps its own schedule and the call reports that
+    /// nothing was written.
+    #[tokio::test]
+    async fn engine_outage_leaves_quarantined_and_removed_rows_alone() {
+        let pool = temp_pool().await;
+        for (host, status) in [
+            ("outage-quar.example.com", "quarantine"),
+            ("outage-gone.example.com", "removed"),
+        ] {
+            let id = seed_proxy(&pool, "vless", host).await;
+            sqlx::query("UPDATE proxies SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(
+                !check_engine_unavailable(&pool, id, 5_000).await.unwrap(),
+                "a {status} row must not be stamped"
+            );
+            let row = get_by_id(&pool, id).await.unwrap().unwrap();
+            assert_eq!(row.status, status);
+            assert_eq!(row.last_t2_failed_at, None);
+        }
     }
 
     #[tokio::test]
@@ -2789,11 +3387,14 @@ mod tests {
         );
     }
 
-    /// The symmetric side of the suppression flag: any successful
-    /// check, T1 or T2, `alive` or revival from quarantine, clears
-    /// `last_t2_failed_at`, so the proxy re-enters the T1 sample.
+    /// The symmetric side of the suppression flag, as migration 0007
+    /// states it: "T1 checks for the proxy are skipped **until the next
+    /// successful T2** clears the flag" — only a T2 success lifts it. A
+    /// plain TCP/TLS success says nothing about the tunnel, so it must
+    /// leave `last_t2_failed_at` alone and the row out of the T1 sample;
+    /// the T2 recency selector is the only way back.
     #[tokio::test]
-    async fn t2_block_clears_on_next_success() {
+    async fn t2_block_clears_on_next_t2_success_only() {
         let pool = temp_pool().await;
         let id = seed_proxy(&pool, "vless", "unblock.example.com").await;
 
@@ -2811,27 +3412,42 @@ mod tests {
             .collect();
         assert!(!blocked_ids.contains(&id));
 
-        // Any successful check resets the flag, the probe daemon passes
-        // `reset_fail_count` based on the source (T2 always true, T1
-        // conditional on `last_failed_kind`), but the t2-block clearing is
-        // unconditional.
+        // A T1 success: the row is `alive` again, the block stays.
         check_succeeded(&pool, id, 2_000, Some(10), false, ProxyStatus::Alive)
             .await
             .unwrap();
 
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
-        assert!(
-            row.last_t2_failed_at.is_none(),
-            "successful check must clear last_t2_failed_at, got {:?}",
-            row.last_t2_failed_at
+        assert_eq!(row.status, "alive");
+        assert_eq!(
+            row.last_t2_failed_at,
+            Some(1_000),
+            "a T1 success must not clear last_t2_failed_at"
         );
-        let unblocked_ids: Vec<i64> = select_t1_candidates(&pool, 100)
+        let still_blocked: Vec<i64> = select_t1_candidates(&pool, 100)
             .await
             .unwrap()
             .iter()
             .map(|c| c.id)
             .collect();
-        assert!(unblocked_ids.contains(&id));
+        assert!(
+            !still_blocked.contains(&id),
+            "a T1-success row under a T2 block stays out of the T1 sample"
+        );
+
+        // The T2 success the probe writes for a passing tunnel check
+        // (`status_to = ready`) is what lifts the block.
+        check_succeeded(&pool, id, 3_000, Some(20), true, ProxyStatus::Ready)
+            .await
+            .unwrap();
+
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "ready");
+        assert!(
+            row.last_t2_failed_at.is_none(),
+            "a T2 success must clear last_t2_failed_at, got {:?}",
+            row.last_t2_failed_at
+        );
     }
 
     #[tokio::test]
@@ -3158,6 +3774,20 @@ mod tests {
         id
     }
 
+    /// Link a bulk fixture row to a source. The revival paths require a
+    /// live link (a row without one is in no probe lane), so revival
+    /// tests have to give their targets one.
+    async fn link_row(pool: &DbPool, proxy_id: i64, source_id: &str) {
+        sqlx::query(
+            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, ?, 1)",
+        )
+        .bind(proxy_id)
+        .bind(source_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn bulk_status_of(
         pool: &DbPool,
         id: i64,
@@ -3436,6 +4066,8 @@ mod tests {
         make_source(&pool, "srcR0000000").await;
         let de = bulk_test_row(&pool, "revive-de", "vless", "removed", Some("DE"), None).await;
         let us = bulk_test_row(&pool, "revive-us", "vless", "removed", Some("US"), None).await;
+        link_row(&pool, de, "srcR0000000").await;
+        link_row(&pool, us, "srcR0000000").await;
         let now = crate::models::now_ts();
         // Stamp a non-zero ladder / quarantine / fail_count on DE to
         // confirm the revival clears them.
@@ -3494,6 +4126,8 @@ mod tests {
         make_source(&pool, "srcR0000002").await;
         let yes = bulk_test_row(&pool, "revive-asn-yes", "vless", "removed", None, None).await;
         let no = bulk_test_row(&pool, "revive-asn-no", "vless", "removed", None, None).await;
+        link_row(&pool, yes, "srcR0000002").await;
+        link_row(&pool, no, "srcR0000002").await;
         sqlx::query("UPDATE proxies SET geo_asn = 'AS24940' WHERE id IN (?, ?)")
             .bind(yes)
             .bind(no)
@@ -3522,6 +4156,8 @@ mod tests {
         make_source(&pool, "srcR0000003").await;
         let lonely = bulk_test_row(&pool, "revive-lonely", "vless", "removed", None, None).await;
         let tried = bulk_test_row(&pool, "revive-tried", "vless", "removed", None, None).await;
+        link_row(&pool, lonely, "srcR0000003").await;
+        link_row(&pool, tried, "srcR0000003").await;
         sqlx::query("INSERT INTO probe_results (proxy_id, probe_kind, ok, checked_at) VALUES (?, 't1', 0, 1)")
             .bind(tried)
             .execute(&pool)
@@ -3555,6 +4191,7 @@ mod tests {
             None,
         )
         .await;
+        link_row(&pool, q, "srcR0000004").await;
         sqlx::query(
             "UPDATE proxies SET quarantined_at = 1500, ladder_at = 1700, ladder_step = 2,
                   fail_count = 4 WHERE id = ?",
@@ -3595,6 +4232,134 @@ mod tests {
         assert_eq!(bulk_status_of(&pool, alive).await.0, "alive");
         assert_eq!(bulk_status_of(&pool, removed).await.0, "removed");
         assert_eq!(bulk_status_of(&pool, unknown).await.0, "unknown");
+    }
+
+    /// The T1 lanes (random sample and priority queue) and the T2 sample
+    /// all require a live `proxy_source_links` row. A revival that
+    /// ignored that would hand the panel a "revived N rows" toast for
+    /// rows no probe can reach: the request is queued, skipped at
+    /// drain, and the next reconcile retires the row again. All five
+    /// revival statements therefore require the link — including
+    /// `revive_quarantine`, where the ladder is the only lane that ever
+    /// saw a link-less row and reviving drops it.
+    #[tokio::test]
+    async fn bulk_revival_skips_rows_without_a_source_link() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcR0000006").await;
+        let now = crate::models::now_ts();
+
+        // One target per panel, all linked, each the only row its own
+        // filter matches (the country, the AS and the "no probe history"
+        // filters overlap otherwise).
+        let by_country =
+            bulk_test_row(&pool, "revive-c", "vless", "removed", Some("DE"), None).await;
+        let by_asn = bulk_test_row(
+            &pool,
+            "revive-a",
+            "vless",
+            "removed",
+            Some("US"),
+            Some("AS24940"),
+        )
+        .await;
+        let by_history =
+            bulk_test_row(&pool, "revive-h", "vless", "removed", Some("FR"), None).await;
+        let from_quarantine = bulk_test_row(
+            &pool,
+            "revive-q",
+            "vless",
+            "quarantine",
+            Some("DE"),
+            Some("AS24940"),
+        )
+        .await;
+        for id in [by_country, by_asn, by_history, from_quarantine] {
+            link_row(&pool, id, "srcR0000006").await;
+        }
+        // All four carry a stale T2 block, a revived row must not keep it:
+        // the T1 lanes filter on `last_t2_failed_at IS NULL`.
+        sqlx::query("UPDATE proxies SET last_t2_failed_at = 1_000 WHERE id IN (?, ?, ?, ?)")
+            .bind(by_country)
+            .bind(by_asn)
+            .bind(by_history)
+            .bind(from_quarantine)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The same population without a link to any source: in range of
+        // every filter above, reachable by no probe lane.
+        let orphan_removed = bulk_test_row(
+            &pool,
+            "revive-orphan-removed",
+            "vless",
+            "removed",
+            Some("DE"),
+            Some("AS24940"),
+        )
+        .await;
+        let orphan_quarantine = bulk_test_row(
+            &pool,
+            "revive-orphan-quarantine",
+            "vless",
+            "quarantine",
+            Some("DE"),
+            Some("AS24940"),
+        )
+        .await;
+        sqlx::query("UPDATE proxies SET last_t2_failed_at = 1_000 WHERE id IN (?, ?)")
+            .bind(orphan_removed)
+            .bind(orphan_quarantine)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            revive_removed_by_country(&pool, "DE", now).await.unwrap(),
+            vec![by_country]
+        );
+        assert_eq!(
+            revive_removed_by_asn(&pool, "24940", now).await.unwrap(),
+            vec![by_asn]
+        );
+        assert_eq!(
+            revive_removed_without_probe_history(&pool, now)
+                .await
+                .unwrap(),
+            vec![by_history]
+        );
+        assert!(
+            revive_removed(&pool, &["revive-orphan-removed".to_string()], now)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            revive_quarantine(&pool, now).await.unwrap(),
+            vec![from_quarantine]
+        );
+
+        assert_eq!(bulk_status_of(&pool, orphan_removed).await.0, "removed");
+        assert_eq!(
+            bulk_status_of(&pool, orphan_quarantine).await.0,
+            "quarantine",
+            "an unlinked quarantined row keeps its ladder instead of being revived into a lane that cannot see it"
+        );
+
+        // The revived rows are back on a T1 lane, the untouched ones keep
+        // the block they had.
+        for id in [by_country, by_asn, by_history, from_quarantine] {
+            let row = get_by_id(&pool, id).await.unwrap().unwrap();
+            assert_eq!(row.status, "unknown");
+            assert_eq!(row.last_t2_failed_at, None, "revival clears the T2 block");
+        }
+        let (blocked,): (Option<i64>,) =
+            sqlx::query_as("SELECT last_t2_failed_at FROM proxies WHERE id = ?")
+                .bind(orphan_removed)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blocked, Some(1_000));
     }
 
     /// Empty quarantine → no due rows.

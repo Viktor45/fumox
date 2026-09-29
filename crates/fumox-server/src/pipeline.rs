@@ -592,10 +592,17 @@ impl CompiledPipeline {
     /// selectors must see the original values exactly as the serving-side
     /// pass does.
     ///
-    /// `geo` carries the resolved ASN stamps parallel to `entries`
-    /// (`geo.len() == entries.len()`); ASN-targeted rules consult this slice
-    /// and a missing stamp is never a hit (matches `filter.exclude_asns`
-    /// semantics). The caller resolves geo before calling this so the
+    /// `geo` carries the resolved ASN stamps parallel to `entries`; ASN-
+    /// targeted rules consult this slice and a missing stamp is never a hit
+    /// (matches `filter.exclude_asns` semantics). A slice shorter than
+    /// `entries` is legal — the caller resolves no stamps at all when the
+    /// geo resolver is inactive (geo disabled, or the `.mmdb` files absent),
+    /// the default configuration — so every entry past the end of the slice
+    /// counts as unstamped and survives, exactly like
+    /// `reconcile_source`'s own `geo.get(idx)` lookup. Zipping the two
+    /// slices would instead truncate the batch to the shorter one and make
+    /// the ingest pass reconcile an empty source.
+    /// The caller resolves geo before calling this so the
     /// function itself does not need to be async.
     pub fn drop_entries(
         &self,
@@ -605,25 +612,27 @@ impl CompiledPipeline {
         if self.drop.is_empty() {
             return entries;
         }
-        debug_assert_eq!(
-            entries.len(),
-            geo.len(),
-            "drop_entries: entries and geo must be parallel slices"
-        );
+        if geo.len() < entries.len() {
+            tracing::warn!(
+                entries = entries.len(),
+                stamps = geo.len(),
+                "drop_entries: fewer geo stamps than entries, unstamped entries keep their ASN drop rules unapplied"
+            );
+        }
         entries
             .into_iter()
-            .zip(geo.iter())
-            .filter(|(entry, stamp)| {
+            .enumerate()
+            .filter(|(idx, entry)| {
+                let stamp = geo.get(*idx).and_then(|stamp| stamp.as_ref());
                 !self.drop.iter().any(|rule| match rule {
                     CompiledDrop::Regex { regex, target } => matches_target(entry, regex, target),
                     CompiledDrop::Asn { asns } => stamp
-                        .as_ref()
                         .and_then(|s| s.asn.as_deref())
                         .and_then(stored_asn_number)
                         .is_some_and(|n| asns.contains(&n)),
                 })
             })
-            .map(|(entry, _)| entry)
+            .map(|(_, entry)| entry)
             .collect()
     }
 
@@ -1608,6 +1617,51 @@ mod tests {
         let no_geo = vec![None; entries.len()];
         let untouched = compiled.drop_entries(entries, &no_geo);
         assert_eq!(untouched.len(), 3, "missing ASN is not a hit");
+    }
+
+    #[test]
+    fn drop_entries_keeps_the_batch_when_the_geo_slice_is_short() {
+        // The resolver is inactive (geo disabled, or the `.mmdb` files are
+        // missing on disk — the default configuration), so the ingest
+        // caller resolves no stamps at all and passes an empty slice. The
+        // batch must survive intact: a truncated zip would drop every
+        // proxy and make reconcile retire the whole source.
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [
+                { "match": "\\.cn$", "target": "host" },
+                { "target": "asn", "asns": ["24940"] }
+            ]
+        })))
+        .unwrap();
+        let entries = vec![
+            entry("p1", "h1.example.com"),
+            entry("p2", "h2.example.com"),
+            entry("p3", "h3.example.com"),
+        ];
+        let names =
+            |kept: Vec<ProxyEntry>| -> Vec<String> { kept.into_iter().map(|e| e.name).collect() };
+        assert_eq!(
+            names(compiled.drop_entries(entries.clone(), &[])),
+            ["p1", "p2", "p3"]
+        );
+        // Regex rules need no stamp, so they still fire on a stamp-less
+        // batch: only the ASN lookups are skipped.
+        let with_cn = compiled.drop_entries(
+            vec![entry("p1", "h1.example.com"), entry("cn", "h.cn")],
+            &[],
+        );
+        assert_eq!(names(with_cn), ["p1"]);
+        // A partially resolved slice behaves the same for the tail: the
+        // entries past its end are unstamped, not dropped.
+        let partial = compiled.drop_entries(
+            entries,
+            &[Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some("AS13335".into()),
+                ..Default::default()
+            })],
+        );
+        assert_eq!(names(partial), ["p1", "p2", "p3"]);
     }
 
     #[test]

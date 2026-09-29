@@ -4,7 +4,7 @@
 
 use fumox_core::config::DatabaseConfig;
 use fumox_core::db;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_db_path(label: &str) -> PathBuf {
@@ -79,6 +79,119 @@ async fn repair_migration_checksums_is_a_noop_on_clean_db() {
     cleanup_files(&path);
 }
 
+/// The self-heal must leave a durable trace. sqlx hashes the whole
+/// migration file, so a comment edit and a DDL edit are indistinguishable
+/// at the re-stamp: a schema that fell behind the files would otherwise be
+/// discovered only by noticing a missing column. `migrate()` therefore
+/// records the versions it re-stamped under `meta.migrations_repaired`,
+/// which survives the boot log that announced it.
+#[tokio::test]
+async fn migrate_records_the_repaired_versions_in_meta() {
+    let path = temp_db_path("recorded");
+    let cfg = DatabaseConfig {
+        path: path.clone(),
+        ..Default::default()
+    };
+    let pool = db::connect_pool(&cfg).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !versions.is_empty(),
+        "pre-condition: migrations must have run"
+    );
+
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE success = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    db::migrate(&pool)
+        .await
+        .expect("migrate must auto-recover from a checksum mismatch");
+
+    let recorded: Option<String> =
+        sqlx::query_scalar("SELECT value FROM meta WHERE key = 'migrations_repaired'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    let recorded = recorded.expect(
+        "a checksum re-stamp that may hide an unapplied DDL change must be recorded in meta",
+    );
+    for version in &versions {
+        assert!(
+            recorded.contains(&version.to_string()),
+            "meta.migrations_repaired must name version {version}, got: {recorded}"
+        );
+    }
+
+    // A clean run must not keep re-announcing a repair that did not happen.
+    db::migrate(&pool).await.unwrap();
+    let after: String =
+        sqlx::query_scalar("SELECT value FROM meta WHERE key = 'migrations_repaired'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        after, recorded,
+        "a clean migrate must leave the recorded repair untouched"
+    );
+
+    drop(pool);
+    cleanup_files(&path);
+}
+
+/// The repair is one-directional on purpose: a version the embedded set
+/// does not know about belongs to a newer Fumox, and its row is none of
+/// this build's business. The `repair_migration_checksums` example states
+/// that as a pre-flight check instead of re-stamping what it can and
+/// leaving `migrate()` to fail with `VersionMissing`.
+#[tokio::test]
+async fn repair_leaves_migrations_this_build_does_not_embed_alone() {
+    let path = temp_db_path("newer");
+    let cfg = DatabaseConfig {
+        path: path.clone(),
+        ..Default::default()
+    };
+    let pool = db::connect_pool(&cfg).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations
+             (version, description, installed_on, success, checksum, execution_time)
+         VALUES (99, 'from a newer build', '2026-01-01 00:00:00', 1, X'00', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let migrator: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+    let re_stamped = db::repair_migration_checksums(&pool, &migrator)
+        .await
+        .unwrap();
+    assert!(
+        re_stamped.is_empty(),
+        "nothing in this build's set disagrees with the stored checksums: {re_stamped:?}"
+    );
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 99")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        vec![0u8],
+        "the unknown version's row must be left exactly as it was"
+    );
+
+    drop(pool);
+    cleanup_files(&path);
+}
+
 #[tokio::test]
 async fn migrate_propagates_non_mismatch_errors_untouched() {
     // The auto-repair only fires for `MigrateError::VersionMismatch`.
@@ -95,6 +208,111 @@ async fn migrate_propagates_non_mismatch_errors_untouched() {
     db::migrate(&pool)
         .await
         .expect("first-time migrate must succeed");
+    drop(pool);
+    cleanup_files(&path);
+}
+
+/// The compiled `repair_migration_checksums` example, next to this test
+/// binary in `<target>/debug/examples/`. `cargo test` builds the workspace
+/// examples before running the integration tests; a targeted
+/// `cargo test --test migration_repair` does not, hence the explicit
+/// panic rather than a skip: a silently skipped refusal test is exactly
+/// the rot this one exists to prevent.
+fn repair_example_bin() -> PathBuf {
+    let exe = std::env::current_exe().expect("test executable path");
+    // <target>/debug/deps/migration_repair-<hash> → <target>/debug
+    let profile_dir = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("deps/<profile> layout");
+    let bin = profile_dir.join("examples").join(format!(
+        "repair_migration_checksums{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    assert!(
+        bin.is_file(),
+        "the repair example is not built at {}; run \
+         `cargo build -p fumox-core --example repair_migration_checksums`",
+        bin.display()
+    );
+    bin
+}
+
+fn run_repair_tool(bin: &Path, db_path: &Path) -> std::process::Output {
+    std::process::Command::new(bin)
+        .arg(db_path)
+        .output()
+        .expect("the repair example must be executable")
+}
+
+/// The tool's own pre-flight, driven as a subprocess because it lives in
+/// `main()` of the example: a database carrying an applied version this
+/// build does not embed was migrated by a *newer* Fumox, and re-stamping
+/// the versions we do know would leave sqlx refusing to start with
+/// `VersionMissing(99)` anyway. The tool must refuse, name the version,
+/// and touch nothing — otherwise it silently "repairs" a half-understood
+/// database.
+///
+/// The first run over the pristine database is the control: exit 0 there
+/// proves the refusal below comes from the extra version, not from the
+/// tool failing outright.
+#[tokio::test]
+async fn the_repair_tool_refuses_a_database_from_a_newer_build() {
+    let bin = repair_example_bin();
+    let path = temp_db_path("refuse");
+    let cfg = DatabaseConfig {
+        path: path.clone(),
+        ..Default::default()
+    };
+    let pool = db::connect_pool(&cfg).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+
+    // Control: the database is exactly what this build migrates.
+    drop(pool);
+    let control = run_repair_tool(&bin, &path);
+    assert!(
+        control.status.success(),
+        "the tool must accept a database it fully understands: status {:?}, stderr: {}",
+        control.status.code(),
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    let pool = db::connect_pool(&cfg).await.unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations
+             (version, description, installed_on, success, checksum, execution_time)
+         VALUES (99, 'from a newer build', '2026-01-01 00:00:00', 1, X'00', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    drop(pool);
+
+    let out = run_repair_tool(&bin, &path);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the refusal must be a non-zero exit, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not embed") && stderr.contains("99"),
+        "the message must name the unknown version, got: {stderr}"
+    );
+
+    // Refused means untouched: the unknown row still carries its checksum.
+    let pool = db::connect_pool(&cfg).await.unwrap();
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 99")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        vec![0u8],
+        "a refused run must not re-stamp anything"
+    );
     drop(pool);
     cleanup_files(&path);
 }

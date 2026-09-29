@@ -76,8 +76,17 @@ where
 /// RFC 1918 private space, link-local (incl. the `169.254.169.254` cloud
 /// metadata endpoint), CGNAT, unspecified, broadcast, multicast and
 /// benchmark ranges, TEST-NET documentation space, plus their IPv6
-/// equivalents, IPv4-mapped IPv6 addresses and the IPv6 transition
-/// ranges that embed IPv4 (NAT64 `64:ff9b::/96`, 6to4 `2002::/16`).
+/// equivalents (incl. the deprecated `fec0::/10` site-local block), the
+/// IPv4-mapped `::ffff:0:0/96` and IPv4-compatible `::/96` forms, and the
+/// NAT64 `64:ff9b::/96` and 6to4 `2002::/16` transition ranges.
+///
+/// That list is the enforced set, not "every spelling of an IPv4 address":
+/// the IPv4-translated prefix `::ffff:0:0:0/96` is neither
+/// `to_ipv4_mapped()` nor `to_ipv4()`, and Teredo `2001:0000::/32` is not
+/// matched either, so an address in either of them passes this gate.
+/// Neither is routable on a default host (Teredo needs its own interface),
+/// which is why neither is a hole an attacker can dial today — but a
+/// caller must not read this function as covering them.
 pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
     if allow_private {
         return Ok(());
@@ -94,6 +103,15 @@ pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
             if v6.is_unspecified() {
                 return Err("unspecified address".into());
             }
+            // IPv4-compatible ::/96 (deprecated, RFC 4291 §2.5.5.1 but still
+            // what a crafted feed line reaches for): the low 32 bits are a
+            // plain IPv4 address, so `::a9fe:a9fe` must be vetted as
+            // 169.254.169.254. `to_ipv4()` also covers the mapped form
+            // handled above; keeping the two apart preserves the distinct
+            // reason strings. `::` and `::1` are already handled above.
+            if let Some(compat) = v6.to_ipv4() {
+                return check_ipv4(compat);
+            }
             if v6.is_multicast() {
                 // ff00::/8, includes the often-routable ff02::1.
                 return Err("multicast address".into());
@@ -106,6 +124,11 @@ pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
             // fc00::/7 unique-local
             if segments[0] & 0xfe00 == 0xfc00 {
                 return Err("unique-local address".into());
+            }
+            // fec0::/10 site-local (deprecated by RFC 3879, but still
+            // unicast space an internal service can be addressed on).
+            if segments[0] & 0xffc0 == 0xfec0 {
+                return Err("site-local address (deprecated fec0::/10)".into());
             }
             // NAT64 well-known prefix 64:ff9b::/96: the low 32 bits are an
             // IPv4 address, vet the embedded address, not the wrapper
@@ -289,6 +312,34 @@ mod tests {
         ] {
             assert!(check_ip(ip(addr), false).is_err(), "{addr} must be blocked");
         }
+    }
+
+    /// Every IPv6 spelling of a blocked IPv4 address must be blocked, not
+    /// just the mapped form: a feed line writing the metadata endpoint as
+    /// `[::a9fe:a9fe]` must not walk past a policy that only vets
+    /// `to_ipv4_mapped()`. The deprecated `fec0::/10` site-local block is
+    /// in the same shape — routable unicast, never a public target.
+    #[test]
+    fn ipv4_compatible_and_site_local_v6_are_blocked() {
+        for addr in [
+            // ::/96 IPv4-compatible: 127.0.0.1, 169.254.169.254, 192.168.0.1
+            "::7f00:1",
+            "::a9fe:a9fe",
+            "::c0a8:1",
+            // fec0::/10 site-local, deprecated but unicast.
+            "fec0::1",
+            "feff:ffff::1",
+        ] {
+            assert!(check_ip(ip(addr), false).is_err(), "{addr} must be blocked");
+        }
+        // fec0::/10 ends at feff:ffff, whose upper neighbour ff00::/8 is
+        // multicast, so there is no public address to check on that edge.
+        // The lower neighbour febf:... is fe80::/10 link-local and stays
+        // blocked under its own rule.
+        assert!(check_ip(ip("febf:ffff::1"), false).is_err());
+        // ::/96 with a public payload is public space too, the 6to4-style
+        // payload rule, not a blanket prefix ban.
+        assert!(check_ip(ip("::8.8.8.8"), false).is_ok());
     }
 
     #[test]

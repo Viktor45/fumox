@@ -960,6 +960,24 @@ pub async fn proxies_revive_removed_by_country(
 // Actions
 // ---------------------------------------------------------------------------
 
+/// The `#status-badge` swap fragment for a row an action left alone,
+/// same shape the detail template renders: the form's `hx-target` points
+/// at the wrapper, so a refusal has to answer with it or the button dies.
+/// The class is picked from the status value, never interpolated.
+fn status_badge(lang: &Lang, status: &str) -> String {
+    let (class, key) = match status {
+        "alive" => ("alive", "common.status_alive"),
+        "ready" => ("ready", "common.status_ready"),
+        "quarantine" => ("quarantine", "common.status_quarantine"),
+        "removed" => ("removed", "common.status_removed"),
+        _ => ("unknown", "common.status_unknown"),
+    };
+    format!(
+        r#"<span id="status-badge"><span class="badge {class}">{}</span></span>"#,
+        lang.t(key)
+    )
+}
+
 /// Manual "reset status": back to a pristine `unknown`,
 /// the probe daemon picks the proxy up on its next cycle.
 pub async fn proxy_reset(
@@ -970,7 +988,30 @@ pub async fn proxy_reset(
     let lang = state.locales.lang_from_headers(&headers);
     match proxies::reset_status(&state.pool, id).await {
         Ok(true) => {}
-        Ok(false) => return not_found(lang, "err.proxy_not_found"),
+        // `false` covers two different rows: one that is gone, and one
+        // that exists but belongs to no probe lane (reconciliation
+        // retired it, or its scheme is one no lane checks). Only the
+        // first is a 404 — answering the second with `proxy not found`
+        // told an operator that a proxy still on the screen does not
+        // exist. The refusal is reported instead, as a rejected action:
+        // the badge comes back unchanged, which is the truth.
+        Ok(false) => match proxies::get_by_id(&state.pool, id).await {
+            Ok(Some(row)) => {
+                tracing::info!(
+                    proxy_id = id,
+                    status = %row.status,
+                    "proxy status reset refused: no probe lane can reach the row"
+                );
+                return action_response_err(
+                    is_htmx(&headers),
+                    &format!("/admin/proxies/{id}"),
+                    status_badge(&lang, &row.status),
+                    lang.t("px.reset_unreachable"),
+                );
+            }
+            Ok(None) => return not_found(lang, "err.proxy_not_found"),
+            Err(err) => return server_error(lang, &err),
+        },
         Err(err) => return server_error(lang, &err),
     }
     tracing::info!(proxy_id = id, "proxy status reset");

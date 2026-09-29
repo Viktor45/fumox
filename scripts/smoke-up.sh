@@ -4,7 +4,10 @@
 # its own generated admin token and fresh volumes. The main stack (ports
 # 8080/8081, project "fumox") is never touched; both stands share the image
 # tags (ghcr.io/viktor45/fumox:latest, ghcr.io/viktor45/fumox-meow:latest),
-# so the smoke build doubles as the main-stack rebuild.
+# so the smoke build doubles as the main-stack rebuild. The shared host
+# ./config mount is the one thing a compose project cannot scope, so the
+# server gets it read-only here (FUMOX_CONFIG_ACCESS=ro) — the smoke stand's
+# admin panel can read app.toml but never writes it.
 #
 # Usage:
 #   scripts/smoke-up.sh [--no-build]
@@ -76,6 +79,11 @@ if [ -z "${FUMOX_ADMIN__TOKEN:-}" ]; then
     GENERATED_TOKEN=1
 fi
 export FUMOX_ADMIN__TOKEN FUMOX_PUBLIC_PORT="$SMOKE_PUBLIC_PORT" FUMOX_ADMIN_BIND="$SMOKE_BIND" FUMOX_ADMIN_PORT="$SMOKE_ADMIN_PORT"
+# Named volumes are project-scoped, the ./config bind mount is not: both stands
+# mount the same host directory. Keep the smoke stand's config read-only so
+# its admin *Edit settings* page can never rewrite the main stack's app.toml.
+# Not a knob — the isolation guarantee is the point of the stand.
+export FUMOX_CONFIG_ACCESS=ro
 
 BUILD_FLAGS=(--build)
 if [ "${1:-}" = "--no-build" ]; then

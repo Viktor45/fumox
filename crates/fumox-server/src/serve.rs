@@ -55,6 +55,10 @@ pub struct AppState {
     /// any host (today's behavior); setting this locks the alive-export
     /// endpoint to the operator's own hostname.
     pub allowed_hosts: Vec<String>,
+    /// Row ceiling of one `/export/alive` / `/export/ready` body
+    /// (`[server].export_max_rows`). The two links have no upstream cap of
+    /// their own, so this is the only thing bounding one public request.
+    pub export_max_rows: u32,
 }
 
 /// Per-IP rate limiters of the public listener: a generous ceiling for
@@ -112,11 +116,18 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Per-IP rate limiting for the public listener: every request counts against the generous
+/// Per-IP rate limiting for the public listener: every request that reaches
+/// this middleware counts against the generous
 /// `[server].rate_limit`; a 403 (failed access-token check) additionally
 /// counts against the strict `[server].auth_fail_rate_limit`, and once that
 /// window is exhausted the endpoint answers 429 instead. Requests without
 /// connect info (unit tests, embedded runtimes) pass through uncounted.
+///
+/// Not every public route is behind this middleware: `main.rs` adds
+/// `/healthz` with `.route()` on the router this layer was already applied
+/// to, so a health check is never answered with 429 however busy the peer
+/// is (an orchestrator probe must not share a budget with subscriber
+/// downloads).
 ///
 /// The listener installs `into_make_service_with_connect_info::<SocketAddr>()`,
 /// which stores the peer address as `ConnectInfo<SocketAddr>`, reading the
@@ -153,6 +164,12 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
 struct ErrorReply {
     status: StatusCode,
     message: String,
+    /// Whether the cached entry for this key must be dropped when a
+    /// background re-render fails this way. True for the unrecoverable
+    /// `http_client` outcome (SPEC §10.2: the upstream status code is
+    /// served), false when the failure is a transient server-side one where
+    /// the last good snapshot is still the best answer.
+    drop_cached: bool,
 }
 
 impl ErrorReply {
@@ -161,6 +178,7 @@ impl ErrorReply {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "internal server error".to_string(),
+            drop_cached: false,
         }
     }
 
@@ -171,6 +189,17 @@ impl ErrorReply {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "internal server error".to_string(),
+            drop_cached: false,
+        }
+    }
+
+    /// The source answered with an unrecoverable client error: the upstream
+    /// status is the answer, and a cached snapshot must not keep masking it.
+    fn upstream_unavailable(status: StatusCode, message: String) -> Self {
+        Self {
+            status,
+            message,
+            drop_cached: true,
         }
     }
 }
@@ -277,16 +306,35 @@ where
         if let Some(claim) = state.caches.try_start_revalidate(&key).await {
             let state = state.clone();
             let key = key.clone();
+            let generation = claim.generation();
             tokio::spawn(async move {
                 // The claim is released when `claim` drops, panic included.
                 let _claim = claim;
                 match make_render().await {
                     Ok(rendered) => {
-                        state.caches.processed_put(&key, rendered).await;
+                        // An invalidation that landed while this render ran
+                        // supersedes it: storing pre-change data with a full
+                        // TTL would resurrect the very staleness the
+                        // invalidation ended.
+                        if !state
+                            .caches
+                            .processed_put_revalidated(&key, rendered, generation)
+                            .await
+                        {
+                            tracing::debug!(
+                                key = %key,
+                                "revalidation result dropped: the key was invalidated while rendering"
+                            );
+                        }
                     }
                     Err(err) => {
-                        // Keep serving the stale snapshot; the failure is
-                        // journaled where it happened.
+                        // An unrecoverable upstream answer is the endpoint's
+                        // answer now: drop the snapshot so the next request
+                        // re-renders and returns the upstream status instead
+                        // of the last good body with frozen headers.
+                        if err.drop_cached {
+                            state.caches.processed_invalidate(&key).await;
+                        }
                         tracing::warn!(key = %key, status = %err.status, "revalidation failed");
                     }
                 }
@@ -308,8 +356,9 @@ where
     }
 }
 
-/// Render a profile: per-source merged pipelines → merge → dedup → sort →
-/// encode, with the serving outcome policy.
+/// Render a profile: per-source merged pipelines (each capped by its own
+/// `limit.count`) → merge → dedup → sort → profile-level cap → encode,
+/// with the serving outcome policy.
 async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, ErrorReply> {
     let links = profiles::get_sources(&state.pool, &profile.id)
         .await
@@ -340,14 +389,14 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     for (source, _) in &members {
         if source.error_class == Some(ErrorClass::HttpClient) {
             let upstream = last_http_status(state, &source.id).await.unwrap_or(502);
-            return Err(ErrorReply {
-                status: StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY),
-                message: format!(
+            return Err(ErrorReply::upstream_unavailable(
+                StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY),
+                format!(
                     "source \"{}\" unavailable: {}",
                     source.name,
                     source.last_error.as_deref().unwrap_or("HTTP client error")
                 ),
-            });
+            ));
         }
     }
 
@@ -408,7 +457,14 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
             });
         }
         loaded_statuses.extend(candidates.iter().map(|c| c.status));
-        all.extend(compiled.apply_per_source(candidates, &state.geo).await);
+        // Full per-source run, not just the per-source steps: the source's
+        // own `limit.count` caps that source's contribution, and the
+        // profile-level cap is applied again to the merged list below.
+        // Running the cap only in the sort-winning `finalize` would make a
+        // source's limit conditional on that same source also setting an
+        // explicit `sort`, while `/src` (one source, one `apply`) always
+        // honoured it.
+        all.extend(compiled.apply(candidates, &state.geo).await);
     }
     // "All proxies quarantined/removed" verdict: the profile
     // does hold proxies, but every one of them was dropped by a health
@@ -481,14 +537,14 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
 async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, ErrorReply> {
     if source.error_class == Some(ErrorClass::HttpClient) {
         let upstream = last_http_status(state, &source.id).await.unwrap_or(502);
-        return Err(ErrorReply {
-            status: StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY),
-            message: format!(
+        return Err(ErrorReply::upstream_unavailable(
+            StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY),
+            format!(
                 "source \"{}\" unavailable: {}",
                 source.name,
                 source.last_error.as_deref().unwrap_or("HTTP client error")
             ),
-        });
+        ));
     }
 
     let compiled = CompiledPipeline::from_json(source.pipeline.as_ref())
@@ -701,7 +757,7 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
     value.strip_prefix("Bearer ").map(str::to_string)
 }
 
-fn to_response(rendered: &Rendered) -> Response {
+pub(crate) fn to_response(rendered: &Rendered) -> Response {
     let mut response = (
         StatusCode::from_u16(rendered.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         Body::from(rendered.body.clone()),
@@ -769,6 +825,7 @@ mod tests {
             limits,
             trusted_cidrs: Vec::new(),
             allowed_hosts: Vec::new(),
+            export_max_rows: fumox_core::config::ServerConfig::default().export_max_rows,
         }
     }
 
@@ -1005,6 +1062,12 @@ mod tests {
 
     fn header_str<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
         headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// Proxy lines of a url_list body: everything that is not one of the
+    /// leading `#` metadata comments.
+    fn proxy_lines(body: &str) -> usize {
+        body.lines().filter(|l| !l.starts_with('#')).count()
     }
 
     #[tokio::test]
@@ -1294,6 +1357,177 @@ mod tests {
 
         let (status, _, _) = get(router(state), "/sub/profA0000000").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A cached snapshot must not outlive an unrecoverable upstream error:
+    /// the re-render of a stale entry fails with the same `http_client`
+    /// verdict the cold path answers, and while the stale body kept being
+    /// served the documented "return the upstream status code" contract
+    /// never took effect.
+    #[tokio::test]
+    async fn failed_revalidation_drops_the_cached_snapshot() {
+        let state = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+
+        // Cold render: a 200 with a full TTL is cached.
+        let (status, _, body) = get(router(state.clone()), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("h1.example.com"), "{body:?}");
+
+        // Age the entry so the next request takes the stale-while-revalidate
+        // path and spawns a background re-render.
+        let cached = state
+            .caches
+            .processed_get("sub:profA0000000")
+            .await
+            .expect("the cold render is cached");
+        state
+            .caches
+            .processed_put(
+                "sub:profA0000000",
+                Rendered {
+                    status: cached.status,
+                    body: cached.body.clone(),
+                    content_type: cached.content_type.clone(),
+                    extra_headers: cached.extra_headers.clone(),
+                    fresh_until: 0,
+                    source_ids: cached.source_ids.clone(),
+                },
+            )
+            .await;
+
+        // The source goes down with an unrecoverable client error.
+        fetch_log::insert(
+            &state.pool,
+            &fetch_log::FetchLogEntry {
+                source_id: "srcA0000000",
+                fetched_at: fumox_core::models::now_ts(),
+                ok: false,
+                http_status: Some(404),
+                bytes: None,
+                proxies_found: None,
+                error: Some("Not Found"),
+                error_class: Some(ErrorClass::HttpClient),
+            },
+        )
+        .await
+        .unwrap();
+        sources::record_fetch_outcome(
+            &state.pool,
+            "srcA0000000",
+            &FetchOutcome::Failure {
+                at: fumox_core::models::now_ts(),
+                error: "HTTP 404",
+                class: ErrorClass::HttpClient,
+            },
+        )
+        .await
+        .unwrap();
+
+        // This request is already in flight on the stale snapshot; the
+        // background re-render must drop it.
+        let (status, _, _) = get(router(state.clone()), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        for _ in 0..200 {
+            if state
+                .caches
+                .processed_get("sub:profA0000000")
+                .await
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .caches
+                .processed_get("sub:profA0000000")
+                .await
+                .is_none(),
+            "a failed re-render with an unrecoverable upstream error must drop the entry"
+        );
+
+        // The next request is the cold path again: the upstream status.
+        let (status, _, _) = get(router(state), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A source's `limit.count` must cap that source's contribution to
+    /// `/sub` on its own. The cap used to be taken from whichever pipeline
+    /// won the sort contest, so a limit-only source was served in full and
+    /// only started counting once the same source also set a `sort`.
+    #[tokio::test]
+    async fn source_limit_applies_with_and_without_an_explicit_sort() {
+        for sort in [None, Some(serde_json::json!({ "by": "name" }))] {
+            let state = test_state().await;
+            let mut source = make_source(&state, "srcA0000000").await;
+            let mut pipeline = serde_json::json!({ "version": 1, "limit": { "count": 1 } });
+            if let Some(sort) = sort.clone() {
+                pipeline["sort"] = sort;
+            }
+            source.pipeline = Some(pipeline);
+            sources::update(&state.pool, &source).await.unwrap();
+            make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+            ingest(
+                &state,
+                "srcA0000000",
+                &[
+                    entry("a", "h1.example.com", 443),
+                    entry("b", "h2.example.com", 443),
+                    entry("c", "h3.example.com", 443),
+                ],
+            )
+            .await;
+            // /src serves the live tiers only, probe the three rows first.
+            sqlx::query("UPDATE proxies SET status = 'alive'")
+                .execute(&state.pool)
+                .await
+                .unwrap();
+
+            let label = format!("sort={sort:?}");
+            let (status, _, body) = get(router(state.clone()), "/sub/profA0000000").await;
+            assert_eq!(status, StatusCode::OK, "{label}");
+            assert_eq!(proxy_lines(&body), 1, "/sub, {label}: {body:?}");
+
+            // The same config on the single-source endpoint, the reference
+            // behaviour the profile path has to match.
+            let (status, _, body) = get(router(state), "/src/srcA0000000").await;
+            assert_eq!(status, StatusCode::OK, "{label}");
+            assert_eq!(proxy_lines(&body), 1, "/src, {label}: {body:?}");
+        }
+    }
+
+    /// The profile-level cap still applies to the merged list: a source
+    /// without a limit of its own cannot outgrow the profile's.
+    #[tokio::test]
+    async fn profile_limit_caps_the_merged_list() {
+        let state = test_state().await;
+        let mut source = make_source(&state, "srcA0000000").await;
+        source.pipeline = Some(serde_json::json!({ "version": 1 }));
+        sources::update(&state.pool, &source).await.unwrap();
+        let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        profile.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "limit": { "count": 2 }
+        }));
+        profiles::update(&state.pool, &profile).await.unwrap();
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("a", "h1.example.com", 443),
+                entry("b", "h2.example.com", 443),
+                entry("c", "h3.example.com", 443),
+            ],
+        )
+        .await;
+
+        let (status, _, body) = get(router(state), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(proxy_lines(&body), 2, "{body:?}");
     }
 
     #[tokio::test]

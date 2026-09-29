@@ -5,7 +5,6 @@
 //! keys and `busy_timeout`, without the latter, concurrent upserts from two
 //! processes produce `SQLITE_BUSY` (DATABASE, exploitation notes).
 
-use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
@@ -36,6 +35,17 @@ pub type DbPool = SqlitePool;
 /// file access); the `restrict_file_permissions` confirmation is also a
 /// no-op.
 pub async fn connect_pool(cfg: &DatabaseConfig) -> crate::Result<SqlitePool> {
+    if cfg.max_connections == 0 {
+        // sqlx accepts a zero-sized pool and then fails every acquisition
+        // with `PoolTimedOut` after its 30 s acquire timeout, so the
+        // misconfiguration surfaces as a startup stall instead of a
+        // message naming the offending key. Reject it here, before the
+        // pool or the file exists.
+        return Err(crate::Error::Config(
+            "database.max_connections must be >= 1, got 0 (a zero-sized pool can never hand out a connection)"
+                .to_string(),
+        ));
+    }
     pre_create_db_file(&cfg.path)?;
 
     // We pre-created the file on Unix (0o600, mode set atomically at
@@ -52,7 +62,13 @@ pub async fn connect_pool(cfg: &DatabaseConfig) -> crate::Result<SqlitePool> {
             true
         }
     };
-    let options = SqliteConnectOptions::from_str(&sqlite_url(&cfg.path))?
+    // The path goes to SQLite as a `PathBuf`, never as a `sqlite:` URL
+    // string: sqlx parses that URL as a URI and percent-decodes it, so a
+    // database path containing `%2F` (or `?`, or `#`) would name a
+    // different file than the one `pre_create_db_file` just created with
+    // mode 0600 — the 0600 file nobody opens.
+    let options = SqliteConnectOptions::new()
+        .filename(&cfg.path)
         .create_if_missing(create_if_missing)
         .journal_mode(SqliteJournalMode::Wal)
         // NORMAL is the recommended synchronous mode for WAL: survives a
@@ -151,25 +167,36 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
 /// applied migration, every change belongs in a new file. Comment-only
 /// edits break this discipline for no gain, so this function catches the
 /// specific `VersionMismatch` variant and re-stamps every applied
-/// migration's checksum with the on-disk content. The schema on disk is
-/// unchanged; only the bookkeeping column is rewritten. Any other error
-/// (dirty state, missing migration, structural mismatch, real DDL
-/// failure) is surfaced to the caller untouched.
+/// migration's checksum with the on-disk content.
+///
+/// What the re-stamp does *not* do is apply anything: sqlx never re-runs
+/// an already-applied migration, and the SHA-384 covers the whole file, so
+/// a comment edit and a DDL edit are indistinguishable at this point. A
+/// DDL edit to an applied file therefore leaves the on-disk schema behind
+/// the file's contents, and no amount of re-stamping closes that gap — it
+/// has to be closed with a new migration file. The repair is consequently
+/// never silent: the affected versions are logged at `error` level with
+/// that instruction, and recorded in `meta.migrations_repaired` so the
+/// fact survives the log. Any other error (dirty state, missing migration,
+/// structural mismatch, real DDL failure) is surfaced to the caller
+/// untouched.
 pub async fn migrate(pool: &SqlitePool) -> crate::Result<()> {
     let migrator: Migrator = sqlx::migrate!("./migrations");
+    let mut repaired: Vec<i64> = Vec::new();
     if let Err(error) = migrator.run(pool).await {
         if !matches!(error, MigrateError::VersionMismatch(_)) {
             return Err(error.into());
         }
         // `migrator.iter()` carries the canonical checksums the embedded
-        // copy expects. The pre-flight inside `repair_migration_checksums`
-        // refuses to run if any embedded migration has not been applied
-        // yet, so the bookkeeping row exists for every version we touch.
-        let re_stamped = repair_migration_checksums(pool, &migrator).await?;
-        tracing::warn!(
-            versions = ?re_stamped,
-            "sqlx migration checksum mismatch detected; re-stamped with on-disk SHA-384"
-        );
+        // copy expects. Only applied versions are touched, so the
+        // bookkeeping row exists for every version we rewrite.
+        repaired = repair_migration_checksums(pool, &migrator).await?;
+        if repaired.is_empty() {
+            // Nothing was rewritten, so the retry below would fail with the
+            // very same error. Report the original mismatch instead of
+            // claiming a repair that did not happen.
+            return Err(error.into());
+        }
         migrator.run(pool).await?;
     }
 
@@ -195,6 +222,50 @@ pub async fn migrate(pool: &SqlitePool) -> crate::Result<()> {
         .await?;
     }
 
+    if !repaired.is_empty() {
+        record_migration_repair(pool, &repaired).await?;
+    }
+
+    Ok(())
+}
+
+/// Persist the self-heal under `meta.migrations_repaired` and shout about
+/// it. The `meta` row is the part that outlives the process: a boot log is
+/// usually long gone by the time an operator wonders why a column they see
+/// in a migration file is missing from the schema.
+async fn record_migration_repair(pool: &SqlitePool, versions: &[i64]) -> crate::Result<()> {
+    let list = versions
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let since_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    tracing::error!(
+        versions = ?versions,
+        "sqlx migration checksum mismatch on already-applied migration(s); \
+         the stored SHA-384 was re-stamped from the files and the schema on \
+         disk was NOT changed. sqlx never re-runs an applied migration, so if \
+         the edit was not comment-only the schema is now behind the files: \
+         ship a new migration file for the DDL"
+    );
+    // Best effort: a failure to write the breadcrumb must not turn a
+    // recovered boot into a failed one, the log line above already fired.
+    let recorded = sqlx::query(
+        "INSERT INTO meta (key, value) VALUES ('migrations_repaired', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(format!("versions=[{list}] at {since_unix}"))
+    .execute(pool)
+    .await;
+    if let Err(err) = recorded {
+        tracing::warn!(
+            error = %err,
+            "failed to record the migration repair under meta.migrations_repaired"
+        );
+    }
     Ok(())
 }
 
@@ -202,9 +273,12 @@ pub async fn migrate(pool: &SqlitePool) -> crate::Result<()> {
 /// the embedded `Migrator` derives from the current file content. Used by
 /// [`migrate`] to recover from a checksum mismatch (comment-only edits to
 /// already-applied migration files), and exposed as a standalone helper so
-/// tests and ops scripts can trigger the same repair without booting the
-/// full server. Returns the list of versions whose checksums were
-/// rewritten.
+/// tests, the `repair_migration_checksums` example and ops scripts can
+/// trigger the same repair without booting the full server — one
+/// implementation, so the guards below cannot drift from the tool's copy.
+/// Returns the list of versions whose checksums were actually rewritten:
+/// a version whose stored hash already matches is not reported, and a row
+/// this build's embedded set does not know about is never touched.
 pub async fn repair_migration_checksums(
     pool: &SqlitePool,
     migrator: &Migrator,
@@ -246,10 +320,6 @@ pub async fn repair_migration_checksums(
         .await
         .ok();
     Ok(re_stamped)
-}
-
-fn sqlite_url(path: &std::path::Path) -> String {
-    format!("sqlite:{}", path.display())
 }
 
 /// Test-only switch: when set, the inner `set_permissions` call inside
@@ -339,6 +409,66 @@ mod unix_db_tests {
         let _pool = connect_pool(&cfg).await.unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// The configured path reaches SQLite verbatim. Interpolating it into
+    /// a `sqlite:` URL string and letting sqlx URI-parse the result would
+    /// percent-decode it: a database file named `pl%2Fain.db` would be
+    /// opened as `pl/ain.db` — a file that does not exist, or worse one
+    /// that does and was never chmod'ed to 0600.
+    #[tokio::test]
+    async fn connect_pool_opens_the_literal_path_without_uri_decoding() {
+        let _serial = chmod_test_mutex().lock().await;
+        let dir = tempdir_lite::TempDir::new("db-percent-path");
+        let path = dir.path().join("pl%2Fain%3Fmode=ro.db");
+        let cfg = DatabaseConfig {
+            path: path.clone(),
+            busy_timeout_ms: 1000,
+            max_connections: 1,
+        };
+        let pool = connect_pool(&cfg).await.unwrap();
+        // The file `pre_create_db_file` chmod'ed is the one the pool opened.
+        let opened: String =
+            sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            // SQLite reports the path with symlinks resolved (/var ->
+            // /private/var on macOS), so compare the canonical forms.
+            std::fs::canonicalize(&opened).unwrap(),
+            std::fs::canonicalize(&path).unwrap(),
+            "the pool must open the configured path, not a URI-decoded variant of it"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// A zero-sized pool is a config error, not a runtime condition: sqlx
+    /// accepts `max_connections(0)` and then fails every acquisition with
+    /// `PoolTimedOut` 30 s later, so without this guard a typo in
+    /// `[database]` costs the operator a 30 s startup stall and a
+    /// `PoolTimedOut` that never names the offending key.
+    #[tokio::test]
+    async fn connect_pool_rejects_zero_max_connections() {
+        let (_dir, path) = fresh_db_path("db-zero-conns");
+        let cfg = DatabaseConfig {
+            path: path.clone(),
+            busy_timeout_ms: 1000,
+            max_connections: 0,
+        };
+        let err = connect_pool(&cfg).await.unwrap_err();
+        assert!(
+            err.to_string().contains("max_connections"),
+            "expected the error to name database.max_connections, got: {err}"
+        );
+        // Rejected before the pool is built, so the file was never touched.
+        assert!(
+            !path.exists(),
+            "the config error must fire before pre_create_db_file"
+        );
     }
 
     #[tokio::test]

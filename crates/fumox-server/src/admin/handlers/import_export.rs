@@ -7,7 +7,12 @@
 //! new source ids, and existing rows are never overwritten. Slug collisions
 //! with the database (or within the file) drop the slug rather than the
 //! object; references to sources absent from the file are excluded from the
-//! composition. Both cases surface as warnings, not errors.
+//! composition. Both cases surface as warnings, not errors. A reference
+//! repeated inside one profile is kept once (the composition is keyed by
+//! source, a repeat would abort the insert after the profile row was
+//! already written). Two *source rows* sharing one reference are a hard
+//! error: the reference binds them together, so the file does not say
+//! which row a profile composition means.
 //!
 //! Validation mirrors the source/profile forms and is all-or-nothing: any
 //! hard error yields a 422 with the full list and writes nothing.
@@ -425,6 +430,19 @@ pub async fn rotate_alive_token(State(state): State<AdminState>, headers: Header
     }
 }
 
+/// Compact size of a pipeline document, the same measure the builder form
+/// applies: the stored JSON is re-rendered into every edit form and
+/// recompiled by the preview, so a file could otherwise plant a pipeline up
+/// to the 1 MiB body limit (16× the form cap).
+///
+/// The raw form measures the *pretty* JSON it renders into its textarea
+/// instead, so a document in the window between the two sizes is accepted
+/// here and then rejected by the form on every later save. The builder
+/// mode is the one this measure mirrors exactly.
+fn pipeline_size(pipeline: &serde_json::Value) -> usize {
+    serde_json::to_string(pipeline).map_or(usize::MAX, |text| text.len())
+}
+
 /// Validate every imported object with the same rules as the forms. Returns
 /// a (possibly empty) list of localized errors; any error aborts the import.
 async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -> Vec<String> {
@@ -463,8 +481,21 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
     let mut dns_budget = caps::IMPORT_DNS_VET;
     let mut dns_capped = false;
 
+    // A reference is the join key between a source row and the profile
+    // compositions naming it. Two rows sharing one are ambiguous: the
+    // write phase keys new ids by reference, so the second row would win
+    // and the first be silently orphaned. Reject the file instead of
+    // guessing which of the two the operator meant.
+    let mut seen_refs: HashSet<&str> = HashSet::new();
+
     for s in &file.sources {
         let ctx = format!("{} «{}»", lang.t("io.source_word"), s.name);
+        if !seen_refs.insert(s.reference.as_str()) {
+            errors.push(format!(
+                "{ctx}: {}",
+                lang.t("val.dup_ref").replace("{ref}", &s.reference)
+            ));
+        }
         if s.name.trim().is_empty() {
             errors.push(format!("{ctx}: {}", lang.t("val.required")));
         } else if s.name.chars().count() > 200 {
@@ -548,6 +579,16 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             }
         }
         if let Some(pipeline) = s.pipeline.as_ref() {
+            // Same cap the source form applies: the JSON is stored verbatim
+            // and re-rendered into every edit form, and the preview
+            // recompiles it on each keystroke.
+            if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
+                errors.push(format!(
+                    "{ctx}: {}",
+                    lang.t("val.field_too_long")
+                        .replace("{}", &caps::PIPELINE_BYTES.to_string())
+                ));
+            }
             for issue in CompiledPipeline::from_json(Some(pipeline))
                 .err()
                 .into_iter()
@@ -591,6 +632,13 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             ));
         }
         if let Some(pipeline) = p.pipeline.as_ref() {
+            if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
+                errors.push(format!(
+                    "{ctx}: {}",
+                    lang.t("val.field_too_long")
+                        .replace("{}", &caps::PIPELINE_BYTES.to_string())
+                ));
+            }
             for issue in CompiledPipeline::from_json(Some(pipeline))
                 .err()
                 .into_iter()
@@ -690,10 +738,21 @@ async fn apply_import(
 
         // Remap composition onto the freshly created source ids; references
         // to sources missing from the file are dropped with a warning.
+        // A reference repeated inside one profile collapses to its first
+        // position: `profile_sources` is keyed by (profile_id, source_id),
+        // so writing it twice aborts the whole composition insert — after
+        // the profile row was already committed, leaving an empty profile
+        // behind a 500. `/admin/export` never emits a duplicate ref, so
+        // this only ever sees a hand-edited file.
         let mut composition: Vec<(String, i64)> = Vec::new();
+        let mut placed: HashSet<String> = HashSet::new();
         for (position, reference) in p.source_refs.iter().enumerate() {
             match ref_to_id.get(reference) {
-                Some(new_id) => composition.push((new_id.clone(), position as i64)),
+                Some(new_id) if !placed.contains(new_id) => {
+                    placed.insert(new_id.clone());
+                    composition.push((new_id.clone(), position as i64));
+                }
+                Some(_) => {}
                 None => summary.warnings.push(
                     lang.t("io.warn_unknown_ref")
                         .replace("{profile}", &p.name)
@@ -777,6 +836,36 @@ mod tests {
             enabled: true,
             source_refs: source_refs.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// Admin state on a throwaway database; the import path itself needs
+    /// nothing but the pool, the caches and the config.
+    async fn test_state() -> AdminState {
+        let dir = std::env::temp_dir().join(format!("fumox-import-test-{}", models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(refresh_rx); // keep the channel open for sends
+        let config = fumox_core::AppConfig::default();
+        let fetcher =
+            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.geo.dns_timeout());
+        AdminState::new(
+            pool,
+            crate::cache::Caches::new(),
+            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
+            refresh_tx,
+            crate::scheduler::SchedulerState::new(1),
+            crate::events::EventBus::new(),
+            fetcher,
+            config,
+            fumox_core::config::ResolvedConfigPath::Missing,
+        )
     }
 
     #[test]
@@ -915,6 +1004,135 @@ mod tests {
             exported_at: 1,
             sources: Vec::new(),
             profiles: vec![ok],
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A profile whose `sources` list names the same reference twice: the
+    /// write phase must not abort on the `(profile_id, source_id)` primary
+    /// key and leave the already-committed profile row without sources.
+    /// `/admin/export` never emits a duplicate ref, so this is the
+    /// hand-edited file the import screen accepts.
+    #[tokio::test]
+    async fn repeated_source_reference_stores_the_source_once() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let lang = state.locales.default_lang();
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![source("srcA0000000", "s1", None)],
+            profiles: vec![profile("p1", None, &["srcA0000000", "srcA0000000"])],
+        };
+
+        let summary = apply_import(&state, &lang, file)
+            .await
+            .expect("a repeated source reference must not abort the import");
+        assert_eq!(summary.profiles_created, 1);
+
+        let rows = profiles::list(&pool, false).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let composition = profiles::get_sources(&pool, &rows[0].id).await.unwrap();
+        assert_eq!(composition.len(), 1, "the ref is stored exactly once");
+    }
+
+    /// Two *source rows* sharing one `ref`: the write phase keys the fresh
+    /// ids by reference, so the second row would overwrite the first in
+    /// `ref_to_id` and the profile would bind only that one while the other
+    /// source is created and silently orphaned. Validation rejects the
+    /// ambiguity instead of picking a winner.
+    #[tokio::test]
+    async fn duplicate_source_reference_is_rejected() {
+        let state = test_state().await;
+        let lang = state.locales.default_lang();
+        let dup_text = lang.t("val.dup_ref").replace("{ref}", "srcA0000000");
+
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![
+                source("srcA0000000", "s1", None),
+                source("srcA0000000", "s2", None),
+            ],
+            profiles: vec![profile("p1", None, &["srcA0000000"])],
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(
+            errors.iter().any(|e| e.contains(&dup_text)),
+            "a reference used by two sources must be rejected: {errors:?}"
+        );
+
+        // Distinct references stay silent under the same rule, whatever the
+        // URLs vet to in this environment.
+        let file = ConfigExport {
+            sources: vec![
+                source("srcA0000000", "s1", None),
+                source("srcB0000000", "s2", None),
+            ],
+            ..file
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(
+            !errors.iter().any(|e| e.contains(&dup_text)),
+            "distinct references must not be flagged: {errors:?}"
+        );
+    }
+
+    /// The import path applies the same `PIPELINE_BYTES` cap the source and
+    /// profile forms do: the stored JSON is re-rendered into every edit form
+    /// and recompiled by the preview, so without the cap a file could plant
+    /// a pipeline up to the 1 MiB body limit. The rule set here is
+    /// semantically valid, so only the size may reject it.
+    #[tokio::test]
+    async fn imported_pipelines_respect_the_form_size_cap() {
+        let state = test_state().await;
+        let lang = state.locales.default_lang();
+
+        let rules: Vec<serde_json::Value> = (0..800)
+            .map(|i| {
+                serde_json::json!({
+                    "match": format!("^rule-{i}-{}", "x".repeat(80)),
+                    "replace": "r",
+                })
+            })
+            .collect();
+        let big = serde_json::json!({ "version": 1, "rename": rules });
+        assert!(
+            CompiledPipeline::from_json(Some(&big)).is_ok(),
+            "the oversized pipeline is semantically valid"
+        );
+        assert!(pipeline_size(&big) > caps::PIPELINE_BYTES);
+
+        let mut s = source("srcA0000000", "s1", None);
+        s.pipeline = Some(big.clone());
+        let mut p = profile("p1", None, &["srcA0000000"]);
+        p.pipeline = Some(big);
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![s],
+            profiles: vec![p],
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert_eq!(
+            errors.len(),
+            2,
+            "source and profile are both refused: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(|e| e.contains("65536")),
+            "the cap, not a pipeline semantic, is the reason: {errors:?}"
+        );
+
+        // A pipeline inside the cap still imports.
+        let mut s = source("srcA0000000", "s1", None);
+        s.pipeline = Some(serde_json::json!({ "version": 1 }));
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![s],
+            profiles: Vec::new(),
         };
         let errors = validate_import(&state, &lang, &file).await;
         assert!(errors.is_empty(), "{errors:?}");

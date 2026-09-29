@@ -627,11 +627,12 @@ async fn perform_quarantine_check(
 ///
 /// Success is strict: only a tunnel that came
 /// up *and* answered with a measured `delay` counts, anything else the
-/// engine reports is a failure. A meow-rs outage is likewise a *failed*
-/// check for every proxy that was due one (journaled as
-/// `probe_kind='t2'`, fail ladder runs): a silent skip left the head of
-/// the recency queue pinned for as long as the engine was down, and an
-/// operator could not tell an outage from an empty pool. The cycle still
+/// engine reports is a failure. A meow-rs outage is *not* charged to the
+/// proxies: every proxy that was due one is journaled
+/// (as `probe_kind='t2'`, the record that un-sticks the recency queue)
+/// and stamped as unverified, but its own fail budget and the quarantine
+/// path stay untouched, so an outage cannot retire a healthy pool
+/// ([`journal_engine_fault`]). The cycle still
 /// backs off so a dead meow-rs is not hammered every minute.
 async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     let now = now_ts();
@@ -702,8 +703,8 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     }
 
     // Cheap liveness check first: no point rewriting the config file when
-    // the service is down anyway. An outage here fails the whole batch on
-    // the ladder and backs off.
+    // the service is down anyway. An outage here stamps the whole batch
+    // unverified (no fail budget) and backs off.
     if let Err(error) = ctx.meow.ping().await {
         tracing::warn!(%error, "meow-rs unavailable, T2 batch failed with backoff");
         ctx.backoff_meow();
@@ -776,7 +777,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                 Err(_) => return,
             };
             if batch_guard.is_aborted() {
-                journal_and_fail(
+                journal_engine_fault(
                     &ctx,
                     row.id,
                     "aborted: meow-rs became unavailable mid-batch",
@@ -903,7 +904,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                             );
                             ctx.backoff_meow();
                         }
-                        journal_and_fail(
+                        journal_engine_fault(
                             &ctx,
                             row.id,
                             &format!("meow-rs unavailable mid-batch: {error}"),
@@ -918,10 +919,16 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     Ok(done + blocked)
 }
 
-/// Journal one failed T2 attempt and run the fail ladder: a proxy that could not get its tunnel check, whether the
-/// tunnel itself failed, the target was vet-refused, or meow-rs was down ,
-/// receives a `probe_kind='t2'` failure record, which is also what moves
-/// it forward in the recency queue.
+/// Journal one failed T2 attempt and run the fail ladder: a proxy that got
+/// a verdict, whether the tunnel itself failed or the target was vet-refused,
+/// receives a `probe_kind='t2'` failure record, which is also what moves it
+/// forward in the recency queue.
+///
+/// The remaining caller is the per-request blip branch, where the engine
+/// answered its liveness ping but the delay endpoint failed for this one
+/// proxy. That verdict is charged against the fail budget like any other;
+/// a meow-rs that is alive to `GET /version` but broken on every delay
+/// request is charged this way for the whole batch.
 async fn journal_and_fail(ctx: &Context, id: i64, reason: &str) {
     let now = now_ts();
     journal(
@@ -959,14 +966,47 @@ async fn journal_and_fail(ctx: &Context, id: i64, reason: &str) {
     }
 }
 
-/// Fail every proxy of a batch on the ladder with the same engine-outage
-/// reason: a meow-rs outage at ping/reload
-/// time means every due proxy went unverified this cycle, an unrecorded
-/// skip is indistinguishable from an empty pool and pins the head of the
-/// recency queue for the whole outage.
+/// Journal one T2 attempt that never happened because the engine was down
+/// and stamp the row as *unverified*, not as *failed*.
+///
+/// Both documented effects of a T2 failure are kept: the journal row (it
+/// is what un-sticks the head of the recency queue, an unrecorded skip
+/// pins it for the whole outage) and the `last_t2_failed_at` stamp plus
+/// the `ready` → `alive` demote, so the tunnel-verified tier cannot outlive
+/// an outage. What it does not do is charge the proxy's own fail budget:
+/// the outage is a fact about meow-rs, and with the shipped
+/// `fail_limit = 2` two outage cycles would quarantine a proxy that never
+/// failed a check, dropping it out of both T2 selectors and out of
+/// `/export/alive`. The outage is charged to the engine instead: the
+/// `BatchGuard` strike counter, the exponential backoff and the log line
+/// below are where it shows up.
+async fn journal_engine_fault(ctx: &Context, id: i64, reason: &str) {
+    let now = now_ts();
+    journal(
+        ctx,
+        ProbeResultEntry {
+            proxy_id: id,
+            checked_at: now,
+            ok: false,
+            latency_ms: None,
+            error: Some(reason),
+            probe_kind: T2_KIND,
+        },
+    )
+    .await;
+    if let Err(error) = proxies::check_engine_unavailable(&ctx.pool, id, now).await {
+        tracing::warn!(id, %error, "failed to stamp the T2 engine fault");
+    }
+}
+
+/// Stamp every proxy of a batch with the same engine-outage reason: a
+/// meow-rs outage at ping/reload time means every due proxy went
+/// unverified this cycle, and an unrecorded skip is indistinguishable from
+/// an empty pool (and pins the head of the recency queue for the whole
+/// outage). No fail budget is charged, see [`journal_engine_fault`].
 async fn journal_engine_failure(ctx: &Context, batch: &[proxies::ProxyRow], reason: &str) {
     for row in batch {
-        journal_and_fail(ctx, row.id, reason).await;
+        journal_engine_fault(ctx, row.id, reason).await;
     }
     tracing::warn!(proxies = batch.len(), "T2 batch failed by engine outage");
 }
@@ -1222,8 +1262,9 @@ mod tests {
 
     /// Engine failure (engine-failure branch 1): meow answers
     /// /version but rejects the config reload, every proxy of the batch
-    /// gets a journaled failed t2 check (outage reason, fail ladder) and
-    /// the recency queue head cannot pin during the outage.
+    /// gets a journaled failed t2 check (outage reason) and the recency
+    /// queue head cannot pin during the outage. The outage is *not*
+    /// charged to the proxies: only the T1 dial counts.
     #[tokio::test]
     async fn t2_engine_failure_at_reload_fails_the_batch() {
         let pool = temp_pool().await;
@@ -1274,9 +1315,14 @@ mod tests {
             assert_eq!(kind, "t2", "the reload outage must be journaled as t2");
             assert!(error.contains("meow-rs unavailable"), "id {id}: {error}");
             let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-            // Both lanes failed: the T1 dial (nothing listens on 443) and
-            // the journaled engine outage, fail_count counts both.
-            assert_eq!(row.fail_count, 2);
+            // Only the T1 dial (nothing listens on 443) is charged: the
+            // engine outage stamps the outstanding T2 verdict but leaves
+            // the proxy's own fail budget alone.
+            assert_eq!(row.fail_count, 1, "id {id}");
+            assert!(
+                row.last_t2_failed_at.is_some(),
+                "id {id}: the outstanding T2 verdict must be stamped"
+            );
         }
 
         // The meow backoff is armed: a second immediate cycle sleeps
@@ -1287,6 +1333,80 @@ mod tests {
                 < ctx.meow_retry_at.load(std::sync::atomic::Ordering::Relaxed),
             "the reload outage must arm the meow backoff"
         );
+    }
+
+    /// The regression this whole split exists for: a meow-rs outage must
+    /// not charge the proxies it skipped. With the shipped
+    /// `fail_limit = 2` two outage cycles used to quarantine a proxy
+    /// that had never failed a single check, dropping it out of both T2
+    /// selectors and out of `/export/alive` for a fault of the sidecar.
+    ///
+    /// The proxy here is genuinely healthy (a live TCP listener, so T1
+    /// passes every cycle) and sits in the tunnel-verified `ready` tier.
+    /// meow-rs is unreachable, so every cycle takes the ping-outage
+    /// branch. After two cycles the row must still be in service, with
+    /// the T2 verdict stamped (the `ready` tier does not survive an
+    /// outage) and the fail counter still at zero.
+    #[tokio::test]
+    async fn meow_outage_never_quarantines_a_healthy_proxy() {
+        let pool = temp_pool().await;
+
+        // A live listener so T1 passes and the only failure the proxy can
+        // collect is one the engine owes it.
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match tcp.accept().await {
+                    Ok(ok) => ok,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        let id = seed_proxy(&pool, "vless", "127.0.0.1", tcp_port, "ready").await;
+
+        // The shipped fail_limit of 2, and meow-rs on a closed port.
+        let config_path = std::env::temp_dir().join(format!(
+            "fumox-probe-test-{}.yaml",
+            fumox_core::models::new_id()
+        ));
+        let mut config = test_config(2, "127.0.0.1:1", config_path);
+        config.probe.allow_private_targets = true;
+        let ctx = Arc::new(Context::new(config, pool.clone()));
+
+        for cycle in 1..=2 {
+            // The backoff gate would otherwise skip T2 on the second
+            // cycle; clear it so both cycles really reach the outage
+            // branch (the backoff itself is asserted in the reload test).
+            ctx.meow_retry_at.store(0, Ordering::Relaxed);
+            run_cycle(ctx.clone()).await.unwrap();
+
+            let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
+            assert_ne!(
+                row.status, "quarantine",
+                "cycle {cycle}: an engine outage must not quarantine a healthy proxy"
+            );
+            assert_eq!(
+                row.fail_count, 0,
+                "cycle {cycle}: the outage must not charge the proxy's fail budget"
+            );
+            assert_eq!(
+                row.quarantined_at, None,
+                "cycle {cycle}: no second chance may be scheduled"
+            );
+            assert!(
+                row.last_t2_failed_at.is_some(),
+                "cycle {cycle}: the outstanding T2 verdict must be stamped"
+            );
+            assert_eq!(
+                row.status, "alive",
+                "cycle {cycle}: the ready tier must not outlive an engine outage"
+            );
+        }
     }
 
     /// Engine failure (engine-failure branch 2): meow dies
@@ -1388,9 +1508,14 @@ mod tests {
                 mid_batch += 1;
             }
             let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-            // Both lanes failed: the T1 dial (nothing listens on 443) and
-            // the engine failure, fail_count counts both.
-            assert_eq!(row.fail_count, 2);
+            // Only the T1 dial (nothing listens on 443) is charged: an
+            // engine outage, mid-batch or aborted, stamps the outstanding
+            // T2 verdict without spending the proxy's fail budget.
+            assert_eq!(row.fail_count, 1, "id {id}");
+            assert!(
+                row.last_t2_failed_at.is_some(),
+                "id {id}: the outstanding T2 verdict must be stamped"
+            );
         }
         // With concurrency 4 the exact split between "mid_batch" and
         // "aborted:" depends on the semaphore; the invariant is that
@@ -1746,9 +1871,8 @@ mod tests {
         let live = seed_proxy(&pool, "vless", "127.0.0.1", live_port, "unknown").await;
         let dying = seed_proxy(&pool, "vless", "127.0.0.1", dead_port, "unknown").await;
 
-        // meow-rs is absent: its T2 lane fails the due proxies on the
-        // ladder, the live proxy collects
-        // one engine-outage failure per cycle, not a silent skip.
+        // meow-rs is absent: its T2 lane journals the due proxies
+        // (outage reason, not a silent skip) but does not charge them.
         let config = test_config(
             2,
             "127.0.0.1:1",
@@ -1758,12 +1882,17 @@ mod tests {
 
         // Cycle 1: live proxy becomes alive (T1), dead one collects fail #1
         // (T1); after promotion the live one enters the T2 batch, where the
-        // engine outage records its own failure (fail_limit=2 not reached).
+        // engine outage stamps the outstanding T2 verdict without touching
+        // the fail budget.
         run_cycle(ctx.clone()).await.unwrap();
         let row = proxies::get_by_id(&pool, live).await.unwrap().unwrap();
         assert_eq!(row.status, "alive");
         assert!(row.latency_ms.is_some());
-        assert_eq!(row.fail_count, 1, "the meow outage must fail the T2 lane");
+        assert_eq!(
+            row.fail_count, 0,
+            "the meow outage stamps the T2 verdict but must not fail the proxy"
+        );
+        assert!(row.last_t2_failed_at.is_some());
         let row = proxies::get_by_id(&pool, dying).await.unwrap().unwrap();
         assert_eq!(row.status, "unknown");
         assert_eq!(row.fail_count, 1);

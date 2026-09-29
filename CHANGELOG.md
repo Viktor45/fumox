@@ -10,6 +10,426 @@ The categories follow [Keep a Changelog](https://keepachangelog.com/);
 `Docs` covers the user guide and READMEs, `Internal` (dependency bumps,
 CI plumbing) is omitted — it never changes the shipped image.
 
+## Unreleased (2026-09-29)
+
+Defect fixes in the working tree, not yet on a published image.
+
+### Added
+
+- `[geo].startup_download_budget_secs` (default 60, `0` = do not
+  wait): the ceiling on how long startup blocks on the GeoLite2
+  download before it binds the listeners. The budget is an upper
+  bound on a stalled mirror, not a promise that geo is ready — past
+  it the download continues detached and that run serves without geo
+  enrichment until the next start. Tunable like every other key
+  (`FUMOX_GEO__STARTUP_DOWNLOAD_BUDGET_SECS`).
+
+### Fixed
+
+- Source reconcile retired proxies that belonged to someone else. The
+  end-of-pass sweep asked a global question ("is this row link-less?")
+  and therefore swept up the deliberate residue the admin *Delete
+  source* click leaves behind under `drop_gate = false`, where
+  `mark_orphans_removed` protects `ready` and `unknown` rows and
+  leaves them link-less on purpose. Reconciling an unrelated source
+  one tick later retired them, undoing the operator's choice. The
+  sweep now runs before the `DELETE` and asks only about the links
+  *this* pass removes: a stale link of this source and no link that
+  survives it. Guarded by
+  `reconcile_of_another_source_leaves_protected_orphans_alone`.
+- `check_failed` lost fail-count increments and could resurrect a
+  retired row. The `fail_count` read and the write that acts on it
+  were two pool-level statements: overlapping checks of the same row
+  lost an increment, and the write carried no status guard, so a row
+  that had meanwhile been driven to `removed` with a second chance
+  scheduled was pulled back into `quarantine`. Both statements now
+  run in one `BEGIN IMMEDIATE` transaction (`SQLITE_BUSY_SNAPSHOT` is
+  outside `busy_timeout`) and repeat the `status IN ('unknown',
+  'alive', 'ready')` guard; a refused write reports
+  `Transition::Unchanged` instead of the attempted transition.
+- A T1 success lifted the T2 suppression flag. `check_succeeded`
+  cleared `last_t2_failed_at` on any success, so a proxy that had just
+  failed its tunnel check re-entered the T1 rotation on a plain
+  TCP/TLS verdict — the exact case the flag (migration 0007) exists
+  to suppress. Only a T2 success does now, and `ready` is the T2
+  success tier.
+- A meow-rs outage was charged to the proxies it skipped. The
+  journal-and-fail path ran the whole fail ladder for every due proxy
+  when the engine was down at `ping`/`reload_config` or died
+  mid-batch, and with the shipped `fail_limit = 2` two outage cycles
+  quarantined a proxy that had failed no check at all — dropping a
+  healthy row out of both T2 selectors and out of `/export/alive` for
+  the sidecar's fault. An outage is now a distinct outcome:
+  `journal_engine_fault` still writes the `probe_kind='t2'` record
+  (the entry that un-sticks the head of the recency queue) and stamps
+  `last_t2_failed_at` with a `ready` → `alive` demote, so the
+  tunnel-verified tier still does not outlive an outage, but
+  `fail_count` and the quarantine ladder stay untouched. The outage
+  is charged to the engine instead — `BatchGuard` strikes, the
+  exponential backoff, the log line. The boundary is the
+  post-failure `/version` ping: a `ServiceUnavailable` the engine
+  *answers* is a per-request blip and remains an ordinary charged
+  verdict. Guarded by
+  `meow_outage_never_quarantines_a_healthy_proxy`.
+- Every revival path left the row in no probe lane. `reset_status`,
+  `revive_removed` and its country / ASN / no-probe-history variants
+  and `revive_quarantine` put the row back to `unknown` but kept
+  `last_t2_failed_at` set, and the revival predicates did not require
+  a `proxy_source_links` row — so a revived proxy no T1 lane selects
+  (`last_t2_failed_at IS NULL`) and no T2 sample offers (`alive` /
+  `ready`) would ever look at again. The flag is now cleared with the
+  rest of the lifecycle and the link predicate is applied. *Reset
+  status* additionally enqueues the row for priority checking, the
+  handoff the bulk paths hand their callers.
+- *Reset status* reported a proxy that still exists as nonexistent.
+  `reset_status` returns one boolean for two different outcomes: a row
+  that is gone, and a row that exists but belongs to no probe lane (no
+  `proxy_source_links` row left after reconciliation retired it, or a
+  scheme no lane checks — `tuic`, `mieru`). Both came back as `false`
+  and both were answered with `err.proxy_not_found`, so an operator
+  pressing the button on a proxy sitting right there on the screen was
+  told it did not exist. The second case is now a rejected action
+  rather than a 404: the panel answers with the unchanged
+  `#status-badge` fragment (which is what the form's `hx-target`
+  expects) and a message saying the status was left as it is because no
+  probe can reach the row (`px.reset_unreachable`, both catalogs). A
+  genuinely missing row still 404s, and a database error still 500s.
+- The probe priority queue accepted rows no lane would ever drain: an
+  id with no `proxy_source_links` row and an id under a T2 block.
+  `enqueue_checks` now applies the drain's own predicates, so the
+  revival paths cannot leave dead weight in the table. Guarded by
+  `queue_drain_skips_rows_under_a_t2_block`.
+- The admin *Logout* button was a CSRF-able POST. `/admin/logout`
+  sat outside the protected nest, so an attacker page that could
+  auto-submit a cross-site form signed the operator out at will. The
+  route moved inside, where `require_auth` and `csrf_protect` both
+  run; the form in `base.html` already ships the `_csrf` field. Guarded
+  by `logout_requires_session_and_csrf`.
+- The *Import / Export* screen built its serve links against
+  `[admin].allowed_hosts` while the export endpoints gate on
+  `[server].allowed_hosts`. The two lists could diverge silently: a
+  host allowlisted for the panel but not for the public listener
+  produced `/export/alive/{token}` links that answer 404 "link not
+  found" on every click, and the reverse direction rendered a host
+  the export gate had never agreed to serve. `serve_base` validates
+  against the list the public listener actually gates on. Guarded by
+  `serve_base_validates_against_the_server_host_allowlist`.
+- A `Host` header holding userinfo leaked the export token into a
+  link. The link-builder stripped the port with its own parser and
+  never canonicalized, so `name@evil.com` was emitted verbatim into
+  `http://name@evil.com/export/alive/{token}` — the link sends the
+  operator, and anyone who clicks it, to an attacker-controlled host
+  with the token as the query. It runs the same canonicalizer as the
+  gate, even with the empty allowlist the gate itself skips. Guarded
+  by `build_serve_link_host_never_emits_userinfo`.
+- Config import accepted a pipeline 16× larger than the edit form
+  allows. The `PIPELINE_BYTES` cap (65536) was applied by the source
+  and profile forms but not by the import validator, so a file could
+  plant a pipeline up to the 1 MiB body limit; the stored JSON is
+  re-rendered into every edit form and recompiled by the preview.
+- A repeated source reference in one profile aborted the import
+  halfway. `profile_sources` is keyed by `(profile_id, source_id)`,
+  so a hand-edited file naming the same reference twice failed the
+  whole composition insert *after* the profile row was committed,
+  leaving an empty profile behind a 500. A repeat now collapses to
+  its first position. Two *source rows* sharing one reference are a
+  new hard error instead: the reference is the join key that binds
+  the rows together and the write phase keys new ids by it, so the
+  file does not say which row a profile composition means
+  (`val.dup_ref` in both catalogs). `/admin/export` never emits
+  either shape, so this only ever sees a hand-edited file. Guarded
+  by `repeated_source_reference_stores_the_source_once`.
+- The *Edit source* form mangled header values containing a bullet.
+  The mask restore matched on `value.contains('•')` and looked the
+  original up by header name, so a real value the operator typed with
+  a bullet in it (`tok•en`) was silently replaced by the stored
+  secret, and a secret whose key the operator renamed was dropped and
+  the literal mask `abc…••••` was sent upstream. The restore now
+  matches on the mask itself, so a renamed key keeps its secret and a
+  typed value is a value.
+- The sing-box / Xray parser dropped every credential of a
+  multi-user endpoint. The builders took `users.first()` and emitted
+  one entry, silently and with no invalid counter to show for it, so a
+  shared `vnext` / `servers` array yielded one proxy instead of one
+  per user. Every user is now its own entry (per-user `flow`,
+  `alterId`, `scy` stay on their own row), a junk element costs only
+  itself, and an endpoint whose users are all unusable is counted as
+  invalid instead of vanishing. Guarded by
+  `every_user_of_an_xray_endpoint_becomes_an_entry`.
+- Two Clash-advertised nodes differing only in a connection-defining
+  field deduplicated into one row. The fingerprint's
+  `SECURITY_PARAMS` list held the URI spellings only, so the Clash
+  ones (`servername`, `network`, `ws-path`, `client-fingerprint`,
+  `grpc-service-name`, plus the URI-less `ws-headers`, `ws-opts` and
+  `reality-opts` blocks, stored verbatim) were invisible to the
+  dedup key and the upsert overwrote one node with the other. The
+  spellings that do have a URI form are now canonicalized onto it
+  (`canonical_key`), so the same node advertised as Clash YAML and as
+  a URI still deduplicates together. Guarded by
+  `clash_spellings_are_security_relevant`,
+  `clash_structured_fields_are_security_relevant` and
+  `clash_and_uri_spellings_agree`.
+- Fingerprint pre-images could be forged from inside a value. The
+  pairs were joined with `&` and `k=v` unescaped, so
+  `path=/search` + `host=evil` and the single parameter
+  `host=evil&path=/search` hashed identically — attacker-controlled
+  feed text choosing which of two nodes a dedup keeps. Keys and
+  values are now escaped, `%` included, so escaping is reversible.
+  Guarded by `separator_bytes_in_values_cannot_forge_a_pair`.
+- URI serialization emitted parameter values verbatim. The Clash and
+  sing-box parsers feed the same `Param` list with *decoded* text
+  from YAML / JSON scalars, so a value can carry a raw `&` or `#`:
+  `&` spawned a bogus extra parameter and `#` swallowed the proxy
+  name (everything after the first `#` is the fragment). Only the
+  query delimiters, space and the C0 controls are escaped now; `%`
+  is deliberately left alone, which is what keeps a value the URI
+  parsers stored still percent-encoded byte-exact. Guarded by
+  `query_delimiters_in_values_do_not_corrupt_the_line` and
+  `already_encoded_values_are_not_double_encoded`.
+- SSRF policy missed two IPv6 spellings of a blocked address. Only
+  the mapped form (`::ffff:0:0/96`) was vetted, so `[::a9fe:a9fe]` —
+  the metadata endpoint in the deprecated IPv4-compatible `::/96` form
+  — walked past the policy; the deprecated site-local block
+  `fec0::/10` was not blocked at all, despite being routable unicast
+  space an internal service can be addressed on. `::/96` is now vetted
+  as the embedded IPv4 (`::8.8.8.8` stays public, it is not a blanket
+  prefix ban). Guarded by
+  `ipv4_compatible_and_site_local_v6_are_blocked`.
+- A database path with a percent escape opened the wrong file. The
+  path was interpolated into a `sqlite:` URL string and sqlx
+  URI-parsed it, so a database file named `pl%2Fain.db` was opened as
+  `pl/ain.db` — a file that does not exist, or worse one that does
+  and was never chmod'ed to 0600, while the file
+  `pre_create_db_file` had just created with mode 0600 sat unused.
+  The path now reaches SQLite as a `PathBuf`. Guarded by
+  `connect_pool_opens_the_literal_path_without_uri_decoding`.
+- `database.max_connections = 0` surfaced as a 30-second startup
+  stall. sqlx accepts a zero-sized pool and then fails every
+  acquisition with `PoolTimedOut` after its acquire timeout, so a
+  typo in `[database]` cost the operator a stall and an error that
+  never named the offending key. It is rejected before the pool or
+  the file exists. Guarded by `connect_pool_rejects_zero_max_connections`.
+- The migration-checksum self-heal hid a possible DDL gap. sqlx
+  hashes the whole file and never re-runs an applied migration, so a
+  re-stamp cannot tell a comment edit from a DDL edit: the boot
+  recovered with a single `warn` and the schema stayed behind the
+  files, discoverable only by noticing a missing column much later.
+  The affected versions are now logged at `error` level with the
+  instruction to ship a new migration file, and recorded under
+  `meta.migrations_repaired` so the fact survives the boot log. A
+  repair that rewrote nothing re-raises the original mismatch instead
+  of claiming a repair that did not happen. The gap itself is *not*
+  closed and is not meant to be: the re-stamp is bookkeeping only, so
+  an edited already-applied migration is still never applied — only a
+  new migration file can bring the schema up to date, which is why
+  the repair now shouts instead of helping. Guarded by
+  `migrate_records_the_repaired_versions_in_meta`.
+- The `repair_migration_checksums` example re-stamped rows that were
+  already current, reported them as repairs, and had its own copy of
+  the UPDATE — the `success = 1 AND checksum != ?2` guards could
+  drift from the copy `migrate()` uses. It now calls
+  `db::repair_migration_checksums`, says "already current" for the
+  rest, and refuses a database carrying a migration this build does
+  not embed (a newer Fumox) instead of leaving `migrate()` to fail
+  with `VersionMissing`. Guarded by
+  `repair_leaves_migrations_this_build_does_not_embed_alone`.
+- With the geo resolver inactive — geo disabled, or the `.mmdb` files
+  absent, the default configuration — `drop_entries` zipped the
+  entries against an *empty* stamp slice and returned nothing, so a
+  source with any `drop` rule was reconciled empty and retired
+  wholesale. The lookup is indexed with `geo.get(idx)`: entries past
+  the end of the slice count as unstamped and survive, and regex
+  rules (which need no stamp) still fire. Guarded by
+  `drop_entries_keeps_the_batch_when_the_geo_slice_is_short`.
+- A parse or DB failure suppressed re-fetching a source for a whole
+  TTL. The raw snapshot was written right after the fetch, before
+  anything was parsed or reconciled, but it *is* the freshness marker
+  (`Caches::raw_is_fresh`) — so one bad payload stopped every
+  non-forced fetch until the TTL elapsed while the scheduler kept
+  reporting successful ingests. It is now written only once the
+  payload has parsed and reconciled. Guarded by
+  `a_parse_failure_leaves_no_fresh_raw_snapshot`.
+- A background re-render that started before an ingest committed
+  stored its pre-commit rows with a full fresh TTL. The put landed
+  after `invalidate_processed_for_source` and the invalidated key
+  served the old rows as fresh until the TTL expired — the very
+  staleness the invalidation had just ended. Every invalidation now
+  bumps a per-key generation, the re-render claims the generation
+  before it starts, and `processed_put_revalidated` drops a rendering
+  whose generation moved (including one that moved between the check
+  and the insert). Guarded by
+  `revalidation_started_before_an_ingest_does_not_store_its_rendering`.
+- A cached `/sub` and `/src` snapshot outlived an unrecoverable
+  upstream error. Stale-while-revalidate spawned the re-render, the
+  render returned the documented `http_client` verdict, and the stale
+  body kept being served — so "return the upstream status code" never
+  took effect for any client that had a cached copy. An unrecoverable
+  answer now invalidates the key (transient server-side failures keep
+  the last good snapshot). Guarded by
+  `failed_revalidation_drops_the_cached_snapshot`.
+- A source's `limit.count` was ignored on `/sub` unless that same
+  source also set an explicit `sort`. The per-source pipeline ran only
+  the steps that need sorting (`apply_per_source`), leaving the cap
+  to the sort-winning `finalize`, so the cap was conditional on the
+  sort; `/src`, one source and one `apply`, always honoured it. The
+  full per-source run now applies, and the profile-level cap is
+  applied again to the merged list.
+- *Refresh now* was parked behind a whole scheduler sweep. The tick
+  arm awaited `sweep` inline, and a sweep drains its entire
+  `JoinSet`, so a manual refresh sat in the channel until every due
+  source had finished: it was neither fetched nor marked in flight,
+  and the status fragment the panel polls reported the previous fetch
+  as the finished one. The sweep is detached now, behind a flag that
+  keeps two sweeps from overlapping. Guarded by
+  `refresh_now_is_not_parked_behind_a_running_sweep`.
+- A stalled GeoLite2 mirror held the whole startup hostage. The
+  download ran before the listeners bound and without a bound, so
+  `/healthz` was unreachable for the sum of two per-file download
+  budgets. Startup now waits at most
+  `[geo].startup_download_budget_secs` (60 s, `0` = do not wait)
+  and then leaves the task running — the install is an atomic
+  rename, so a download finishing mid-run can never expose a
+  half-written file, and the next start picks it up. Guarded by
+  `a_stalled_geo_download_does_not_hold_startup`.
+- A GeoLite2 file of the wrong kind was accepted. The content check
+  was the MaxMind metadata marker alone, so a mirror serving the ASN
+  database under the City name installed silently and every proxy
+  got wrong country / AS facts; the check was also age-first, so a
+  wrong-but-plausible file was kept for another month. The
+  `database_type` the metadata block declares must now match the
+  slot, and the type only counts *after* the marker (a city name in
+  the data section is not a declaration). This is a format and
+  identity check, not provenance: the mirrors publish no checksum to
+  pin here. Guarded by
+  `a_well_formed_file_of_the_wrong_kind_is_refreshed`.
+- The unattended GeoLite2 download followed any redirect. The client
+  used `Policy::limited(MAX_REDIRECTS)`, which follows off https and
+  to any host, so a hijacked release or a mis-typed URL could deliver
+  a foreign file into `db_dir`. Redirects are now https-only, capped,
+  and restricted to `github.com` and the `*.githubusercontent.com`
+  release-asset CDN. Guarded by
+  `a_redirect_off_the_mirror_hosts_is_refused`.
+- The smoke stand could overwrite the main stack's config. Named
+  volumes are project-scoped but the `./config` bind mount is the
+  same host directory for every compose project, so the smoke
+  stand's admin panel wrote the main stack's `app.toml` through the
+  *Edit settings* page. The mount is now parameterized by
+  `FUMOX_CONFIG_ACCESS` (`rw` by default, unchanged for the main
+  stack) and `scripts/smoke-up.sh` pins it to `ro` — a knob for the
+  operator, not for the stand, the isolation guarantee is the point.
+- The `latest` image tag was republished from every branch. The
+  per-arch and merge jobs attached the raw `MEOW_VERSION` tag
+  unconditionally, so a feature-branch build moved the tag everyone
+  pulls. It is now attached only from `main` or a `v*` tag — the same
+  ref gate `docker.yml` uses, and a `MEOW_VERSION` that names a
+  release keeps the previous behaviour.
+- A `ready` proxy rendered the `unknown` badge on the proxy detail
+  card. The template's badge chain had no `ready` arm, so a
+  tunnel-verified proxy fell through to the `else`. Guarded by the
+  admin-side assertion added next to the existing `/export/ready/`
+  card check.
+
+### Docs
+
+- The guide told operators to drop GeoLite2 `.mmdb` files into
+  `./config`; the shipped Compose stack has set
+  `FUMOX_GEO__DB_DIR=/shared` since 338929e, and the environment
+  outranks the file, so that directory was never scanned. The compose
+  header, `config/app.toml` and both guides now point at the
+  `meow-shared` volume and say plainly that the manual step is
+  optional on a stock stack (the server downloads the databases into
+  `/shared` at startup anyway).
+- Both guides described `./config` as mounted read-only. The server
+  container mounts it read-write precisely so the admin *Edit
+  settings* page can save, which is the change this batch
+  introduced; the probe is the `:ro` one. `FUMOX_CONFIG_ACCESS` —
+  the knob that this change added — was documented in the compose
+  file, the changelog and `scripts/smoke-up.sh` but in neither
+  guide, so it is now in the `.env` table too.
+- The reverse-proxy note told operators to set both
+  `[server].allowed_hosts` and `[admin].allowed_hosts` "to the
+  hostname the proxy serves". The admin panel builds the links
+  behind *Import / Export*, *Sources* and *Profiles* against the
+  **public** list, so the shipped loopback quickstart
+  (`http://127.0.0.1:8081/admin`) plus a pinned public domain makes
+  exactly those three screens answer `500`. The note, both guides'
+  configuration tables and both troubleshooting sections now spell
+  out the second list to add.
+- The *Settings* page was described as rendering "every
+  `config/app.toml` knob except the admin token" and "the complete
+  effective config". Two keys have no rendered field:
+  `[server].export_max_rows` and
+  `[geo].startup_download_budget_secs`. Both apply from the file as
+  documented; the guides now name them as the exception instead of
+  claiming completeness.
+- `[server].export_max_rows = 0` was undocumented. It does not mean
+  unlimited — the value clamps up to 1 row, so the body serves a
+  single node. The config reference (both languages) now says so,
+  next to the sibling keys that do give `0` a meaning.
+- The export links were documented as "rendered at most once every
+  30 s". That holds per request, not per window: the cache has no
+  single-flight claim, so a burst landing on the boundary renders
+  once per request (the pool caps the concurrency, so the cost is
+  latency rather than throughput). Wording corrected in both guides
+  and on the code.
+- Corrected code comments that asserted more than the code
+  delivers: the `check_ip` policy no longer claims to cover "every
+  IPv6 form that carries an IPv4 address" (the IPv4-translated
+  `::ffff:0:0:0/96` and Teredo `2001:0000::/32` are not matched, and
+  were not before either); `render_tier` no longer claims a
+  truncated download "documents itself" (the body carries no
+  truncation marker, only the `nodes count` header does);
+  `pipeline_size` no longer claims to match *both* form modes (the
+  raw form measures pretty-printed JSON, so a document in the window
+  between the two sizes imports and then fails to save); and the
+  real-`.mmdb` test says that its assertion also covers file age, so
+  it goes red with "looks stale" once a developer's copies are a
+  month old.
+
+### Changed
+
+- `/export/alive/{token}` and `/export/ready/{token}` re-read and
+  re-serialized the whole tier on every download. Both now render at
+  most once per 30 s (`EXPORT_TTL_SECS`) and are served from the
+  shared processed cache in between, like `/sub` and `/src`; the
+  entries carry no source id, so per-source invalidation never
+  touches them. The exports have no source TTL to inherit and no
+  invalidation trigger (the probe owns the tiers), so the window is
+  fixed and short, and an expired entry is re-rendered inline rather
+  than served stale — a download is a snapshot by definition, and a
+  quietly outdated one is worse than a slow request. A tier can
+  therefore lag a status change by up to 30 s.
+- The two export links are now capped at 50 000 rows, and the cap is
+  a setting rather than a constant: `[server].export_max_rows`
+  (`FUMOX_SERVER__EXPORT_MAX_ROWS`), defaulting to the number the
+  hard-coded `EXPORT_MAX_ROWS` used, so a deployment that never sets
+  it changes nothing and a bigger tier can be shipped whole. The
+  window above bounds the *rate* of rendering; nothing bounded the
+  *size*. Unlike `/sub` and `/src`, which a profile's `limit.count` and
+  a source's pipeline cap already bound, these two have no upstream
+  cap, so one download on a public cacheable URL meant an unbounded
+  `fetch_all`, an unbounded serialization and an unbounded body. The
+  cap is a `LIMIT ?` in the backing query (`list_alive` /
+  `list_ready`), not a post-read truncate, and it truncates the stable
+  id order (lowest ids first), so two renders of the same tier agree.
+  The `nodes count` header reports what the body really carries, so a
+  truncated download documents itself; the admin badge (`count_alive` /
+  `count_ready`) stays uncapped on purpose, so the operator can still
+  see that the export is smaller than the tier. The cap is applied
+  after the host and token gates: a rejected request cannot tell a
+  capped render from a full one, and costs no query. Guarded by
+  `export_body_is_capped_in_sql`,
+  `cap_is_applied_after_the_host_and_token_gates`,
+  `export_cap_follows_the_configured_setting` and
+  `server_export_max_rows_is_configurable`.
+- Ingest resolves geo facts concurrently instead of one await per
+  entry. Every unseen host costs up to `[geo].dns_timeout` (5 s by
+  default) when DNS hangs, so a feed of dead hosts cost the sum of
+  them. Lookups now overlap under a cap of 32 in flight
+  (`GEO_LOOKUP_CONCURRENCY`), keeping the input order the drop rules
+  and the reconcile upsert rely on (`buffered`, not
+  `buffer_unordered`).
+
 ## 2026-09-23 · sha-b72b03f
 
 ### Fixed

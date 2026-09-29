@@ -14,6 +14,17 @@
 //! `sqlx::migrate!().run(pool)` succeeds again without touching the
 //! schema.
 //!
+//! What it cannot do is fix a DDL edit: sqlx never re-runs an applied
+//! migration, and the SHA-384 covers the whole file, so the re-stamp
+//! hides the difference instead of applying it. A DDL change to an
+//! already-applied file needs a new migration file.
+//!
+//! The database must be fully in sync with this build's embedded set
+//! in both directions — a migration this build does not know about
+//! means the database was migrated by a newer Fumox, and the tool
+//! refuses rather than leaving `migrate()` to fail with
+//! `VersionMissing`.
+//!
 //! Usage:
 //!
 //! ```text
@@ -77,37 +88,55 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .into());
     }
-
-    let mut updated = 0usize;
-    for migration in migrator.iter() {
-        let rows = sqlx::query(
-            "UPDATE _sqlx_migrations
-             SET checksum = ?2
-             WHERE version = ?1",
+    // The mirror check. A database carrying a version this build does not
+    // embed was migrated by a newer Fumox; re-stamping the versions we do
+    // know about would leave sqlx refusing to start with
+    // `VersionMissing(<that version>)` anyway, so the tool must say so up
+    // front instead of promising a `migrate()` that cannot succeed.
+    let only_in_applied: Vec<i64> = applied_versions
+        .iter()
+        .copied()
+        .filter(|v| !embedded_versions.contains(v))
+        .collect();
+    if !only_in_applied.is_empty() {
+        return Err(format!(
+            "the database has applied migrations this build does not embed: \
+             {only_in_applied:?}; it was migrated by a newer Fumox, downgrade \
+             to that build instead of re-stamping checksums"
         )
-        .bind(migration.version)
-        .bind(&*migration.checksum)
-        .execute(&pool)
-        .await?;
-        if rows.rows_affected() == 1 {
-            updated += 1;
+        .into());
+    }
+
+    // The UPDATE itself lives in `db::repair_migration_checksums` so the
+    // `success = 1 AND checksum != ?2` guards cannot drift from the copy
+    // `db::migrate()` uses: a row that already matches is left alone and
+    // not reported as a repair.
+    let re_stamped = fumox_core::db::repair_migration_checksums(&pool, &migrator).await?;
+    let re_stamped_set: std::collections::HashSet<i64> = re_stamped.iter().copied().collect();
+    for migration in migrator.iter() {
+        if re_stamped_set.contains(&migration.version) {
             println!("  ✓ version {:>3}: checksum re-stamped", migration.version);
-        } else if rows.rows_affected() == 0 {
-            return Err(format!(
-                "no _sqlx_migrations row for version {}; \
-                 cannot repair an incomplete state",
+        } else {
+            println!(
+                "  · version {:>3}: checksum already current",
                 migration.version
-            )
-            .into());
+            );
         }
     }
 
     pool.execute("PRAGMA wal_checkpoint(TRUNCATE)").await.ok();
 
     println!(
-        "done: {updated} checksum(s) re-stamped in {}; \
-         sqlx::migrate!().run() will accept the current files now",
+        "done: {} checksum(s) re-stamped in {}",
+        re_stamped.len(),
         path.display()
     );
+    if !re_stamped.is_empty() {
+        println!(
+            "note: the re-stamp only rewrites bookkeeping. sqlx never re-runs an \
+             applied migration, so if the edit was not comment-only the schema \
+             on disk is behind the files — ship a new migration file for the DDL."
+        );
+    }
     Ok(())
 }

@@ -207,6 +207,16 @@ pub struct ServerConfig {
     /// alive-export endpoint to the operator's own hostname.
     #[serde(default = "defaults::allowed_hosts")]
     pub allowed_hosts: Vec<String>,
+    /// Hard ceiling on the rows one `/export/alive` / `/export/ready` body
+    /// may carry, applied as `LIMIT ?` in the backing query. Unlike `/sub`
+    /// and `/src`, which a profile's `limit.count` and a source pipeline
+    /// already bound, the two export links have no upstream cap, so without
+    /// one a large pool would turn one public request into an unbounded
+    /// read, render and body. An operator whose tier exceeds the ceiling
+    /// raises it here; the admin badge stays uncapped, so a truncated
+    /// export is always visible as smaller than the tier.
+    #[serde(default = "defaults::export_max_rows")]
+    pub export_max_rows: u32,
 }
 
 impl Default for ServerConfig {
@@ -217,6 +227,7 @@ impl Default for ServerConfig {
             auth_fail_rate_limit: defaults::auth_fail_rate_limit(),
             trust_proxy_ips: defaults::trust_proxy_ips(),
             allowed_hosts: defaults::allowed_hosts(),
+            export_max_rows: defaults::export_max_rows(),
         }
     }
 }
@@ -360,6 +371,12 @@ pub struct GeoConfig {
     /// Timeout for the async DNS resolution step.
     #[serde(default = "defaults::dns_timeout_secs")]
     pub dns_timeout_secs: u64,
+    /// Upper bound on how long startup waits for the GeoLite2 download
+    /// before the listeners bind. Past it the download keeps running in the
+    /// background (the file is installed by an atomic rename) and this run
+    /// simply runs without geo enrichment until the next start.
+    #[serde(default = "defaults::geo_startup_download_budget_secs")]
+    pub startup_download_budget_secs: u64,
 }
 
 impl Default for GeoConfig {
@@ -370,6 +387,7 @@ impl Default for GeoConfig {
             db_dir: defaults::geo_db_dir(),
             cache_max_entries: defaults::geo_cache_max_entries(),
             dns_timeout_secs: defaults::dns_timeout_secs(),
+            startup_download_budget_secs: defaults::geo_startup_download_budget_secs(),
         }
     }
 }
@@ -380,6 +398,12 @@ impl GeoConfig {
     /// conversion at each call site.
     pub fn dns_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.dns_timeout_secs)
+    }
+
+    /// How long startup may block on the GeoLite2 download before the
+    /// listeners bind without geo enrichment.
+    pub fn startup_download_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.startup_download_budget_secs)
     }
 }
 
@@ -893,6 +917,9 @@ mod defaults {
     pub const fn dns_timeout_secs() -> u64 {
         5
     }
+    pub const fn geo_startup_download_budget_secs() -> u64 {
+        60
+    }
     pub const fn admin_enabled() -> bool {
         true
     }
@@ -932,6 +959,12 @@ mod defaults {
     /// alive-export endpoint to the proxy's own hostname.
     pub fn allowed_hosts() -> Vec<String> {
         Vec::new()
+    }
+    /// Row ceiling of one alive/ready export body. Generous for a normal
+    /// pool, finite because the export link is public, cacheable and has
+    /// no upstream cap of its own.
+    pub const fn export_max_rows() -> u32 {
+        50_000
     }
     pub const fn cycle_interval_secs() -> u64 {
         60
@@ -1285,11 +1318,25 @@ probe_results_days = 7
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Keys the reference file deliberately does not declare: `geo.db` is
+    /// the inert one-database-era selector, kept in the struct so existing
+    /// configs keep parsing and shown in `/admin/settings` with a footnote.
+    /// Writing it into a file that promises "every available key" would
+    /// only invite an operator to set a key that does nothing. Every other
+    /// key must be there — that is the point of the guard.
+    const REFERENCE_FILE_OMISSIONS: &[&str] = &["geo.db"];
+
     /// The shipped `config/app.toml` is the full reference of every available
     /// key at its default value (owner request 2026-08-30). Guard it against
     /// rot: whenever a config struct gains a field, the file must gain the
     /// key too, or this test fails. Values are intentionally not compared ,
     /// the file doubles as a working deployment config and may override them.
+    ///
+    /// The key set is read from the file **as TOML text**, not through
+    /// `extract::<AppConfig>()`: every field carries a serde default, so a
+    /// deserialized struct is the default set by construction and a key
+    /// deleted from the file reappears filled from that default — the diff
+    /// was empty whatever the file said.
     #[test]
     fn shipped_app_toml_covers_every_key() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/app.toml");
@@ -1297,27 +1344,63 @@ probe_results_days = 7
             return; // the reference file is not part of a sparse checkout
         }
 
-        // Parsed standalone (no built-in defaults, no env) the file must
-        // deserialize into AppConfig on its own: `deny_unknown_fields`
-        // rejects typos here, missing keys would silently fall back.
-        let file = Figment::from(Toml::file(&path))
-            .extract::<AppConfig>()
-            .expect("config/app.toml must deserialize into AppConfig");
+        let text = std::fs::read_to_string(&path).expect("config/app.toml must be readable");
+        let doc: toml_edit::DocumentMut = text
+            .parse()
+            .expect("config/app.toml must be valid TOML on its own");
 
         let mut file_keys = std::collections::BTreeSet::new();
-        leaf_paths("", &serde_json::to_value(&file).unwrap(), &mut file_keys);
+        for (key, item) in doc.iter() {
+            toml_leaf_paths(key, item, &mut file_keys);
+        }
         let mut default_keys = std::collections::BTreeSet::new();
         leaf_paths(
             "",
             &serde_json::to_value(AppConfig::default()).unwrap(),
             &mut default_keys,
         );
+        for omitted in REFERENCE_FILE_OMISSIONS {
+            assert!(
+                default_keys.remove(*omitted),
+                "{omitted} is not a config key any more, drop it from REFERENCE_FILE_OMISSIONS"
+            );
+        }
 
         let missing: Vec<_> = default_keys.difference(&file_keys).collect();
         assert!(
             missing.is_empty(),
             "config/app.toml is missing keys (add them at their default values): {missing:?}"
         );
+        let unknown: Vec<_> = file_keys.difference(&default_keys).collect();
+        assert!(
+            unknown.is_empty(),
+            "config/app.toml declares keys AppConfig does not know (typo, or a renamed key): {unknown:?}"
+        );
+    }
+
+    /// Dotted leaf paths of a parsed TOML document (`server.allowed_hosts`):
+    /// tables recurse, everything else is a single key so an array stays one
+    /// leaf, matching how [`leaf_paths`] flattens the serialized struct.
+    fn toml_leaf_paths(
+        prefix: &str,
+        item: &toml_edit::Item,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        match item {
+            toml_edit::Item::Table(table) => {
+                for (key, nested) in table.iter() {
+                    let path = if prefix.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    toml_leaf_paths(&path, nested, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
     }
 
     /// Flatten a JSON value into dotted leaf paths (`admin.rate_limit` etc.);
@@ -1354,6 +1437,90 @@ probe_results_days = 7
             ..Default::default()
         };
         assert_eq!(cfg.dns_timeout(), std::time::Duration::from_secs(7));
+    }
+
+    /// The startup budget is operator-tunable, not a constant baked into
+    /// the server binary: a mirror that needs longer than the default (or an
+    /// operator willing to boot without geo) must be able to say so in
+    /// `app.toml` or via `FUMOX_GEO__STARTUP_DOWNLOAD_BUDGET_SECS`.
+    #[test]
+    fn geo_startup_download_budget_is_configurable() {
+        let _guard = env_mutex().lock();
+
+        assert_eq!(
+            GeoConfig::default().startup_download_budget(),
+            std::time::Duration::from_secs(60)
+        );
+        let cfg = GeoConfig {
+            startup_download_budget_secs: 5,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.startup_download_budget(),
+            std::time::Duration::from_secs(5)
+        );
+
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-geobudget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.toml");
+        std::fs::write(&file, "[geo]\nstartup_download_budget_secs = 15\n").unwrap();
+        let loaded = load_config(Some(&file)).unwrap();
+        assert_eq!(
+            loaded.geo.startup_download_budget(),
+            std::time::Duration::from_secs(15)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The alive/ready export row ceiling is a setting, like the geo
+    /// startup budget above: an operator with a tier larger than the
+    /// shipped 50 000 rows raises it in `config/app.toml` or via
+    /// `FUMOX_SERVER__EXPORT_MAX_ROWS`, and the env override still
+    /// outranks the file. A config missing the key keeps the shipped
+    /// number, so no existing deployment changes behavior.
+    #[test]
+    fn server_export_max_rows_is_configurable() {
+        let _guard = env_mutex().lock();
+
+        assert_eq!(
+            ServerConfig::default().export_max_rows,
+            50_000,
+            "the default must be the number the hard-coded constant used"
+        );
+
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-exportcap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.toml");
+
+        // A config that does not mention the key keeps the default.
+        std::fs::write(&file, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
+        assert_eq!(
+            load_config(Some(&file)).unwrap().server.export_max_rows,
+            50_000
+        );
+
+        // The file raises it.
+        std::fs::write(&file, "[server]\nexport_max_rows = 200000\n").unwrap();
+        assert_eq!(
+            load_config(Some(&file)).unwrap().server.export_max_rows,
+            200_000
+        );
+
+        // The env outranks the file, as for every other key.
+        // SAFETY: every touch of FUMOX_SERVER__EXPORT_MAX_ROWS across the
+        // test suite is serialized by `env_mutex`.
+        unsafe { std::env::set_var("FUMOX_SERVER__EXPORT_MAX_ROWS", "7") };
+        assert_eq!(
+            load_config(Some(&file)).unwrap().server.export_max_rows,
+            7,
+            "FUMOX_SERVER__EXPORT_MAX_ROWS must outrank the file value"
+        );
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("FUMOX_SERVER__EXPORT_MAX_ROWS");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// `FUMOX_ADMIN__TOKEN` must outrank the value written to

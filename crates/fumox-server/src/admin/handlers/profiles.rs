@@ -789,6 +789,7 @@ pub async fn profile_detail(
         limits: crate::serve::PublicRateLimits::unlimited(),
         trusted_cidrs: Vec::new(),
         allowed_hosts: Vec::new(),
+        export_max_rows: state.server.export_max_rows,
     };
     let (preview, preview_note) =
         match crate::serve::preview_sub(&app_state, &profile, PREVIEW_LINES).await {

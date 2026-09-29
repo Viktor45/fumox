@@ -520,6 +520,68 @@ mod tests {
         );
     }
 
+    /// The scan must also be able to fail on its own terms: with the real
+    /// templates and the real catalogs both in the green state, a filter
+    /// that silently matches nothing would leave the guard above passing
+    /// forever. Here a key a template resolves is removed from one catalog
+    /// and must be reported, for each of the three helpers.
+    #[test]
+    fn template_key_scan_reports_keys_absent_from_a_catalog() {
+        let template = concat!(
+            r#"{{ self.t("nav.dashboard") }}"#,
+            r#"{{ self.t_args("probe.recs_head", &[]) }}"#,
+            r#"{{ self.t_named("set.editing_path", &[]) }}"#,
+        );
+        let keys: Vec<String> = TEMPLATE_KEY_RE
+            .captures_iter(template)
+            .map(|caps| caps[1].to_string())
+            .collect();
+        assert_eq!(
+            keys,
+            ["nav.dashboard", "probe.recs_head", "set.editing_path"]
+        );
+
+        let full: HashMap<String, String> =
+            keys.iter().map(|key| (key.clone(), key.clone())).collect();
+        let catalogs = vec![
+            ("en".to_string(), full.clone()),
+            ("ru".to_string(), full.clone()),
+        ];
+        assert!(
+            missing_keys(template, &catalogs).is_empty(),
+            "a fully translated key must not be reported"
+        );
+
+        for absent in &keys {
+            let mut trimmed = full.clone();
+            trimmed.remove(absent);
+            let one_short = vec![
+                ("en".to_string(), full.clone()),
+                ("ru".to_string(), trimmed),
+            ];
+            assert_eq!(
+                missing_keys(template, &one_short),
+                vec![format!("{absent} (ru)")],
+                "a key used in a template but missing from one catalog must be reported"
+            );
+        }
+    }
+
+    /// Key references in one template source that no catalog defines,
+    /// as `"<key> (<language>)"`.
+    fn missing_keys(text: &str, catalogs: &[(String, HashMap<String, String>)]) -> Vec<String> {
+        let mut missing = Vec::new();
+        for captures in TEMPLATE_KEY_RE.captures_iter(text) {
+            let key = &captures[1];
+            for (code, catalog) in catalogs {
+                if !catalog.contains_key(key) {
+                    missing.push(format!("{key} ({code})"));
+                }
+            }
+        }
+        missing
+    }
+
     fn visit_templates(
         dir: &std::path::Path,
         catalogs: &[(String, HashMap<String, String>)],
@@ -531,19 +593,23 @@ mod tests {
                 visit_templates(&path, catalogs, missing);
             } else if path.extension().is_some_and(|ext| ext == "html") {
                 let text = std::fs::read_to_string(&path).expect("template readable");
-                for captures in TEMPLATE_KEY_RE.captures_iter(&text) {
-                    let key = &captures[1];
-                    for (code, catalog) in catalogs {
-                        if !catalog.contains_key(key) {
-                            missing.push(format!("{}: {key} ({code})", path.display()));
-                        }
-                    }
-                }
+                missing.extend(
+                    missing_keys(&text, catalogs)
+                        .into_iter()
+                        .map(|entry| format!("{}: {entry}", path.display())),
+                );
             }
         }
     }
 
+    /// Catalog lookups, whichever helper the template reaches for: `t`,
+    /// `t_args` and `t_named` all resolve a key against the catalogs, so a
+    /// key used only by a parameterized phrase is just as missing as a
+    /// plain one. The plain `t` branch is last so a `t_args("…", …)` call
+    /// is not also read as a `t("…")` one. Only the opening quote is
+    /// required after the key: the two parameterized helpers take the
+    /// arguments after it.
     static TEMPLATE_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"t\("([a-z0-9_.]+)"\)"#).expect("valid regex")
+        regex::Regex::new(r#"(?:t_args|t_named|t)\("([a-z0-9_.]+)""#).expect("valid regex")
     });
 }

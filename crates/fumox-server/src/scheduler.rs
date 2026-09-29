@@ -17,6 +17,7 @@ use fumox_core::models::Source;
 use fumox_core::repo::sources;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -113,10 +114,28 @@ pub async fn run(
 ) {
     let mut tick = tokio::time::interval(SWEEP_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A sweep drains its whole JoinSet, so a slow source would otherwise
+    // hold the loop for the length of that fetch and park a *Refresh now*
+    // behind it — the refresh would not even be marked in flight, and the
+    // status fragment the panel polls would report the previous fetch as
+    // the finished one. The sweep therefore runs detached, and this flag
+    // keeps two sweeps from overlapping.
+    let sweeping = Arc::new(AtomicBool::new(false));
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                sweep(&env, &state, &events).await;
+                if sweeping.swap(true, Ordering::SeqCst) {
+                    tracing::debug!("scheduler sweep still running; skipping this tick");
+                    continue;
+                }
+                let env = env.clone();
+                let state = state.clone();
+                let events = events.clone();
+                let sweeping_done = sweeping.clone();
+                tokio::spawn(async move {
+                    sweep(&env, &state, &events).await;
+                    sweeping_done.store(false, Ordering::SeqCst);
+                });
             }
             maybe_id = refresh_rx.recv() => {
                 let Some(source_id) = maybe_id else {
@@ -264,6 +283,137 @@ fn spawn_ingest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::Event;
+    use fumox_core::config::{DatabaseConfig, FetchConfig, GeoConfig};
+    use fumox_core::geo::GeoResolver;
+    use fumox_core::models::Source;
+    use std::time::Duration;
+
+    /// Wait for the `fetch.started` event of one source, failing the test
+    /// when it does not arrive inside the window.
+    async fn await_fetch_started(
+        rx: &mut tokio::sync::broadcast::Receiver<Event>,
+        source_id: &str,
+    ) {
+        let wait = async {
+            loop {
+                let event = rx.recv().await.expect("event bus stays open");
+                if event.name == "fetch.started" && event.data["source_id"] == source_id {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| panic!("{source_id}: fetch.started did not arrive in time"));
+    }
+
+    fn test_source(id: &str, url: String, ttl: i64, last_fetched_at: Option<i64>) -> Source {
+        Source {
+            id: id.to_string(),
+            slug: None,
+            name: id.to_string(),
+            url,
+            enabled: true,
+            encoding: Default::default(),
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: ttl,
+            tags: None,
+            pipeline: None,
+            headers: None,
+            ip_family: None,
+            created_at: fumox_core::models::now_ts(),
+            updated_at: fumox_core::models::now_ts(),
+            last_fetched_at,
+            last_error: None,
+            error_class: None,
+        }
+    }
+
+    /// A *Refresh now* asked for while a sweep is still running must start
+    /// at once. The loop used to await the sweep inline and the sweep
+    /// drains its whole `JoinSet`, so the refresh sat in the channel until
+    /// every due source had finished: it was neither fetched nor marked
+    /// in flight, and the status fragment the panel polls reported the
+    /// previous fetch as the finished one.
+    #[tokio::test]
+    async fn refresh_now_is_not_parked_behind_a_running_sweep() {
+        // A source host that accepts connections and never answers, so the
+        // sweep stays busy for the whole test.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    // No response, and the socket stays open: the fetch is
+                    // still waiting when the test is done with it.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("fumox-sched-test-{}", fumox_core::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = fumox_core::db::connect_pool(&DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+
+        // Due for the very first sweep (no fetch yet), so the sweep picks
+        // it up and blocks on it.
+        let slow = test_source("srcSlow0000", format!("http://{addr}/hang"), 0, None);
+        // Not due (fetched just now): only an explicit refresh starts it.
+        let fast = test_source(
+            "srcFast0000",
+            format!("http://{addr}/ok"),
+            3600,
+            Some(fumox_core::models::now_ts()),
+        );
+        sources::create(&pool, &slow).await.unwrap();
+        sources::create(&pool, &fast).await.unwrap();
+
+        let fetch_config = FetchConfig {
+            // Long enough that no fetch gives up inside the test window.
+            read_timeout_secs: 120,
+            connect_timeout_secs: 5,
+            ..Default::default()
+        };
+        let env = IngestEnv {
+            pool,
+            fetcher: Fetcher::new(fetch_config, true, Duration::from_secs(5)),
+            caches: Caches::new(),
+            geo: Arc::new(GeoResolver::new(&GeoConfig {
+                enabled: false,
+                ..Default::default()
+            })),
+            settings: crate::ingest::IngestSettings {
+                refresh_check_limit: 0,
+                drop_gate: false,
+                removed_as_unknown: false,
+            },
+        };
+        let events = EventBus::new();
+        let mut rx = events.subscribe();
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+        let scheduler = tokio::spawn(run(env, SchedulerState::new(2), events.clone(), refresh_rx));
+
+        // The first interval tick is immediate, the sweep starts the slow
+        // source and stays on it.
+        await_fetch_started(&mut rx, "srcSlow0000").await;
+
+        // A refresh arriving mid-sweep must be picked up right away.
+        refresh_tx.send("srcFast0000".to_string()).unwrap();
+        await_fetch_started(&mut rx, "srcFast0000").await;
+        scheduler.abort();
+    }
 
     #[tokio::test]
     async fn in_flight_guard_is_exclusive() {

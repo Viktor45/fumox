@@ -54,7 +54,33 @@ const SECURITY_PARAMS: &[&str] = &[
     "skip-cert-verify",
     // hysteria2 / quic extras
     "servicename",
+    // Clash structured blocks, stored verbatim: they have no URI spelling
+    // and each one changes how the client must connect. The Clash fields
+    // that *do* have a URI spelling (`servername`, `network`, `ws-path`,
+    // `client-fingerprint`, `grpc-service-name`) are folded onto it by
+    // `canonical_key` and never reach this list under their own name.
+    "ws-headers",
+    "ws-opts",
+    "reality-opts",
 ];
+
+/// Map a parameter key onto the spelling the fingerprint is keyed by.
+///
+/// Clash carries its own field names for fields every URI format spells the
+/// same way. Left alone, the same node advertised as Clash YAML and as a URI
+/// would get two different fingerprints and land in two rows, so the Clash
+/// spelling is rewritten to the URI one before the security filter runs.
+fn canonical_key(key: &str) -> String {
+    match key {
+        "servername" => "sni",
+        "network" => "type",
+        "ws-path" => "path",
+        "client-fingerprint" => "fp",
+        "grpc-service-name" => "servicename",
+        other => other,
+    }
+    .to_string()
+}
 
 /// Compute the stable deduplication fingerprint of a proxy entry.
 pub fn fingerprint(entry: &ProxyEntry) -> String {
@@ -79,14 +105,15 @@ pub fn normalize_host(host: &str) -> String {
     host.to_ascii_lowercase().trim_end_matches('.').to_string()
 }
 
-/// Canonical form of the security-relevant parameters: keys lower-cased,
-/// insecure-aliases merged, pairs sorted and joined with `&`.
+/// Canonical form of the security-relevant parameters: keys lower-cased and
+/// alias-mapped, insecure-aliases merged, pairs escaped, sorted and joined
+/// with `&`.
 fn canonical_security_params(entry: &ProxyEntry) -> String {
     let mut pairs: Vec<(String, String)> = entry
         .params
         .iter()
         .filter_map(|param| {
-            let key = param.key.to_ascii_lowercase();
+            let key = canonical_key(&param.key.to_ascii_lowercase());
             if !SECURITY_PARAMS.contains(&key.as_str()) {
                 return None;
             }
@@ -96,9 +123,30 @@ fn canonical_security_params(entry: &ProxyEntry) -> String {
     pairs.sort();
     pairs
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
+        .map(|(k, v)| format!("{}={}", escape(k), escape(v)))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Escape a key or value so the `=` and `&` separators cannot be forged from
+/// inside a value.
+///
+/// Feed text is attacker-controlled: `path=/search` + `host=evil` and the
+/// single parameter `host=evil&path=/search` would otherwise produce the same
+/// pre-image and the same fingerprint. Only bytes outside printable ASCII and
+/// the two separators (plus `%`, so escaping is reversible) are rewritten.
+fn escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'%' => out.push_str("%25"),
+            b'&' => out.push_str("%26"),
+            b'=' => out.push_str("%3D"),
+            0x21..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Merge the certificate-verification spellings (`insecure`, `allowInsecure`,
@@ -250,6 +298,101 @@ mod tests {
             vec![param("security", "none"), param("type", "ws")],
         );
         assert_eq!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn clash_spellings_are_security_relevant() {
+        // Clash keeps its own field names; parsed verbatim they must still
+        // reach the dedup key, or two nodes differing only in `servername`
+        // collapse and the upsert overwrites one with the other.
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     servername: a.example.com, network: ws, ws-path: /ws,",
+            "     client-fingerprint: chrome, grpc-service-name: g}\n",
+            "  - {name: b, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     servername: b.example.com, network: ws, ws-path: /ws,",
+            "     client-fingerprint: chrome, grpc-service-name: g}\n",
+        );
+        let parsed = crate::parsers::clash::parse_payload(yaml).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_ne!(
+            fingerprint(&parsed.entries[0]),
+            fingerprint(&parsed.entries[1])
+        );
+    }
+
+    #[test]
+    fn clash_structured_fields_are_security_relevant() {
+        // `ws-headers`, `ws-opts` and `reality-opts` are YAML blocks with no
+        // URI spelling; they are kept verbatim and are connection-defining.
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     ws-headers: {Host: a.example.com}}\n",
+            "  - {name: b, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     ws-headers: {Host: b.example.com}}\n",
+        );
+        let parsed = crate::parsers::clash::parse_payload(yaml).unwrap();
+        assert_ne!(
+            fingerprint(&parsed.entries[0]),
+            fingerprint(&parsed.entries[1])
+        );
+
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     reality-opts: {public-key: AAA}}\n",
+            "  - {name: b, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     reality-opts: {public-key: BBB}}\n",
+        );
+        let parsed = crate::parsers::clash::parse_payload(yaml).unwrap();
+        assert_ne!(
+            fingerprint(&parsed.entries[0]),
+            fingerprint(&parsed.entries[1])
+        );
+    }
+
+    #[test]
+    fn clash_and_uri_spellings_agree() {
+        // The same node advertised once as Clash YAML and once as a URI must
+        // deduplicate together, so the Clash spelling has to canonicalize onto
+        // the URI one rather than sitting beside it.
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     network: ws, servername: a.example.com, client-fingerprint: chrome}\n",
+        );
+        let mut clash = crate::parsers::clash::parse_payload(yaml).unwrap().entries[0].clone();
+        let crate::parsers::LineOutcome::Parsed(mut uri) = crate::parsers::parse_line(
+            "vless://u@h.example.com:443?type=ws&sni=a.example.com&fp=chrome#a",
+        ) else {
+            panic!("expected a parsed vless entry");
+        };
+        clash.name = String::new();
+        uri.name = String::new();
+        assert_eq!(fingerprint(&clash), fingerprint(&uri));
+    }
+
+    #[test]
+    fn separator_bytes_in_values_cannot_forge_a_pair() {
+        // Without escaping, `path=/search` + `host=evil` and the single param
+        // `host=evil&path=/search` are the same pre-image.
+        let split = entry(
+            "n",
+            "h",
+            vec![param("path", "/search"), param("host", "evil")],
+        );
+        let forged = entry("n", "h", vec![param("host", "evil&path=/search")]);
+        assert_ne!(fingerprint(&split), fingerprint(&forged));
+
+        let quoted = entry("n", "h", vec![param("host", "evil&host=other")]);
+        let two = entry(
+            "n",
+            "h",
+            vec![param("host", "evil"), param("host", "other")],
+        );
+        assert_ne!(fingerprint(&quoted), fingerprint(&two));
     }
 
     #[test]

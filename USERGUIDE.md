@@ -198,6 +198,7 @@ Useful `.env` variables (all except the token are optional):
 | `FUMOX_ADMIN_PORT`                | `8081`                                | Host port for the admin panel (always published to loopback only or `FUMOX_ADMIN_BIND`).                                                                        |
 | `FUMOX_MEOW__TEST_URL`            | `http://www.gstatic.com/generate_204` | URL used for T2 delay tests. Override if it is blocked in your region (e.g. `http://cp.cloudflare.com`).                                                         |
 | `FUMOX_ADMIN__ALLOW_PRIVATE_URLS` | `false`                               | Allow source URLs pointing at private/loopback addresses (disables the SSRF guard). Local testing only.                                                          |
+| `FUMOX_CONFIG_ACCESS`             | `rw`                                  | Mount mode for `./config` in the **server** container. `rw` lets the admin *Edit settings* page save `app.toml`; `ro` mounts it read-only, which turns that page into a read-only view. The probe container is always `:ro`. |
 | `MEOW_VERSION`                    | `latest`                              | The meow-rs release for **local builds** of the wrapper image (`--build` mode; no effect when pulling). `latest` resolves the newest release via the GitHub API; a tag (e.g. `v0.21.2`) pins one. |
 
 Notes:
@@ -224,8 +225,22 @@ Notes:
 >   the historical behavior behind a direct connection; the safe
 >   configuration for any reverse-proxy-fronted deployment is to set
 >   both.
-- The SQLite database lives in the `fumox-data` volume; `./config` is mounted
-  read-only for `app.toml` and GeoLite2 files.
+>
+> The two lists are checked separately, and the admin panel builds the
+> links behind *Import / Export*, *Sources* and *Profiles* against the
+> **public** list. So if you pin `[server].allowed_hosts` to a public
+> domain but reach the panel on its own loopback address
+> (`http://127.0.0.1:8081/admin`, what Compose ships), the panel passes
+> its own host gate and then fails to build those links: `/admin/import`,
+> `/admin/sources/{id}` and `/admin/profiles/{id}` answer `500`. Either
+> reach the panel on the same hostname the public list allows, or add
+> `127.0.0.1` to `[server].allowed_hosts` as well.
+- The SQLite database lives in the `fumox-data` volume. `./config` is mounted
+  into the server container **read-write** by default, so the admin *Edit
+  settings* page can save `app.toml`; set `FUMOX_CONFIG_ACCESS=ro` to pin it
+  read-only instead (the edit page then renders read-only). The probe
+  container always mounts it `:ro`. Under Compose the GeoLite2 databases do
+  **not** live there — see [section 11](#11-geo-enrichment).
 - meow-rs publishes no official Docker image, so the small wrapper
   (`docker/meow/Dockerfile`) around the release binary is either pulled
   ready-made from GHCR or built in `--build` mode; it is published manually
@@ -509,7 +524,7 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 | **Fetch log**       | Journal of every source fetch: time, status, bytes, proxies found, error class                                                                                                                        |
 | **Probe**           | Health-check daemon status: heartbeat, meow-rs status, quarantine queue with scheduled second chances                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
-| **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels — every `config/app.toml` knob except the admin token, which is never rendered. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
+| **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels — nearly every `config/app.toml` knob, and never the admin token. Two keys are file-only and have no field on the page: `[server].export_max_rows` and `[geo].startup_download_budget_secs`; the file values still apply, the panel just cannot show or edit them. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
 
 ### Times and timezones
 
@@ -530,6 +545,8 @@ and access tokens) as a versioned JSON file. *Import* recreates them with
 - profile composition is remapped onto the new source ids;
 - a slug collision → the object is created without a slug (reported as a warning);
 - a reference to a source missing from the file → dropped from the composition (warning);
+- one reference used by two *source rows* → rejected (the reference binds the rows together, so the file does not say which one a profile composition means);
+- a reference repeated twice inside one *profile's* source list → kept once (the first position wins);
 - validation is all-or-nothing: any invalid object aborts the whole import
   (`422` with a list of problems, nothing written).
 
@@ -543,6 +560,33 @@ token:
 - `GET /export/ready/{token}`: the `ready` tier only (proxies that
   successfully completed both T1 and T2 checks). Same metadata shape,
   title `export/ready`.
+
+Both links are snapshots, not live views, and are bounded twice:
+
+- **At most 50 000 rows per body** — the shipped value of
+  `[server].export_max_rows`. Unlike `/sub` and `/src`, the exports
+  have no per-source or per-profile limit of their own, so a very large
+  pool would otherwise turn one download into an unbounded read and an
+  unbounded file. Raise the key when your tier is bigger. The cut takes
+  the oldest rows (lowest ids) and the `nodes count` header reports how
+  many the body really carries, so a truncated download says so. The
+  live counts next to the links are **not** capped — they show the real
+  size of each tier, which is how you see that the export is smaller
+  than the pool.
+- **Cached for 30 seconds.** A burst of downloads inside one window is
+  served from the same body, so the common case costs one render rather
+  than one per request. The window is a cache TTL, not a lock: a request
+  that arrives after the window has expired re-renders the tier itself,
+  so a herd landing exactly on the boundary does one render per request
+  (the database pool still caps how many of those run at once). The
+  other trade-off is staleness: a proxy that dies can still appear in a
+  body for up to 30 seconds after the change. A download is a snapshot
+  by definition, and an outdated one served quietly is worse than a
+  slightly slower request — an expired body is re-rendered, never
+  handed out stale.
+
+Because the two tiers do not overlap, a `ready` proxy appears only in
+`/export/ready`, never in `/export/alive`.
 
 `Download url_list` saves the body as a file; *Regenerate link*
 replaces the token if the link leaks (the old link stops working
@@ -607,6 +651,7 @@ form.
 | `auth_fail_rate_limit` | `"30/min"`       | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets                                                                                                                      |
 | `trust_proxy_ips`      | `[]`             | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the per-IP rate-limit and admin URL scheme. Empty = never trust forwarded headers (direct-connection default). Set this when behind nginx |
 | `allowed_hosts`        | `[]`             | Hostnames / IPs allowed to reach the public listener, including the `/export/alive/{token}` and `/export/ready/{token}` endpoints. Empty = accept any `Host` value. Set this when serving from a fixed domain name |
+| `export_max_rows`      | `50000`          | Row ceiling of one `/export/alive/{token}` / `/export/ready/{token}` body, applied as a `LIMIT` in the query behind them. These two links have no per-source or per-profile cap of their own, so this is what keeps one public download from reading and shipping the whole tier; raise it when your tier is bigger. The cut takes the lowest ids and the `nodes count` header reports what the body really carries, while the admin tier counts stay uncapped, so a truncated export is visible as smaller than the tier. `0` does not mean "unlimited": the value is clamped up to 1 row (a negative or zero `LIMIT` would otherwise read as unbounded in SQLite), so a body of `0` serves a single node. The body is cached for 30 s, so a status change can take up to 30 s to reach the link |
 
 ### `[database]` – SQLite
 
@@ -635,7 +680,7 @@ form.
 | --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `refresh_check_limit` | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue)                                                                                                       |
 | `drop_gate`           | `false` | Drop-rules gate on the alive-linger. `true`: an alive proxy of a source with `drop` rules leaves on the next refresh once a rule catches it; `false`: every source lingers, the probe alone retires proxies |
-| `removed_as_unknown`  | `false` | Revive a `removed` proxy the feed still carries: the row resets to the pristine `unknown` state (fail count and quarantine fields cleared) and walks the checks again, joining the priority queue. `false`: `removed` stays terminal — the only ways back are the admin "reset status" action or «purge removed» plus a re-insert |
+| `removed_as_unknown`  | `false` | Revive a `removed` proxy the feed still carries: the row resets to the pristine `unknown` state (fail count and quarantine fields cleared) and walks the checks again, joining the priority queue. `false`: `removed` stays terminal — the only ways back are the admin "reset status" action (which only bites on a row the probe can still reach, see below) or «purge removed» plus a re-insert |
 
 ### `[geo]` – geo enrichment
 
@@ -643,9 +688,10 @@ form.
 | ------------------- | ----------- | ---------------------------------------------------------- |
 | `enabled`           | `true`      | Master switch                                              |
 | `db`                | `"country"` | Legacy key from the one-database era; kept so existing configs parse, no longer affects resolution — all databases in `db_dir` are merged |
-| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`            |
+| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`. Under Docker Compose the shipped stack overrides this to `/shared` (the `meow-shared` volume) via `FUMOX_GEO__DB_DIR`, so `./config` on the host is **not** scanned for databases — put them in the `meow-shared` volume, or unset the override. Env outranks the file, which is why editing `db_dir` in `config/app.toml` has no effect on the Compose stack |
 | `cache_max_entries` | `16384`     | Host→geo cache size                                        |
 | `dns_timeout_secs`  | `5`         | DNS resolution timeout                                     |
+| `startup_download_budget_secs` | `60` | How long startup waits for the GeoLite2 download before it starts listening. Past the budget the download keeps running in the background (the file is installed by an atomic rename, so a half-written `.mmdb` is never visible) and this run serves without geo enrichment until the next start. `0` = do not wait at all |
 
 ### `[admin]` – admin panel
 
@@ -885,6 +931,15 @@ The rules in plain language:
   lists it again, its state is *not* reset: reconciliation never touches the
   state machine (only the probe does). Ways back: *Reset status* on the proxy
   card, or *Purge removed* followed by the next fetch inserting it as new.
+- **Reset status only resets what the probe can pick up.** It puts the row
+  back to a pristine `unknown` and hands it to the priority queue, so it only
+  does anything for a proxy the probe will actually look at. For a row that
+  belongs to no probe lane — no link to any source left, or a scheme no lane
+  checks (`tuic`, `mieru`) — the panel says so and leaves the status exactly
+  as it is; the badge does not change. The link is what puts a row in front of
+  the probe, and reconciliation drops it on the next refresh, so re-insert the
+  proxy through a source (or *Purge removed* and let the next fetch carry it)
+  rather than pressing the button again.
 - **Disappearing from a source does not retire a live proxy (alive-linger).**
   While the probe keeps confirming a proxy (`alive`), a source refresh that no
   longer sees it keeps its link: the proxy continues its check cycle and stays
@@ -922,11 +977,15 @@ panel's *Settings* page.
 | `[meow].backoff_initial_secs`        | `60`                | Initial T2 backoff while meow-rs is unavailable                                                                                                     |
 | `[meow].backoff_max_secs`            | `900`               | T2 backoff ceiling (15 min)                                                                                                                         |
 
-The *Settings* page renders the **complete** effective config, not just the
+The *Settings* page renders the effective config, not just the
 state machine: the table above, plus `[server]`, `[database]`, `[geo]`,
 `[admin]` and `[log]` panels (rate limits in the canonical `N/unit` form,
 response caps human-readable, the legacy `[geo].db` marked as ignored). The
-admin token is the only value that never appears on the page.
+admin token is never shown. Two keys are also absent from the page for a
+different reason — they have no rendered field at all: `[server].export_max_rows`
+and `[geo].startup_download_budget_secs`. Both apply from the file exactly as
+documented; only the panel skips them, so read their values from
+`config/app.toml`.
 
 ### Editing `config/app.toml` from the panel
 
@@ -1091,8 +1150,15 @@ Manual installation (e.g. with your own MaxMind license) goes like this:
 1. Register a free account at <https://www.maxmind.com/en/geolite2/signup>.
 2. Download the database you need via
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/).
-3. Place the file into `[geo].db_dir` (default `config/`) under its canonical
-   name: `GeoLite2-City.mmdb` or `GeoLite2-ASN.mmdb`.
+3. Place the file into `[geo].db_dir` under its canonical name:
+   `GeoLite2-City.mmdb` or `GeoLite2-ASN.mmdb`. The default is `config/` next
+   to the binary, which is the host's `./config` under Compose — **but the
+   shipped Compose stack overrides `[geo].db_dir` to `/shared`**, so a file
+   dropped in `./config` is never read there. Under Compose, put the `.mmdb`
+   into the `meow-shared` volume (`/shared`), or drop the `FUMOX_GEO__DB_DIR`
+   override from `docker-compose.yml` and set `[geo].db_dir` in the file.
+   You can skip this step entirely: Fumox downloads the databases itself
+   (see below), and under Compose that download already targets `/shared`.
 
 Fumox opens **every** database it finds in `[geo].db_dir` and merges their
 facts, so country, city and ASN data combine in one name template. The
@@ -1103,7 +1169,10 @@ everything else keeps working. MaxMind updates their databases weekly.
 
 Fumox fetches the databases itself: at startup the server checks
 `[geo].db_dir` and downloads any GeoLite2 database that is missing, broken
-or older than a month from a public release mirror.
+or older than a month from a public release mirror. It waits at most
+`[geo].startup_download_budget_secs` (60 s) for that to finish before it
+starts serving; a slower mirror does not keep the service down — the
+download carries on in the background and takes effect on the next start.
 
 **Name templates.** The `geo.template` pipeline setting (default
 `"{flag} {country} · {name}"`) supports these placeholders — all of them
@@ -1173,6 +1242,9 @@ stored.
       header reaching the listener can make the admin render URLs
       pointing at attacker-controlled hosts and steal the capability
       token. Set this on every deployment served from a fixed hostname.
+      If the panel is reached on a *different* host than the public
+      listener serves (loopback is the Compose default), add that host to
+      `[server].allowed_hosts` too, or those three admin screens 500.
 - [ ] `allow_private_urls` left `false` (SSRF protection), unless you have a
       specific trusted-internal-source reason.
 - [ ] One `fumox-server` + one `fumox-probe` against the same database file;
@@ -1218,7 +1290,9 @@ WantedBy=multi-user.target
 | `X-Fumox-Stale: true` header                                          | Some sources are temporarily unreachable; last good data is being served. The fetch log shows which sources and why (`error_class`).               |
 | Source shows `parse_error`                                            | The source returned HTTP 200 but unparseable content (anti-bot page, CDN stub, format change). The last good snapshot is served meanwhile.         |
 | Source won't save: "private URL" error                                | The URL resolves to a loopback/private address and `allow_private_urls` is false. That's the SSRF guard working.                                   |
-| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`.                                                                      |
+| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`. Under Compose the directory is `/shared`, not `./config` — see [section 11](#11-geo-enrichment).    |
+| Admin *Import / Export*, *Sources* or *Profiles* answer 500            | `[server].allowed_hosts` is pinned to a public domain, but the panel is reached on another host (typically `127.0.0.1:8081`). The panel passes its own gate, then cannot build a link against the public list. Add the panel's host to `[server].allowed_hosts` or use the same hostname for both. |
+| GeoLite2 file placed in `./config` is ignored                          | The Compose stack sets `FUMOX_GEO__DB_DIR=/shared`, and the environment outranks `config/app.toml`. Use the `meow-shared` volume, or remove the override and set `[geo].db_dir`. |
 | T2 checks never run, probe logs mention meow backoff                  | meow-rs is down or `[meow].api_addr` is wrong. In Docker, it must be `meow:9090`; the config path must be the shared volume (`/shared/meow.yaml`). |
 | `SQLITE_BUSY` errors in logs                                          | `busy_timeout_ms` was removed or set too low while two processes write to the DB. Restore the default (5000).                                      |
 | Build fails: `sqlite3.h: No such file`                                | Install the system SQLite dev package (`libsqlite3-dev` on Debian/Ubuntu).                                                                         |

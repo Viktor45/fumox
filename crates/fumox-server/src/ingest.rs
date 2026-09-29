@@ -15,7 +15,7 @@
 use crate::cache::Caches;
 use crate::fetcher::{FetchFailure, FetchedPayload, Fetcher};
 use fumox_core::db::DbPool;
-use fumox_core::geo::GeoResolver;
+use fumox_core::geo::{GeoInfo, GeoResolver};
 use fumox_core::models::{ProxyEntry, Source};
 use fumox_core::repo::{fetch_log, probe, proxies, sources};
 
@@ -111,7 +111,12 @@ pub async fn ingest_source(
             return IngestOutcome::FetchFailed { failure };
         }
     };
-    caches.raw_put(&source.id, payload.clone(), now).await;
+    // The raw snapshot is a *freshness* marker, not a download log: it
+    // stands for "the database is already reconciled from this payload"
+    // (see `Caches::raw_is_fresh`). It is therefore written only once the
+    // payload has parsed and reconciled — caching it before that made a
+    // single parse or DB failure suppress every non-forced re-fetch for a
+    // whole TTL while the scheduler kept reporting successful ingests.
 
     match parse_payload(source, &payload) {
         Ok(filtered) => {
@@ -147,6 +152,10 @@ pub async fn ingest_source(
             .await
             {
                 Ok(stats) => {
+                    // The payload is now the content of the database, so it
+                    // may serve as this source's freshness marker until the
+                    // TTL elapses.
+                    caches.raw_put(&source.id, payload.clone(), now).await;
                     journal_success(pool, source, &payload, recognised, now).await;
                     if dropped_by_pipeline > 0 {
                         tracing::info!(
@@ -304,25 +313,67 @@ async fn enqueue_probe_requests(pool: &DbPool, ids: &[i64], limit: u32, now: i64
     }
 }
 
-/// Resolve geo facts for every parsed entry, parallel to `entries`. With an
-/// inactive resolver (geo disabled or database missing) every stamp is
-/// `None`, which the upsert treats as "keep what is stored".
-async fn resolve_geo_stamps(
-    geo: &GeoResolver,
+/// Ceiling on concurrent host lookups inside one ingest pass. Every
+/// unseen host costs up to `[geo].dns_timeout` (5 s by default) when DNS
+/// hangs, so the lookups run concurrently instead of one await per entry;
+/// the cap keeps a large feed from fanning out into thousands of sockets.
+const GEO_LOOKUP_CONCURRENCY: usize = 32;
+
+/// The two [`GeoResolver`] calls [`resolve_geo_stamps`] makes. The real
+/// resolver implements it as-is; the seam exists so the lookup *shape*
+/// (concurrent, capped, input-ordered) can be observed without a MaxMind
+/// database and a slow DNS server on the test machine. The test drives
+/// [`resolve_geo_stamps`] itself, not a copy of its loop.
+trait GeoLookup {
+    /// Whether the resolver can enrich at all.
+    fn is_active(&self) -> bool;
+    /// Resolve one host, `None` when nothing is known about it.
+    fn resolve_host(
+        &self,
+        host: &str,
+    ) -> impl std::future::Future<Output = Option<std::sync::Arc<GeoInfo>>> + Send;
+}
+
+impl GeoLookup for GeoResolver {
+    fn is_active(&self) -> bool {
+        GeoResolver::is_active(self)
+    }
+
+    fn resolve_host(
+        &self,
+        host: &str,
+    ) -> impl std::future::Future<Output = Option<std::sync::Arc<GeoInfo>>> + Send {
+        self.resolve(host)
+    }
+}
+
+/// Resolve geo facts for every parsed entry; the returned vector stays
+/// index-aligned with `entries`. With an inactive resolver (geo disabled
+/// or database missing) every stamp is `None`, which the upsert treats as
+/// "keep what is stored".
+async fn resolve_geo_stamps<G: GeoLookup>(
+    geo: &G,
     entries: &[ProxyEntry],
 ) -> Vec<Option<proxies::GeoStamp>> {
     if !geo.is_active() {
         return Vec::new();
     }
-    let mut stamps = Vec::with_capacity(entries.len());
-    for entry in entries {
-        stamps.push(
-            geo.resolve(&entry.host)
-                .await
-                .map(|info| proxies::GeoStamp::from_info(&info)),
-        );
-    }
-    stamps
+    use futures_util::StreamExt;
+    // `buffered` (not `buffer_unordered`) keeps the input order, which the
+    // drop rules and the reconcile upsert both rely on, while holding at
+    // most `GEO_LOOKUP_CONCURRENCY` lookups in flight.
+    futures_util::stream::iter(
+        entries
+            .iter()
+            .map(|entry| geo.resolve_host(&entry.host))
+            .collect::<Vec<_>>(),
+    )
+    .buffered(GEO_LOOKUP_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .map(|info| info.map(|info| proxies::GeoStamp::from_info(&info)))
+    .collect()
 }
 
 /// What [`parse_payload`] produced: the entries that survived the
@@ -528,7 +579,9 @@ async fn journal_parse_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fumox_core::models::{Encoding, InputFormat};
+    use fumox_core::models::{Encoding, InputFormat, Scheme};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn source_with(encoding: Encoding, input_format: Option<InputFormat>) -> Source {
         let now = fumox_core::models::now_ts();
@@ -559,6 +612,210 @@ mod tests {
             http_status: 200,
             bytes: body.len() as u64,
             body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// A `Fetcher` pointed at a one-shot local HTTP server, plus the
+    /// database and caches one `ingest_source` call needs. The private-IP
+    /// policy is switched off so the loopback test server is reachable.
+    async fn ingest_env(body: &'static str) -> (DbPool, Caches, Fetcher, Source) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "fumox-ingest-test-{}",
+            fumox_core::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = fumox_core::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        };
+        let pool = fumox_core::db::connect_pool(&cfg).await.unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+
+        let mut source = source_with(Encoding::Auto, None);
+        source.url = format!("http://{addr}/sub");
+        sources::create(&pool, &source).await.unwrap();
+
+        let fetcher = Fetcher::new(
+            fumox_core::config::FetchConfig::default(),
+            true, // allow_private_urls: the mirror above is loopback
+            std::time::Duration::from_secs(5),
+        );
+        (pool, Caches::new(), fetcher, source)
+    }
+
+    fn settings() -> IngestSettings {
+        IngestSettings {
+            refresh_check_limit: 0,
+            drop_gate: false,
+            removed_as_unknown: false,
+        }
+    }
+
+    fn inactive_geo() -> std::sync::Arc<GeoResolver> {
+        std::sync::Arc::new(GeoResolver::new(&fumox_core::config::GeoConfig {
+            enabled: false,
+            ..Default::default()
+        }))
+    }
+
+    /// The raw snapshot is the freshness marker for the *next* pass, so it
+    /// may only be written once the payload has been parsed and
+    /// reconciled. Caching it before that let one parse error suppress
+    /// every non-forced re-fetch for a whole TTL.
+    #[tokio::test]
+    async fn a_parse_failure_leaves_no_fresh_raw_snapshot() {
+        let (pool, caches, fetcher, source) = ingest_env("this is not a subscription").await;
+        let outcome = ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &inactive_geo(),
+            settings(),
+            &source,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, IngestOutcome::ParseFailed { .. }));
+
+        assert!(
+            !caches
+                .raw_is_fresh(&source.id, source.cache_ttl_seconds)
+                .await,
+            "a failed ingest must not mark the source fresh"
+        );
+    }
+
+    /// The converse: a reconciled payload is what the DB now holds, so it
+    /// is exactly what the freshness marker is allowed to claim.
+    #[tokio::test]
+    async fn a_reconciled_payload_is_cached_as_fresh() {
+        let (pool, caches, fetcher, source) =
+            ingest_env("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
+        let outcome = ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &inactive_geo(),
+            settings(),
+            &source,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, IngestOutcome::Ok { .. }));
+
+        assert!(
+            caches
+                .raw_is_fresh(&source.id, source.cache_ttl_seconds)
+                .await
+        );
+    }
+
+    /// Geo lookups run concurrently, capped: a feed of dead hosts must not
+    /// cost one `dns_timeout` per entry, and the results must stay aligned
+    /// with the input order the drop rules and the upsert rely on.
+    ///
+    /// Driven through [`resolve_geo_stamps`] itself — the assertions are
+    /// about how the production function drives the resolver, so reverting
+    /// it to a sequential `for entry in entries { geo.resolve(...).await }`
+    /// loop fails the peak-concurrency assertion.
+    #[tokio::test]
+    async fn geo_lookups_are_concurrent_capped_and_keep_input_order() {
+        // More entries than the cap, so the cap is genuinely engaged.
+        const ENTRIES: usize = 40;
+        let entries: Vec<ProxyEntry> = (0..ENTRIES)
+            .map(|i| ProxyEntry {
+                scheme: Scheme::Vless,
+                name: format!("n{i}"),
+                host: format!("host-{i}.invalid"),
+                port: 443,
+                credential: "uuid".into(),
+                params: Vec::new(),
+                raw_path: String::new(),
+                raw_line: String::new(),
+            })
+            .collect();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let geo = CountingGeo {
+            in_flight: Arc::clone(&in_flight),
+            peak: Arc::clone(&peak),
+        };
+        let stamps = resolve_geo_stamps(&geo, &entries).await;
+
+        // Order: the stamp for entry i still carries entry i's host.
+        assert_eq!(stamps.len(), ENTRIES);
+        for (stamp, entry) in stamps.iter().zip(&entries) {
+            assert_eq!(
+                stamp.as_ref().and_then(|s| s.country.as_deref()),
+                Some(entry.host.as_str()),
+                "stamps must stay index-aligned with the input order"
+            );
+        }
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "lookups must overlap; peak concurrency was {peak}, a sequential \
+             loop would report 1"
+        );
+        assert!(
+            peak <= GEO_LOOKUP_CONCURRENCY,
+            "the concurrency cap must hold, peak was {peak}"
+        );
+    }
+
+    /// A stand-in resolver that counts how many lookups are in flight at
+    /// once. Each lookup takes long enough for the others to be polled
+    /// meanwhile, and answers with the host it was asked about so the
+    /// ordering assertion has something to read back.
+    ///
+    /// The counter moves inside the returned future, on its first poll:
+    /// building a future starts no work, exactly as `GeoResolver::resolve`
+    /// does, so the count reflects lookups actually running and not the
+    /// ones `resolve_geo_stamps` merely created.
+    struct CountingGeo {
+        in_flight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl GeoLookup for CountingGeo {
+        fn is_active(&self) -> bool {
+            true
+        }
+
+        fn resolve_host(
+            &self,
+            host: &str,
+        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+            let in_flight = Arc::clone(&self.in_flight);
+            let peak = Arc::clone(&self.peak);
+            let host = host.to_string();
+            async move {
+                let running = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Some(Arc::new(GeoInfo {
+                    ip: host.clone(),
+                    country_code: Some(host),
+                    ..Default::default()
+                }))
+            }
         }
     }
 

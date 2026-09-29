@@ -19,8 +19,9 @@
 # digests into one manifest list.
 #
 # Resulting tags:
-#   MEOW_VERSION=latest  -> latest, main, sha-<shortsha>
-#   MEOW_VERSION=v0.21.2 -> v0.21.2, main, sha-<shortsha>
+#   MEOW_VERSION=latest  -> latest, main, sha-<shortsha>   (latest only from
+#                           main or a v* tag, same ref gate docker.yml uses)
+#   MEOW_VERSION=v0.21.2 -> v0.21.2, main, sha-<shortsha>  (from any ref)
 #
 # The compose/quadlet stacks use the locally built `fumox-meow:local`; this
 # GHCR image exists for deployments that prefer to pull — point the compose
@@ -108,7 +109,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha
-            type=raw,value=${{ env.MEOW_VERSION }}
+            type=raw,value=${{ env.MEOW_VERSION }},enable=${{ env.MEOW_VERSION != 'latest' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
 
       # Push the single-platform image by digest only; tags are attached by
       # the merge job once both architectures exist.
@@ -202,7 +203,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha
-            type=raw,value=${{ env.MEOW_VERSION }}
+            type=raw,value=${{ env.MEOW_VERSION }},enable=${{ env.MEOW_VERSION != 'latest' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Create manifest list and push
         working-directory: /tmp/digests

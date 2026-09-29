@@ -97,9 +97,12 @@ pub async fn top_failure_reasons(
 
 /// Enqueue up to `limit` of `candidate_ids` for priority checking. Only
 /// T1-probeable schemes are accepted (unprobeable schemes would clog the
-/// queue forever); the row itself must still be `unknown`. Idempotent ,
-/// an id already queued is left untouched (`INSERT OR IGNORE`). Returns the
-/// number of newly queued ids.
+/// queue forever); the row itself must still be `unknown` and still be
+/// linked to a source, the same predicate the drain applies — a row
+/// without a link is skipped by every T1 lane, so queueing it would only
+/// leave a request nothing will ever consume. Idempotent , an id already
+/// queued is left untouched (`INSERT OR IGNORE`). Returns the number of
+/// newly queued ids.
 pub async fn enqueue_checks(
     pool: &DbPool,
     candidate_ids: &[i64],
@@ -122,6 +125,7 @@ pub async fn enqueue_checks(
              WHERE p.id IN ({placeholders})
                AND p.status = 'unknown'
                AND p.scheme NOT IN ({excluded})
+               AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
              ORDER BY p.id DESC LIMIT ?"
         );
         // sqlx 0.9 SqlSafeStr: the format! only expands `?` placeholder
@@ -142,9 +146,12 @@ pub async fn enqueue_checks(
 }
 
 /// Drain the queue, newest first (fresh proxies check first).
-/// Returns candidates that are still `unknown`, still linked to a source
-/// and T1-probeable; everything else in the queue is skipped here and
-/// removed by [`purge_settled_checks`].
+/// Returns candidates that are still `unknown`, still linked to a source,
+/// T1-probeable and not under a T2 block (`last_t2_failed_at IS NULL`,
+/// the same guard as the random sample — migration 0007: a T2 failure
+/// suppresses T1 until the next successful T2, and the T2 recency
+/// selector is the only way back); everything else in the queue is
+/// skipped here and removed by [`purge_settled_checks`].
 pub async fn select_queued_checks(pool: &DbPool, limit: u32) -> crate::Result<Vec<T1Candidate>> {
     let excluded = vec!["?"; T1_EXCLUDED_SCHEMES.len()].join(", ");
     let sql = format!(
@@ -153,6 +160,7 @@ pub async fn select_queued_checks(pool: &DbPool, limit: u32) -> crate::Result<Ve
          JOIN proxies p ON p.id = q.proxy_id
          WHERE p.status = 'unknown'
            AND p.scheme NOT IN ({excluded})
+           AND p.last_t2_failed_at IS NULL
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
          ORDER BY q.requested_at DESC, q.proxy_id DESC
          LIMIT ?"
@@ -480,6 +488,18 @@ mod tests {
         // Idempotent: re-enqueueing does not duplicate.
         assert_eq!(enqueue_checks(&pool, &[trojan], 10, 3000).await.unwrap(), 0);
 
+        // A row without a source link is not queued at all: no T1 lane
+        // would ever drain it, so the request would be dead weight in
+        // the table (and the revival paths would report a row the probe
+        // cannot reach).
+        let (queued_for_unlinked,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM probe_requests WHERE proxy_id = ?")
+                .bind(unlinked)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(queued_for_unlinked, 0);
+
         // Drain: newest first, only unknown+probeable+linked rows.
         let drained = select_queued_checks(&pool, 10).await.unwrap();
         let drained_ids: Vec<i64> = drained.iter().map(|c| c.id).collect();
@@ -494,6 +514,35 @@ mod tests {
         assert_eq!(claim_checks(&pool, &drained_ids).await.unwrap(), 2);
         let left = select_queued_checks(&pool, 10).await.unwrap();
         assert!(left.is_empty());
+    }
+
+    /// The priority lane carries the T2 suppression flag too:
+    /// migration 0007 puts a proxy under a T2 block "until the next
+    /// successful T2", and the T2 recency selector is the only way back.
+    /// Without the guard a queued row would leave the block on the next
+    /// plain TCP success, re-entering the T1 rotation the flag exists
+    /// to keep it out of.
+    #[tokio::test]
+    async fn queue_drain_skips_rows_under_a_t2_block() {
+        let pool = temp_pool().await;
+        let free = insert_proxy(&pool, "fp-free", "trojan", "unknown", true).await;
+        let blocked = insert_proxy(&pool, "fp-blocked", "trojan", "unknown", true).await;
+        sqlx::query("UPDATE proxies SET last_t2_failed_at = 1_000 WHERE id = ?")
+            .bind(blocked)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        enqueue_checks(&pool, &[free, blocked], 10, 2_000)
+            .await
+            .unwrap();
+        let drained: Vec<i64> = select_queued_checks(&pool, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(drained, vec![free], "the T2-blocked row stays in the queue");
     }
 
     #[tokio::test]

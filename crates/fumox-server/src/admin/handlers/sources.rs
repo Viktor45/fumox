@@ -628,13 +628,7 @@ async fn build_source_from_form(
         && let Ok(Some(stored)) = sources::get(&state.pool, id).await
         && let Some(stored_headers) = stored.headers
     {
-        for (key, value) in headers_map.iter_mut() {
-            if value.contains('•')
-                && let Some(original) = stored_headers.get(key)
-            {
-                *value = original.clone();
-            }
-        }
+        restore_masked_headers(&mut headers_map, &stored_headers);
     }
 
     let now = now_ts();
@@ -667,6 +661,64 @@ async fn build_source_from_form(
         last_error: existing.as_ref().and_then(|s| s.last_error.clone()),
         error_class: existing.as_ref().and_then(|s| s.error_class),
     })
+}
+
+/// Put the stored secret back where the form still carries the mask
+/// rendered from it (`mask_secret`).
+///
+/// An unchanged key is matched by key *and* mask, so it restores its own
+/// secret exactly and a value the operator retyped (`tok•en`, or a fresh
+/// secret replacing the mask) is left alone. Only a key that is not in the
+/// stored row falls back to the mask lookup, which is what restores a mask
+/// whose header was renamed.
+///
+/// Matching on the mask itself, not on "the value contains a bullet", is
+/// what keeps a real header value the operator typed with a bullet in it
+/// from being silently reverted. Anything that is not a mask of a stored
+/// secret stays exactly as typed.
+fn restore_masked_headers(
+    headers_map: &mut std::collections::BTreeMap<String, String>,
+    stored: &std::collections::BTreeMap<String, String>,
+) {
+    if headers_map.is_empty() || stored.is_empty() {
+        return;
+    }
+    // The mask is a three-character prefix, so two secrets sharing one
+    // (any two JWTs, both starting `eyJ`) render identically. Such a mask
+    // is left out of the fallback map entirely rather than resolved to an
+    // arbitrary one of its candidates: the key path above already gave
+    // every unchanged key its own secret, and a renamed key carrying a
+    // colliding mask is kept as typed instead of being rewritten into
+    // somebody else's secret. Only *different* secrets colliding make it
+    // ambiguous - two stored headers carrying the same secret render the
+    // same mask but have one single answer, and that answer is the secret.
+    let mut masks: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
+    let mut ambiguous: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for original in stored.values() {
+        let mask = mask_secret(original);
+        if ambiguous.contains(&mask) {
+            continue;
+        }
+        match masks.get(mask.as_str()) {
+            Some(previous) if *previous != original.as_str() => {
+                masks.remove(&mask);
+                ambiguous.insert(mask);
+            }
+            Some(_) => {}
+            None => {
+                masks.insert(mask, original.as_str());
+            }
+        }
+    }
+    for (key, value) in headers_map.iter_mut() {
+        let restored = match stored.get(key.as_str()) {
+            Some(original) if *value == mask_secret(original) => Some(original.as_str()),
+            _ => masks.get(value.as_str()).copied(),
+        };
+        if let Some(original) = restored {
+            *value = original.to_string();
+        }
+    }
 }
 
 fn form_values_from(form: &[(String, String)]) -> SourceFormValues {
@@ -1340,5 +1392,108 @@ impl SourceLogFragment {
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|n| fmt_bytes(&self.lang, n))
             .unwrap_or_else(|| ",".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restore_masked_headers;
+    use std::collections::BTreeMap;
+
+    fn headers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// The mask the edit form renders is replaced by the stored secret
+    /// under its own key, as before.
+    #[test]
+    fn unchanged_mask_is_restored_from_the_stored_secret() {
+        let stored = headers(&[("X-Token", "supersecretvalue")]);
+        let mut submitted = headers(&[("X-Token", &super::mask_secret("supersecretvalue"))]);
+        restore_masked_headers(&mut submitted, &stored);
+        assert_eq!(submitted["X-Token"], "supersecretvalue");
+    }
+
+    /// A header the operator renamed keeps its secret: the mask is matched
+    /// by value, not by key, so it never reaches the upstream fetch as a
+    /// literal `abc…••••`.
+    #[test]
+    fn mask_under_a_renamed_key_is_restored() {
+        let stored = headers(&[("X-Token", "supersecretvalue")]);
+        let mut submitted = headers(&[("Authorization", &super::mask_secret("supersecretvalue"))]);
+        restore_masked_headers(&mut submitted, &stored);
+        assert_eq!(submitted["Authorization"], "supersecretvalue");
+    }
+
+    /// A real value that happens to contain the bullet the mask is drawn
+    /// with is a value, not a mask: the old `contains('•')` test threw it
+    /// away and stored the stored secret instead.
+    #[test]
+    fn typed_value_with_a_bullet_is_kept() {
+        let stored = headers(&[("X-Token", "supersecretvalue")]);
+        let mut submitted = headers(&[("X-Token", "tok•en"), ("X-Other", "abc…••••extra")]);
+        restore_masked_headers(&mut submitted, &stored);
+        assert_eq!(submitted["X-Token"], "tok•en");
+        assert_eq!(submitted["X-Other"], "abc…••••extra");
+    }
+
+    /// Two stored headers holding the *same* secret render one mask with
+    /// one single answer, so a renamed key carrying that mask restores it
+    /// instead of keeping the mask and replaying `sup…••••` upstream as a
+    /// credential. Blacklisting the mask on a duplicate key rather than on
+    /// two different secrets is what made this one a no-op.
+    #[test]
+    fn renamed_key_mask_restores_a_secret_two_headers_share() {
+        let stored = headers(&[("X-A", "supersecretvalue"), ("X-B", "supersecretvalue")]);
+        let mut submitted = headers(&[("X-Renamed", &super::mask_secret("supersecretvalue"))]);
+        restore_masked_headers(&mut submitted, &stored);
+        assert_eq!(submitted["X-Renamed"], "supersecretvalue");
+    }
+
+    /// A new source has nothing stored to restore from.
+    #[test]
+    fn restore_is_a_noop_without_stored_headers() {
+        let mut submitted = headers(&[("X-Token", "tok•en")]);
+        restore_masked_headers(&mut submitted, &BTreeMap::new());
+        assert_eq!(submitted["X-Token"], "tok•en");
+    }
+
+    /// Two secrets whose first three characters are equal (any two JWTs)
+    /// mask identically. Keyed by mask alone they collapse into one entry
+    /// and the second secret is written over the first, so each header
+    /// keeps its own.
+    #[test]
+    fn secrets_sharing_a_mask_prefix_restore_independently() {
+        let stored = headers(&[
+            ("Authorization", "eyJAAA-first-secret"),
+            ("X-Api-Key", "eyJBBB-second-secret"),
+        ]);
+        let mut submitted = headers(&[
+            ("Authorization", &super::mask_secret("eyJAAA-first-secret")),
+            ("X-Api-Key", &super::mask_secret("eyJBBB-second-secret")),
+        ]);
+        restore_masked_headers(&mut submitted, &stored);
+        assert_eq!(submitted["Authorization"], "eyJAAA-first-secret");
+        assert_eq!(submitted["X-Api-Key"], "eyJBBB-second-secret");
+    }
+
+    /// A mask that several stored secrets could have been rendered from is
+    /// not resolved by guesswork when its key is new: the form rendered it
+    /// ambiguous, so it stays as submitted.
+    #[test]
+    fn colliding_mask_under_a_new_key_is_not_guessed() {
+        let stored = headers(&[
+            ("Authorization", "eyJAAA-first-secret"),
+            ("X-Api-Key", "eyJBBB-second-secret"),
+        ]);
+        let mut submitted = headers(&[("X-Renamed", &super::mask_secret("eyJAAA-first-secret"))]);
+        restore_masked_headers(&mut submitted, &stored);
+        assert_eq!(
+            submitted["X-Renamed"],
+            super::mask_secret("eyJAAA-first-secret")
+        );
     }
 }

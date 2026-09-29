@@ -240,6 +240,16 @@ impl AdminState {
     /// the host the admin panel was opened on (Host header) with the
     /// public port from `[server].bind`, https when the admin request
     /// itself arrived over https (see `request_is_https`).
+    ///
+    /// The link is validated against `[server].allowed_hosts`, the list
+    /// the public listener actually gates on — including the
+    /// token-bearing `/export/alive/{token}` and `/export/ready/{token}`
+    /// links the Import/Export screen renders from this base. Validating
+    /// against `[admin].allowed_hosts` instead let the two lists diverge
+    /// silently: a host the operator allowlisted for the panel but not for
+    /// the public listener produced links that answer 404 "link not found"
+    /// on every click, and the reverse direction rendered a host the
+    /// export gate had never agreed to serve.
     fn serve_base(
         &self,
         peer: SocketAddr,
@@ -250,7 +260,7 @@ impl AdminState {
             peer,
             headers,
             &self.trusted_cidrs,
-            &self.admin.allowed_hosts,
+            &self.server.allowed_hosts,
         )
     }
 
@@ -437,6 +447,13 @@ pub fn router(state: AdminState) -> axum::Router {
         )
         .route("/import/alive-token", post(handlers::rotate_alive_token))
         .route("/events", get(handlers::events_stream))
+        // Logout is a state-changing POST like every other one: the session
+        // it clears is the panel's only authentication, and an attacker
+        // page that can auto-submit a cross-site form to `/admin/logout`
+        // signs the operator out at will. Mounted inside the nest so both
+        // `require_auth` and `csrf_protect` run; the form in `base.html`
+        // already ships the `_csrf` field the layer checks.
+        .route("/logout", post(auth::logout))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::csrf_protect,
@@ -455,7 +472,6 @@ pub fn router(state: AdminState) -> axum::Router {
             "/admin/login",
             get(auth::login_form).post(auth::login_submit),
         )
-        .route("/admin/logout", post(auth::logout))
         .route("/admin/set-lang", get(auth::set_lang))
         .route("/admin/set-theme", get(theme::set_theme))
         .route("/admin/set-dash-top-n", get(dash_top_n::set_top_n))
@@ -836,7 +852,47 @@ mod tests {
         test_state_with_admin(admin_config(admin_limit)).await
     }
 
+    /// The serve links are built against `[server].allowed_hosts`, the
+    /// list the public listener gates the export endpoints with. Building
+    /// them against the admin list let the two diverge: a host allowed for
+    /// the panel but not for the public listener yielded an
+    /// `/export/alive/{token}` link that answers 404 on every click, and a
+    /// host allowed for the public listener but not for the panel was
+    /// rejected outright by `serve_base`.
+    #[tokio::test]
+    async fn serve_base_validates_against_the_server_host_allowlist() {
+        let mut admin = admin_config(10);
+        admin.allowed_hosts = vec!["panel.example.com".to_string()];
+        let server = fumox_core::config::ServerConfig {
+            allowed_hosts: vec!["vpn.example.com".to_string()],
+            ..Default::default()
+        };
+        let state = test_state_with_configs(admin, server).await;
+        let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+
+        // The panel's own host is not on the public listener's list, so no
+        // serve link may be built for it: the export gate would 404 it.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "panel.example.com".parse().unwrap());
+        assert!(state.serve_base(peer, &headers).is_err());
+
+        // A host on the public list builds, whatever the panel's list says.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        assert_eq!(
+            state.serve_base(peer, &headers).unwrap(),
+            "http://vpn.example.com:8080"
+        );
+    }
+
     async fn test_state_with_admin(admin: AdminConfig) -> AdminState {
+        test_state_with_configs(admin, Default::default()).await
+    }
+
+    async fn test_state_with_configs(
+        admin: AdminConfig,
+        server: fumox_core::config::ServerConfig,
+    ) -> AdminState {
         let dir =
             std::env::temp_dir().join(format!("fumox-admin-test-{}", fumox_core::models::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -854,6 +910,7 @@ mod tests {
         };
         let config = fumox_core::AppConfig {
             admin,
+            server,
             ..Default::default()
         };
         let fetcher = Fetcher::new(
@@ -889,6 +946,26 @@ mod tests {
             builder = builder.header(header::COOKIE, cookie);
         }
         builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    /// The `HX-Trigger` payload carries its message percent-encoded
+    /// (the browser header is decoded as Latin-1), so a test that wants
+    /// to read the toast text decodes it first.
+    fn percent_decode(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).expect("ascii percent escape");
+                out.push(u8::from_str_radix(hex, 16).expect("valid percent escape"));
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).expect("decoded payload is utf-8")
     }
 
     async fn login(app: &axum::Router) -> String {
@@ -1106,6 +1183,60 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!reloaded.enabled); // was true, toggled to false
+    }
+
+    /// Logout is a state-changing POST, so it lives inside the protected
+    /// nest: a cross-site form POST carrying the operator's cookie but no
+    /// `_csrf` must not clear the session, and a cookie-less POST must not
+    /// reach the handler at all.
+    #[tokio::test]
+    async fn logout_requires_session_and_csrf() {
+        let state = test_state(1000).await;
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+
+        // A cross-site form POST: session cookie present, no _csrf, no
+        // Origin the server could check. Must not clear the session.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/logout", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "a CSRF-less logout must not send a cookie-clearing Set-Cookie"
+        );
+
+        // Without a session the request never reaches the handler.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/logout", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/login"
+        );
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+
+        // The form in `base.html` ships the genuine token: it works.
+        let csrf = csrf_for(&state, &cookie);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/logout",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cleared = response.headers().get(header::SET_COOKIE).unwrap();
+        let cleared = cleared.to_str().unwrap();
+        assert!(cleared.contains("Max-Age=0"), "cookie: {cleared}");
     }
 
     /// M3: an over-cap body must be rejected
@@ -1790,6 +1921,31 @@ mod tests {
         let html = String::from_utf8_lossy(&html);
         assert!(html.contains("/export/ready/"), "{html}");
         assert!(html.contains("готовые"), "the ready column title: {html}");
+
+        // The card's own badge chain carries the ready tier too, so a
+        // T2-verified proxy does not render as «unknown».
+        let ready_id: i64 = sqlx::query_scalar("SELECT id FROM proxies WHERE status = 'ready'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/admin/proxies/{ready_id}"),
+                "",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("badge ready"), "card badge: {html}");
+        assert!(
+            !html.contains("badge unknown"),
+            "a ready proxy must not render the unknown badge: {html}"
+        );
     }
 
     #[tokio::test]
@@ -3053,6 +3209,85 @@ mod tests {
                 .await
                 .unwrap();
         assert!(removed_at.is_some(), "removed_at must be stamped");
+    }
+
+    /// A reconcile-retired row is refused by the repo (no source link,
+    /// so no probe lane can reach it), and the answer used to be a 404
+    /// telling the operator the proxy does not exist. It exists: it is
+    /// on the screen the click came from. The refusal is reported as a
+    /// rejected action, the row is left exactly as it was, and a row that
+    /// really is gone still 404s.
+    #[tokio::test]
+    async fn reset_of_a_row_no_probe_lane_can_reach_is_reported_not_called_missing() {
+        let state = test_state(1000).await;
+        let pool = state.pool.clone();
+        // No proxy_source_links row: reconciliation retired it, so every
+        // lane's link predicate filters it out.
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
+                                  status, quarantined_at, created_at, updated_at)
+             VALUES ('fp-orphan', 'vless', 'n', 'orphan.example.com', 443, 'c',
+                     'quarantine', 111, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM proxies WHERE fingerprint = 'fp-orphan'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let session = format!("{cookie}; fumox_lang=en");
+        let mut req = request(
+            "POST",
+            &format!("/admin/proxies/{id}/reset"),
+            &format!("_csrf={csrf}"),
+            Some(&session),
+        );
+        req.headers_mut()
+            .insert("HX-Request", "true".parse().unwrap());
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let trigger = response
+            .headers()
+            .get("HX-Trigger")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(trigger.contains("\"level\": \"error\""), "{trigger}");
+        // The toast rides percent-encoded, so compare on the decoded text:
+        // the message must be the refusal, not `proxy not found`.
+        let toast = percent_decode(&trigger);
+        let en = state.locales.resolve("en");
+        assert!(toast.contains(en.t("px.reset_unreachable")), "{toast}");
+        assert!(!toast.contains("proxy not found"), "{toast}");
+        // The status the click was refused for is the one that stays.
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(body.contains("badge quarantine"), "{body}");
+        let (status, quarantined_at): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, quarantined_at FROM proxies WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "quarantine");
+        assert_eq!(quarantined_at, Some(111), "the row must be untouched");
+
+        // A row that is genuinely gone is still a 404.
+        let mut req = request(
+            "POST",
+            &format!("/admin/proxies/{}/reset", id + 1000),
+            &format!("_csrf={csrf}"),
+            Some(&session),
+        );
+        req.headers_mut()
+            .insert("HX-Request", "true".parse().unwrap());
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

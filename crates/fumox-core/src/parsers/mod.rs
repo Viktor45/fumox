@@ -86,12 +86,13 @@ fn parsed(result: Result<ProxyEntry, String>) -> LineOutcome {
 
 /// Reject a field value that would break the one-proxy-per-line contract.
 ///
-/// The URI serializers emit `host`, `credential` and parameter values
-/// verbatim, only `name` goes through [`uri::encode_fragment`], so a line
-/// break inside any of them splits one stored proxy into several output
-/// lines. A crafted Clash YAML or legacy-`ss` feed could smuggle a proxy of
-/// an entirely different scheme past a source's protocol allowlist that way,
-/// or forge `url_list` metadata comments.
+/// The URI serializers emit `host` and `credential` verbatim and parameter
+/// values with only the query delimiters escaped (`uri::encode_query_delimiters`),
+/// `name` goes through [`uri::encode_fragment`], so a line break inside any
+/// of them splits one stored proxy into several output lines. A crafted Clash
+/// YAML or legacy-`ss` feed could smuggle a proxy of an entirely different
+/// scheme past a source's protocol allowlist that way, or forge `url_list`
+/// metadata comments.
 ///
 /// URI-list input cannot reach this: `parse_uri_list` iterates over
 /// `str::lines`. The vectors are the formats whose fields are not

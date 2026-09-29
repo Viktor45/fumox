@@ -20,6 +20,7 @@ mod serve;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::routing::get;
 use clap::Parser;
@@ -77,9 +78,19 @@ async fn main() -> anyhow::Result<()> {
     alive_export::ensure_token(&pool).await?;
 
     // Best-effort GeoLite2 database download into [geo].db_dir: fetch what
-    // is missing, broken or older than a month. Runs before the geo
-    // resolver opens the files; failures never block startup.
-    geo_download::ensure_geo_databases(&config).await;
+    // is missing, broken or older than a month. It runs before the geo
+    // resolver opens the files, but only for `[geo].startup_download_budget_secs`:
+    // two slow mirrors must not hold `/healthz` and the whole public surface
+    // hostage for the sum of their per-file download budgets. Past the budget
+    // the task keeps running detached (the file is installed atomically, so
+    // the resolver and a later start never see a partial one) and this process
+    // simply runs without geo enrichment until the next start.
+    let geo_config = config.clone();
+    await_geo_within_budget(
+        tokio::spawn(async move { geo_download::ensure_geo_databases(&geo_config).await }),
+        config.geo.startup_download_budget(),
+    )
+    .await;
 
     // Background source refresh loop: fetch → parse → reconcile → journal.
     let fetcher = Fetcher::new(
@@ -129,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
         limits: serve::PublicRateLimits::from_config(&config.server),
         trusted_cidrs: admin::parse_trusted_cidrs(&config.server.trust_proxy_ips),
         allowed_hosts: config.server.allowed_hosts.clone(),
+        export_max_rows: config.server.export_max_rows,
     };
     let app = serve::router(state).route("/healthz", get(|| async { "ok\n" }));
 
@@ -176,6 +188,30 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Wait for the GeoLite2 download task, but no longer than `budget`
+/// (`[geo].startup_download_budget_secs`, 60 s by default — generous enough
+/// for a healthy mirror to install both databases, short enough that a
+/// stalled one cannot keep `/healthz` unreachable for the sum of two
+/// per-file download budgets). On elapse the task is left running (dropping
+/// a `JoinHandle` detaches, it does not abort) and startup continues: geo
+/// enrichment is optional, and a container that answers `/healthz` is worth
+/// more than one that boots with a database. The install itself is an
+/// atomic rename, so a detached download finishing mid-run can never expose
+/// a half-written file.
+async fn await_geo_within_budget(task: tokio::task::JoinHandle<()>, budget: Duration) {
+    match tokio::time::timeout(budget, task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "GeoLite2 download task failed")
+        }
+        Err(_) => tracing::warn!(
+            budget_secs = budget.as_secs(),
+            "GeoLite2 download still running at the startup budget; \
+             starting without it, the download continues in the background"
+        ),
+    }
+}
+
 /// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM.
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -200,4 +236,49 @@ async fn shutdown_signal() {
         () = terminate => {},
     }
     tracing::info!("shutdown signal received, draining connections");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stalled GeoLite2 download must not keep the listeners from
+    /// binding: the wait gives up at the budget and leaves the task
+    /// running. Before the budget was bounded, two slow mirrors held
+    /// `/healthz` unreachable for the sum of their per-file budgets.
+    #[tokio::test]
+    async fn a_stalled_geo_download_does_not_hold_startup() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            // Far longer than the budget below.
+            tokio::time::sleep(Duration::from_secs(3_600)).await;
+        });
+        started_rx.await.unwrap();
+
+        let budget = Duration::from_millis(100);
+        let began = std::time::Instant::now();
+        await_geo_within_budget(task, budget).await;
+        let elapsed = began.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "waited {elapsed:?}, expected to give up at {budget:?}"
+        );
+    }
+
+    /// The normal path: a download that finishes inside the budget is
+    /// awaited to completion, so a working mirror still gets its files in
+    /// before the resolver opens them.
+    #[tokio::test]
+    async fn a_finished_geo_download_is_awaited() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = done_tx.send(());
+        });
+        await_geo_within_budget(task, Duration::from_secs(5)).await;
+        // The task ran to its end rather than being abandoned.
+        done_rx.await.unwrap();
+    }
 }

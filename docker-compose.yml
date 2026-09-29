@@ -30,9 +30,20 @@
 # Volumes:
 #   fumox-data   SQLite database, shared by server and probe -> /app/data
 #   meow-shared  generated Clash config exchange             -> /shared
-#   ./config     app.toml + GeoLite2 .mmdb files (read-only) -> /app/config
-#                Drop GeoLite2-City.mmdb (or ASN) into ./config to
-#                enable geo enrichment; it is gitignored and not bundled.
+#   ./config     app.toml                                   -> /app/config
+#                (probe always :ro; the server :rw so the admin
+#                *Edit settings* page can save, or :ro with
+#                FUMOX_CONFIG_ACCESS=ro)
+#
+# GeoLite2 .mmdb files do NOT go into ./config: both services set
+# FUMOX_GEO__DB_DIR=/shared (the meow-shared volume, the same place
+# /shared/meow.yaml goes), and the environment outranks config/app.toml,
+# so ./config is never scanned for databases. The server downloads them
+# into /shared at startup, which is why the manual step below is optional
+# and needs no action on a stock `docker compose up`. To supply your own
+# MaxMind files, copy them into that volume:
+#   docker compose cp GeoLite2-City.mmdb server:/shared/
+# or drop the FUMOX_GEO__DB_DIR override and set [geo].db_dir instead.
 
 services:
   server:
@@ -60,12 +71,19 @@ services:
       # SSRF guard: set true in .env only for trusted local test setups
       # (source URLs may then point at private/loopback addresses).
       FUMOX_ADMIN__ALLOW_PRIVATE_URLS: ${FUMOX_ADMIN__ALLOW_PRIVATE_URLS:-false}
+      # GeoLite2 databases live in the meow-shared volume, not in ./config:
+      # the env layer outranks config/app.toml, so [geo].db_dir = "config"
+      # from the file is ignored by this stack. See the Volumes header.
     volumes:
       # Writable: the admin *Edit settings* page writes /app/config/app.toml
-      # in place via the toml_edit-backed editor (see USERGUIDE §7). If you
-      # want config edits off, drop the `:rw` (server) and the editor
-      # renders disabled with the `set.edit_unwritable` banner.
-      - ./config:/app/config:rw,z
+      # in place via the toml_edit-backed editor (see USERGUIDE §7). Set
+      # FUMOX_CONFIG_ACCESS=ro in .env to turn config edits off — the editor
+      # then renders disabled with the `set.edit_unwritable` banner. That is
+      # what scripts/smoke-up.sh does: only the named volumes are
+      # project-scoped, the bind mount is the same host ./config for every
+      # compose project, so a writable mount would let the smoke stand's
+      # admin panel overwrite the main stack's app.toml.
+      - ./config:/app/config:${FUMOX_CONFIG_ACCESS:-rw},z
       - fumox-data:/app/data
       - meow-shared:/shared
     ports:

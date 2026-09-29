@@ -13,6 +13,14 @@
 //!   contain `/`);
 //! * parameter values are stored exactly as they appear (still
 //!   percent-encoded), so serialization can reproduce the original bytes.
+//!
+//! The value vocabulary is not URI-only: the Clash and sing-box parsers feed
+//! the same [`Param`] list with *decoded* text taken from YAML/JSON scalars,
+//! so a stored value may carry a raw `&` or `#`. Serialization therefore
+//! escapes the characters that would otherwise break the emitted line (see
+//! [`encode_query_delimiters`]).
+
+use std::borrow::Cow;
 
 use crate::models::{Param, ProxyEntry, Scheme};
 
@@ -326,6 +334,10 @@ fn check_param_size(key: &str, value: &str) -> Result<(), String> {
 /// Serialize ordered parameters back into a query string (`k=v&k=v`).
 /// Empty-key params serialize as empty segments, reproducing the occasional
 /// `?&k=v` / `k=v&` quirks of real feeds.
+///
+/// Keys and values go through [`encode_query_delimiters`] first: a value
+/// carrying a raw `&` or `#` would split into a bogus extra parameter and
+/// swallow the proxy name on re-parse.
 pub fn serialize_query(params: &[Param]) -> String {
     params
         .iter()
@@ -333,11 +345,47 @@ pub fn serialize_query(params: &[Param]) -> String {
             if p.key.is_empty() && p.value.is_empty() {
                 String::new()
             } else {
-                format!("{}={}", p.key, p.value)
+                format!(
+                    "{}={}",
+                    encode_query_delimiters(&p.key),
+                    encode_query_delimiters(&p.value)
+                )
             }
         })
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Percent-encode the characters that carry structural meaning inside the
+/// emitted query string: `&` starts a new parameter, `#` starts the
+/// fragment (the proxy name), and space plus the C0 controls are not legal
+/// in a URI at all.
+///
+/// `%` is deliberately left alone. The URI parsers store values still
+/// percent-encoded and emit them verbatim, so re-encoding `%` would turn
+/// every `%2F` into `%252F` and break the byte-exact round-trip; that
+/// restraint is what lets a value the Clash/sing-box parsers contributed as
+/// *decoded* text (`/search?q=1&host=evil`) come back out of a re-parse as
+/// the single value it was.
+fn encode_query_delimiters(raw: &str) -> Cow<'_, str> {
+    fn must_encode(ch: char) -> bool {
+        matches!(ch, '&' | '#' | ' ' | '\u{7f}') || ch.is_control()
+    }
+    if !raw.chars().any(must_encode) {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = String::with_capacity(raw.len() * 3);
+    for ch in raw.chars() {
+        if must_encode(ch) {
+            let mut buf = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buf).as_bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Lenient percent-decoding: valid `%XX` escapes are decoded, anything else
@@ -409,8 +457,10 @@ pub fn parse_with_spec(
 
 /// Generic serializer for the `userinfo@host:port[?query][#name]` family.
 ///
-/// The credential and parameter values are emitted exactly as stored (still
-/// percent-encoded); the name is re-encoded with [`encode_fragment`].
+/// The credential is emitted exactly as stored and parameter values keep
+/// their percent-encoding (only the characters that would break the query
+/// are escaped, see [`encode_query_delimiters`]); the name is re-encoded
+/// with [`encode_fragment`].
 pub fn serialize_with_spec(spec: &UriSchemeSpec, entry: &ProxyEntry) -> String {
     let mut out = String::with_capacity(128);
     out.push_str(spec.prefix);
@@ -633,5 +683,98 @@ mod tests {
         assert_eq!(entry.params[1].value, "%40spam");
         let unknown = entry.unknown_params_json();
         assert_eq!(unknown.get("telegram").unwrap(), "%40spam");
+    }
+
+    /// A value the Clash/sing-box parsers contributed as decoded text can
+    /// carry a raw `&` or `#`. Emitted verbatim, `&` spawns a bogus extra
+    /// parameter and `#` swallows the proxy name (the fragment is everything
+    /// after the first `#`).
+    #[test]
+    fn query_delimiters_in_values_do_not_corrupt_the_line() {
+        let entry = ProxyEntry {
+            scheme: Scheme::Vless,
+            name: "Name".into(),
+            host: "h.example.com".into(),
+            port: 443,
+            credential: "uuid".into(),
+            params: vec![
+                Param {
+                    key: "type".into(),
+                    value: "ws".into(),
+                    known: true,
+                },
+                Param {
+                    key: "path".into(),
+                    value: "/search?q=1&host=evil".into(),
+                    known: true,
+                },
+            ],
+            raw_path: String::new(),
+            raw_line: String::new(),
+        };
+        let out = serialize_with_spec(&VLESS_SPEC, &entry);
+        // `&` is escaped; the rest of the value is left as the producer
+        // wrote it (`?` and `=` are legal inside a query value).
+        assert_eq!(
+            out,
+            "vless://uuid@h.example.com:443?type=ws&path=/search?q=1%26host=evil#Name"
+        );
+        // One `path` parameter, and the name is still `Name`.
+        let back =
+            parse_with_spec(&VLESS_SPEC, out.strip_prefix("vless://").unwrap(), &out).unwrap();
+        assert_eq!(back.params.len(), 2);
+        assert_eq!(back.params[1].key, "path");
+        assert_eq!(back.name, "Name");
+        // The escaped value is what a client percent-decodes back to the
+        // original text.
+        assert_eq!(
+            percent_decode(&back.params[1].value),
+            "/search?q=1&host=evil"
+        );
+
+        // A `#` in a value used to make the name `b&path=…`.
+        let hashed = ProxyEntry {
+            params: vec![Param {
+                key: "type".into(),
+                value: "/a#b".into(),
+                known: true,
+            }],
+            ..entry
+        };
+        let out = serialize_with_spec(&VLESS_SPEC, &hashed);
+        let back =
+            parse_with_spec(&VLESS_SPEC, out.strip_prefix("vless://").unwrap(), &out).unwrap();
+        assert_eq!(back.name, "Name");
+        assert_eq!(back.params.len(), 1);
+        assert_eq!(percent_decode(&back.params[0].value), "/a#b");
+    }
+
+    /// The escape is structural only: a value the URI parser stored still
+    /// percent-encoded must be emitted byte-for-byte, or the whole-line
+    /// round-trip guarantee (`vless_round_trip_is_byte_exact_for_encoded_names`,
+    /// and the `test.txt` fixture check) regresses into double-encoding.
+    #[test]
+    fn already_encoded_values_are_not_double_encoded() {
+        let params = vec![
+            Param {
+                key: "path".into(),
+                value: "/a%2Fb%20c?d=1".into(),
+                known: true,
+            },
+            Param {
+                key: "host".into(),
+                value: "%.DE".into(),
+                known: true,
+            },
+            Param {
+                key: "raw".into(),
+                value: "50%off&тест".into(),
+                known: false,
+            },
+        ];
+        assert_eq!(
+            serialize_query(&params),
+            "path=/a%2Fb%20c?d=1&host=%.DE&raw=50%off%26тест"
+        );
     }
 }

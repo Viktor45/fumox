@@ -3,16 +3,25 @@
 //! Fumox never ships the `.mmdb` files (they are gitignored). Until
 //! now the operator had to fetch them by hand; this module closes that gap:
 //! before the listeners bind, each GeoLite2 database in `[geo].db_dir` is
-//! checked and, when missing, implausible (a truncated or broken download
-//! from an earlier attempt) or older than [`MAX_AGE`], re-downloaded from
-//! the fixed public mirrors into a temporary file that is atomically
-//! renamed into place. The resolver therefore always finds either a
-//! complete file or nothing, never a half-written one, and a failed
-//! download simply retries on the next start.
+//! checked and, when missing, implausible (a truncated, broken or wrongly
+//! typed download from an earlier attempt) or older than [`MAX_AGE`],
+//! re-downloaded from the fixed public mirrors into a temporary file that
+//! is atomically renamed into place. The resolver therefore always finds
+//! either a complete file or nothing, never a half-written one, and a
+//! failed download simply retries on the next start.
+//!
+//! The wait is bounded by the caller (`[geo].startup_download_budget_secs`,
+//! read in `main`): past that budget startup continues and the download
+//! finishes in the background, so the resolver this run opens without a
+//! database and the next start picks it up. The atomic rename is what makes
+//! that safe.
 //!
 //! Everything here is best-effort: a failure (unwritable directory, no
 //! network, mirror down) is logged and skipped, geo enrichment is an
-//! optional enhancement, never a startup requirement.
+//! optional enhancement, never a startup requirement. The download is
+//! unattended, so it neither follows a redirect off https nor to a host
+//! outside [`REDIRECT_HOSTS`], and accepts a file only when its own
+//! metadata block declares the `database_type` this slot expects.
 
 use fumox_core::config::{AppConfig, GeoDbKind};
 use std::path::{Path, PathBuf};
@@ -36,12 +45,30 @@ const MAX_MMDB_BYTES: u64 = 512 * 1024 * 1024;
 const METADATA_MARKER: &[u8] = b"\xab\xcd\xefMaxMind.com";
 /// Tail window scanned for the metadata marker.
 const MARKER_WINDOW: u64 = 128 * 1024;
+/// Hosts a redirect may lead to, besides `*.githubusercontent.com` (the
+/// release-asset CDN, whose exact subdomain varies). The mirror URLs are
+/// hardcoded public GitHub release links, which answer with a redirect to
+/// one of these; nothing else may follow. A redirect to any other host (or
+/// off https) is refused rather than fetched, so a hijacked release or a
+/// mis-typed URL cannot deliver a foreign file — the content check is a
+/// format check, not provenance.
+const REDIRECT_HOSTS: &[&str] = &["github.com"];
+
+/// CDN suffix the release-asset redirect is allowed to land on.
+const REDIRECT_HOST_SUFFIX: &str = ".githubusercontent.com";
 
 /// One downloadable GeoLite2 database: its canonical file name comes from
 /// the [`GeoDbKind`], the URL is the public release mirror.
 struct GeoFile {
     kind: GeoDbKind,
     url: &'static str,
+    /// `database_type` the file's own metadata block must declare. The
+    /// marker alone accepts any MaxMind build, so without this a mirror
+    /// that serves the ASN file under the City name installs silently and
+    /// every proxy gets wrong country/AS facts. The string is MaxMind's
+    /// own, fixed per product, and is rewritten into the metadata block
+    /// exactly like the other database fields.
+    db_type: &'static str,
 }
 
 fn all_files() -> [GeoFile; 2] {
@@ -49,10 +76,12 @@ fn all_files() -> [GeoFile; 2] {
         GeoFile {
             kind: GeoDbKind::City,
             url: "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb",
+            db_type: "GeoLite2-City",
         },
         GeoFile {
             kind: GeoDbKind::Asn,
             url: "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb",
+            db_type: "GeoLite2-ASN",
         },
     ]
 }
@@ -107,24 +136,27 @@ enum Outcome {
 
 async fn ensure_one(dir: &Path, file: &GeoFile, user_agent: &str) -> Outcome {
     let path = dir.join(file.kind.file_name());
-    if !needs_download(&path) {
+    if !needs_download(&path, file.db_type) {
         return Outcome::Fresh;
     }
-    match download_and_install(&path, file.url, user_agent).await {
+    match download_and_install(&path, file, user_agent).await {
         Ok(bytes) => Outcome::Downloaded { bytes },
         Err(reason) => Outcome::Failed { reason },
     }
 }
 
-/// Whether the file must be (re-)downloaded: absent, implausible (empty or
-/// without the MaxMind metadata marker, e.g. a broken earlier download) or
-/// older than [`MAX_AGE`].
-fn needs_download(path: &Path) -> bool {
+/// Whether the file must be (re-)downloaded: absent, implausible (empty,
+/// without the MaxMind metadata marker, or declaring a different
+/// `database_type` than this slot expects — a broken or swapped earlier
+/// download) or older than [`MAX_AGE`]. Age is only consulted for a file
+/// that passes the content check, so a wrong-but-plausible file is
+/// refreshed instead of being kept for another month.
+fn needs_download(path: &Path, db_type: &str) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return true; // absent
     };
-    if !meta.is_file() || !plausible_mmdb(path) {
-        return true; // broken content, refresh regardless of age
+    if !meta.is_file() || !verified_mmdb(path, db_type) {
+        return true; // broken or wrong content, refresh regardless of age
     }
     // A future mtime (clock skew) counts as fresh: it cannot be a month old.
     match SystemTime::now().duration_since(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)) {
@@ -133,33 +165,84 @@ fn needs_download(path: &Path) -> bool {
     }
 }
 
-/// Light format check: non-empty and the MaxMind metadata marker appears in
-/// the file tail. Catches HTML error pages, empty and truncated files.
-fn plausible_mmdb(path: &Path) -> bool {
-    let Ok(mut file) = std::fs::File::open(path) else {
+/// Content check for one slot: non-empty, the MaxMind metadata marker in
+/// the file tail, and the metadata block declaring `db_type`. Catches HTML
+/// error pages, empty and truncated files, and a database installed under
+/// the wrong name (which would tag every proxy with the wrong facts).
+/// It is deliberately a *format and identity* check, not a trust
+/// guarantee: the mirrors publish no checksum to pin here, so what this
+/// buys is "never silently install the wrong database", not provenance.
+fn verified_mmdb(path: &Path, db_type: &str) -> bool {
+    let Some(tail) = read_tail(path) else {
         return false;
     };
-    let len = match file.metadata().map(|m| m.len()) {
-        Ok(len) if len > 0 => len,
-        _ => return false,
-    };
-    use std::io::{Read, Seek, SeekFrom};
-    let start = len.saturating_sub(MARKER_WINDOW);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return false;
-    }
-    let mut tail = Vec::new();
-    match file.read_to_end(&mut tail) {
-        Ok(_) => twoway_find(&tail).is_some(),
-        Err(_) => false,
+    match twoway_find(&tail, METADATA_MARKER) {
+        // The type only counts when it sits in the metadata block, i.e.
+        // after the marker: a city name appearing in the data section is
+        // not a declaration of what the file is.
+        Some(marker) => twoway_find(&tail[marker..], db_type.as_bytes()).is_some(),
+        None => false,
     }
 }
 
-/// Find [`METADATA_MARKER`] in a buffer (naive scan; the window is small).
-fn twoway_find(haystack: &[u8]) -> Option<usize> {
+/// The last [`MARKER_WINDOW`] bytes of the file, or `None` when the file is
+/// missing, empty or unreadable.
+fn read_tail(path: &Path) -> Option<Vec<u8>> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = match file.metadata().map(|m| m.len()) {
+        Ok(len) if len > 0 => len,
+        _ => return None,
+    };
+    use std::io::{Read, Seek, SeekFrom};
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(MARKER_WINDOW)))
+        .is_err()
+    {
+        return None;
+    }
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    Some(tail)
+}
+
+/// Find `needle` in a buffer (naive scan; the window is small).
+fn twoway_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
     haystack
-        .windows(METADATA_MARKER.len())
-        .position(|window| window == METADATA_MARKER)
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Redirect policy for the unattended download: at most [`MAX_REDIRECTS`]
+/// hops, https only, and only to the hosts the hardcoded release links are
+/// expected to answer from (see [`REDIRECT_HOSTS`]). The download runs
+/// without an operator watching, so an unexpected target is refused
+/// outright instead of being fetched and content-checked.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let Some(host) = attempt.url().host_str() else {
+            return attempt.error("redirect target has no host");
+        };
+        if attempt.url().scheme() != "https" {
+            return attempt.error("refusing a redirect off https");
+        }
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        if !host_allowed_for_redirect(host) {
+            return attempt.error("refusing a redirect to an unexpected host");
+        }
+        attempt.follow()
+    })
+}
+
+/// Whether a redirect may follow to `host`: one of the exact mirror hosts
+/// or the release-asset CDN suffix.
+fn host_allowed_for_redirect(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    REDIRECT_HOSTS.contains(&host.as_str()) || host.ends_with(REDIRECT_HOST_SUFFIX)
 }
 
 /// Create `dir` when missing and probe that we can actually write to it
@@ -186,9 +269,13 @@ fn ensure_writable_dir(dir: &Path) -> bool {
 /// onto `dest` after validation. On any failure the temporary file is
 /// removed and `dest` (if it exists) is left untouched, so the next start
 /// retries with a clean slate.
-async fn download_and_install(dest: &Path, url: &str, user_agent: &str) -> Result<u64, String> {
+async fn download_and_install(
+    dest: &Path,
+    file: &GeoFile,
+    user_agent: &str,
+) -> Result<u64, String> {
     let tmp = tmp_path(dest);
-    let result = download_body(url, &tmp, user_agent).await;
+    let result = download_body(file.url, &tmp, user_agent).await;
     let bytes = match result {
         Ok(bytes) => bytes,
         Err(reason) => {
@@ -196,9 +283,12 @@ async fn download_and_install(dest: &Path, url: &str, user_agent: &str) -> Resul
             return Err(reason);
         }
     };
-    if !plausible_mmdb(&tmp) {
+    if !verified_mmdb(&tmp, file.db_type) {
         drop(std::fs::remove_file(&tmp));
-        return Err("downloaded file is not a valid MaxMind database".to_string());
+        return Err(format!(
+            "downloaded file does not declare database_type {}",
+            file.db_type
+        ));
     }
     // Same-directory rename: atomic on POSIX and Windows.
     std::fs::rename(&tmp, dest).map_err(|err| {
@@ -234,7 +324,7 @@ async fn download_body_capped(
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent(user_agent.to_string())
-        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+        .redirect(redirect_policy())
         .build()
         .map_err(|err| err.to_string())?;
 
@@ -297,17 +387,28 @@ mod tests {
         dir
     }
 
-    fn fake_mmdb(body: &[u8]) -> Vec<u8> {
+    /// A body followed by the metadata marker and a `database_type` field,
+    /// the shape a real `.mmdb` tail has.
+    fn fake_mmdb(body: &[u8], db_type: &str) -> Vec<u8> {
         let mut bytes = body.to_vec();
         bytes.extend_from_slice(METADATA_MARKER);
+        bytes.extend_from_slice(b"\x07database_type");
+        bytes.extend_from_slice(db_type.as_bytes());
         bytes
     }
 
+    const CITY: &str = "GeoLite2-City";
+    const ASN: &str = "GeoLite2-ASN";
+
     #[test]
     fn marker_scan_finds_the_metadata_tail() {
-        assert!(twoway_find(&fake_mmdb(b"proxies")).is_some());
-        assert!(twoway_find(b"no marker here").is_none());
-        assert!(twoway_find(b"").is_none());
+        let tail = fake_mmdb(b"proxies", CITY);
+        assert!(twoway_find(&tail, METADATA_MARKER).is_some());
+        assert!(twoway_find(b"no marker here", METADATA_MARKER).is_none());
+        assert!(twoway_find(b"", METADATA_MARKER).is_none());
+        // A needle longer than the haystack never matches.
+        assert!(twoway_find(METADATA_MARKER, b"\xab\xcd\xefMaxMind.com!!").is_none());
+        assert!(twoway_find(b"ab", b"").is_none());
     }
 
     #[test]
@@ -316,19 +417,19 @@ mod tests {
         let path = dir.join("x.mmdb");
 
         // Absent file.
-        assert!(needs_download(&path));
+        assert!(needs_download(&path, CITY));
 
         // Empty file (a broken download).
         std::fs::write(&path, b"").unwrap();
-        assert!(needs_download(&path));
+        assert!(needs_download(&path, CITY));
 
         // Markerless content (an HTML error page served with HTTP 200).
         std::fs::write(&path, b"<html>not a database</html>").unwrap();
-        assert!(needs_download(&path));
+        assert!(needs_download(&path, CITY));
 
         // A plausible, fresh file stays.
-        std::fs::write(&path, fake_mmdb(b"db-body")).unwrap();
-        assert!(!needs_download(&path));
+        std::fs::write(&path, fake_mmdb(b"db-body", CITY)).unwrap();
+        assert!(!needs_download(&path, CITY));
 
         // Older than a month, refresh.
         let month_ago = SystemTime::now() - Duration::from_secs(31 * 24 * 3600);
@@ -338,9 +439,71 @@ mod tests {
             .unwrap()
             .set_modified(month_ago)
             .unwrap();
-        assert!(needs_download(&path));
+        assert!(needs_download(&path, CITY));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The wrong database installed under the right name is plausible but
+    /// not this slot's file: it must be refreshed, not kept for a month
+    /// while stamping every proxy with the other database's facts.
+    #[test]
+    fn a_well_formed_file_of_the_wrong_kind_is_refreshed() {
+        let dir = scratch_dir();
+        let path = dir.join("GeoLite2-City.mmdb");
+
+        // ASN content sitting in the City slot.
+        std::fs::write(&path, fake_mmdb(b"asn-body", ASN)).unwrap();
+        assert!(needs_download(&path, CITY));
+        assert!(!needs_download(&path, ASN));
+
+        // The type string before the marker is data-section text, not a
+        // declaration, and must not satisfy the check.
+        let mut smuggled = b"GeoLite2-City".to_vec();
+        smuggled.extend_from_slice(&fake_mmdb(b"body", ASN));
+        std::fs::write(&path, smuggled).unwrap();
+        assert!(needs_download(&path, CITY));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn redirect_targets_are_limited_to_the_mirror_hosts() {
+        // The release shortlink and the CDN it redirects to are allowed.
+        assert!(host_allowed_for_redirect("github.com"));
+        assert!(host_allowed_for_redirect("GitHub.com"));
+        assert!(host_allowed_for_redirect(
+            "release-assets.githubusercontent.com"
+        ));
+        // Anything else is not.
+        assert!(!host_allowed_for_redirect("evil.example"));
+        assert!(!host_allowed_for_redirect("github.com.evil.example"));
+        assert!(!host_allowed_for_redirect("notgithubusercontent.com"));
+        assert!(!host_allowed_for_redirect(""));
+    }
+
+    /// The real databases must survive the content check, or every start
+    /// would re-download ~78 MB for nothing. Skips itself when the
+    /// gitignored `.mmdb` files are absent (CI runs without them).
+    ///
+    /// `needs_download` also carries the 30-day freshness rule, so this
+    /// assertion folds in the age of the developer's own copies: they pass
+    /// now and start failing with "looks stale" once the files are a month
+    /// old, which is the one case the content check is not about. Re-touch
+    /// the files or delete them to get a green run back.
+    #[test]
+    fn real_workspace_databases_pass_the_content_check() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        for file in all_files() {
+            let name = file.kind.file_name();
+            let path = dir.join(name);
+            if !path.is_file() {
+                eprintln!("skipping: {} absent", path.display());
+                continue;
+            }
+            assert!(verified_mmdb(&path, file.db_type), "{name} rejected");
+            assert!(!needs_download(&path, file.db_type), "{name} looks stale");
+        }
     }
 
     #[test]
@@ -404,7 +567,7 @@ mod tests {
         let dir = scratch_dir();
         let dest = dir.join("GeoLite2-City.mmdb");
         // A plausible previous database must survive the failed refresh.
-        std::fs::write(&dest, fake_mmdb(b"previous")).unwrap();
+        std::fs::write(&dest, fake_mmdb(b"previous", CITY)).unwrap();
 
         let err = download_body_capped(
             &format!("http://{addr}/GeoLite2-City.mmdb"),
@@ -419,7 +582,60 @@ mod tests {
         // The temp file was cleaned up by the caller contract (checked by
         // download_and_install in production); here only the error and the
         // intact destination matter.
-        assert_eq!(std::fs::read(&dest).unwrap(), fake_mmdb(b"previous"));
+        assert_eq!(std::fs::read(&dest).unwrap(), fake_mmdb(b"previous", CITY));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The unattended download follows the release shortlink, so the
+    /// redirect policy is the only thing between a hijacked release and a
+    /// foreign file in `db_dir`. A 302 to anywhere outside the mirror
+    /// hosts must fail the request instead of being followed.
+    #[tokio::test]
+    async fn a_redirect_off_the_mirror_hosts_is_refused() {
+        // A server that redirects to a second server, which would happily
+        // serve a body if it were ever reached.
+        let payload_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let payload_addr = payload_server.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut sock, _)) = payload_server.accept().await {
+                let body = fake_mmdb(b"served", CITY);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            }
+        });
+
+        let redirector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirector_addr = redirector.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut sock, _)) = redirector.accept().await {
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: http://{payload_addr}/x.mmdb\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+            }
+        });
+
+        let dir = scratch_dir();
+        let dest = dir.join("GeoLite2-City.mmdb");
+        let err = download_body_capped(
+            &format!("http://{redirector_addr}/GeoLite2-City.mmdb"),
+            &tmp_path(&dest),
+            "fumox-test",
+            MAX_MMDB_BYTES,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("redirect"), "{err}");
+
+        // Nothing was installed.
+        assert!(!dest.exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -125,11 +125,17 @@
       function localize(root) {
         if (!root.querySelectorAll) return;
         var lang = document.documentElement.lang || undefined;
-        var fmt;
+        var full, dayOnly;
         try {
-          fmt = new Intl.DateTimeFormat(lang, {
+          full = new Intl.DateTimeFormat(lang, {
             year: 'numeric', month: '2-digit', day: '2-digit',
             hour: '2-digit', minute: '2-digit', second: '2-digit'
+          });
+          // `time.ts.day` marks a calendar-day bucket (the ingest chart's
+          // columns): the time of day is always 00:00 and only crowds out
+          // the date in a 64px column, so those keep the date alone.
+          dayOnly = new Intl.DateTimeFormat(lang, {
+            year: 'numeric', month: '2-digit', day: '2-digit'
           });
         } catch (_) { return; }
         var zone = '';
@@ -141,6 +147,8 @@
           if (!attr) return;
           var stamp = new Date(attr);
           if (isNaN(stamp)) return;
+          var isDay = el.classList.contains('day');
+          var fmt = isDay ? dayOnly : full;
           var local = fmt.format(stamp);
           el.textContent = local;
           // Language-neutral tooltip: the original UTC instant and the zone used.

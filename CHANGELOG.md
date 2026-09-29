@@ -26,6 +26,17 @@ Defect fixes in the working tree, not yet on a published image.
 
 ### Fixed
 
+- The dashboard's "new proxies over the last 7 days" chart labelled its
+  columns with clipped timestamps. Each bar is a midnight-UTC day bucket,
+  but it was rendered through the shared `<time class="ts">` helper, which
+  base.html's `localize()` rewrites into a full local timestamp — so every
+  label spent its 64 px on `00:00:00` and the browser cut the date down to
+  `09/23/202…`. The columns now carry a `day`-classed `<time>` that
+  `localize()` formats date-only, and the tooltip still carries the full
+  instant and zone. The same column's `aria-label` had the `<time>`
+  element interpolated into the attribute, so screen readers were handed
+  the raw markup; it is plain text now. Covered by
+  `day_element_omits_the_time_part`.
 - Source reconcile retired proxies that belonged to someone else. The
   end-of-pass sweep asked a global question ("is this row link-less?")
   and therefore swept up the deliberate residue the admin *Delete

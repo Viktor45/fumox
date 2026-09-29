@@ -169,6 +169,16 @@ impl DashboardTemplate {
     fn ts(&self, ts: &i64) -> String {
         fmt_ts_element(*ts)
     }
+    /// Calendar day of an ingest-chart bucket, date only (the chart's
+    /// columns are midnight UTC and a timestamp does not fit them).
+    fn day(&self, ts: &i64) -> String {
+        fmt_day_element(*ts)
+    }
+    /// The same day as plain text, for the `aria-label` of a chart column
+    /// (an attribute must not carry the `<time>` element).
+    fn day_plain(&self, ts: &i64) -> String {
+        fmt_day_plain(*ts)
+    }
     fn opt_ts(&self, ts: &Option<i64>) -> String {
         fmt_opt_ts_element(*ts)
     }
@@ -569,6 +579,33 @@ pub fn fmt_opt_ts_element(ts: Option<i64>) -> String {
     ts.map(fmt_ts_element).unwrap_or_else(|| ",".into())
 }
 
+/// Render a Unix timestamp as a `<time class="ts day">` element carrying the
+/// calendar **day** only, for the per-day buckets of the ingest chart.
+///
+/// A bucket is midnight UTC, so a timestamp formatter is the wrong shape
+/// here: it spends the label's width on `00:00:00`, which the 64 px column
+/// then clips. The `day` class tells `localize()` in `base.html` to format
+/// the date without a time part, so the label survives the rewrite and the
+/// tooltip still carries the full instant.
+pub fn fmt_day_element(ts: i64) -> String {
+    format!(
+        "<time class=\"ts day\" datetime=\"{}\">{}</time>",
+        fmt_ts_attr(ts),
+        fmt_day_plain(ts)
+    )
+}
+
+/// The `YYYY-MM-DD` calendar day of a timestamp, as plain text (no markup,
+/// for attribute values).
+fn fmt_day_plain(ts: i64) -> String {
+    const FMT: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[year]-[month]-[day]");
+    match time::OffsetDateTime::from_unix_timestamp(ts) {
+        Ok(dt) => dt.format(FMT).unwrap_or_else(|_| ts.to_string()),
+        Err(_) => ts.to_string(),
+    }
+}
+
 /// Human-readable byte size for fetch logs (units follow the UI language).
 pub fn fmt_bytes(lang: &Lang, bytes: i64) -> String {
     let units: [&str; 4] = [
@@ -845,6 +882,19 @@ pub async fn all_sources_for_selects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn day_element_omits_the_time_part() {
+        // A midnight-UTC ingest bucket must label its column with the date
+        // alone: the `day` class keeps base.html's localize() from writing a
+        // time back in, and a 64 px column has no room for one.
+        let html = fmt_day_element(1_700_000_000);
+        assert_eq!(
+            html,
+            "<time class=\"ts day\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14</time>"
+        );
+        assert!(!html.contains("22:13:20</time>"), "the label kept a time");
+    }
 
     #[test]
     fn fmt_ts_element_carries_utc_datetime_and_fallback_text() {

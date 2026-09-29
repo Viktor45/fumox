@@ -204,12 +204,12 @@
   {% else %}
     <div class="stat-bars">
       {% for (day, created) in ingest_days %}
-      <div class="stat-bar" role="img" aria-label="{{ created }} {{ self.t("stats.ingest_day_label") }} {{ self.ts(day) | safe }}">
+      <div class="stat-bar" role="img" aria-label="{{ created }} {{ self.t("stats.ingest_day_label") }} {{ self.day_plain(day) }}">
         <div class="stat-bar-col" aria-hidden="true">
           <div class="stat-bar-fill" style="height: {{ self.bar_width(created, ingest_max) }}%"></div>
         </div>
         <div class="stat-bar-num" aria-hidden="true">{{ created }}</div>
-        <div class="stat-bar-label" aria-hidden="true">{{ self.ts(day) | safe }}</div>
+        <div class="stat-bar-label">{{ self.day(day) | safe }}</div>
       </div>
       {% endfor %}
     </div>

@@ -112,8 +112,20 @@ pub async fn enqueue_checks(
     let mut queued = 0u64;
     let mut remaining = i64::from(limit);
     // IN-lists are chunked so a huge ingest cannot blow the bound-variable
-    // limit; the newest ids (highest rowid) win within the limit.
-    for chunk in candidate_ids.chunks(500) {
+    // limit; the newest ids (highest rowid) win within the limit. The two
+    // only agree if the chunks themselves are walked newest-first: the
+    // per-chunk `ORDER BY p.id DESC LIMIT ?` can only see inside its own
+    // chunk, so a caller-supplied list longer than 500 (a bulk revival of
+    // a whole country/ASN) would otherwise spend the whole limit on the
+    // oldest ids and never even look at the newest. Sort a copy descending
+    // and chunk that, so the first chunk holds the highest ids; `dedup`
+    // then also keeps a repeated id from being enqueued twice across the
+    // chunk boundary (`INSERT OR IGNORE` would swallow it anyway, the
+    // `remaining` accounting would not).
+    let mut newest_first = candidate_ids.to_vec();
+    newest_first.sort_unstable_by(|a, b| b.cmp(a));
+    newest_first.dedup();
+    for chunk in newest_first.chunks(500) {
         if remaining <= 0 {
             break;
         }
@@ -543,6 +555,59 @@ mod tests {
             .map(|c| c.id)
             .collect();
         assert_eq!(drained, vec![free], "the T2-blocked row stays in the queue");
+    }
+
+    /// The queue's own contract is "the newest ids win within the limit"
+    /// (the daemon drains it newest-first), so that must hold across the
+    /// 500-id chunk boundary too, not only inside the first chunk. The
+    /// bulk revival handlers hand their whole id list over with a small
+    /// limit: a list longer than one chunk (1200 rows is an ordinary
+    /// revival population) must still enqueue the highest ids.
+    #[tokio::test]
+    async fn enqueue_prefers_the_newest_ids_across_chunk_boundaries() {
+        let pool = temp_pool().await;
+        sqlx::query(
+            "INSERT OR IGNORE INTO sources (id, name, url, enabled, cache_ttl_seconds, created_at, updated_at)
+             VALUES ('srcA0000000', 's', 'https://example.com', 1, 3600, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // 1200 linked, `unknown`, T1-probeable candidates in one statement
+        // (a per-row helper would dominate the runtime of the test).
+        sqlx::query(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1200)
+             INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             SELECT 'fp-bulk-' || x, 'trojan', 'n', 'h', 443, 'c', 'unknown', 1, 1 FROM cnt",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
+             SELECT id, 'srcA0000000', 1 FROM proxies",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM proxies ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1200);
+
+        assert_eq!(enqueue_checks(&pool, &ids, 50, 1_000).await.unwrap(), 50);
+        let queued: Vec<i64> =
+            sqlx::query_scalar("SELECT proxy_id FROM probe_requests ORDER BY proxy_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            queued,
+            ids[ids.len() - 50..].to_vec(),
+            "the limit must be spent on the highest ids, not on the first chunk"
+        );
     }
 
     #[tokio::test]

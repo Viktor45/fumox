@@ -2,10 +2,13 @@
 //!
 //! Every sweep (30 s) the scheduler picks enabled sources whose
 //! `cache_ttl_seconds` has elapsed since `last_fetched_at` and ingests them
-//! concurrently, bounded by a semaphore (`[fetch].max_concurrency`).
+//! concurrently, bounded by a semaphore (`[fetch].max_concurrency`). A
+//! source whose last attempt failed is additionally held back by a growing
+//! backoff, so a permanently dead URL is not asked again on every tick (see
+//! [`is_due`]).
 //! The admin panel can request an immediate refresh through the mpsc
 //! channel; a per-source in-flight guard prevents duplicate fetches
-//!.
+//! and always bypasses the backoff.
 
 use crate::cache::Caches;
 use crate::events::EventBus;
@@ -14,7 +17,7 @@ use crate::ingest;
 use fumox_core::db::DbPool;
 use fumox_core::geo::GeoResolver;
 use fumox_core::models::Source;
-use fumox_core::repo::sources;
+use fumox_core::repo::{fetch_log, sources};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +27,88 @@ use tokio::task::JoinSet;
 
 /// How often the scheduler looks for sources due for a refresh.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Delay before a source whose last fetch failed is retried, doubled per
+/// consecutive failure and capped at [`FAILURE_BACKOFF_MAX_SECS`]. A dead URL
+/// (401/403/404, dead DNS, a feed that no longer parses) does not become
+/// healthy because it was asked again 30 s later, and the fetcher has no
+/// internal backoff of its own for the non-recoverable classes.
+const FAILURE_BACKOFF_BASE_SECS: i64 = 60;
+
+/// Ceiling of the failure backoff: still three orders of magnitude below the
+/// 30 s sweep, and still far below the smallest sensible operator patience
+/// for a source that quietly recovered.
+const FAILURE_BACKOFF_MAX_SECS: i64 = 3_600;
+
+/// How many journal rows one source's failure history is read from — enough
+/// to reach the backoff ceiling, the journal is retention-bounded anyway.
+const FAILURE_HISTORY_ROWS: i64 = 8;
+
+/// What the fetch journal says about the most recent attempts of one source.
+#[derive(Debug, Clone, Copy)]
+struct FailureHistory {
+    /// `fetched_at` of the newest journal row, successful or not.
+    last_attempt_at: i64,
+    /// Attempts that failed in a row, counted from the newest row backwards.
+    consecutive_failures: u32,
+}
+
+/// Delay before retrying a source that has just failed `consecutive_failures`
+/// times in a row.
+fn failure_backoff_secs(consecutive_failures: u32) -> i64 {
+    let exponent = consecutive_failures.min(16) as i64;
+    FAILURE_BACKOFF_BASE_SECS
+        .saturating_mul(1i64 << exponent)
+        .min(FAILURE_BACKOFF_MAX_SECS)
+}
+
+/// Whether a source is due for a fetch at `now`: its ordinary TTL cadence,
+/// and — when its last attempt failed — only once the backoff has elapsed.
+///
+/// The TTL check alone is not enough. `last_fetched_at` is documented as the
+/// last *successful* fetch and a failure leaves it NULL, so a source that
+/// never worked (or whose feed broke) is due on every single sweep: one
+/// upstream request per [`SWEEP_INTERVAL`] for the whole lifetime of the
+/// deployment. A source that once succeeded is no better off — the old
+/// stamp stays, and `now - ts >= ttl` keeps holding once it expires.
+fn is_due(source: &Source, now: i64, history: Option<&FailureHistory>) -> bool {
+    let ttl_due = match source.last_fetched_at {
+        None => true,
+        Some(ts) => now.saturating_sub(ts) >= source.cache_ttl_seconds,
+    };
+    if !ttl_due {
+        return false;
+    }
+    let Some(history) = history else {
+        return true;
+    };
+    if history.consecutive_failures == 0 {
+        return true;
+    }
+    // An admin edit lands in `updated_at` (a failed fetch leaves it alone),
+    // so a source whose configuration was just corrected is retried without
+    // waiting out a backoff earned by the old configuration.
+    if source.updated_at > history.last_attempt_at {
+        return true;
+    }
+    now.saturating_sub(history.last_attempt_at)
+        >= failure_backoff_secs(history.consecutive_failures)
+}
+
+/// Read the recent attempts of one source, or `None` when the journal holds
+/// nothing for it (never fetched, or every row was purged by retention) —
+/// the caller then falls back to the plain TTL cadence.
+async fn failure_history(pool: &DbPool, source_id: &str) -> Option<FailureHistory> {
+    let rows = fetch_log::recent_for_source(pool, source_id, FAILURE_HISTORY_ROWS)
+        .await
+        .ok()?;
+    let newest = rows.first()?;
+    let consecutive_failures = rows.iter().take_while(|row| row.ok == 0).count() as u32;
+    Some(FailureHistory {
+        last_attempt_at: newest.fetched_at,
+        consecutive_failures,
+    })
+}
 
 /// Shared scheduler state: the concurrency semaphore and the set of
 /// currently fetching source ids.
@@ -157,12 +242,27 @@ async fn sweep(env: &IngestEnv, state: &SchedulerState, events: &EventBus) {
     let due = match sources::list(&env.pool, true).await {
         Ok(all) => {
             let now = fumox_core::models::now_ts();
-            all.into_iter()
-                .filter(|source| match source.last_fetched_at {
-                    None => true,
-                    Some(ts) => now.saturating_sub(ts) >= source.cache_ttl_seconds,
-                })
-                .collect::<Vec<_>>()
+            let mut due = Vec::new();
+            for source in all {
+                // The journal is only consulted for a source whose recorded
+                // verdict says the last attempt failed; a healthy one keeps
+                // the plain TTL check and pays no extra query.
+                let history = if source.error_class.is_some() {
+                    failure_history(&env.pool, &source.id).await
+                } else {
+                    None
+                };
+                if is_due(&source, now, history.as_ref()) {
+                    due.push(source);
+                } else if let Some(history) = history {
+                    tracing::debug!(
+                        source = %source.id,
+                        consecutive_failures = history.consecutive_failures,
+                        "scheduler sweep: backing off a failing source"
+                    );
+                }
+            }
+            due
         }
         Err(err) => {
             tracing::error!(error = %err, "scheduler sweep: cannot list sources");
@@ -287,6 +387,9 @@ mod tests {
     use fumox_core::config::{DatabaseConfig, FetchConfig, GeoConfig};
     use fumox_core::geo::GeoResolver;
     use fumox_core::models::Source;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// Wait for the `fetch.started` event of one source, failing the test
@@ -413,6 +516,154 @@ mod tests {
         refresh_tx.send("srcFast0000".to_string()).unwrap();
         await_fetch_started(&mut rx, "srcFast0000").await;
         scheduler.abort();
+    }
+
+    /// A local upstream that answers every request with 401 (a permanently
+    /// dead URL: wrong credentials, a vanished feed) and counts the requests
+    /// it received.
+    async fn dead_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    async fn test_env(pool: DbPool) -> (IngestEnv, SchedulerState, EventBus) {
+        let fetch_config = FetchConfig {
+            read_timeout_secs: 10,
+            connect_timeout_secs: 5,
+            // A 401 is not recoverable, the fetch policy must not mask the
+            // scheduler's own cadence with its retries.
+            max_retries: 0,
+            ..Default::default()
+        };
+        let env = IngestEnv {
+            pool,
+            fetcher: Fetcher::new(fetch_config, true, Duration::from_secs(5)),
+            caches: Caches::new(),
+            geo: Arc::new(GeoResolver::new(&GeoConfig {
+                enabled: false,
+                ..Default::default()
+            })),
+            settings: crate::ingest::IngestSettings {
+                refresh_check_limit: 0,
+                drop_gate: false,
+                removed_as_unknown: false,
+            },
+        };
+        (env, SchedulerState::new(4), EventBus::new())
+    }
+
+    async fn test_pool() -> DbPool {
+        let dir =
+            std::env::temp_dir().join(format!("fumox-sched-test-{}", fumox_core::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = fumox_core::db::connect_pool(&DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        pool
+    }
+
+    /// A source whose URL is permanently dead must stop being hammered by
+    /// the 30 s sweep. The failure is journalled but `last_fetched_at` stays
+    /// NULL (the column is "last *successful* fetch"), so the TTL check
+    /// alone calls the source due forever and one upstream request per sweep
+    /// went out for the whole lifetime of the deployment.
+    #[tokio::test]
+    async fn a_dead_source_is_not_refetched_on_every_sweep() {
+        let (addr, hits) = dead_upstream().await;
+        let pool = test_pool().await;
+        sources::create(
+            &pool,
+            &test_source("srcDead000", format!("http://{addr}/list"), 3600, None),
+        )
+        .await
+        .unwrap();
+        let (env, state, events) = test_env(pool.clone()).await;
+
+        sweep(&env, &state, &events).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the first sweep fetches a never-fetched source"
+        );
+        let source = sources::get(&pool, "srcDead000").await.unwrap().unwrap();
+        assert!(
+            source.last_fetched_at.is_none(),
+            "a failed fetch does not count as a successful one"
+        );
+        assert_eq!(
+            source.error_class,
+            Some(fumox_core::models::ErrorClass::HttpClient)
+        );
+
+        // The next tick (30 s later) must not go out to a URL that just
+        // answered 401; the backoff is the throttle.
+        sweep(&env, &state, &events).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a dead upstream must not be hit again on the very next sweep"
+        );
+
+        // A healthy source is untouched by any of this: the backoff only
+        // applies to a source whose last attempt failed.
+        sources::create(
+            &pool,
+            &test_source("srcOk00000", format!("http://{addr}/ok"), 0, None),
+        )
+        .await
+        .unwrap();
+        sources::record_fetch_outcome(
+            &pool,
+            "srcOk00000",
+            &sources::FetchOutcome::Success {
+                at: fumox_core::models::now_ts(),
+            },
+        )
+        .await
+        .unwrap();
+        sweep(&env, &state, &events).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a source due by its TTL is still fetched on every sweep"
+        );
+    }
+
+    /// The backoff has to grow, or a permanently dead source is merely
+    /// throttled to a request a minute instead of one every 30 s, and it has
+    /// to be capped, or a source that recovers stays dark for days.
+    #[test]
+    fn failure_backoff_grows_and_is_capped() {
+        assert_eq!(failure_backoff_secs(1), 120);
+        assert_eq!(failure_backoff_secs(2), 240);
+        assert_eq!(failure_backoff_secs(5), 1920);
+        assert_eq!(failure_backoff_secs(6), FAILURE_BACKOFF_MAX_SECS);
+        assert_eq!(failure_backoff_secs(40), FAILURE_BACKOFF_MAX_SECS);
+        // Never below the base, never longer than the cap, never a hammer.
+        assert!(failure_backoff_secs(1) > SWEEP_INTERVAL.as_secs() as i64);
     }
 
     #[tokio::test]

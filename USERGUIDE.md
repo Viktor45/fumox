@@ -802,7 +802,7 @@ deduplicate by fingerprint". `"version": 1` is required.
 | `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`                                                                            |
 | `dedup`  | Deduplication                                                | `by`: only `"fingerprint"` in v1                                                                                                   |
 | `sort`   | Output ordering                                              | `by`: `source` \| `name` \| `country` \| `latency` (null latencies go last); `desc`: default `false`                               |
-| `limit`  | Cap the output size                                          | `count`: integer ≥ 1, keep at most this many proxies of the final, deduplicated and sorted list (its top); `null`/omitted = no cap |
+| `limit`  | Cap the output size                                          | `count`: integer ≥ 1 — on a source, at most this many of that source's own proxies, before the merge with the profile's other sources; on a profile, at most this many proxies of the final, deduplicated and sorted list (its top). A source's cap does not limit a multi-source profile: it serves each source's top up to that count, i.e. more than `count` proxies in total; `null`/omitted = no cap |
 
 Validation is strict: unknown keys, a non-compiling regex or an invalid enum
 value are rejected with a field error in the admin form; nothing is saved.

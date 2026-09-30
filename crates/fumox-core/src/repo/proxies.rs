@@ -374,6 +374,15 @@ pub async fn update_geo(pool: &DbPool, id: i64, geo: &GeoStamp) -> crate::Result
 
 /// Store the full outcome of an on-demand geo resolution: the facts plus
 /// the IP they were resolved from (admin proxy-card action).
+///
+/// `COALESCE`, exactly like the reconcile upsert: a `None` field means
+/// "not known from this lookup", never "erase". The resolver merges the
+/// databases with an `any`-hit, so a stamp can be partial where the others
+/// are silent — an ASN-only hit (the City record decodes with an empty
+/// country, as it does for the Cloudflare `104.16.0.0/12` block) must not
+/// wipe a country the ingest path already resolved. `resolved_ip` is
+/// always a concrete address from the lookup that just ran and is
+/// written as-is.
 pub async fn update_geo_full(
     pool: &DbPool,
     id: i64,
@@ -381,7 +390,11 @@ pub async fn update_geo_full(
     resolved_ip: &str,
 ) -> crate::Result<()> {
     sqlx::query(
-        "UPDATE proxies SET geo_country = ?, geo_city = ?, geo_asn = ?, resolved_ip = ?
+        "UPDATE proxies SET
+             geo_country = COALESCE(?, geo_country),
+             geo_city = COALESCE(?, geo_city),
+             geo_asn = COALESCE(?, geo_asn),
+             resolved_ip = ?
          WHERE id = ?",
     )
     .bind(&geo.country)
@@ -3733,6 +3746,80 @@ mod tests {
         // The row has country data now, so it no longer counts as missing.
         let missing = list_missing_geo(&pool, 0, 500).await.unwrap();
         assert!(missing.iter().all(|(known, _)| known != &id));
+    }
+
+    /// The admin card refresh resolves a host and writes the whole stamp
+    /// back. The resolver merges the databases with an `any`-hit, so one
+    /// stamp can be partial where the others are silent — an ASN-only hit
+    /// (the City record decodes with an empty country, as it does for the
+    /// Cloudflare `104.16.0.0/12` block) must not erase the country the
+    /// ingest path already resolved, same invariant the reconcile upsert
+    /// keeps.
+    #[tokio::test]
+    async fn update_geo_full_keeps_stored_facts_a_partial_stamp_cannot_replace() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let e = entry("geo-card", "h1.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[Some(GeoStamp {
+                country: Some("US".into()),
+                city: Some("New York".into()),
+                asn: None,
+            })],
+            1000,
+            false,
+        )
+        .await
+        .unwrap();
+        let id = get_by_fingerprint(&pool, &e.fingerprint())
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        update_geo_full(
+            &pool,
+            id,
+            &GeoStamp {
+                country: None,
+                city: None,
+                asn: Some("AS13335".into()),
+            },
+            "104.16.0.1",
+        )
+        .await
+        .unwrap();
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(
+            row.geo_country.as_deref(),
+            Some("US"),
+            "an ASN-only stamp must not wipe the stored country"
+        );
+        assert_eq!(row.geo_city.as_deref(), Some("New York"));
+        assert_eq!(row.geo_asn.as_deref(), Some("AS13335"));
+        assert_eq!(row.resolved_ip.as_deref(), Some("104.16.0.1"));
+
+        // A stamp that does carry the fields still overwrites them.
+        update_geo_full(
+            &pool,
+            id,
+            &GeoStamp {
+                country: Some("DE".into()),
+                city: Some("Frankfurt".into()),
+                asn: Some("AS24940".into()),
+            },
+            "1.2.3.4",
+        )
+        .await
+        .unwrap();
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.geo_country.as_deref(), Some("DE"));
+        assert_eq!(row.geo_city.as_deref(), Some("Frankfurt"));
+        assert_eq!(row.geo_asn.as_deref(), Some("AS24940"));
+        assert_eq!(row.resolved_ip.as_deref(), Some("1.2.3.4"));
     }
 
     // Bulk cleanup transitions: each action

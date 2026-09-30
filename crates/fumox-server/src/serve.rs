@@ -14,7 +14,7 @@
 //!   `X-Fumox-Warning: all-proxies-quarantined`.
 
 use crate::admin::auth::RateLimiter;
-use crate::cache::{Caches, Rendered};
+use crate::cache::{Caches, InlineRenderGuard, Rendered};
 use crate::pipeline::{self, Candidate, CompiledPipeline, PipelineIssue};
 use axum::Router;
 use axum::body::Body;
@@ -33,6 +33,21 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Upper bound on how long a rendered subscription body is served from the
+/// processed cache as fresh, in seconds.
+///
+/// A source TTL answers a different question — how often to re-download the
+/// upstream feed — and the admin form accepts up to a day. Health is owned by
+/// another process: `fumox-probe` moves rows between tiers, and the server
+/// only hears about it when the next ingest invalidates the rendering. Left
+/// unbounded, a node the probe just retired keeps being served for a whole
+/// TTL. The window is therefore fixed and short, the same reasoning (and the
+/// same value) as `alive_export::EXPORT_TTL_SECS`: long enough to collapse a
+/// burst of client downloads into one render, far shorter than a probe cycle.
+/// A stale entry is still served immediately (stale-while-revalidate), so
+/// this costs one background re-render per window, never a 5xx.
+const RENDER_FRESHNESS_CAP_SECS: i64 = 30;
 
 /// Shared state of the public listener.
 #[derive(Clone)]
@@ -247,11 +262,22 @@ async fn serve_sub(
     let key = format!("sub:{}", profile.id);
     let render_state = state.clone();
     let render_profile = profile.clone();
-    serve_cached(&state, key, move || {
-        let state = render_state.clone();
-        let profile = render_profile.clone();
-        async move { render_sub(&state, &profile).await }
-    })
+    let sources_state = state.clone();
+    let sources_profile = profile.clone();
+    serve_cached(
+        &state,
+        key,
+        move || {
+            let state = sources_state.clone();
+            let profile = sources_profile.clone();
+            async move { member_source_ids(&state, &profile.id).await }
+        },
+        move || {
+            let state = render_state.clone();
+            let profile = render_profile.clone();
+            async move { render_sub(&state, &profile).await }
+        },
+    )
     .await
 }
 
@@ -281,22 +307,60 @@ async fn serve_src(
     let key = format!("src:{}", source.id);
     let render_state = state.clone();
     let render_source = source.clone();
-    serve_cached(&state, key, move || {
-        let state = render_state.clone();
-        let source = render_source.clone();
-        async move { render_src(&state, &source).await }
-    })
+    let source_id = source.id.clone();
+    serve_cached(
+        &state,
+        key,
+        move || {
+            let source_id = source_id.clone();
+            async move { vec![source_id] }
+        },
+        move || {
+            let state = render_state.clone();
+            let source = render_source.clone();
+            async move { render_src(&state, &source).await }
+        },
+    )
     .await
+}
+
+/// Source ids a profile's rendering can draw from, used to scope the cache's
+/// generation bookkeeping for a cold render (see
+/// [`Caches::begin_inline_render`]). A superset of what the render actually
+/// touches is fine: the render skips disabled or vanished members itself.
+///
+/// Only consulted on a cache miss — the resolution is a second, indexed read
+/// that a cache hit never pays.
+async fn member_source_ids(state: &AppState, profile_id: &str) -> Vec<String> {
+    match profiles::get_sources(&state.pool, profile_id).await {
+        Ok(links) => links.into_iter().map(|(source_id, _)| source_id).collect(),
+        Err(err) => {
+            // The render itself is about to read the same table and will
+            // fail with the same error; nothing is stored either way.
+            tracing::error!(error = %err, "profile members lookup failed");
+            Vec::new()
+        }
+    }
 }
 
 /// Cache lookup with stale-while-revalidate: a fresh entry is
 /// served as-is; a stale one is served immediately while a background
 /// re-render refreshes the entry; a miss renders inline. Only 200
 /// responses are stored.
-async fn serve_cached<F, Fut>(state: &AppState, key: String, make_render: F) -> Response
+async fn serve_cached<F, Fut, S, SFut>(
+    state: &AppState,
+    key: String,
+    key_sources: S,
+    make_render: F,
+) -> Response
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = Result<Rendered, ErrorReply>> + Send + 'static,
+    // `key_sources`: the sources the render draws from, resolved on the miss
+    // path only. The inline-render claim is scoped to them, so an ingest of
+    // an unrelated source cannot refuse this key's put.
+    S: FnOnce() -> SFut,
+    SFut: Future<Output = Vec<String>>,
 {
     let now = fumox_core::models::now_ts();
     if let Some(rendered) = state.caches.processed_get(&key).await {
@@ -316,10 +380,11 @@ where
                         // supersedes it: storing pre-change data with a full
                         // TTL would resurrect the very staleness the
                         // invalidation ended.
-                        if !state
+                        if state
                             .caches
-                            .processed_put_revalidated(&key, rendered, generation)
+                            .processed_put_guarded(&key, Arc::new(rendered), generation)
                             .await
+                            .is_none()
                         {
                             tracing::debug!(
                                 key = %key,
@@ -343,16 +408,48 @@ where
         return to_response(&rendered);
     }
 
+    // The inline render is claimed before it starts, for the same reason the
+    // background one is: this key has no entry, so without the claim an
+    // invalidation landing now would not see it and the put below would
+    // store pre-change rows as fresh for a full TTL.
+    let claim = state
+        .caches
+        .begin_inline_render(&key, key_sources().await)
+        .await;
+    let generation = claim.as_ref().map(InlineRenderGuard::generation);
     match make_render().await {
         Ok(rendered) => {
-            let rendered = if rendered.status == 200 {
-                state.caches.processed_put(&key, rendered).await
+            let rendered = Arc::new(rendered);
+            let cached = if rendered.status == 200 {
+                match generation {
+                    Some(generation) => {
+                        let stored = state
+                            .caches
+                            .processed_put_guarded(&key, rendered.clone(), generation)
+                            .await;
+                        if stored.is_none() {
+                            tracing::debug!(
+                                key = %key,
+                                "inline render not cached: the key was invalidated while rendering"
+                            );
+                        }
+                        stored
+                    }
+                    // Another render of this key is already in flight and
+                    // will store its own (identical) body; this one is
+                    // served without caching it.
+                    None => None,
+                }
             } else {
-                Arc::new(rendered)
+                None
             };
-            to_response(&rendered)
+            drop(claim);
+            to_response(cached.as_ref().unwrap_or(&rendered))
         }
-        Err(err) => error_response(err.status, &err.message),
+        Err(err) => {
+            drop(claim);
+            error_response(err.status, &err.message)
+        }
     }
 }
 
@@ -468,26 +565,37 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     }
     // "All proxies quarantined/removed" verdict: the profile
     // does hold proxies, but every one of them was dropped by a health
-    // filter. `ready` counts as served-tier too, a verified proxy is
-    // not part of the "everything is hidden" story.
+    // filter. Only the two hidden tiers count: `ready` is a served tier, a
+    // verified proxy is not part of the "everything is hidden" story (and
+    // neither is a proxy a `filter`/ASN/drop rule removed, which is a
+    // configuration fact the operator reads in the pipeline, not a health
+    // one).
     let all_quarantined = !loaded_statuses.is_empty()
         && all.is_empty()
-        && loaded_statuses.iter().all(|status| {
-            matches!(
-                status,
-                ProxyStatus::Quarantine | ProxyStatus::Removed | ProxyStatus::Ready
-            )
-        });
+        && loaded_statuses
+            .iter()
+            .all(|status| matches!(status, ProxyStatus::Quarantine | ProxyStatus::Removed));
 
     // Global sort: the profile's explicit `sort` wins, otherwise the first
     // source (in profile order) that set one, otherwise source order.
-    let sorter = members
+    let source_sort = members
         .iter()
         .find(|(_, compiled)| compiled.sort_explicit)
-        .map(|(_, compiled)| compiled)
+        .map(|(source, _)| source)
         .filter(|_| !profile_pipeline.sort_explicit)
-        .unwrap_or(&profile_pipeline);
-    sorter.finalize(&mut all);
+        .and_then(|source| source.pipeline.as_ref())
+        .and_then(|pipeline| pipeline.get("sort"))
+        .cloned();
+    // The post-merge step runs with the profile's own pipeline, plus that
+    // sort section: `finalize` caps the list it is given, and a cap that
+    // reached the merged list from a *source* pipeline would truncate every
+    // other source's proxies too. Each source's cap was already applied to
+    // that source's own contribution by `apply` above.
+    let finalizer = CompiledPipeline::from_json(
+        finalize_config(profile.pipeline.as_ref(), source_sort).as_ref(),
+    )
+    .map_err(|errors| ErrorReply::corrupted_pipeline(&format!("sub:{}", profile.id), &errors))?;
+    finalizer.finalize(&mut all);
 
     // The metadata block goes only into plain uri_list output: base64 blobs
     // must stay decodable to a bare list (the block would double-encode as
@@ -527,7 +635,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         body,
         content_type,
         extra_headers,
-        fresh_until: fumox_core::models::now_ts() + min_ttl,
+        fresh_until: fumox_core::models::now_ts() + min_ttl.min(RENDER_FRESHNESS_CAP_SECS),
         source_ids,
     })
 }
@@ -588,7 +696,8 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
         body,
         content_type,
         extra_headers,
-        fresh_until: fumox_core::models::now_ts() + source.cache_ttl_seconds.max(1),
+        fresh_until: fumox_core::models::now_ts()
+            + source.cache_ttl_seconds.clamp(1, RENDER_FRESHNESS_CAP_SECS),
         source_ids: vec![source.id.clone()],
     })
 }
@@ -726,6 +835,33 @@ fn fmt_rfc3339_utc(ts: i64) -> String {
         .ok()
         .and_then(|dt| dt.format(FMT).ok())
         .unwrap_or_else(|| ts.to_string())
+}
+
+/// The pipeline config the merged-list `finalize` step runs with: the
+/// profile's own config, plus the `sort` section of the source that won the
+/// sort contest when the profile does not set one.
+///
+/// Rebuilt from JSON rather than reusing the winning source's compiled
+/// pipeline: `finalize` dedups, sorts *and* applies `limit.count`, and a
+/// source's cap must bound that source's own contribution (applied by
+/// `apply` per source), not the whole merged profile. The remaining sections
+/// are inert in `finalize`.
+fn finalize_config(
+    profile_pipeline: Option<&serde_json::Value>,
+    source_sort: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    // The profile's config was already validated above (`profile_pipeline`),
+    // so it is either absent, `null` or an object here.
+    let mut config = match profile_pipeline {
+        None | Some(serde_json::Value::Null) => serde_json::json!({ "version": 1 }),
+        Some(value) => value.clone(),
+    };
+    if let Some(sort) = source_sort
+        && let Some(map) = config.as_object_mut()
+    {
+        map.insert("sort".to_string(), sort);
+    }
+    Some(config)
 }
 
 /// `profile-update-interval` in whole hours (mihomo convention), rounded
@@ -1296,6 +1432,45 @@ mod tests {
         );
     }
 
+    /// The quarantine warning must mean "everything is quarantined": a
+    /// pipeline filter that hides every proxy is a configuration fact, and
+    /// `ready` is a served tier to begin with, so neither may report a
+    /// health problem the operator would chase in the wrong place.
+    #[tokio::test]
+    async fn a_filter_that_hides_every_ready_proxy_is_not_a_quarantine_warning() {
+        let state = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        profile.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "filter": { "protocols": ["trojan"] }
+        }));
+        profiles::update(&state.pool, &profile).await.unwrap();
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("a", "h1.example.com", 443),
+                entry("b", "h2.example.com", 443),
+            ],
+        )
+        .await;
+        // Tunnel-verified tier: nothing is quarantined or removed here.
+        sqlx::query("UPDATE proxies SET status = 'ready'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(proxy_lines(&body), 0, "{body:?}");
+        assert_eq!(
+            header_str(&headers, "x-fumox-warning"),
+            None,
+            "a filter is not a quarantine: {body:?}"
+        );
+    }
+
     #[tokio::test]
     async fn recoverable_source_error_serves_stale_with_header() {
         let state = test_state().await;
@@ -1528,6 +1703,107 @@ mod tests {
         let (status, _, body) = get(router(state), "/sub/profA0000000").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(proxy_lines(&body), 2, "{body:?}");
+    }
+
+    /// A source's `limit.count` bounds that source's own contribution, not
+    /// the merged profile. The cap used to be carried into the post-merge
+    /// `finalize` by whichever pipeline won the sort contest, so a source
+    /// that set both a `sort` and a `limit` silently truncated every other
+    /// source's proxies out of `/sub` as well.
+    #[tokio::test]
+    async fn source_limit_does_not_truncate_the_other_sources() {
+        let state = test_state().await;
+        // Source A: explicit sort *and* a cap of 2 over 3 proxies.
+        let mut a = make_source(&state, "srcA0000000").await;
+        a.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "sort": { "by": "name" },
+            "limit": { "count": 2 }
+        }));
+        sources::update(&state.pool, &a).await.unwrap();
+        // Source B: no cap of its own.
+        let mut b = make_source(&state, "srcB0000000").await;
+        b.pipeline = Some(serde_json::json!({ "version": 1 }));
+        sources::update(&state.pool, &b).await.unwrap();
+        make_profile(&state, "profA0000000", &["srcA0000000", "srcB0000000"]).await;
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("a1", "h1.example.com", 443),
+                entry("a2", "h2.example.com", 443),
+                entry("a3", "h3.example.com", 443),
+            ],
+        )
+        .await;
+        ingest(
+            &state,
+            "srcB0000000",
+            &[
+                entry("b1", "h4.example.com", 443),
+                entry("b2", "h5.example.com", 443),
+                entry("b3", "h6.example.com", 443),
+            ],
+        )
+        .await;
+        sqlx::query("UPDATE proxies SET status = 'alive'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, _, body) = get(router(state), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        // 2 from A (its own cap) + 3 from B.
+        assert_eq!(proxy_lines(&body), 5, "{body:?}");
+        for host in ["h4", "h5", "h6"] {
+            assert!(
+                body.contains(&format!("{host}.example.com:443")),
+                "source B must not be truncated away: {body:?}"
+            );
+        }
+    }
+
+    /// Health is owned by another process: the probe daemon moves rows
+    /// between tiers, and the server only hears about it at the next
+    /// ingest — a window of one *source* TTL, a full day at the maximum the
+    /// admin form accepts. A rendered body must therefore not claim to be
+    /// fresh for longer than the same short bound `/export/alive` uses.
+    #[tokio::test]
+    async fn rendered_output_is_not_fresh_for_a_whole_source_ttl() {
+        let state = test_state().await;
+        let mut source = make_source(&state, "srcA0000000").await;
+        source.cache_ttl_seconds = 86_400;
+        sources::update(&state.pool, &source).await.unwrap();
+        make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+        sqlx::query("UPDATE proxies SET status = 'alive'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        for (key, uri) in [
+            ("sub:profA0000000", "/sub/profA0000000"),
+            ("src:srcA0000000", "/src/srcA0000000"),
+        ] {
+            let (status, _, body) = get(router(state.clone()), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(body.contains("h1.example.com"), "{uri}: {body:?}");
+            let cached = state
+                .caches
+                .processed_get(key)
+                .await
+                .expect("the cold render is cached");
+            // Read the clock *after* the render: `fresh_until` is
+            // `now_ts() + cap` as computed inside it, so a stamp taken
+            // before the request would only hold while both calls land in
+            // the same second.
+            let after = fumox_core::models::now_ts();
+            assert!(
+                cached.fresh_until <= after + RENDER_FRESHNESS_CAP_SECS,
+                "{uri}: a retired proxy would stay served for {} s, the health bound is {RENDER_FRESHNESS_CAP_SECS}",
+                cached.fresh_until - after
+            );
+        }
     }
 
     #[tokio::test]

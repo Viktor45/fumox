@@ -1047,8 +1047,226 @@ async fn refresh_geo(state: &AdminState, proxy: &mut proxies::ProxyRow) {
         return;
     }
     tracing::debug!(proxy_id = proxy.id, host = %proxy.host, "card geo refreshed");
-    proxy.geo_country = stamp.country;
-    proxy.geo_city = stamp.city;
-    proxy.geo_asn = stamp.asn;
+    merge_geo_stamp(proxy, &stamp);
     proxy.resolved_ip = Some(info.ip);
+}
+
+/// Project a freshly resolved stamp onto the row the card is rendered
+/// from. A field is overwritten only when the stamp actually carries it:
+/// the resolver merges the databases with an `any`-hit, so a stamp is
+/// legitimately partial where the other databases are silent, and an
+/// ASN-only hit (a City record decoding with an empty country, as for the
+/// Cloudflare `104.16.0.0/12` block) must not turn a stored country or
+/// city into `None` on the struct — the card would then render `-` for a
+/// country the row still holds. This is the in-memory half of the same
+/// invariant the `COALESCE` in
+/// [`fumox_core::repo::proxies::update_geo_full`] keeps in the database.
+///
+/// Split out of [`refresh_geo`] so the merge is testable without a
+/// GeoLite2 database on disk.
+fn merge_geo_stamp(proxy: &mut proxies::ProxyRow, stamp: &proxies::GeoStamp) {
+    if let Some(country) = &stamp.country {
+        proxy.geo_country = Some(country.clone());
+    }
+    if let Some(city) = &stamp.city {
+        proxy.geo_city = Some(city.clone());
+    }
+    if let Some(asn) = &stamp.asn {
+        proxy.geo_asn = Some(asn.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A card row as the database hands it over: the stored geo facts are
+    /// whatever the ingest path resolved.
+    fn card_row(country: Option<&str>, city: Option<&str>, asn: Option<&str>) -> proxies::ProxyRow {
+        proxies::ProxyRow {
+            id: 1,
+            fingerprint: "fp".into(),
+            scheme: "vless".into(),
+            name: "n".into(),
+            host: "h1.example.com".into(),
+            port: 443,
+            credential: "uuid".into(),
+            params: None,
+            unknown_params: None,
+            raw_line: None,
+            geo_country: country.map(str::to_string),
+            geo_city: city.map(str::to_string),
+            geo_asn: asn.map(str::to_string),
+            resolved_ip: None,
+            status: "unknown".into(),
+            fail_count: 0,
+            last_checked_at: None,
+            last_alive_at: None,
+            quarantined_at: None,
+            ladder_at: None,
+            ladder_step: 0,
+            removed_at: None,
+            latency_ms: None,
+            speed_mbps: None,
+            last_t2_failed_at: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    /// The card is rendered from this `ProxyRow`, never re-read from the
+    /// database, so the refresh must not turn a stored fact into `None` on
+    /// the struct either. The resolver merges the databases with an
+    /// `any`-hit, so a partial stamp is an ordinary outcome: an ASN-only
+    /// hit (a City record that decodes with an empty country, as for the
+    /// Cloudflare `104.16.0.0/12` block) must keep the country and city the
+    /// card shows, exactly as `update_geo_full`'s `COALESCE` keeps them in
+    /// the database.
+    #[test]
+    fn a_partial_stamp_does_not_clear_the_rendered_geo_fields() {
+        let mut row = card_row(Some("US"), Some("New York"), None);
+        merge_geo_stamp(
+            &mut row,
+            &proxies::GeoStamp {
+                country: None,
+                city: None,
+                asn: Some("AS13335".into()),
+            },
+        );
+        assert_eq!(
+            row.geo_country.as_deref(),
+            Some("US"),
+            "an ASN-only stamp must not render an empty Country over a stored 'US'"
+        );
+        assert_eq!(
+            row.geo_city.as_deref(),
+            Some("New York"),
+            "an ASN-only stamp must not render an empty City over a stored one"
+        );
+        assert_eq!(
+            row.geo_asn.as_deref(),
+            Some("AS13335"),
+            "the ASN the lookup did resolve is shown"
+        );
+    }
+
+    /// A stamp that does carry the fields still refreshes them.
+    #[test]
+    fn a_full_stamp_refreshes_the_rendered_geo_fields() {
+        let mut row = card_row(Some("US"), Some("New York"), Some("AS13335"));
+        merge_geo_stamp(
+            &mut row,
+            &proxies::GeoStamp {
+                country: Some("DE".into()),
+                city: Some("Frankfurt".into()),
+                asn: Some("AS24940".into()),
+            },
+        );
+        assert_eq!(row.geo_country.as_deref(), Some("DE"));
+        assert_eq!(row.geo_city.as_deref(), Some("Frankfurt"));
+        assert_eq!(row.geo_asn.as_deref(), Some("AS24940"));
+    }
+
+    /// The workspace `config/` directory with the gitignored GeoLite2 files
+    /// (the test skips itself when it is empty, CI runs without them), the
+    /// same fixture convention as the resolver tests in `fumox-core::geo`.
+    fn workspace_db_dir() -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let has_any = ["GeoLite2-City.mmdb", "GeoLite2-ASN.mmdb"]
+            .iter()
+            .any(|name| dir.join(name).is_file());
+        has_any.then(|| dir.canonicalize().unwrap())
+    }
+
+    /// An admin state on a throwaway database, with the card resolver
+    /// pointed at the workspace GeoLite2 files. `None` when none are
+    /// present.
+    async fn geo_card_state() -> Option<AdminState> {
+        let db_dir = workspace_db_dir()?;
+        let dir = std::env::temp_dir().join(format!("fumox-card-test-{}", now_ts()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(refresh_rx); // keep the channel open for sends
+        let config = fumox_core::AppConfig::default();
+        let fetcher =
+            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.geo.dns_timeout());
+        let mut state = AdminState::new(
+            pool,
+            crate::cache::Caches::new(),
+            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
+            refresh_tx,
+            crate::scheduler::SchedulerState::new(1),
+            crate::events::EventBus::new(),
+            fetcher,
+            config,
+            fumox_core::config::ResolvedConfigPath::Missing,
+        );
+        state.geo_full = std::sync::Arc::new(fumox_core::geo::FullResolver::from_dir(
+            &fumox_core::config::GeoConfig {
+                db_dir,
+                ..Default::default()
+            },
+        ));
+        state.geo_full.is_active().then_some(state)
+    }
+
+    /// The card end to end: opening it refreshes the geo facts, and for a
+    /// host whose lookup only yields an ASN the row the template renders
+    /// must keep its stored country and city — on the struct *and* in the
+    /// database. Skipped without the GeoLite2 files, and on a database
+    /// build that does not reproduce the ASN-only shape.
+    #[tokio::test]
+    async fn card_refresh_keeps_stored_geo_when_the_lookup_only_yields_an_asn() {
+        let Some(state) = geo_card_state().await else {
+            eprintln!("skipping: no GeoLite2 databases in workspace config/");
+            return;
+        };
+        // A literal address from the Cloudflare block: the City record
+        // decodes with an empty country there, the ASN record hits.
+        let host = "104.16.0.1";
+        let Some(info) = state.geo_full.resolve(host).await else {
+            eprintln!("skipping: {host} not covered by the local GeoLite2 files");
+            return;
+        };
+        if info.country_code.is_some() || info.asn.is_none() {
+            eprintln!("skipping: local databases no longer give an ASN-only stamp: {info:?}");
+            return;
+        }
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies
+                 (fingerprint, scheme, name, host, port, credential,
+                  geo_country, geo_city, created_at, updated_at)
+             VALUES ('fp-card', 'vless', 'n', ?, 443, 'uuid', 'US', 'New York', 1, 1)
+             RETURNING id",
+        )
+        .bind(host)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let mut row = proxies::get_by_id(&state.pool, id).await.unwrap().unwrap();
+        refresh_geo(&state, &mut row).await;
+
+        // What the card renders: a `-` here would hide a country the row
+        // still holds.
+        assert_eq!(
+            row.geo_country.as_deref(),
+            Some("US"),
+            "the card must keep showing the stored country"
+        );
+        assert_eq!(row.geo_city.as_deref(), Some("New York"));
+        assert!(row.geo_asn.is_some(), "the resolved ASN is shown");
+        assert_eq!(row.resolved_ip.as_deref(), Some(host));
+        // And the database kept them too.
+        let stored = proxies::get_by_id(&state.pool, id).await.unwrap().unwrap();
+        assert_eq!(stored.geo_country.as_deref(), Some("US"));
+        assert_eq!(stored.geo_city.as_deref(), Some("New York"));
+    }
 }

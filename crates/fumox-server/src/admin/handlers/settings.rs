@@ -995,11 +995,16 @@ fn apply_all(
         lang,
         errors,
     );
+    // Bounds mirror `fumox_core::config::de_recheck_delays`, the parser
+    // both binaries load the file with: at most 16 steps of 1..=30 days.
     i64_list_field(
         raw,
         "probe.recheck_delays_secs",
         cfg,
         "probe.recheck_delays_secs",
+        RECHECK_MAX_STEPS,
+        1,
+        RECHECK_MAX_DELAY_SECS,
         lang,
         errors,
     );
@@ -1206,6 +1211,14 @@ fn apply_all(
 
 // Field helpers.
 
+/// Bounds of the quarantine recheck ladder, copied from
+/// `fumox_core::config::de_recheck_delays` (the deserializer both
+/// binaries load the file with). The panel writes the file verbatim, so
+/// it must refuse exactly what that parser refuses: a value the loader
+/// rejects aborts the next start of fumox-server and fumox-probe.
+const RECHECK_MAX_STEPS: usize = 16;
+const RECHECK_MAX_DELAY_SECS: i64 = 30 * 24 * 60 * 60;
+
 /// Return the value at `field` only when the form actually carried it.
 /// Missing fields are skipped silently, the editor only writes the
 /// sections the operator touched, preserving every other setting as it
@@ -1393,11 +1406,27 @@ fn string_list(
     let _ = cfg.set(target, item::string_array(items));
 }
 
+/// One integer per line, bounded the way the canonical loader bounds the
+/// field it writes: at most `max_items` entries, each within `min..=max`.
+/// The admin panel writes the file verbatim and the next start of both
+/// binaries aborts on anything `fumox_core::config` refuses, so a bound
+/// the loader does not share would turn a green toast into a dead server.
+///
+/// An empty list is refused even though the loader accepts one: for the
+/// only field using this helper today, the recheck ladder, `[]` means
+/// «remove the proxy right after the failed second chance», and the field
+/// hint never says so — silently emptying the textarea would disable the
+/// quarantine ladder behind a success toast. An operator who wants that
+/// configures the file directly.
+#[allow(clippy::too_many_arguments)]
 fn i64_list_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
     target: &str,
+    max_items: usize,
+    min: i64,
+    max: i64,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1427,6 +1456,24 @@ fn i64_list_field(
     if parsed.is_empty() {
         errors.push((field.into(), lang.t("val.empty_list").into()));
         return;
+    }
+    // The count, not a value, is what failed: `val.in_range` is the
+    // scalar range key the other helpers use and would read as a per-value
+    // bound that the very same check accepts `max_items` of. No catalog
+    // key names a list length, and the locales are not this file's to
+    // extend, so the sentence is written out here — the same escape
+    // `bool_field` takes for an unexpected literal. It counts generic
+    // entries, not whatever the caller's field calls them.
+    if parsed.len() > max_items {
+        errors.push((field.into(), format!("at most {max_items} entries")));
+        return;
+    }
+    for n in &parsed {
+        if *n < min || *n > max {
+            let msg = lang.t_args("val.in_range", &[min.to_string(), max.to_string()]);
+            errors.push((field.into(), msg));
+            return;
+        }
     }
     let _ = cfg.set(target, item::i64_array(parsed));
 }
@@ -1720,6 +1767,118 @@ mod tests {
             serialized.contains("rate_limit = \"120/min\""),
             "got: {serialized}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The recheck ladder is the only integer list the panel writes, and
+    /// the canonical loader (`config::de_recheck_delays`) refuses more
+    /// than 16 steps and any delay outside 1..=30 days — both binaries
+    /// abort on a file the loader rejects. The bounds checked here must
+    /// therefore be the loader's: a ladder the panel accepts has to round
+    /// trip through `config::load_config`, and one it rejects must never
+    /// reach the file. An emptied textarea is the one value the loader
+    /// takes and the panel does not, and that asymmetry is deliberate
+    /// (see `i64_list_field`).
+    #[test]
+    fn recheck_ladder_bounds_match_the_canonical_loader() {
+        use fumox_core::config::load_config;
+
+        let dir = temp_dir("ladder");
+        let path = write_minimal_config(&dir);
+        let lang = test_lang();
+
+        // One admin save cycle. `load_config` deliberately does NOT take the
+        // `EditLock` that `EditableConfig::load` holds: the plain loader
+        // reads the file without it, and has to keep doing so, because the
+        // admin handler re-reads through it while the editor handle is still
+        // in scope. A loader that took the lock would deadlock the request.
+        // See `fumox_core::config_writer::EditLock`.
+        let save = |raw: &HashMap<String, String>| -> Vec<(String, String)> {
+            let mut errors = Vec::new();
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            apply_all(raw, &mut cfg, &lang, &mut errors);
+            if errors.is_empty() {
+                cfg.save().unwrap();
+            }
+            errors
+        };
+        let ladder = |steps: &[i64]| -> HashMap<String, String> {
+            HashMap::from([(
+                "probe.recheck_delays_secs".to_string(),
+                steps
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )])
+        };
+
+        // A ladder the loader accepts must save and reload unchanged.
+        let steps: Vec<i64> = (1..=16).collect();
+        let errors = save(&ladder(&steps));
+        assert!(errors.is_empty(), "16 steps must be accepted: {errors:?}");
+        let loaded = load_config(Some(&path)).expect("the saved ladder must load");
+        assert_eq!(loaded.probe.recheck_delays_secs, steps);
+
+        // 17 steps: the panel must refuse it, the loader would not. The
+        // message must name the count, not borrow the scalar range wording
+        // `u64_field` and friends use — «must be between 0 and 16» reads
+        // as a per-delay bound and contradicts the 16 steps just accepted.
+        // It also must stay generic: `i64_list_field` is parameterised by
+        // `max_items` and knows nothing about ladders, so it counts
+        // entries, not steps.
+        let errors = save(&ladder(&(1..=17).collect::<Vec<i64>>()));
+        let message = collect_field(&errors, "probe.recheck_delays_secs")
+            .unwrap_or_else(|| panic!("17 steps must be refused with a message, got {errors:?}"));
+        assert_ne!(
+            message,
+            lang.t_args("val.in_range", &["0".to_string(), "16".to_string()]),
+            "an over-long ladder must not be reported as a scalar range"
+        );
+        assert_eq!(
+            message, "at most 16 entries",
+            "the count message must not borrow this helper's caller's vocabulary"
+        );
+        assert!(
+            load_config(Some(&path)).is_ok(),
+            "the refused ladder must not have been written"
+        );
+
+        // Per-delay range: 0, a negative and 30 days + 1s are out,
+        // 30 days exactly is in.
+        for (value, accepted) in [
+            ("0", false),
+            ("-1", false),
+            ("2592001", false),
+            ("2592000", true),
+        ] {
+            let raw = HashMap::from([("probe.recheck_delays_secs".to_string(), value.into())]);
+            let errors = save(&raw);
+            assert_eq!(
+                collect_field(&errors, "probe.recheck_delays_secs").is_some(),
+                !accepted,
+                "delay {value} accepted={accepted}, errors: {errors:?}"
+            );
+        }
+
+        // An emptied textarea is refused, not silently written as an empty
+        // ladder: the field hint never mentions that `[]` means «remove
+        // the proxy right after the failed second chance», and the panel
+        // must not trade the operator's ladder for that on a stray
+        // select-all + delete.
+        let errors = save(&ladder(&[]));
+        assert_eq!(
+            collect_field(&errors, "probe.recheck_delays_secs"),
+            Some(lang.t("val.empty_list")),
+            "an emptied ladder must be refused: {errors:?}"
+        );
+        let loaded = load_config(Some(&path)).expect("the last good ladder must still load");
+        assert_eq!(
+            loaded.probe.recheck_delays_secs,
+            vec![2_592_000],
+            "the refused empty ladder must not have been written"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

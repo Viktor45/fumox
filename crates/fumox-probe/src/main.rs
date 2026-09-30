@@ -204,15 +204,21 @@ async fn run(ctx: Arc<Context>) -> anyhow::Result<()> {
 /// One scheduling cycle: quarantine dues first (they are time-sensitive),
 /// then the priority queue (fresh proxies), then the T1 sample
 /// and the T2 batch.
+///
+/// The random sample skips the rows the queue lane just covered: both lanes
+/// draw from the same `unknown` population and claiming a request only
+/// deletes its queue row, so without the hand-off one dead proxy in both
+/// selections collected two `fail_count` steps from this single cycle and
+/// quarantined in half the cycles `fail_limit` promises.
 async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
     let now = now_ts();
     let quarantine = probe_due_quarantine(ctx.clone(), now).await?;
-    let queued_checked = probe_queued_checks(ctx.clone()).await?;
-    let t1_checked = probe_t1_sample(ctx.clone()).await?;
+    let queued = probe_queued_checks(ctx.clone()).await?;
+    let t1_checked = probe_t1_sample(ctx.clone(), &queued.claimed).await?;
     let t2_checked = probe_t2_batch(ctx).await?;
     tracing::info!(
         quarantine_checked = quarantine,
-        queued_checked,
+        queued_checked = queued.checked,
         t1_checked,
         t2_checked,
         "probe cycle done"
@@ -224,26 +230,58 @@ async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
 // T1: random connectivity sample
 // ---------------------------------------------------------------------------
 
+/// What one T1 lane covered: `checked` is how many verdicts it produced
+/// (for the cycle log), `claimed` every row it took, whether the row
+/// produced a verdict (unknown scheme, unprobeable port) or a vet refusal.
+struct LaneOutcome {
+    checked: usize,
+    claimed: Vec<i64>,
+}
+
+impl LaneOutcome {
+    fn empty() -> Self {
+        Self {
+            checked: 0,
+            claimed: Vec::new(),
+        }
+    }
+}
+
 /// Priority lane: T1 checks the server enqueued at source
 /// refresh time for freshly inserted proxies. Drained newest first, capped
 /// by the same per-cycle quota as the random sample. Requests are claimed
 /// (deleted) up-front, so a mid-batch crash cannot turn them into an
 /// endless retry loop; anything not yet covered falls back to the random
 /// sample below.
-async fn probe_queued_checks(ctx: Arc<Context>) -> anyhow::Result<usize> {
+async fn probe_queued_checks(ctx: Arc<Context>) -> anyhow::Result<LaneOutcome> {
     let candidates =
         probe_repo::select_queued_checks(&ctx.pool, ctx.config.probe.sample_size).await?;
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(LaneOutcome::empty());
     }
     let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
     probe_repo::claim_checks(&ctx.pool, &ids).await?;
-    run_t1_checks(ctx, candidates).await
+    let checked = run_t1_checks(ctx, candidates).await?;
+    Ok(LaneOutcome {
+        checked,
+        claimed: ids,
+    })
 }
 
-/// Probe a random sample of `unknown`/`alive` proxies.
-async fn probe_t1_sample(ctx: Arc<Context>) -> anyhow::Result<usize> {
+/// Probe a random sample of `unknown`/`alive` proxies, minus the rows
+/// `already_checked` covered earlier in this cycle (the queue lane, see
+/// [`run_cycle`]). The sample is a random draw with a quota, so dropping
+/// the overlap simply leaves the cycle with a slightly smaller one.
+async fn probe_t1_sample(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::Result<usize> {
     let candidates = proxies::select_t1_candidates(&ctx.pool, ctx.config.probe.sample_size).await?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let covered: std::collections::HashSet<i64> = already_checked.iter().copied().collect();
+    let candidates: Vec<proxies::T1Candidate> = candidates
+        .into_iter()
+        .filter(|c| !covered.contains(&c.id))
+        .collect();
     if candidates.is_empty() {
         return Ok(0);
     }
@@ -2198,5 +2236,59 @@ mod tests {
         let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.status, "removed");
         assert!(row.removed_at.is_some());
+    }
+
+    /// The two T1 lanes of one cycle must not both charge the same proxy.
+    /// They overlap completely (the priority queue and the random sample
+    /// draw from the same `unknown` population and claiming a request only
+    /// deletes the queue row), so a dead proxy in both lanes collected two
+    /// `fail_count` steps from a single cycle and quarantined twice as
+    /// fast as `fail_limit` says.
+    #[tokio::test]
+    async fn queued_and_random_t1_lanes_do_not_double_charge_a_cycle() {
+        let pool = temp_pool().await;
+
+        // Dead port: every T1 check of the cycle fails.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        // A pool smaller than twice `sample_size` (50), so the random
+        // sample necessarily overlaps the enqueued half.
+        let mut ids = Vec::new();
+        for _ in 0..20 {
+            ids.push(seed_proxy(&pool, "vless", "127.0.0.1", dead_port, "unknown").await);
+        }
+        let queued = probe_repo::enqueue_checks(&pool, &ids[..10], 50, now_ts())
+            .await
+            .unwrap();
+        assert_eq!(queued, 10, "the priority queue must be seeded");
+
+        // A fail limit the double charge would not reach in one cycle, so
+        // the assertion below is about the counter, not about quarantine.
+        let config = test_config(
+            5,
+            "127.0.0.1:1",
+            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
+        );
+        let ctx = Arc::new(Context::new(config, pool.clone()));
+
+        run_cycle(ctx).await.unwrap();
+
+        for id in &ids {
+            let row = proxies::get_by_id(&pool, *id).await.unwrap().unwrap();
+            assert_eq!(
+                row.fail_count, 1,
+                "id {id}: one cycle may charge one failure, whatever lane ran it"
+            );
+            let (attempts,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND ok = 0 AND probe_kind = 'tcp'",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(attempts, 1, "id {id}: the T1 verdict must be recorded once");
+        }
     }
 }

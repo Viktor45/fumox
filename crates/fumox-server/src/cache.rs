@@ -19,15 +19,18 @@
 //! containing the source (but keeps the just-written raw snapshot), so clients
 //! see fresh proxies without waiting out the TTL.
 //!
-//! Every invalidation also bumps that key's generation. A background
-//! re-render reads the generation when it starts and its result is dropped
-//! when the generation moved meanwhile: that rendering was computed from
-//! pre-change rows and must not be stored with a full fresh TTL behind the
-//! change that invalidated it.
+//! Every invalidation also bumps that key's generation. A render — the
+//! background one of a stale entry and the inline one of a cache miss alike
+//! — reads the generation when it starts and its result is dropped when the
+//! generation moved meanwhile: that rendering was computed from pre-change
+//! rows and must not be stored with a full fresh TTL behind the change that
+//! invalidated it. A key with no entry yet (the inline path) is registered
+//! with the cache layer for the duration of its render precisely so that
+//! invalidations can see it.
 
 use crate::fetcher::FetchedPayload;
 use moka::future::Cache;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -79,6 +82,14 @@ pub struct Caches {
     /// Processed keys currently being revalidated in the background, keeps
     /// concurrent stale requests from spawning duplicate re-renders.
     revalidating: Arc<Mutex<HashSet<String>>>,
+    /// Processed keys currently being rendered inline (the cache-miss path),
+    /// mapped to the sources that render draws from. Such a key has no entry
+    /// yet, so it is invisible to the iteration in
+    /// [`Caches::invalidate_processed_for_source`]; the claim is what lets an
+    /// invalidation supersede a render that is still running. The source set
+    /// keeps that supersession narrow: an ingest of a source this render
+    /// cannot touch must not refuse its put.
+    inline_rendering: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 impl Caches {
@@ -97,6 +108,7 @@ impl Caches {
                 .time_to_idle(ENTRY_IDLE_LIMIT)
                 .build(),
             revalidating: Arc::new(Mutex::new(HashSet::new())),
+            inline_rendering: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -138,9 +150,10 @@ impl Caches {
         arc
     }
 
-    /// Store the result of a background re-render started under
-    /// `generation` (the value [`Caches::try_start_revalidate`] handed out).
-    /// Returns whether it was stored.
+    /// Store the result of a render that was claimed under `generation` (the
+    /// value [`Caches::try_start_revalidate`] or
+    /// [`Caches::begin_inline_render`] handed out). Returns the stored entry,
+    /// or `None` when an invalidation superseded the rendering.
     ///
     /// A rendering whose generation moved in the meantime was computed from
     /// rows that an invalidation has already superseded: storing it with its
@@ -148,23 +161,23 @@ impl Caches {
     /// which is exactly what the invalidation was meant to end. Such a
     /// rendering is dropped instead, the key stays empty and the next
     /// request re-renders inline from the new rows.
-    pub async fn processed_put_revalidated(
+    pub async fn processed_put_guarded(
         &self,
         key: &str,
-        rendered: Rendered,
+        rendered: Arc<Rendered>,
         generation: u64,
-    ) -> bool {
+    ) -> Option<Arc<Rendered>> {
         if self.generation(key).await != generation {
-            return false;
+            return None;
         }
-        self.processed_put(key, rendered).await;
+        self.processed.insert(key.to_string(), rendered).await;
         if self.generation(key).await != generation {
             // An invalidation landed between the check and the insert and
             // therefore did not see this entry; drop it by hand.
             self.processed_invalidate(key).await;
-            return false;
+            return None;
         }
-        true
+        self.processed_get(key).await
     }
 
     /// Called by the admin save handlers (Phase 2.5).
@@ -200,15 +213,31 @@ impl Caches {
 
     /// Source data refreshed (a successful ingest reconciled at least one
     /// row): drop every rendered output that contains the source so clients
-    /// see the new proxies immediately. The raw snapshot is kept, the ingest
-    /// that triggers this just wrote it.
+    /// see the new proxies immediately, and supersede every cold render that
+    /// is still running over it. The raw snapshot is kept, the ingest that
+    /// triggers this just wrote it.
     pub async fn invalidate_processed_for_source(&self, source_id: &str) {
-        let affected: Vec<String> = self
+        let mut affected: Vec<String> = self
             .processed
             .iter()
             .filter(|(_, rendered)| rendered.source_ids.iter().any(|id| id == source_id))
             .map(|(key, _)| (*key).clone())
             .collect();
+        // A key with no entry yet — an inline (cache-miss) render of it is
+        // running right now — is invisible to the iteration above. Its
+        // rendering is still computed from the pre-ingest rows, so its
+        // generation has to move too or the put would land behind this
+        // invalidation (see [`Caches::processed_put_guarded`]). Only renders
+        // that name this source are touched: an unrelated key's cold render
+        // stays storable.
+        let inline = self.inline_rendering.lock().await;
+        affected.extend(
+            inline
+                .iter()
+                .filter(|(_, sources)| sources.iter().any(|id| id == source_id))
+                .map(|(key, _)| key.clone()),
+        );
+        drop(inline);
         for key in affected {
             self.bump_generation(&key).await;
             self.processed.invalidate(&key).await;
@@ -252,6 +281,80 @@ impl Caches {
     pub async fn is_revalidating(&self, key: &str) -> bool {
         self.revalidating.lock().await.contains(key)
     }
+
+    // ---- inline (cache-miss) render coordination ----
+
+    /// Claim an inline render of a key the processed layer does not hold.
+    /// Returns a guard carrying the generation the render must still hold to
+    /// be storable, or `None` when another render of the same key is already
+    /// in flight — a burst of requests on a cold key renders the same body
+    /// once for the cache and answers the rest without storing it.
+    ///
+    /// The guard also keeps the key visible to
+    /// [`Caches::invalidate_processed_for_source`]: without an entry there
+    /// is nothing for that call to find, and the pre-change rendering would
+    /// be stored as fresh for a full TTL behind the invalidation.
+    ///
+    /// `source_ids` are the sources the rendering can draw from; they scope
+    /// the claim's reach, so an ingest of a source this render cannot touch
+    /// leaves its put alone instead of starving the cache of valid fills. A
+    /// superset is safe, an empty list is not (it would make the claim
+    /// invisible to every invalidation).
+    pub async fn begin_inline_render(
+        &self,
+        key: &str,
+        source_ids: Vec<String>,
+    ) -> Option<InlineRenderGuard> {
+        let claimed = self
+            .inline_rendering
+            .lock()
+            .await
+            .insert(key.to_string(), source_ids.into_iter().collect())
+            .is_none();
+        if !claimed {
+            return None;
+        }
+        Some(InlineRenderGuard {
+            inline_rendering: self.inline_rendering.clone(),
+            key: key.to_string(),
+            generation: self.generation(key).await,
+        })
+    }
+}
+
+/// Releases one inline-render claim when dropped, including while a panic
+/// unwinds the rendering task.
+pub struct InlineRenderGuard {
+    inline_rendering: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    key: String,
+    /// Invalidation generation of the key at claim time; the rendering this
+    /// claim covers may only be stored while it still holds.
+    generation: u64,
+}
+
+impl InlineRenderGuard {
+    /// Generation to hand back to [`Caches::processed_put_guarded`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for InlineRenderGuard {
+    fn drop(&mut self) {
+        // Same shape as `RevalidateGuard::drop`: `Drop` cannot await, the
+        // lock is only ever held for a set insert/remove, so blocking on it
+        // here cannot deadlock.
+        let key = std::mem::take(&mut self.key);
+        if let Ok(mut guard) = self.inline_rendering.try_lock() {
+            guard.remove(&key);
+            return;
+        }
+        // Contended: hand the removal to the runtime rather than block.
+        let inline_rendering = self.inline_rendering.clone();
+        tokio::spawn(async move {
+            inline_rendering.lock().await.remove(&key);
+        });
+    }
 }
 
 /// Releases one revalidation claim when dropped, including while a panic
@@ -265,7 +368,7 @@ pub struct RevalidateGuard {
 }
 
 impl RevalidateGuard {
-    /// Generation to hand back to [`Caches::processed_put_revalidated`].
+    /// Generation to hand back to [`Caches::processed_put_guarded`].
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -461,12 +564,105 @@ mod tests {
         caches.invalidate_processed_for_source("s1").await;
 
         let stored = caches
-            .processed_put_revalidated("sub:p1", rendered(now + 3600, &["s1"]), generation)
+            .processed_put_guarded(
+                "sub:p1",
+                Arc::new(rendered(now + 3600, &["s1"])),
+                generation,
+            )
             .await;
-        assert!(!stored, "pre-ingest rendering must be refused");
+        assert!(stored.is_none(), "pre-ingest rendering must be refused");
         assert!(
             caches.processed_get("sub:p1").await.is_none(),
             "the invalidated key must stay empty until it is re-rendered"
+        );
+    }
+
+    /// An inline (cache-miss) render that started before an ingest commits
+    /// must not store its pre-commit rendering with a full fresh TTL behind
+    /// the ingest's invalidation either. The key has no entry while that
+    /// render runs, so `invalidate_processed_for_source` cannot find it by
+    /// iterating the processed layer and its generation stays where it was.
+    #[tokio::test]
+    async fn inline_render_started_before_an_ingest_does_not_store_its_rendering() {
+        let caches = Caches::new();
+        let now = fumox_core::models::now_ts();
+
+        // A cache miss: the inline render of an empty key claims it.
+        let claim = caches
+            .begin_inline_render("sub:p1", vec!["s1".to_string()])
+            .await
+            .expect("the first cold render claims the key");
+
+        // The ingest commits while that render is still running.
+        caches.invalidate_processed_for_source("s1").await;
+
+        let stored = caches
+            .processed_put_guarded(
+                "sub:p1",
+                Arc::new(rendered(now + 3600, &["s1"])),
+                claim.generation(),
+            )
+            .await;
+        assert!(stored.is_none(), "pre-ingest rendering must be refused");
+        assert!(
+            caches.processed_get("sub:p1").await.is_none(),
+            "the pre-ingest rendering must not be served as fresh for a full TTL"
+        );
+    }
+
+    /// A cold render no invalidation touched still fills the cache, and the
+    /// claim is released so the next miss renders again.
+    #[tokio::test]
+    async fn inline_render_without_an_invalidation_still_stores() {
+        let caches = Caches::new();
+        let now = fumox_core::models::now_ts();
+        let claim = caches
+            .begin_inline_render("sub:p1", vec!["s1".to_string()])
+            .await
+            .unwrap();
+        let stored = caches
+            .processed_put_guarded(
+                "sub:p1",
+                Arc::new(rendered(now + 3600, &["s1"])),
+                claim.generation(),
+            )
+            .await;
+        assert!(stored.is_some());
+        drop(claim);
+        assert!(
+            caches
+                .begin_inline_render("sub:p1", vec!["s1".to_string()])
+                .await
+                .is_some(),
+            "the claim must be released when the render ends"
+        );
+    }
+
+    /// An ingest of one source must not discard the in-flight cold render of
+    /// a key that has nothing to do with it. Under a busy ingest schedule a
+    /// wide blast radius starves the processed cache of perfectly valid
+    /// fills: the body is still served, only the put is refused.
+    #[tokio::test]
+    async fn an_unrelated_ingest_does_not_discard_an_in_flight_render() {
+        let caches = Caches::new();
+        let now = fumox_core::models::now_ts();
+        // A cold render of a profile over "s2", while "s1" gets ingested.
+        let claim = caches
+            .begin_inline_render("sub:p1", vec!["s2".to_string()])
+            .await
+            .expect("the first cold render claims the key");
+        caches.invalidate_processed_for_source("s1").await;
+
+        let stored = caches
+            .processed_put_guarded(
+                "sub:p1",
+                Arc::new(rendered(now + 3600, &["s2"])),
+                claim.generation(),
+            )
+            .await;
+        assert!(
+            stored.is_some(),
+            "an ingest of an unrelated source must not refuse this fill"
         );
     }
 
@@ -481,9 +677,13 @@ mod tests {
             .await;
         let claim = caches.try_start_revalidate("sub:p1").await.unwrap();
         let stored = caches
-            .processed_put_revalidated("sub:p1", rendered(now + 3600, &["s1"]), claim.generation())
+            .processed_put_guarded(
+                "sub:p1",
+                Arc::new(rendered(now + 3600, &["s1"])),
+                claim.generation(),
+            )
             .await;
-        assert!(stored);
+        assert!(stored.is_some());
         assert!(caches.processed_get("sub:p1").await.is_some());
     }
 }

@@ -75,9 +75,17 @@ impl From<std::io::Error> for ConfigWriteError {
 /// Loaded once per request, mutated by [`Self::set`], committed by
 /// [`Self::save`]. The in-memory document preserves comments, blank
 /// lines and key ordering from the source file.
+///
+/// That is a read-modify-write of the whole file, and the settings
+/// form has no double-submit guard, so the window between `load` and
+/// `save` is reachable from two requests at once. The handle therefore
+/// takes the editor lock on construction and releases it on drop, which
+/// makes the snapshot the `save` writes a snapshot of the current file
+/// rather than of whatever the file held when the request started.
 pub struct EditableConfig {
     path: PathBuf,
     doc: DocumentMut,
+    _lock: EditLock,
 }
 
 impl std::fmt::Debug for EditableConfig {
@@ -93,7 +101,13 @@ impl EditableConfig {
     /// Load the TOML at `path`. Returns an empty document if the file
     /// does not exist yet (the admin panel's *Create from defaults*
     /// path writes one for the first time).
+    ///
+    /// Blocks while another live [`EditableConfig`] in this process is
+    /// between its own `load` and its drop, so the document returned is
+    /// the current state of the file and no save can land between the
+    /// read and the mutation that follows it.
     pub fn load(path: &Path) -> Result<Self, ConfigWriteError> {
+        let lock = EditLock::acquire();
         let doc = match std::fs::read_to_string(path) {
             Ok(s) => DocumentMut::from_str(&s).map_err(|e| ConfigWriteError::Parse {
                 path: path.to_path_buf(),
@@ -105,6 +119,7 @@ impl EditableConfig {
         Ok(Self {
             path: path.to_path_buf(),
             doc,
+            _lock: lock,
         })
     }
 
@@ -163,6 +178,12 @@ impl EditableConfig {
     /// Atomic save: write to a sibling `<name>.tmp.<pid>.<n>` and
     /// rename over the original. Falls back to direct `write` on
     /// filesystems that reject `rename` (some NFS / SMB mounts).
+    ///
+    /// The handle owns the editor lock, so no other live
+    /// [`EditableConfig`] in this process can have snapshotted the file
+    /// before the mutation that produced this document: the second
+    /// submission to wait, it waits in `load` and then reads what this
+    /// save wrote.
     ///
     /// Tmp-file uniqueness: process id alone is not enough, because two
     /// concurrent saves from the same admin server process (a
@@ -223,6 +244,75 @@ impl EditableConfig {
 /// admin server at the same time.
 static SAVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Serialises the read-modify-write cycle of [`EditableConfig`]
+/// inside one process: `load` blocks until every earlier handle has
+/// been dropped (which is after its `save`), so a document can never be
+/// a snapshot of a file that another live handle is about to replace.
+///
+/// One lock rather than one per path: the admin panel edits exactly one
+/// config, and keying by path would have to reconcile relative and
+/// absolute spellings of the same file. A second *process* editing the
+/// same file is out of scope, the tmp name already keeps that case from
+/// corrupting the file (last rename wins).
+///
+/// # Contract for anyone adding the next lock acquisition
+///
+/// * **Not reentrant.** The flag is held across the whole
+///   load -> mutate -> save cycle and released only in `Drop`, so code
+///   that runs *while a handle is alive* must never call `acquire`.
+///
+/// * **`config::load` / `config::load_config` must never take it.** The
+///   admin handler re-reads the config through that loader while its
+///   `EditableConfig` is still in scope (the post-save
+///   `refresh_live_config`), and the loader runs on the request thread.
+///   A loader that took this spin lock would hang that request, and the
+///   admin panel would stop saving entirely.
+///
+/// * **Scope is this module's edit path only.** A global for the crate,
+///   not for the whole configuration system: the plain loader reads the
+///   same file today without it, and that is the intended design, not an
+///   oversight to tidy up.
+///
+/// `plain_config_loader_does_not_take_the_editor_lock` in the tests
+/// below fails (5s timeout) the day anyone makes the loader take this
+/// lock, so the rule is enforced, not just documented.
+struct EditLock;
+
+impl EditLock {
+    fn acquire() -> Self {
+        // Spin with `yield_now` first, then back off, so a handler that
+        // only holds the lock across a handful of syscalls does not
+        // burn a core for its whole duration while a sibling is in a
+        // blocking write.
+        let mut spins = 0u32;
+        while EDITOR_LOCK
+            .compare_exchange_weak(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            if spins < 128 {
+                spins += 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        Self
+    }
+}
+
+impl Drop for EditLock {
+    fn drop(&mut self) {
+        EDITOR_LOCK.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+static EDITOR_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Write the tmp file with the original file's permission mode.
 ///
 /// `save` commits by renaming the tmp over the original, which swaps the
@@ -277,13 +367,22 @@ fn enter_or_create_table<'a>(
 
 /// Can the OS let us modify `path`? Either the file exists and its
 /// permissions allow writes, or it does not exist and its parent
-/// directory is writable (a brand-new file can be created there).
+/// directory is writable (a brand-new file can be created there), or
+/// `path` is a directory and we can create entries in it.
+///
+/// The directory case is not hypothetical: the admin panel's *Create
+/// from defaults* handler asks about the config *directory*, because
+/// the file it is about to create is not there yet. Opening a
+/// directory `O_WRONLY` fails with `EISDIR` on Linux and macOS, so a
+/// directory must be probed like the missing-file case instead of
+/// being run through the file's open-for-write fast path.
 ///
 /// The fast path checks the inode's `readonly` flag; the slow path
-/// actually attempts an open-for-write (or a probe file in the parent
-/// when the target is missing) so a read-only filesystem mount, the
-/// docker `:ro` case, where metadata still looks writable but the
-/// kernel rejects every write with `EROFS`, is detected too.
+/// actually attempts an open-for-write (or a probe file in the
+/// directory when the target is missing or is a directory) so a
+/// read-only filesystem mount, the docker `:ro` case, where metadata
+/// still looks writable but the kernel rejects every write with
+/// `EROFS`, is detected too.
 ///
 /// **Advisory only.** The check does not consult POSIX mode bits or
 /// ACLs and is meaningless for `root`, which writes regardless. Use
@@ -292,6 +391,9 @@ fn enter_or_create_table<'a>(
 /// at write time.
 pub fn is_writable(path: &Path) -> bool {
     match std::fs::metadata(path) {
+        // Asked about a directory, so answer the question that matters:
+        // can we put a new entry in it?
+        Ok(md) if md.is_dir() => can_create_in(path),
         Ok(md) => {
             if md.permissions().readonly() {
                 return false;
@@ -302,41 +404,42 @@ pub fn is_writable(path: &Path) -> bool {
             // failure as "not writable from this process".
             std::fs::OpenOptions::new().write(true).open(path).is_ok()
         }
-        Err(_) => {
-            // File missing, the target's parent must accept new files.
-            let Some(parent) = path.parent() else {
-                return false;
-            };
-            let Ok(md) = std::fs::metadata(parent) else {
-                return false;
-            };
-            if md.permissions().readonly() {
-                return false;
-            }
-            // Drop a probe file in the parent to surface a read-only mount
-            // (otherwise we could miss a `:ro` filesystem with no existing
-            // file in it). The probe is opened with `create_new(true)` so
-            // we never overwrite a real file.
-            let probe = parent.join(format!(
-                ".fumox-write-probe-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&probe)
-            {
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&probe);
-                    true
-                }
-                Err(_) => false,
-            }
+        // File missing, the target's parent must accept new files.
+        Err(_) => path.parent().is_some_and(can_create_in),
+    }
+}
+
+/// Can we create a new file inside `dir`? Probes with a throwaway
+/// `create_new` file so a read-only mount is surfaced even when the
+/// directory is empty and no existing file would fail to open.
+fn can_create_in(dir: &Path) -> bool {
+    let Ok(md) = std::fs::metadata(dir) else {
+        return false;
+    };
+    if md.permissions().readonly() {
+        return false;
+    }
+    // Drop a probe file in the directory to surface a read-only mount
+    // (otherwise we could miss a `:ro` filesystem with no existing
+    // file in it). The probe is opened with `create_new(true)` so
+    // we never overwrite a real file. The counter keeps two probes
+    // racing in the same process from colliding on the clock reading
+    // and reporting a writable directory as not writable.
+    let probe = dir.join(format!(
+        ".fumox-write-probe-{}-{}",
+        std::process::id(),
+        SAVE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
         }
+        Err(_) => false,
     }
 }
 
@@ -605,6 +708,134 @@ mod tests {
         std::fs::set_permissions(&path, perms).unwrap();
 
         assert!(!is_writable(&path));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: the *Create from defaults* handler asks about the
+    /// config *directory*, not the file it is about to create in it
+    /// (`settings.rs` passes `target.parent()`). Opening a directory
+    /// `O_WRONLY` fails with `EISDIR` on Linux and macOS, so the
+    /// open-for-write fast path reported "not writable" for a directory
+    /// the process can obviously write into and the create button was
+    /// permanently broken.
+    #[test]
+    fn is_writable_returns_true_for_writable_directory() {
+        let dir = tmp_dir("writable-dir");
+        assert!(dir.is_dir());
+        assert!(
+            is_writable(&dir),
+            "is_writable must answer for a directory, that is what the create path passes"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the contract for a directory: a directory we
+    /// may not write into is still not writable.
+    #[test]
+    fn is_writable_returns_false_for_readonly_directory() {
+        let dir = tmp_dir("readonly-dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = is_writable(&dir);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!result, "is_writable must report false for a read-only dir");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: `settings_update` is a read-modify-write of the whole
+    /// file, and the write button has no double-submit guard, so two
+    /// overlapping submissions used to interleave as
+    /// `load(A) load(B) save(A) save(B)` and the second save renamed a
+    /// document snapshotted before the first one landed. Both requests
+    /// reported success and one change was gone. The load -> mutate ->
+    /// save cycle has to be serialised for the whole process, the
+    /// per-save tmp counter only solved the tmp-file-name half of it.
+    #[test]
+    fn overlapping_edits_do_not_lose_the_first_change() {
+        let dir = tmp_dir("lost-update");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
+
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel::<()>();
+        let first = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut cfg = EditableConfig::load(&path).unwrap();
+                cfg.set("server.bind", item::string("127.0.0.1:1111"))
+                    .unwrap();
+                // Tell the second submission that our snapshot is taken
+                // and our change is not on disk yet, then hold the edit
+                // open long enough for it to read a stale copy.
+                loaded_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                cfg.save().unwrap();
+            }
+        });
+
+        loaded_rx.recv().unwrap();
+        let second = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut cfg = EditableConfig::load(&path).unwrap();
+                cfg.set("probe.cycle_interval_secs", item::integer(90))
+                    .unwrap();
+                cfg.save().unwrap();
+            }
+        });
+
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("127.0.0.1:1111"),
+            "second save rolled the file back to a stale snapshot: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("cycle_interval_secs = 90"),
+            "second change missing: {on_disk}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pins the scope of [`EditLock`]: it guards this module's
+    /// read-modify-write path and nothing else. The plain figment
+    /// loader (`config::load` / `load_config`) reads the same file
+    /// without it, and it has to keep doing so — the admin handler
+    /// re-reads the config through `refresh_live_config` while its
+    /// `EditableConfig` is still alive, and the lock is not reentrant,
+    /// so a loader that took it would deadlock that request.
+    #[test]
+    fn plain_config_loader_does_not_take_the_editor_lock() {
+        let dir = tmp_dir("loader-lock-boundary");
+        let path = dir.join("app.toml");
+        std::fs::write(
+            &path,
+            "[server]\nbind = \"0.0.0.0:8080\"\n[probe]\ncycle_interval_secs = 60\n",
+        )
+        .unwrap();
+
+        // Live handle, editor lock held for as long as this binding.
+        let _cfg = EditableConfig::load(&path).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loader_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = crate::config::load_config(Some(&loader_path));
+            tx.send(()).unwrap();
+        });
+
+        // A lock the loader also took would spin here until the timeout.
+        let returned = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(_cfg);
+
+        assert!(
+            returned.is_ok(),
+            "config::load_config must not take the editor lock: it deadlocked against a live EditableConfig"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

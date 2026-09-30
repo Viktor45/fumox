@@ -399,16 +399,36 @@ async fn build_profile_from_form(
     };
 
     // Access token: an unchanged masked placeholder keeps the stored secret;
-    // an empty field clears the token (public endpoint).
+    // an empty field clears the token (public endpoint). The mask is
+    // resolved *before* the checks below: `mask_secret` renders the secret
+    // as `abc…••••`, and `…`/`•` are outside the token charset, so
+    // validating the placeholder made every save of a token-protected
+    // profile fail with `val.token_format` and locked the operator out of
+    // renaming it.
+    //
+    // The stored row is matched by the *mask itself*, never by "the value
+    // contains a bullet": anything else the operator typed is what they
+    // typed, and treating it as a mask would silently drop a rotated
+    // credential (and skip its cap and charset checks) behind a success
+    // toast. Same rule as the source form's `restore_masked_headers`.
     let token_raw = get("access_token");
-    let mut access_token = if token_raw.is_empty() {
-        None
-    } else {
-        Some(token_raw.clone())
+    let stored = match existing_id {
+        Some(id) => profiles::get(&state.pool, id).await.ok().flatten(),
+        None => None,
+    };
+    let stored_token = stored
+        .as_ref()
+        .and_then(|p| p.access_token.as_deref())
+        .filter(|secret| token_raw == mask_secret(secret));
+    let access_token = match stored_token {
+        Some(secret) => Some(secret.to_string()),
+        None if token_raw.is_empty() => None,
+        None => Some(token_raw.clone()),
     };
     // Token format cap: the token guards a public
     // endpoint, so it is URL-safe and bounded like every other field.
-    if let Some(token) = access_token.as_ref()
+    if stored_token.is_none()
+        && let Some(token) = access_token.as_ref()
         && token.len() > caps::ACCESS_TOKEN
     {
         errors.push((
@@ -416,18 +436,13 @@ async fn build_profile_from_form(
             lang.t("val.field_too_long")
                 .replace("{}", &caps::ACCESS_TOKEN.to_string()),
         ));
-    } else if let Some(token) = access_token.as_ref()
+    } else if stored_token.is_none()
+        && let Some(token) = access_token.as_ref()
         && !token
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
     {
         errors.push(("access_token".into(), lang.t("val.token_format").into()));
-    }
-    if let Some(id) = existing_id
-        && token_raw.contains('•')
-        && let Ok(Some(stored)) = profiles::get(&state.pool, id).await
-    {
-        access_token = stored.access_token;
     }
 
     let format_raw = get("output_format");
@@ -557,10 +572,6 @@ async fn build_profile_from_form(
     }
 
     let now = now_ts();
-    let existing = match existing_id {
-        Some(id) => profiles::get(&state.pool, id).await.ok().flatten(),
-        None => None,
-    };
 
     Ok(Profile {
         id: existing_id.map(str::to_string).unwrap_or_else(new_id),
@@ -571,7 +582,9 @@ async fn build_profile_from_form(
         pipeline,
         countries,
         enabled: form.iter().any(|(k, _)| k == "enabled"),
-        created_at: existing.map(|p| p.created_at).unwrap_or(now),
+        // `stored` is the row read above for the mask, so `created_at`
+        // carries over without a second query.
+        created_at: stored.as_ref().map(|p| p.created_at).unwrap_or(now),
         updated_at: now,
     })
 }
@@ -931,4 +944,201 @@ pub async fn profile_delete(
         String::new(),
         lang.t("prof.deleted_toast"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Admin state on a throwaway migrated database: the form builder
+    /// only touches the pool (slug/target lookups, stored token).
+    async fn test_state() -> AdminState {
+        let dir = std::env::temp_dir().join(format!("fumox-profile-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(refresh_rx); // keep the channel open for sends
+        let config = fumox_core::AppConfig::default();
+        let fetcher =
+            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.geo.dns_timeout());
+        AdminState::new(
+            pool,
+            crate::cache::Caches::new(),
+            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
+            refresh_tx,
+            crate::scheduler::SchedulerState::new(1),
+            crate::events::EventBus::new(),
+            fetcher,
+            config,
+            fumox_core::config::ResolvedConfigPath::Missing,
+        )
+    }
+
+    fn stored_profile(token: Option<&str>) -> Profile {
+        let now = now_ts();
+        Profile {
+            id: new_id(),
+            slug: Some("p1".into()),
+            access_token: token.map(str::to_string),
+            name: "p1".into(),
+            output_format: OutputFormat::UriList,
+            pipeline: None,
+            countries: Vec::new(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The edit form re-renders the stored secret as `mask_secret`
+    /// (`abc…••••`) and posts it back verbatim on any save. That mask is
+    /// not a token, so the charset check used to reject it and the whole
+    /// save came back 422: a profile with an access token could never be
+    /// renamed, re-slugged or re-pointed at other sources.
+    #[tokio::test]
+    async fn unchanged_masked_token_keeps_the_stored_secret() {
+        let state = test_state().await;
+        let lang = state.locales.default_lang();
+        let secret = "supersecretvalue";
+        let stored = stored_profile(Some(secret));
+        profiles::create(&state.pool, &stored).await.unwrap();
+
+        // Exactly what GET /admin/profiles/{id}/edit hands the browser.
+        let masked = mask_secret(secret);
+        assert!(masked.contains('•'), "the form value is the mask {masked}");
+        let form: Vec<(String, String)> = vec![
+            ("name".into(), "renamed".into()),
+            ("slug".into(), "p1".into()),
+            ("access_token".into(), masked),
+            ("output_format".into(), "uri_list".into()),
+            ("enabled".into(), "on".into()),
+        ];
+
+        let built = build_profile_from_form(&state, &lang, &form, Some(&stored.id))
+            .await
+            .expect("posting the form back unchanged must save");
+        assert_eq!(
+            built.access_token.as_deref(),
+            Some(secret),
+            "the masked placeholder must keep the stored secret"
+        );
+        // The other fields of the same save did change.
+        assert_eq!(built.name, "renamed");
+
+        // An empty field still clears the token (public endpoint).
+        let form: Vec<(String, String)> = vec![
+            ("name".into(), "renamed".into()),
+            ("slug".into(), "p1".into()),
+            ("access_token".into(), String::new()),
+            ("output_format".into(), "uri_list".into()),
+        ];
+        let built = build_profile_from_form(&state, &lang, &form, Some(&stored.id))
+            .await
+            .expect("clearing the token must save");
+        assert_eq!(built.access_token, None);
+    }
+
+    /// The mask bypass is narrow: a token the operator actually typed is
+    /// still held to the format and the cap.
+    #[tokio::test]
+    async fn a_typed_token_is_still_validated() {
+        let state = test_state().await;
+        let lang = state.locales.default_lang();
+        let stored = stored_profile(None);
+        profiles::create(&state.pool, &stored).await.unwrap();
+
+        let with_token = |token: &str| -> Vec<(String, String)> {
+            vec![
+                ("name".into(), "p1".into()),
+                ("slug".into(), "free".into()),
+                ("access_token".into(), token.to_string()),
+                ("output_format".into(), "uri_list".into()),
+            ]
+        };
+
+        let errors = build_profile_from_form(&state, &lang, &with_token("bad token!"), None)
+            .await
+            .expect_err("a token outside the charset must be refused");
+        assert!(
+            errors.iter().any(|(field, _)| field == "access_token"),
+            "the format check must still fire: {errors:?}"
+        );
+
+        let over = "a".repeat(caps::ACCESS_TOKEN + 1);
+        let errors = build_profile_from_form(&state, &lang, &with_token(&over), None)
+            .await
+            .expect_err("an over-long token must be refused");
+        assert!(
+            errors.iter().any(|(field, _)| field == "access_token"),
+            "the cap must still fire: {errors:?}"
+        );
+
+        let built = build_profile_from_form(&state, &lang, &with_token("good-token_1"), None)
+            .await
+            .expect("a well-formed token must save");
+        assert_eq!(built.access_token.as_deref(), Some("good-token_1"));
+    }
+
+    /// Only the mask itself may resolve to the stored secret. On a profile
+    /// that already has a token, anything else the operator typed is what
+    /// they typed — including a value carrying a bullet, which the old
+    /// "contains a bullet" heuristic silently swapped for the stored
+    /// secret (a credential rotation that reported success and rotated
+    /// nothing). The sources form already documents and implements this
+    /// rule: "Matching on the mask itself, not on 'the value contains a
+    /// bullet', is what keeps a real value the operator typed from being
+    /// silently reverted" (sources.rs, `restore_masked_headers`).
+    #[tokio::test]
+    async fn a_typed_bullet_is_not_mistaken_for_the_mask() {
+        let state = test_state().await;
+        let lang = state.locales.default_lang();
+        let stored = stored_profile(Some("supersecretvalue"));
+        profiles::create(&state.pool, &stored).await.unwrap();
+
+        let with_token = |token: &str| -> Vec<(String, String)> {
+            vec![
+                ("name".into(), "p1".into()),
+                ("slug".into(), "p1".into()),
+                ("access_token".into(), token.to_string()),
+                ("output_format".into(), "uri_list".into()),
+            ]
+        };
+
+        // The mask itself still restores the stored secret.
+        let mask = mask_secret("supersecretvalue");
+        let built = build_profile_from_form(&state, &lang, &with_token(&mask), Some(&stored.id))
+            .await
+            .expect("the unchanged mask must save");
+        assert_eq!(built.access_token.as_deref(), Some("supersecretvalue"));
+
+        // A typed value that merely contains a bullet is not the mask, so
+        // it is validated like any other typed value: '•' is outside the
+        // token charset and the save is refused rather than silently
+        // keeping the old secret.
+        let errors =
+            build_profile_from_form(&state, &lang, &with_token("tok•en"), Some(&stored.id))
+                .await
+                .expect_err("a typed bullet must not resolve to the stored secret");
+        assert!(
+            errors.iter().any(|(field, _)| field == "access_token"),
+            "the format check must fire on a typed bullet: {errors:?}"
+        );
+
+        // …and a different, well-formed token rotates the secret.
+        let built = build_profile_from_form(
+            &state,
+            &lang,
+            &with_token("rotated-token"),
+            Some(&stored.id),
+        )
+        .await
+        .expect("a typed token must replace the stored one");
+        assert_eq!(built.access_token.as_deref(), Some("rotated-token"));
+    }
 }

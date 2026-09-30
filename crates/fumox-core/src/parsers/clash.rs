@@ -18,6 +18,15 @@ struct ClashTypeSpec {
     scheme: Scheme,
     /// Credential fields in the order they are joined with `:`.
     credential_fields: &'static [&'static str],
+    /// Whether an absent *first* credential field keeps its empty slot.
+    ///
+    /// It must when every part is optional, because the output writers
+    /// skip an empty part and read a colon-less credential as no
+    /// credential at all (socks5 `username`/`password`). It must not when
+    /// the first part is a method with a default: the shadowsocks writers
+    /// take the default only for a colon-less credential and would emit an
+    /// empty cipher for `":pw"`.
+    optional_credential_fields: bool,
     /// Lower-cased Clash field names recognized as defined parameters.
     known_fields: &'static [&'static str],
 }
@@ -25,12 +34,14 @@ struct ClashTypeSpec {
 const SS_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Ss,
     credential_fields: &["cipher", "password"],
+    optional_credential_fields: false,
     known_fields: &["udp", "plugin", "plugin-opts"],
 };
 
 const TROJAN_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Trojan,
     credential_fields: &["password"],
+    optional_credential_fields: false,
     known_fields: &[
         "sni",
         "skip-cert-verify",
@@ -46,6 +57,7 @@ const TROJAN_SPEC: ClashTypeSpec = ClashTypeSpec {
 const VMESS_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Vmess,
     credential_fields: &["uuid"],
+    optional_credential_fields: false,
     known_fields: &[
         "alterid",
         "cipher",
@@ -68,6 +80,7 @@ const VMESS_SPEC: ClashTypeSpec = ClashTypeSpec {
 const HYSTERIA2_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Hysteria2,
     credential_fields: &["password"],
+    optional_credential_fields: false,
     known_fields: &[
         "sni",
         "skip-cert-verify",
@@ -82,6 +95,7 @@ const HYSTERIA2_SPEC: ClashTypeSpec = ClashTypeSpec {
 const VLESS_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Vless,
     credential_fields: &["uuid"],
+    optional_credential_fields: false,
     known_fields: &[
         "tls",
         "skip-cert-verify",
@@ -102,6 +116,8 @@ const VLESS_SPEC: ClashTypeSpec = ClashTypeSpec {
 const SOCKS5_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Socks5,
     credential_fields: &["username", "password"],
+    // Every part is optional: the writers skip an empty one.
+    optional_credential_fields: true,
     known_fields: &["udp"],
 };
 
@@ -174,12 +190,40 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     let host = string_field(map, "server")?;
     let port = numeric_field(map, "port")?;
 
-    let credential_parts: Vec<String> = spec
+    // The credential fields are joined in their declared order, which is
+    // the only contract the output writers have: they split on `:` and
+    // read a colon-less credential as "no credential at all".
+    //   - an absent field *after* the first present one always keeps its
+    //     empty slot, or the fields in front of it shift left and are
+    //     lost: a socks5 item with only `username` must store
+    //     `onlyuser:`, not `onlyuser`;
+    //   - an absent *leading* field keeps its slot only when every part
+    //     is optional (`optional_credential_fields`), because the writers
+    //     then skip the empty part. Shadowsocks reads the first part as
+    //     the cipher and takes its default only for a colon-less
+    //     credential, so there an absent leading field is dropped and an
+    //     ss item with only `password` stores `pw`;
+    //   - with nothing present the credential stays empty, so a
+    //     single-field scheme without its secret emits no userinfo.
+    let fields: Vec<Option<String>> = spec
         .credential_fields
         .iter()
-        .filter_map(|field| map.get(field).map(yaml_to_string))
+        .map(|field| map.get(field).map(yaml_to_string))
         .collect();
-    let credential = credential_parts.join(":");
+    let first = if spec.optional_credential_fields {
+        0
+    } else {
+        fields.iter().position(Option::is_some).unwrap_or(0)
+    };
+    let credential = if fields.iter().all(Option::is_none) {
+        String::new()
+    } else {
+        fields[first..]
+            .iter()
+            .map(|value| value.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(":")
+    };
 
     // A YAML scalar may legally contain a line break, but the URI
     // serializers emit these two fields verbatim, one would split this proxy
@@ -336,6 +380,64 @@ proxy-groups:
     fn payload_without_proxies_is_an_error() {
         assert!(parse_payload("mixed-port: 7890\n").is_err());
         assert!(parse_payload(":::").is_err());
+    }
+
+    /// `credential_fields` are joined positionally, so an absent field
+    /// must keep its empty slot. A socks5 item carrying only `username`
+    /// was stored as `onlyuser`, a string the output writers — which
+    /// split on `:` — read as no credentials at all.
+    #[test]
+    fn an_absent_credential_field_keeps_its_slot() {
+        let yaml =
+            "proxies:\n  - {name: s, type: socks5, server: h, port: 1080, username: onlyuser}\n";
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.entries[0].credential, "onlyuser:");
+    }
+
+    /// A leading absent field must not leave an empty slot: the output
+    /// writers split on `:` and would read `":pw"` as an empty cipher. A
+    /// trailing one must keep its slot, or the writers lose the field in
+    /// front of it (`onlyuser` carries no password to recover, and no
+    /// username either once the split fails).
+    #[test]
+    fn a_missing_cipher_keeps_the_password_usable() {
+        let yaml = "proxies:\n  - {name: s, type: ss, server: h, port: 8388, password: pw}\n";
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.entries[0].credential, "pw");
+        // The writers fall back to a default method only for a
+        // colon-less credential, so this is the shape they can use.
+        let clash = crate::formats::clash::entry_to_clash(&result.entries[0]).unwrap();
+        assert_eq!(
+            clash.get("cipher").and_then(|v| v.as_str()),
+            Some("chacha20-ietf-poly1305")
+        );
+        assert_eq!(clash.get("password").and_then(|v| v.as_str()), Some("pw"));
+    }
+
+    /// The mirror of the case above: a socks5 item carrying only a
+    /// `password` must keep its empty leading slot, because both writers
+    /// skip empty parts (`both parts are optional`, formats/clash.rs:136)
+    /// while a colon-less credential is read as no credentials at all.
+    #[test]
+    fn a_password_only_socks5_keeps_its_credential() {
+        let yaml =
+            "proxies:\n  - {name: s, type: socks5, server: h, port: 1080, password: onlypass}\n";
+        let result = parse_payload(yaml).unwrap();
+        let e = &result.entries[0];
+        assert_eq!(e.credential, ":onlypass");
+
+        let clash = crate::formats::clash::entry_to_clash(e).unwrap();
+        assert!(clash.get("username").is_none());
+        assert_eq!(
+            clash.get("password").and_then(|v| v.as_str()),
+            Some("onlypass")
+        );
+        let singbox = crate::formats::singbox::entry_to_outbound(e).unwrap();
+        assert!(singbox.get("username").is_none());
+        assert_eq!(
+            singbox.get("password").and_then(|v| v.as_str()),
+            Some("onlypass")
+        );
     }
 
     #[test]

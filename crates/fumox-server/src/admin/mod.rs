@@ -241,15 +241,22 @@ impl AdminState {
     /// public port from `[server].bind`, https when the admin request
     /// itself arrived over https (see `request_is_https`).
     ///
-    /// The link is validated against `[server].allowed_hosts`, the list
-    /// the public listener actually gates on — including the
-    /// token-bearing `/export/alive/{token}` and `/export/ready/{token}`
-    /// links the Import/Export screen renders from this base. Validating
-    /// against `[admin].allowed_hosts` instead let the two lists diverge
-    /// silently: a host the operator allowlisted for the panel but not for
-    /// the public listener produced links that answer 404 "link not found"
-    /// on every click, and the reverse direction rendered a host the
-    /// export gate had never agreed to serve.
+    /// The link is validated against `[admin].allowed_hosts`, the same
+    /// list `enforce_allowed_hosts` gates the request with, so a host that
+    /// reaches a handler can never be turned into a 500 by the three
+    /// callers that render a serve link (sources, profiles, Import/Export).
+    ///
+    /// One fail mode is removed, not both. The public listener gates on its
+    /// own `[server].allowed_hosts` (see `alive_export::serve_tier`), so
+    /// when an operator allowlists a panel host that is not on the public
+    /// list, the link is still built from the panel's own host and the
+    /// public listener answers 404 "link not found" when it is clicked.
+    /// Gating on both lists instead would only move the failure: `Err`
+    /// reaches handlers that render a hard 500 through `server_error`, and
+    /// those call sites live outside this module. The 500 is the worse of
+    /// the two — it breaks the whole page, not just one link — so the
+    /// panel list wins and the 404-on-click tradeoff is recorded here
+    /// instead of being silently dropped.
     fn serve_base(
         &self,
         peer: SocketAddr,
@@ -260,7 +267,7 @@ impl AdminState {
             peer,
             headers,
             &self.trusted_cidrs,
-            &self.server.allowed_hosts,
+            &self.admin.allowed_hosts,
         )
     }
 
@@ -852,15 +859,13 @@ mod tests {
         test_state_with_admin(admin_config(admin_limit)).await
     }
 
-    /// The serve links are built against `[server].allowed_hosts`, the
-    /// list the public listener gates the export endpoints with. Building
-    /// them against the admin list let the two diverge: a host allowed for
-    /// the panel but not for the public listener yielded an
-    /// `/export/alive/{token}` link that answers 404 on every click, and a
-    /// host allowed for the public listener but not for the panel was
-    /// rejected outright by `serve_base`.
+    /// The serve links are built against the same `[admin].allowed_hosts`
+    /// the router gates the request with. The two lists are independent
+    /// config, so validating the link against `[server].allowed_hosts` let a
+    /// host that passed the edge gate reach the handler and be turned into
+    /// a 500 by the three pages that render a serve link.
     #[tokio::test]
-    async fn serve_base_validates_against_the_server_host_allowlist() {
+    async fn serve_base_validates_against_the_admin_host_allowlist() {
         let mut admin = admin_config(10);
         admin.allowed_hosts = vec!["panel.example.com".to_string()];
         let server = fumox_core::config::ServerConfig {
@@ -870,18 +875,84 @@ mod tests {
         let state = test_state_with_configs(admin, server).await;
         let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
 
-        // The panel's own host is not on the public listener's list, so no
-        // serve link may be built for it: the export gate would 404 it.
+        // The host the panel was opened on builds its serve link even when
+        // the public listener gates on a different list.
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "panel.example.com".parse().unwrap());
-        assert!(state.serve_base(peer, &headers).is_err());
-
-        // A host on the public list builds, whatever the panel's list says.
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "vpn.example.com".parse().unwrap());
         assert_eq!(
             state.serve_base(peer, &headers).unwrap(),
-            "http://vpn.example.com:8080"
+            "http://panel.example.com:8080"
+        );
+
+        // A host the panel does not allow builds nothing.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        assert!(state.serve_base(peer, &headers).is_err());
+    }
+
+    /// End to end through the router: a Host that passes the admin gate
+    /// renders the serve-link pages instead of the 500 all three callers
+    /// used to return from `build_serve_link_host`. Both allowlists
+    /// configured, and pointing at different hosts, is the ordinary
+    /// operator setup that made this the normal outcome.
+    #[tokio::test]
+    async fn serve_link_pages_render_for_an_admin_allowlisted_host() {
+        let mut admin = admin_config(1000);
+        admin.allowed_hosts = vec!["panel.example.com".to_string()];
+        let server = fumox_core::config::ServerConfig {
+            allowed_hosts: vec!["vpn.example.com".to_string()],
+            ..Default::default()
+        };
+        let state = test_state_with_configs(admin, server).await;
+        let app = router(state);
+
+        let with_host = |method: &str, uri: &str, body: &str, cookie: Option<&str>| {
+            let mut r = request(method, uri, body, cookie);
+            r.headers_mut()
+                .insert(header::HOST, "panel.example.com".parse().unwrap());
+            r
+        };
+
+        let response = app
+            .clone()
+            .oneshot(with_host(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let response = app
+            .oneshot(with_host("GET", "/admin/import", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains("http://panel.example.com:8080/export/alive/"),
+            "the export link must be built from the panel's own host: {html:.400}"
+        );
+        // The remaining tradeoff, recorded in `serve_base`: the link is not
+        // rewritten to the host the public listener does allow, so with the
+        // two lists pointing at different hosts that link 404s on click.
+        // The page itself must render — that is the half this fixes.
+        assert!(
+            !html.contains("vpn.example.com"),
+            "the link must not be silently swapped for another host: {html:.400}"
         );
     }
 

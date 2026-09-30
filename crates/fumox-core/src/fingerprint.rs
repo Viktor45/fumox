@@ -2,16 +2,22 @@
 //!
 //! ```text
 //! fingerprint = sha256(
-//!     scheme "|" normalize(host) "|" port "|" credential "|" canonical(security_params)
+//!     scheme "|" escape(normalize(host)) "|" port "|" escape(credential)
+//!     "|" canonical(security_params)
 //! )
 //! ```
+//!
+//! Every attacker-controlled field is escaped — the host, the credential and
+//! the parameter keys and values — so a separator byte coming from feed text
+//! cannot move a field boundary inside the pre-image. The scheme and the port
+//! are written as they are: a fixed enum literal and a number.
 //!
 //! The display name and cosmetic parameters (advertising tags, bandwidth
 //! caps, timestamps) are deliberately excluded, so the same server advertised
 //! under different names collapses into a single row. `fingerprint` is UNIQUE
 //! in the schema, which makes reconciliation a natural upsert.
 
-use crate::models::ProxyEntry;
+use crate::models::{ProxyEntry, Scheme};
 use sha2::{Digest, Sha256};
 
 /// Lower-cased parameter keys that change how a client must connect or
@@ -39,6 +45,7 @@ const SECURITY_PARAMS: &[&str] = &[
     "utls",
     "sni",
     "flow",
+    "pinsha256",
     // cipher / credentials extras
     "encryption",
     "scy",
@@ -57,8 +64,9 @@ const SECURITY_PARAMS: &[&str] = &[
     // Clash structured blocks, stored verbatim: they have no URI spelling
     // and each one changes how the client must connect. The Clash fields
     // that *do* have a URI spelling (`servername`, `network`, `ws-path`,
-    // `client-fingerprint`, `grpc-service-name`) are folded onto it by
-    // `canonical_key` and never reach this list under their own name.
+    // `client-fingerprint`, `grpc-service-name`, `fingerprint`) are folded
+    // onto it by `canonical_key` and never reach this list under their own
+    // name.
     "ws-headers",
     "ws-opts",
     "reality-opts",
@@ -70,28 +78,43 @@ const SECURITY_PARAMS: &[&str] = &[
 /// same way. Left alone, the same node advertised as Clash YAML and as a URI
 /// would get two different fingerprints and land in two rows, so the Clash
 /// spelling is rewritten to the URI one before the security filter runs.
-fn canonical_key(key: &str) -> String {
+///
+/// The transport is spelled per scheme: the vmess JSON and the sing-box native
+/// form both call it `net`, while vless, trojan and the rest call it `type`.
+/// Folding it onto one spelling for every scheme would split the vmess forms
+/// from each other, so the target key depends on the scheme.
+fn canonical_key(scheme: Scheme, key: &str) -> String {
     match key {
         "servername" => "sni",
+        "network" if scheme == Scheme::Vmess => "net",
         "network" => "type",
         "ws-path" => "path",
         "client-fingerprint" => "fp",
         "grpc-service-name" => "servicename",
+        // Clash's `fingerprint` is the certificate pin (`pinSHA256` in the
+        // URI), not the uTLS client hello — that one is `client-fingerprint`.
+        "fingerprint" => "pinsha256",
         other => other,
     }
     .to_string()
 }
 
 /// Compute the stable deduplication fingerprint of a proxy entry.
+///
+/// Every attacker-controlled field that reaches the pre-image — the host, the
+/// credential and the parameter keys and values — is escaped, so a separator
+/// byte inside one of them can never be read as a boundary. The scheme and
+/// the port need no escaping: the scheme is a closed enum written as a fixed
+/// literal, the port a number by type.
 pub fn fingerprint(entry: &ProxyEntry) -> String {
     let mut hasher = Sha256::new();
     hasher.update(entry.scheme.as_str().as_bytes());
     hasher.update(b"|");
-    hasher.update(normalize_host(&entry.host).as_bytes());
+    hasher.update(escape(&normalize_host(&entry.host)).as_bytes());
     hasher.update(b"|");
     hasher.update(entry.port.to_string().as_bytes());
     hasher.update(b"|");
-    hasher.update(entry.credential.as_bytes());
+    hasher.update(escape(&entry.credential).as_bytes());
     hasher.update(b"|");
     hasher.update(canonical_security_params(entry).as_bytes());
     to_hex(&hasher.finalize())
@@ -113,7 +136,7 @@ fn canonical_security_params(entry: &ProxyEntry) -> String {
         .params
         .iter()
         .filter_map(|param| {
-            let key = canonical_key(&param.key.to_ascii_lowercase());
+            let key = canonical_key(entry.scheme, &param.key.to_ascii_lowercase());
             if !SECURITY_PARAMS.contains(&key.as_str()) {
                 return None;
             }
@@ -128,13 +151,16 @@ fn canonical_security_params(entry: &ProxyEntry) -> String {
         .join("&")
 }
 
-/// Escape a key or value so the `=` and `&` separators cannot be forged from
-/// inside a value.
+/// Escape a key or value so the separators around it cannot be forged from
+/// inside it.
 ///
-/// Feed text is attacker-controlled: `path=/search` + `host=evil` and the
-/// single parameter `host=evil&path=/search` would otherwise produce the same
-/// pre-image and the same fingerprint. Only bytes outside printable ASCII and
-/// the two separators (plus `%`, so escaping is reversible) are rewritten.
+/// Feed text is attacker-controlled and the values reach the pre-image
+/// verbatim, so a raw separator byte would move a field boundary:
+/// `path=/search` + `host=evil` and the single parameter `host=evil&path=/search`
+/// would otherwise produce the same pre-image and the same fingerprint, and a
+/// `|` inside a host or a credential would shift the top-level fields the same
+/// way. Only bytes outside printable ASCII and the separators (plus `%`, so
+/// escaping is reversible) are rewritten.
 fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -142,6 +168,7 @@ fn escape(value: &str) -> String {
             b'%' => out.push_str("%25"),
             b'&' => out.push_str("%26"),
             b'=' => out.push_str("%3D"),
+            b'|' => out.push_str("%7C"),
             0x21..=0x7e => out.push(byte as char),
             _ => out.push_str(&format!("%{byte:02X}")),
         }
@@ -195,6 +222,13 @@ mod tests {
             key: key.to_string(),
             value: value.to_string(),
             known: true,
+        }
+    }
+
+    fn parse_one(line: &str) -> ProxyEntry {
+        match crate::parsers::parse_line(line) {
+            crate::parsers::LineOutcome::Parsed(entry) => entry,
+            other => panic!("expected a parsed entry, got {other:?}"),
         }
     }
 
@@ -375,6 +409,58 @@ mod tests {
     }
 
     #[test]
+    fn cert_pin_is_security_relevant() {
+        // The pinned certificate decides which servers the client accepts, so
+        // two hysteria2 nodes pinning different certificates are different
+        // nodes. Left out of the dedup key they shared one row and the
+        // upsert silently overwrote one with the other.
+        let uri_a = parse_one("hysteria2://pass@h.example.com:443?pinSHA256=AAAA");
+        let uri_b = parse_one("hysteria2://pass@h.example.com:443?pinSHA256=BBBB");
+        assert_ne!(fingerprint(&uri_a), fingerprint(&uri_b));
+
+        // Clash spells the same field `fingerprint`; it must canonicalize
+        // onto the URI spelling instead of sitting beside it, or a node
+        // published in both formats lands in two rows.
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: hysteria2, server: h.example.com, port: 443,",
+            "     password: pass, fingerprint: AAAA}\n",
+            "  - {name: b, type: hysteria2, server: h.example.com, port: 443,",
+            "     password: pass, fingerprint: BBBB}\n",
+        );
+        let parsed = crate::parsers::clash::parse_payload(yaml).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_ne!(
+            fingerprint(&parsed.entries[0]),
+            fingerprint(&parsed.entries[1])
+        );
+        assert_eq!(fingerprint(&parsed.entries[0]), fingerprint(&uri_a));
+        assert_eq!(fingerprint(&parsed.entries[1]), fingerprint(&uri_b));
+    }
+
+    #[test]
+    fn clash_and_uri_spellings_agree_for_vmess() {
+        // vmess names the transport `net` in the URI JSON and sing-box native
+        // form, `network` only in Clash. Folding Clash's spelling onto `type`
+        // left the two forms as separate keys, so one vmess server published
+        // as Clash YAML and as a vmess:// link got two fingerprints, two rows
+        // and two copies in every subscription.
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vmess, server: h.example.com, port: 443, uuid: u,",
+            "     network: ws, servername: a.example.com}\n",
+        );
+        let mut clash = crate::parsers::clash::parse_payload(yaml).unwrap().entries[0].clone();
+        let mut uri = parse_one(concat!(
+            "vmess://eyJ2IjoiMiIsInBzIjoiYSIsImFkZCI6ImguZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQz",
+            "IiwiaWQiOiJ1IiwibmV0Ijoid3MiLCJzbmkiOiJhLmV4YW1wbGUuY29tIn0="
+        ));
+        clash.name = String::new();
+        uri.name = String::new();
+        assert_eq!(fingerprint(&clash), fingerprint(&uri));
+    }
+
+    #[test]
     fn separator_bytes_in_values_cannot_forge_a_pair() {
         // Without escaping, `path=/search` + `host=evil` and the single param
         // `host=evil&path=/search` are the same pre-image.
@@ -393,6 +479,31 @@ mod tests {
             vec![param("host", "evil"), param("host", "other")],
         );
         assert_ne!(fingerprint(&quoted), fingerprint(&two));
+    }
+
+    #[test]
+    fn pipe_in_a_field_cannot_shift_the_pre_image_boundary() {
+        // The pre-image is `scheme|host|port|credential|params`, and the host
+        // and the credential reach it verbatim (parse_hostport and
+        // split_userinfo keep them as written). A `|` inside either one moved
+        // a field boundary, so two unrelated malformed lines hashed to the
+        // same fingerprint and the upsert kept only the last of them.
+        let first = parse_one("vless://x@a|443:1#one");
+        let second = parse_one("vless://1|x@a:443#two");
+        assert_eq!(first.host, "a|443");
+        assert_eq!(first.port, 1);
+        assert_eq!(first.credential, "x");
+        assert_eq!(second.host, "a");
+        assert_eq!(second.port, 443);
+        assert_eq!(second.credential, "1|x");
+        assert_ne!(fingerprint(&first), fingerprint(&second));
+
+        // The value level behind it: a pipe inside a field is rewritten, and a
+        // value without one is untouched, so the common case keeps the
+        // documented pre-image byte for byte.
+        assert_eq!(escape("a|443"), "a%7C443");
+        assert_eq!(escape("1|x"), "1%7Cx");
+        assert_eq!(escape("h.example.com"), "h.example.com");
     }
 
     #[test]

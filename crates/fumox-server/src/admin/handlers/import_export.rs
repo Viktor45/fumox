@@ -6,8 +6,10 @@
 //! receive fresh `nanoid(12)` ids, profile composition is remapped onto the
 //! new source ids, and existing rows are never overwritten. Slug collisions
 //! with the database (or within the file) drop the slug rather than the
-//! object; references to sources absent from the file are excluded from the
-//! composition. Both cases surface as warnings, not errors. A reference
+//! object; a source and a profile live in separate slug name-spaces (one
+//! UNIQUE column each), so the same slug on both is kept on both. References
+//! to sources absent from the file are excluded from the composition. Both
+//! cases surface as warnings, not errors. A reference
 //! repeated inside one profile is kept once (the composition is keyed by
 //! source, a repeat would abort the insert after the profile row was
 //! already written). Two *source rows* sharing one reference are a hard
@@ -687,16 +689,23 @@ async fn apply_import(
     let mut summary = ImportSummary::default();
 
     // Slugs already present in the DB or used earlier in this file cannot be
-    // reused; the object is still created, just without a slug.
-    let mut taken_slugs: HashSet<String> = HashSet::new();
+    // reused; the object is still created, just without a slug. Sources and
+    // profiles are tracked separately: `slug` is UNIQUE per table, and each
+    // side resolves its own only — `profiles::resolve_token` behind
+    // `/sub/{id}` (serve.rs:234) and `sources::resolve_token` behind
+    // `/src/{id}` (serve.rs:295), each querying one table. The same slug is
+    // therefore legal on a source and on a profile, and must survive the
+    // round trip on both.
+    let mut taken_source_slugs: HashSet<String> = HashSet::new();
     for s in sources::list(&state.pool, false).await? {
         if let Some(slug) = s.slug {
-            taken_slugs.insert(slug);
+            taken_source_slugs.insert(slug);
         }
     }
+    let mut taken_profile_slugs: HashSet<String> = HashSet::new();
     for p in profiles::list(&state.pool, false).await? {
         if let Some(slug) = p.slug {
-            taken_slugs.insert(slug);
+            taken_profile_slugs.insert(slug);
         }
     }
 
@@ -706,7 +715,7 @@ async fn apply_import(
     for s in file.sources {
         let id = models::new_id();
         ref_to_id.insert(s.reference.clone(), id.clone());
-        let slug = claim_slug(s.slug, &mut taken_slugs, &s.name, lang, &mut summary);
+        let slug = claim_slug(s.slug, &mut taken_source_slugs, &s.name, lang, &mut summary);
         let source = models::Source {
             id: id.clone(),
             slug,
@@ -734,7 +743,13 @@ async fn apply_import(
 
     for p in file.profiles {
         let id = models::new_id();
-        let slug = claim_slug(p.slug, &mut taken_slugs, &p.name, lang, &mut summary);
+        let slug = claim_slug(
+            p.slug,
+            &mut taken_profile_slugs,
+            &p.name,
+            lang,
+            &mut summary,
+        );
 
         // Remap composition onto the freshly created source ids; references
         // to sources missing from the file are dropped with a warning.
@@ -1007,6 +1022,100 @@ mod tests {
         };
         let errors = validate_import(&state, &lang, &file).await;
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// `sources.slug` and `profiles.slug` are two independent UNIQUE
+    /// constraints on two tables, and each kind resolves its own only
+    /// (`profiles::resolve_token` for `/sub/{id}`, `sources::resolve_token`
+    /// for `/src/{id}`). The import must keep the two namespaces apart:
+    /// sharing a slug across the two kinds is legal, and collapsing them
+    /// into one "taken" set silently strips the profile's slug on a round
+    /// trip, repointing every client that was subscribed to `/sub/{slug}`
+    /// at `/sub/{id}`.
+    #[tokio::test]
+    async fn a_source_and_a_profile_may_hold_the_same_slug() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let lang = state.locales.default_lang();
+
+        // The DB itself allows one slug on both tables.
+        let now = models::now_ts();
+        let existing_source = models::Source {
+            id: models::new_id(),
+            slug: Some("main".into()),
+            name: "s0".into(),
+            url: "https://example.com/sub".into(),
+            enabled: true,
+            encoding: Encoding::Auto,
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 3600,
+            tags: None,
+            pipeline: None,
+            headers: None,
+            ip_family: None,
+            created_at: now,
+            updated_at: now,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        };
+        sources::create(&pool, &existing_source).await.unwrap();
+        let existing_profile = models::Profile {
+            id: models::new_id(),
+            slug: Some("main".into()),
+            access_token: None,
+            name: "p0".into(),
+            output_format: OutputFormat::UriList,
+            pipeline: None,
+            countries: Vec::new(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        profiles::create(&pool, &existing_profile).await.unwrap();
+
+        // Importing the same deployment again: every object collides
+        // with its own table's row, so nothing may keep a slug.
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![source("srcB0000000", "s1", Some("main"))],
+            profiles: vec![profile("p1", Some("main"), &["srcB0000000"])],
+        };
+        let summary = apply_import(&state, &lang, file).await.unwrap();
+        assert_eq!(summary.sources_created, 1);
+        assert_eq!(summary.profiles_created, 1);
+
+        let rows = profiles::list(&pool, false).await.unwrap();
+        let imported = rows.iter().find(|p| p.name == "p1").unwrap();
+        assert_eq!(
+            imported.slug, None,
+            "the profile collides with the stored profile of the same name-space"
+        );
+        let rows = sources::list(&pool, false).await.unwrap();
+        let imported = rows.iter().find(|s| s.name == "s1").unwrap();
+        assert_eq!(imported.slug, None, "collides with the stored source");
+
+        // A fresh deployment importing the same file: the source and the
+        // profile share a slug, and both must keep it, each in its own
+        // table.
+        let fresh = test_state().await;
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![source("srcA0000000", "s1", Some("main"))],
+            profiles: vec![profile("p1", Some("main"), &["srcA0000000"])],
+        };
+        apply_import(&fresh, &lang, file).await.unwrap();
+
+        let stored = profiles::get_by_slug(&fresh.pool, "main").await.unwrap();
+        assert!(
+            stored.is_some(),
+            "the profile must keep its slug: /sub/main would otherwise 404"
+        );
+        let stored = sources::get_by_slug(&fresh.pool, "main").await.unwrap();
+        assert!(stored.is_some(), "the source keeps its slug too");
     }
 
     /// A profile whose `sources` list names the same reference twice: the

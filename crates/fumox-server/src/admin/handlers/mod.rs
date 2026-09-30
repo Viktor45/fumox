@@ -397,22 +397,9 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         };
 
     // Unprobeable schemes (tuic/mieru stay `unknown` forever).
-    let unprobeable_schemes: Vec<&'static str> = Scheme::all()
-        .iter()
-        .filter(|scheme| !scheme.is_probeable())
-        .map(|scheme| scheme.as_str())
-        .collect();
-    let placeholders = vec!["?"; unprobeable_schemes.len()].join(", ");
-    let unprobeable_sql = format!("SELECT COUNT(*) FROM proxies WHERE scheme IN ({placeholders})");
-    let unprobeable = {
-        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(unprobeable_sql.as_str()));
-        for scheme in &unprobeable_schemes {
-            query = query.bind(scheme);
-        }
-        match query.fetch_one(pool).await {
-            Ok(count) => count,
-            Err(err) => return server_error(lang, &err),
-        }
+    let unprobeable = match unprobeable_count(pool).await {
+        Ok(count) => count,
+        Err(err) => return server_error(lang, &err),
     };
 
     // Ingest dynamics: proxies created per day over the last 7 days,
@@ -483,6 +470,29 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         },
         StatusCode::OK,
     )
+}
+
+/// Proxies of a scheme the probe cannot judge at all (tuic/mieru). The
+/// dashboard renders it as a sub-line of the "Never checked yet" card, so
+/// it counts the same population that card does: retired rows are excluded.
+/// The cleanup button moves exactly these rows to `removed`, and counting
+/// them anyway let the sub-line outgrow the headline it annotates (0 never
+/// checked, 300 unprobeable).
+async fn unprobeable_count(pool: &fumox_core::db::DbPool) -> Result<i64, fumox_core::Error> {
+    let unprobeable_schemes: Vec<&'static str> = Scheme::all()
+        .iter()
+        .filter(|scheme| !scheme.is_probeable())
+        .map(|scheme| scheme.as_str())
+        .collect();
+    let placeholders = vec!["?"; unprobeable_schemes.len()].join(", ");
+    let sql = format!(
+        "SELECT COUNT(*) FROM proxies WHERE status != 'removed' AND scheme IN ({placeholders})"
+    );
+    let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
+    for scheme in &unprobeable_schemes {
+        query = query.bind(scheme);
+    }
+    Ok(query.fetch_one(pool).await?)
 }
 
 /// Grouped health counters per scheme, largest bucket first (`scheme` is
@@ -1048,5 +1058,63 @@ mod tests {
         // The old FormMap behavior, for contrast: last value wins.
         let Query(map) = Query::<FormMap>::try_from_uri(&uri).expect("query parses");
         assert_eq!(map.get("status").map(String::as_str), Some("quarantine"));
+    }
+
+    /// The "unprobeable (tuic/mieru)" sub-line is rendered under the
+    /// "Never checked yet" headline, which counts `status != 'removed'`.
+    /// The cleanup button moves exactly these rows to `removed`, so
+    /// counting them anyway made the sub-line outgrow the number it
+    /// annotates: 0 never checked, 300 unprobeable.
+    #[tokio::test]
+    async fn unprobeable_count_excludes_rows_the_cleanup_button_retired() {
+        let dir =
+            std::env::temp_dir().join(format!("fumox-dash-test-{}", fumox_core::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = fumox_core::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        };
+        let pool = fumox_core::db::connect_pool(&cfg).await.unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+
+        let now = fumox_core::models::now_ts();
+        for i in 0..5 {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, host, port, status, created_at, updated_at)
+                 VALUES (?1, 'tuic', 'example.com', 443, 'unknown', ?2, ?2)",
+            )
+            .bind(format!("fp-tuic-{i}"))
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // A probeable scheme is never part of the sub-line.
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, host, port, status, created_at, updated_at)
+             VALUES ('fp-vless', 'vless', 'example.com', 443, 'unknown', ?1, ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(unprobeable_count(&pool).await.unwrap(), 5);
+
+        let retired = fumox_core::repo::proxies::remove_unprobeable_unknown(&pool)
+            .await
+            .unwrap();
+        assert_eq!(retired, 5);
+        // The headline the sub-line sits under is now 0 too, so the two
+        // can no longer disagree.
+        let never_checked: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(last_checked_at IS NULL), 0) FROM proxies
+                                WHERE status != 'removed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(never_checked, 1, "only the vless row is left unchecked");
+        assert_eq!(unprobeable_count(&pool).await.unwrap(), 0);
     }
 }

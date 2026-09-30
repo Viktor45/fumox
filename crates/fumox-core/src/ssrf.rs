@@ -184,6 +184,17 @@ pub async fn vet_probe_host_addrs(
         return Ok(vec![ip]);
     }
     let lookup = lookup_with_timeout(host, dns_timeout).await?;
+    vet_resolved_addrs(host, allow_private, lookup)
+}
+
+/// The policy and the per-host cap applied to one resolver answer list,
+/// split out of [`vet_probe_host_addrs`] so the cap can be tested against a
+/// recorded `getaddrinfo` ordering without live DNS.
+fn vet_resolved_addrs(
+    host: &str,
+    allow_private: bool,
+    lookup: Vec<IpAddr>,
+) -> Result<Vec<IpAddr>, String> {
     let mut addrs: Vec<IpAddr> = Vec::new();
     for ip in lookup {
         check_ip(ip, allow_private).map_err(|reason| format!("{host}: {reason}"))?;
@@ -194,8 +205,61 @@ pub async fn vet_probe_host_addrs(
     if addrs.is_empty() {
         return Err(format!("DNS resolution returned no addresses for {host}"));
     }
-    addrs.truncate(MAX_VETTED_ADDRESSES);
-    Ok(addrs)
+    Ok(cap_vetted(&addrs))
+}
+
+/// Cap a vetted address list at [`MAX_VETTED_ADDRESSES`] without letting the
+/// cap delete a whole address family.
+///
+/// A plain `truncate` is wrong here: `getaddrinfo` orders dual-stack answers
+/// IPv6-first and CDN-fronted names publish more AAAA records than A ones, so
+/// the window can close before the only A record — and the callers
+/// (`pick_vetted` with `IpFamily::Any`, which prefers IPv4 and falls back to
+/// the first address) then dial or pin a wrong-family address. One slot per
+/// family is therefore reserved first, and the remaining slots are filled in
+/// resolver order; the returned list is still at most
+/// [`MAX_VETTED_ADDRESSES`] long, so the per-candidate dial budget the cap
+/// exists to bound is unchanged.
+fn cap_vetted(addrs: &[IpAddr]) -> Vec<IpAddr> {
+    if addrs.len() <= MAX_VETTED_ADDRESSES {
+        return addrs.to_vec();
+    }
+    let mut keep = vec![false; addrs.len()];
+    let mut kept = 0usize;
+    let mut v4_reserved = false;
+    let mut v6_reserved = false;
+    for (i, ip) in addrs.iter().enumerate() {
+        if ip.is_ipv4() {
+            if v4_reserved {
+                continue;
+            }
+            v4_reserved = true;
+        } else {
+            if v6_reserved {
+                continue;
+            }
+            v6_reserved = true;
+        }
+        keep[i] = true;
+        kept += 1;
+        if kept == MAX_VETTED_ADDRESSES {
+            break;
+        }
+    }
+    for keep_i in keep.iter_mut() {
+        if kept == MAX_VETTED_ADDRESSES {
+            break;
+        }
+        if !*keep_i {
+            *keep_i = true;
+            kept += 1;
+        }
+    }
+    addrs
+        .iter()
+        .zip(keep)
+        .filter_map(|(ip, keep_i)| keep_i.then_some(*ip))
+        .collect()
 }
 
 /// Upper bound on the vetted addresses returned per host. DNS can resolve
@@ -204,8 +268,12 @@ pub async fn vet_probe_host_addrs(
 /// (T1) or one pinned entry in a meow batch config (T2) — without the cap
 /// one hostname stretches a whole probe cycle by
 /// `count × connect_timeout` (security review f9). Real frontends resolve
-/// to a handful of addresses; the tail beyond the cap adds
-/// attacker-amplified work, not reachability.
+/// to a handful of addresses, so the tail beyond the cap is dropped.
+///
+/// The bound is on the list, not on what a family may claim: the tail can
+/// hold the only address of a family the caller needs, so the tail is
+/// dropped in favour of the first address of each family, see
+/// [`cap_vetted`].
 const MAX_VETTED_ADDRESSES: usize = 4;
 
 /// Same policy as [`vet_probe_host_addrs`], discarding the resolved
@@ -479,6 +547,62 @@ mod tests {
             err.contains("DNS resolution failed"),
             "expected DNS resolution failed error, got: {err}"
         );
+    }
+
+    /// The per-host cap must not delete an address family.
+    ///
+    /// `getaddrinfo` orders dual-stack answers IPv6-first (RFC 6724
+    /// destination selection) and CDN-fronted names routinely publish more
+    /// AAAA records than A ones, so a cap that simply truncates the
+    /// combined list drops the only A record — and the probe callers then
+    /// pick (`IpFamily::Any`, which prefers IPv4 and falls back to the
+    /// first address) or pin a wrong-family address, or dial an IPv6
+    /// address the host cannot reach from this network.
+    #[test]
+    fn vetted_address_cap_keeps_both_families() {
+        let v4 = "142.251.153.119".parse::<IpAddr>().unwrap();
+        let v6s: Vec<IpAddr> = (1..=6)
+            .map(|i| format!("2606:4700:4700::{i:x}").parse().unwrap())
+            .collect();
+
+        // Six AAAA then one A, the ordering the resolver hands back.
+        let mut lookup = v6s.clone();
+        lookup.push(v4);
+        let vetted = vet_resolved_addrs("cdn.example.com", false, lookup).unwrap();
+        assert!(
+            vetted.len() <= MAX_VETTED_ADDRESSES,
+            "cap must still bound the dial budget, got {}",
+            vetted.len()
+        );
+        assert!(
+            vetted.contains(&v4),
+            "cap dropped the only A record, kept {vetted:?}"
+        );
+        assert_eq!(
+            pick_vetted(&vetted, IpFamily::Any),
+            Some(v4),
+            "the caller must still be able to pick the A record out of {vetted:?}"
+        );
+
+        // The mirror image: five A records then one AAAA.
+        let mut lookup: Vec<IpAddr> = (1..=5)
+            .map(|i| format!("93.184.216.{i}").parse().unwrap())
+            .collect();
+        let only_v6 = "2606:4700:4700::1111".parse::<IpAddr>().unwrap();
+        lookup.push(only_v6);
+        let vetted = vet_resolved_addrs("cdn.example.com", false, lookup).unwrap();
+        assert!(vetted.len() <= MAX_VETTED_ADDRESSES);
+        assert!(
+            vetted.contains(&only_v6),
+            "cap dropped the only AAAA record, kept {vetted:?}"
+        );
+        assert_eq!(pick_vetted(&vetted, IpFamily::Ipv6), Some(only_v6));
+
+        // Resolver order survives the cap within a family, and a list that
+        // already fits is returned untouched.
+        let short = vec![v6s[0], v4, v6s[1]];
+        let vetted = vet_resolved_addrs("small.example.com", false, short.clone()).unwrap();
+        assert_eq!(vetted, short);
     }
 
     #[test]

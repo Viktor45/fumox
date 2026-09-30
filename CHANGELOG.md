@@ -339,6 +339,263 @@ Defect fixes in the working tree, not yet on a published image.
   tunnel-verified proxy fell through to the `else`. Guarded by the
   admin-side assertion added next to the existing `/export/ready/`
   card check.
+- The admin panel's *Create from defaults* button could never work.
+  `is_writable` tested writability by opening the path for write,
+  which fails with `EISDIR` on a directory — and the handler hands it
+  `config/`, the directory, while the same call on the *file* path in
+  `admin/mod.rs` takes the missing-file branch and answers true. The
+  button's state and its handler disagreed about one question, so an
+  operator with no `config/app.toml` got a "not writable" error about
+  a directory the process could plainly write to. A directory is now
+  answered with the `create_new` probe the missing-file branch
+  already used. Guarded by
+  `is_writable_returns_true_for_writable_directory`.
+- The dedup key ignored TLS certificate pinning, so two nodes
+  differing only in the certificate they pin shared one key and the
+  second was overwritten by reconcile's `ON CONFLICT` — vanishing
+  from the database and from every subscription. `pinSHA256` is now in
+  `SECURITY_PARAMS`, and Clash's `fingerprint` is folded onto it so
+  the pin counts in either spelling; listing both keys instead would
+  have split a node published as Clash YAML from the same node
+  published as a URI. Guarded by `cert_pin_is_security_relevant`.
+- A vless proxy that arrived from a Clash YAML source was served to
+  sing-box clients as plaintext. mihomo spells the toggle `tls: true`
+  and the SNI `servername`; the sing-box writer's TLS decision read
+  only `security`/`sni`, matched neither, and emitted no `tls` object
+  at all — while the same proxy as a `vless://` URI encoded
+  correctly and the Clash writer kept both spellings. The decision now
+  reads an explicit `tls` toggle first and returns from it, so a
+  `tls: false` carrying a stray `servername` stays plaintext too.
+  Guarded by `vless_from_clash_input_keeps_tls_and_servername` and
+  `clash_tls_false_outranks_a_stray_servername`.
+- One malformed endpoint discarded every good one in an Xray
+  outbound. The `vnext` and `servers` builders returned `Err` from
+  inside their per-element loop, and the caller turned that into a
+  single `invalid` count without keeping the entries already built —
+  so a two-endpoint vless whose first user was valid and second was
+  not yielded zero entries. A bad element now costs only itself, and
+  `Err` is raised once after the loop, only when nothing at all was
+  built, so a fully malformed outbound is still counted `invalid`.
+  Guarded by `an_unusable_vnext_element_keeps_the_earlier_endpoints`
+  and `a_malformed_xray_server_element_keeps_the_earlier_endpoints`.
+- A Clash-sourced vless/vmess node was health-checked as plain TCP.
+  `t1::check_kind` decided TCP-vs-TLS from `security` alone, but the
+  Clash parser never emits that key — it stores `tls`/`servername` —
+  so a node with broken TLS was marked `alive` and served, while the
+  same node from a URI spelling was correctly walked to quarantine.
+  The verdict depended on which feed the node arrived in. The
+  decision now accepts both producer vocabularies, case-insensitively,
+  mirroring the Clash writer that already understood both. Guarded by
+  `clash_and_uri_spellings_agree_on_tls`.
+- An export→import round trip could silently strip a profile's slug.
+  `apply_import` seeded one `taken_slugs` set from both the sources
+  and the profiles tables and handed it to every object, but the two
+  slugs live in separate namespaces — independent `UNIQUE` columns on
+  two different tables, resolved per table. A source always claimed a
+  shared slug first, so the profile was written without one and its
+  `/sub/{slug}` URL became `/sub/{id}`, breaking every client already
+  pointed at it, with only a warning in the import summary. The claim
+  set is now per table. A comment in the same function naming
+  `/sub/{slug}` for both sides was wrong about the routes too, and is
+  corrected. Guarded by `a_source_and_a_profile_may_hold_the_same_slug`.
+- Opening a proxy card could wipe the country ingest had resolved.
+  The geo resolver needs only one backend to hit, so a host in the
+  Cloudflare block returned an ASN with no country, and both
+  `update_geo_full` — which bound all three columns unconditionally,
+  unlike every other writer in the tree — and the `ProxyRow` handed
+  to the template overwrote the stored facts with NULL. The card
+  showed `-` for a row the database still knew. The columns are now
+  `COALESCE`d like the reconcile upsert, and the call site merges the
+  stamp instead of replacing the row's fields with it. Guarded by
+  `update_geo_full_keeps_stored_facts_a_partial_stamp_cannot_replace`
+  and `a_partial_stamp_does_not_clear_the_rendered_geo_fields`.
+- The probe ladder editor accepted values the server refuses to boot
+  from. `i64_list_field` checked only that each line parsed as an
+  integer and that the list was non-empty, with no step cap and no
+  range check, while the canonical loader enforces at most 16 steps
+  each within a month and both binaries abort on a bad file. The
+  panel reported success and the next restart of `fumox-server` and
+  `fumox-probe` died on the file it had just written. The bounds are
+  now the loader's, and the test beside it pins that an accepted
+  ladder round trips through `config::load_config` while a rejected
+  one never reaches the file. Guarded by
+  `recheck_ladder_bounds_match_the_canonical_loader`.
+- A source's own `limit.count` capped the entire merged profile. When
+  a profile declared no explicit sort, the sort winner was a
+  *source's* compiled pipeline, and its `finalize` truncated the
+  merged cross-source vector — so a two-source profile whose first
+  source set `limit: {count: 2}` served 2 nodes instead of 5,
+  contradicting the comment above the code. Only a profile-level cap
+  now truncates the merged list. Behaviour change for operators: a
+  multi-source profile whose source set `limit.count` will now serve
+  more proxies than before, because each source's top is served up to
+  that count. Both guides' `limit` row now says so. Guarded by
+  `source_limit_does_not_truncate_the_other_sources`.
+- Two overlapping settings submissions silently lost one change while
+  both reported success. The editor's load → mutate → save ran
+  unsynchronised — the temp-file counter in `save` covered only the
+  rename half of the race — and the write button carries no
+  double-submit guard, so a double-click issued two POSTs and the
+  second rename published a document snapshotted before the first
+  landed. `EditableConfig` now holds a lock across the whole cycle,
+  released on drop. That lock is not reentrant, and the plain loader
+  must never take it: the admin handler re-reads through
+  `config::load_config` while the editor handle is alive, so a loader
+  that took it would hang the request and the panel would stop saving.
+  Both rules are pinned by a test. Guarded by
+  `overlapping_edits_do_not_lose_the_first_change`.
+- The same vmess node advertised as Clash YAML and as a `vmess://`
+  link got two fingerprints, two rows and two entries in every
+  subscription. `canonical_key` folds Clash's `network` onto `type`
+  to stop exactly that, but vmess's other spellings call the same
+  field `net`, a separate entry in `SECURITY_PARAMS`; the fold is
+  per-scheme now, onto `net` for vmess and `type` for the rest. The
+  alias test beside it only ever covered vless, whose URI spelling
+  really is `type`. Guarded by
+  `clash_and_uri_spellings_agree_for_vmess`.
+- A Clash socks5 entry carrying only `username` was stored as
+  `onlyuser` rather than `onlyuser:`, and both output writers guard
+  on `split_once(':')` — so the outbound carried no username and no
+  password and the authentication was lost silently. Credentials are
+  now joined positionally, with an absent field keeping its slot. The
+  leading slot is per-spec: socks5 keeps it, because both writers
+  treat an empty first part as absent, while shadowsocks does not,
+  because its writers default the method only on a colon-less
+  credential. Guarded by
+  `a_password_only_socks5_keeps_its_credential`.
+- Bulk revival enqueued the oldest proxies rather than the newest.
+  `enqueue_checks` claims in its comment that the newest ids win the
+  limit, but it walked the caller's id list in chunks oldest-first, so
+  the per-chunk `ORDER BY p.id DESC LIMIT ?` spent the whole limit on
+  the first 500 ids and everything above that was never considered. It
+  now chunks a descending-sorted, deduped copy, so chunking and
+  newest-wins can agree at all. Guarded by
+  `enqueue_prefers_the_newest_ids_across_chunk_boundaries`.
+- A permanently dead source was re-fetched every 30 seconds for the
+  life of the deployment. A failed fetch writes no timestamp — the
+  column is documented as *last successful fetch* and a test pins
+  that — and the scheduler read a NULL as due-now, with no failure
+  backoff anywhere, so a 401, a dead DNS name or a body that no longer
+  parses got the same cadence as a healthy source. The sweep now
+  applies an exponential backoff read from the fetch journal,
+  doubling from 60 s to a 3600 s cap, and consults the journal only
+  for sources whose recorded error class says the last attempt
+  failed, so a healthy source pays no extra query. Guarded by
+  `a_dead_source_is_not_refetched_on_every_sweep`.
+- The probe could lose the only address family a proxy was reachable
+  on. `vet_probe_host_addrs` truncated the vetted list to four before
+  the caller picked a family, and `pick_vetted` falls back to the
+  first address — so a CDN hostname publishing four or more AAAA
+  records had every working A record truncated away, and the probe
+  dialled, or pinned meow-rs to, an address it could not use. The cap
+  now reserves a slot for the first address of each family present.
+  The list is still at most four long, so the dial budget the cap
+  exists to bound is unchanged, and the fetcher path — which filters
+  by family before vetting — was never affected. Guarded by
+  `vetted_address_cap_keeps_both_families`.
+- Every T2 batch charged healthy TLS proxies a tunnel failure. The
+  pin substitutes the vetted IP into `server`, and `sni`/`servername`
+  is emitted only when the entry already carries it — the normal
+  shape of a `trojan://pass@example.com:443#n` line — so mihomo had
+  no name to verify the certificate against and fell back to the IP
+  literal, while the mapping deliberately does not force
+  `skip-cert-verify`. Pinning now carries the entry's own server
+  name, or failing that the pre-pin hostname, under the key the writer
+  reads for that scheme; an entry already hosted on an IP literal is
+  left alone. Guarded by
+  `pinning_keeps_a_tls_server_name_for_a_bare_entry`.
+- One probe cycle could charge a single dead proxy two failures. The
+  queued lane and the random lane run back to back and their
+  selectors overlapped completely — claiming a row only deletes the
+  queue row, it does not change the proxy's status — so the same proxy
+  could reach the ladder's limit in one cycle instead of across
+  three, and one that failed the queue lane and then passed the
+  random lane had its counter reset in the same breath. The queue lane
+  now hands its claimed ids to the random lane, which filters them
+  out of the draw; the overlap is closed in the probe rather than in
+  the core selectors it reads through. Guarded by
+  `queued_and_random_t1_lanes_do_not_double_charge_a_cycle`.
+- A client could pick its own rate-limit key, including on the admin
+  login brute-force cap, behind a `Forwarded`-emitting reverse proxy
+  that leaves `X-Forwarded-For` alone. `client_key` tried XFF first
+  and only fell through to `Forwarded` when XFF yielded nothing, and
+  `walk_xff` cannot tell a client-authored entry from a
+  proxy-appended one — so a forged header short-circuited the one the
+  proxy actually signed. An exhausted all-trusted chain in one header
+  is now evidence that the peer wrote that header, and the client
+  named by the other wins. The trade-off is documented rather than
+  hidden: when two proxies each write one header and they disagree,
+  requests share the per-deployment bucket (5 requests per 60 s by
+  default), the cost of not being able to tell which header the
+  deployment's proxy writes. Guarded by
+  `a_two_proxy_chain_writing_one_header_each_keeps_the_client_key`.
+- A profile with an access token could never be saved again. The
+  edit form re-renders the masked placeholder `abc…••••`, which the
+  token charset check rejects — and the error was raised before the
+  "unchanged mask keeps the stored secret" fixup, so the whole save
+  aborted with 422 and the profile's name, slug, output format,
+  country allowlist and source composition were all frozen. The mask
+  is now matched exactly, the rule the sources page already used for
+  header secrets, so a token the operator actually typed is validated
+  like any other value. Guarded by
+  `a_typed_bullet_is_not_mistaken_for_the_mask`.
+- Three admin screens answered `500` for a host the panel had
+  already admitted. The router gates on `[admin].allowed_hosts` but
+  builds the serve links against the separate `[server].allowed_hosts`,
+  and all three callers turned that rejection into an internal error —
+  so on a deployment that pins both lists, which is the reason both
+  exist, *Import / Export*, *Sources* and *Profiles* were
+  unreachable. The links are now built against the host that reached
+  the panel. Note that the link then carries the panel's own host, so
+  on a split allowlist it still 404s when the public listener is
+  clicked; that trade-off is documented in place of the 500.
+  Guarded by `serve_link_pages_render_for_an_admin_allowlisted_host`.
+- A cold render could be cached as fresh for a full source TTL after
+  an ingest. The generation counter exists so an invalidation drops a
+  rendering computed from pre-ingest rows, but the cold path stored
+  unconditionally and `invalidate_processed_for_source` could only
+  bump keys it found by iterating existing entries — so a key with no
+  entry yet, which is exactly an in-flight cold render, was invisible
+  to it. The cold path now claims the key before rendering and stores
+  through the same guarded put the stale path already used. Guarded by
+  `inline_render_started_before_an_ingest_does_not_store_its_rendering`.
+- `X-Fumox-Warning: all-proxies-quarantined` was sent for profiles
+  where nothing was quarantined. The predicate counted `ready` as a
+  hidden tier, contradicting the comment three lines above it, and
+  read the pre-filter population — so a `filter.protocols` (or ASN,
+  or drop-rule) filter that removed every ready proxy produced a
+  health warning. Only `quarantine` and `removed` count now: a
+  filter is a configuration fact, not a health one. Guarded by
+  `a_filter_that_hides_every_ready_proxy_is_not_a_quarantine_warning`.
+- A proxy the probe had already quarantined or removed kept being
+  served. `/sub` and `/src` stamp their cache entry with the source
+  fetch TTL, but the probe is a separate process that moves rows
+  between tiers and nothing in the server reacts to it — the only
+  ingest-time drop is gated on a fetch having changed something. The
+  window was therefore the feed-download interval: an hour by
+  default, up to 24 at the admin form's maximum. Rendered output is
+  now capped at 30 s of freshness, the same bound `alive_export`
+  already used for exactly this reason, and stale entries are still
+  served immediately while being re-rendered in the background.
+  Guarded by `rendered_output_is_not_fresh_for_a_whole_source_ttl`.
+- A pipe in a host or credential could move a fingerprint field
+  boundary. The pre-image joins its fields with a literal `|` and the
+  escaping rewrote only `%`, `&` and `=`, so two malformed feed lines
+  that both contained one collapsed into a single row and a node
+  vanished from the subscription — while the comment beside it
+  claimed the escaping made separators unforgeable. The separator is
+  escaped now, so the pre-image is injective in it, and the over-claim
+  is narrowed to what the code does: the scheme and the port are
+  written unescaped, one being a fixed enum literal and the other a
+  number by type. Guarded by
+  `pipe_in_a_field_cannot_shift_the_pre_image_boundary`.
+- The dashboard's "unprobeable (tuic/mieru)" sub-line could exceed
+  the "Never checked yet" headline it sits under. The sub-line
+  counted removed rows and the headline excluded them, so after
+  *Remove unprobeable unknown* the panel read 0 with 300 beneath it.
+  The sub-line now carries the headline's own population filter.
+  Guarded by
+  `unprobeable_count_excludes_rows_the_cleanup_button_retired`.
 
 ### Docs
 
@@ -396,6 +653,13 @@ Defect fixes in the working tree, not yet on a published image.
   real-`.mmdb` test says that its assertion also covers file age, so
   it goes red with "looks stale" once a developer's copies are a
   month old.
+- The pipeline tables in both guides described `limit.count` as
+  capping "the final, deduplicated and sorted list" on a source as well
+  as on a profile. A source-level cap applies to that source's own
+  proxies, before the merge — the behaviour the serving code's own
+  comment described, and the one this batch's `limit` fix made true —
+  so a multi-source profile serves each source's top up to that count,
+  i.e. more than `count` in total. Both tables now say which is which.
 
 ### Changed
 

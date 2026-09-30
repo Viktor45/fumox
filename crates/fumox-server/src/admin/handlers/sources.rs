@@ -26,9 +26,7 @@ use std::str::FromStr;
 /// total length 2–64.
 const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
 
-// ---------------------------------------------------------------------------
 // List
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, sqlx::FromRow)]
 struct SourceListRow {
@@ -139,9 +137,7 @@ pub async fn sources_list(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Form (create / edit)
-// ---------------------------------------------------------------------------
 
 /// Display/edit values of the source form (all as strings, as typed). The
 /// pipeline is carried by the widget HTML, not by these values.
@@ -473,7 +469,6 @@ async fn build_source_from_form(
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect();
-        // Tag caps: count and per-tag length.
         if list.len() > caps::TAGS {
             errors.push((
                 "tags".into(),
@@ -857,9 +852,7 @@ pub async fn source_update(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Card
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, sqlx::FromRow)]
 struct LogRow {
@@ -1052,9 +1045,7 @@ pub async fn source_log(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Actions
-// ---------------------------------------------------------------------------
 
 pub async fn source_toggle(
     State(state): State<AdminState>,
@@ -1267,9 +1258,7 @@ pub async fn source_delete(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Dry-run fetch
-// ---------------------------------------------------------------------------
 
 /// Dry-run result fragment: what a real fetch would see, without writing
 /// anything to the database.

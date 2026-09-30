@@ -37,23 +37,9 @@ fn num(value: i64) -> Value {
 /// Generate the full Clash config for one T2 batch, returning the YAML plus
 /// the ids of the rows actually included in it.
 ///
-/// Rows whose entry cannot be serialized are skipped (`None` from
-/// [`proxy_to_value`]) and their ids stay out of the returned list, the
-/// caller must journal them explicitly, otherwise the engine later answers
-/// "proxy not found" for them and the journal shows a misleading reason.
-///
-/// Listener ports are disabled (`0`): meow-rs only needs the proxy
-/// definitions to run delay tests. Proxy definitions come from the shared
-/// core mapping (the same one serving Clash subscriptions); the T2 policy
-/// on top is deterministic `fumox-{id}` names.
-///
-/// Certificate verification is **not** forced off here. Unlike T1, which
-/// only times a handshake, T2 builds a real authenticated tunnel and the
-/// generated YAML carries the proxy's own credential (uuid / password /
-/// `method:password`), so an unverified connection lets an on-path attacker
-/// impersonate the server and harvest it. `skip-cert-verify` is therefore
-/// emitted by the core mapping only for entries whose own parameters ask for
-/// it.
+/// Certificate verification is not forced off: T2 carries the proxy's own
+/// credential through the tunnel, so only entries whose own params ask for
+/// it get skip-cert-verify.
 pub fn generate(
     rows: &[ProxyRow],
     pins: &std::collections::HashMap<String, std::net::IpAddr>,
@@ -91,8 +77,8 @@ pub fn generate(
 /// pinning also carries the proxy's own hostname into the scheme's
 /// server-name param (see [`carry_server_name`]): the entry's `sni` /
 /// `servername` when it has one, its pre-pin host when it does not, which is
-/// what keeps certificate verification — never forced off here, see
-/// [`generate`] — pointed at the right name while the hostname itself never
+/// what keeps certificate verification (never forced off here, see
+/// [`generate`]) pointed at the right name while the hostname itself never
 /// enters the dial.
 fn proxy_to_value(
     row: &ProxyRow,
@@ -123,7 +109,7 @@ fn proxy_to_value(
 ///
 /// For trojan/hysteria2 the mapping reads `sni` alone. `servername` is
 /// listed second as a fallback the mapping itself would drop, since it
-/// emits no name at all for such a row — reading it is deliberate, see
+/// emits no name at all for such a row, reading it is deliberate, see
 /// [`carry_server_name`].
 fn server_name_sources(scheme: Scheme) -> Option<(&'static str, &'static [&'static str])> {
     match scheme {
@@ -133,23 +119,10 @@ fn server_name_sources(scheme: Scheme) -> Option<(&'static str, &'static [&'stat
     }
 }
 
-/// Leave the entry with exactly one server-name param, under the key
-/// `formats::clash` renders it, so a pinned row carries the same name the
-/// unpinned render of that row carries: the entry's own spelling,
-/// consulted in the mapping's own order and skipping values it would not
-/// copy (empty ones). When the entry names no server at all, the pre-pin
-/// host stands in — the case the pin exists for.
-///
-/// One case deliberately goes past that parity: a trojan or hysteria2 row
-/// spelling `servername` and no `sni` renders no name unpinned (the mapping
-/// reads `sni` alone there), and pinning turns that spelling into the `sni`
-/// mihomo reads rather than letting an IP literal stand in for the
-/// certificate name. See
-/// `pinning_supplies_a_sni_the_mapping_would_drop`.
-///
-/// A host that already is an IP literal is left alone: pinning it changes
-/// nothing and an IP is not a name any server certificate can be verified
-/// against.
+/// The entry keeps exactly one server-name param, under the key
+/// `formats::clash` renders it: its own spelling, else the pre-pin host.
+/// A trojan/hysteria2 spelling only `servername` becomes `sni`, which the
+/// mapping would drop.
 fn carry_server_name(entry: &mut ProxyEntry, pre_pin_host: &str) {
     let Some((key, sources)) = server_name_sources(entry.scheme) else {
         return;
@@ -428,8 +401,8 @@ mod tests {
         assert_eq!(proxies[1]["server"].as_str(), Some("203.0.113.10"));
     }
 
-    /// A pinned TLS entry with no `sni`/`servername` of its own — the shape
-    /// of a plain `trojan://pass@real.example.com:443` feed line — used to
+    /// A pinned TLS entry with no `sni`/`servername` of its own, the shape
+    /// of a plain `trojan://pass@real.example.com:443` feed line, used to
     /// be emitted as `server: <vetted ip>` and nothing else, so mihomo had
     /// no name to verify the certificate against while verification itself
     /// stayed on (T2 never forces `skip-cert-verify`). The pre-pin hostname

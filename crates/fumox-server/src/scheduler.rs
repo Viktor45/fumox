@@ -40,7 +40,7 @@ const FAILURE_BACKOFF_BASE_SECS: i64 = 60;
 /// for a source that quietly recovered.
 const FAILURE_BACKOFF_MAX_SECS: i64 = 3_600;
 
-/// How many journal rows one source's failure history is read from — enough
+/// How many journal rows one source's failure history is read from: enough
 /// to reach the backoff ceiling, the journal is retention-bounded anyway.
 const FAILURE_HISTORY_ROWS: i64 = 8;
 
@@ -63,13 +63,13 @@ fn failure_backoff_secs(consecutive_failures: u32) -> i64 {
 }
 
 /// Whether a source is due for a fetch at `now`: its ordinary TTL cadence,
-/// and — when its last attempt failed — only once the backoff has elapsed.
+/// and, when its last attempt failed, only once the backoff has elapsed.
 ///
 /// The TTL check alone is not enough. `last_fetched_at` is documented as the
 /// last *successful* fetch and a failure leaves it NULL, so a source that
 /// never worked (or whose feed broke) is due on every single sweep: one
 /// upstream request per [`SWEEP_INTERVAL`] for the whole lifetime of the
-/// deployment. A source that once succeeded is no better off — the old
+/// deployment. A source that once succeeded is no better off: the old
 /// stamp stays, and `now - ts >= ttl` keeps holding once it expires.
 fn is_due(source: &Source, now: i64, history: Option<&FailureHistory>) -> bool {
     let ttl_due = match source.last_fetched_at {
@@ -96,7 +96,7 @@ fn is_due(source: &Source, now: i64, history: Option<&FailureHistory>) -> bool {
 }
 
 /// Read the recent attempts of one source, or `None` when the journal holds
-/// nothing for it (never fetched, or every row was purged by retention) —
+/// nothing for it (never fetched, or every row was purged by retention):
 /// the caller then falls back to the plain TTL cadence.
 async fn failure_history(pool: &DbPool, source_id: &str) -> Option<FailureHistory> {
     let rows = fetch_log::recent_for_source(pool, source_id, FAILURE_HISTORY_ROWS)
@@ -201,7 +201,7 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // A sweep drains its whole JoinSet, so a slow source would otherwise
     // hold the loop for the length of that fetch and park a *Refresh now*
-    // behind it — the refresh would not even be marked in flight, and the
+    // behind it: the refresh would not even be marked in flight, and the
     // status fragment the panel polls would report the previous fetch as
     // the finished one. The sweep therefore runs detached, and this flag
     // keeps two sweeps from overlapping.

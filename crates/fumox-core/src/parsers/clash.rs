@@ -384,8 +384,8 @@ proxy-groups:
 
     /// `credential_fields` are joined positionally, so an absent field
     /// must keep its empty slot. A socks5 item carrying only `username`
-    /// was stored as `onlyuser`, a string the output writers — which
-    /// split on `:` — read as no credentials at all.
+    /// was stored as `onlyuser`, a string the output writers read as no
+    /// credentials at all, because they split on `:`.
     #[test]
     fn an_absent_credential_field_keeps_its_slot() {
         let yaml =

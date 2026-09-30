@@ -213,11 +213,11 @@ Notes:
 > **Behind a reverse proxy, two config keys must be set** for both the
 > `/sub` clients and the admin panel to behave correctly:
 >
-> - `[server].trust_proxy_ips` / `[admin].trust_proxy_ips` — the proxy's
+> - `[server].trust_proxy_ips` / `[admin].trust_proxy_ips`: the proxy's
 >   CIDR (`["127.0.0.1/32"]` for nginx on the same host). Without this,
 >   the per-IP rate limit collapses to one budget because every request
 >   arrives from the proxy's IP.
-> - `[server].allowed_hosts` / `[admin].allowed_hosts` — your public
+> - `[server].allowed_hosts` / `[admin].allowed_hosts`: your public
 >   hostname (`["fumox.example.com"]`). Without this, the `Host` header is
 >   trusted as-is: an attacker that can poison the `Host` reaching the
 >   listener can render admin URLs and the alive/ready export endpoints
@@ -233,7 +233,7 @@ Notes:
 > `[server].allowed_hosts` to a public domain but reach the panel on
 > its own loopback address (`http://127.0.0.1:8081/admin`, what
 > Compose ships), the link is built as `http://127.0.0.1:8080/...` and
-> the public listener answers it `404` — it does not serve that host.
+> the public listener answers it `404`: it does not serve that host.
 > Either reach the panel on the same hostname the public list allows,
 > or add `127.0.0.1` to `[server].allowed_hosts` as well.
 - The SQLite database lives in the `fumox-data` volume. `./config` is mounted
@@ -241,7 +241,7 @@ Notes:
   settings* page can save `app.toml`; set `FUMOX_CONFIG_ACCESS=ro` to pin it
   read-only instead (the edit page then renders read-only). The probe
   container always mounts it `:ro`. Under Compose the GeoLite2 databases do
-  **not** live there — see [section 11](#11-geo-enrichment).
+  **not** live there, see [section 11](#11-geo-enrichment).
 - meow-rs publishes no official Docker image, so the small wrapper
   (`docker/meow/Dockerfile`) around the release binary is either pulled
   ready-made from GHCR or built in `--build` mode; it is published manually
@@ -525,7 +525,7 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 | **Fetch log**       | Journal of every source fetch: time, status, bytes, proxies found, error class                                                                                                                        |
 | **Probe**           | Health-check daemon status: heartbeat, meow-rs status, quarantine queue with scheduled second chances                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
-| **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels — nearly every `config/app.toml` knob, and never the admin token. Two keys are file-only and have no field on the page: `[server].export_max_rows` and `[geo].startup_download_budget_secs`; the file values still apply, the panel just cannot show or edit them. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
+| **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels: nearly every `config/app.toml` knob, and never the admin token. Two keys are file-only and have no field on the page: `[server].export_max_rows` and `[geo].startup_download_budget_secs`; the file values still apply, the panel just cannot show or edit them. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
 
 ### Times and timezones
 
@@ -564,14 +564,14 @@ token:
 
 Both links are snapshots, not live views, and are bounded twice:
 
-- **At most 50 000 rows per body** — the shipped value of
+- **At most 50 000 rows per body**, the shipped value of
   `[server].export_max_rows`. Unlike `/sub` and `/src`, the exports
   have no per-source or per-profile limit of their own, so a very large
   pool would otherwise turn one download into an unbounded read and an
   unbounded file. Raise the key when your tier is bigger. The cut takes
   the oldest rows (lowest ids) and the `nodes count` header reports how
   many the body really carries, so a truncated download says so. The
-  live counts next to the links are **not** capped — they show the real
+  live counts next to the links are **not** capped: they show the real
   size of each tier, which is how you see that the export is smaller
   than the pool.
 - **Cached for 30 seconds.** A burst of downloads inside one window is
@@ -583,7 +583,7 @@ Both links are snapshots, not live views, and are bounded twice:
   other trade-off is staleness: a proxy that dies can still appear in a
   body for up to 30 seconds after the change. A download is a snapshot
   by definition, and an outdated one served quietly is worse than a
-  slightly slower request — an expired body is re-rendered, never
+  slightly slower request: an expired body is re-rendered, never
   handed out stale.
 
 Because the two tiers do not overlap, a `ready` proxy appears only in
@@ -633,15 +633,16 @@ Three layers, later wins:
    FUMOX_MEOW__API_ADDR=meow:9090     # [meow] api_addr
    ```
 
-   Env overrides outrank the file at every leaf — `String`, `bool`, integers
+   Env overrides outrank the file at every leaf: `String`, `bool`, integers
    and `SocketAddr` accept the env value as-is. `Vec<String>` overrides need
    a JSON array (e.g. `FUMOX_SERVER__TRUST_PROXY_IPS='["10.0.0.0/8"]'`),
    not a comma-separated string, except where a custom deserializer is
    wired in (e.g. `[meow].test_url`, which accepts both).
 
 The annotated reference file shipped with the repo is
-[`config/app.toml`](./config/app.toml). Below is the same information in table
-form.
+[`config/app.toml`](./config/app.toml). The table below lists the built-in
+defaults from `crates/fumox-core/src/config.rs`; `config/app.toml` ships
+tuned values that differ for some keys.
 
 ### `[server]` – public listener
 
@@ -681,15 +682,15 @@ form.
 | --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `refresh_check_limit` | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue)                                                                                                       |
 | `drop_gate`           | `false` | Drop-rules gate on the alive-linger. `true`: an alive proxy of a source with `drop` rules leaves on the next refresh once a rule catches it; `false`: every source lingers, the probe alone retires proxies |
-| `removed_as_unknown`  | `false` | Revive a `removed` proxy the feed still carries: the row resets to the pristine `unknown` state (fail count and quarantine fields cleared) and walks the checks again, joining the priority queue. `false`: `removed` stays terminal — the only ways back are the admin "reset status" action (which only bites on a row the probe can still reach, see below) or «purge removed» plus a re-insert |
+| `removed_as_unknown`  | `false` | Revive a `removed` proxy the feed still carries: the row resets to the pristine `unknown` state (fail count and quarantine fields cleared) and walks the checks again, joining the priority queue. `false`: `removed` stays terminal: the only ways back are the admin "reset status" action (which only bites on a row the probe can still reach, see below) or «purge removed» plus a re-insert |
 
 ### `[geo]` – geo enrichment
 
 | Key                 | Default     | Meaning                                                    |
 | ------------------- | ----------- | ---------------------------------------------------------- |
 | `enabled`           | `true`      | Master switch                                              |
-| `db`                | `"country"` | Legacy key from the one-database era; kept so existing configs parse, no longer affects resolution — all databases in `db_dir` are merged |
-| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`. Under Docker Compose the shipped stack overrides this to `/shared` (the `meow-shared` volume) via `FUMOX_GEO__DB_DIR`, so `./config` on the host is **not** scanned for databases — put them in the `meow-shared` volume, or unset the override. Env outranks the file, which is why editing `db_dir` in `config/app.toml` has no effect on the Compose stack |
+| `db`                | `"country"` | Legacy key from the one-database era; kept so existing configs parse, no longer affects resolution; all databases in `db_dir` are merged |
+| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`. Under Docker Compose the shipped stack overrides this to `/shared` (the `meow-shared` volume) via `FUMOX_GEO__DB_DIR`, so `./config` on the host is **not** scanned for databases: put them in the `meow-shared` volume, or unset the override. Env outranks the file, which is why editing `db_dir` in `config/app.toml` has no effect on the Compose stack |
 | `cache_max_entries` | `16384`     | Host→geo cache size                                        |
 | `dns_timeout_secs`  | `5`         | DNS resolution timeout                                     |
 | `startup_download_budget_secs` | `60` | How long startup waits for the GeoLite2 download before it starts listening. Past the budget the download keeps running in the background (the file is installed by an atomic rename, so a half-written `.mmdb` is never visible) and this run serves without geo enrichment until the next start. `0` = do not wait at all |
@@ -705,7 +706,7 @@ form.
 | `allow_private_urls` | `false`            | SSRF guard: when false, source URLs may not resolve to loopback, RFC1918, link-local or cloud-metadata addresses (checked at save *and* at every fetch)                            |
 | `rate_limit`         | `"120/min"`        | Per-IP limit for admin routes                                                                                                                                                        |
 | `login_rate_limit`   | `"5/min"`          | Per-IP limit for the login form                                                                                                                                                      |
-| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy. Plain-HTTP deployments must keep it `false` — browsers silently drop `Secure` cookies on `http://`, which looks like a successful login (`admin logged in` in logs) followed by a permanent redirect to `/admin/login`. Override per-deploy with `FUMOX_ADMIN__SECURE_COOKIES=true` in `.env` (env wins over the file). |
+| `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy. Plain-HTTP deployments must keep it `false`: browsers silently drop `Secure` cookies on `http://`, which looks like a successful login (`admin logged in` in logs) followed by a permanent redirect to `/admin/login`. Override per-deploy with `FUMOX_ADMIN__SECURE_COOKIES=true` in `.env` (env wins over the file). |
 | `trust_proxy_ips`    | `[]`               | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the admin per-IP rate-limit and rendered URL scheme. Empty = never trust forwarded headers                   |
 | `allowed_hosts`      | `[]`               | Hostnames / IPs allowed to reach the admin listener. Empty = accept any `Host` value. Set this when serving the admin from a fixed domain name (e.g. reverse-proxied to `fumox.local`) |
 | `locales_dir`        | `"locales"`        | Directory with UI translation catalogs (`<code>.toml`)                                                                                                                               |
@@ -803,7 +804,7 @@ deduplicate by fingerprint". `"version": 1` is required.
 | `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`                                                                            |
 | `dedup`  | Deduplication                                                | `by`: only `"fingerprint"` in v1                                                                                                   |
 | `sort`   | Output ordering                                              | `by`: `source` \| `name` \| `country` \| `latency` (null latencies go last); `desc`: default `false`                               |
-| `limit`  | Cap the output size                                          | `count`: integer ≥ 1 — on a source, at most this many of that source's own proxies, before the merge with the profile's other sources; on a profile, at most this many proxies of the final, deduplicated and sorted list (its top). A source's cap does not limit a multi-source profile: it serves each source's top up to that count, i.e. more than `count` proxies in total; `null`/omitted = no cap |
+| `limit`  | Cap the output size                                          | `count`: integer ≥ 1, on a source at most this many of that source's own proxies before the merge with the profile's other sources; on a profile, at most this many proxies of the final, deduplicated and sorted list (its top). A source's cap does not limit a multi-source profile: it serves each source's top up to that count, i.e. more than `count` proxies in total; `null`/omitted = no cap |
 
 Validation is strict: unknown keys, a non-compiling regex or an invalid enum
 value are rejected with a field error in the admin form; nothing is saved.
@@ -935,8 +936,8 @@ The rules in plain language:
 - **Reset status only resets what the probe can pick up.** It puts the row
   back to a pristine `unknown` and hands it to the priority queue, so it only
   does anything for a proxy the probe will actually look at. For a row that
-  belongs to no probe lane — no link to any source left, or a scheme no lane
-  checks (`tuic`, `mieru`) — the panel says so and leaves the status exactly
+  belongs to no probe lane (no link to any source left, or a scheme no lane
+  checks (`tuic`, `mieru`)), the panel says so and leaves the status exactly
   as it is; the badge does not change. The link is what puts a row in front of
   the probe, and reconciliation drops it on the next refresh, so re-insert the
   proxy through a source (or *Purge removed* and let the next fetch carry it)
@@ -983,7 +984,7 @@ state machine: the table above, plus `[server]`, `[database]`, `[geo]`,
 `[admin]` and `[log]` panels (rate limits in the canonical `N/unit` form,
 response caps human-readable, the legacy `[geo].db` marked as ignored). The
 admin token is never shown. Two keys are also absent from the page for a
-different reason — they have no rendered field at all: `[server].export_max_rows`
+different reason; they have no rendered field at all: `[server].export_max_rows`
 and `[geo].startup_download_budget_secs`. Both apply from the file exactly as
 documented; only the panel skips them, so read their values from
 `config/app.toml`.
@@ -993,9 +994,9 @@ documented; only the panel skips them, so read their values from
 The overview links to `/admin/settings/edit`, a form-based editor backed by
 [`toml_edit`](https://crates.io/crates/toml_edit) that writes the file in
 place. Comments you wrote into `config/app.toml` (RU/EN pairs, banners,
-hints — every `#…` line) survive every save because the editor operates on
+hints, every `#…` line) survive every save because the editor operates on
 the parsed document, not a regenerated one. Sections are grouped by owning
-process (Server / Probe / Shared) via CSS-only `<input type="radio">` tabs —
+process (Server / Probe / Shared) via CSS-only `<input type="radio">` tabs,
 no JavaScript required.
 
 Editing is **restart-required**: the panel saves the file, but server and
@@ -1006,7 +1007,7 @@ existing figment merge, so a transient ENV override is still the right
 tool for one-off adjustments.
 
 Rotating `[admin].token` or flipping `[admin].secure_cookies` invalidates
-every active session on the next request — the panel reads the new value
+every active session on the next request; the panel reads the new value
 on startup, so cookies signed under the old token stop verifying and
 existing users get signed out without notice. Plan such changes for a
 quiet window, and warn anyone who is logged in.
@@ -1026,7 +1027,7 @@ The editor is intentionally narrow on safety:
   red field messages (`422`); nothing is written until every field is
   valid. `bind` changes are checked with `SocketAddr::from_str`, the
   recheck ladder is parsed as `Vec<i64>`, rate limits as `<N>/<unit>`.
-- The admin token field is a plain input — sending the empty string
+- The admin token field is a plain input; sending the empty string
   keeps the current token (used by the encrypted digest over the
   session cookie) so the panel never silently disables itself.
   Changing the token invalidates every active session the next request.
@@ -1056,7 +1057,7 @@ throughput:
 
 | Knob | Effect | When to touch |
 |------|--------|--------------|
-| `[probe].sample_size` | Rows a cycle takes from the queue, before concurrency. | First lever — main throughput control. |
+| `[probe].sample_size` | Rows a cycle takes from the queue, before concurrency. | First lever, the main throughput control. |
 | `[probe].concurrency` | Parallel checks *within* a cycle. | Only when one cycle no longer fits `cycle_interval_secs`. |
 | `[probe].cycle_interval_secs` | How often a new cycle starts. | Tighten only after `sample_size` is already large. |
 
@@ -1075,14 +1076,14 @@ It is the reason a big queue is not by itself a backlog: a row
 quarantined a minute ago is not due for another 12–16 h, so no cycle can
 retire it and no setting on that page changes it.
 
-`lane` sizes the quarantine lane only — the one lane that retires queue
+`lane` sizes the quarantine lane only, the one lane that retires queue
 rows. A cycle also awaits the queued-checks, T1 sample and T2 batch
 lanes, and the estimate deliberately does not claim their work. `period`
 takes a `max` because the daemon's ticker skips missed ticks: a lane
 longer than the interval pushes the next start out by the work.
 
-When `retire_per_cycle` is 0 — usually because the second-chance window
-has not elapsed yet, or because `sample_size` is 0 — the cycle picks up
+When `retire_per_cycle` is 0, usually because the second-chance window
+has not elapsed yet or because `sample_size` is 0, the cycle picks up
 nothing and there is no drain to estimate. The banner then reports what
 the cycle took and how much is due, instead of a figure it does not
 have. At `sample_size = 0` the two sample-proportional triggers stay off
@@ -1097,8 +1098,8 @@ Two assumptions the figure rests on:
   improvement, not a promise to hit the target.
 
 If `drain_minutes` exceeds `[probe].backlog_target_drain_minutes`
-(default 60), the banner suggests — each one only when it can be shown
-to help, and evaluated in sequence so the whole set is consistent when
+(default 60), the banner suggests values; each one is offered only when it
+can be shown to help, and evaluated in sequence so the whole set is consistent when
 applied together:
 
 - `sample_size`, capped at both 500 and the number of rows actually due
@@ -1106,18 +1107,18 @@ applied together:
   `due_count > sample_size` plus a 20 % margin over the current value;
 - `concurrency`, only when the modelled lane exceeds the interval; the
   value is the smallest `c ≤ 64` that brings the lane back inside it
-  **at the sample size in effect, or the one just recommended** — the
+  **at the sample size in effect, or the one just recommended**: the
   two recommendations are chained, so applying both keeps the cycle on
   schedule;
 - `cycle_interval_secs`, only when the shortened period still fits the
-  modelled lane, and never below 5 s — the same floor the daemon puts on
+  modelled lane, and never below 5 s, the same floor the daemon puts on
   its own beat period, so the banner never advises running the cycle
   faster than the cadence it considers sane.
 
 **What does not help with backlog.** `fail_limit`, `recheck_delays_secs`,
 `second_chance_min_hours`, `second_chance_spread_hours`,
 `queue_stale_days`, and the `[meow]` backoff are all about *inflow*
-or external services — they cannot drain an existing queue faster.
+or external services; they cannot drain an existing queue faster.
 They are still useful for keeping new failures from piling up, but
 treat them as inflow controls, not throughput controls.
 
@@ -1129,7 +1130,7 @@ treat them as inflow controls, not throughput controls.
 |------------:|-------------:|-------:|------:|--------|
 | 800 | 50 | 140 s | 38 min | warning: `due_overflow`; the drain fits the target, so no recommendations |
 | 4 000 | 50 | 140 s | 187 min | warning + `sample_size = 156` + `concurrency = 52` |
-| 10 000 | 50 | 140 s | 467 min | warning + `sample_size = 389`, no concurrency rec — even at 64 the 389-row lane needs 980 s |
+| 10 000 | 50 | 140 s | 467 min | warning + `sample_size = 389`, no concurrency rec, even at 64 the 389-row lane needs 980 s |
 | 100 000 | 50 | 140 s | 4 667 min | warning + `sample_size = 500` (capped), no concurrency rec, likewise |
 
 At `backlog_target_drain_minutes = 15` the 4 000-row queue asks for the
@@ -1157,7 +1158,7 @@ Manual installation (e.g. with your own MaxMind license) goes like this:
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/).
 3. Place the file into `[geo].db_dir` under its canonical name:
    `GeoLite2-City.mmdb` or `GeoLite2-ASN.mmdb`. The default is `config/` next
-   to the binary, which is the host's `./config` under Compose — **but the
+   to the binary, which is the host's `./config` under Compose, **but the
    shipped Compose stack overrides `[geo].db_dir` to `/shared`**, so a file
    dropped in `./config` is never read there. Under Compose, put the `.mmdb`
    into the `meow-shared` volume (`/shared`), or drop the `FUMOX_GEO__DB_DIR`
@@ -1176,11 +1177,11 @@ Fumox fetches the databases itself: at startup the server checks
 `[geo].db_dir` and downloads any GeoLite2 database that is missing, broken
 or older than a month from a public release mirror. It waits at most
 `[geo].startup_download_budget_secs` (60 s) for that to finish before it
-starts serving; a slower mirror does not keep the service down — the
+starts serving; a slower mirror does not keep the service down: the
 download carries on in the background and takes effect on the next start.
 
 **Name templates.** The `geo.template` pipeline setting (default
-`"{flag} {country} · {name}"`) supports these placeholders — all of them
+`"{flag} {country} · {name}"`) supports these placeholders; all of them
 work in one template at the same time, each drawing on its own database:
 
 | Placeholder | Meaning                               | Data source              |
@@ -1243,7 +1244,7 @@ stored.
       `[admin].allowed_hosts` to the hostname the proxy serves (e.g.
       `["fumox.example.com"]`). Without it, the `Host` header is
       honored as-is for the alive/ready export token URLs and the
-      rendered admin URLs — an attacker who can poison the `Host`
+      rendered admin URLs, so an attacker who can poison the `Host`
       header reaching the listener can make the admin render URLs
       pointing at attacker-controlled hosts and steal the capability
       token. Set this on every deployment served from a fixed hostname.
@@ -1253,8 +1254,10 @@ stored.
       Export*, *Sources* and *Profiles* is built from the host you
       reached the panel on, and the public listener answers `404` for a
       host it does not serve. Those three screens themselves render.
-- [ ] `allow_private_urls` left `false` (SSRF protection), unless you have a
-      specific trusted-internal-source reason.
+- [ ] `allow_private_urls` set to `false` (the built-in default, SSRF
+      protection). The shipped `config/app.toml` example sets it to `true`,
+      so change it unless you have a specific trusted-internal-source
+      reason. The same holds for `[probe].allow_private_targets`.
 - [ ] One `fumox-server` + one `fumox-probe` against the same database file;
       `busy_timeout_ms` stays set.
 - [ ] meow-rs runs as its own long-lived service (systemd unit / container
@@ -1298,7 +1301,7 @@ WantedBy=multi-user.target
 | `X-Fumox-Stale: true` header                                          | Some sources are temporarily unreachable; last good data is being served. The fetch log shows which sources and why (`error_class`).               |
 | Source shows `parse_error`                                            | The source returned HTTP 200 but unparseable content (anti-bot page, CDN stub, format change). The last good snapshot is served meanwhile.         |
 | Source won't save: "private URL" error                                | The URL resolves to a loopback/private address and `allow_private_urls` is false. That's the SSRF guard working.                                   |
-| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`. Under Compose the directory is `/shared`, not `./config` — see [section 11](#11-geo-enrichment).    |
+| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`. Under Compose the directory is `/shared`, not `./config`, see [section 11](#11-geo-enrichment).    |
 | *Import / Export*, *Sources* or *Profiles*: export link 404s         | The link is built from the panel's host; the public listener answers `404` for a host it does not serve. Add it to `[server].allowed_hosts`.     |
 | GeoLite2 file placed in `./config` is ignored                          | The Compose stack sets `FUMOX_GEO__DB_DIR=/shared`, and the environment outranks `config/app.toml`. Use the `meow-shared` volume, or remove the override and set `[geo].db_dir`. |
 | T2 checks never run, probe logs mention meow backoff                  | meow-rs is down or `[meow].api_addr` is wrong. In Docker, it must be `meow:9090`; the config path must be the shared volume (`/shared/meow.yaml`). |
@@ -1310,5 +1313,5 @@ WantedBy=multi-user.target
 
 | Document                                                      | Contents                                          |
 | ------------------------------------------------------------- | ------------------------------------------------- |
-| [`README.md`](./README.md) / [`README.ru.md`](./README.ru.md) | Project overview, name story, minimal quick start |
+| [`README.md`](./README.md) / [`README.ru.md`](./README.ru.md) | Project overview, minimal quick start                      |
 | [`config/app.toml`](./config/app.toml)                        | Annotated reference configuration                 |

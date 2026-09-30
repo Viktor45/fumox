@@ -584,26 +584,9 @@ impl CompiledPipeline {
         out
     }
 
-    /// Discard entries matching the `drop` rules (ingestion side
-    /// step 3): a matching proxy is never stored, reconciled, geo-resolved
-    /// or queued for probing. Only the drop step runs here, the pipeline's
-    /// other sections are serving-side by design (a profile may override
-    /// them, but profiles never take part in ingestion), and the drop
-    /// selectors must see the original values exactly as the serving-side
-    /// pass does.
-    ///
-    /// `geo` carries the resolved ASN stamps parallel to `entries`; ASN-
-    /// targeted rules consult this slice and a missing stamp is never a hit
-    /// (matches `filter.exclude_asns` semantics). A slice shorter than
-    /// `entries` is legal — the caller resolves no stamps at all when the
-    /// geo resolver is inactive (geo disabled, or the `.mmdb` files absent),
-    /// the default configuration — so every entry past the end of the slice
-    /// counts as unstamped and survives, exactly like
-    /// `reconcile_source`'s own `geo.get(idx)` lookup. Zipping the two
-    /// slices would instead truncate the batch to the shorter one and make
-    /// the ingest pass reconcile an empty source.
-    /// The caller resolves geo before calling this so the
-    /// function itself does not need to be async.
+    /// Drop rules only, on the same pre-rename values the serving pass sees.
+    /// `geo` may be shorter than `entries` (inactive resolver): unstamped
+    /// entries survive, zipping the two would truncate the batch.
     pub fn drop_entries(
         &self,
         entries: Vec<ProxyEntry>,
@@ -1622,7 +1605,7 @@ mod tests {
     #[test]
     fn drop_entries_keeps_the_batch_when_the_geo_slice_is_short() {
         // The resolver is inactive (geo disabled, or the `.mmdb` files are
-        // missing on disk — the default configuration), so the ingest
+        // missing on disk, the default configuration), so the ingest
         // caller resolves no stamps at all and passes an empty slice. The
         // batch must survive intact: a truncated zip would drop every
         // proxy and make reconcile retire the whole source.

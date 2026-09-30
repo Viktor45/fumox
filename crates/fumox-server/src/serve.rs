@@ -37,8 +37,8 @@ use std::time::Duration;
 /// Upper bound on how long a rendered subscription body is served from the
 /// processed cache as fresh, in seconds.
 ///
-/// A source TTL answers a different question — how often to re-download the
-/// upstream feed — and the admin form accepts up to a day. Health is owned by
+/// A source TTL answers a different question: how often to re-download the
+/// upstream feed, and the admin form accepts up to a day. Health is owned by
 /// another process: `fumox-probe` moves rows between tiers, and the server
 /// only hears about it when the next ingest invalidates the rendering. Left
 /// unbounded, a node the probe just retired keeps being served for a whole
@@ -131,23 +131,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Per-IP rate limiting for the public listener: every request that reaches
-/// this middleware counts against the generous
-/// `[server].rate_limit`; a 403 (failed access-token check) additionally
-/// counts against the strict `[server].auth_fail_rate_limit`, and once that
-/// window is exhausted the endpoint answers 429 instead. Requests without
-/// connect info (unit tests, embedded runtimes) pass through uncounted.
-///
-/// Not every public route is behind this middleware: `main.rs` adds
-/// `/healthz` with `.route()` on the router this layer was already applied
-/// to, so a health check is never answered with 429 however busy the peer
-/// is (an orchestrator probe must not share a budget with subscriber
-/// downloads).
-///
-/// The listener installs `into_make_service_with_connect_info::<SocketAddr>()`,
-/// which stores the peer address as `ConnectInfo<SocketAddr>`, reading the
-/// bare `SocketAddr` here would silently match nothing and disable the whole
-/// limiter (regression fixed 2026-09-11).
+/// Per-IP limiting: every request counts against `[server].rate_limit`, a 403
+/// additionally against `[server].auth_fail_rate_limit`, and an exhausted
+/// window answers 429. Requests without `ConnectInfo<SocketAddr>` pass
+/// uncounted.
 async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(connect) = req.extensions().get::<ConnectInfo<SocketAddr>>().cloned() else {
         return next.run(req).await;
@@ -329,7 +316,7 @@ async fn serve_src(
 /// [`Caches::begin_inline_render`]). A superset of what the render actually
 /// touches is fine: the render skips disabled or vanished members itself.
 ///
-/// Only consulted on a cache miss — the resolution is a second, indexed read
+/// Only consulted on a cache miss: the resolution is a second, indexed read
 /// that a cache hit never pays.
 async fn member_source_ids(state: &AppState, profile_id: &str) -> Vec<String> {
     match profiles::get_sources(&state.pool, profile_id).await {
@@ -1765,7 +1752,7 @@ mod tests {
 
     /// Health is owned by another process: the probe daemon moves rows
     /// between tiers, and the server only hears about it at the next
-    /// ingest — a window of one *source* TTL, a full day at the maximum the
+    /// ingest, a window of one *source* TTL, a full day at the maximum the
     /// admin form accepts. A rendered body must therefore not claim to be
     /// fresh for longer than the same short bound `/export/alive` uses.
     #[tokio::test]

@@ -1,4 +1,4 @@
-/* Fumox admin panel — single self-contained stylesheet.
+/* Fumox admin panel: single self-contained stylesheet.
    No framework, no CDN: the interface must work offline.
 
    Day/night themes: every color goes through a CSS custom property; the
@@ -52,7 +52,7 @@
   --topbar-link: #c3cbdc;
   --topbar-hover: rgba(255, 255, 255, 0.08);
   --topbar-active: rgba(255, 255, 255, 0.14);
-  /* switchers (language/theme) outside the topbar — login screen */
+  /* switchers (language/theme) outside the topbar, login screen */
   --switch-text: #5a6478;
   --switch-hover: rgba(20, 32, 58, 0.06);
   --switch-active-bg: rgba(20, 32, 58, 0.1);
@@ -241,7 +241,7 @@ a:hover { text-decoration: underline; }
 }
 .page-head h1 { font-size: 21px; margin: 0; flex: 1; }
 
-/* Dashboard Top-N selector — small form, right side of the page-head.
+/* Dashboard Top-N selector: small form, right side of the page-head.
    Drops to a new line on narrow screens via the parent's flex-wrap. */
 .topn-picker { font-size: 13px; color: var(--muted); }
 .topn-picker label {
@@ -315,7 +315,7 @@ table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellips
 }
 /* Wrapping cell for long error messages / URLs: the text flows onto as
    many lines as it needs (breaking anywhere, URLs have no spaces), so the
-   column never stretches the table — it just grows downward. inline-block
+   column never stretches the table, it just grows downward. inline-block
    makes the width caps actually apply (they are ignored on plain inline
    spans). */
 .cell-wrap {
@@ -326,7 +326,7 @@ table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellips
   white-space: normal;
 }
 /* Fetch journal tables (logs page, source card, dashboard): every column
-   is one line — source, result, HTTP, size and proxy counts must never
+   is one line: source, result, HTTP, size and proxy counts must never
    wrap mid-cell when a long error message squeezes the other columns.
    The error column itself keeps wrapping via .cell-wrap below. */
 table.data.journal td { white-space: nowrap; }
@@ -335,25 +335,25 @@ table.data.journal td .cell-wrap { white-space: normal; }
 /* Short mono identifiers (protocol names, probe kinds, output formats)
    never break across lines: `overflow-wrap: anywhere` on body would
    otherwise hyphenate `hysteria2` inside narrow table columns (probe
-   quarantine queue, stats). Host:port addresses keep wrapping — a long
+   quarantine queue, stats). Host:port addresses keep wrapping, a long
    hostname must not stretch the column. The wrapping error cells
    (.cell-wrap: dashboard failure reasons, journal errors) override the
-   nowrap — `td.mono` is more specific than `.cell-wrap`, so the
+   nowrap: `td.mono` is more specific than `.cell-wrap`, so the
    exclusion must be spelled out the same way as td.addr below. */
 table.data td.mono { white-space: nowrap; }
 table.data td.mono.cell-wrap { white-space: normal; }
 /* Two-column failure-reason table (dashboard): nothing competes with the
-   reason column for width, so it takes all the space the panel offers —
+   reason column for width, so it takes all the space the panel offers,
    the journal-grade 360px cap would pin the text to a narrow strip and
    leave a dead gap before the counter column. */
 table.data.failures td.cell-wrap { max-width: none; }
 table.data td.addr { overflow-wrap: anywhere; white-space: normal; }
-/* Probe quarantine queue: the address is an atomic inline box — under
+/* Probe quarantine queue: the address is an atomic inline box; under
    width pressure it drops to its own line whole instead of splitting
    "9.9.9.9:" / "8388" at the <wbr>. A box wider than the cell (long
    IPv6 host) still wraps internally. */
 .queue-addr { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
-/* Status and error-class badges never break across lines — a wrapped
+/* Status and error-class badges never break across lines, a wrapped
    "http_server" would change the row height and shift the table. */
 table.data .badge { white-space: nowrap; }
 
@@ -438,7 +438,7 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
    the tab strip and the highlighted border is driven by `:checked`. */
 input.tab-input {
   /* Stay in the layout flow (so they remain keyboard-focusable) but
-     empty visually — `display: none` would break the `:checked ~
+     empty visually: `display: none` would break the `:checked ~
      .tabs label[for=…]` selector pattern below (general-sibling
      combinator requires the radios to precede the labels). */
   position: absolute;
@@ -455,10 +455,20 @@ input.tab-input {
   margin: 0 0 18px;
   overflow-x: auto;
   /* Tabs stay reachable at any width without wrapping into a vertical
-     stack — narrow viewports can scroll horizontally within the strip. */
+     stack; narrow viewports can scroll horizontally within the strip. */
   scrollbar-width: none;
 }
 .tabs::-webkit-scrollbar { display: none; }
+/* The only focusable element of the tab strip is the hidden radio input
+   (`input.tab-input`), so the visible ring is drawn on its label through the
+   sibling combinator: focusing the input lights up the tab it drives. */
+#tab-server:focus-visible ~ .tabs label[for="tab-server"],
+#tab-probe:focus-visible ~ .tabs label[for="tab-probe"],
+#tab-shared:focus-visible ~ .tabs label[for="tab-shared"] {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
 .tabs label {
   padding: 10px 18px;
   cursor: pointer;
@@ -473,11 +483,6 @@ input.tab-input {
   align-items: center;
 }
 .tabs label:hover { color: var(--text); }
-.tabs label:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
-  border-radius: 4px;
-}
 /* Global keyboard focus ring for interactive elements that have hover/active
    state rules but no explicit focus-visible. :where() keeps specificity at
    zero so the per-element hover/active styling keeps priority when not
@@ -681,7 +686,7 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
 .cleanup-op .inline-controls { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 /* Same row-of-controls pattern used outside the cleanup dialog (settings
    edit: numeric input paired with a unit select) needs the flex parent
-   here — otherwise the children render as block boxes and the side-by-side
+   here, otherwise the children render as block boxes and the side-by-side
    design intent is lost. */
 div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 /* A number paired with a unit select is one control, not two stacked
@@ -756,7 +761,7 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   white-space: nowrap;
 }
 
-/* Scheme/country distribution: one row per bucket — name, stacked health
+/* Scheme/country distribution: one row per bucket: name, stacked health
    segments (widths via the inline --w custom property) and clickable
    per-status counters. */
 .stat-split { display: flex; flex-direction: column; gap: 8px; }
@@ -849,7 +854,7 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   margin: 4px 0 8px;
   flex-wrap: wrap;
 }
-/* Section heading inside the builder field — was a bare `<label>` before,
+/* Section heading inside the builder field, was a bare `<label>` before,
    which read as a form field label to assistive tech even though it
    labels a heading-shaped group of controls. Promoting it to `<h3>`
    gives the section a real place in the page outline and lets the
@@ -864,7 +869,7 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
    without a server round-trip; hidden by default with `display:none`
    on a section whose only checked radio is `skip`. The base.html JS
    toggles the class on radio change. Without JS the inner block stays
-   visible regardless — the section's `emit()` silently discards typed
+   visible regardless: the section's `emit()` silently discards typed
    values when the radio is `skip`. */
 .ped-inner[hidden] { display: none !important; }
 
@@ -943,7 +948,7 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .panel { padding: 14px; }
 
   /* iOS Safari zooms the page on focus for any input with font-size
-     below 16px — keep form controls at 16px. The selectors mirror the
+     below 16px, keep form controls at 16px. The selectors mirror the
      base rules so specificity does not let `font: inherit` win. */
   .field input[type="text"], .field input[type="number"],
   .field input[type="password"], .field input[type="url"],
@@ -975,7 +980,7 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   /* Readable floors for the columns that are allowed to shrink
      (`overflow-wrap: anywhere` would otherwise squeeze them to a few
      characters per line under table width pressure): the wrapping error
-     cell keeps a 200px floor, a host:port cell 190px — 165px of text
+     cell keeps a 200px floor, a host:port cell 190px; 165px of text
      covers the longest IPv4:port (21 chars) plus the 24px cell padding,
      so IPv4 addresses always stay on one line and only long IPv6 hosts
      wrap, at the <wbr> in front of the port; kv labels 110px. */
@@ -991,7 +996,7 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 
   /* Ingest chart: the label is a column-flex child sized to its content
      (up to the 64px cap), so on a narrow screen the seven 64px labels
-     overlap each other — cap them at the bar width instead. */
+     overlap each other, cap them at the bar width instead. */
   .stat-bar-label { max-width: 100%; }
 
   /* Toasts span the viewport instead of hanging off its right edge. */
@@ -1000,12 +1005,12 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 
   dialog { padding: 16px; }
 
-  /* Secondary columns of the widest tables — hidden, the scroll
+  /* Secondary columns of the widest tables: hidden, the scroll
      container covers the rest. */
   .col-optional { display: none; }
 
   /* Filters panel (proxies/sources/logs): every `.field` is a flex child
-     capped at min-width: 130px — on a 360 px viewport seven fields would
+     capped at min-width: 130px; on a 360 px viewport seven fields would
      overflow the row. Let each field grow to its own line so the apply
      button lands below without ugly wrapping. */
   .filters { flex-direction: column; align-items: stretch; }
@@ -1046,7 +1051,7 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .stat-card .num { font-size: 22px; }
   /* On a 360 px viewport the 110 px floor on `.kv th` plus a long
      `td.mono.small` value (full file path, full URL) can push the table
-     past the panel — drop the floor so the column shrinks with the text. */
+     past the panel, drop the floor so the column shrinks with the text. */
   .kv th { min-width: 0; }
   /* Wider stat-bars labels need more room than the 700 px breakpoint
      gave them; the per-day value stays visible (a title-only value is

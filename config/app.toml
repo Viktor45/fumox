@@ -1,17 +1,23 @@
 # Fumox, конфигурация приложения.
-# Файл перечисляет ВСЕ доступные ключи со значениями по умолчанию, правьте
-# только то, что нужно изменить. Каждый ключ имеет дефолт: файл можно урезать
-# до нужных секций или вовсе не создавать, сервис работает на встроенных дефолтах.
+# Файл перечисляет каждый ключ, который принимает приложение, кроме
+# неактивного наследного селектора [geo].db. Значения здесь: это
+# поставляемые дефолты этого проекта, а не встроенные значения из кода:
+# встроенные смотрите в config.rs::defaults. Правьте только то, что нужно
+# изменить. Каждый ключ имеет дефолт: файл можно урезать до нужных секций
+# или вовсе не создавать, сервис работает на встроенных дефолтах.
 # Переопределение через окружение: FUMOX_СЕКЦИЯ__КЛЮЧ, например
 # FUMOX_ADMIN__TOKEN=secret (двойное подчеркивание разделяет секции).
 #
-# Диапазоны ниже — это то, что принимает админка (/admin/settings, «Правка»):
+# Диапазоны ниже: это то, что принимает админка (/admin/settings, «Правка»):
 # границы формы, а не произвольные числа. Ключи, которых в форме нет, помечены
-# отдельно. Ключ, которого здесь нет, будет отвергнут при загрузке: секции
-# объявлены с deny_unknown_fields, опечатка — ошибка, а не тихий игнор.
+# отдельно. Любой другой ключ, которого здесь нет, будет отвергнут при загрузке
+# (единственное исключение: неактивный [geo].db из эпохи одной базы): секции
+# объявлены с deny_unknown_fields, опечатка дает ошибку, а не тихий игнор.
 #
 # Fumox, application configuration.
-# The file lists EVERY available key at its default value, change only what
+# The file lists every key the app accepts, except the inert legacy
+# [geo].db selector. Values are the shipped defaults of this project, not the
+# built-in fallbacks: see config.rs::defaults for those. Change only what
 # you need. Every key has a default: the file may be trimmed down to the
 # sections you need or omitted entirely, the service runs on built-in defaults.
 # Environment overrides: FUMOX_SECTION__KEY, e.g. FUMOX_ADMIN__TOKEN=secret
@@ -19,7 +25,8 @@
 #
 # The ranges below are what the admin panel (/admin/settings) accepts: the
 # form's own bounds, not round numbers. Keys the form does not edit are
-# marked as such. A key that is not here is rejected at load time: the
+# marked as such. Any other key that is not here is rejected at load time
+# (the one exception is the inert legacy [geo].db selector): the
 # sections deny unknown fields, so a typo is an error, not a silent no-op.
 
 [server]
@@ -56,14 +63,14 @@ allowed_hosts = []
 # Поднимите значение, если тир больше; в админке счётчик тира не урезан,
 # так что усечение всегда видно.
 # Тело кэшируется на 30 с, поэтому статус может доехать до ссылки с
-# задержкой до 30 с — выгрузка это снимок.
+# задержкой до 30 с: выгрузка это снимок.
 # Row ceiling of one /export/alive/… and /export/ready/… body (LIMIT in SQL).
 # These two links have no upstream cap of their own, unlike /sub and /src, so
 # without one a single public request read and shipped the whole tier. Raise it
 # when the tier is bigger; the admin tier badge stays uncapped, so a truncated
 # export is always visible as smaller than the tier.
 # The body is cached for 30 s, so a status change reaches the link with up to
-# that much delay — a download is a snapshot, and an expired one is re-rendered
+# that much delay: a download is a snapshot, and an expired one is re-rendered
 # rather than served stale.
 export_max_rows = 50000
 # Диапазон: N = 1..=1000000 запросов (форма), окно = sec | min | hour | day.
@@ -214,7 +221,7 @@ enabled = true
 # In prod set an absolute path to a read-only volume with fresh .mmdb
 # NOTE: the shipped Docker Compose stack overrides this to /shared
 # (FUMOX_GEO__DB_DIR), and the environment outranks the file, so the value
-# here does not apply on that stack — put the databases in the meow-shared
+# here does not apply on that stack: put the databases in the meow-shared
 # volume instead.
 db_dir = "config"
 # Диапазон: 0..=10000000 записей (форма). Потолок in-memory кэша moka, уходит
@@ -266,12 +273,14 @@ bind = "127.0.0.1:8081"
 # Range: 1..=8760 hours (form, upper bound is one year).
 # How long the admin session cookie lives.
 session_ttl_hours = 168
-# Диапазон: true | false, дефолт false.
-# false = отказываем RFC1918/loopback по умолчанию (SSRF-защита активна).
+# Диапазон: true | false. В сборке дефолт false.
+# В этом примере стоит true: false = отказывать RFC1918/loopback (SSRF-защита
+# активна). Поставьте обратно false, если источники не доверенные;
 # true имеет смысл только при собственной изолированной feed-инфраструктуре.
-# Range: true | false, default false.
-# false rejects RFC1918/loopback out of the box (SSRF guard active).
-# Set true only on your own isolated feed infra.
+# Range: true | false; the built-in default is false.
+# This example ships true: false rejects RFC1918/loopback (SSRF guard active).
+# Set it back to false for untrusted sources; true makes sense only on your
+# own isolated feed infra.
 allow_private_urls = true
 # Диапазон: N = 1..=1000000 запросов (форма), окно = sec | min | hour | day.
 # /admin/* кроме login.
@@ -279,7 +288,7 @@ allow_private_urls = true
 # /admin/* except login.
 rate_limit = "120/min"
 # Диапазон тот же, что у admin.rate_limit выше; окно меньше, потому что
-# форма логина — единственная точка перебора.
+# форма логина: единственная точка перебора.
 # Range: same as admin.rate_limit above; a smaller window, because the login
 # form is the one thing being brute-forced.
 login_rate_limit = "5/min"
@@ -368,8 +377,8 @@ second_chance_min_hours = 2
 # Range: 0..=8760 hours (form). 0 = recheck exactly at min with no spread, so
 # every proxy comes back in one burst.
 second_chance_spread_hours = 1
-# Диапазон: до 16 ступеней, каждая 1..=2592000 секунд (30 дней). Больше —
-# ошибка загрузки конфига, а не молчаливое усечение. Пустой массив допустим.
+# Диапазон: до 16 ступеней, каждая 1..=2592000 секунд (30 дней). Больше
+# этого: ошибка загрузки конфига, а не молчаливое усечение. Пустой массив допустим.
 # Лестница повторных проверок карантина: задержки в секундах
 # между последовательными ретраями после провала второго шанса. Провал ретрая
 # N назначает ретрай N+1 через recheck_delays_secs[N-1]; провал последней
@@ -399,15 +408,15 @@ queue_stale_days = 7
 # computing suggested [probe] values.
 backlog_target_drain_minutes = 60
 # Диапазон: 60..=604800 секунд (форма), то есть от минуты до недели.
-# 86400 с (сутки) — ротация probe_results/fetch_log под полные сутки, в пару
+# 86400 с (сутки): ротация probe_results/fetch_log под полные сутки, в пару
 # к [retention].*_days, чтобы ротация шла раз в сутки и совпадала с окном.
 # Range: 60..=604800 seconds (form), one minute to one week.
 # 86400 s (one day) pairs with [retention].*_days so rotation runs once per
 # day and matches the retention window.
 retention_interval_secs = 86400
-# Диапазон: true | false, дефолт false.
-# Запрет диала приватных адресов из фидов: без этого флага демон не
-# подключается к loopback/RFC1918/link-local/CGNAT целям, фид может
+# Диапазон: true | false. В сборке дефолт false.
+# В этом примере стоит true, поэтому запрета ниже сейчас нет: без этого флага
+# демон не подключается к loopback/RFC1918/link-local/CGNAT целям, фид может
 # подсунуть «прокси» с адресом внутренней сети. Отказ регистрируется как
 # проваленная проверка: заблокированная цель проходит обычную лестницу
 # фейлов, а не зависает в очередях навсегда.
@@ -415,8 +424,9 @@ retention_interval_secs = 86400
 # CGNAT targets coming from feeds, and a refusal counts as a failed check
 # (see the fail ladder above). A feed can plant a «proxy» pointing inside
 # your network; the refusal sends it through the ordinary fail ladder
-# instead of clogging the queues forever.
-# Range: true | false, default false.
+# instead of clogging the queues forever. This example ships true, so that
+# guard is off here; the built-in default is false.
+# Range: true | false; the built-in default is false. This example ships true.
 allow_private_targets = true
 
 [meow]
@@ -432,13 +442,13 @@ api_addr = "127.0.0.1:9090"
 # Path to meow-rs's own config, no range: /shared/meow.yaml in the typical
 # docker-compose layout; override if your volume layout differs.
 config_path = "/shared/meow.yaml"
-# Строка, массив строк или строка с запятыми — без диапазона. Probe случайно
+# Строка, массив строк или строка с запятыми, без диапазона. Probe случайно
 # выбирает один адрес на каждую проверку, поэтому выход одного из строя не
 # ломает T2. Ниже, актуальные адреса captive-проверки Android (проверены
 # вживую 2026-08-29, все отвечают HTTP 204); уберите недоступные в вашем
 # регионе. HTTPS-варианты (www.google.com, connectivitycheck.gstatic.com,
 # play.googleapis.com) тоже живы, но дают лишний TLS-handshake внутри туннеля.
-# A string, an array of strings, or a comma-separated string — no range. The
+# A string, an array of strings, or a comma-separated string, no range. The
 # probe picks one at random per check, so a dead endpoint no longer breaks T2.
 # Below are the current Android captive-portal endpoints (verified live
 # 2026-08-29, all answer HTTP 204); drop the ones unreachable in your region.

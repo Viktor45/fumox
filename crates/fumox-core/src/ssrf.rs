@@ -85,7 +85,7 @@ where
 /// `to_ipv4_mapped()` nor `to_ipv4()`, and Teredo `2001:0000::/32` is not
 /// matched either, so an address in either of them passes this gate.
 /// Neither is routable on a default host (Teredo needs its own interface),
-/// which is why neither is a hole an attacker can dial today — but a
+/// which is why neither is a hole an attacker can dial today, but a
 /// caller must not read this function as covering them.
 pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
     if allow_private {
@@ -213,7 +213,7 @@ fn vet_resolved_addrs(
 ///
 /// A plain `truncate` is wrong here: `getaddrinfo` orders dual-stack answers
 /// IPv6-first and CDN-fronted names publish more AAAA records than A ones, so
-/// the window can close before the only A record — and the callers
+/// the window can close before the only A record, and the callers
 /// (`pick_vetted` with `IpFamily::Any`, which prefers IPv4 and falls back to
 /// the first address) then dial or pin a wrong-family address. One slot per
 /// family is therefore reserved first, and the remaining slots are filled in
@@ -265,7 +265,7 @@ fn cap_vetted(addrs: &[IpAddr]) -> Vec<IpAddr> {
 /// Upper bound on the vetted addresses returned per host. DNS can resolve
 /// a feed-supplied name to dozens of A/AAAA records, and every returned
 /// address becomes one dial attempt holding a probe concurrency permit
-/// (T1) or one pinned entry in a meow batch config (T2) — without the cap
+/// (T1) or one pinned entry in a meow batch config (T2), without the cap
 /// one hostname stretches a whole probe cycle by
 /// `count × connect_timeout` (security review f9). Real frontends resolve
 /// to a handful of addresses, so the tail beyond the cap is dropped.
@@ -386,7 +386,7 @@ mod tests {
     /// just the mapped form: a feed line writing the metadata endpoint as
     /// `[::a9fe:a9fe]` must not walk past a policy that only vets
     /// `to_ipv4_mapped()`. The deprecated `fec0::/10` site-local block is
-    /// in the same shape — routable unicast, never a public target.
+    /// in the same shape, routable unicast, never a public target.
     #[test]
     fn ipv4_compatible_and_site_local_v6_are_blocked() {
         for addr in [
@@ -554,7 +554,7 @@ mod tests {
     /// `getaddrinfo` orders dual-stack answers IPv6-first (RFC 6724
     /// destination selection) and CDN-fronted names routinely publish more
     /// AAAA records than A ones, so a cap that simply truncates the
-    /// combined list drops the only A record — and the probe callers then
+    /// combined list drops the only A record, and the probe callers then
     /// pick (`IpFamily::Any`, which prefers IPv4 and falls back to the
     /// first address) or pin a wrong-family address, or dial an IPv6
     /// address the host cannot reach from this network.

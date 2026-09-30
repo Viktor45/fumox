@@ -54,9 +54,7 @@ const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
 /// Only schema version we understand today.
 const SUPPORTED_VERSION: u32 = 1;
 
-// ---------------------------------------------------------------------------
 // Wire format
-// ---------------------------------------------------------------------------
 
 /// Versioned export file. `ref` carries the original id so profile
 /// composition can be remapped onto fresh ids at import time; primary keys
@@ -122,9 +120,7 @@ struct ExportProfile {
     source_refs: Vec<String>,
 }
 
-// ---------------------------------------------------------------------------
 // Export
-// ---------------------------------------------------------------------------
 
 /// `GET /admin/export`, download the whole configuration as JSON.
 pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) -> Response {
@@ -206,9 +202,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
     response
 }
 
-// ---------------------------------------------------------------------------
 // Import
-// ---------------------------------------------------------------------------
 
 /// Outcome of a successful import for the summary panel.
 #[derive(Debug, Default)]

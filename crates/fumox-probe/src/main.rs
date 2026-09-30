@@ -226,10 +226,6 @@ async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// T1: random connectivity sample
-// ---------------------------------------------------------------------------
-
 /// What one T1 lane covered: `checked` is how many verdicts it produced
 /// (for the cycle log), `claimed` every row it took, whether the row
 /// produced a verdict (unknown scheme, unprobeable port) or a vet refusal.
@@ -483,10 +479,6 @@ async fn apply_regular_failure(ctx: &Context, id: i64, now: i64) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Quarantine: second chances and the recheck ladder
-// ---------------------------------------------------------------------------
-
 /// Re-check quarantined proxies whose scheduled moment has arrived.
 async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usize> {
     let due = proxies::select_due_quarantine(&ctx.pool, now, ctx.config.probe.sample_size).await?;
@@ -655,10 +647,6 @@ async fn perform_quarantine_check(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// T2: real tunnel checks through meow-rs
-// ---------------------------------------------------------------------------
 
 /// Generate a Clash batch, reload meow-rs, and delay-test every proxy
 /// through a real tunnel.
@@ -1007,17 +995,9 @@ async fn journal_and_fail(ctx: &Context, id: i64, reason: &str) {
 /// Journal one T2 attempt that never happened because the engine was down
 /// and stamp the row as *unverified*, not as *failed*.
 ///
-/// Both documented effects of a T2 failure are kept: the journal row (it
-/// is what un-sticks the head of the recency queue, an unrecorded skip
-/// pins it for the whole outage) and the `last_t2_failed_at` stamp plus
-/// the `ready` → `alive` demote, so the tunnel-verified tier cannot outlive
-/// an outage. What it does not do is charge the proxy's own fail budget:
-/// the outage is a fact about meow-rs, and with the shipped
-/// `fail_limit = 2` two outage cycles would quarantine a proxy that never
-/// failed a check, dropping it out of both T2 selectors and out of
-/// `/export/alive`. The outage is charged to the engine instead: the
-/// `BatchGuard` strike counter, the exponential backoff and the log line
-/// below are where it shows up.
+/// An engine outage journals the attempt (so the recency queue keeps
+/// moving) and stamps last_t2_failed_at plus the ready -> alive demote,
+/// but never charges the proxy's fail budget.
 async fn journal_engine_fault(ctx: &Context, id: i64, reason: &str) {
     let now = now_ts();
     journal(
@@ -1048,10 +1028,6 @@ async fn journal_engine_failure(ctx: &Context, batch: &[proxies::ProxyRow], reas
     }
     tracing::warn!(proxies = batch.len(), "T2 batch failed by engine outage");
 }
-
-// ---------------------------------------------------------------------------
-// Background maintenance
-// ---------------------------------------------------------------------------
 
 /// Cutoff timestamp for a retention window of `days`. A zero window would
 /// wipe the whole history on every cycle, so it is clamped to one day.
@@ -1123,10 +1099,6 @@ async fn run_retention(ctx: &Context) {
         Err(error) => tracing::warn!(%error, "probe_requests rotation failed"),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 /// Journal one probe attempt; a failed write is logged but does not stop
 /// the state machine (the lifecycle transition is the source of truth).
@@ -1459,8 +1431,8 @@ mod tests {
     async fn t2_engine_failure_mid_batch_aborts_the_rest() {
         let pool = temp_pool().await;
 
-        // The pre-flight at L662 calls /version first, so the handler
-        // returns 200 on that call and 500 on every subsequent one. This
+        // The pre-flight ping calls /version first, so the handler returns
+        // 200 on that call and 500 on every subsequent one. This
         // models "engine crashed after the pre-flight passed".
         let version_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let version_calls_inner = version_calls.clone();
@@ -1503,7 +1475,7 @@ mod tests {
 
         // Four proxies: with threshold=3 the first three tasks record a
         // failure (engine_alive = false) and the third one flips the
-        // abort flag. The fourth task, whichever side of the L733 check
+        // abort flag. The fourth task, whichever side of the is_aborted() check
         // it lands on, gets either a "mid-batch" record or an "aborted:"
         // record, both are engine-outage texts.
         let a = seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;

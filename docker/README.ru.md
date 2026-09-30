@@ -1,4 +1,4 @@
-# Quadlet (podman/systemd) — развертывание Fumox без docker compose
+# Quadlet (podman/systemd): развертывание Fumox без docker compose
 
 Эквиваленты `docker-compose.yml` в виде quadlet-юнитов: systemd управляет
 подом с тремя контейнерами (fumox-server, fumox-probe, meow-rs), как делал
@@ -6,23 +6,23 @@ compose. Два варианта на выбор:
 
 | Папка      | Вариант                                        | Когда удобен                                                                                                                            |
 | ---------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `quadlet/` | `fumox.pod` + три `.container` + два `.volume` | Нативный способ quadlet — оптимален: явные юниты, точечные volume-монты, `Restart` на каждый контейнер, статус каждого сервиса отдельно |
+| `quadlet/` | `fumox.pod` + три `.container` + два `.volume` | Нативный способ quadlet, оптимален: явные юниты, точечные volume-монты, `Restart` на каждый контейнер, статус каждого сервиса отдельно |
 | `kube/`    | `fumox.kube` + `fumox-pod.yaml`                | Один манифест, близкий к k8s; удобно, если YAML уже привычнее                                                                           |
 
 Нужен podman ≥ 4.4 (лучше 5.x). По умолчанию все описано для **rootless**
-(рекомендуется); отличия для root — в конце.
+(рекомендуется); отличия для root в конце.
 
 Под публикует только HTTP: HTTPS терминирует обратный прокси перед
-прослушивателем сервера — готовый nginx-пример лежит в `docker/nginx/`
+прослушивателем сервера. Готовый nginx-пример лежит в `docker/nginx/`
 (общий с docker-compose).
 
 ## Подготовка (для обоих вариантов)
 
-Quadlet не собирает образы — юниты ссылаются на локальные имена
+Quadlet не собирает образы: юниты ссылаются на локальные имена
 `localhost/fumox:local` и `localhost/fumox-meow:local`. Подготовьте их любым
 из двух способов:
 
-**Способ 1 — забрать готовые образы из GHCR (быстрее всего):**
+**Способ 1: забрать готовые образы из GHCR (быстрее всего):**
 
 ```sh
 podman pull ghcr.io/viktor45/fumox:latest
@@ -32,14 +32,14 @@ podman tag ghcr.io/viktor45/fumox-meow:latest localhost/fumox-meow:local
 ```
 
 `ghcr.io/viktor45/fumox` публикуется workflow `.github/workflows/docker.yml`
-по тегам `v*` и вручную через `workflow_dispatch` (см. заголовок файла —
+по тегам `v*` и вручную через `workflow_dispatch` (см. заголовок файла,
 автосборки при push в `main` нет);
 `ghcr.io/viktor45/fumox-meow` упаковывается вручную workflow'ом
-`docker-meow.yml`. Можно обойтись без перетегирования — поправьте строки
+`docker-meow.yml`. Можно обойтись без перетегирования: поправьте строки
 `Image=` в юнитах на GHCR-имена напрямую; там же удобно запиннить версию
 (`ghcr.io/viktor45/fumox:0.2.0`) вместо `latest`.
 
-**Способ 2 — сборка из исходников** (из корня репозитория):
+**Способ 2: сборка из исходников** (из корня репозитория):
 
 ```sh
 podman build -t localhost/fumox:local .
@@ -65,13 +65,13 @@ cp config/GeoLite2-*.mmdb ~/fumox/config/   # опционально: гео-о�
    $EDITOR ~/.config/fumox/fumox.env          # задать FUMOX_ADMIN__TOKEN
    ```
 
-   Кроме `FUMOX_ADMIN__TOKEN` в файле можно задать `FUMOX_CONFIG` — путь к
+   Кроме `FUMOX_ADMIN__TOKEN` в файле можно задать `FUMOX_CONFIG`, путь к
    TOML-файлу конфигурации внутри контейнера (по умолчанию
    `/app/config/app.toml` из смонтированного каталога). Переменные из юнита
-   (`Environment=`) сильнее этого файла, поэтому путь в юнитах не зафиксирован —
+   (`Environment=`) сильнее этого файла, поэтому путь в юнитах не зафиксирован,
    настраивайте его здесь.
 
-2. Установить юниты (все файлы из папки — в один каталог юнитов):
+2. Установить юниты (все файлы из папки, в один каталог юнитов):
 
    ```sh
    mkdir -p ~/.config/containers/systemd
@@ -88,38 +88,38 @@ cp config/GeoLite2-*.mmdb ~/fumox/config/   # опционально: гео-о�
 
 3. Автостарт без активной сессии: `loginctl enable-linger $USER`.
 
-Проверка: `curl -s http://127.0.0.1:8080/healthz` → `ok`; админка —
+Проверка: `curl -s http://127.0.0.1:8080/healthz` → `ok`; админка
 <http://127.0.0.1:8081/admin> (на хост публикуется только loopback, как и в
 compose). Логи: `journalctl --user -u fumox-server -u fumox-probe -u fumox-meow -f`.
 
 ### Правка `app.toml` из админки
 
-`fumox-server.container` монтирует каталог конфига как `:rw,Z` — страница
+`fumox-server.container` монтирует каталог конфига как `:rw,Z`, поэтому страница
 *Edit settings* (`/admin/settings/edit`) пишет `/app/config/app.toml` на
 месте через `toml_edit`-редактор. Комментарии переживают каждое
 сохранение; ENV-переменные `FUMOX_SECTION__KEY` сохраняют приоритет по
 merge figment; после сохранения нужно перезапустить server и probe.
-`fumox-probe.container` остаётся read-only — probe только читает файл
-при старте и никогда в него не пишет. Чтобы выключить редактор — поменяйте
+`fumox-probe.container` остаётся read-only: probe только читает файл
+при старте и никогда в него не пишет. Чтобы выключить редактор, поменяйте
 в server-юните `:rw,Z` на `:ro,Z`; страница отрендерится с заблокированными
 контролами и красным баннером `set.edit_unwritable`.
 
 ### Безопасность cookie на plain HTTP
 
 И quadlet, и compose публикуют админку на `127.0.0.1:8081` по plain HTTP.
-Значит `[admin].secure_cookies` должен оставаться `false` — иначе браузер
+Значит `[admin].secure_cookies` должен оставаться `false`, иначе браузер
 молча отбрасывает `Secure`-cookie сессии, и каждый вход выглядит как
-успешный `admin logged in` в `journalctl` с вечной петлёй редиректов на
+успешный `admin logged in` в `journalctl` с постоянным редиректом на
 `/admin/login`. Включайте только при TLS-терминации на reverse-proxy:
 добавьте `FUMOX_ADMIN__SECURE_COOKIES=true` в `fumox.env` (ENV приоритетнее
-файла — тот же figment merge, что и для остальных override-переменных).
+файла, тот же figment merge, что и для остальных override-переменных).
 Смена `[admin].token` или переключение `secure_cookies` инвалидирует все
-активные сессии на следующем запросе — планируйте ротацию токена на тихое
+активные сессии на следующем запросе, поэтому планируйте ротацию токена на тихое
 окно.
 
 ## Вариант B: `kube/`
 
-1. Образы — как выше.
+1. Образы: как выше.
 2. Секрет с переменными (`.env`-аналог):
 
    ```sh
@@ -139,8 +139,8 @@ merge figment; после сохранения нужно перезапусти
 
 PVC `fumox-data` и `meow-shared` при первом старте podman автоматически
 создает как именованные volume-ы (см. `podman volume ls`). Админ-порт
-объявлен с `hostIP: 127.0.0.1` — после старта проверьте `podman port fumox`;
-старые podman (без поддержки `hostIP`) опубликуют 8081 на все интерфейсы —
+объявлен с `hostIP: 127.0.0.1`; после старта проверьте `podman port fumox`;
+старые podman (без поддержки `hostIP`) опубликуют 8081 на все интерфейсы,
 закройте его фаерволом или обновитесь.
 
 ## Отличия от docker compose
@@ -149,7 +149,7 @@ PVC `fumox-data` и `meow-shared` при первом старте podman авт
   namespace, DNS-имен сервисов нет. 9090 наружу не публикуется, как и в compose.
 - Образы либо тянутся из GHCR, либо собираются вручную (`podman build`);
   compose умеет и то и другое (`up -d` тянет, `up --build` собирает).
-- Именованные volume-ы podman (`fumox-data`, `meow-shared`) — не те же
+- Именованные volume-ы podman (`fumox-data`, `meow-shared`) это не те же
   хранилища, что у docker. Перенос БД из compose:
 
   ```sh
@@ -163,7 +163,7 @@ PVC `fumox-data` и `meow-shared` при первом старте podman авт
   (docker volume mountpoint может требовать root; на macOS/OrbStack данные
   лежат в VM docker.)
 - `restart: unless-stopped` → `Restart=on-failure` в секциях `[Service]`
-  (systemd не перезапускает явно остановленное — семантика совпадает).
+  (systemd не перезапускает явно остановленное, семантика совпадает).
 - Секрет `FUMOX_ADMIN__TOKEN` хранится не в `.env` рядом с compose-файлом,
   а в `~/.config/fumox/fumox.env` (вариант A) или в `podman secret`
   (вариант B).
@@ -193,5 +193,5 @@ meow-rs.)
 
 Те же файлы кладутся в `/etc/containers/systemd/`; `%h` тогда разворачивается
 в `/root` (поправьте `EnvironmentFile=` и пути volume на системные), в
-`[Install]` замените `default.target` на `multi-user.target`, управление —
+`[Install]` замените `default.target` на `multi-user.target`, управление:
 `systemctl daemon-reload && systemctl start fumox-pod` (без `--user`).

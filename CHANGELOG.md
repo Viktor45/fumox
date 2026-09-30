@@ -8,7 +8,7 @@ your pull date against the section dates.
 
 The categories follow [Keep a Changelog](https://keepachangelog.com/);
 `Docs` covers the user guide and READMEs, `Internal` (dependency bumps,
-CI plumbing) is omitted — it never changes the shipped image.
+CI plumbing) is omitted: it never changes the shipped image.
 
 ## Unreleased (2026-09-29)
 
@@ -19,7 +19,7 @@ Defect fixes in the working tree, not yet on a published image.
 - `[geo].startup_download_budget_secs` (default 60, `0` = do not
   wait): the ceiling on how long startup blocks on the GeoLite2
   download before it binds the listeners. The budget is an upper
-  bound on a stalled mirror, not a promise that geo is ready — past
+  bound on a stalled mirror, not a promise that geo is ready; past
   it the download continues detached and that run serves without geo
   enrichment until the next start. Tunable like every other key
   (`FUMOX_GEO__STARTUP_DOWNLOAD_BUDGET_SECS`).
@@ -29,7 +29,7 @@ Defect fixes in the working tree, not yet on a published image.
 - The dashboard's "new proxies over the last 7 days" chart labelled its
   columns with clipped timestamps. Each bar is a midnight-UTC day bucket,
   but it was rendered through the shared `<time class="ts">` helper, which
-  base.html's `localize()` rewrites into a full local timestamp — so every
+  base.html's `localize()` rewrites into a full local timestamp, so every
   label spent its 64 px on `00:00:00` and the browser cut the date down to
   `09/23/202…`. The columns now carry a `day`-classed `<time>` that
   `localize()` formats date-only, and the tooltip still carries the full
@@ -61,14 +61,14 @@ Defect fixes in the working tree, not yet on a published image.
 - A T1 success lifted the T2 suppression flag. `check_succeeded`
   cleared `last_t2_failed_at` on any success, so a proxy that had just
   failed its tunnel check re-entered the T1 rotation on a plain
-  TCP/TLS verdict — the exact case the flag (migration 0007) exists
+  TCP/TLS verdict, the exact case the flag (migration 0007) exists
   to suppress. Only a T2 success does now, and `ready` is the T2
   success tier.
 - A meow-rs outage was charged to the proxies it skipped. The
   journal-and-fail path ran the whole fail ladder for every due proxy
   when the engine was down at `ping`/`reload_config` or died
   mid-batch, and with the shipped `fail_limit = 2` two outage cycles
-  quarantined a proxy that had failed no check at all — dropping a
+  quarantined a proxy that had failed no check at all, dropping a
   healthy row out of both T2 selectors and out of `/export/alive` for
   the sidecar's fault. An outage is now a distinct outcome:
   `journal_engine_fault` still writes the `probe_kind='t2'` record
@@ -76,7 +76,7 @@ Defect fixes in the working tree, not yet on a published image.
   `last_t2_failed_at` with a `ready` → `alive` demote, so the
   tunnel-verified tier still does not outlive an outage, but
   `fail_count` and the quarantine ladder stay untouched. The outage
-  is charged to the engine instead — `BatchGuard` strikes, the
+  is charged to the engine instead: `BatchGuard` strikes, the
   exponential backoff, the log line. The boundary is the
   post-failure `/version` ping: a `ServiceUnavailable` the engine
   *answers* is a per-request blip and remains an ordinary charged
@@ -86,7 +86,7 @@ Defect fixes in the working tree, not yet on a published image.
   `revive_removed` and its country / ASN / no-probe-history variants
   and `revive_quarantine` put the row back to `unknown` but kept
   `last_t2_failed_at` set, and the revival predicates did not require
-  a `proxy_source_links` row — so a revived proxy no T1 lane selects
+  a `proxy_source_links` row, so a revived proxy no T1 lane selects
   (`last_t2_failed_at IS NULL`) and no T2 sample offers (`alive` /
   `ready`) would ever look at again. The flag is now cleared with the
   rest of the lifecycle and the link predicate is applied. *Reset
@@ -96,7 +96,7 @@ Defect fixes in the working tree, not yet on a published image.
   `reset_status` returns one boolean for two different outcomes: a row
   that is gone, and a row that exists but belongs to no probe lane (no
   `proxy_source_links` row left after reconciliation retired it, or a
-  scheme no lane checks — `tuic`, `mieru`). Both came back as `false`
+  scheme no lane checks (`tuic`, `mieru`)). Both came back as `false`
   and both were answered with `err.proxy_not_found`, so an operator
   pressing the button on a proxy sitting right there on the screen was
   told it did not exist. The second case is now a rejected action
@@ -128,7 +128,7 @@ Defect fixes in the working tree, not yet on a published image.
 - A `Host` header holding userinfo leaked the export token into a
   link. The link-builder stripped the port with its own parser and
   never canonicalized, so `name@evil.com` was emitted verbatim into
-  `http://name@evil.com/export/alive/{token}` — the link sends the
+  `http://name@evil.com/export/alive/{token}`: the link sends the
   operator, and anyone who clicks it, to an attacker-controlled host
   with the token as the query. It runs the same canonicalizer as the
   gate, even with the empty allowlist the gate itself skips. Guarded
@@ -183,7 +183,7 @@ Defect fixes in the working tree, not yet on a published image.
 - Fingerprint pre-images could be forged from inside a value. The
   pairs were joined with `&` and `k=v` unescaped, so
   `path=/search` + `host=evil` and the single parameter
-  `host=evil&path=/search` hashed identically — attacker-controlled
+  `host=evil&path=/search` hashed identically, so attacker-controlled
   feed text choosing which of two nodes a dedup keeps. Keys and
   values are now escaped, `%` included, so escaping is reversible.
   Guarded by `separator_bytes_in_values_cannot_forge_a_pair`.
@@ -198,9 +198,9 @@ Defect fixes in the working tree, not yet on a published image.
   `query_delimiters_in_values_do_not_corrupt_the_line` and
   `already_encoded_values_are_not_double_encoded`.
 - SSRF policy missed two IPv6 spellings of a blocked address. Only
-  the mapped form (`::ffff:0:0/96`) was vetted, so `[::a9fe:a9fe]` —
-  the metadata endpoint in the deprecated IPv4-compatible `::/96` form
-  — walked past the policy; the deprecated site-local block
+  the mapped form (`::ffff:0:0/96`) was vetted, so `[::a9fe:a9fe]`,
+  the metadata endpoint in the deprecated IPv4-compatible `::/96` form,
+  walked past the policy; the deprecated site-local block
   `fec0::/10` was not blocked at all, despite being routable unicast
   space an internal service can be addressed on. `::/96` is now vetted
   as the embedded IPv4 (`::8.8.8.8` stays public, it is not a blanket
@@ -209,7 +209,7 @@ Defect fixes in the working tree, not yet on a published image.
 - A database path with a percent escape opened the wrong file. The
   path was interpolated into a `sqlite:` URL string and sqlx
   URI-parsed it, so a database file named `pl%2Fain.db` was opened as
-  `pl/ain.db` — a file that does not exist, or worse one that does
+  `pl/ain.db`, a file that does not exist, or worse one that does
   and was never chmod'ed to 0600, while the file
   `pre_create_db_file` had just created with mode 0600 sat unused.
   The path now reaches SQLite as a `PathBuf`. Guarded by
@@ -231,21 +231,21 @@ Defect fixes in the working tree, not yet on a published image.
   repair that rewrote nothing re-raises the original mismatch instead
   of claiming a repair that did not happen. The gap itself is *not*
   closed and is not meant to be: the re-stamp is bookkeeping only, so
-  an edited already-applied migration is still never applied — only a
+  an edited already-applied migration is still never applied; only a
   new migration file can bring the schema up to date, which is why
   the repair now shouts instead of helping. Guarded by
   `migrate_records_the_repaired_versions_in_meta`.
 - The `repair_migration_checksums` example re-stamped rows that were
   already current, reported them as repairs, and had its own copy of
-  the UPDATE — the `success = 1 AND checksum != ?2` guards could
+  the UPDATE, and the `success = 1 AND checksum != ?2` guards could
   drift from the copy `migrate()` uses. It now calls
   `db::repair_migration_checksums`, says "already current" for the
   rest, and refuses a database carrying a migration this build does
   not embed (a newer Fumox) instead of leaving `migrate()` to fail
   with `VersionMissing`. Guarded by
   `repair_leaves_migrations_this_build_does_not_embed_alone`.
-- With the geo resolver inactive — geo disabled, or the `.mmdb` files
-  absent, the default configuration — `drop_entries` zipped the
+- With the geo resolver inactive (geo disabled, or the `.mmdb` files
+  absent, the default configuration), `drop_entries` zipped the
   entries against an *empty* stamp slice and returned nothing, so a
   source with any `drop` rule was reconciled empty and retired
   wholesale. The lookup is indexed with `geo.get(idx)`: entries past
@@ -255,7 +255,7 @@ Defect fixes in the working tree, not yet on a published image.
 - A parse or DB failure suppressed re-fetching a source for a whole
   TTL. The raw snapshot was written right after the fetch, before
   anything was parsed or reconciled, but it *is* the freshness marker
-  (`Caches::raw_is_fresh`) — so one bad payload stopped every
+  (`Caches::raw_is_fresh`), so one bad payload stopped every
   non-forced fetch until the TTL elapsed while the scheduler kept
   reporting successful ingests. It is now written only once the
   payload has parsed and reconciled. Guarded by
@@ -263,7 +263,7 @@ Defect fixes in the working tree, not yet on a published image.
 - A background re-render that started before an ingest committed
   stored its pre-commit rows with a full fresh TTL. The put landed
   after `invalidate_processed_for_source` and the invalidated key
-  served the old rows as fresh until the TTL expired — the very
+  served the old rows as fresh until the TTL expired, the very
   staleness the invalidation had just ended. Every invalidation now
   bumps a per-key generation, the re-render claims the generation
   before it starts, and `processed_put_revalidated` drops a rendering
@@ -273,7 +273,7 @@ Defect fixes in the working tree, not yet on a published image.
 - A cached `/sub` and `/src` snapshot outlived an unrecoverable
   upstream error. Stale-while-revalidate spawned the re-render, the
   render returned the documented `http_client` verdict, and the stale
-  body kept being served — so "return the upstream status code" never
+  body kept being served, so "return the upstream status code" never
   took effect for any client that had a cached copy. An unrecoverable
   answer now invalidates the key (transient server-side failures keep
   the last good snapshot). Guarded by
@@ -298,7 +298,7 @@ Defect fixes in the working tree, not yet on a published image.
   `/healthz` was unreachable for the sum of two per-file download
   budgets. Startup now waits at most
   `[geo].startup_download_budget_secs` (60 s, `0` = do not wait)
-  and then leaves the task running — the install is an atomic
+  and then leaves the task running: the install is an atomic
   rename, so a download finishing mid-run can never expose a
   half-written file, and the next start picks it up. Guarded by
   `a_stalled_geo_download_does_not_hold_startup`.
@@ -326,12 +326,12 @@ Defect fixes in the working tree, not yet on a published image.
   stand's admin panel wrote the main stack's `app.toml` through the
   *Edit settings* page. The mount is now parameterized by
   `FUMOX_CONFIG_ACCESS` (`rw` by default, unchanged for the main
-  stack) and `scripts/smoke-up.sh` pins it to `ro` — a knob for the
+  stack) and `scripts/smoke-up.sh` pins it to `ro`, a knob for the
   operator, not for the stand, the isolation guarantee is the point.
 - The `latest` image tag was republished from every branch. The
   per-arch and merge jobs attached the raw `MEOW_VERSION` tag
   unconditionally, so a feature-branch build moved the tag everyone
-  pulls. It is now attached only from `main` or a `v*` tag — the same
+  pulls. It is now attached only from `main` or a `v*` tag, the same
   ref gate `docker.yml` uses, and a `MEOW_VERSION` that names a
   release keeps the previous behaviour.
 - A `ready` proxy rendered the `unknown` badge on the proxy detail
@@ -341,7 +341,7 @@ Defect fixes in the working tree, not yet on a published image.
   card check.
 - The admin panel's *Create from defaults* button could never work.
   `is_writable` tested writability by opening the path for write,
-  which fails with `EISDIR` on a directory — and the handler hands it
+  which fails with `EISDIR` on a directory, and the handler hands it
   `config/`, the directory, while the same call on the *file* path in
   `admin/mod.rs` takes the missing-file branch and answers true. The
   button's state and its handler disagreed about one question, so an
@@ -352,7 +352,7 @@ Defect fixes in the working tree, not yet on a published image.
   `is_writable_returns_true_for_writable_directory`.
 - The dedup key ignored TLS certificate pinning, so two nodes
   differing only in the certificate they pin shared one key and the
-  second was overwritten by reconcile's `ON CONFLICT` — vanishing
+  second was overwritten by reconcile's `ON CONFLICT`, vanishing
   from the database and from every subscription. `pinSHA256` is now in
   `SECURITY_PARAMS`, and Clash's `fingerprint` is folded onto it so
   the pin counts in either spelling; listing both keys instead would
@@ -362,7 +362,7 @@ Defect fixes in the working tree, not yet on a published image.
   sing-box clients as plaintext. mihomo spells the toggle `tls: true`
   and the SNI `servername`; the sing-box writer's TLS decision read
   only `security`/`sni`, matched neither, and emitted no `tls` object
-  at all — while the same proxy as a `vless://` URI encoded
+  at all, while the same proxy as a `vless://` URI encoded
   correctly and the Clash writer kept both spellings. The decision now
   reads an explicit `tls` toggle first and returns from it, so a
   `tls: false` carrying a stray `servername` stays plaintext too.
@@ -371,16 +371,16 @@ Defect fixes in the working tree, not yet on a published image.
 - One malformed endpoint discarded every good one in an Xray
   outbound. The `vnext` and `servers` builders returned `Err` from
   inside their per-element loop, and the caller turned that into a
-  single `invalid` count without keeping the entries already built —
+  single `invalid` count without keeping the entries already built,
   so a two-endpoint vless whose first user was valid and second was
-  not yielded zero entries. A bad element now costs only itself, and
+  not, yielded zero entries. A bad element now costs only itself, and
   `Err` is raised once after the loop, only when nothing at all was
   built, so a fully malformed outbound is still counted `invalid`.
   Guarded by `an_unusable_vnext_element_keeps_the_earlier_endpoints`
   and `a_malformed_xray_server_element_keeps_the_earlier_endpoints`.
 - A Clash-sourced vless/vmess node was health-checked as plain TCP.
   `t1::check_kind` decided TCP-vs-TLS from `security` alone, but the
-  Clash parser never emits that key — it stores `tls`/`servername` —
+  Clash parser never emits that key (it stores `tls`/`servername`),
   so a node with broken TLS was marked `alive` and served, while the
   same node from a URI spelling was correctly walked to quarantine.
   The verdict depended on which feed the node arrived in. The
@@ -390,8 +390,8 @@ Defect fixes in the working tree, not yet on a published image.
 - An export→import round trip could silently strip a profile's slug.
   `apply_import` seeded one `taken_slugs` set from both the sources
   and the profiles tables and handed it to every object, but the two
-  slugs live in separate namespaces — independent `UNIQUE` columns on
-  two different tables, resolved per table. A source always claimed a
+  slugs live in separate namespaces (independent `UNIQUE` columns on
+  two different tables, resolved per table). A source always claimed a
   shared slug first, so the profile was written without one and its
   `/sub/{slug}` URL became `/sub/{id}`, breaking every client already
   pointed at it, with only a warning in the import summary. The claim
@@ -401,9 +401,9 @@ Defect fixes in the working tree, not yet on a published image.
 - Opening a proxy card could wipe the country ingest had resolved.
   The geo resolver needs only one backend to hit, so a host in the
   Cloudflare block returned an ASN with no country, and both
-  `update_geo_full` — which bound all three columns unconditionally,
-  unlike every other writer in the tree — and the `ProxyRow` handed
-  to the template overwrote the stored facts with NULL. The card
+  `update_geo_full`, which bound all three columns unconditionally,
+  unlike every other writer in the tree, and the `ProxyRow` handed
+  to the template, overwrote the stored facts with NULL. The card
   showed `-` for a row the database still knew. The columns are now
   `COALESCE`d like the reconcile upsert, and the call site merges the
   stamp instead of replacing the row's fields with it. Guarded by
@@ -423,7 +423,7 @@ Defect fixes in the working tree, not yet on a published image.
 - A source's own `limit.count` capped the entire merged profile. When
   a profile declared no explicit sort, the sort winner was a
   *source's* compiled pipeline, and its `finalize` truncated the
-  merged cross-source vector — so a two-source profile whose first
+  merged cross-source vector, so a two-source profile whose first
   source set `limit: {count: 2}` served 2 nodes instead of 5,
   contradicting the comment above the code. Only a profile-level cap
   now truncates the merged list. Behaviour change for operators: a
@@ -433,8 +433,8 @@ Defect fixes in the working tree, not yet on a published image.
   `source_limit_does_not_truncate_the_other_sources`.
 - Two overlapping settings submissions silently lost one change while
   both reported success. The editor's load → mutate → save ran
-  unsynchronised — the temp-file counter in `save` covered only the
-  rename half of the race — and the write button carries no
+  unsynchronised (the temp-file counter in `save` covered only the
+  rename half of the race), and the write button carries no
   double-submit guard, so a double-click issued two POSTs and the
   second rename published a document snapshotted before the first
   landed. `EditableConfig` now holds a lock across the whole cycle,
@@ -455,7 +455,7 @@ Defect fixes in the working tree, not yet on a published image.
   `clash_and_uri_spellings_agree_for_vmess`.
 - A Clash socks5 entry carrying only `username` was stored as
   `onlyuser` rather than `onlyuser:`, and both output writers guard
-  on `split_once(':')` — so the outbound carried no username and no
+  on `split_once(':')`, so the outbound carried no username and no
   password and the authentication was lost silently. Credentials are
   now joined positionally, with an absent field keeping its slot. The
   leading slot is per-spec: socks5 keeps it, because both writers
@@ -472,9 +472,9 @@ Defect fixes in the working tree, not yet on a published image.
   newest-wins can agree at all. Guarded by
   `enqueue_prefers_the_newest_ids_across_chunk_boundaries`.
 - A permanently dead source was re-fetched every 30 seconds for the
-  life of the deployment. A failed fetch writes no timestamp — the
+  life of the deployment. A failed fetch writes no timestamp (the
   column is documented as *last successful fetch* and a test pins
-  that — and the scheduler read a NULL as due-now, with no failure
+  that), and the scheduler read a NULL as due-now, with no failure
   backoff anywhere, so a 401, a dead DNS name or a body that no longer
   parses got the same cadence as a healthy source. The sweep now
   applies an exponential backoff read from the fetch journal,
@@ -485,18 +485,18 @@ Defect fixes in the working tree, not yet on a published image.
 - The probe could lose the only address family a proxy was reachable
   on. `vet_probe_host_addrs` truncated the vetted list to four before
   the caller picked a family, and `pick_vetted` falls back to the
-  first address — so a CDN hostname publishing four or more AAAA
+  first address, so a CDN hostname publishing four or more AAAA
   records had every working A record truncated away, and the probe
   dialled, or pinned meow-rs to, an address it could not use. The cap
   now reserves a slot for the first address of each family present.
   The list is still at most four long, so the dial budget the cap
-  exists to bound is unchanged, and the fetcher path — which filters
-  by family before vetting — was never affected. Guarded by
+  exists to bound is unchanged, and the fetcher path, which filters
+  by family before vetting, was never affected. Guarded by
   `vetted_address_cap_keeps_both_families`.
 - Every T2 batch charged healthy TLS proxies a tunnel failure. The
   pin substitutes the vetted IP into `server`, and `sni`/`servername`
-  is emitted only when the entry already carries it — the normal
-  shape of a `trojan://pass@example.com:443#n` line — so mihomo had
+  is emitted only when the entry already carries it (the normal
+  shape of a `trojan://pass@example.com:443#n` line), so mihomo had
   no name to verify the certificate against and fell back to the IP
   literal, while the mapping deliberately does not force
   `skip-cert-verify`. Pinning now carries the entry's own server
@@ -506,8 +506,8 @@ Defect fixes in the working tree, not yet on a published image.
   `pinning_keeps_a_tls_server_name_for_a_bare_entry`.
 - One probe cycle could charge a single dead proxy two failures. The
   queued lane and the random lane run back to back and their
-  selectors overlapped completely — claiming a row only deletes the
-  queue row, it does not change the proxy's status — so the same proxy
+  selectors overlapped completely (claiming a row only deletes the
+  queue row, it does not change the proxy's status), so the same proxy
   could reach the ladder's limit in one cycle instead of across
   three, and one that failed the queue lane and then passed the
   random lane had its counter reset in the same breath. The queue lane
@@ -520,7 +520,7 @@ Defect fixes in the working tree, not yet on a published image.
   that leaves `X-Forwarded-For` alone. `client_key` tried XFF first
   and only fell through to `Forwarded` when XFF yielded nothing, and
   `walk_xff` cannot tell a client-authored entry from a
-  proxy-appended one — so a forged header short-circuited the one the
+  proxy-appended one, so a forged header short-circuited the one the
   proxy actually signed. An exhausted all-trusted chain in one header
   is now evidence that the peer wrote that header, and the client
   named by the other wins. The trade-off is documented rather than
@@ -531,7 +531,7 @@ Defect fixes in the working tree, not yet on a published image.
   `a_two_proxy_chain_writing_one_header_each_keeps_the_client_key`.
 - A profile with an access token could never be saved again. The
   edit form re-renders the masked placeholder `abc…••••`, which the
-  token charset check rejects — and the error was raised before the
+  token charset check rejects, and the error was raised before the
   "unchanged mask keeps the stored secret" fixup, so the whole save
   aborted with 422 and the profile's name, slug, output format,
   country allowlist and source composition were all frozen. The mask
@@ -542,7 +542,7 @@ Defect fixes in the working tree, not yet on a published image.
 - Three admin screens answered `500` for a host the panel had
   already admitted. The router gates on `[admin].allowed_hosts` but
   builds the serve links against the separate `[server].allowed_hosts`,
-  and all three callers turned that rejection into an internal error —
+  and all three callers turned that rejection into an internal error,
   so on a deployment that pins both lists, which is the reason both
   exist, *Import / Export*, *Sources* and *Profiles* were
   unreachable. The links are now built against the host that reached
@@ -554,7 +554,7 @@ Defect fixes in the working tree, not yet on a published image.
   an ingest. The generation counter exists so an invalidation drops a
   rendering computed from pre-ingest rows, but the cold path stored
   unconditionally and `invalidate_processed_for_source` could only
-  bump keys it found by iterating existing entries — so a key with no
+  bump keys it found by iterating existing entries, so a key with no
   entry yet, which is exactly an in-flight cold render, was invisible
   to it. The cold path now claims the key before rendering and stores
   through the same guarded put the stale path already used. Guarded by
@@ -562,7 +562,7 @@ Defect fixes in the working tree, not yet on a published image.
 - `X-Fumox-Warning: all-proxies-quarantined` was sent for profiles
   where nothing was quarantined. The predicate counted `ready` as a
   hidden tier, contradicting the comment three lines above it, and
-  read the pre-filter population — so a `filter.protocols` (or ASN,
+  read the pre-filter population, so a `filter.protocols` (or ASN,
   or drop-rule) filter that removed every ready proxy produced a
   health warning. Only `quarantine` and `removed` count now: a
   filter is a configuration fact, not a health one. Guarded by
@@ -570,7 +570,7 @@ Defect fixes in the working tree, not yet on a published image.
 - A proxy the probe had already quarantined or removed kept being
   served. `/sub` and `/src` stamp their cache entry with the source
   fetch TTL, but the probe is a separate process that moves rows
-  between tiers and nothing in the server reacts to it — the only
+  between tiers and nothing in the server reacts to it, so the only
   ingest-time drop is gated on a fetch having changed something. The
   window was therefore the feed-download interval: an hour by
   default, up to 24 at the admin form's maximum. Rendered output is
@@ -582,7 +582,7 @@ Defect fixes in the working tree, not yet on a published image.
   boundary. The pre-image joins its fields with a literal `|` and the
   escaping rewrote only `%`, `&` and `=`, so two malformed feed lines
   that both contained one collapsed into a single row and a node
-  vanished from the subscription — while the comment beside it
+  vanished from the subscription, while the comment beside it
   claimed the escaping made separators unforgeable. The separator is
   escaped now, so the pre-image is injective in it, and the over-claim
   is narrowed to what the code does: the scheme and the port are
@@ -601,7 +601,7 @@ Defect fixes in the working tree, not yet on a published image.
   the two sample-proportional triggers divided the quarantine depth
   by a `.max(1)` stand-in while the snapshot underneath printed the
   real `0`, so a 25-row queue read "25× the per-cycle sample" above a
-  "sample 0/cycle". Both triggers now stay off at zero — there is no
+  "sample 0/cycle". Both triggers now stay off at zero: there is no
   sample to measure against, and the `all_idle` line already reports
   the state with the numbers an operator can act on. Guarded by
   `sample_size_zero_reports_idleness_not_a_ratio_over_zero`.
@@ -615,7 +615,7 @@ Defect fixes in the working tree, not yet on a published image.
   pool plus its writes, and the daemon already puts a `.max(5)` floor
   on its beat period, so the recommendation now stays silent below
   that instead of printing a value an operator should not set. The
-  knob itself is unaffected — a period the model can certify at or
+  knob itself is unaffected: a period the model can certify at or
   above the floor still prints. Both guides' recommendation list
   says so. Guarded by
   `period_rec_never_lands_below_the_beating_floor`, and the whole
@@ -669,8 +669,8 @@ Defect fixes in the working tree, not yet on a published image.
   period to 5 s. Every key now opens its comment block with the range
   it is actually held to, and the keys the form does not edit say so
   instead of implying a bound they do not have. The two keys whose
-  prose admitted no range — the `host:port` sockets, the paths, the
-  token — say that plainly in words instead.
+  prose admitted no range (the `host:port` sockets, the paths, the
+  token) say that plainly in words instead.
   The `[probe]` block also carried the `allow_private_targets` SSRF
   explanation above `connect_timeout_secs`, next to a commented-out
   duplicate of a key that lives 50 lines further down; it now sits
@@ -686,8 +686,8 @@ Defect fixes in the working tree, not yet on a published image.
 - Both guides described `./config` as mounted read-only. The server
   container mounts it read-write precisely so the admin *Edit
   settings* page can save, which is the change this batch
-  introduced; the probe is the `:ro` one. `FUMOX_CONFIG_ACCESS` —
-  the knob that this change added — was documented in the compose
+  introduced; the probe is the `:ro` one. `FUMOX_CONFIG_ACCESS`,
+  the knob that this change added, was documented in the compose
   file, the changelog and `scripts/smoke-up.sh` but in neither
   guide, so it is now in the `.env` table too.
 - The reverse-proxy note told operators to set both
@@ -707,7 +707,7 @@ Defect fixes in the working tree, not yet on a published image.
   documented; the guides now name them as the exception instead of
   claiming completeness.
 - `[server].export_max_rows = 0` was undocumented. It does not mean
-  unlimited — the value clamps up to 1 row, so the body serves a
+  unlimited: the value clamps up to 1 row, so the body serves a
   single node. The config reference (both languages) now says so,
   next to the sibling keys that do give `0` a meaning.
 - The export links were documented as "rendered at most once every
@@ -732,8 +732,8 @@ Defect fixes in the working tree, not yet on a published image.
 - The pipeline tables in both guides described `limit.count` as
   capping "the final, deduplicated and sorted list" on a source as well
   as on a profile. A source-level cap applies to that source's own
-  proxies, before the merge — the behaviour the serving code's own
-  comment described, and the one this batch's `limit` fix made true —
+  proxies, before the merge, the behaviour the serving code's own
+  comment described, and the one this batch's `limit` fix made true,
   so a multi-source profile serves each source's top up to that count,
   i.e. more than `count` in total. Both tables now say which is which.
 
@@ -747,7 +747,7 @@ Defect fixes in the working tree, not yet on a published image.
   touches them. The exports have no source TTL to inherit and no
   invalidation trigger (the probe owns the tiers), so the window is
   fixed and short, and an expired entry is re-rendered inline rather
-  than served stale — a download is a snapshot by definition, and a
+  than served stale: a download is a snapshot by definition, and a
   quietly outdated one is worse than a slow request. A tier can
   therefore lag a status change by up to 30 s.
 - The two export links are now capped at 50 000 rows, and the cap is
@@ -790,7 +790,7 @@ Defect fixes in the working tree, not yet on a published image.
   checkbox / select / spinbutton reverted to the value the running
   server loaded an hour ago even when the file on disk held the new
   value. The handler now calls `AppConfig::load(path)` on every
-  `GET /admin/settings/edit` — `raw_from_state(state)` is replaced
+  `GET /admin/settings/edit`, `raw_from_state(state)` is replaced
   by `raw_from_config(&cfg)`, with a `state_appconfig(state)`
   fallback for the unwritable / load-error paths. ENV overrides
   keep their priority because figment merges them on top of the
@@ -811,7 +811,7 @@ Defect fixes in the working tree, not yet on a published image.
   `[ingest].removed_as_unknown` still shows its default value),
   and ENV overrides keep winning on top because the figment merge
   runs every refresh. The destructured fields frozen at startup
-  are intentionally left alone — `server_bind` socket address and
+  are intentionally left alone: `server_bind` socket address and
   the HMAC keys derived from the admin token stay put (silently
   rebinding the listener or invalidating every active session
   would be a footgun). Regression guarded by the unit test
@@ -834,7 +834,7 @@ Defect fixes in the working tree, not yet on a published image.
   separate *Create from defaults* button on the overview
   generates the file from the embedded reference copy when
   absent. All edits are restart-required (probe must be restarted
-  alongside server). No runtime-config DB overlay is introduced —
+  alongside server). No runtime-config DB overlay is introduced,
   that would not help probe, which still re-reads the file at
   startup.
 - Pipeline editor gained a `target: "asn"` drop-rule option: a
@@ -861,8 +861,8 @@ Defect fixes in the working tree, not yet on a published image.
   for the ingest-driven `[ingest].removed_as_unknown` path, and
   the returned ids are enqueued into `probe_requests` so the
   probe picks them up on the next cycle rather than waiting for
-  the random sample to come around. Nothing is physically deleted
-  — the *Purge removed* button stays the only hard-delete.
+  the random sample to come around. Nothing is physically deleted:
+  the *Purge removed* button stays the only hard-delete.
 
 ### Changed
 
@@ -870,7 +870,7 @@ Defect fixes in the working tree, not yet on a published image.
   most recent T2 attempt fails (bad credentials, meow-rs
   unreachable, the target hit the SSRF policy, or a
   `ServiceUnavailable` from the engine), subsequent T1 checks
-  for that proxy are skipped until the next successful T2 — the
+  for that proxy are skipped until the next successful T2; the
   T2 recency selector is the only path back into the T1 rotation.
   A T1 failure (a closed TCP port) does not trigger the
   suppression because it is not a property of the tunnel.
@@ -879,7 +879,7 @@ Defect fixes in the working tree, not yet on a published image.
   drop or rename row fires an htmx round-trip that swaps the row
   in place, so the regex ↔ ASN switch is immediate and the `asns`
   input appears without an explicit add button. The round-trip
-  carries `?render=1` so it never grows the row count — only the
+  carries `?render=1` so it never grows the row count: only the
   explicit *Add rule* / *Add drop rule* buttons append.
 - Pipeline preview now updates on every keystroke. The wrapper
   around the JSON preview listens for `change, input` events
@@ -890,7 +890,7 @@ Defect fixes in the working tree, not yet on a published image.
 - Admin *Sources → Delete* action is now conservative on `ready`
   proxies when `[ingest].drop_gate = false` (the default): a
   tunnel-verified row is left alone instead of being retired
-  just because its source was removed — the probe keeps being
+  just because its source was removed: the probe keeps being
   the only authority on its lifecycle. With `drop_gate = true`
   the strict policy applies and every orphan retires, including
   `ready`.
@@ -919,7 +919,7 @@ Defect fixes in the working tree, not yet on a published image.
   edited in place (typically a comment-only change), the SHA-384
   stored in `_sqlx_migrations.checksum` is re-stamped from the
   on-disk content and `migrate()` is retried. The schema on disk
-  is unchanged — only the bookkeeping column is rewritten. Any
+  is unchanged; only the bookkeeping column is rewritten. Any
   other sqlx error (`Dirty`, `VersionMissing`, structural
   mismatch, real DDL failure) propagates to the caller untouched.
 
@@ -960,7 +960,7 @@ Defect fixes in the working tree, not yet on a published image.
   either array, `X-Forwarded-For` and RFC 7239 `Forwarded: for=…`
   are honored for the per-IP rate-limit key. Empty disables
   forwarded-header trust (the historical behavior behind a
-  direct connection) — any caller can otherwise spoof the key.
+  direct connection), any caller can otherwise spoof the key.
   This closes a security audit finding.
 
 ### Changed
@@ -989,7 +989,7 @@ Defect fixes in the working tree, not yet on a published image.
 
 - Removed-as-unknown: a new `[ingest].removed_as_unknown` ingestion
   control (default `false`). With it enabled, a `removed` proxy the
-  feed still carries is revived on the next refresh — the row resets
+  feed still carries is revived on the next refresh: the row resets
   to a pristine `unknown` with the fail counter and quarantine fields
   cleared, and walks the checks again as if it had just been inserted.
   With the default, `removed` stays terminal.
@@ -1025,7 +1025,7 @@ Defect fixes in the working tree, not yet on a published image.
 
 - Geo pipeline: City and ASN databases are now merged into one
   pipeline (City carries every fact the previous Country database
-  had), and GeoLite2-Country is retired — the server no longer
+  had), and GeoLite2-Country is retired: the server no longer
   downloads or reads it, an existing `GeoLite2-Country.mmdb` is
   ignored, and `[geo].db` remains accepted in configs but does
   nothing. The six placeholders (`{flag}`, `{country}`, `{city}`,
@@ -1098,7 +1098,7 @@ Defect fixes in the working tree, not yet on a published image.
 - Proxy card actions by ASN and status: the proxies browser card
   now drives actions keyed off ASN or status directly. The Docker
   Compose file is also adjusted for Podman rootless compatibility.
-- Pipeline — ASN filter and output limit: the pipeline now exposes
+- Pipeline: ASN filter and output limit, the pipeline now exposes
   an ASN allowlist (`asns` / `exclude_asns`), and an output-limit
   step (`{ "limit": { "count": N } }`) caps the final deduplicated
   and sorted list.

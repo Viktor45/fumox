@@ -73,33 +73,9 @@ fn sole(found: Forwarded, peer: SocketAddr) -> IpAddr {
 ///    trusted chain ⇒ that client.
 /// 6. Anything else ⇒ the peer IP.
 ///
-/// There is deliberately no precedence between the two headers. A trusted
-/// proxy writes one of them and leaves the other exactly as the client sent
-/// it (nginx and Caddy pass `Forwarded` through untouched and write XFF;
-/// Traefik/Envoy/HAProxy in Forwarded mode write `Forwarded` and leave
-/// XFF), and nothing inside a request says which one the trusted hop wrote:
-/// the right-to-left walk can only skip trusted-CIDR entries, it cannot
-/// tell a proxy-appended element from a client-authored one. So a fixed
-/// precedence always loses to a client that sends the *other* header —
-/// either way round, the rate-limit key, including the `login_limiter`
-/// brute-force cap, becomes client-chosen. Rule 5 is what keeps rule 6
-/// honest in the other direction: a two-proxy chain where the outer hop
-/// writes `Forwarded` and the peer writes XFF (Traefik in front of nginx)
-/// exhausts the XFF walk on trusted entries, and reading that as a forgery
-/// would collapse every such deployment onto the peer — one shared login
-/// window of 5 requests a minute for the whole installation, which any
-/// anonymous passer-by could then exhaust for every admin.
-///
-/// The cost of rule 6 is the mirror image of the bypass it prevents, and it is
-/// deliberate: the peer bucket is *shared*, not private, so a client whose
-/// own `Forwarded` disagrees with the peer's XFF (a client that sends one,
-/// or a further proxy in front of the peer that writes only `Forwarded`)
-/// shares the peer's window with everything else that lands there. The key
-/// is still never the client's choice, which is the property the cap
-/// depends on; only its granularity is lost, and only for requests that
-/// carry a header the trusted proxy does not write. Choosing between the
-/// two headers instead would need a per-deployment setting saying which
-/// one the proxy writes — a request alone cannot carry that signal.
+/// No precedence between `Forwarded` and `X-Forwarded-For`: the walk cannot
+/// tell a proxy-appended entry from a client-authored one, so either fixed
+/// order is client-chosen.
 pub fn client_key(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> IpAddr {
     // 1. No trusted proxies configured ⇒ never honor forwarded headers.
     if trusted_cidrs.is_empty() {

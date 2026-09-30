@@ -1,4 +1,4 @@
-# Quadlet (podman/systemd) — running Fumox without docker compose
+# Quadlet (podman/systemd): running Fumox without docker compose
 
 Quadlet-unit equivalents of `docker-compose.yml`: systemd manages a pod with
 three containers (fumox-server, fumox-probe, meow-rs) just like compose did.
@@ -6,23 +6,23 @@ Two variants to choose from:
 
 | Folder     | Variant                                          | When it fits                                                                                                                       |
 | ---------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `quadlet/` | `fumox.pod` + three `.container` + two `.volume` | The native quadlet way — optimal: explicit units, precise per-container volume mounts, `Restart` per container, per-service status |
+| `quadlet/` | `fumox.pod` + three `.container` + two `.volume` | The native quadlet way, optimal: explicit units, precise per-container volume mounts, `Restart` per container, per-service status |
 | `kube/`    | `fumox.kube` + `fumox-pod.yaml`                  | A single, k8s-shaped manifest; handy if YAML is what you know best                                                                 |
 
 Requires podman ≥ 4.4 (5.x preferred). Everything below assumes **rootless**
 podman (recommended); rootful differences are at the end.
 
 The pod publishes plain HTTP only: terminate HTTPS with a reverse proxy in
-front of the server listener — `docker/nginx/` holds a ready nginx example,
+front of the server listener. `docker/nginx/` holds a ready nginx example,
 shared with the docker-compose setup.
 
 ## Preparation (both variants)
 
-Quadlet does not build images — the units reference the local names
+Quadlet does not build images: the units reference the local names
 `localhost/fumox:local` and `localhost/fumox-meow:local`. Prepare them either
 way:
 
-**Option 1 — pull the published GHCR images (fastest):**
+**Option 1: pull the published GHCR images (fastest):**
 
 ```sh
 podman pull ghcr.io/viktor45/fumox:latest
@@ -33,13 +33,13 @@ podman tag ghcr.io/viktor45/fumox-meow:latest localhost/fumox-meow:local
 
 `ghcr.io/viktor45/fumox` is published by `.github/workflows/docker.yml` on
 `v*` tags and manual `workflow_dispatch` (see the in-file header for the
-current tag rules — there is no automatic rebuild on push to `main`).
+current tag rules, so there is no automatic rebuild on push to `main`).
 `ghcr.io/viktor45/fumox-meow` is packaged manually by `docker-meow.yml`. To
 skip the retagging, edit the `Image=` lines of the units to the GHCR names
-directly — that is also where you pin a version (`ghcr.io/viktor45/fumox:0.2.0`)
+directly, which is also where you pin a version (`ghcr.io/viktor45/fumox:0.2.0`)
 instead of `latest`.
 
-**Option 2 — build from source** (from the repository root):
+**Option 2: build from source** (from the repository root):
 
 ```sh
 podman build -t localhost/fumox:local .
@@ -65,13 +65,13 @@ cp config/GeoLite2-*.mmdb ~/fumox/config/   # optional: geo enrichment
    $EDITOR ~/.config/fumox/fumox.env          # set FUMOX_ADMIN__TOKEN
    ```
 
-   Besides `FUMOX_ADMIN__TOKEN`, the file can set `FUMOX_CONFIG` — the path
+   Besides `FUMOX_ADMIN__TOKEN`, the file can set `FUMOX_CONFIG`, the path
    to the TOML config file inside the container (default:
    `/app/config/app.toml` from the mounted config directory). Unit-level
    `Environment=` values outrank this file, which is exactly why the path is
-   not fixed in the units — configure it here.
+   not fixed in the units, configure it here.
 
-2. Install the units (every file from the folder — into one unit directory):
+2. Install the units (every file from the folder, into one unit directory):
 
    ```sh
    mkdir -p ~/.config/containers/systemd
@@ -94,12 +94,12 @@ as compose). Logs: `journalctl --user -u fumox-server -u fumox-probe -u fumox-me
 
 ### Editing `app.toml` from the admin panel
 
-`fumox-server.container` mounts the config directory as `:rw,Z` — the
+`fumox-server.container` mounts the config directory as `:rw,Z`, so the
 admin *Edit settings* page (`/admin/settings/edit`) writes
 `/app/config/app.toml` in place through the `toml_edit`-backed editor.
 Comments survive every save; ENV overrides (`FUMOX_SECTION__KEY`) keep
 winning per the figment merge; both server and probe must be restarted
-after a save. `fumox-probe.container` stays read-only — the probe only
+after a save. `fumox-probe.container` stays read-only: the probe only
 reads the file at startup and never writes it. If you prefer the editor
 off entirely, change the server mount to `:ro,Z`; the page will render
 disabled with a red `set.edit_unwritable` banner explaining why.
@@ -108,19 +108,19 @@ disabled with a red `set.edit_unwritable` banner explaining why.
 
 Quadlet (and the compose variant) default to publishing the admin panel
 on `127.0.0.1:8081` over plain HTTP. `[admin].secure_cookies` therefore
-must stay `false` — otherwise the browser silently drops the `Secure`
+must stay `false`, otherwise the browser silently drops the `Secure`
 session cookie, every login attempt looks like a successful
 `admin logged in` in `journalctl` followed by a permanent redirect to
 `/admin/login`. Override only when TLS is terminated at a reverse proxy:
 add `FUMOX_ADMIN__SECURE_COOKIES=true` to `fumox.env` (env wins over the
 file, the same figment merge that powers the rest of the override
 hierarchy). Rotating `[admin].token` or flipping `secure_cookies`
-invalidates every active session on the next request — plan token
+invalidates every active session on the next request, so plan token
 rotations for a quiet window.
 
 ## Variant B: `kube/`
 
-1. Images — as above.
+1. Images: as above.
 2. The variables secret (the `.env` equivalent):
 
    ```sh
@@ -140,9 +140,9 @@ rotations for a quiet window.
 
 On first start podman automatically backs the `fumox-data` and `meow-shared`
 PVCs with named volumes (see `podman volume ls`). The admin port is declared
-with `hostIP: 127.0.0.1` — after start verify with `podman port fumox`;
+with `hostIP: 127.0.0.1`; after start verify with `podman port fumox`;
 older podman releases (without `hostIP` support) publish 8081 on every
-interface — close it with a firewall or upgrade.
+interface, so close it with a firewall or upgrade.
 
 ## Differences from docker compose
 
@@ -165,7 +165,7 @@ interface — close it with a firewall or upgrade.
   (the docker volume mountpoint may require root; on macOS/OrbStack the
   data lives inside the docker VM.)
 - `restart: unless-stopped` → `Restart=on-failure` in the `[Service]`
-  sections (systemd does not restart explicitly stopped units — the
+  sections (systemd does not restart explicitly stopped units, the
   semantics match).
 - The `FUMOX_ADMIN__TOKEN` secret is kept not in a `.env` next to the
   compose file but in `~/.config/fumox/fumox.env` (variant A) or a

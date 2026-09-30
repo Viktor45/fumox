@@ -50,7 +50,7 @@ const MARKER_WINDOW: u64 = 128 * 1024;
 /// hardcoded public GitHub release links, which answer with a redirect to
 /// one of these; nothing else may follow. A redirect to any other host (or
 /// off https) is refused rather than fetched, so a hijacked release or a
-/// mis-typed URL cannot deliver a foreign file — the content check is a
+/// mis-typed URL cannot deliver a foreign file: the content check is a
 /// format check, not provenance.
 const REDIRECT_HOSTS: &[&str] = &["github.com"];
 
@@ -147,7 +147,7 @@ async fn ensure_one(dir: &Path, file: &GeoFile, user_agent: &str) -> Outcome {
 
 /// Whether the file must be (re-)downloaded: absent, implausible (empty,
 /// without the MaxMind metadata marker, or declaring a different
-/// `database_type` than this slot expects — a broken or swapped earlier
+/// `database_type` than this slot expects, a broken or swapped earlier
 /// download) or older than [`MAX_AGE`]. Age is only consulted for a file
 /// that passes the content check, so a wrong-but-plausible file is
 /// refreshed instead of being kept for another month.

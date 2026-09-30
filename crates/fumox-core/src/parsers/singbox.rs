@@ -145,9 +145,7 @@ fn vec1(entry: ProxyEntry) -> Vec<ProxyEntry> {
     vec![entry]
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 // sing-box native dialect
-// ─────────────────────────────────────────────────────────────────────────
 
 fn native_vless(map: &Map<String, Value>, name: &str) -> Result<ProxyEntry, String> {
     let (host, port) = native_endpoint(map)?;
@@ -464,9 +462,7 @@ fn native_transport_params(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 // Xray/v2ray-core ("vnext") dialect
-// ─────────────────────────────────────────────────────────────────────────
 
 fn xray_vless(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
     let mut entries = Vec::new();
@@ -745,7 +741,7 @@ fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, S
 /// `servers[i].users`) as objects, skipping non-object elements.
 ///
 /// Every user is a distinct credential for the same endpoint, so each one
-/// becomes its own [`ProxyEntry`] — the same treatment the sibling
+/// becomes its own [`ProxyEntry`], the same treatment the sibling
 /// `vnext`/`servers` arrays already get, and the reason a multi-user
 /// outbound must not be collapsed to its first element. A junk element
 /// costs only itself (log-and-skip), not the credentials around it.
@@ -936,9 +932,7 @@ fn xray_stream_params(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 // Shared helpers
-// ─────────────────────────────────────────────────────────────────────────
 
 /// Client-side knobs that describe the local dialer, not the proxy; dropped
 /// rather than passed through to keep DB rows and URI output clean.
@@ -1663,12 +1657,10 @@ mod tests {
         assert_eq!(result.invalid, 1);
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // Fixture tests against the real sing-box/Xray samples `test-sing.txt`
     // (single Xray config) and `test-sing2.txt` (v2rayN share array). The
     // fixtures are gitignored (real credentials) and never committed;
     // these tests skip themselves when the files are absent.
-    // ─────────────────────────────────────────────────────────────────────
 
     fn fixture_payload(name: &str) -> Option<String> {
         std::fs::read_to_string(

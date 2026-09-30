@@ -244,38 +244,11 @@ impl EditableConfig {
 /// admin server at the same time.
 static SAVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Serialises the read-modify-write cycle of [`EditableConfig`]
-/// inside one process: `load` blocks until every earlier handle has
-/// been dropped (which is after its `save`), so a document can never be
-/// a snapshot of a file that another live handle is about to replace.
-///
-/// One lock rather than one per path: the admin panel edits exactly one
-/// config, and keying by path would have to reconcile relative and
-/// absolute spellings of the same file. A second *process* editing the
-/// same file is out of scope, the tmp name already keeps that case from
-/// corrupting the file (last rename wins).
-///
-/// # Contract for anyone adding the next lock acquisition
-///
-/// * **Not reentrant.** The flag is held across the whole
-///   load -> mutate -> save cycle and released only in `Drop`, so code
-///   that runs *while a handle is alive* must never call `acquire`.
-///
-/// * **`config::load` / `config::load_config` must never take it.** The
-///   admin handler re-reads the config through that loader while its
-///   `EditableConfig` is still in scope (the post-save
-///   `refresh_live_config`), and the loader runs on the request thread.
-///   A loader that took this spin lock would hang that request, and the
-///   admin panel would stop saving entirely.
-///
-/// * **Scope is this module's edit path only.** A global for the crate,
-///   not for the whole configuration system: the plain loader reads the
-///   same file today without it, and that is the intended design, not an
-///   oversight to tidy up.
-///
-/// `plain_config_loader_does_not_take_the_editor_lock` in the tests
-/// below fails (5s timeout) the day anyone makes the loader take this
-/// lock, so the rule is enforced, not just documented.
+/// One process-wide lock, not one per path: the admin panel edits exactly
+/// one config, and keying by path would have to reconcile relative and
+/// absolute spellings of the same file. Not reentrant: the flag is held from
+/// `load` to drop, so `config::load_config` must never take it (the admin
+/// handler re-reads the config through it while the handle is alive).
 struct EditLock;
 
 impl EditLock {

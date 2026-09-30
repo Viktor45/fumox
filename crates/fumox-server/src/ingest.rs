@@ -114,7 +114,7 @@ pub async fn ingest_source(
     // The raw snapshot is a *freshness* marker, not a download log: it
     // stands for "the database is already reconciled from this payload"
     // (see `Caches::raw_is_fresh`). It is therefore written only once the
-    // payload has parsed and reconciled — caching it before that made a
+    // payload has parsed and reconciled, caching it before that made a
     // single parse or DB failure suppress every non-forced re-fetch for a
     // whole TTL while the scheduler kept reporting successful ingests.
 
@@ -728,7 +728,7 @@ mod tests {
     /// cost one `dns_timeout` per entry, and the results must stay aligned
     /// with the input order the drop rules and the upsert rely on.
     ///
-    /// Driven through [`resolve_geo_stamps`] itself — the assertions are
+    /// Driven through [`resolve_geo_stamps`] itself: the assertions are
     /// about how the production function drives the resolver, so reverting
     /// it to a sequential `for entry in entries { geo.resolve(...).await }`
     /// loop fails the peak-concurrency assertion.

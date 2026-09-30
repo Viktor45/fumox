@@ -188,16 +188,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Wait for the GeoLite2 download task, but no longer than `budget`
-/// (`[geo].startup_download_budget_secs`, 60 s by default — generous enough
-/// for a healthy mirror to install both databases, short enough that a
-/// stalled one cannot keep `/healthz` unreachable for the sum of two
-/// per-file download budgets). On elapse the task is left running (dropping
-/// a `JoinHandle` detaches, it does not abort) and startup continues: geo
-/// enrichment is optional, and a container that answers `/healthz` is worth
-/// more than one that boots with a database. The install itself is an
-/// atomic rename, so a detached download finishing mid-run can never expose
-/// a half-written file.
+/// Wait for the GeoLite2 download task, but no longer than `budget`. On
+/// elapse the handle drops, which detaches the task rather than aborting it;
+/// the install is an atomic rename, so a late finish never exposes a partial
+/// file.
 async fn await_geo_within_budget(task: tokio::task::JoinHandle<()>, budget: Duration) {
     match tokio::time::timeout(budget, task).await {
         Ok(Ok(())) => {}

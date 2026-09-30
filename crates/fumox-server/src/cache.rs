@@ -19,9 +19,9 @@
 //! containing the source (but keeps the just-written raw snapshot), so clients
 //! see fresh proxies without waiting out the TTL.
 //!
-//! Every invalidation also bumps that key's generation. A render — the
-//! background one of a stale entry and the inline one of a cache miss alike
-//! — reads the generation when it starts and its result is dropped when the
+//! Every invalidation also bumps that key's generation. A render, the
+//! background one of a stale entry or the inline one of a cache miss alike,
+//! reads the generation when it starts and its result is dropped when the
 //! generation moved meanwhile: that rendering was computed from pre-change
 //! rows and must not be stored with a full fresh TTL behind the change that
 //! invalidated it. A key with no entry yet (the inline path) is registered
@@ -112,8 +112,6 @@ impl Caches {
         }
     }
 
-    // ---- raw layer ----
-
     pub async fn raw_get(&self, source_id: &str) -> Option<Arc<RawSnapshot>> {
         self.raw.get(&source_id.to_string()).await
     }
@@ -137,8 +135,6 @@ impl Caches {
             )
             .await;
     }
-
-    // ---- processed layer ----
 
     pub async fn processed_get(&self, key: &str) -> Option<Arc<Rendered>> {
         self.processed.get(&key.to_string()).await
@@ -200,8 +196,6 @@ impl Caches {
         self.generations.insert(key, next).await;
     }
 
-    // ---- invalidation ----
-
     /// Source changed (url/encoding/input_format/protocols/headers/TTL/
     /// pipeline/enabled): drop its raw snapshot and every rendered output
     /// that contains it.
@@ -223,8 +217,8 @@ impl Caches {
             .filter(|(_, rendered)| rendered.source_ids.iter().any(|id| id == source_id))
             .map(|(key, _)| (*key).clone())
             .collect();
-        // A key with no entry yet — an inline (cache-miss) render of it is
-        // running right now — is invisible to the iteration above. Its
+        // A key with no entry yet, an inline (cache-miss) render of it
+        // running right now, is invisible to the iteration above. Its
         // rendering is still computed from the pre-ingest rows, so its
         // generation has to move too or the put would land behind this
         // invalidation (see [`Caches::processed_put_guarded`]). Only renders
@@ -251,8 +245,6 @@ impl Caches {
         self.processed_invalidate(&format!("sub:{profile_id}"))
             .await;
     }
-
-    // ---- stale-while-revalidate coordination ----
 
     /// Claim the background revalidation of a key. Returns a guard that
     /// releases the claim on drop, or `None` when another task holds it.
@@ -282,12 +274,10 @@ impl Caches {
         self.revalidating.lock().await.contains(key)
     }
 
-    // ---- inline (cache-miss) render coordination ----
-
     /// Claim an inline render of a key the processed layer does not hold.
     /// Returns a guard carrying the generation the render must still hold to
     /// be storable, or `None` when another render of the same key is already
-    /// in flight — a burst of requests on a cold key renders the same body
+    /// in flight: a burst of requests on a cold key renders the same body
     /// once for the cache and answers the rest without storing it.
     ///
     /// The guard also keeps the key visible to

@@ -18,22 +18,9 @@ pub type DbPool = SqlitePool;
 
 /// Opens a connection pool configured for multi-process WAL access.
 ///
-/// The database file is created with `0600` permissions on Unix because it
-/// stores proxy credentials in plain text.
-///
-/// Pre-create race story (Unix):
-/// - Process A: pre-creates with `OpenOptions::create_new(true).mode(0o600)`
-///   → wins, file born with mode `0o600` atomically.
-/// - Process B: tries the same `create_new(true)` → `AlreadyExists` → drops
-///   into the "present" branch → opens the existing file with mode already
-///   `0o600` (set by A) → `restrict_file_permissions` is a no-op
-///   confirmation.
-/// - The window during which the file exists without `0o600` is *zero*, the
-///   OS sets the mode atomically at create time.
-///
-/// On non-Unix platforms the pre-create step is a no-op (NTFS DACLs govern
-/// file access); the `restrict_file_permissions` confirmation is also a
-/// no-op.
+/// `create_new(true).mode(0o600)` sets the 0600 mode atomically, so the file
+/// holding the plain-text credentials is never briefly world-readable; on
+/// non-Unix this is a no-op and the ACL model governs.
 pub async fn connect_pool(cfg: &DatabaseConfig) -> crate::Result<SqlitePool> {
     if cfg.max_connections == 0 {
         // sqlx accepts a zero-sized pool and then fails every acquisition
@@ -64,9 +51,8 @@ pub async fn connect_pool(cfg: &DatabaseConfig) -> crate::Result<SqlitePool> {
     };
     // The path goes to SQLite as a `PathBuf`, never as a `sqlite:` URL
     // string: sqlx parses that URL as a URI and percent-decodes it, so a
-    // database path containing `%2F` (or `?`, or `#`) would name a
-    // different file than the one `pre_create_db_file` just created with
-    // mode 0600 — the 0600 file nobody opens.
+    // path containing `%2F`, `?` or `#` names a different file than the one
+    // `pre_create_db_file` just created with mode 0600, the file nobody opens.
     let options = SqliteConnectOptions::new()
         .filename(&cfg.path)
         .create_if_missing(create_if_missing)

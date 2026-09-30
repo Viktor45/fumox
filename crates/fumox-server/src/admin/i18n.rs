@@ -602,20 +602,8 @@ mod tests {
         }
     }
 
-    /// Catalog lookups, whichever helper the template reaches for: `t`,
-    /// `t_args` and `t_named` all resolve a key against the catalogs, so a
-    /// key used only by a parameterized phrase is just as missing as a
-    /// plain one. The plain `t` branch is last so a `t_args("…", …)` call
-    /// is not also read as a `t("…")` one. Only the opening quote is
-    /// required after the key: the two parameterized helpers take the
-    /// arguments after it.
-    ///
-    /// The `\b` is load-bearing. Without it the alternation matches the
-    /// tail of any helper whose name happens to end in `t`, so
-    /// `self.range_text("probe.sample_size")` in the settings form was
-    /// read as a catalog lookup for the key `probe.sample_size` and every
-    /// bounded field failed the test. A helper call is always preceded by
-    /// `.` or a word character; a real `t(` is preceded by a non-word one.
+    /// The `\b` is load-bearing: without it any helper whose name ends in `t`
+    /// (`self.range_text("…")`) is read as a catalog lookup for the wrong key.
     static TEMPLATE_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"\b(?:t_args|t_named|t)\("([a-z0-9_.]+)""#).expect("valid regex")
     });

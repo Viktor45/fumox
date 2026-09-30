@@ -10,7 +10,7 @@ Fumox fetches proxy lists from many sources, filters and refines them in real ti
 
 The project is in active development.
 
-**Fastest start — prebuilt images from GHCR** (multi-arch `linux/amd64` +
+**Fastest start: prebuilt images from GHCR** (multi-arch `linux/amd64` +
 `linux/arm64`, build-provenance attested; the meow-rs wrapper image is
 refreshed by a manual workflow):
 
@@ -47,14 +47,14 @@ Configuration lives in [`config/app.toml`](./config/app.toml); every key has a
 default and can be overridden through the environment: `FUMOX_SECTION__KEY`
 (e.g. `FUMOX_ADMIN__TOKEN=secret`).
 
-MaxMind GeoLite2 databases (`.mmdb`) are not part of the repository — download
+MaxMind GeoLite2 databases (`.mmdb`) are not part of the repository. Download
 them into `config/` separately:
 
 1. Sign up at <https://www.maxmind.com/en/geolite2/signup> (free account).
 2. Download the databases you need via
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/):
    `GeoLite2-City.mmdb` for country flags/names and city names
-   (`GeoLite2-ASN.mmdb` adds AS numbers/organizations — every database
+   (`GeoLite2-ASN.mmdb` adds AS numbers/organizations; every database
    present is merged, so they combine in one name template).
 3. Place each file in `config/` under its canonical name.
 
@@ -66,7 +66,7 @@ weekly.
 
 ## Security
 
-`[admin].token` is the only critical secret on a fresh install — change it
+`[admin].token` is the only critical secret on a fresh install: change it
 before exposing the admin panel to anything other than `127.0.0.1`. **Behind
 a reverse proxy, two config keys must be set** so the per-IP rate limit and
 the `Host`-header allowlist behave correctly:
@@ -78,7 +78,7 @@ the `Host`-header allowlist behave correctly:
 - `[server].allowed_hosts` and `[admin].allowed_hosts`: your public
   hostname (e.g. `["fumox.example.com"]`). Without these, the `Host`
   header is honored as-is for the `/export/alive/{token}` /
-  `/export/ready/{token}` export token URLs and the rendered admin URLs — an attacker that can poison `Host` reaching the
+  `/export/ready/{token}` export token URLs and the rendered admin URLs, so an attacker that can poison `Host` reaching the
   listener can render URLs pointing at a host they control.
 
 Both keys default to `[]` to preserve the historical behavior behind a
@@ -87,7 +87,7 @@ configuration reference and the production checklist for context.
 
 - `[admin].secure_cookies` (or the matching `FUMOX_ADMIN__SECURE_COOKIES`
   env override): keep `false` when the panel is reached over plain HTTP
-  (the `docker-compose.yml` default — `http://127.0.0.1:8081`). Browsers
+  (the `docker-compose.yml` default, `http://127.0.0.1:8081`). Browsers
   silently drop `Secure` cookies on `http://`, so a successful login
   (`admin logged in` in logs) gets followed by a permanent redirect to
   `/admin/login`. Set `true` only when TLS is terminated at a reverse

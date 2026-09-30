@@ -55,9 +55,7 @@ const COVERAGE_SQL: &[(&str, &str)] = &[
     ),
 ];
 
-// ---------------------------------------------------------------------------
 // List
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, sqlx::FromRow)]
 struct ProxyListRow {
@@ -367,9 +365,7 @@ pub async fn proxies_list(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Card
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, sqlx::FromRow)]
 struct ProbeHistoryRow {
@@ -548,9 +544,7 @@ pub async fn proxy_detail(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Probe history fragment (live refresh)
-// ---------------------------------------------------------------------------
 
 /// Standalone fragment template for the probe history table; the same
 /// markup is `{% include %}`d into the full card, so the initial render and
@@ -607,9 +601,7 @@ pub async fn proxy_probe_history(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Purge removed
-// ---------------------------------------------------------------------------
 
 /// Physically delete every `removed` proxy (and, via cascade, its links and
 /// probe history). Guarded by a confirmation dialog in the UI.
@@ -637,14 +629,12 @@ pub async fn proxies_purge_removed(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Bulk cleanup
 //
 // Every action below transitions rows into the terminal `removed` status ,
 // they never delete. The physical cleanup stays the single «purge removed»
 // button, so each action is reversible via the per-proxy «reset status»
 // until purged.
-// ---------------------------------------------------------------------------
 
 /// Shared tail of the parameterless cleanup handlers: run the repo
 /// transition, log it and answer with the count badge + toast.
@@ -794,14 +784,12 @@ pub async fn proxies_remove_alive_by_country(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Bulk revival
 //
 // Every action below moves rows *back* to `unknown`, the inverse of the
 // cleanup panel. Revived ids are enqueued into `probe_requests` so the probe
 // daemon picks them up on its next cycle (the same handoff the ingest path
 // uses for `[ingest].removed_as_unknown`).
-// ---------------------------------------------------------------------------
 
 /// Enqueue revived ids for priority probing. Failures are logged and
 /// never fail the revival: the proxy sits in the random sample until
@@ -956,9 +944,7 @@ pub async fn proxies_revive_removed_by_country(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Actions
-// ---------------------------------------------------------------------------
 
 /// The `#status-badge` swap fragment for a row an action left alone,
 /// same shape the detail template renders: the form's `hx-target` points
@@ -988,13 +974,7 @@ pub async fn proxy_reset(
     let lang = state.locales.lang_from_headers(&headers);
     match proxies::reset_status(&state.pool, id).await {
         Ok(true) => {}
-        // `false` covers two different rows: one that is gone, and one
-        // that exists but belongs to no probe lane (reconciliation
-        // retired it, or its scheme is one no lane checks). Only the
-        // first is a 404 — answering the second with `proxy not found`
-        // told an operator that a proxy still on the screen does not
-        // exist. The refusal is reported instead, as a rejected action:
-        // the badge comes back unchanged, which is the truth.
+        // `false` is a gone row or one no probe lane can reach; only the first is a 404.
         Ok(false) => match proxies::get_by_id(&state.pool, id).await {
             Ok(Some(row)) => {
                 tracing::info!(
@@ -1051,19 +1031,8 @@ async fn refresh_geo(state: &AdminState, proxy: &mut proxies::ProxyRow) {
     proxy.resolved_ip = Some(info.ip);
 }
 
-/// Project a freshly resolved stamp onto the row the card is rendered
-/// from. A field is overwritten only when the stamp actually carries it:
-/// the resolver merges the databases with an `any`-hit, so a stamp is
-/// legitimately partial where the other databases are silent, and an
-/// ASN-only hit (a City record decoding with an empty country, as for the
-/// Cloudflare `104.16.0.0/12` block) must not turn a stored country or
-/// city into `None` on the struct — the card would then render `-` for a
-/// country the row still holds. This is the in-memory half of the same
-/// invariant the `COALESCE` in
-/// [`fumox_core::repo::proxies::update_geo_full`] keeps in the database.
-///
-/// Split out of [`refresh_geo`] so the merge is testable without a
-/// GeoLite2 database on disk.
+/// Overwrite a field only when the stamp carries it: a partial stamp
+/// must not turn a stored country or city into `None`.
 fn merge_geo_stamp(proxy: &mut proxies::ProxyRow, stamp: &proxies::GeoStamp) {
     if let Some(country) = &stamp.country {
         proxy.geo_country = Some(country.clone());

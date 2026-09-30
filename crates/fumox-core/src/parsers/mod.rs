@@ -111,7 +111,7 @@ pub(crate) fn reject_line_breaks(field: &str, value: &str) -> Result<(), String>
 /// and re-deserializing it into fresh owned values that are retained in the
 /// result tree; its only bound is a document-global jump counter that an
 /// alias bomb stays far under. One anchor of `s` events plus `k` references
-/// materializes ~`k×s` values from a payload of ~`k+s` events — quadratic
+/// materializes ~`k×s` values from a payload of ~`k+s` events, quadratic
 /// memory amplification from a feed payload bounded only by the 10 MiB fetch
 /// cap (security review f4: 20 KiB → >1 GiB heap, allocation failure aborts
 /// the whole process). Feed content has no legitimate use for aliases, so
@@ -121,7 +121,7 @@ pub(crate) fn reject_line_breaks(field: &str, value: &str) -> Result<(), String>
 /// toward false positives: a missed alias is a security hole, a wrongly
 /// rejected payload is a visible parse error. It must therefore find every
 /// alias an attacker can write (in valid YAML a `*` at a token position is
-/// always an alias — plain scalars cannot start with an indicator), while
+/// always an alias, plain scalars cannot start with an indicator), while
 /// not rejecting the quoted scalars and block scalars real configs carry
 /// (`password: pass*word` must keep parsing). Positions treated as literal
 /// text: double/single-quoted scalars (entered only at token boundaries,
@@ -217,8 +217,8 @@ fn scan_yaml_line(
 }
 
 /// Does the `|`/`>` starting at `header` begin a block scalar? The header
-/// must sit at a value position — after `key:`, after a `-` entry marker,
-/// or alone on the line — and may only carry the indentation digit and
+/// must sit at a value position: after `key:`, after a `-` entry marker,
+/// or alone on the line, and may only carry the indentation digit and
 /// chomping indicator before whitespace or a comment. Text like
 /// `key: a |` is a plain scalar ending in `|`; treating it as a header
 /// would swallow the alias-bearing lines that follow.
@@ -445,7 +445,7 @@ fn parse_uri_list(text: &str, format: InputFormat) -> crate::Result<ParsedSubscr
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
-            continue; // comments and blanks are not proxy lines
+            continue;
         }
         match parse_line(line) {
             LineOutcome::Parsed(entry) => result.entries.push(entry),
@@ -722,13 +722,11 @@ mod tests {
         assert_eq!(result.unrecognized, 0);
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // Fixture-driven tests against the real subscription sample in
     // `test.txt`. The fixture is gitignored (it may contain non-public
     // data) and is never committed; these tests skip themselves when it
     // is absent. Thresholds below are calibrated for a ~390-line sample
     // (Sept 2026); they guard against regressions, not exact sizes.
-    // ─────────────────────────────────────────────────────────────────────
 
     #[test]
     fn fixture_authority_and_query_round_trip_byte_exact() {

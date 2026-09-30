@@ -25,9 +25,7 @@ const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
 /// Preview length on the profile card.
 const PREVIEW_LINES: usize = 50;
 
-// ---------------------------------------------------------------------------
 // List
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, sqlx::FromRow)]
 struct ProfileListRow {
@@ -98,9 +96,7 @@ pub async fn profiles_list(State(state): State<AdminState>, headers: HeaderMap) 
     )
 }
 
-// ---------------------------------------------------------------------------
 // Form (create / edit)
-// ---------------------------------------------------------------------------
 
 /// Display/edit values of the profile form (all as strings, as typed). The
 /// pipeline is carried by the widget HTML, not by these values.
@@ -398,19 +394,8 @@ async fn build_profile_from_form(
         Some(slug_raw)
     };
 
-    // Access token: an unchanged masked placeholder keeps the stored secret;
-    // an empty field clears the token (public endpoint). The mask is
-    // resolved *before* the checks below: `mask_secret` renders the secret
-    // as `abc…••••`, and `…`/`•` are outside the token charset, so
-    // validating the placeholder made every save of a token-protected
-    // profile fail with `val.token_format` and locked the operator out of
-    // renaming it.
-    //
-    // The stored row is matched by the *mask itself*, never by "the value
-    // contains a bullet": anything else the operator typed is what they
-    // typed, and treating it as a mask would silently drop a rotated
-    // credential (and skip its cap and charset checks) behind a success
-    // toast. Same rule as the source form's `restore_masked_headers`.
+    // The mask is resolved before validation: `…`/`•` are outside the token
+    // charset, so an unchanged placeholder must never be checked as typed.
     let token_raw = get("access_token");
     let stored = match existing_id {
         Some(id) => profiles::get(&state.pool, id).await.ok().flatten(),
@@ -704,9 +689,7 @@ pub async fn profile_update(
     Redirect::to(&format!("/admin/profiles/{}", profile.id)).into_response()
 }
 
-// ---------------------------------------------------------------------------
 // Card
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, sqlx::FromRow)]
 struct CompositionRow {
@@ -867,9 +850,7 @@ pub async fn profile_detail(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Actions
-// ---------------------------------------------------------------------------
 
 pub async fn profile_toggle(
     State(state): State<AdminState>,
@@ -1085,15 +1066,7 @@ mod tests {
         assert_eq!(built.access_token.as_deref(), Some("good-token_1"));
     }
 
-    /// Only the mask itself may resolve to the stored secret. On a profile
-    /// that already has a token, anything else the operator typed is what
-    /// they typed — including a value carrying a bullet, which the old
-    /// "contains a bullet" heuristic silently swapped for the stored
-    /// secret (a credential rotation that reported success and rotated
-    /// nothing). The sources form already documents and implements this
-    /// rule: "Matching on the mask itself, not on 'the value contains a
-    /// bullet', is what keeps a real value the operator typed from being
-    /// silently reverted" (sources.rs, `restore_masked_headers`).
+    /// Only the mask itself restores the stored secret; anything else typed is validated as typed.
     #[tokio::test]
     async fn a_typed_bullet_is_not_mistaken_for_the_mask() {
         let state = test_state().await;

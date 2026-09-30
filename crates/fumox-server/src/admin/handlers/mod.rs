@@ -542,10 +542,6 @@ async fn country_split(
     .await?)
 }
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
 /// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (the no-JS
 /// fallback). This text is the no-JS fallback inside [`fmt_ts_element`].
 pub fn fmt_ts(ts: i64) -> String {

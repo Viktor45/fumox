@@ -7,8 +7,8 @@
 //! )
 //! ```
 //!
-//! Every attacker-controlled field is escaped — the host, the credential and
-//! the parameter keys and values — so a separator byte coming from feed text
+//! Every attacker-controlled field is escaped: the host, the credential and
+//! the parameter keys and values, so a separator byte coming from feed text
 //! cannot move a field boundary inside the pre-image. The scheme and the port
 //! are written as they are: a fixed enum literal and a number.
 //!
@@ -92,7 +92,7 @@ fn canonical_key(scheme: Scheme, key: &str) -> String {
         "client-fingerprint" => "fp",
         "grpc-service-name" => "servicename",
         // Clash's `fingerprint` is the certificate pin (`pinSHA256` in the
-        // URI), not the uTLS client hello — that one is `client-fingerprint`.
+        // URI), not the uTLS client hello: that one is `client-fingerprint`.
         "fingerprint" => "pinsha256",
         other => other,
     }
@@ -101,8 +101,8 @@ fn canonical_key(scheme: Scheme, key: &str) -> String {
 
 /// Compute the stable deduplication fingerprint of a proxy entry.
 ///
-/// Every attacker-controlled field that reaches the pre-image — the host, the
-/// credential and the parameter keys and values — is escaped, so a separator
+/// Every attacker-controlled field that reaches the pre-image: the host, the
+/// credential and the parameter keys and values, is escaped, so a separator
 /// byte inside one of them can never be read as a boundary. The scheme and
 /// the port need no escaping: the scheme is a closed enum written as a fixed
 /// literal, the port a number by type.

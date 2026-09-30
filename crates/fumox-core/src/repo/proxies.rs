@@ -1287,43 +1287,11 @@ pub async fn select_due_quarantine(
     Ok(rows)
 }
 
-/// Apply a successful check: the proxy is `alive` (or `ready` for a
-/// successful T2, see `status_to`), every quarantine/recheck timestamp
-/// cleared, `last_alive_at` stamped and the measured latency stored.
-/// Covers `unknown → alive` (first success) and quarantine
-/// revival alike.
-///
-/// `status_to` decides the target tier:
-/// `"ready"`, the latest T2 tunnel check succeeded, the tunnel-verified
-/// tier; `"alive"`, a T1 success. A T1 success never demotes a `ready`
-/// row (the CASE keeps it), because a live TCP/TLS connect says nothing
-/// about the tunnel; only a failed T2 outcome does. The value is written
-/// as one of two fixed SQL literals chosen by the caller's own enum ,
-/// never interpolated from untrusted input.
-///
-/// `status_to` is also what identifies a T2 success, and a T2 success
-/// is the only thing that lifts `last_t2_failed_at` (migration 0007:
-/// a T2 failure suppresses T1 "until the next successful T2", and the
-/// T2 recency selector is the only way back). A T1 success — including
-/// a quarantine revival, which is a TCP/TLS connect too — leaves the
-/// flag alone; clearing it there would let a proxy that just failed its
-/// tunnel back into the T1 rotation on a plain TCP verdict, which is
-/// the case the flag exists to suppress. The revival paths
-/// ([`reset_status`], [`revive_removed`] and the bulk variants) clear
-/// it as part of putting the row back at its starting square, so a
-/// re-checked row is never stuck behind a stale flag.
-///
-/// `reset_fail_count` implements the strict T2 priority: a T1 success
-/// must not wipe the fail counter
-/// accumulated from T2 failures, the tunnel verdict stands until T2 itself
-/// confirms the proxy or the quarantine ladder takes over. T2 successes and
-/// second-chance revivals reset the counter unconditionally; a T1 success
-/// resets it only when the last failed attempt was not a T2 one (the caller
-/// asks [`crate::repo::probe::last_failed_kind`]).
-///
-/// `status != 'removed'` keeps a success from reviving a removed proxy:
-/// `removed` is terminal, only the admin "reset status" action (or purge
-/// removed followed by a re-insert from a fetch) returns a proxy to service.
+/// Apply a successful check: `status_to` picks the tier (a T1 success never
+/// demotes `ready`) and is the only thing that lifts `last_t2_failed_at`.
+/// `reset_fail_count` follows the T2-priority rule: the caller that saw no
+/// T2 failure (see [`crate::repo::probe::last_failed_kind`]) resets it.
+/// `status != 'removed'` keeps a removed row terminal.
 pub async fn check_succeeded(
     pool: &DbPool,
     id: i64,
@@ -1337,10 +1305,6 @@ pub async fn check_succeeded(
         ProxyStatus::Ready => "'ready'",
         _ => "CASE WHEN status = 'ready' THEN 'ready' ELSE 'alive' END",
     };
-    // Only a T2 success is allowed to lift the T1 suppression flag, and
-    // `ready` is exactly the T2-success tier (the probe promotes to
-    // `ready` on a passing tunnel check, everything else lands on
-    // `alive`). The T1 lanes both filter on `last_t2_failed_at IS NULL`.
     let clear_t2_failed = status_to == ProxyStatus::Ready;
     let sql = format!(
         "UPDATE proxies SET

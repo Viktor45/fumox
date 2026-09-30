@@ -3458,9 +3458,7 @@ mod tests {
         assert_eq!(status_by_fp(&pool, "fp-ashet").await, "removed");
         assert_eq!(status_by_fp(&pool, "fp-asno").await, "alive");
 
-        // Regression (2026-09-11): the HTMX badge fragment substitutes the
-        // `{asn}` placeholder, the catalogs read "removed by AS{asn}" and a
-        // mismatch used to render the literal "AS{n}" to the operator.
+        // The badge fragment must substitute the catalog's {asn} into "AS{asn}".
         seed_cleanup_proxy(
             &pool,
             "fp-asfrag",
@@ -4045,9 +4043,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Dashboard Top-N picker (configurable widget sizes)
-    // -----------------------------------------------------------------
+    // Dashboard Top-N picker
 
     #[tokio::test]
     async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
@@ -5458,10 +5454,7 @@ mod tests {
 
         let app = router(state.clone());
         let cookie = login(&app).await;
-        // The dashboard no longer carries a fetches table, it moved to the logs screen only, so the wrapping
-        // cell is asserted wherever the error column exists. The source card
-        // renders the same _log fragment inline, so it carries the journal
-        // table too.
+        // Every page below renders the journal table, so the wrapping error cell is asserted on each.
         for (path, check_error_cell) in [
             ("/admin/logs/fetch", true),
             (&format!("/admin/sources/{}/log", source.id), true),

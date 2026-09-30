@@ -203,6 +203,54 @@
         syncAll(document);
       });
     })();
+
+    // Settings tabs: the panes swap on the radio's :checked, but
+    // `aria-selected` is server-rendered and would keep naming the tab the
+    // page loaded with. Mirror the radio onto the labels.
+    (function () {
+      function syncTabs() {
+        document.querySelectorAll('input.tab-input').forEach(function (input) {
+          var label = document.querySelector('label[for="' + input.id + '"]');
+          if (label) label.setAttribute('aria-selected', input.checked ? 'true' : 'false');
+        });
+      }
+      document.body.addEventListener('change', function (event) {
+        if (event.target instanceof HTMLInputElement && event.target.classList.contains('tab-input')) syncTabs();
+      });
+      syncTabs();
+    })();
+
+    // Rule counters: the lists are capped in height, so the number is the
+    // only way to see how many rules a section holds, and htmx changes the
+    // rows without a page render. Blank lines do not count, the rename
+    // editor always keeps one and it emits no rule.
+    (function () {
+      function filledRows(container) {
+        if (!container) return 0;
+        return Array.prototype.filter.call(
+          container.querySelectorAll('.ped-row'),
+          function (row) {
+            return Array.prototype.some.call(
+              row.querySelectorAll('input[type="text"]'),
+              function (input) { return input.value.trim() !== ''; }
+            );
+          }
+        ).length;
+      }
+      function syncRuleCounts() {
+        document.querySelectorAll('[data-ped-count]').forEach(function (badge) {
+          var which = badge.getAttribute('data-ped-count');
+          var count = filledRows(
+            document.querySelector(which === 'rename' ? '#ped-rows' : '#ped-drop-rows')
+          );
+          badge.textContent = String(count);
+          if (count === 0) badge.setAttribute('hidden', '');
+          else badge.removeAttribute('hidden');
+        });
+      }
+      document.body.addEventListener('htmx:afterSettle', syncRuleCounts);
+      syncRuleCounts();
+    })();
   </script>
 </body>
 </html>

@@ -18,7 +18,7 @@
 //! the same [`Param`] list with *decoded* text taken from YAML/JSON scalars,
 //! so a stored value may carry a raw `&` or `#`. Serialization therefore
 //! escapes the characters that would otherwise break the emitted line (see
-//! [`encode_query_delimiters`]).
+//! `encode_query_delimiters`).
 
 use std::borrow::Cow;
 
@@ -335,7 +335,7 @@ fn check_param_size(key: &str, value: &str) -> Result<(), String> {
 /// Empty-key params serialize as empty segments, reproducing the occasional
 /// `?&k=v` / `k=v&` quirks of real feeds.
 ///
-/// Keys and values go through [`encode_query_delimiters`] first: a value
+/// Keys and values go through `encode_query_delimiters` first: a value
 /// carrying a raw `&` or `#` would split into a bogus extra parameter and
 /// swallow the proxy name on re-parse.
 pub fn serialize_query(params: &[Param]) -> String {
@@ -459,7 +459,7 @@ pub fn parse_with_spec(
 ///
 /// The credential is emitted exactly as stored and parameter values keep
 /// their percent-encoding (only the characters that would break the query
-/// are escaped, see [`encode_query_delimiters`]); the name is re-encoded
+/// are escaped, see `encode_query_delimiters`); the name is re-encoded
 /// with [`encode_fragment`].
 pub fn serialize_with_spec(spec: &UriSchemeSpec, entry: &ProxyEntry) -> String {
     let mut out = String::with_capacity(128);

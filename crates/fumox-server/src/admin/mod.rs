@@ -4263,9 +4263,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // Configuration import/export (Phase 4)
-    // -----------------------------------------------------------------
 
     /// A minimal enabled source fixture for repo writes.
     fn test_source(id: &str, slug: &str) -> fumox_core::models::Source {
@@ -4585,9 +4583,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // Pipeline builder
-    // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn pipeline_builder_endpoints_require_auth_and_csrf() {

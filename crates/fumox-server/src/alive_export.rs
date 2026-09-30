@@ -192,7 +192,7 @@ fn cache_key(tier: &str) -> String {
 ///
 /// "Cached for the window" is the guarantee, not "rendered once": there is
 /// no single-flight claim here, so two requests that both observe an
-/// expired entry both render it. [`serve_cached`] in `serve.rs` is the
+/// expired entry both render it. `serve_cached` in `serve.rs` is the
 /// path that does claim the work; this one cannot reuse it because the
 /// export deliberately refuses to serve a stale body to a waiting
 /// requester.

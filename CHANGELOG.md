@@ -26,6 +26,53 @@ Defect fixes in the working tree, not yet on a published image.
 
 ### Fixed
 
+- Every page heading collapsed to a character-wide column on a phone.
+  `.page-head h1` carried `flex: 1`, which is `flex: 1 1 0%`: a zero
+  flex-basis tells the browser the heading occupies no space, so the row
+  never wraps, the action buttons take the whole width and the heading is
+  left with the few leftover pixels. With the body-level
+  `overflow-wrap: anywhere` that rendered "Proxies total: 4638" as
+  `Pr / ox / ie / s / to / tal: / 46 / 38`. The basis is `auto` now, so
+  the heading claims its text width and the actions wrap below it, while
+  `flex-grow` still keeps them right-aligned on a wide screen. All 13
+  templates that use `.page-head` were affected, not just the proxies
+  list.
+- Ordinary words broke mid-word in table columns at phone width. The body
+  sets `overflow-wrap: anywhere` so that unbreakable tokens (URLs, SHA
+  fingerprints, raw proxy lines) cannot blow a column out, but it also
+  split names once a column got tight: "FlareFeed" as "FlareFe / ed" in
+  the source and profile name columns, "Endpoint" as "Endpo / int" in
+  the key-value tables, and `false` as `fal / se` in a value column
+  squeezed to 49px by a sentence-long label beside it. Name links and
+  key-value labels now opt out with `overflow-wrap: normal`, and the
+  starved value columns carry min-width floors so a long label can no
+  longer take the row. URLs, addresses and hashes still break anywhere,
+  which is what the global rule is for.
+- The key-value tables could not keep a two-column shape below 420px: a
+  sentence-long label plus a `nowrap` timestamp need more than the
+  ~255px a panel has, and squeezing them both split words and pushed the
+  table past the panel edge. Each row now stacks below that width, label
+  above value.
+- Every `<select>` on the source and profile forms was 39px tall on a
+  phone. The 16px font rule (there so iOS does not zoom the page on
+  focus) only lifts a select to 39px, under the 44px target. Selects now
+  carry `min-height: 44px` at that breakpoint, including the dashboard
+  Top-N picker and the pipeline rule-row target selects.
+- The settings tabs named the wrong tab to assistive tech. The panes swap
+  on the hidden radio's `:checked`, but `aria-selected` was rendered
+  server-side and never updated, so after switching to *Probe* the DOM
+  still announced *Server* as selected. A small listener now mirrors the
+  radio state onto the labels.
+- `[hidden]` silently stopped working anywhere it met an author `display`.
+  `.badge { display: inline-block }` outranks the user-agent stylesheet,
+  so the pipeline rule counters rendered "0" instead of disappearing.
+  The attribute is restated once, globally.
+- A pipeline rule row wrapped over three ragged lines. The rows sit
+  inside a `.field`, so `.field select { width: 100% }` handed the
+  target select the full panel width. `.ped-row select` is `width: auto`
+  now, and on a phone the remove button keeps its own size instead of
+  becoming a full-width row of its own, which was an easy mis-tap on a
+  destructive action.
 - The dashboard's "new proxies over the last 7 days" chart labelled its
   columns with clipped timestamps. Each bar is a midnight-UTC day bucket,
   but it was rendered through the shared `<time class="ts">` helper, which
@@ -739,6 +786,28 @@ Defect fixes in the working tree, not yet on a published image.
 
 ### Changed
 
+- The pipeline builder is three tabs instead of one column of seven
+  sections. The sections are grouped in the order the pipeline runs:
+  *Input* (protocol filter), *Rules* (renaming and discarding, the lists
+  that grow) and *Output* (health, geo, sorting, limit). Each tab states
+  in one line what it is for, and *Output* lays its four sections out
+  two-up on a wide screen. The tabs are CSS-only like the settings
+  editor (hidden radios drive the panes, no JavaScript). One component
+  renders both the source and the profile form, so both get the layout,
+  and the profile keeps its tri-state controls on renaming and
+  discarding.
+- Rule lists are capped in height and carry a live count. Ten discard
+  rules used to push the add button, the second list and the preview a
+  screen down; the list now scrolls inside its pane and a counter beside
+  each heading shows how many rules it holds. The count is recomputed
+  after every HTMX settle, and blank lines do not count: the rename
+  editor deliberately keeps one empty line as a place to start typing,
+  and an empty line emits no rule.
+- The dashboard stat cards lost their per-metric colour stripe. It read
+  as a status signal and it lied: green under "checks in 24h" over a
+  0/12, amber under a healthy median latency. Status colour belongs to
+  the badges, which mark a real state, and the cards now match every
+  other panel.
 - `/export/alive/{token}` and `/export/ready/{token}` re-read and
   re-serialized the whole tier on every download. Both now render at
   most once per 30 s (`EXPORT_TTL_SECS`) and are served from the

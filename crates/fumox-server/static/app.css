@@ -98,6 +98,9 @@
 }
 
 * { box-sizing: border-box; }
+/* An author `display` outranks the UA stylesheet's `[hidden]`, so the
+   attribute silently stopped working (rule counters showed "0"). */
+[hidden] { display: none !important; }
 
 body {
   margin: 0;
@@ -210,27 +213,9 @@ a:hover { text-decoration: underline; }
   flex-wrap: wrap;
   gap: 4px;
 }
-/* Per-category accent stripe (dashboard stat-cards): distinguishes the
-   otherwise identical `.panel.stat-card` shells by the metric family
-   they carry (sources / probes / latency / quarantine / never-checked).
-   The negative margins cancel the panel's 18 px / 20 px padding so the
-   stripe lands flush with the panel border. */
-.stat-card::before {
-  content: "";
-  display: block;
-  height: 3px;
-  margin: -18px -20px 12px;
-  background: var(--accent);
-  border-radius: var(--radius) var(--radius) 0 0;
-}
-.stat-card-sources::before  { background: var(--accent); }
-.stat-card-profiles::before { background: var(--ready); }
-.stat-card-proxies::before  { background: var(--ok); }
-.stat-card-fetches::before  { background: var(--accent-hover); }
-.stat-card-probes::before   { background: var(--ok); }
-.stat-card-latency::before  { background: var(--warn); }
-.stat-card-quarantine::before { background: var(--warn); }
-.stat-card-never::before    { background: var(--muted); opacity: 0.6; }
+/* No accent stripe here on purpose: a per-metric-family stripe reads as a
+   status signal, and it lies (green over a 0/12 check count, amber over a
+   healthy median). Status colour belongs to .badge, which marks real state. */
 
 .page-head {
   display: flex;
@@ -239,7 +224,10 @@ a:hover { text-decoration: underline; }
   margin-bottom: 16px;
   flex-wrap: wrap;
 }
-.page-head h1 { font-size: 21px; margin: 0; flex: 1; }
+/* `flex: 1 1 auto`, not `1 1 0%`: a zero basis claims no width, so the
+   actions never wrap and the heading is left with the leftover pixels,
+   which `overflow-wrap: anywhere` then breaks character by character. */
+.page-head h1 { font-size: 21px; margin: 0; flex: 1 1 auto; }
 
 /* Dashboard Top-N selector: small form, right side of the page-head.
    Drops to a new line on narrow screens via the parent's flex-wrap. */
@@ -296,6 +284,10 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; white
    `overflow-wrap: anywhere` lets a squeezed column shrink below one
    digit, splitting "20" onto two lines. */
 table.data td.rank { white-space: nowrap; }
+/* A name is not an unbreakable token: body sets `anywhere` for URLs and
+   hashes, which split "FlareFeed" into "FlareFe / ed" in a tight column.
+   The word stays whole and .table-scroll takes the width instead. */
+table.data td > a { overflow-wrap: normal; }
 table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Truncated source link inside a table cell (dashboard, fetch journal):
    same effect as .truncate, but as a class instead of an inline style. */
@@ -432,10 +424,10 @@ legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
 
 .form-actions { display: flex; gap: 10px; margin-top: 18px; align-items: center; flex-wrap: wrap; }
 
-/* CSS-only tabs (settings edit page): three sibling radio inputs
-   select which `<section>` pane is visible, with no JS required. The
-   radio inputs themselves are hidden; the `<label>` elements act as
-   the tab strip and the highlighted border is driven by `:checked`. */
+/* CSS-only tabs, no JS: hidden sibling radios drive the panes through
+   `:checked`, the labels are the strip. Settings editor and pipeline
+   builder. CSS cannot match "the pane named like the checked radio", so
+   every new tab id has to be added to the four lists below. */
 input.tab-input {
   /* Stay in the layout flow (so they remain keyboard-focusable) but
      empty visually: `display: none` would break the `:checked ~
@@ -464,7 +456,10 @@ input.tab-input {
    sibling combinator: focusing the input lights up the tab it drives. */
 #tab-server:focus-visible ~ .tabs label[for="tab-server"],
 #tab-probe:focus-visible ~ .tabs label[for="tab-probe"],
-#tab-shared:focus-visible ~ .tabs label[for="tab-shared"] {
+#tab-shared:focus-visible ~ .tabs label[for="tab-shared"],
+#pedtab-input:focus-visible ~ .tabs label[for="pedtab-input"],
+#pedtab-rules:focus-visible ~ .tabs label[for="pedtab-rules"],
+#pedtab-output:focus-visible ~ .tabs label[for="pedtab-output"] {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
   border-radius: 4px;
@@ -511,7 +506,10 @@ input.tab-input {
 }
 #tab-server:checked ~ .tabs label[for="tab-server"],
 #tab-probe:checked ~ .tabs label[for="tab-probe"],
-#tab-shared:checked ~ .tabs label[for="tab-shared"] {
+#tab-shared:checked ~ .tabs label[for="tab-shared"],
+#pedtab-input:checked ~ .tabs label[for="pedtab-input"],
+#pedtab-rules:checked ~ .tabs label[for="pedtab-rules"],
+#pedtab-output:checked ~ .tabs label[for="pedtab-output"] {
   color: var(--accent);
   border-bottom-color: var(--accent);
 }
@@ -519,7 +517,10 @@ input.tab-input {
 .tab-pane { display: none; }
 #tab-server:checked ~ #pane-server,
 #tab-probe:checked ~ #pane-probe,
-#tab-shared:checked ~ #pane-shared {
+#tab-shared:checked ~ #pane-shared,
+#pedtab-input:checked ~ #pedtab-input-pane,
+#pedtab-rules:checked ~ #pedtab-rules-pane,
+#pedtab-output:checked ~ #pedtab-output-pane {
   display: block;
 }
 
@@ -625,7 +626,9 @@ pre.mono { white-space: pre-wrap; }
 
 .kv { width: 100%; border-collapse: collapse; }
 .kv th, .kv td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left; }
-.kv th { width: 220px; color: var(--muted); font-weight: 600; font-size: 13px; }
+/* Labels keep their words whole: with `min-width: 0` at 420px and the
+   inherited `anywhere`, "Endpoint" rendered as "Endpo / int". */
+.kv th { width: 220px; color: var(--muted); font-weight: 600; font-size: 13px; overflow-wrap: normal; }
 .kv tr:last-child th, .kv tr:last-child td { border-bottom: none; }
 
 .pagination { display: flex; gap: 6px; margin-top: 14px; align-items: center; flex-wrap: wrap; }
@@ -819,7 +822,10 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 .ped-row input[type="text"]:not(.mono) { flex: 1 1 160px; }
 .ped-row input.mono { flex: 0 0 70px; }
 .ped-row input[name$="_key"] { flex: 0 1 110px; }
-.ped-row select { flex: 0 0 auto; }
+/* The rows sit inside a `.field`, so `.field select { width: 100% }` gave
+   every target select the full panel width and wrapped a rule over three
+   ragged lines. */
+.ped-row select { flex: 0 0 auto; width: auto; min-width: 0; }
 .ped-arrow { color: var(--muted); }
 .ped-preview-json {
   padding: 10px 12px;
@@ -863,7 +869,20 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   margin: 0 0 4px;
   font-size: 14px;
   font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
+/* Ten discard rules used to push the add button, the second list and the
+   preview a screen down; capped, the list scrolls and the editor stays put. */
+.ped-rows {
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin-bottom: 8px;
+}
+.ped-rows:empty { min-height: 0; }
 /* Inner fields of a tri-state section (geo / sort / limit). Always in
    the DOM so the browser can hold typed values across radio toggles
    without a server round-trip; hidden by default with `display:none`
@@ -949,11 +968,17 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 
   /* iOS Safari zooms the page on focus for any input with font-size
      below 16px, keep form controls at 16px. The selectors mirror the
-     base rules so specificity does not let `font: inherit` win. */
+     base rules so specificity does not let `font: inherit` win.
+     The Top-N picker sits outside `.field`, so it needs its own entry:
+     at 13px it both triggered the zoom and stayed a 23px-tall target. */
   .field input[type="text"], .field input[type="number"],
   .field input[type="password"], .field input[type="url"],
   .field select, .field textarea,
-  .filters .field input, .filters .field select { font-size: 16px; }
+  .filters .field input, .filters .field select,
+  .topn-picker select { font-size: 16px; }
+  /* 16px text only lifts a select to 39px, still under the target. */
+  .field select, .filters .field select, .ped-row select,
+  .topn-picker select { min-height: 44px; }
 
   /* A number and its unit go back to one per line on a phone: at this
      width a 120px number next to a select leaves the select too narrow
@@ -989,6 +1014,13 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   table.data td.addr { min-width: 190px; }
   table.data td.queue-name { min-width: 190px; }
   .kv th { width: auto; min-width: 110px; }
+  /* Starved-value floors. A long `.kv` label is a sentence and happily
+     takes the whole row, which left the value column at 49px and split
+     "false" in half. The same happened to the endpoint titles, whose
+     sibling URL column is nowrap and therefore greedy. Both floors cost
+     nothing: the table scrolls inside .table-scroll. */
+  .kv td { min-width: 90px; }
+  .endpoints td:first-child { min-width: 150px; }
 
   /* Distribution rows (stats): counters drop onto their own line
      instead of squeezing the bar. */
@@ -1031,6 +1063,10 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .ped-row > * { flex: 1 1 auto !important; width: 100%; min-width: 0; }
   .ped-row input[type="text"]:not(.mono) { flex-basis: auto; }
   .ped-arrow { transform: rotate(90deg); align-self: flex-start; }
+  /* The remove button keeps its own size: a full-width row of its own is
+     an easy mis-tap on a destructive action, and it wasted a whole
+     screen row per rule. */
+  .ped-row > button { flex: 0 0 auto !important; width: auto; align-self: flex-end; }
   .ped-columns > div { min-width: 0; }
 
   /* Stat-bar chart: cap each column at a sane minimum so seven bars fit
@@ -1049,10 +1085,13 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .panel { padding: 12px; }
   .page-head h1 { font-size: 18px; }
   .stat-card .num { font-size: 22px; }
-  /* On a 360 px viewport the 110 px floor on `.kv th` plus a long
-     `td.mono.small` value (full file path, full URL) can push the table
-     past the panel, drop the floor so the column shrinks with the text. */
-  .kv th { min-width: 0; }
+  /* Two columns cannot work here: a sentence-long label and a nowrap
+     timestamp need more than the ~255 px the panel has, and squeezing
+     them split words and pushed the table past the panel. */
+  .kv tr { display: block; padding: 7px 0; border-bottom: 1px solid var(--border); }
+  .kv th, .kv td { display: block; width: auto; min-width: 0; padding: 0; border-bottom: none; }
+  .kv th { padding-bottom: 1px; }
+  .kv tr:last-child { border-bottom: none; }
   /* Wider stat-bars labels need more room than the 700 px breakpoint
      gave them; the per-day value stays visible (a title-only value is
      unreachable on touch), just smaller. */

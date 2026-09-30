@@ -58,7 +58,7 @@
 </div>
 
 <div class="grid cols-4">
-  <div class="panel stat-card stat-card-sources">
+  <div class="panel stat-card">
     <div class="num">{{ sources_enabled }} / {{ sources_total }}</div>
     <div class="label">{{ self.t("dash.sources_enabled") }}</div>
     {% if sources_with_errors > 0 %}
@@ -67,11 +67,11 @@
       <div class="sub">{{ self.t("dash.no_errors") }}</div>
     {% endif %}
   </div>
-  <div class="panel stat-card stat-card-profiles">
+  <div class="panel stat-card">
     <div class="num">{{ profiles_total }}</div>
     <div class="label">{{ self.t("dash.profiles") }}</div>
   </div>
-  <div class="panel stat-card stat-card-proxies">
+  <div class="panel stat-card">
     <div class="num">{{ self.proxy_total() }}</div>
     <div class="label">{{ self.t("dash.proxies_total") }}</div>
     <div class="sub">
@@ -80,21 +80,21 @@
       {% endfor %}
     </div>
   </div>
-  <div class="panel stat-card stat-card-fetches">
+  <div class="panel stat-card">
     <div class="num">{{ fetch_ok_24h }} / {{ fetch_total_24h }}</div>
     <div class="label">{{ self.t("dash.fetches_24h") }}</div>
   </div>
 </div>
 
 <div class="grid cols-4">
-  <div class="panel stat-card stat-card-probes">
+  <div class="panel stat-card">
     <div class="num">{{ probes_ok_24h }} / {{ probes_total_24h }}</div>
     <div class="label">{{ self.t("stats.probes_24h") }}</div>
     {% if probes_total_24h > 0 %}
       <div class="sub">{{ self.pct(probes_ok_24h, probes_total_24h) }}% {{ self.t("stats.success_rate") }}</div>
     {% endif %}
   </div>
-  <div class="panel stat-card stat-card-latency">
+  <div class="panel stat-card">
     <div class="num">
       {% match latency_median %}
         {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
@@ -109,12 +109,12 @@
         {% when Some with (ms) %}{{ self.t("stats.latency_avg") }} {{ ms }} {{ self.t("common.ms") }}{% when None %}{% endmatch %}
     </div>
   </div>
-  <div class="panel stat-card stat-card-quarantine">
+  <div class="panel stat-card">
     <div class="num">{{ in_quarantine }}</div>
     <div class="label">{{ self.t("stats.in_quarantine") }}</div>
     <div class="sub">{{ self.t("stats.awaiting_second_chance").replace("{}", &quarantine_second_chance.to_string()) }}</div>
   </div>
-  <div class="panel stat-card stat-card-never">
+  <div class="panel stat-card">
     <div class="num">{{ never_checked }}</div>
     <div class="label">{{ self.t("stats.never_checked") }}</div>
     <div class="sub">{{ self.t("stats.unprobeable_count").replace("{}", &unprobeable.to_string()) }}</div>

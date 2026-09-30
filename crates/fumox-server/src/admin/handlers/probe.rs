@@ -350,7 +350,15 @@ fn compute_backlog(
     heartbeat_age_secs: Option<i64>,
     cfg: &ProbeConfig,
 ) -> Option<BacklogDiagnostic> {
-    let sample_size = cfg.sample_size.max(1) as i64;
+    // The raw configured value, not a clamped one. `sample_size = 0` is
+    // reachable from the settings form (it accepts `0..=100000`) and
+    // makes the daemon take literally nothing, so the two
+    // sample-proportional triggers below have no sample to compare
+    // against: "N× the per-cycle sample" over a zero sample states
+    // nothing. `all_idle` reports that state with the numbers the
+    // operator needs, so the triggers stay off at zero rather than
+    // measuring a sample that does not exist.
+    let sample_size = cfg.sample_size as i64;
     let model = CycleModel::new(cfg, quarantine_count, due_count);
     let target_minutes = cfg.backlog_target_drain_minutes.max(1);
     // Same `.max(1)` the daemon's retention applies before it computes
@@ -361,13 +369,13 @@ fn compute_backlog(
     let mut level = BacklogLevel::Warning;
     let mut factors: Vec<BacklogFactor> = Vec::new();
 
-    if quarantine_count > sample_size * 20 {
+    if sample_size > 0 && quarantine_count > sample_size * 20 {
         factors.push(BacklogFactor {
             key: "deep_queue",
             severity: BacklogLevel::Warning,
         });
     }
-    if due_count > sample_size * 5 {
+    if sample_size > 0 && due_count > sample_size * 5 {
         factors.push(BacklogFactor {
             key: "due_overflow",
             severity: BacklogLevel::Warning,
@@ -451,6 +459,16 @@ fn compute_backlog(
         stale_days,
     })
 }
+
+/// Smallest period the banner will recommend. The settings form accepts
+/// `cycle_interval_secs` from `1`, but a cycle is several `SELECT`s
+/// across the pool plus the writes its lanes make, and the daemon's own
+/// beat period already carries a `.max(5)` floor — the same reason
+/// [`heartbeat_stale_after`] starts its threshold there. Shortening the
+/// cycle below the cadence the daemon considers sane for its heartbeat
+/// is advice that costs more than the drain it buys, so the third
+/// recommendation stays quiet instead of printing it.
+const MIN_RECOMMENDED_CYCLE_SECS: u64 = 5;
 
 /// Build up to three concrete suggestions, or none at all.
 ///
@@ -540,6 +558,7 @@ fn compute_recs(cfg: &ProbeConfig, model: &CycleModel) -> Vec<TuningRec> {
     {
         let required_period = ceil_div(target_seconds, cycles as i128) as u64;
         if required_period >= planned.lane_secs
+            && required_period >= MIN_RECOMMENDED_CYCLE_SECS
             && required_period < planned.cycle_interval_secs.saturating_mul(8) / 10
         {
             out.push(TuningRec {
@@ -1218,5 +1237,124 @@ mod tests {
         let diag = compute_backlog(1, 0, Some(30 * 86_400), None, &cfg).unwrap();
         assert_eq!(diag.level, BacklogLevel::Danger);
         assert!(factor_keys(&diag).contains(&"stale_oldest"));
+    }
+
+    /// `sample_size = 0` is reachable from the settings form. The
+    /// sample-proportional triggers would compare the queue against a
+    /// sample that does not exist and print a ratio over zero; the
+    /// one true statement about that state is the one `all_idle`
+    /// makes, and the configured `0` has to survive into it.
+    #[test]
+    fn sample_size_zero_reports_idleness_not_a_ratio_over_zero() {
+        let cfg = cfg_with(0, 60, 60);
+        for (quarantine, due) in [(0, 0), (1, 0), (25, 0), (400, 400), (100_000, 100_000)] {
+            let diag = backlog(quarantine, due, &cfg);
+            assert_eq!(
+                factor_keys(&diag),
+                vec!["all_idle"],
+                "{quarantine}/{due}: {:?}",
+                factor_keys(&diag)
+            );
+            assert_eq!(diag.level, BacklogLevel::Ok, "{quarantine}/{due}");
+            assert_eq!(diag.due_capacity, 0);
+            assert_eq!(diag.drain_minutes, None);
+            assert!(rec_pairs(&diag).is_empty());
+        }
+
+        // A dead daemon and a stale row still speak over it: those are
+        // measured in seconds and days, not against the sample.
+        let diag = compute_backlog(400, 400, Some(9 * 86_400), Some(600), &cfg).unwrap();
+        assert_eq!(diag.level, BacklogLevel::Danger);
+        assert!(factor_keys(&diag).contains(&"stale_oldest"));
+        assert!(factor_keys(&diag).contains(&"heartbeat_dead"));
+
+        // One row is the smallest non-idle sample, and it behaves as
+        // it always did: the triggers come back rather than staying
+        // off for every value below some threshold.
+        let diag = backlog(21, 0, &cfg_with(1, 60, 60));
+        assert!(factor_keys(&diag).contains(&"deep_queue"));
+    }
+
+    /// The third recommendation shortens the cycle. With aggressive
+    /// timeouts the modelled lane is short enough that the arithmetic
+    /// lands on a 2-second cycle — a period faster than the daemon's own
+    /// beat floor, which is churn the operator cannot use. The gate
+    /// stays silent instead of printing it, while a period it can
+    /// certify above the floor still prints.
+    #[test]
+    fn period_rec_never_lands_below_the_beating_floor() {
+        // `due <= sample_size`, so the throughput rec cannot fire and
+        // take the chained model out from under the period arithmetic.
+        let cfg = ProbeConfig {
+            sample_size: 100,
+            cycle_interval_secs: 60,
+            backlog_target_drain_minutes: 5,
+            connect_timeout_secs: 1,
+            tls_timeout_secs: 1,
+            concurrency: 64,
+            ..ProbeConfig::default()
+        };
+        let rec = |quarantine| rec_pairs(&backlog(quarantine, 50, &cfg));
+
+        // 1 500 rows, 50 retired per cycle, a 2 s lane inside a 60 s
+        // period: 30 min to drain against a 5 min target, and the
+        // arithmetic answers 10 s.
+        let model = CycleModel::new(&cfg, 1_500, 50);
+        assert_eq!(model.cycles_to_drain, Some(30));
+        assert_eq!(model.drain_minutes, Some(30));
+        assert_eq!(
+            rec(1_500),
+            vec![("cycle_interval_secs", "10".to_string())],
+            "the floor must gate the value, not the knob"
+        );
+
+        // Ten times the queue over the same period: the arithmetic
+        // answers 2 s, which is under the floor. Before it existed this
+        // printed `cycle_interval_secs = 2`.
+        let model = CycleModel::new(&cfg, 10_000, 50);
+        assert_eq!(model.cycles_to_drain, Some(200));
+        assert_eq!(
+            rec(10_000),
+            Vec::<(&str, String)>::new(),
+            "a 2 s cycle is not a recommendation"
+        );
+    }
+
+    /// Every value the banner prints has to be one an operator can
+    /// actually set, and one the daemon can live with. Swept over the
+    /// ranges the settings form offers rather than asserted on the few
+    /// states the worked example reaches, because the arithmetic is
+    /// the part that has no test of its own.
+    #[test]
+    fn recs_stay_inside_the_range_the_form_accepts() {
+        for sample in [0u32, 1, 7, 50, 500, 5_000, 100_000] {
+            for cycle in [1u64, 2, 5, 60, 3_600, 86_400] {
+                for concurrency in [1usize, 2, 8, 64, 1_024] {
+                    for target in [5u64, 60, 1_440] {
+                        let mut cfg = cfg_with(sample, cycle, target);
+                        cfg.concurrency = concurrency;
+                        for quarantine in [0i64, 1, 800, 4_000, 100_000, 10_000_000] {
+                            for (key, value) in rec_pairs(&backlog(quarantine, quarantine, &cfg)) {
+                                let n: u64 = value.parse().expect("rec value is a number");
+                                let bound = match key {
+                                    "sample_size" => 1..=500,
+                                    // The search stops at 64 by design: past
+                                    // that, a recommendation is a load test.
+                                    "concurrency" => 1..=64,
+                                    "cycle_interval_secs" => MIN_RECOMMENDED_CYCLE_SECS..=cycle,
+                                    other => panic!("unexpected rec {other}"),
+                                };
+                                assert!(
+                                    bound.contains(&n),
+                                    "sample {sample} cycle {cycle} conc {concurrency} \
+                                     target {target} q {quarantine}: {key} = {value}, \
+                                     want {bound:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

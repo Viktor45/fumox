@@ -760,8 +760,8 @@ where
     D: serde::Deserializer<'de>,
 {
     let delays = Vec::<i64>::deserialize(deserializer)?;
-    const MAX_STEPS: usize = 16;
-    const MAX_DELAY_SECS: i64 = 30 * 24 * 60 * 60;
+    const MAX_STEPS: usize = bounds::RECHECK_MAX_STEPS;
+    const MAX_DELAY_SECS: i64 = bounds::RECHECK_MAX_DELAY_SECS;
     if delays.len() > MAX_STEPS {
         return Err(serde::de::Error::custom(format!(
             "recheck_delays_secs: at most {MAX_STEPS} steps are supported (got {})",
@@ -859,6 +859,145 @@ impl<'de> Deserialize<'de> for RateLimit {
         }
 
         deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// The value range the admin editor accepts for one numeric setting.
+///
+/// These bounds are what the *editor* enforces and what the settings
+/// form advertises, not a promise about what the running code can
+/// survive. They live here, next to the config they describe, because
+/// they used to live in three places at once: as literal arguments in
+/// the save handler, as `min`/`max` attributes in the template, and as
+/// prose in `config/app.toml`. One table, three consumers.
+///
+/// `max: None` means the editor deliberately sets no ceiling. For a
+/// value that has to fit an `i64` in the TOML document that is a
+/// technical artifact, not a number an operator should ever type, so
+/// the form says "no upper bound" rather than printing `4611686018…`.
+pub mod bounds {
+    /// Ceiling on `[fetch].max_response_bytes`: the editor writes
+    /// integers into a TOML document, so the value has to survive an
+    /// `i64` with room to spare. Not an operator-facing limit.
+    pub const MAX_RESPONSE_BYTES: u64 = u64::MAX / 2;
+
+    /// Steps of the quarantine recheck ladder. Past this the ladder is
+    /// a config error rather than a longer queue, so a typo cannot
+    /// schedule rechecks years out.
+    pub const RECHECK_MAX_STEPS: usize = 16;
+
+    /// Longest single recheck delay, 30 days.
+    pub const RECHECK_MAX_DELAY_SECS: i64 = 30 * 24 * 60 * 60;
+
+    /// Accepted range of a numeric setting, inclusive on both ends.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Range {
+        pub min: u64,
+        /// `None` = the editor sets no upper bound.
+        pub max: Option<u64>,
+    }
+
+    impl Range {
+        pub const fn new(min: u64, max: u64) -> Self {
+            Self {
+                min,
+                max: Some(max),
+            }
+        }
+
+        /// A range with a floor and no ceiling.
+        pub const fn at_least(min: u64) -> Self {
+            Self { min, max: None }
+        }
+
+        pub fn contains(self, value: u64) -> bool {
+            value >= self.min && self.max.is_none_or(|max| value <= max)
+        }
+    }
+
+    /// Every bounded numeric setting, keyed by its dotted config path.
+    /// A key missing from this table is either not a number or not
+    /// editable in the admin panel; the template test enforces that
+    /// every number input resolves here.
+    pub const RANGES: &[(&str, Range)] = &[
+        ("database.busy_timeout_ms", Range::new(100, 60_000)),
+        ("database.max_connections", Range::new(1, 1024)),
+        ("fetch.connect_timeout_secs", Range::new(1, 600)),
+        ("fetch.read_timeout_secs", Range::new(1, 3600)),
+        ("fetch.max_response_bytes", Range::at_least(1024)),
+        ("fetch.max_concurrency", Range::new(1, 1024)),
+        ("fetch.max_retries", Range::new(0, 16)),
+        ("fetch.retry_base_backoff_ms", Range::new(0, 60_000)),
+        ("ingest.refresh_check_limit", Range::new(0, 10_000)),
+        ("geo.cache_max_entries", Range::new(0, 10_000_000)),
+        ("geo.dns_timeout_secs", Range::new(1, 60)),
+        ("admin.session_ttl_hours", Range::new(1, 24 * 365)),
+        ("admin.rate_limit.limit", Range::new(1, 1_000_000)),
+        ("admin.login_rate_limit.limit", Range::new(1, 1_000_000)),
+        ("probe.fail_limit", Range::new(1, 32)),
+        ("probe.second_chance_min_hours", Range::new(0, 24 * 365)),
+        ("probe.second_chance_spread_hours", Range::new(0, 24 * 365)),
+        ("probe.queue_stale_days", Range::new(0, 365)),
+        (
+            "probe.retention_interval_secs",
+            Range::new(60, 7 * 24 * 3600),
+        ),
+        ("probe.cycle_interval_secs", Range::new(1, 24 * 3600)),
+        ("probe.sample_size", Range::new(0, 100_000)),
+        ("probe.connect_timeout_secs", Range::new(1, 600)),
+        ("probe.tls_timeout_secs", Range::new(1, 600)),
+        ("probe.concurrency", Range::new(1, 1024)),
+        ("probe.heartbeat_interval_secs", Range::new(1, 24 * 3600)),
+        ("probe.backlog_target_drain_minutes", Range::new(5, 24 * 60)),
+        ("meow.timeout_secs", Range::new(1, 600)),
+        ("meow.backoff_initial_secs", Range::new(1, 24 * 3600)),
+        ("meow.backoff_max_secs", Range::new(1, 24 * 3600)),
+        ("retention.probe_results_days", Range::new(1, 3650)),
+        ("retention.fetch_log_days", Range::new(1, 3650)),
+        ("server.rate_limit.limit", Range::new(1, 1_000_000)),
+        (
+            "server.auth_fail_rate_limit.limit",
+            Range::new(1, 1_000_000),
+        ),
+    ];
+
+    /// The accepted range of `dotted_key`, or `None` when the setting
+    /// is not a bounded number.
+    pub fn range_of(dotted_key: &str) -> Option<Range> {
+        RANGES
+            .iter()
+            .find(|(key, _)| *key == dotted_key)
+            .map(|(_, range)| *range)
+    }
+
+    /// `min` rendered for an HTML attribute. A setting with no range
+    /// yields an empty string rather than a made-up zero.
+    pub fn min_attr(dotted_key: &str) -> String {
+        range_of(dotted_key)
+            .map(|r| r.min.to_string())
+            .unwrap_or_default()
+    }
+
+    /// `max` rendered for an HTML attribute, empty when unbounded: HTML
+    /// treats a missing `max` as "no limit", and `min=0`/`max=-1` is the
+    /// only way to express it, which is exactly the trick this table
+    /// exists to avoid.
+    pub fn max_attr(dotted_key: &str) -> String {
+        range_of(dotted_key)
+            .and_then(|r| r.max)
+            .map(|max| max.to_string())
+            .unwrap_or_default()
+    }
+
+    /// The range as an operator reads it: `1..=86400`, or `1024 и выше`
+    /// for an open-ended one. The open-ended wording comes from the
+    /// caller's locale catalog, so no UI copy lives in this module.
+    pub fn display(dotted_key: &str, open_ended: &str) -> Option<String> {
+        let range = range_of(dotted_key)?;
+        Some(match range.max {
+            Some(max) => format!("{}..={}", range.min, max),
+            None => format!("{} {open_ended}", range.min),
+        })
     }
 }
 
@@ -1325,6 +1464,42 @@ probe_results_days = 7
     /// only invite an operator to set a key that does nothing. Every other
     /// key must be there — that is the point of the guard.
     const REFERENCE_FILE_OMISSIONS: &[&str] = &["geo.db"];
+
+    /// The bounds table is a lookup, so a duplicate key is not a
+    /// compile error: `range_of` would silently return the first one and
+    /// the second would read as a live row that no field ever uses. The
+    /// server-side test proves every row is rendered; this proves there
+    /// is only one row per key, and that no range is inverted.
+    #[test]
+    fn bounds_rows_are_unique_and_ordered() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (key, range) in bounds::RANGES {
+            assert!(seen.insert(*key), "duplicate bounds row for {key}");
+            if let Some(max) = range.max {
+                assert!(range.min <= max, "{key}: min {} above max {max}", range.min);
+            }
+        }
+    }
+
+    /// Every bounds key has to be a real config path. The table is keyed
+    /// by the *form field* name, which for the four rate-limit inputs is
+    /// `<path>.limit` (the number half of a number-plus-unit pair)
+    /// while the config itself stores one `RateLimit` under `<path>`.
+    /// That suffix is the only place the two naming schemes differ, so
+    /// it is stripped here rather than pretended away.
+    #[test]
+    fn bounds_keys_are_real_config_paths() {
+        for (key, _) in bounds::RANGES {
+            let path = key.strip_suffix(".limit").unwrap_or(key);
+            let (section, leaf) = path.split_once('.').expect("bounds key is section.leaf");
+            let json = serde_json::to_value(AppConfig::default()).unwrap();
+            let found = json
+                .get(section)
+                .and_then(|s| s.get(leaf))
+                .is_some_and(|v| !v.is_null());
+            assert!(found, "{key} is bounded but AppConfig has no such key");
+        }
+    }
 
     /// The shipped `config/app.toml` is the full reference of every available
     /// key at its default value (owner request 2026-08-30). Guard it against

@@ -226,15 +226,16 @@ Notes:
 >   configuration for any reverse-proxy-fronted deployment is to set
 >   both.
 >
-> The two lists are checked separately, and the admin panel builds the
-> links behind *Import / Export*, *Sources* and *Profiles* against the
-> **public** list. So if you pin `[server].allowed_hosts` to a public
-> domain but reach the panel on its own loopback address
-> (`http://127.0.0.1:8081/admin`, what Compose ships), the panel passes
-> its own host gate and then fails to build those links: `/admin/import`,
-> `/admin/sources/{id}` and `/admin/profiles/{id}` answer `500`. Either
-> reach the panel on the same hostname the public list allows, or add
-> `127.0.0.1` to `[server].allowed_hosts` as well.
+> The two lists are checked separately. The admin panel builds the
+> alive/ready export link behind *Import / Export*, *Sources* and
+> *Profiles* from the host you reached the panel on, and those three
+> screens render whatever that host is. If you pin
+> `[server].allowed_hosts` to a public domain but reach the panel on
+> its own loopback address (`http://127.0.0.1:8081/admin`, what
+> Compose ships), the link is built as `http://127.0.0.1:8080/...` and
+> the public listener answers it `404` — it does not serve that host.
+> Either reach the panel on the same hostname the public list allows,
+> or add `127.0.0.1` to `[server].allowed_hosts` as well.
 - The SQLite database lives in the `fumox-data` volume. `./config` is mounted
   into the server container **read-write** by default, so the admin *Edit
   settings* page can save `app.toml`; set `FUMOX_CONFIG_ACCESS=ro` to pin it
@@ -1083,7 +1084,9 @@ longer than the interval pushes the next start out by the work.
 When `retire_per_cycle` is 0 — usually because the second-chance window
 has not elapsed yet, or because `sample_size` is 0 — the cycle picks up
 nothing and there is no drain to estimate. The banner then reports what
-the cycle took and how much is due, instead of a figure it does not have.
+the cycle took and how much is due, instead of a figure it does not
+have. At `sample_size = 0` the two sample-proportional triggers stay off
+entirely: a ratio of the queue against a zero sample says nothing.
 
 Two assumptions the figure rests on:
 
@@ -1107,7 +1110,9 @@ applied together:
   two recommendations are chained, so applying both keeps the cycle on
   schedule;
 - `cycle_interval_secs`, only when the shortened period still fits the
-  modelled lane.
+  modelled lane, and never below 5 s — the same floor the daemon puts on
+  its own beat period, so the banner never advises running the cycle
+  faster than the cadence it considers sane.
 
 **What does not help with backlog.** `fail_limit`, `recheck_delays_secs`,
 `second_chance_min_hours`, `second_chance_spread_hours`,
@@ -1244,7 +1249,10 @@ stored.
       token. Set this on every deployment served from a fixed hostname.
       If the panel is reached on a *different* host than the public
       listener serves (loopback is the Compose default), add that host to
-      `[server].allowed_hosts` too, or those three admin screens 500.
+      `[server].allowed_hosts` too: the export link on *Import /
+      Export*, *Sources* and *Profiles* is built from the host you
+      reached the panel on, and the public listener answers `404` for a
+      host it does not serve. Those three screens themselves render.
 - [ ] `allow_private_urls` left `false` (SSRF protection), unless you have a
       specific trusted-internal-source reason.
 - [ ] One `fumox-server` + one `fumox-probe` against the same database file;
@@ -1291,7 +1299,7 @@ WantedBy=multi-user.target
 | Source shows `parse_error`                                            | The source returned HTTP 200 but unparseable content (anti-bot page, CDN stub, format change). The last good snapshot is served meanwhile.         |
 | Source won't save: "private URL" error                                | The URL resolves to a loopback/private address and `allow_private_urls` is false. That's the SSRF guard working.                                   |
 | No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`. Under Compose the directory is `/shared`, not `./config` — see [section 11](#11-geo-enrichment).    |
-| Admin *Import / Export*, *Sources* or *Profiles* answer 500            | `[server].allowed_hosts` is pinned to a public domain, but the panel is reached on another host (typically `127.0.0.1:8081`). The panel passes its own gate, then cannot build a link against the public list. Add the panel's host to `[server].allowed_hosts` or use the same hostname for both. |
+| *Import / Export*, *Sources* or *Profiles*: export link 404s         | The link is built from the panel's host; the public listener answers `404` for a host it does not serve. Add it to `[server].allowed_hosts`.     |
 | GeoLite2 file placed in `./config` is ignored                          | The Compose stack sets `FUMOX_GEO__DB_DIR=/shared`, and the environment outranks `config/app.toml`. Use the `meow-shared` volume, or remove the override and set `[geo].db_dir`. |
 | T2 checks never run, probe logs mention meow backoff                  | meow-rs is down or `[meow].api_addr` is wrong. In Docker, it must be `meow:9090`; the config path must be the shared volume (`/shared/meow.yaml`). |
 | `SQLITE_BUSY` errors in logs                                          | `busy_timeout_ms` was removed or set too low while two processes write to the DB. Restore the default (5000).                                      |

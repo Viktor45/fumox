@@ -5,38 +5,56 @@
 # Переопределение через окружение: FUMOX_СЕКЦИЯ__КЛЮЧ, например
 # FUMOX_ADMIN__TOKEN=secret (двойное подчеркивание разделяет секции).
 #
+# Диапазоны ниже — это то, что принимает админка (/admin/settings, «Правка»):
+# границы формы, а не произвольные числа. Ключи, которых в форме нет, помечены
+# отдельно. Ключ, которого здесь нет, будет отвергнут при загрузке: секции
+# объявлены с deny_unknown_fields, опечатка — ошибка, а не тихий игнор.
+#
 # Fumox, application configuration.
 # The file lists EVERY available key at its default value, change only what
 # you need. Every key has a default: the file may be trimmed down to the
 # sections you need or omitted entirely, the service runs on built-in defaults.
 # Environment overrides: FUMOX_SECTION__KEY, e.g. FUMOX_ADMIN__TOKEN=secret
 # (a double underscore separates the section from the key).
+#
+# The ranges below are what the admin panel (/admin/settings) accepts: the
+# form's own bounds, not round numbers. Keys the form does not edit are
+# marked as such. A key that is not here is rejected at load time: the
+# sections deny unknown fields, so a typo is an error, not a silent no-op.
 
 [server]
-# Публичный слушатель для GET /sub/{id} и GET /src/{id}.
-# Public listener for GET /sub/{id} and GET /src/{id}.
+# Сокет в виде host:port, без диапазона: любой адрес и порт, который можно
+# занять. Слушает только GET /sub/{id} и GET /src/{id}.
+# A host:port socket, no range: any address and port that can be bound.
+# Serves GET /sub/{id} and GET /src/{id} only.
+#
+# Socket as host:port, no range: any bindable address and port. Listens for
+# GET /sub/{id} and GET /src/{id} only.
 bind = "0.0.0.0:8080"
-# CIDRs reverse-proxy, чьи X-Forwarded-For / Forwarded for=… принимаются для
-# ключа per-IP rate-limit. Пусто = не доверять forwarded-заголовкам (любой
-# клиент иначе мог бы подменить ключ).
+# Список CIDR произвольной длины; пусто = не доверять forwarded-заголовкам (любой
+# клиент иначе мог бы подменить ключ per-IP rate-limit).
 # Reverse-proxy CIDRs whose X-Forwarded-For / Forwarded for=… are honored for
 # the per-IP rate-limit key. Empty = never trust forwarded headers (any
 # caller can otherwise spoof the key).
 trust_proxy_ips = []
-# Hostnames/IPs, которым разрешено обращаться к публичному слушателю.
-# Пусто = принять любой Host (текущее поведение); задайте значение, чтобы
-# привязать /export/alive/… к своему домену.
+# Список hostname/IP произвольной длины; пусто = принять любой Host.
+# Задайте, чтобы привязать /export/alive/… к своему домену.
 # Hostnames/IPs allowed to reach the public listener. Empty = accept any
 # Host (current behavior); set this to pin /export/alive/… to your domain.
 allowed_hosts = []
+# Диапазон: 1..=4294967295 строк (тип u32), в форме ключа нет.
+# 0 НЕ значит «без ограничения»: значение поднимается вверх до 1 строки
+# (ноль или минус в LIMIT SQLite прочитала бы как бесконечность), поэтому
+# при 0 тело отдаст ровно один узел.
+# Range: 1..=4294967295 rows (u32); not exposed in the form.
+# 0 does NOT mean unlimited: the value clamps up to 1 row (a zero or negative
+# LIMIT would otherwise read as unbounded in SQLite), so 0 serves one node.
+#
 # Потолок строк в одном теле /export/alive/… и /export/ready/… (LIMIT в SQL).
 # У этих ссылок нет своего ограничения сверху, в отличие от /sub и /src,
 # поэтому без него один публичный запрос читал и отдавал весь тир целиком.
 # Поднимите значение, если тир больше; в админке счётчик тира не урезан,
 # так что усечение всегда видно.
-# 0 НЕ значит «без ограничения»: значение поднимается вверх до 1 строки
-# (ноль или минус в LIMIT SQLite прочитала бы как бесконечность), поэтому
-# при 0 тело отдаст ровно один узел.
 # Тело кэшируется на 30 с, поэтому статус может доехать до ссылки с
 # задержкой до 30 с — выгрузка это снимок.
 # Row ceiling of one /export/alive/… and /export/ready/… body (LIMIT in SQL).
@@ -44,89 +62,124 @@ allowed_hosts = []
 # without one a single public request read and shipped the whole tier. Raise it
 # when the tier is bigger; the admin tier badge stays uncapped, so a truncated
 # export is always visible as smaller than the tier.
-# 0 does NOT mean unlimited: the value clamps up to 1 row (a zero or negative
-# LIMIT would otherwise read as unbounded in SQLite), so 0 serves one node.
 # The body is cached for 30 s, so a status change reaches the link with up to
 # that much delay — a download is a snapshot, and an expired one is re-rendered
 # rather than served stale.
 export_max_rows = 50000
-# Per-IP лимит на все публичные запросы (окно 60 с), общий потолок против
-# скрейпинга и флуда.
+# Диапазон: N = 1..=1000000 запросов (форма), окно = sec | min | hour | day.
+# Голое целое без «/» тоже принимается и читается как «в минуту».
 # Per-IP limit for every public request (60 s window), a general ceiling
 # against scraping and floods.
+# Range: N = 1..=1000000 requests (form), window = sec | min | hour | day.
+# A bare integer is also accepted and reads as per-minute.
 rate_limit = "300/min"
-# Per-IP лимит, пополняемый неудачными проверками access-token (HTTP 403 на
-# /sub) — сигнал перебора у защищённых профилей.
+# Диапазон тот же, что у rate_limit выше.
 # Per-IP limit fed by failed access-token checks (HTTP 403 on /sub), the
 # brute-force signal for protected profiles.
+# Same range as server.rate_limit above.
 auth_fail_rate_limit = "30/min"
 
 [database]
-# SQLite (WAL), единственный источник истины.
-# SQLite (WAL), the single source of truth.
+# Путь к файлу SQLite, без диапазона: каталог должен существовать и быть
+# доступен на запись обоим процессам.
+# SQLite (WAL), the single source of truth. No range: the directory must
+# exist and be writable by both processes.
 path = "fumox.db"
-# обязателен: пишут два процесса (server и probe)
-# required: two processes write to the database (server and probe)
+# Диапазон: 100..=60000 мс (форма). Обязателен: пишут два процесса
+# (server и probe), без него второй не ждет занятую базу, а получает
+# SQLITE_BUSY.
+# Range: 100..=60000 ms (form). Required: two processes write to the
+# database (server and probe); without it the second one does not wait for
+# the lock, it gets SQLITE_BUSY.
 busy_timeout_ms = 5000
+# Диапазон: 1..=1024 соединений (форма). SQLite сериализует записи, так что
+# заметный прирост на больших значениях обычно не появляется.
+# Range: 1..=1024 connections (form). SQLite serializes writes, so a
+# measurable gain past a modest value is uncommon.
 max_connections = 8
 
 [fetch]
-# Загрузка источников по HTTP.
-# Source fetching over HTTP.
+# Диапазон: 1..=600 секунд (форма).
+# Таймаут установки соединения при загрузке источников.
+# Range: 1..=600 seconds (form).
+# Connect timeout for source fetching.
 connect_timeout_secs = 10
+# Диапазон: 1..=3600 секунд (форма).
+# Таймаут чтения ответа источника.
+# Range: 1..=3600 seconds (form).
+# Response read timeout for source fetching.
 read_timeout_secs = 30
-# 10 МиБ; защита от decompression-bomb / 10 MiB; decompression-bomb guard
+# Диапазон: от 1024 байт (форма), верхней границы нет.
+# 10 МиБ; защита от decompression-bomb.
+# Range: from 1024 bytes (form), no upper bound.
+# 10 MiB; decompression-bomb guard.
 max_response_bytes = 10485760
+# Диапазон: 1..=1024 (форма).
 # 4 = потолок параллельных загрузок на процесс: выше, источники начинают отвечать 429,
-# ниже, слишком долгий прогон фидов с десятками URL 
+# ниже, слишком долгий прогон фидов с десятками URL
+# Range: 1..=1024 (form).
 # 4 caps parallel HTTP fetches per process: higher values trigger 429s,
 # lower ones stall feeds with dozens of URLs
 max_concurrency = 4
-# только для устранимых классов (network, http_server)
+# Диапазон: 0..=16 (форма), 0 = не повторять вовсе.
+# Повторы применяются только к устранимым классам ошибок (network, http_server).
+# Range: 0..=16 (form), 0 = never retry.
 # retries apply only to recoverable error classes (network, http_server)
 max_retries = 2
-# экспоненциальный backoff от этой базы / exponential backoff base for retries
+# Диапазон: 0..=60000 мс (форма), 0 = без задержки перед первой попыткой.
+# Экспоненциальный backoff от этой базы / exponential backoff base for retries
+# Range: 0..=60000 ms (form), 0 = no delay before the first attempt.
+# exponential backoff base for retries
 retry_base_backoff_ms = 500
+# Строка без диапазона: любой User-Agent, который не запрещён целевым сервером.
 # Встроенный дефолт генерируется из версии бинарника (сейчас fumox/0.1.0):
 # удалите строку, подставится актуальная версия при сборке. headers
 # конкретного источника важнее этого значения.
+# Free-form string, no range: any User-Agent the target server does not block.
 # The built-in default is derived from the binary version (fumox/0.1.0 now):
 # remove the line to inherit it at compile time. Per-source headers win.
 user_agent = "fumox/0.1.0"
-# Семейство IP-протоколов по умолчанию для загрузки источников: any | ipv4 | ipv6.
+# Диапазон: any | ipv4 | ipv6, других значений парсер не принимает.
+# Семейство IP-протоколов по умолчанию для загрузки источников.
 # Источник без своего ip_family наследует это значение. any, dual-stack:
 # первый IPv4-адрес, иначе IPv6. Выбранное семейство строгое: нет адреса
 # нужного семейства, загрузка с ошибкой. Переопределение:
 # FUMOX_FETCH__IP_FAMILY.
-# Default IP protocol family for source fetching: any | ipv4 | ipv6. Sources
+# Range: any | ipv4 | ipv6; the parser accepts nothing else.
+# Default IP protocol family for source fetching. Sources
 # without their own ip_family inherit this. any = dual-stack (first IPv4
 # address wins, IPv6 fallback). The family is strict: no address of that
 # family means a fetch error. Env override: FUMOX_FETCH__IP_FAMILY.
 ip_family = "any"
 
 [ingest]
-# Инжест источников планировщиком fumox-server: fetch → parse → reconcile.
-# Source ingestion by the fumox-server scheduler: fetch → parse → reconcile.
-# новых unknown-прокси за обновление источника в приоритет-очередь (0 = выкл)
-# newly inserted unknown proxies per source refresh queued for priority checking (0 = off)
+# Диапазон: 0..=10000 (форма), 0 = не ставить в приоритетную очередь.
+# Новых unknown-прокси за обновление источника в приоритетную очередь.
+# Range: 0..=10000 (form), 0 = never queue.
+# Newly inserted unknown proxies per source refresh queued for priority
+# checking.
 refresh_check_limit = 100
+# Диапазон: true | false, дефолт false.
 # Как поступать с живым прокси, исчезнувшим из выдачи источника.
 # false (дефолт): прокси остается за источником, пока проверки подтверждают,
 # что он жив; как только проверки завалят его, прокси удаляется из базы автоматически.
 # true: если у источника есть правила отбрасывания (drop) в pipeline, живой
 # прокси под таким правилом убирается уже на ближайшем обновлении.
+# Range: true | false, default false.
 # What happens to an alive proxy that vanished from a source feed.
 # false (the default): the proxy stays linked to the source while checks
 # keep confirming it is alive; once the checks fail it, the proxy gets
 # removed automatically. true: when the source has pipeline drop rules, an alive
 # proxy caught by a rule is removed on the very next refresh.
 drop_gate = false
+# Диапазон: true | false, дефолт false.
 # Возврат удаленного прокси, который снова появился в источнике.
 # false (дефолт): removed терминален, возврат только вручную («сбросить
 # статус» в админке) или через «purge removed» + повторная вставка.
 # true: прокси, все еще приходящий из фида, сбрасывается в статус
 # unknown (fail_count и карантинные поля очищены, как после «сброса
-# статуса») и заново проходит проверки, вставая в приоритет-очередь.
+# статуса») и заново проходит проверки, вставая в приоритетную очередь.
+# Range: true | false, default false.
 # Revive a removed proxy that reappears in a source feed.
 # false (the default): removed stays terminal, the only ways back are the
 # admin "reset status" action or «purge removed» plus a re-insert.
@@ -136,11 +189,13 @@ drop_gate = false
 removed_as_unknown = false
 
 [geo]
+# Диапазон: true | false.
 # Гео-обогащение MaxMind GeoLite2: по IP-адресу узла определяются страна,
 # город и автономная система, открываются ВСЕ базы в db_dir и их факты
 # объединяются, поэтому {country}, {city} и {asn} работают в одном шаблоне
 # имени. Файлы .mmdb не коммитятся; при старте сервер сам скачивает
 # отсутствующие/устаревшие базы в db_dir, если каталог доступен для записи.
+# Range: true | false.
 # MaxMind GeoLite2 geo enrichment: a node's IP resolves to its country,
 # city and autonomous system, ALL databases in db_dir are opened and their
 # facts merged, so {country}, {city} and {asn} work in one name template.
@@ -148,11 +203,13 @@ removed_as_unknown = false
 # missing/stale databases into db_dir automatically, provided the directory
 # is writable.
 enabled = true
+# Каталог с файлами .mmdb, без диапазона: путь должен существовать.
 # «config», дефолт рядом с бинарником: удобно для dev-сборки и одиночного запуска.
 # В проде задайте абсолютный путь к read-only тому с актуальными .mmdb
 # ВНИМАНИЕ: поставляемый стек Docker Compose переопределяет это на /shared
 # (переменная FUMOX_GEO__DB_DIR), а окружение приоритетнее файла, поэтому на
 # этом стеке значение из файла не применяется: базы кладите в том meow-shared.
+# Directory holding the .mmdb files, no range: the path must exist.
 # "config" is the default next to the binary, convenient for dev.
 # In prod set an absolute path to a read-only volume with fresh .mmdb
 # NOTE: the shipped Docker Compose stack overrides this to /shared
@@ -160,155 +217,229 @@ enabled = true
 # here does not apply on that stack — put the databases in the meow-shared
 # volume instead.
 db_dir = "config"
-# 16384 = потолок записей in-memory кэша moka: каждая запись маленькая (страна/город/AS),
-# итого пара мегабайт; поднимите, если в вашем фиде заметно больше уникальных хостов
-# 16384 caps the in-memory moka cache; entries are small (country/city/AS), a couple of MB total;
-# raise this if your feed holds noticeably more unique hosts
+# Диапазон: 0..=10000000 записей (форма). Потолок in-memory кэша moka, уходит
+# в max_capacity как есть.
+# Каждая запись маленькая (страна/город/AS), итого пара мегабайт; поднимите,
+# если в вашем фиде заметно больше уникальных хостов.
+# Range: 0..=10000000 entries (form). The in-memory moka capacity ceiling,
+# passed to max_capacity unchanged.
+# Entries are small (country/city/AS), a couple of MB total; raise this if
+# your feed holds noticeably more unique hosts.
 cache_max_entries = 16384
+# Диапазон: 1..=60 секунд (форма).
+# Таймаут DNS-резолва на шаге обогащения.
+# Range: 1..=60 seconds (form).
+# Timeout for the async DNS resolution step.
 dns_timeout_secs = 5
+# Диапазон: 0 = не ждать вовсе, сверху не ограничено (u64, форма ключа нет).
 # Сколько секунд старт ждет скачивания баз GeoLite2, прежде чем поднять
 # слушатели: медленное зеркало не должно держать /healthz недоступным.
 # По истечении бюджета загрузка продолжается в фоне, а текущий запуск
 # работает без гео-обогащения до следующего старта (файл ставится
 # атомарным rename, поэтому частичный .mmdb никто не увидит).
+# Range: 0 = do not wait at all, no upper bound (u64, not in the form).
 # How many seconds startup waits for the GeoLite2 download before binding
 # the listeners, so a slow mirror cannot keep /healthz unreachable. Past
 # the budget the download continues in the background and this run serves
 # without geo enrichment until the next start (the file lands via an
-# atomic rename, so no partial .mmdb is ever visible). 0 = не ждать вовсе
-# / do not wait at all.
+# atomic rename, so no partial .mmdb is ever visible).
 startup_download_budget_secs = 60
 
 [admin]
+# Диапазон: true | false.
 # Админка. Пустой token = админка отключена (отдает 404).
+# Range: true | false.
 # Admin panel. An empty token disables the panel (it answers 404).
 enabled = true
+# Строка без диапазона: это и есть пароль, держите его секретом. Пустая
+# строка отключает админку целиком.
+# Free-form string, no range: this is the password itself, keep it secret.
+# An empty string disables the panel entirely.
 token = "change-me"
-# отдельный слушатель; наружу, reverse-proxy/SSH-туннель
-# a separate listener; expose it through a reverse proxy or an SSH tunnel
+# Сокет отдельного слушателя в виде host:port, без диапазона. Наружу его
+# не выставляют: reverse-proxy или SSH-туннель.
+# A separate listener's host:port socket, no range. Never exposed directly:
+# a reverse proxy or an SSH tunnel.
 bind = "127.0.0.1:8081"
-# 7 дней / 7 days
+# Диапазон: 1..=8760 часов (форма, верхняя граница = год).
+# Сколько живёт сессионная cookie админки.
+# Range: 1..=8760 hours (form, upper bound is one year).
+# How long the admin session cookie lives.
 session_ttl_hours = 168
+# Диапазон: true | false, дефолт false.
 # false = отказываем RFC1918/loopback по умолчанию (SSRF-защита активна).
-# true имеет смысл только при собственной изолированной feed-инфраструктуре 
+# true имеет смысл только при собственной изолированной feed-инфраструктуре.
+# Range: true | false, default false.
 # false rejects RFC1918/loopback out of the box (SSRF guard active).
-# Set true only on your own isolated feed infra
+# Set true only on your own isolated feed infra.
 allow_private_urls = true
-# /admin/* кроме login / /admin/* except login
+# Диапазон: N = 1..=1000000 запросов (форма), окно = sec | min | hour | day.
+# /admin/* кроме login.
+# Range: N = 1..=1000000 requests (form), window = sec | min | hour | day.
+# /admin/* except login.
 rate_limit = "120/min"
-# POST /admin/login
+# Диапазон тот же, что у admin.rate_limit выше; окно меньше, потому что
+# форма логина — единственная точка перебора.
+# Range: same as admin.rate_limit above; a smaller window, because the login
+# form is the one thing being brute-forced.
 login_rate_limit = "5/min"
-# каталог переводов админки (<код>.toml); новый файл = новый язык после рестарта
-# admin UI translation catalogs (<code>.toml); a new file adds a language after restart
+# Каталог с переводами админки (<код>.toml), без диапазона: новый файл = новый
+# язык после рестарта. Язык берется из cookie lang, а не из Accept-Language;
+# кода без файла за ним не существует, отдается язык по умолчанию (ru, если
+# его каталог на месте, иначе первый в алфавитном порядке).
+# Directory of admin UI translation catalogs (<code>.toml), no range: a new
+# file adds a language after a restart. The language comes from the `lang`
+# cookie, not from Accept-Language; a code with no catalog behind it falls
+# back to the default (ru if present, else the first alphabetically).
 locales_dir = "locales"
-# CIDRs reverse-proxy для per-IP ключа админки. Пусто = forwarded-заголовки
-# игнорируются.
+# Список CIDR произвольной длины; пусто = forwarded-заголовки игнорируются.
 # Reverse-proxy CIDRs for the admin per-IP rate-limit key. Empty = ignore
 # forwarded headers.
 trust_proxy_ips = []
-# Hostnames/IPs, которым разрешено обращаться к админ-слушателю. Пусто =
-# принять любой Host.
+# Список hostname/IP произвольной длины; пусто = принять любой Host.
 # Hostnames/IPs allowed to reach the admin listener. Empty = accept any Host.
 allowed_hosts = []
+# Диапазон: true | false. Ставьте true, только когда панель открывается по
+# HTTPS: cookie с флагом Secure не поставится по http://.
+# Range: true | false. Set true only behind HTTPS: a Secure cookie is never
+# set over http://.
 secure_cookies = false
 
 [probe]
-# Демон проверки живучести прокси.
-# Proxy health-check daemon.
+# Диапазон: 1..=86400 секунд (форма). Демон поднимает меньше единицы до 1.
 # 60 с, компромисс между задержкой прогона приоритетной выборки probe и нагрузкой
-# на исходящие коннекты 
-# 60 s balances probe responsiveness (priority sample turnaround) against outbound connect load
+# на исходящие коннекты.
+# Range: 1..=86400 seconds (form). The daemon raises anything below 1 to 1.
+# 60 s balances probe responsiveness (priority sample turnaround) against
+# outbound connect load.
 cycle_interval_secs = 60
-# случайная выборка прокси за цикл (без всплесков) / random proxy sample per cycle (no bursts)
+# Диапазон: 0..=100000 (форма). 0 = цикл не берёт из очереди ничего, карантин
+# не осушается вовсе. Случайная выборка прокси за цикл (без всплесков).
+# Range: 0..=100000 (form). 0 = the cycle retires nothing and the quarantine
+# never drains. Random proxy sample per cycle (no bursts).
 sample_size = 50
+# Диапазон: 1..=32 (форма).
 # Неудачных проверок подряд до карантина. Для нового прокси это T1-проверки
 # (приоритетная очередь, затем случайная выборка); провалы T2 считают в тот же
 # счетчик. Уменьшите значение, чтобы не тратить время T1 на мертвые прокси.
+# Range: 1..=32 (form).
 # Consecutive failed checks before quarantine. For a fresh proxy these are
 # T1 checks (priority queue, then the random sample); T2 failures count in
 # the same counter. Lower it to stop spending T1 time on dead proxies.
 fail_limit = 2
-# Запрет диала приватных адресов из фидов: без этого флага демон не
-# подключается к loopback/RFC1918/link-local/CGNAT целям, фид может
-# подсунуть «прокси» с адресом внутренней сети. Отказ регистрируется как
-# проваленная проверка: заблокированная цель проходит обычную лестницу
-# фейлов, а не зависает в очередях навсегда.
-# Refuse to dial private addresses coming from feeds: with this flag unset
-# the daemon never connects to loopback/RFC1918/link-local/CGNAT targets ,
-# a feed can plant a «proxy» pointing inside your network. A refusal is
-# journaled as a *failed check*: the blocked target goes through the ordinary fail
-# ladder instead of clogging the queues forever.
-# allow_private_targets = false
-# T1: TCP-connect
+# Диапазон: 1..=600 секунд (форма).
+# T1: TCP-connect, таймаут установления соединения.
+# Range: 1..=600 seconds (form).
+# T1: TCP connect timeout.
 connect_timeout_secs = 5
-# T1: TLS-handshake
+# Диапазон: 1..=600 секунд (форма).
+# T1: TLS-handshake.
+# Range: 1..=600 seconds (form).
+# T1: TLS handshake.
 tls_timeout_secs = 5
+# Диапазон: 1..=1024 (форма). 0 поднимается до 1. Больше 64 демон
+# рекомендовать не будет, даже если очередь этого требует.
+# Range: 1..=1024 (form). 0 is raised to 1. The banner will not recommend
+# more than 64, however deep the queue.
 concurrency = 8
-# 30 с, куда реже probe просто молчит, не присылая heartbeat; значение меньше 15с
-# расходится с обычной задержкой пуша meta-ключа и не несёт пользы
+# Диапазон: 1..=86400 секунд (форма), но бит идёт не чаще раза в 5 секунд:
+# демон поднимает меньше 5 до 5, и карточка демона в админке считает мертвым
+# после max(значение, 5) × 3 секунд.
+# 30 с = как долго probe может молчать, прежде чем это заметит админка;
+# ниже 15 с не быстрее частоты записи meta-ключа и не несёт пользы.
+# Range: 1..=86400 seconds (form), but the beat never runs faster than every
+# 5 s: the daemon raises anything below 5 to 5, and the admin daemon card
+# calls it dead after max(value, 5) × 3 seconds.
 # 30 s = how long a silent probe can stay silent before the admin UI notices;
-# going under 15s is no faster than the meta-key push cadence and buys nothing
+# going under 15s is no faster than the meta-key push cadence and buys nothing.
 heartbeat_interval_secs = 30
+# Диапазон: 0..=8760 часов (форма).
 # Второй шанс для прокси в карантине: повторная проверка в случайный момент
-# окна [1ч, 3ч) после карантина, окно задается как min + случайная
+# окна [min, min + spread) после карантина, окно задается как min + случайная
 # добавка от 0 до spread (UTC, момент фиксируется в базе при карантине).
+# Range: 0..=8760 hours (form).
 # A quarantined proxy's second chance: rechecked at a random moment of the
-# [1h, 3h) window after quarantine, the window is min plus a random
+# [min, min + spread) window after quarantine, the window is min plus a random
 # addition from 0 to spread (UTC, the moment is fixed in the database when
 # quarantined).
 second_chance_min_hours = 2
+# Диапазон: 0..=8760 часов (форма). 0 = повторная проверка ровно в min, без
+# разброса, все прокси приходят одним залпом.
+# Range: 0..=8760 hours (form). 0 = recheck exactly at min with no spread, so
+# every proxy comes back in one burst.
 second_chance_spread_hours = 1
+# Диапазон: до 16 ступеней, каждая 1..=2592000 секунд (30 дней). Больше —
+# ошибка загрузки конфига, а не молчаливое усечение. Пустой массив допустим.
 # Лестница повторных проверок карантина: задержки в секундах
 # между последовательными ретраями после провала второго шанса. Провал ретрая
 # N назначает ретрай N+1 через recheck_delays_secs[N-1]; провал последней
 # ступени удаляет прокси. Длина произвольная (до 16 ступеней, каждая до 30
 # дней); пустой массив = удалять сразу после провала второго шанса.
+# Range: at most 16 steps, each 1..=2592000 seconds (30 days). Beyond that the
+# config fails to load rather than being silently trimmed. An empty list is
+# legal.
 # Quarantine recheck ladder: delays in seconds between
 # consecutive rechecks after a failed second chance. Failing recheck N
 # schedules recheck N+1 after recheck_delays_secs[N-1]; failing the last
 # entry removes the proxy. Arbitrary length (up to 16 steps of at most 30
 # days); an empty list removes right after the failed second chance.
 recheck_delays_secs = [600, 900]   # 10 мин → 15 мин / 10m → 15m
+# Диапазон: 0..=365 дней (форма), 0 читается как 1 день.
 # Записи очереди приоритетных проверок (probe_requests) старше этого срока
 # удаляются (ежедневная задача ротации).
+# Range: 0..=365 days (form), 0 is read as 1 day.
 # Priority-queue entries (probe_requests) older than this are purged.
 queue_stale_days = 7
-# Целевое время (мин), за которое чекер на /admin/probe пытается
-# осушить текущий карантин. Если затраты при текущих настройках превышает
-# это число, чекер предложит конкретные [probe].sample_size /
-# cycle_interval_secs / concurrency. 5..=1440.
+# Диапазон: 5..=1440 минут (форма), то есть от 5 минут до суток.
+# Целевое время, за которое чекер на /admin/probe пытается осушить текущий
+# карантин. Если затраты при текущих настройках превышают это число, чекер
+# предложит конкретные [probe].sample_size / cycle_interval_secs / concurrency.
+# Range: 5..=1440 minutes (form), i.e. 5 minutes to a day.
 # Target drain time (min) used by the /admin/probe backlog banner when
-# computing suggested [probe] values. 5..=1440.
+# computing suggested [probe] values.
 backlog_target_drain_minutes = 60
-# 86400 с (сутки), ротация probe_results/fetch_log под полные сутки, в пару к [retention].*_days 
-# 86400 s (one day) pairs with [retention].*_days so rotation runs once per day and matches the retention window
+# Диапазон: 60..=604800 секунд (форма), то есть от минуты до недели.
+# 86400 с (сутки) — ротация probe_results/fetch_log под полные сутки, в пару
+# к [retention].*_days, чтобы ротация шла раз в сутки и совпадала с окном.
+# Range: 60..=604800 seconds (form), one minute to one week.
+# 86400 s (one day) pairs with [retention].*_days so rotation runs once per
+# day and matches the retention window.
 retention_interval_secs = 86400
+# Диапазон: true | false, дефолт false.
+# Запрет диала приватных адресов из фидов: без этого флага демон не
+# подключается к loopback/RFC1918/link-local/CGNAT целям, фид может
+# подсунуть «прокси» с адресом внутренней сети. Отказ регистрируется как
+# проваленная проверка: заблокированная цель проходит обычную лестницу
+# фейлов, а не зависает в очередях навсегда.
+# With this flag unset the daemon never dials loopback/RFC1918/link-local/
+# CGNAT targets coming from feeds, and a refusal counts as a failed check
+# (see the fail ladder above). A feed can plant a «proxy» pointing inside
+# your network; the refusal sends it through the ordinary fail ladder
+# instead of clogging the queues forever.
+# Range: true | false, default false.
 allow_private_targets = true
 
 [meow]
-# meow-rs, движок реальных туннельных проверок. Живет как отдельный
-# системный сервис: Fumox им не управляет, только дергает его REST API
-# и перезагружает конфиг через PUT /configs.
-# meow-rs, the engine behind real tunnel checks. It runs as a separate
-# system service: Fumox does not manage it, it only calls its REST API
-# and reloads its config via PUT /configs.
+# Сокет в виде host:port, без диапазона: адрес, на котором поднят meow-rs.
+# Fumox им не управляет: только дергает REST API и перезагружает конфиг
+# через PUT /configs.
+# A host:port socket, no range: the address meow-rs listens on. Fumox does
+# not manage it: it only calls its REST API and reloads its config via
+# PUT /configs.
 api_addr = "127.0.0.1:9090"
-# /shared/meow.yaml, путь, на который meow-rs настроен в типовом docker-compose;
-# подмените, когда раскладка томов иная 
-# /shared/meow.yaml is where meow-rs expects its config in the typical docker-compose layout;
-# override if your volume layout differs
+# Путь к конфигу meow-rs, без диапазона: /shared/meow.yaml в типовом
+# docker-compose, подмените, когда раскладка томов иная.
+# Path to meow-rs's own config, no range: /shared/meow.yaml in the typical
+# docker-compose layout; override if your volume layout differs.
 config_path = "/shared/meow.yaml"
-# Адрес(а) T2-проверки задержки через туннель: probe случайно выбирает один
-# из списка на каждую проверку, выход одного адреса из строя не ломает T2.
-# Можно задать один адрес, TOML-массив или строку с адресами через запятую
-# (удобно для FUMOX_MEOW__TEST_URL). Ниже, актуальные адресы captive-проверки
-# Android (проверены вживую 2026-08-29, все отвечают HTTP 204); уберите
-# недоступные в вашем регионе. HTTPS-варианты (www.google.com,
-# connectivitycheck.gstatic.com, play.googleapis.com) тоже живы, но дают
-# лишний TLS-handshake внутри туннеля.
-# Test URL(s) of the T2 tunnel delay check: the probe picks one at random
-# per check, a dead endpoint no longer breaks T2. Accepts a single URL, a
-# TOML array, or a comma-separated string (handy for FUMOX_MEOW__TEST_URL).
+# Строка, массив строк или строка с запятыми — без диапазона. Probe случайно
+# выбирает один адрес на каждую проверку, поэтому выход одного из строя не
+# ломает T2. Ниже, актуальные адреса captive-проверки Android (проверены
+# вживую 2026-08-29, все отвечают HTTP 204); уберите недоступные в вашем
+# регионе. HTTPS-варианты (www.google.com, connectivitycheck.gstatic.com,
+# play.googleapis.com) тоже живы, но дают лишний TLS-handshake внутри туннеля.
+# A string, an array of strings, or a comma-separated string — no range. The
+# probe picks one at random per check, so a dead endpoint no longer breaks T2.
 # Below are the current Android captive-portal endpoints (verified live
 # 2026-08-29, all answer HTTP 204); drop the ones unreachable in your region.
 # HTTPS variants (www.google.com, connectivitycheck.gstatic.com,
@@ -331,30 +462,54 @@ test_url = [
   # legacy Android 2.3-4.x, still alive
   "https://clients3.google.com/generate_204",
 ]
+# Диапазон: 1..=600 секунд (форма). Уходит в meow-rs параметром timeout у
+# проверки задержки (это и есть бюджет туннеля) и одновременно служит
+# потолком таймаута HTTP-клиента; сам HTTP-запрос идет с запасом в 5 с.
+# Range: 1..=600 seconds (form). Sent to meow-rs as the delay check's
+# `timeout` parameter (that is the tunnel budget) and used as the HTTP
+# client's own timeout; the request itself is given a 5 s margin on top.
 timeout_secs = 7
+# Диапазон: 1..=86400 секунд (форма).
 # Backoff повторных обращений к meow-rs, когда он недоступен (удваивается с
-# каждым подряд идущим провалом, от initial до max).
+# каждым подряд идущим провалом, от initial до max; при max остаётся max).
+# Range: 1..=86400 seconds (form).
 # Retry backoff while meow-rs is unavailable (doubles per consecutive
-# failure, from initial up to max).
+# failure, from initial up to max, then stays at max).
 backoff_initial_secs = 60
+# Диапазон: 1..=86400 секунд (форма).
+# Потолок того же backoff: удвоение останавливается здесь, а не растёт дальше.
+# Range: 1..=86400 seconds (form).
+# Ceiling of the same backoff: doubling stops here instead of growing on.
 backoff_max_secs = 900
 
 [retention]
+# Диапазон: 1..=3650 дней (форма), то есть до 10 лет. Меньше 1 отвергнуть
+# нельзя: 0 дней означал бы хранить ноль записей.
 # Ротация истории (ежедневная задача в probe).
+# Range: 1..=3650 days (form), up to 10 years. Below 1 is not accepted: 0
+# days would mean keeping no rows at all.
 # History rotation (a daily task in the probe daemon).
 probe_results_days = 7
+# Диапазон тот же, что у probe_results_days выше.
+# Сколько дней хранить журнал загрузки источников.
+# Range: same as probe_results_days above.
+# How many days of source-fetch log to keep.
 fetch_log_days = 7
 
 [log]
-# Уровень консольных логов каждого процесса: error | warn | info | debug | trace.
-# Оба процесса читают этот файл, поэтому ключ свой у каждого: server, для
-# fumox-server, probe, для fumox-probe (probe на info пишет строку «probe
-# cycle done» каждый цикл; warn ее убирает). Полные директивы EnvFilter в
-# RUST_LOG имеют приоритет над конфигом (например RUST_LOG=fumox_core=debug,info).
-# Console log level per process: error | warn | info | debug | trace. Both
-# processes read this file, so each has its own key: server for fumox-server,
-# probe for fumox-probe (at info the probe prints a «probe cycle done» line
-# every cycle; warn silences it). Full EnvFilter directives in RUST_LOG take
-# precedence over the config (e.g. RUST_LOG=fumox_core=debug,info).
+# Диапазон: error | warn | info | debug | trace, других значений нет.
+# Уровень консольных логов каждого процесса. Оба процесса читают этот файл,
+# поэтому ключ свой у каждого: server, для fumox-server, probe, для fumox-probe
+# (probe на info пишет строку «probe cycle done» каждый цикл; warn ее убирает).
+# Полные директивы EnvFilter в RUST_LOG имеют приоритет над конфигом (например
+# RUST_LOG=fumox_core=debug,info).
+# Range: error | warn | info | debug | trace; nothing else is accepted.
+# Console log level per process. Both processes read this file, so each has
+# its own key: server for fumox-server, probe for fumox-probe (at info the
+# probe prints a «probe cycle done» line every cycle; warn silences it). Full
+# EnvFilter directives in RUST_LOG take precedence over the config (e.g.
+# RUST_LOG=fumox_core=debug,info).
 server = "info"
+# Диапазон тот же, что у log.server выше.
+# Range: same as log.server above.
 probe = "info"

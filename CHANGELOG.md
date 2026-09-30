@@ -596,9 +596,85 @@ Defect fixes in the working tree, not yet on a published image.
   The sub-line now carries the headline's own population filter.
   Guarded by
   `unprobeable_count_excludes_rows_the_cleanup_button_retired`.
+- At `[probe].sample_size = 0` the probe page's backlog banner
+  reported the queue as a multiple of a sample that does not exist:
+  the two sample-proportional triggers divided the quarantine depth
+  by a `.max(1)` stand-in while the snapshot underneath printed the
+  real `0`, so a 25-row queue read "25× the per-cycle sample" above a
+  "sample 0/cycle". Both triggers now stay off at zero — there is no
+  sample to measure against, and the `all_idle` line already reports
+  the state with the numbers an operator can act on. Guarded by
+  `sample_size_zero_reports_idleness_not_a_ratio_over_zero`.
+- The banner's `cycle_interval_secs` recommendation could ask for a
+  cycle faster than the daemon's own heartbeat floor. The period is
+  `ceil(target / cycles)`, so a queue long enough to need many cycles
+  and a tight `connect_timeout_secs + tls_timeout_secs` land on
+  single-digit seconds: with `sample_size = 100`, `concurrency = 64`,
+  1 s timeouts and a 60 s cycle, a 10 000-row queue produced
+  `cycle_interval_secs = 2`. A cycle is several `SELECT`s across the
+  pool plus its writes, and the daemon already puts a `.max(5)` floor
+  on its beat period, so the recommendation now stays silent below
+  that instead of printing a value an operator should not set. The
+  knob itself is unaffected — a period the model can certify at or
+  above the floor still prints. Both guides' recommendation list
+  says so. Guarded by
+  `period_rec_never_lands_below_the_beating_floor`, and the whole
+  value space is swept by `recs_stay_inside_the_range_the_form_accepts`
+  so no knob can print a value outside the settings form's own range.
 
 ### Docs
 
+- The settings form advertised a range it never enforced. The four
+  rate-limit inputs carried `min="1" max="1000000"`, but the only thing
+  that ever checked them was the browser's own number validation, so a
+  POST that skipped the browser wrote `0/min` and left every public
+  route behind a zero budget. The bounds are enforced server-side now,
+  and three of the four fields (`admin.rate_limit`,
+  `admin.login_rate_limit`, `server.auth_fail_rate_limit`) additionally
+  rendered no error line at all, so the message had nowhere to appear;
+  they have one, for the number and the unit.
+- Every bounded setting now shows its range under the input, taken
+  from the same table the save handler enforces, so the number an
+  operator reads before typing and the number in the rejection after
+  saving cannot be different values. The recheck ladder, which is a
+  list rather than a number, states its own bound (up to 16 steps,
+  each 1..=30 days) next to its existing hint.
+- The accepted range of a setting now lives in one place,
+  `config::bounds`, instead of three: literal arguments at the save
+  site, literal `min`/`max` attributes in the template, and prose in
+  `config/app.toml`. The form and the validator read the same rows, the
+  quarantine ladder's 16-step and 30-day limits are now shared with the
+  config deserializer that enforces them at load, and a test fails if a
+  number input appears with no row, if a row stops being rendered, or
+  if the template grows a literal bound again.
+- The number and unit halves of a rate limit sat on two lines with the
+  unit select spanning the whole panel: the `.field` rule gives every
+  input `width: 100%`, and two of those inside a wrapping flex row each
+  claim a line. They are one control and now sit on one line, going back
+  to a full-width stack on phones where a 120px number would leave the
+  unit too narrow to read.
+- The i18n key scanner matched `t("…")` anywhere in a template,
+  including the tail of a helper whose name ended in `t`, so
+  `self.range_text("probe.sample_size")` was read as a catalog lookup
+  for the key `probe.sample_size`. The pattern is word-bounded now;
+  it was a false positive waiting for any helper to grow a `t`.
+
+- `config/app.toml` documented what each key *does* but never what
+  values it accepts, and the accepted range is not discoverable from
+  the file: the bounds live in the admin form's `min`/`max`
+  attributes, so a hand-edited config had no way to learn that
+  `probe.recheck_delays_secs` fails to load past 16 steps or 30 days
+  per step, that `[server].export_max_rows = 0` serves one row rather
+  than everything, or that the daemon raises a sub-second heartbeat
+  period to 5 s. Every key now opens its comment block with the range
+  it is actually held to, and the keys the form does not edit say so
+  instead of implying a bound they do not have. The two keys whose
+  prose admitted no range — the `host:port` sockets, the paths, the
+  token — say that plainly in words instead.
+  The `[probe]` block also carried the `allow_private_targets` SSRF
+  explanation above `connect_timeout_secs`, next to a commented-out
+  duplicate of a key that lives 50 lines further down; it now sits
+  with the key it describes, and the stray commented-out copy is gone.
 - The guide told operators to drop GeoLite2 `.mmdb` files into
   `./config`; the shipped Compose stack has set
   `FUMOX_GEO__DB_DIR=/shared` since 338929e, and the environment

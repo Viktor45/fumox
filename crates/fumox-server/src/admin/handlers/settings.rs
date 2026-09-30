@@ -23,7 +23,7 @@ use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::config::{
-    AppConfig, DEFAULT_CONFIG_PATH, GeoDbKind, RateLimit, ResolvedConfigPath,
+    AppConfig, DEFAULT_CONFIG_PATH, GeoDbKind, RateLimit, ResolvedConfigPath, bounds,
 };
 use fumox_core::config_writer::{EditableConfig, item};
 use fumox_core::models::IpFamily;
@@ -173,6 +173,37 @@ impl SettingsEditTemplate {
             .iter()
             .find(|(f, _)| f == field)
             .map(|(_, m)| m.as_str())
+    }
+
+    /// `min` for a number input, straight from the bounds table. An
+    /// unbounded setting renders an empty attribute rather than a
+    /// fabricated `0`.
+    fn range_min(&self, field: &str) -> String {
+        bounds::min_attr(field)
+    }
+
+    /// `max` for a number input, empty when the setting is unbounded.
+    fn range_max(&self, field: &str) -> String {
+        bounds::max_attr(field)
+    }
+
+    /// The range as the operator reads it, shown under the input. It is
+    /// the same value the save handler enforces, so the number in the
+    /// hint and the number in the error cannot drift apart.
+    fn range_text(&self, field: &str) -> Option<String> {
+        bounds::display(field, self.lang.t("set.range_open_ended"))
+    }
+
+    /// Longest recheck ladder the config accepts, in steps. The ladder
+    /// is a list, so its bound is a count rather than a range; both
+    /// numbers come from the same constants the deserializer enforces.
+    fn ladder_steps(&self) -> usize {
+        bounds::RECHECK_MAX_STEPS
+    }
+
+    /// Longest single recheck delay, in seconds.
+    fn ladder_max_delay(&self) -> i64 {
+        bounds::RECHECK_MAX_DELAY_SECS
     }
 
     /// Path the editor would write to. Surfaces in the page subtitle
@@ -735,8 +766,6 @@ fn apply_all(
         "database.busy_timeout_ms",
         cfg,
         "database.busy_timeout_ms",
-        100,
-        60_000,
         lang,
         errors,
     );
@@ -745,8 +774,6 @@ fn apply_all(
         "database.max_connections",
         cfg,
         "database.max_connections",
-        1,
-        1024,
         lang,
         errors,
     );
@@ -757,8 +784,6 @@ fn apply_all(
         "fetch.connect_timeout_secs",
         cfg,
         "fetch.connect_timeout_secs",
-        1,
-        600,
         lang,
         errors,
     );
@@ -767,8 +792,6 @@ fn apply_all(
         "fetch.read_timeout_secs",
         cfg,
         "fetch.read_timeout_secs",
-        1,
-        3600,
         lang,
         errors,
     );
@@ -777,8 +800,6 @@ fn apply_all(
         "fetch.max_response_bytes",
         cfg,
         "fetch.max_response_bytes",
-        1024,
-        u64::MAX / 2,
         lang,
         errors,
     );
@@ -787,8 +808,6 @@ fn apply_all(
         "fetch.max_concurrency",
         cfg,
         "fetch.max_concurrency",
-        1,
-        1024,
         lang,
         errors,
     );
@@ -797,8 +816,6 @@ fn apply_all(
         "fetch.max_retries",
         cfg,
         "fetch.max_retries",
-        0,
-        16,
         lang,
         errors,
     );
@@ -807,8 +824,6 @@ fn apply_all(
         "fetch.retry_base_backoff_ms",
         cfg,
         "fetch.retry_base_backoff_ms",
-        0,
-        60_000,
         lang,
         errors,
     );
@@ -842,8 +857,6 @@ fn apply_all(
         "ingest.refresh_check_limit",
         cfg,
         "ingest.refresh_check_limit",
-        0,
-        10_000,
         lang,
         errors,
     );
@@ -879,8 +892,6 @@ fn apply_all(
         "geo.cache_max_entries",
         cfg,
         "geo.cache_max_entries",
-        0,
-        10_000_000,
         lang,
         errors,
     );
@@ -889,8 +900,6 @@ fn apply_all(
         "geo.dns_timeout_secs",
         cfg,
         "geo.dns_timeout_secs",
-        1,
-        60,
         lang,
         errors,
     );
@@ -904,8 +913,6 @@ fn apply_all(
         "admin.session_ttl_hours",
         cfg,
         "admin.session_ttl_hours",
-        1,
-        24 * 365,
         lang,
         errors,
     );
@@ -970,8 +977,6 @@ fn apply_all(
         "probe.fail_limit",
         cfg,
         "probe.fail_limit",
-        1,
-        32,
         lang,
         errors,
     );
@@ -980,8 +985,6 @@ fn apply_all(
         "probe.second_chance_min_hours",
         cfg,
         "probe.second_chance_min_hours",
-        0,
-        24 * 365,
         lang,
         errors,
     );
@@ -990,8 +993,6 @@ fn apply_all(
         "probe.second_chance_spread_hours",
         cfg,
         "probe.second_chance_spread_hours",
-        0,
-        24 * 365,
         lang,
         errors,
     );
@@ -1002,9 +1003,9 @@ fn apply_all(
         "probe.recheck_delays_secs",
         cfg,
         "probe.recheck_delays_secs",
-        RECHECK_MAX_STEPS,
+        bounds::RECHECK_MAX_STEPS,
         1,
-        RECHECK_MAX_DELAY_SECS,
+        bounds::RECHECK_MAX_DELAY_SECS,
         lang,
         errors,
     );
@@ -1013,8 +1014,6 @@ fn apply_all(
         "probe.queue_stale_days",
         cfg,
         "probe.queue_stale_days",
-        0,
-        365,
         lang,
         errors,
     );
@@ -1023,8 +1022,6 @@ fn apply_all(
         "probe.retention_interval_secs",
         cfg,
         "probe.retention_interval_secs",
-        60,
-        7 * 24 * 3600,
         lang,
         errors,
     );
@@ -1033,8 +1030,6 @@ fn apply_all(
         "probe.cycle_interval_secs",
         cfg,
         "probe.cycle_interval_secs",
-        1,
-        24 * 3600,
         lang,
         errors,
     );
@@ -1043,8 +1038,6 @@ fn apply_all(
         "probe.sample_size",
         cfg,
         "probe.sample_size",
-        0,
-        100_000,
         lang,
         errors,
     );
@@ -1060,8 +1053,6 @@ fn apply_all(
         "probe.connect_timeout_secs",
         cfg,
         "probe.connect_timeout_secs",
-        1,
-        600,
         lang,
         errors,
     );
@@ -1070,8 +1061,6 @@ fn apply_all(
         "probe.tls_timeout_secs",
         cfg,
         "probe.tls_timeout_secs",
-        1,
-        600,
         lang,
         errors,
     );
@@ -1080,8 +1069,6 @@ fn apply_all(
         "probe.concurrency",
         cfg,
         "probe.concurrency",
-        1,
-        1024,
         lang,
         errors,
     );
@@ -1090,8 +1077,6 @@ fn apply_all(
         "probe.heartbeat_interval_secs",
         cfg,
         "probe.heartbeat_interval_secs",
-        1,
-        24 * 3600,
         lang,
         errors,
     );
@@ -1100,8 +1085,6 @@ fn apply_all(
         "probe.backlog_target_drain_minutes",
         cfg,
         "probe.backlog_target_drain_minutes",
-        5,
-        24 * 60,
         lang,
         errors,
     );
@@ -1122,8 +1105,6 @@ fn apply_all(
         "meow.timeout_secs",
         cfg,
         "meow.timeout_secs",
-        1,
-        600,
         lang,
         errors,
     );
@@ -1132,8 +1113,6 @@ fn apply_all(
         "meow.backoff_initial_secs",
         cfg,
         "meow.backoff_initial_secs",
-        1,
-        24 * 3600,
         lang,
         errors,
     );
@@ -1142,8 +1121,6 @@ fn apply_all(
         "meow.backoff_max_secs",
         cfg,
         "meow.backoff_max_secs",
-        1,
-        24 * 3600,
         lang,
         errors,
     );
@@ -1154,8 +1131,6 @@ fn apply_all(
         "retention.probe_results_days",
         cfg,
         "retention.probe_results_days",
-        1,
-        3650,
         lang,
         errors,
     );
@@ -1164,8 +1139,6 @@ fn apply_all(
         "retention.fetch_log_days",
         cfg,
         "retention.fetch_log_days",
-        1,
-        3650,
         lang,
         errors,
     );
@@ -1216,9 +1189,6 @@ fn apply_all(
 /// binaries load the file with). The panel writes the file verbatim, so
 /// it must refuse exactly what that parser refuses: a value the loader
 /// rejects aborts the next start of fumox-server and fumox-probe.
-const RECHECK_MAX_STEPS: usize = 16;
-const RECHECK_MAX_DELAY_SECS: i64 = 30 * 24 * 60 * 60;
-
 /// Return the value at `field` only when the form actually carried it.
 /// Missing fields are skipped silently, the editor only writes the
 /// sections the operator touched, preserving every other setting as it
@@ -1264,14 +1234,26 @@ fn string_field(
     let _ = cfg.set(target, item::string(v.to_string()));
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The error text for a value outside its setting's range. Reads the
+/// bound from [`bounds`] by the field name, so a numeric setting cannot
+/// be enforced against one range and advertised with another.
+fn out_of_range(field: &str, value: u64, lang: &Lang) -> String {
+    let Some(range) = bounds::range_of(field) else {
+        // A numeric field with no entry in the table is a wiring bug,
+        // not a user error. Say so instead of blaming the input.
+        return format!("{field} has no configured range");
+    };
+    match range.max {
+        Some(max) => lang.t_args("val.in_range", &[range.min.to_string(), max.to_string()]),
+        None => lang.t_args("val.at_least", &[range.min.to_string(), value.to_string()]),
+    }
+}
+
 fn u64_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
     target: &str,
-    min: u64,
-    max: u64,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1284,22 +1266,18 @@ fn u64_field(
             return;
         }
     };
-    if parsed < min || parsed > max {
-        let msg = lang.t_args("val.in_range", &[min.to_string(), max.to_string()]);
-        errors.push((field.into(), msg));
+    if !bounds::range_of(field).is_some_and(|r| r.contains(parsed)) {
+        errors.push((field.into(), out_of_range(field, parsed, lang)));
         return;
     }
     let _ = cfg.set(target, item::integer(parsed as i64));
 }
 
-#[allow(clippy::too_many_arguments)]
 fn u32_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
     target: &str,
-    min: u32,
-    max: u32,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1312,22 +1290,18 @@ fn u32_field(
             return;
         }
     };
-    if parsed < min || parsed > max {
-        let msg = lang.t_args("val.in_range", &[min.to_string(), max.to_string()]);
-        errors.push((field.into(), msg));
+    if !bounds::range_of(field).is_some_and(|r| r.contains(u64::from(parsed))) {
+        errors.push((field.into(), out_of_range(field, u64::from(parsed), lang)));
         return;
     }
-    let _ = cfg.set(target, item::integer(parsed as i64));
+    let _ = cfg.set(target, item::integer(i64::from(parsed)));
 }
 
-#[allow(clippy::too_many_arguments)]
 fn usize_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
     target: &str,
-    min: usize,
-    max: usize,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1340,9 +1314,8 @@ fn usize_field(
             return;
         }
     };
-    if parsed < min || parsed > max {
-        let msg = lang.t_args("val.in_range", &[min.to_string(), max.to_string()]);
-        errors.push((field.into(), msg));
+    if !bounds::range_of(field).is_some_and(|r| r.contains(parsed as u64)) {
+        errors.push((field.into(), out_of_range(field, parsed as u64, lang)));
         return;
     }
     let _ = cfg.set(target, item::integer(parsed as i64));
@@ -1502,6 +1475,18 @@ fn rate_limit(
             return;
         }
     };
+    // The form has always advertised `min="1" max="1000000"` on this
+    // input, but nothing checked it: the browser's number validation is
+    // the only thing that ever enforced it, so a hand-crafted POST wrote
+    // `0/min` and every public request met the limit. The bound now
+    // comes from the same table the form renders, which is the point of
+    // having one.
+    let field = format!("{prefix}.limit");
+    if !bounds::range_of(&field).is_some_and(|r| r.contains(u64::from(limit))) {
+        let msg = out_of_range(&field, u64::from(limit), lang);
+        errors.push((field, msg));
+        return;
+    }
     let secs = match unit_str {
         "sec" => 1u64,
         "min" => 60,
@@ -1938,5 +1923,111 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every number input in the settings form resolves to a row in
+    /// `config::bounds`, and no bound in that table is left unrendered.
+    ///
+    /// The ranges used to exist twice: as literal `min`/`max` attributes
+    /// in the template and as literal arguments at the save site. The two
+    /// could disagree and nothing noticed, which is how the rate-limit
+    /// inputs ended up advertising a range the server never checked. Now
+    /// that both read one table, the only drift left to guard is the
+    /// table losing or gaining a key the form does not use, and a key
+    /// typed into a field that is not in the table at all.
+    #[test]
+    fn every_number_input_has_a_bounds_entry() {
+        let template = include_str!("../../../templates/settings_edit.html");
+        let mut seen = Vec::new();
+        for line in template.lines() {
+            let Some(rest) = line.split(r#"type="number""#).nth(1) else {
+                continue;
+            };
+            let Some(name) = rest
+                .split(r#"name=""#)
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+            else {
+                continue;
+            };
+            seen.push(name.to_string());
+        }
+        assert!(seen.len() > 25, "template parsing broke: {seen:?}");
+        for name in &seen {
+            assert!(
+                bounds::range_of(name).is_some(),
+                "{name} is a number input with no range in config::bounds::RANGES"
+            );
+        }
+        for (key, _) in bounds::RANGES {
+            assert!(
+                seen.iter().any(|n| n == key),
+                "{key} is bounded but no input edits it; drop it or add the field"
+            );
+        }
+    }
+
+    /// The form must not carry its own numbers: a literal `min="1"` is
+    /// exactly the duplication this table replaced, and it is the one a
+    /// reviewer will not notice is now out of date.
+    #[test]
+    fn the_template_takes_no_literal_bounds() {
+        let template = include_str!("../../../templates/settings_edit.html");
+        for line in template.lines() {
+            assert!(
+                !line.contains(r#"min=""#) || line.contains("self.range_min"),
+                "literal min in: {line}"
+            );
+            assert!(
+                !line.contains(r#"max=""#) || line.contains("self.range_max"),
+                "literal max in: {line}"
+            );
+        }
+    }
+
+    /// The form has always advertised `min="1" max="1000000"` on the
+    /// rate-limit inputs. Before the table existed nothing checked it:
+    /// only the browser's own number validation enforced it, so a POST
+    /// that skipped the browser wrote `0/min` and locked every public
+    /// route behind a zero budget. The bound is now the loader's.
+    #[test]
+    fn rate_limit_rejects_a_value_outside_the_advertised_range() {
+        let dir = temp_dir("rate-range");
+        let path = write_minimal_config(&dir);
+        let lang = test_lang();
+
+        for (value, expect_error) in [("0", true), ("1000001", true), ("1", false)] {
+            let mut raw = HashMap::new();
+            raw.insert("server.rate_limit.limit".into(), value.into());
+            raw.insert("server.rate_limit.unit".into(), "min".into());
+            let mut errors = Vec::new();
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+            assert_eq!(
+                collect_field(&errors, "server.rate_limit.limit").is_some(),
+                expect_error,
+                "rate_limit.limit = {value}: {errors:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unbounded setting says so in words and leaves `max` empty.
+    /// Printing `u64::MAX / 2` would be a true number nobody can type,
+    /// and printing `0` would be a lie the browser reads as "max zero".
+    #[test]
+    fn an_unbounded_setting_renders_an_empty_max() {
+        assert_eq!(bounds::max_attr("fetch.max_response_bytes"), "");
+        assert_eq!(bounds::min_attr("fetch.max_response_bytes"), "1024");
+        assert_eq!(
+            bounds::display("fetch.max_response_bytes", "and up").as_deref(),
+            Some("1024 and up")
+        );
+        assert_eq!(bounds::max_attr("probe.sample_size"), "100000");
+        assert_eq!(
+            bounds::display("probe.sample_size", "and up").as_deref(),
+            Some("0..=100000")
+        );
     }
 }

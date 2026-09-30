@@ -393,6 +393,13 @@ form.stack { max-width: 760px; }
    (import page, pipeline widget preview) and must keep their look there. */
 .hint { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
 .error-text { color: var(--danger); font-size: 13px; margin-top: 3px; }
+/* The accepted range under a number input. The `code` chip is the app's
+   existing way of showing a literal value, so the range reuses it
+   instead of inventing a second look: the digits then line up down the
+   column and scan as a column rather than as thirty-two separate
+   sentences. Only the size is set here, to match the hint it sits in.
+   No new colour: the chip passes AA against both panels on its own. */
+.hint.range code { font-size: 12px; }
 .field input[type="text"], .field input[type="number"], .field input[type="password"],
 .field input[type="url"], .field select, .field textarea {
   width: 100%;
@@ -677,6 +684,15 @@ dialog .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; ma
    here — otherwise the children render as block boxes and the side-by-side
    design intent is lost. */
 div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+/* A number paired with a unit select is one control, not two stacked
+   full-width boxes. The `.field` rule above gives every input
+   `width: 100%`, and inside a wrapping flex row that makes each half
+   claim the whole line: the pair lands on two lines with the unit
+   select spanning the panel. The number keeps the width it needs, the
+   unit gives up its `width: 100%` so its flex basis is its own content,
+   and `flex-grow` then hands it the rest of the line. */
+.field .inline-controls input[type="number"] { width: 120px; flex: 0 0 auto; }
+.field .inline-controls select { width: auto; flex: 1 1 auto; min-width: 0; }
 .cleanup-op input, .cleanup-op select { padding: 6px 8px; font-size: 13.5px; width: 120px; }
 /* The global `overflow-wrap: anywhere` would let a squeezed flex child
    break its label letter-by-letter; the action button must never shrink
@@ -933,6 +949,12 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .field input[type="password"], .field input[type="url"],
   .field select, .field textarea,
   .filters .field input, .filters .field select { font-size: 16px; }
+
+  /* A number and its unit go back to one per line on a phone: at this
+     width a 120px number next to a select leaves the select too narrow
+     to read, and a full-width stack is the taller but clearer trade. */
+  .field .inline-controls input[type="number"] { width: 100%; }
+  .field .inline-controls select { width: 100%; }
 
   /* Comfortable touch targets (44px) for small controls. */
   .btn, .btn.primary, .btn.danger { min-height: 44px; padding-top: 9px; padding-bottom: 9px; }

@@ -609,7 +609,14 @@ mod tests {
     /// is not also read as a `t("…")` one. Only the opening quote is
     /// required after the key: the two parameterized helpers take the
     /// arguments after it.
+    ///
+    /// The `\b` is load-bearing. Without it the alternation matches the
+    /// tail of any helper whose name happens to end in `t`, so
+    /// `self.range_text("probe.sample_size")` in the settings form was
+    /// read as a catalog lookup for the key `probe.sample_size` and every
+    /// bounded field failed the test. A helper call is always preceded by
+    /// `.` or a word character; a real `t(` is preceded by a non-word one.
     static TEMPLATE_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?:t_args|t_named|t)\("([a-z0-9_.]+)""#).expect("valid regex")
+        regex::Regex::new(r#"\b(?:t_args|t_named|t)\("([a-z0-9_.]+)""#).expect("valid regex")
     });
 }

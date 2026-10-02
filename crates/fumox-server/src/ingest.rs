@@ -126,16 +126,15 @@ pub async fn ingest_source(
             // resolution, see [`apply_drop_rules`]. They run before the
             // `removed_as_unknown` revival handoff so the revived set is
             // the same one that survives drop.
-            let (entries_after_drop, dropped_by_pipeline) =
+            let (entries_after_drop, geo_after_drop, dropped_by_pipeline) =
                 match apply_drop_rules(source, filtered.entries, &geo_stamps) {
-                    Ok(pair) => pair,
+                    Ok(triple) => triple,
                     Err(message) => {
                         journal_parse_failure(pool, source, &payload, &message, now).await;
                         return IngestOutcome::ParseFailed { message };
                     }
                 };
-            let found = entries_after_drop.len();
-            // Alive-linger. `[ingest].drop_gate` decides whether
+            let found = entries_after_drop.len(); // Alive-linger. `[ingest].drop_gate` decides whether
             // a source's drop rules disable it: gated (true), a rule added
             // later reaches the already-stored rows on the very next
             // refresh; ungated (false, the default), the probe alone
@@ -145,7 +144,7 @@ pub async fn ingest_source(
                 pool,
                 &source.id,
                 &entries_after_drop,
-                &geo_stamps,
+                &geo_after_drop,
                 now,
                 keep_alive_linger,
             )
@@ -254,9 +253,9 @@ pub async fn dry_run_source(
             // resolver is async-and-cached so a re-fetch in dry-run adds
             // at most one round-trip per unseen host.
             let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
-            let (kept_entries, dropped) =
+            let (kept_entries, _, dropped) =
                 match apply_drop_rules(source, filtered.entries, &geo_stamps) {
-                    Ok(pair) => pair,
+                    Ok(triple) => triple,
                     Err(message) => {
                         return DryRunOutcome::ParseFailed {
                             http_status: payload.http_status,
@@ -448,28 +447,34 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     })
 }
 
+/// What a drop-rule pass hands back: the surviving entries, the stamps that
+/// belong to exactly those entries (same length, same order — reconcile
+/// pairs the two by index), and how many entries were discarded.
+type DropOutcome = (Vec<ProxyEntry>, Vec<Option<proxies::GeoStamp>>, usize);
+
 /// Compile the source's pipeline and run its drop rules against the
 /// entries paired with their resolved ASN stamps. Returns the surviving
-/// entries and how many were discarded. Fails closed when the pipeline
-/// does not compile (the previous `parse_payload` already validated this
-/// path; the re-check is defensive).
+/// entries, the stamps that belong to exactly those entries, and how many
+/// were discarded. Fails closed when the pipeline does not compile (the
+/// previous `parse_payload` already validated this path; the re-check is
+/// defensive).
 fn apply_drop_rules(
     source: &Source,
     entries: Vec<ProxyEntry>,
     geo: &[Option<proxies::GeoStamp>],
-) -> Result<(Vec<ProxyEntry>, usize), String> {
+) -> Result<DropOutcome, String> {
     let before_count = entries.len();
     let compiled = match &source.pipeline {
-        None => return Ok((entries, 0)),
+        None => return Ok((entries, geo.to_vec(), 0)),
         Some(value) => crate::pipeline::CompiledPipeline::from_json(Some(value))
             .map_err(|_| "pipeline config failed validation; refusing to ingest".to_string())?,
     };
     if !compiled.has_drop_rules() {
-        return Ok((entries, 0));
+        return Ok((entries, geo.to_vec(), 0));
     }
-    let after = compiled.drop_entries(entries, geo);
+    let (after, after_geo) = compiled.drop_entries_with_geo(entries, geo);
     let dropped = before_count - after.len();
-    Ok((after, dropped))
+    Ok((after, after_geo, dropped))
 }
 
 async fn journal_success(
@@ -886,7 +891,7 @@ mod tests {
         let entries = parse_payload(&source, &payload(body)).unwrap().entries;
         assert_eq!(entries.len(), 3);
         let geo = vec![None; entries.len()];
-        let (kept, dropped) = apply_drop_rules(&source, entries, &geo).unwrap();
+        let (kept, _geo, dropped) = apply_drop_rules(&source, entries, &geo).unwrap();
         assert_eq!(dropped, 2);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].host, "h.example.com");
@@ -907,9 +912,64 @@ mod tests {
         let body = "vless://uuid@1.2.3.4:443#A\nvless://uuid@h:443#B\n";
         let filtered = parse_payload(&source, &payload(body)).unwrap();
         let geo = vec![None; filtered.entries.len()];
-        let (kept, dropped) = apply_drop_rules(&source, filtered.entries, &geo).unwrap();
+        let (kept, _geo, dropped) = apply_drop_rules(&source, filtered.entries, &geo).unwrap();
         assert!(kept.is_empty());
         assert_eq!(dropped, filtered.recognized);
+    }
+
+    /// Regression: a drop rule shortens the entry list, and the geo stamps
+    /// must be shortened with it. Returning the survivors alone made
+    /// `reconcile_source` pair entry *n* with the stamp of entry *n-1* (or
+    /// worse, from the start of the feed), so a proxy was stored carrying
+    /// another host's country and ASN — and one IP could end up stamped
+    /// with several different AS numbers. Every surviving entry must keep
+    /// the stamp its own host resolved to.
+    #[test]
+    fn drop_rules_keep_every_surviving_entry_paired_with_its_own_geo_stamp() {
+        let mut source = source_with(Encoding::Auto, None);
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "drop": [{ "match": "drop-me", "target": "name" }]
+        }));
+        let stamp = |asn: &str| {
+            Some(fumox_core::repo::proxies::GeoStamp {
+                asn: Some(asn.into()),
+                ..Default::default()
+            })
+        };
+        let body = "vless://uuid@1.1.1.1:443#drop-me\n\
+                    vless://uuid@2.2.2.2:443#keep-a\n\
+                    vless://uuid@3.3.3.3:443#drop-me-too\n\
+                    vless://uuid@4.4.4.4:443#keep-b\n";
+        let entries = parse_payload(&source, &payload(body)).unwrap().entries;
+        assert_eq!(entries.len(), 4);
+        let geo = vec![
+            stamp("AS100"),
+            stamp("AS200"),
+            stamp("AS300"),
+            stamp("AS400"),
+        ];
+        let (kept, kept_geo, dropped) = apply_drop_rules(&source, entries, &geo).unwrap();
+        assert_eq!(dropped, 2);
+        assert_eq!(kept.len(), 2, "the two survivors remain");
+        assert_eq!(
+            kept_geo.len(),
+            kept.len(),
+            "stamps and entries must stay index-aligned for reconcile"
+        );
+        // keep-a is entry 1 and must keep AS200, not the AS100 of the
+        // dropped entry that preceded it.
+        assert_eq!(kept[0].host, "2.2.2.2");
+        assert_eq!(
+            kept_geo[0].as_ref().and_then(|s| s.asn.as_deref()),
+            Some("AS200")
+        );
+        assert_eq!(kept[1].host, "4.4.4.4");
+        assert_eq!(
+            kept_geo[1].as_ref().and_then(|s| s.asn.as_deref()),
+            Some("AS400"),
+            "two drops before it must not shift its stamp"
+        );
     }
 
     #[test]

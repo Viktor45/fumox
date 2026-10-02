@@ -584,29 +584,27 @@ impl CompiledPipeline {
         out
     }
 
-    /// Drop rules only, on the same pre-rename values the serving pass sees.
-    /// `geo` may be shorter than `entries` (inactive resolver): unstamped
-    /// entries survive, zipping the two would truncate the batch.
-    pub fn drop_entries(
+    /// Per-entry verdicts of the drop rules, in input order. `geo` may be
+    /// shorter than `entries` (inactive resolver): unstamped entries keep
+    /// their ASN rules unapplied and survive, zipping the two would
+    /// truncate the batch.
+    fn drop_survivors(
         &self,
-        entries: Vec<ProxyEntry>,
+        entries: &[ProxyEntry],
         geo: &[Option<fumox_core::repo::proxies::GeoStamp>],
-    ) -> Vec<ProxyEntry> {
-        if self.drop.is_empty() {
-            return entries;
-        }
+    ) -> Vec<bool> {
         if geo.len() < entries.len() {
             tracing::warn!(
                 entries = entries.len(),
                 stamps = geo.len(),
-                "drop_entries: fewer geo stamps than entries, unstamped entries keep their ASN drop rules unapplied"
+                "drop rules: fewer geo stamps than entries, unstamped entries keep their ASN drop rules unapplied"
             );
         }
         entries
-            .into_iter()
+            .iter()
             .enumerate()
-            .filter(|(idx, entry)| {
-                let stamp = geo.get(*idx).and_then(|stamp| stamp.as_ref());
+            .map(|(idx, entry)| {
+                let stamp = geo.get(idx).and_then(|stamp| stamp.as_ref());
                 !self.drop.iter().any(|rule| match rule {
                     CompiledDrop::Regex { regex, target } => matches_target(entry, regex, target),
                     CompiledDrop::Asn { asns } => stamp
@@ -615,8 +613,36 @@ impl CompiledPipeline {
                         .is_some_and(|n| asns.contains(&n)),
                 })
             })
-            .map(|(_, entry)| entry)
             .collect()
+    }
+
+    /// Drop rules, keeping every surviving entry paired with its own geo
+    /// stamp. The ingest path persists the entries *and* the stamps, and
+    /// `reconcile_source` pairs the two by index: returning the survivors
+    /// alone would silently re-point every stamp after the first dropped
+    /// entry at a host one or more positions earlier, stamping proxies
+    /// with another host's country and ASN.
+    pub fn drop_entries_with_geo(
+        &self,
+        entries: Vec<ProxyEntry>,
+        geo: &[Option<fumox_core::repo::proxies::GeoStamp>],
+    ) -> (
+        Vec<ProxyEntry>,
+        Vec<Option<fumox_core::repo::proxies::GeoStamp>>,
+    ) {
+        if self.drop.is_empty() {
+            return (entries, geo.to_vec());
+        }
+        let survivors = self.drop_survivors(&entries, geo);
+        let mut kept_entries = Vec::with_capacity(entries.len());
+        let mut kept_geo = Vec::with_capacity(entries.len());
+        for (idx, entry) in entries.into_iter().enumerate() {
+            if survivors[idx] {
+                kept_entries.push(entry);
+                kept_geo.push(geo.get(idx).cloned().flatten());
+            }
+        }
+        (kept_entries, kept_geo)
     }
 
     /// Whether any `drop` rule is configured. Reconciliation asks before a
@@ -1593,12 +1619,12 @@ mod tests {
                 ..Default::default()
             }),
         ];
-        let after = compiled.drop_entries(entries.clone(), &stamps);
+        let after = compiled.drop_entries_with_geo(entries.clone(), &stamps).0;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].host, "h2.example.com");
         // Verify the geometry contract: empty stamps leave entries alone.
         let no_geo = vec![None; entries.len()];
-        let untouched = compiled.drop_entries(entries, &no_geo);
+        let untouched = compiled.drop_entries_with_geo(entries, &no_geo).0;
         assert_eq!(untouched.len(), 3, "missing ASN is not a hit");
     }
 
@@ -1625,25 +1651,29 @@ mod tests {
         let names =
             |kept: Vec<ProxyEntry>| -> Vec<String> { kept.into_iter().map(|e| e.name).collect() };
         assert_eq!(
-            names(compiled.drop_entries(entries.clone(), &[])),
+            names(compiled.drop_entries_with_geo(entries.clone(), &[]).0),
             ["p1", "p2", "p3"]
         );
         // Regex rules need no stamp, so they still fire on a stamp-less
         // batch: only the ASN lookups are skipped.
-        let with_cn = compiled.drop_entries(
-            vec![entry("p1", "h1.example.com"), entry("cn", "h.cn")],
-            &[],
-        );
+        let with_cn = compiled
+            .drop_entries_with_geo(
+                vec![entry("p1", "h1.example.com"), entry("cn", "h.cn")],
+                &[],
+            )
+            .0;
         assert_eq!(names(with_cn), ["p1"]);
         // A partially resolved slice behaves the same for the tail: the
         // entries past its end are unstamped, not dropped.
-        let partial = compiled.drop_entries(
-            entries,
-            &[Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS13335".into()),
-                ..Default::default()
-            })],
-        );
+        let partial = compiled
+            .drop_entries_with_geo(
+                entries,
+                &[Some(fumox_core::repo::proxies::GeoStamp {
+                    asn: Some("AS13335".into()),
+                    ..Default::default()
+                })],
+            )
+            .0;
         assert_eq!(names(partial), ["p1", "p2", "p3"]);
     }
 
@@ -1676,7 +1706,7 @@ mod tests {
                 ..Default::default()
             }),
         ];
-        let after = compiled.drop_entries(entries, &stamps);
+        let after = compiled.drop_entries_with_geo(entries, &stamps).0;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].host, "h3.example.com");
     }
@@ -1691,7 +1721,7 @@ mod tests {
         .unwrap();
         let entries = vec![entry("n", "h.example.com")];
         let stamps = vec![None];
-        let after = compiled.drop_entries(entries, &stamps);
+        let after = compiled.drop_entries_with_geo(entries, &stamps).0;
         assert_eq!(after.len(), 1);
     }
 
@@ -1726,7 +1756,7 @@ mod tests {
                 ..Default::default()
             }),
         ];
-        let after = compiled.drop_entries(entries, &stamps);
+        let after = compiled.drop_entries_with_geo(entries, &stamps).0;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].host, "h.example.com");
         assert_eq!(after[0].name, "kept");

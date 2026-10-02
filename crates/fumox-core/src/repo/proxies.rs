@@ -148,26 +148,27 @@ impl ProxyRow {
 ///
 /// `geo` runs parallel to `entries` (indexed access; a shorter slice or a
 /// `None` element means "no fresh geo facts", the COALESCE upsert branch
-/// then keeps whatever is already stored).
+/// then keeps whatever is already stored). A *longer* slice is refused
+/// rather than truncated: a caller that filtered the entries but passed
+/// the unfiltered stamps back would otherwise store every proxy past the
+/// first drop with another host's country and ASN.
 ///
-/// `keep_alive_linger`: when the source has no `drop` rules,
-/// an `alive` *or* `ready` *or* `unknown` proxy that vanished from the
-/// feed keeps its link, the probe stays the sole owner of its lifecycle,
-/// so a live node and a not-yet-verified node are not terminated by
-/// upstream churn. The next refresh to see it back re-stamps the link.
-/// An `unknown` lingerer is not a zombie row: the priority queue
-/// (`probe_requests`) and the random T1 sample still pick it up via the
-/// `EXISTS (... link ...)` predicate, so the row gets its verdict
-/// eventually. `quarantine`/`removed` proxies are unlinked exactly as
-/// before: a dying lingerer would otherwise occupy the recheck ladder
-/// past its time. The admin's source deletion path
-/// (`mark_orphans_removed`) honours the `[ingest].drop_gate` flag
-/// instead, when it is `false`, `ready` and `unknown` rows are left
+/// `keep_alive_linger`: when `[ingest].drop_gate` is `false` (the
+/// default), a proxy that vanished from the feed is nobody's business but
+/// the probe's — this pass never retires anything, and it keeps the link
+/// on every status the probe still owns (`alive`, `ready`, `unknown`,
+/// `quarantine`), so upstream churn cannot end a node that has not
+/// failed. The recheck ladder and the priority queue keep working on the
+/// `quarantine` lingerer through its own `EXISTS (... link ...)`
+/// predicate, and a row that comes back re-stamps its link on the next
+/// refresh. When `drop_gate` is `true` and the source has `drop` rules,
+/// the sweep and the unlink run unrestricted: a rule added later has to
+/// reach the rows already stored, which is the whole point of the gate.
+/// The admin's source deletion path (`mark_orphans_removed`) honours the
+/// same flag, when it is `false`, `ready` and `unknown` rows are left
 /// alone (`ready` is tunnel-verified, `unknown` has not yet had its
 /// first verdict; the click that deleted the source should not retire
-/// either); when it is `true`, every orphan retires. The sweep below
-/// is scoped to the links *this* pass deletes, so a reconcile of an
-/// unrelated source never retires those rows behind the admin's back.
+/// either); when it is `true`, every orphan retires.
 pub async fn reconcile_source(
     pool: &DbPool,
     source_id: &str,
@@ -185,6 +186,22 @@ pub async fn reconcile_source(
     // as "database is locked" on source refreshes. With IMMEDIATE the
     // whole critical section waits inside busy_timeout instead.
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    // `entries` and `geo` are paired by index below. A longer stamp slice
+    // than there are entries means the caller filtered one side of the pair
+    // and not the other: every stamp from the first extra position on would
+    // land on a host that never resolved to it. Refuse rather than persist
+    // proxies stamped with another host's country and ASN.
+    if geo.len() > entries.len() {
+        tracing::error!(
+            entries = entries.len(),
+            stamps = geo.len(),
+            "reconcile_source: more geo stamps than entries, refusing to stamp misaligned pairs"
+        );
+        return Err(crate::Error::Database(
+            "reconcile_source: geo stamp count does not match entry count".to_string(),
+        ));
+    }
 
     // Pre-existing fingerprints, for insert/update accounting.
     let fingerprints: Vec<String> = entries.iter().map(ProxyEntry::fingerprint).collect();
@@ -285,7 +302,8 @@ pub async fn reconcile_source(
         "DELETE FROM proxy_source_links
          WHERE source_id = ?
            AND seen_at < ?
-           AND proxy_id NOT IN (SELECT id FROM proxies WHERE status IN ('alive', 'ready', 'unknown'))"
+           AND proxy_id NOT IN (SELECT id FROM proxies
+                                WHERE status IN ('alive', 'ready', 'unknown', 'quarantine'))"
     } else {
         "DELETE FROM proxy_source_links WHERE source_id = ? AND seen_at < ?"
     };
@@ -302,32 +320,34 @@ pub async fn reconcile_source(
     // have no link to this source, so they are not in the candidate set.
     // Both EXISTS share the same arguments: a stale link of this source
     // (about to be deleted) and no link that survives it.
-    let linger_filter = if keep_alive_linger {
-        "AND proxies.status NOT IN ('alive', 'ready', 'unknown')"
-    } else {
-        ""
-    };
-    let retire_sql = format!(
-        "UPDATE proxies
-         SET status = 'removed', removed_at = ?, updated_at = ?
-         WHERE status != 'removed'
-           AND EXISTS (SELECT 1 FROM proxy_source_links l
-                       WHERE l.proxy_id = proxies.id AND l.source_id = ? AND l.seen_at < ?)
-           AND NOT EXISTS (SELECT 1 FROM proxy_source_links l
-                           WHERE l.proxy_id = proxies.id
-                             AND NOT (l.source_id = ? AND l.seen_at < ?))
-           {linger_filter}"
-    );
-    stats.removed = sqlx::query(sqlx::AssertSqlSafe(retire_sql.as_str()))
-        .bind(now)
-        .bind(now)
-        .bind(source_id)
-        .bind(now)
-        .bind(source_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected() as usize;
+    //
+    // Under `drop_gate = false` the sweep is skipped outright: that option
+    // means the probe alone retires a proxy, and a proxy that dropped out
+    // of the feed has not failed anything. Retiring it here judged it
+    // without a verdict. `quarantine` lingers along with the live tiers
+    // for the same reason — unlinking it would strand a row in no probe
+    // lane, which kills it just as surely as the sweep did, only without
+    // the record.
+    if !keep_alive_linger {
+        const RETIRE_SQL: &str = "UPDATE proxies
+             SET status = 'removed', removed_at = ?, updated_at = ?
+             WHERE status != 'removed'
+               AND EXISTS (SELECT 1 FROM proxy_source_links l
+                           WHERE l.proxy_id = proxies.id AND l.source_id = ? AND l.seen_at < ?)
+               AND NOT EXISTS (SELECT 1 FROM proxy_source_links l
+                               WHERE l.proxy_id = proxies.id
+                                 AND NOT (l.source_id = ? AND l.seen_at < ?))";
+        stats.removed = sqlx::query(RETIRE_SQL)
+            .bind(now)
+            .bind(now)
+            .bind(source_id)
+            .bind(now)
+            .bind(source_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected() as usize;
+    }
 
     stats.unlinked = sqlx::query(sqlx::AssertSqlSafe(unlinked_sql))
         .bind(source_id)
@@ -822,20 +842,34 @@ pub async fn revive_removed_by_asn(pool: &DbPool, asn: &str, now: i64) -> crate:
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// Bulk revival (admin *Revival* panel): bring every `removed` proxy
-/// that never received a probe verdict back to `unknown`. The
-/// `NOT EXISTS` predicate is the historical record, any row in
+/// Bulk revival (admin *Revival* panel): every proxy that never received
+/// a probe verdict, in either of the two states such a row can be stuck
+/// in, comes back into the rotation.
+///
+/// The `NOT EXISTS` predicate is the historical record: any row in
 /// `probe_results` for the proxy means the probe at least got to it,
-/// which is a stronger signal than the source ever did. Rows that
-/// survived the cleanup *without* ever being probed are exactly the
-/// population the operator is trying to surface here. Returns the
-/// revived ids for enqueueing; link-less rows stay `removed` (see
-/// [`revive_removed`]).
+/// which is a stronger signal than the source ever did.
+///
+/// 1. `removed` rows the cleanup retired without ever being probed go
+///    back to `unknown`.
+/// 2. `unknown` rows frozen by the T2 block (`last_t2_failed_at` set)
+///    are released. Such a row is in no probe lane at all: the queue
+///    drain and the T1 sample both require `last_t2_failed_at IS NULL`,
+///    and the T2 selector only offers `alive`/`ready`, so nothing can
+///    ever clear the flag. Rows revived before the revival paths learned
+///    to clear it (the 2026-09-22..29 window) have been stuck ever
+///    since. Clearing the flag is what actually matters here; the
+///    lifecycle reset keeps the row pristine.
+///
+/// Returns every revived id for enqueueing. Link-less rows are left
+/// alone in both halves: no source link means no probe lane can reach
+/// them (see [`revive_removed`]).
 pub async fn revive_removed_without_probe_history(
     pool: &DbPool,
     now: i64,
 ) -> crate::Result<Vec<i64>> {
-    let rows: Vec<(i64,)> = sqlx::query_as(
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut ids: Vec<i64> = sqlx::query_as(
         "UPDATE proxies SET
              status = 'unknown',
              fail_count = 0,
@@ -851,9 +885,36 @@ pub async fn revive_removed_without_probe_history(
          RETURNING id",
     )
     .bind(now)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|(id,)| id).collect())
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|(id,)| id)
+    .collect();
+
+    ids.extend(
+        sqlx::query_as::<_, (i64,)>(
+            "UPDATE proxies SET
+                 fail_count = 0,
+                 quarantined_at = NULL,
+                 ladder_at = NULL,
+                 ladder_step = 0,
+                 last_t2_failed_at = NULL,
+                 updated_at = ?
+             WHERE status = 'unknown'
+               AND last_t2_failed_at IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = proxies.id)
+               AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = proxies.id)
+             RETURNING id",
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|(id,)| id),
+    );
+
+    tx.commit().await?;
+    Ok(ids)
 }
 
 /// Bulk revival (admin *Revival* panel): bring every `quarantine` proxy
@@ -1735,6 +1796,75 @@ mod tests {
         assert!(stats.inserted_ids.is_empty());
     }
 
+    /// A stamp slice longer than the entry list means the caller filtered
+    /// the entries and handed back the unfiltered stamps: pairing them by
+    /// index would stamp each proxy with a neighbouring host's country and
+    /// ASN. Reconcile must refuse and write nothing.
+    #[tokio::test]
+    async fn reconcile_refuses_more_geo_stamps_than_entries() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let entries = vec![entry("one", "h1.example.com", 443)];
+        let stamps = vec![
+            Some(GeoStamp {
+                asn: Some("AS100".into()),
+                ..Default::default()
+            }),
+            Some(GeoStamp {
+                asn: Some("AS200".into()),
+                ..Default::default()
+            }),
+        ];
+        let err = reconcile_source(&pool, "srcA0000000", &entries, &stamps, 1000, false)
+            .await
+            .expect_err("a longer stamp slice must be refused");
+        assert!(
+            err.to_string().contains("stamp count"),
+            "unexpected error: {err}"
+        );
+        // Nothing was written: a refused reconcile leaves no half-stamped row.
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// The paired happy path: entries and stamps of equal length each land
+    /// on their own row, which is the invariant the drop-filtered ingest
+    /// path depends on.
+    #[tokio::test]
+    async fn reconcile_stamps_each_entry_with_its_own_geo() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let entries = vec![entry("one", "1.1.1.1", 443), entry("two", "2.2.2.2", 443)];
+        let stamps = vec![
+            Some(GeoStamp {
+                country: Some("AA".into()),
+                asn: Some("AS100".into()),
+                ..Default::default()
+            }),
+            Some(GeoStamp {
+                country: Some("BB".into()),
+                asn: Some("AS200".into()),
+                ..Default::default()
+            }),
+        ];
+        reconcile_source(&pool, "srcA0000000", &entries, &stamps, 1000, false)
+            .await
+            .unwrap();
+        for (e, country, asn) in [(&entries[0], "AA", "AS100"), (&entries[1], "BB", "AS200")] {
+            let (c, a): (Option<String>, Option<String>) =
+                sqlx::query_as("SELECT geo_country, geo_asn FROM proxies WHERE host = ?")
+                    .bind(&e.host)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(c.as_deref(), Some(country), "country for {}", e.host);
+            assert_eq!(a.as_deref(), Some(asn), "asn for {}", e.host);
+        }
+    }
+
     #[tokio::test]
     async fn revive_removed_resets_terminal_rows_and_reconcile_keeps_them() {
         let pool = temp_pool().await;
@@ -1933,11 +2063,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quarantined_linger_leaves_on_next_refresh() {
-        // `alive`/`ready`/`unknown` linger; `quarantine` does not: once
-        // the probe quarantines the node, the next refresh unlinks it
-        // and the orphan is removed, a dying lingerer does not occupy
-        // the recheck ladder.
+    async fn quarantined_linger_survives_the_next_refresh() {
+        // `drop_gate = false` means the probe alone retires a proxy. A node
+        // that merely dropped out of the feed has failed nothing, so
+        // reconcile neither unlinks it nor moves it to `removed`; the
+        // recheck ladder keeps working on it through its own link
+        // predicate and the next refresh that sees it re-stamps the link.
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let e = entry("dying", "h1.example.com", 443);
@@ -1962,7 +2093,49 @@ mod tests {
         let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
             .await
             .unwrap();
-        assert_eq!(stats.unlinked, 1, "quarantine does not linger");
+        assert_eq!(stats.unlinked, 0, "quarantine lingers like the live tiers");
+        assert_eq!(stats.removed, 0, "reconcile must not retire anything");
+        assert_eq!(status_of(&pool, &e).await.0, "quarantine");
+        let (links,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM proxy_source_links l
+             JOIN proxies p ON p.id = l.proxy_id WHERE p.fingerprint = ?",
+        )
+        .bind(e.fingerprint())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(links, 1, "the link must survive, or no lane can reach it");
+    }
+
+    /// The gate itself still works: with `keep_alive_linger = false`
+    /// (`drop_gate = true` on a source with drop rules) the sweep is not
+    /// skipped, so a proxy that vanished from the feed is unlinked and
+    /// retired as before.
+    #[tokio::test]
+    async fn drop_gate_still_retires_proxies_that_left_the_feed() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let e = entry("gone", "h1.example.com", 443);
+        reconcile_source(
+            &pool,
+            "srcA0000000",
+            std::slice::from_ref(&e),
+            &[],
+            1000,
+            true,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE proxies SET status = 'quarantine' WHERE fingerprint = ?")
+            .bind(e.fingerprint())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, false)
+            .await
+            .unwrap();
+        assert_eq!(stats.unlinked, 1);
         assert_eq!(stats.removed, 1);
         assert_eq!(status_of(&pool, &e).await.0, "removed");
     }
@@ -2011,9 +2184,10 @@ mod tests {
         assert_eq!(stats.updated, 1);
         assert_eq!(status_of(&pool, &e).await.0, "unknown");
 
-        // And the quarantine transition ends the linger: once the probe
-        // gives it a verdict, the row drops out of the protected set and
-        // the next refresh unlinks it like any other dying row.
+        // And the quarantine transition keeps the linger: under
+        // `drop_gate = false` the probe owns the lifecycle end to end, the
+        // ladder is what retires the row, not a feed that stopped
+        // mentioning it.
         sqlx::query("UPDATE proxies SET status = 'quarantine' WHERE fingerprint = ?")
             .bind(e.fingerprint())
             .execute(&pool)
@@ -2022,15 +2196,17 @@ mod tests {
         let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 4000, true)
             .await
             .unwrap();
-        assert_eq!(stats.unlinked, 1, "quarantine ends the linger");
-        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.unlinked, 0, "quarantine lingers too");
+        assert_eq!(stats.removed, 0);
+        assert_eq!(status_of(&pool, &e).await.0, "quarantine");
     }
 
     #[tokio::test]
     async fn linger_is_per_proxy_not_per_batch() {
-        // One alive, one dead-by-probe (quarantined) row vanish together:
-        // only the alive one keeps its link in the same reconcile pass.
-        // The same per-row filter keeps `unknown` rows linked too.
+        // One alive, one already-removed row vanish together: only the
+        // live one keeps its link in the same reconcile pass. The filter
+        // is evaluated per row, so a dead neighbour cannot drag a live
+        // proxy out with it.
         let pool = temp_pool().await;
         make_source(&pool, "srcA0000000").await;
         let alive = entry("alive", "h1.example.com", 443);
@@ -2045,7 +2221,7 @@ mod tests {
         )
         .await
         .unwrap();
-        for (e, status) in [(&alive, "alive"), (&dying, "quarantine")] {
+        for (e, status) in [(&alive, "alive"), (&dying, "removed")] {
             sqlx::query("UPDATE proxies SET status = ? WHERE fingerprint = ?")
                 .bind(status)
                 .bind(e.fingerprint())
@@ -2057,8 +2233,8 @@ mod tests {
         let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
             .await
             .unwrap();
-        assert_eq!(stats.unlinked, 1);
-        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.unlinked, 1, "only the terminal row loses its link");
+        assert_eq!(stats.removed, 0, "the terminal row is already removed");
         assert_eq!(status_of(&pool, &alive).await.0, "alive");
         assert_eq!(status_of(&pool, &dying).await.0, "removed");
     }
@@ -4222,6 +4398,71 @@ mod tests {
         assert_eq!(ids, vec![lonely]);
         assert_eq!(bulk_status_of(&pool, lonely).await.0, "unknown");
         assert_eq!(bulk_status_of(&pool, tried).await.0, "removed");
+    }
+
+    /// The same button must also release `unknown` rows frozen by the T2
+    /// block. With `last_t2_failed_at` set they satisfy no probe lane at
+    /// all (queue drain and T1 sample require it NULL, the T2 selector
+    /// only offers `alive`/`ready`), so they are never checked and never
+    /// can clear the flag on their own. A row that *has* probe history is
+    /// left alone: the panel is for rows that never got a verdict.
+    #[tokio::test]
+    async fn revive_without_probe_history_releases_t2_frozen_unknown_rows() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcR0000003").await;
+        let frozen = bulk_test_row(&pool, "revive-frozen", "vless", "unknown", None, None).await;
+        let clear = bulk_test_row(&pool, "revive-clear", "vless", "unknown", None, None).await;
+        let frozen_with_history =
+            bulk_test_row(&pool, "revive-frozen-hist", "vless", "unknown", None, None).await;
+        let unlinked = bulk_test_row(
+            &pool,
+            "revive-frozen-nolink",
+            "vless",
+            "unknown",
+            None,
+            None,
+        )
+        .await;
+        for id in [frozen, clear, frozen_with_history] {
+            link_row(&pool, id, "srcR0000003").await;
+        }
+        // frozen + frozen_with_history carry the T2 block; clear does not.
+        for id in [frozen, frozen_with_history] {
+            sqlx::query("UPDATE proxies SET last_t2_failed_at = 1700, fail_count = 3 WHERE id = ?")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO probe_results (proxy_id, probe_kind, ok, checked_at) VALUES (?, 't1', 0, 1)")
+            .bind(frozen_with_history)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let ids = revive_removed_without_probe_history(&pool, 2000)
+            .await
+            .unwrap();
+
+        assert!(ids.contains(&frozen), "the frozen row must be released");
+        let (flag, fails): (Option<i64>, i64) =
+            sqlx::query_as("SELECT last_t2_failed_at, fail_count FROM proxies WHERE id = ?")
+                .bind(frozen)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(flag, None, "the T2 block must be cleared");
+        assert_eq!(fails, 0, "the row goes back pristine");
+
+        assert!(!ids.contains(&clear), "an unblocked row needs no revival");
+        assert!(
+            !ids.contains(&frozen_with_history),
+            "a row with probe history is not historyless"
+        );
+        assert!(
+            !ids.contains(&unlinked),
+            "no source link means no probe lane can reach the row"
+        );
     }
 
     /// `revive_quarantine` moves every quarantined row back to `unknown`

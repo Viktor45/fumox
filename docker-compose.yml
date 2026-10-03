@@ -1,4 +1,4 @@
-# Fumox + meow-rs — one-command deployment: three containers (server, probe,
+# Fumox + meow-rs, one-command deployment: three containers (server, probe,
 # meow) wired through shared volumes and env overrides.
 #
 # Quick start:
@@ -9,9 +9,9 @@
 #   open http://127.0.0.1:8081/admin   # admin panel (login with the token)
 #
 # Services:
-#   server  fumox-server — public /sub + /src on :8080, admin panel on :8081
-#   probe   fumox-probe  — health-check daemon (T1 TCP/TLS + T2 tunnel checks)
-#   meow    meow-rs      — mihomo-compatible kernel the probe drives for T2
+#   server  fumox-server : public /sub + /src on :8080, admin panel on :8081
+#   probe   fumox-probe  : health-check daemon (T1 TCP/TLS + T2 tunnel checks)
+#   meow    meow-rs      : mihomo-compatible kernel the probe drives for T2
 #
 # How the probe ↔ meow wiring works:
 #   - probe reaches the meow-rs REST API at meow:9090 (FUMOX_MEOW__API_ADDR);
@@ -24,7 +24,7 @@
 # Config file location: the services point the loader at the mounted
 # ./config volume explicitly (FUMOX_CONFIG=/app/config/app.toml, the default
 # the image would use anyway). Set FUMOX_CONFIG in .env to a different file
-# name inside that volume (e.g. /app/config/prod.toml) — remember the
+# name inside that volume (e.g. /app/config/prod.toml), remember the
 # mounted file must exist, a missing one is a startup error.
 #
 # Volumes:
@@ -53,7 +53,7 @@ services:
       # `mounts` builds through persistent BuildKit cache mounts: rebuilds
       # after a source change recompile only the workspace crates (~1 min
       # instead of ~7.5). Set FUMOX_BUILD_CACHE=layers in .env on builders
-      # without cache-mount support (e.g. podman-compose) — that path uses
+      # without cache-mount support (e.g. podman-compose), that path uses
       # the classic cargo-chef image layers. See the Dockerfile header.
       args:
         BUILD_CACHE: ${FUMOX_BUILD_CACHE:-mounts}
@@ -77,7 +77,7 @@ services:
     volumes:
       # Writable: the admin *Edit settings* page writes /app/config/app.toml
       # in place via the toml_edit-backed editor (see USERGUIDE §7). Set
-      # FUMOX_CONFIG_ACCESS=ro in .env to turn config edits off — the editor
+      # FUMOX_CONFIG_ACCESS=ro in .env to turn config edits off, the editor
       # then renders disabled with the `set.edit_unwritable` banner. That is
       # what scripts/smoke-up.sh does: only the named volumes are
       # project-scoped, the bind mount is the same host ./config for every
@@ -95,7 +95,7 @@ services:
       # default; put a reverse proxy / SSH tunnel in
       # front to expose it
       #
-      # HTTPS front (optional): docker/nginx/ holds a ready example —
+      # HTTPS front (optional): docker/nginx/ holds a ready example,
       # an nginx container terminating TLS for /sub (→ server:8080) and
       # /admin (→ server:8081), with ACME challenges on port 80. Add:
       #
@@ -107,7 +107,7 @@ services:
       #
       # …and set FUMOX_ADMIN__SECURE_COOKIES=true (the panel is HTTPS-only
       # behind the front). The server ports above can then be unpublished
-      # entirely — nginx reaches both listeners over the compose network.
+      # entirely, nginx reaches both listeners over the compose network.
     restart: unless-stopped
 
   probe:
@@ -124,7 +124,7 @@ services:
       # Override in .env if the default test URL is blocked in your region.
       FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-http://www.gstatic.com/generate_204}
     volumes:
-      # Probe only reads app.toml at startup — never writes. Read-only mount
+      # Probe only reads app.toml at startup, never writes. Read-only mount
       # means a buggy probe can never mangle the config the server is also
       # editing.
       - ./config:/app/config:ro,z

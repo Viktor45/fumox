@@ -159,7 +159,7 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
 /// an already-applied migration, and the SHA-384 covers the whole file, so
 /// a comment edit and a DDL edit are indistinguishable at this point. A
 /// DDL edit to an applied file therefore leaves the on-disk schema behind
-/// the file's contents, and no amount of re-stamping closes that gap — it
+/// the file's contents, and no amount of re-stamping closes that gap, it
 /// has to be closed with a new migration file. The repair is consequently
 /// never silent: the affected versions are logged at `error` level with
 /// that instruction, and recorded in `meta.migrations_repaired` so the
@@ -260,7 +260,7 @@ async fn record_migration_repair(pool: &SqlitePool, versions: &[i64]) -> crate::
 /// [`migrate`] to recover from a checksum mismatch (comment-only edits to
 /// already-applied migration files), and exposed as a standalone helper so
 /// tests, the `repair_migration_checksums` example and ops scripts can
-/// trigger the same repair without booting the full server — one
+/// trigger the same repair without booting the full server, one
 /// implementation, so the guards below cannot drift from the tool's copy.
 /// Returns the list of versions whose checksums were actually rewritten:
 /// a version whose stored hash already matches is not reported, and a row
@@ -400,7 +400,7 @@ mod unix_db_tests {
     /// The configured path reaches SQLite verbatim. Interpolating it into
     /// a `sqlite:` URL string and letting sqlx URI-parse the result would
     /// percent-decode it: a database file named `pl%2Fain.db` would be
-    /// opened as `pl/ain.db` — a file that does not exist, or worse one
+    /// opened as `pl/ain.db`, a file that does not exist, or worse one
     /// that does and was never chmod'ed to 0600.
     #[tokio::test]
     async fn connect_pool_opens_the_literal_path_without_uri_decoding() {

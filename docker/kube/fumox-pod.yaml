@@ -1,4 +1,4 @@
-# Fumox pod manifest for `podman kube play` — the .kube quadlet alternative
+# Fumox pod manifest for `podman kube play`, the .kube quadlet alternative
 # to docker-compose.yml. One pod (shared network namespace): fumox-server,
 # fumox-probe and the meow-rs kernel wired over loopback instead of compose
 # service DNS (FUMOX_MEOW__API_ADDR=127.0.0.1:9090).
@@ -15,12 +15,12 @@
 #      Append FUMOX_MEOW__TEST_URL / FUMOX_ADMIN__ALLOW_PRIVATE_URLS lines
 #      to override those defaults. FUMOX_CONFIG (a path to a differently
 #      named TOML inside the mounted config volume; unset = the image
-#      default /app/config/app.toml) can ride in the same secret — the
+#      default /app/config/app.toml) can ride in the same secret, the
 #      manifest deliberately keeps only the fixed wiring in `env:`.
 #   4. The PVCs fumox-data / meow-shared are backed by podman named volumes
 #      created automatically on first start (`podman volume ls`).
 #
-# Verify the loopback admin binding after start: `podman port fumox` — if
+# Verify the loopback admin binding after start: `podman port fumox`, if
 # your podman ignores hostIP (old versions), 8081 lands on all interfaces;
 # restrict it with a firewall or upgrade podman.
 apiVersion: v1
@@ -77,7 +77,7 @@ spec:
         - secretRef:
             name: fumox-env
       volumeMounts:
-        # Probe reads app.toml at startup — never writes. Read-only mounts
+        # Probe reads app.toml at startup, never writes. Read-only mounts
         # are independent per container in a Pod, so the server can stay
         # writable while the probe stays read-only.
         - name: config

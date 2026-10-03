@@ -44,7 +44,7 @@ enum Forwarded {
     TrustedChain,
     /// No usable entry at all: the header is absent, empty, unparsable, or
     /// deliberately opaque (`for=_hidden`, `for=unknown`). This is silence,
-    /// not evidence — a proxy that hides the client writes exactly this,
+    /// not evidence, a proxy that hides the client writes exactly this,
     /// and so does a client that sends a header the proxy ignores.
     Nothing,
 }
@@ -122,7 +122,7 @@ pub fn client_key(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet:
 /// What the walk does *not* do is prove authorship: a single-element XFF
 /// reads the same whether the trusted proxy appended it or the client
 /// authored it, since the proxy either appends or overwrites. Callers must
-/// therefore establish that the trusted hop writes this header at all —
+/// therefore establish that the trusted hop writes this header at all,
 /// see [`client_key`], which does it from which headers the request
 /// carries. A trust list broad enough to contain the clients themselves
 /// (`0.0.0.0/0`, a `/8` the subscribers live in) also erases the
@@ -152,7 +152,7 @@ fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
 /// Walk RFC 7239 `Forwarded: for=…` right-to-left from the peer, the same
 /// direction [`walk_xff`] scans and for the same reason, and to the same
 /// three-way outcome. Bracket-strip IPv6 literals; skip `for=_hidden` and
-/// `for=unknown` — both mean the proxy declined to name the client, which
+/// `for=unknown`, both mean the proxy declined to name the client, which
 /// is [`Forwarded::Nothing`], never a chain that ran past it.
 fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
     let Some(value) = headers
@@ -744,7 +744,7 @@ mod tests {
     /// five forged XFFs must not produce five rate-limit keys on the login
     /// brute-force cap. A second header beside the proxy's is evidence the
     /// client wrote it, so the two disagree and the key falls back to the
-    /// trusted peer — the one bucket a client cannot pick its way out of.
+    /// trusted peer, the one bucket a client cannot pick its way out of.
     #[test]
     fn client_authored_xff_cannot_pick_the_key_when_the_proxy_writes_forwarded() {
         for forged in [
@@ -766,7 +766,7 @@ mod tests {
     }
 
     /// The mirror image: a proxy that writes only XFF (nginx, Caddy) and
-    /// forwards the client's `Forwarded` verbatim — the default of
+    /// forwards the client's `Forwarded` verbatim, the default of
     /// `proxy_pass_request_headers on`. A single client-authored `for=` is
     /// non-trusted, so the walk over it hands the attacker the key.
     #[test]
@@ -820,7 +820,7 @@ mod tests {
 
     /// A two-proxy chain where the outer hop writes `Forwarded` and the
     /// inner one (the peer) writes XFF: Traefik in front of nginx, both in
-    /// `trust_proxy_ips`. The XFF nginx appends is Traefik's own address —
+    /// `trust_proxy_ips`. The XFF nginx appends is Traefik's own address,
     /// inside the trust list, so the walk returns nothing at all and the
     /// client address only exists in the `Forwarded` the outer hop wrote.
     /// Treating "one header found nothing" as a forged pair collapsed this
@@ -847,8 +847,8 @@ mod tests {
         );
     }
 
-    /// A chain the walk can exhaust — every XFF entry inside the trust list
-    /// — beside a header that names a client is the one disagreement that
+    /// A chain the walk can exhaust, every XFF entry inside the trust list
+    ///, beside a header that names a client is the one disagreement that
     /// is not a forgery: an all-trusted XFF is evidence that the peer wrote
     /// it (only a trusted hop's appending puts a trusted address there, and
     /// the client then sits further left, in the other header). The mirror
@@ -879,8 +879,8 @@ mod tests {
     /// The remaining disagreement, pinned deliberately: a client that sends
     /// its own `Forwarded` (or arrives behind a proxy that writes only
     /// `Forwarded`) beside an XFF-writing peer is indistinguishable from a
-    /// forgery, so the key is the peer's. That bucket is *shared* — one
-    /// window for everything that lands there — which is the documented cost
+    /// forgery, so the key is the peer's. That bucket is *shared*, one
+    /// window for everything that lands there, which is the documented cost
     /// of failing closed here, never a bypass: the key is still not the
     /// client's choice.
     #[test]

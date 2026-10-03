@@ -1188,7 +1188,7 @@ mod tests {
 
     /// The card end to end: opening it refreshes the geo facts, and for a
     /// host whose lookup only yields an ASN the row the template renders
-    /// must keep its stored country and city — on the struct *and* in the
+    /// must keep its stored country and city, on the struct *and* in the
     /// database. Skipped without the GeoLite2 files, and on a database
     /// build that does not reproduce the ASN-only shape.
     #[tokio::test]

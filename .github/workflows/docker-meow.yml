@@ -1,8 +1,8 @@
-# Builds the fumox-meow image (docker/meow/Dockerfile — a thin wrapper around
+# Builds the fumox-meow image (docker/meow/Dockerfile, a thin wrapper around
 # a meow-rs release binary) for linux/amd64 and linux/arm64 and pushes a
 # combined multi-arch manifest to GHCR (ghcr.io/viktor45/fumox-meow).
 #
-# MANUAL ONLY: this workflow never runs on push or tags — dispatch it from
+# MANUAL ONLY: this workflow never runs on push or tags, dispatch it from
 # the Actions tab (or `gh workflow run docker-meow.yml [-f meow_version=v0.22.0]`).
 #
 # The MEOW_VERSION input picks the packaged meow-rs release, exactly like the
@@ -12,7 +12,7 @@
 # (whitespace-trimmed) is also applied as an image tag, so a pinned build is
 # addressable as ghcr.io/viktor45/fumox-meow:v0.22.0.
 #
-# Strategy: same as docker.yml — each architecture is built NATIVELY on a
+# Strategy: same as docker.yml, each architecture is built NATIVELY on a
 # matching GitHub runner (the fetch stage runs apt-get, which is painfully
 # slow under QEMU), pushed by digest, and attested per platform with
 # actions/attest-build-provenance; a merge job stitches the already-attested
@@ -24,7 +24,7 @@
 #   MEOW_VERSION=v0.22.0 -> v0.22.0, main, sha-<shortsha>  (from any ref)
 #
 # The compose/quadlet stacks use the locally built `fumox-meow:local`; this
-# GHCR image exists for deployments that prefer to pull — point the compose
+# GHCR image exists for deployments that prefer to pull, point the compose
 # service's `image:` at it and drop its `build:` section.
 
 name: Docker meow
@@ -160,7 +160,7 @@ jobs:
           pattern: digest-*
           merge-multiple: true
 
-      # GITHUB_ENV does not cross jobs — re-derive the trimmed input for the
+      # GITHUB_ENV does not cross jobs, re-derive the trimmed input for the
       # tag list (must match the build job's tags exactly).
       - name: Prepare
         env:
@@ -211,7 +211,7 @@ jobs:
           IMAGE: ${{ steps.image.outputs.name }}
         run: |
           # The digest is the FILENAME (one empty file per pushed arch).
-          # Quote into an array explicitly — `printf '%s@sha256:%s ' "$IMAGE" *`
+          # Quote into an array explicitly, `printf '%s@sha256:%s ' "$IMAGE" *`
           # reuses its format for every glob element and would emit
           # "<digest2>@sha256:" for each source after the first.
           sources=()

@@ -2,10 +2,10 @@
 """Assemble CHANGELOG.md sections from a flat git-cliff draft.
 
 Input:  lines `date|sha|category|message` on stdin (the flat-draft template
-        in cliff.toml — see the "Flat draft" comment there).
+        in cliff.toml, see the "Flat draft" comment there).
 Output: one `## <date> · sha-<last-commit-of-the-day>` section per day,
         Keep a Changelog categories (Added/Changed/Removed/Fixed/Docs)
-        inside, oldest first — the hand-editing pass then rewrites the
+        inside, oldest first, the hand-editing pass then rewrites the
         terse commit subjects and trims whatever landed before the first
         image was ever published.
 

@@ -2,8 +2,8 @@
 # https://git-cliff.org/docs/configuration
 #
 # Dated image-snapshot changelog (rolling release): a section per publishing
-# batch, keyed by the image sha-tag. The body template is deliberately FLAT —
-# one machine-readable line per commit, `date|sha|category|message` — because
+# batch, keyed by the image sha-tag. The body template is deliberately FLAT,
+# one machine-readable line per commit, `date|sha|category|message`, because
 # Tera cannot group by a computed attribute (the calendar day of a Unix
 # timestamp). The day-sectioning is done by scripts/make-changelog.py,
 # which reads this draft on stdin; a human pass afterwards rewrites the

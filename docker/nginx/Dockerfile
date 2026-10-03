@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 #
 # TLS front for Fumox (docker/nginx/nginx.conf): terminates HTTPS and
-# proxies to the `server` service on the compose network — the public
+# proxies to the `server` service on the compose network, the public
 # subscription listener (8080) and the admin panel (8081), which upstream
 # keeps loopback-only on the host.
 #
 # Certificates are NOT baked into the image: mount them at runtime,
-# read-only —
+# read-only,
 #     ./docker/nginx/certs:/certs:ro
 # with the two files fullchain.pem / privkey.pem (Let's Encrypt layout,
 # e.g. from certbot's /etc/letsencrypt/live/<domain>/). The config reloades
@@ -34,8 +34,8 @@ FROM nginx:stable-alpine
 COPY nginx.conf /etc/nginx/nginx.conf
 
 # Certificates and per-deployment overrides arrive via mounts:
-#   /certs          — fullchain.pem + privkey.pem (required at runtime)
-#   /etc/nginx/conf.d/*.conf — optional extra server blocks
+#   /certs         , fullchain.pem + privkey.pem (required at runtime)
+#   /etc/nginx/conf.d/*.conf, optional extra server blocks
 RUN mkdir -p /certs
 
 # 443: HTTPS front; 80: ACME + redirect.

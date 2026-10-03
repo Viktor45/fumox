@@ -291,9 +291,9 @@ static EDITOR_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// `save` commits by renaming the tmp over the original, which swaps the
 /// inode: whatever mode the operator put on the config file would
 /// silently decay to the umask default (typically 0644) on the first
-/// admin-panel save. The file carries `[admin].token` — the same class
+/// admin-panel save. The file carries `[admin].token`, the same class
 /// of plaintext secret for which `db.rs` deliberately hard-codes 0600 on
-/// the SQLite file — so a hardened 0600 `app.toml` becoming world-readable
+/// the SQLite file, so a hardened 0600 `app.toml` becoming world-readable
 /// exposes the token to every local user (security review f5). The mode is
 /// applied at tmp creation, so the file holding the token is never briefly
 /// world-readable between a write and a chmod. A missing original (the
@@ -584,7 +584,7 @@ mod tests {
     }
 
     /// Regression (security review f5): the save commits by renaming a
-    /// fresh tmp file over the original, which swaps the inode — a mode
+    /// fresh tmp file over the original, which swaps the inode, a mode
     /// the operator put on the file (0600 over the file that carries
     /// `[admin].token`) used to silently decay to the umask default on
     /// the first save.
@@ -776,7 +776,7 @@ mod tests {
     /// Pins the scope of [`EditLock`]: it guards this module's
     /// read-modify-write path and nothing else. The plain figment
     /// loader (`config::load` / `load_config`) reads the same file
-    /// without it, and it has to keep doing so — the admin handler
+    /// without it, and it has to keep doing so, the admin handler
     /// re-reads the config through `refresh_live_config` while its
     /// `EditableConfig` is still alive, and the lock is not reentrant,
     /// so a loader that took it would deadlock that request.

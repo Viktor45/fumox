@@ -1393,7 +1393,7 @@ fn string_list(
 /// An empty list is refused even though the loader accepts one: for the
 /// only field using this helper today, the recheck ladder, `[]` means
 /// «remove the proxy right after the failed second chance», and the field
-/// hint never says so — silently emptying the textarea would disable the
+/// hint never says so, silently emptying the textarea would disable the
 /// quarantine ladder behind a success toast. An operator who wants that
 /// configures the file directly.
 #[allow(clippy::too_many_arguments)]
@@ -1439,7 +1439,7 @@ fn i64_list_field(
     // scalar range key the other helpers use and would read as a per-value
     // bound that the very same check accepts `max_items` of. No catalog
     // key names a list length, and the locales are not this file's to
-    // extend, so the sentence is written out here — the same escape
+    // extend, so the sentence is written out here, the same escape
     // `bool_field` takes for an unexpected literal. It counts generic
     // entries, not whatever the caller's field calls them.
     if parsed.len() > max_items {
@@ -1784,7 +1784,7 @@ mod tests {
 
     /// The recheck ladder is the only integer list the panel writes, and
     /// the canonical loader (`config::de_recheck_delays`) refuses more
-    /// than 16 steps and any delay outside 1..=30 days — both binaries
+    /// than 16 steps and any delay outside 1..=30 days, both binaries
     /// abort on a file the loader rejects. The bounds checked here must
     /// therefore be the loader's: a ladder the panel accepts has to round
     /// trip through `config::load_config`, and one it rejects must never
@@ -1834,7 +1834,7 @@ mod tests {
 
         // 17 steps: the panel must refuse it, the loader would not. The
         // message must name the count, not borrow the scalar range wording
-        // `u64_field` and friends use — «must be between 0 and 16» reads
+        // `u64_field` and friends use, «must be between 0 and 16» reads
         // as a per-delay bound and contradicts the 16 steps just accepted.
         // It also must stay generic: `i64_list_field` is parameterised by
         // `max_items` and knows nothing about ladders, so it counts

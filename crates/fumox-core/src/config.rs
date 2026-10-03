@@ -1474,7 +1474,7 @@ probe_results_days = 7
     /// configs keep parsing and shown in `/admin/settings` with a footnote.
     /// Writing it into a file that promises "every available key" would
     /// only invite an operator to set a key that does nothing. Every other
-    /// key must be there — that is the point of the guard.
+    /// key must be there, that is the point of the guard.
     const REFERENCE_FILE_OMISSIONS: &[&str] = &["geo.db"];
 
     /// The bounds table is a lookup, so a duplicate key is not a
@@ -1522,7 +1522,7 @@ probe_results_days = 7
     /// The key set is read from the file **as TOML text**, not through
     /// `extract::<AppConfig>()`: every field carries a serde default, so a
     /// deserialized struct is the default set by construction and a key
-    /// deleted from the file reappears filled from that default — the diff
+    /// deleted from the file reappears filled from that default, the diff
     /// was empty whatever the file said.
     #[test]
     fn shipped_app_toml_covers_every_key() {

@@ -6,9 +6,9 @@
 # (override the command: `docker run ghcr.io/viktor45/fumox fumox-probe`).
 #
 # Runtime layout:
-#   /app/config  — mount point for app.toml and the GeoLite2 .mmdb files
-#   /app/data    — mount point for the SQLite database (fumox.db)
-#   /app/locales — admin UI translation catalogs (<code>.toml); drop an extra
+#   /app/config  : mount point for app.toml and the GeoLite2 .mmdb files
+#   /app/data    : mount point for the SQLite database (fumox.db)
+#   /app/locales : admin UI translation catalogs (<code>.toml); drop an extra
 #                  file in and restart to add a language (embedded fallbacks
 #                  keep the panel working if the directory is removed)
 #
@@ -28,11 +28,11 @@
 #   * the mold linker replaces the stock ld (linking used to be ~40 % of
 #     the workspace compile step);
 #   * BUILD_CACHE selects the dependency-caching strategy:
-#       - layers (default): the classic cargo-chef image-layer caching —
+#       - layers (default): the classic cargo-chef image-layer caching,
 #         works on every builder (docker, podman, CI);
 #       - mounts: persistent BuildKit cache mounts hold the cargo registry
 #         and target dir and enable incremental release builds, so a
-#         source-only change recompiles just the touched crates — docker
+#         source-only change recompiles just the touched crates, docker
 #         compose passes this (docker-compose.yml / FUMOX_BUILD_CACHE in
 #         .env.example).
 # The build is architecture-agnostic: linux/amd64 and linux/arm64 compile
@@ -98,7 +98,7 @@ RUN cargo build --release --locked \
 # Same cook/build split, but through persistent BuildKit cache mounts keyed
 # by architecture: the cargo registry and target dir outlive image layers, so
 # a source-only change recompiles just the workspace crates. The binaries
-# are copied to /out inside the same RUN — a mounted dir is not part of the
+# are copied to /out inside the same RUN, a mounted dir is not part of the
 # image.
 FROM chef AS build-mounts
 ARG TARGETARCH
@@ -138,7 +138,7 @@ COPY --from=builder /out/fumox-probe /usr/local/bin/fumox-probe
 # Absolute destination: the runtime WORKDIR /app comes only after these
 # lines, so a bare ./locales/ would land in /locales where the server
 # (which resolves [admin].locales_dir against its working directory)
-# never looks — the extra-catalog feature would silently not work.
+# never looks, the extra-catalog feature would silently not work.
 COPY --from=builder /app/locales/ /app/locales/
 
 WORKDIR /app

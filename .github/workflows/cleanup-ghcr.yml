@@ -1,19 +1,19 @@
 # Manifest-aware GHCR retention for the Fumox container images.
 #
 # The build workflow pushes per-arch images BY DIGEST (untagged) and then
-# runs a merge job that stitches them — plus the provenance attestation
-# manifests — into one multi-arch index tagged with `latest`, semver
+# runs a merge job that stitches them, plus the provenance attestation
+# manifests, into one multi-arch index tagged with `latest`, semver
 # (`0.2.0`, `0.2`), `main` and a transient `sha-<shortsha>`. The per-arch
 # children therefore have NO tags of their own, and every live tag
 # references them.
 #
-# A naive "delete anything not `latest`" — or "delete anything untagged" —
+# A naive "delete anything not `latest`", or "delete anything untagged",
 # cleanup breaks the merged manifest list: the per-arch digests it
 # references would disappear and `docker pull` of `latest`/semver starts
 # failing with manifest-unknown (and `gh attestation verify` loses its
 # targets). So this workflow deletes ONLY:
 #   - versions whose tag list contains ONLY `sha-*` entries, older than
-#     RETENTION_DAYS (default 30) — these are the merged indexes of past
+#     RETENTION_DAYS (default 30), these are the merged indexes of past
 #     builds nobody consumes anymore;
 #   - untagged versions, ONLY when PRUNE_UNTAGGED is enabled AND the
 #     version's digest is not referenced by ANY kept tag's manifest list
@@ -119,7 +119,7 @@ jobs:
                 if [ "$ref_status" -ne 0 ]; then
                   # Page-1 failure = package missing/unreadable; the main
                   # walk below reports it. Past page 1 it corrupts the
-                  # reference set — fail closed.
+                  # reference set, fail closed.
                   if [ "$ref_page" -gt 1 ]; then ref_failed=true; fi
                   break
                 fi
@@ -157,7 +157,7 @@ jobs:
               # (skip this package and move on) or end-of-list on a later
               # page (break the walk). Other failures skip this package.
               #
-              # The `set +e ... set -e` guard around `gh api` is essential —
+              # The `set +e ... set -e` guard around `gh api` is essential,
               # `set -e` propagates failures out of a `$(...)` substitution
               # BEFORE we can capture `$?`, so without it the script exits
               # on the first 4xx/5xx response.
@@ -180,7 +180,7 @@ jobs:
                       rm -f "$err_tmp"
                       break   # next package
                     else
-                      echo "  page $page returned 404 — assuming end-of-list"
+                      echo "  page $page returned 404: assuming end-of-list"
                       break
                     fi
                     ;;
@@ -196,7 +196,7 @@ jobs:
                     printf '%s\n' "$gh_err" | sed 's/^/  gh: /' >&2
                     # Body may contain the actual reason; print it short.
                     printf '%s\n' "$resp" | head -c 200 | sed 's/^/  body: /' >&2 || true
-                    echo "  skip: $pkg — gh api exited $gh_status; continuing with next package" >&2
+                    echo "  skip: $pkg: gh api exited $gh_status; continuing with next package" >&2
                     rm -f "$err_tmp"
                     break   # skip THIS package, move to the next one in PACKAGES
                     ;;
@@ -221,7 +221,7 @@ jobs:
 
                 # A version whose tag list is empty is either a per-arch
                 # child manifest of a merged index or a provenance
-                # attestation — deleting those breaks pulls and attestations
+                # attestation, deleting those breaks pulls and attestations
                 # of every tag that references them. They are only touched
                 # in the opt-in, reference-checked PRUNE_UNTAGGED path.
                 untagged=true
@@ -251,13 +251,13 @@ jobs:
                   # timestamp is a reason to SKIP, never to classify the
                   # version as ancient (epoch 0 would make it deletable).
                   created_epoch=$(date -u -d "$created_at" +%s 2>/dev/null) || {
-                    echo "  skip: id=$id — unparseable created_at: ${created_at}" >&2
+                    echo "  skip: id=$id: unparseable created_at: ${created_at}" >&2
                     continue
                   }
                   if [ "$created_epoch" -ge "$cutoff" ]; then continue; fi
                   reason="sha-*-only, created_at=$created_at"
                 else
-                  # Untagged: by default KEEP — it is a child/attestation of
+                  # Untagged: by default KEEP, it is a child/attestation of
                   # a live index. The opt-in path deletes only orphans that
                   # (a) no kept tag's manifest list references and
                   # (b) are older than the retention window (grace against
@@ -267,12 +267,12 @@ jobs:
                     '.[] | select(.id == $id) | .name')
                   if [ -n "$digest" ] && [ "$digest" != "null" ] \
                      && grep -qF "$digest" "$ref_file" 2>/dev/null; then
-                    continue   # referenced by a kept tag — not an orphan
+                    continue   # referenced by a kept tag, not an orphan
                   fi
                   created_at=$(printf '%s' "$resp" | jq -r --argjson id "$id" \
                     '.[] | select(.id == $id) | .created_at')
                   created_epoch=$(date -u -d "$created_at" +%s 2>/dev/null) || {
-                    echo "  skip: id=$id — unparseable created_at: ${created_at}" >&2
+                    echo "  skip: id=$id, unparseable created_at: ${created_at}" >&2
                     continue
                   }
                   if [ "$created_epoch" -ge "$cutoff" ]; then continue; fi
@@ -280,9 +280,9 @@ jobs:
                 fi
 
                 if [ "$DRY_RUN" = "true" ]; then
-                  echo "  [dry-run] would delete id=$id — $reason"
+                  echo "  [dry-run] would delete id=$id: $reason"
                 else
-                  echo "  deleting id=$id — $reason"
+                  echo "  deleting id=$id: $reason"
                   # Idempotency: a 404 here means another job deleted this
                   # version between our listing and our DELETE. Count it as
                   # gone and carry on without failing the run.
@@ -295,7 +295,7 @@ jobs:
                   del_status=$?
                   set -e
                   if [ "$del_status" -ne 0 ] && grep -q "404" "$err_tmp"; then
-                    echo "  (already gone — race with another job)"
+                    echo "  (already gone: race with another job)"
                   elif [ "$del_status" -ne 0 ]; then
                     printf '%s\n' "$(cat "$err_tmp")" | sed 's/^/  gh: /' >&2
                     echo "  error: gh api DELETE exited with status $del_status; continuing with next package" >&2
@@ -312,12 +312,12 @@ jobs:
               # Deleting from page N shifts the remaining list up, so the
               # next page would skip up to `deleted_for_page` unseen
               # entries. Re-read the same page only when something was
-              # REALLY deleted from it. In dry-run — and when every DELETE
-              # came back as an already-gone 404 — the server-side list
+              # REALLY deleted from it. In dry-run, and when every DELETE
+              # came back as an already-gone 404, the server-side list
               # did not change, so re-reading would reprocess the same
               # entries forever; always advance instead.
               if [ "$DRY_RUN" = "false" ] && [ "$real_deleted_for_page" -gt 0 ]; then
-                :   # the list shifted — re-read the same page
+                :   # the list shifted, re-read the same page
               else
                 page=$((page + 1))
               fi

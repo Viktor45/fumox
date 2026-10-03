@@ -98,7 +98,7 @@ pub async fn top_failure_reasons(
 /// Enqueue up to `limit` of `candidate_ids` for priority checking. Only
 /// T1-probeable schemes are accepted (unprobeable schemes would clog the
 /// queue forever); the row itself must still be `unknown` and still be
-/// linked to a source, the same predicate the drain applies — a row
+/// linked to a source, the same predicate the drain applies, a row
 /// without a link is skipped by every T1 lane, so queueing it would only
 /// leave a request nothing will ever consume. Idempotent , an id already
 /// queued is left untouched (`INSERT OR IGNORE`). Returns the number of
@@ -160,7 +160,7 @@ pub async fn enqueue_checks(
 /// Drain the queue, newest first (fresh proxies check first).
 /// Returns candidates that are still `unknown`, still linked to a source,
 /// T1-probeable and not under a T2 block (`last_t2_failed_at IS NULL`,
-/// the same guard as the random sample — migration 0007: a T2 failure
+/// the same guard as the random sample, migration 0007: a T2 failure
 /// suppresses T1 until the next successful T2, and the T2 recency
 /// selector is the only way back); everything else in the queue is
 /// skipped here and removed by [`purge_settled_checks`].

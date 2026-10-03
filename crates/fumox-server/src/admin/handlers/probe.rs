@@ -21,7 +21,7 @@ use std::time::Duration;
 /// periods. The `.max(5)` mirrors the daemon's own beat period
 /// (`heartbeat_interval_secs.max(5)`, `fumox-probe/src/main.rs`), which
 /// is what keeps a daemon beating on schedule from being reported dead
-/// when the operator configures a period below 5 s — the settings form
+/// when the operator configures a period below 5 s, the settings form
 /// accepts `1..=86400`. Used for both the daemon card and the backlog
 /// banner, so the two never disagree.
 fn heartbeat_stale_after(cfg: &ProbeConfig) -> i64 {
@@ -185,7 +185,7 @@ struct BacklogFactor {
 /// One concrete suggested change. `target_value` is the new value the
 /// recommendation asks for (rendered into the localized label and used
 /// by tests). `key` maps to a `probe.rec_<key>` i18n entry, `args` are
-/// the named placeholders that entry needs — the label is resolved
+/// the named placeholders that entry needs, the label is resolved
 /// through the catalog, never formatted here.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -228,8 +228,8 @@ fn ceil_div(numerator: i128, denominator: i128) -> i128 {
 }
 
 /// The one model of "what one probe cycle does" in this file. Every
-/// cycle-derived number the banner prints — the drain figure, the
-/// level, the recommendation gate and the recommendations themselves —
+/// cycle-derived number the banner prints, the drain figure, the
+/// level, the recommendation gate and the recommendations themselves,
 /// comes from one `CycleModel` built per render, so no formula can
 /// drift at a second call site.
 #[derive(Clone, Copy, Debug)]
@@ -257,7 +257,7 @@ struct CycleModel {
     /// pushes the next start out by the work.
     period_secs: u64,
     /// `retire_per_cycle == 0` means the cycle picks up no quarantine
-    /// row at all, so there is no drain to estimate — neither "0
+    /// row at all, so there is no drain to estimate, neither "0
     /// minutes" nor "infinite". Both derived fields stay `None`, the
     /// soft gate cannot fire, and no recommendation is computed.
     cycles_to_drain: Option<i64>,
@@ -358,7 +358,7 @@ fn derive_cycle_model(
 /// `oldest_quarantined_age_secs` = `now - MIN(quarantined_at)` if any
 /// quarantine row exists, `None` otherwise. `heartbeat_age_secs` is
 /// `now - heartbeat.ts` when a heartbeat row exists, `None` when it
-/// does not — a *missing* heartbeat is not a dead daemon, it is a
+/// does not, a *missing* heartbeat is not a dead daemon, it is a
 /// daemon that has not beaten yet (surfaced on the card instead).
 /// The server applies one threshold, [`heartbeat_stale_after`], to
 /// both the daemon card and this banner, so the two never disagree.
@@ -429,7 +429,7 @@ fn compute_backlog(
 
     // One state factor on top of the hard triggers. It is `all_idle`
     // whenever the cycle retires nothing (and so there is no drain
-    // figure to print), whatever else fired — that wording reports
+    // figure to print), whatever else fired, that wording reports
     // what the cycle took rather than asserting why, which is the only
     // claim the page can actually support.
     if model.retire_per_cycle == 0 {
@@ -457,7 +457,7 @@ fn compute_backlog(
 
     // Recommendations only when the modelled drain exceeds the target;
     // otherwise the banner shows the factors without prescriptive
-    // knobs. `drain_minutes == None` can never reach here — `over_target`
+    // knobs. `drain_minutes == None` can never reach here, `over_target`
     // is false and the sample rec below is gated on a modelled drain.
     let recs = if over_target {
         compute_recs(cfg, &model)
@@ -482,7 +482,7 @@ fn compute_backlog(
 /// Smallest period the banner will recommend. The settings form accepts
 /// `cycle_interval_secs` from `1`, but a cycle is several `SELECT`s
 /// across the pool plus the writes its lanes make, and the daemon's own
-/// beat period already carries a `.max(5)` floor — the same reason
+/// beat period already carries a `.max(5)` floor, the same reason
 /// [`heartbeat_stale_after`] starts its threshold there. Shortening the
 /// cycle below the cadence the daemon considers sane for its heartbeat
 /// is advice that costs more than the drain it buys, so the third
@@ -513,7 +513,7 @@ fn compute_recs(cfg: &ProbeConfig, model: &CycleModel) -> Vec<TuningRec> {
 
     // (1) Throughput. Gated on the queue actually holding more due
     // rows than a cycle can take, and capped at the number of rows
-    // that can ever be due — a sample larger than `due_count` retires
+    // that can ever be due, a sample larger than `due_count` retires
     // exactly as many rows, so recommending it buys nothing.
     if model.due_count > model.sample_size as i64 {
         let required = ceil_div(
@@ -543,7 +543,7 @@ fn compute_recs(cfg: &ProbeConfig, model: &CycleModel) -> Vec<TuningRec> {
 
     // (2) Parallelism. Only when the modelled lane no longer fits the
     // period, and the value is the smallest `c <= 64` that brings it
-    // back *at the sample size now in effect* — the recommended one if
+    // back *at the sample size now in effect*, the recommended one if
     // (1) fired. When no such `c` exists, nothing is printed: a
     // concurrency number that does not fit would not help.
     if planned.lane_secs > planned.cycle_interval_secs {
@@ -570,7 +570,7 @@ fn compute_recs(cfg: &ProbeConfig, model: &CycleModel) -> Vec<TuningRec> {
     // (3) Period. Only when the shortened period still fits the work.
     // No `clamp`: the two comparisons are ordered, so the old
     // `min > max` panic has no way back. (2) and (3) stay mutually
-    // exclusive — (2) needs `lane_secs > cycle`, (3) then needs
+    // exclusive, (2) needs `lane_secs > cycle`, (3) then needs
     // `required_period >= lane_secs > cycle > required_period`.
     if let Some(cycles) = planned.cycles_to_drain
         && cycles > 0
@@ -748,7 +748,7 @@ impl ProbeTemplate {
             // instead of recomputing it: there is no second formula on
             // the rendering side that could drift from the one the
             // gate used. `drain_minutes` is `Some` in both arms by
-            // construction — a missing figure is the `all_idle` arm.
+            // construction, a missing figure is the `all_idle` arm.
             "drain_over_target" | "all_ok" => self.lang.t_named(
                 &key,
                 &[
@@ -995,7 +995,7 @@ pub async fn events_stream(
 }
 
 // Unit tests for the cycle model. Both functions are pure, so every
-// branch is reachable without seeding a database — the integration
+// branch is reachable without seeding a database, the integration
 // tests in `admin::tests` only cover the states the daemon can
 // actually produce.
 #[cfg(test)]
@@ -1031,7 +1031,7 @@ mod tests {
 
     /// The old code clamped the recommended period with
     /// `clamp(5, cycle_interval_secs)`, which panics whenever
-    /// `cycle_interval_secs < 5` — reachable straight from a config
+    /// `cycle_interval_secs < 5`, reachable straight from a config
     /// file, since `AppConfig::validate` does not bound the field and
     /// the settings form accepts 1..=86400.
     #[test]
@@ -1051,7 +1051,7 @@ mod tests {
 
         // Same fixture with `concurrency = 0`. Not reachable as a crash
         // before the model (the old code clamped at `.max(1)`, as does
-        // the daemon before building its semaphore) — this guards the
+        // the daemon before building its semaphore), this guards the
         // divide-by-zero a rewrite could introduce.
         cfg.cycle_interval_secs = 60;
         cfg.concurrency = 0;
@@ -1162,7 +1162,7 @@ mod tests {
     }
 
     /// The 20 % margin: a queue one row over the sample must not get a
-    /// "recommend 51" nudge. It is a noise floor, not a gate — the
+    /// "recommend 51" nudge. It is a noise floor, not a gate, the
     /// concurrency rec still fires.
     #[test]
     fn sample_size_rec_respects_the_twenty_percent_margin() {
@@ -1228,7 +1228,7 @@ mod tests {
         );
 
         // 389 rows in a lane need 980 s at any concurrency up to 64, so
-        // no parallelism value is printed — one that did not fit would
+        // no parallelism value is printed, one that did not fit would
         // be a knob the operator turns for nothing.
         let model = CycleModel::new(&cfg, 10_000, 10_000);
         assert_eq!(model.drain_minutes, Some(467));
@@ -1341,7 +1341,7 @@ mod tests {
 
     /// The third recommendation shortens the cycle. With aggressive
     /// timeouts the modelled lane is short enough that the arithmetic
-    /// lands on a 2-second cycle — a period faster than the daemon's own
+    /// lands on a 2-second cycle, a period faster than the daemon's own
     /// beat floor, which is churn the operator cannot use. The gate
     /// stays silent instead of printing it, while a period it can
     /// certify above the floor still prints.

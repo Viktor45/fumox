@@ -6,7 +6,7 @@
 # tags (ghcr.io/viktor45/fumox:latest, ghcr.io/viktor45/fumox-meow:latest),
 # so the smoke build doubles as the main-stack rebuild. The shared host
 # ./config mount is the one thing a compose project cannot scope, so the
-# server gets it read-only here (FUMOX_CONFIG_ACCESS=ro) — the smoke stand's
+# server gets it read-only here (FUMOX_CONFIG_ACCESS=ro), the smoke stand's
 # admin panel can read app.toml but never writes it.
 #
 # Usage:
@@ -82,7 +82,7 @@ export FUMOX_ADMIN__TOKEN FUMOX_PUBLIC_PORT="$SMOKE_PUBLIC_PORT" FUMOX_ADMIN_BIN
 # Named volumes are project-scoped, the ./config bind mount is not: both stands
 # mount the same host directory. Keep the smoke stand's config read-only so
 # its admin *Edit settings* page can never rewrite the main stack's app.toml.
-# Not a knob — the isolation guarantee is the point of the stand.
+# Not a knob, the isolation guarantee is the point of the stand.
 export FUMOX_CONFIG_ACCESS=ro
 
 BUILD_FLAGS=(--build)
@@ -157,7 +157,7 @@ echo ">> server, probe and meow are up"
 # unreachable over the compose network. Not fatal for the smoke verdict, but
 # worth flagging.
 if "${COMPOSE[@]}" -p "$SMOKE_PROJECT" logs probe 2>/dev/null | grep -qi "backoff"; then
-    echo "WARNING: the probe logged a meow-rs backoff — T2 tunnel checks may be down"
+    echo "WARNING: the probe logged a meow-rs backoff: T2 tunnel checks may be down"
 fi
 
 echo

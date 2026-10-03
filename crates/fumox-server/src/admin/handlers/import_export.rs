@@ -685,7 +685,7 @@ async fn apply_import(
     // Slugs already present in the DB or used earlier in this file cannot be
     // reused; the object is still created, just without a slug. Sources and
     // profiles are tracked separately: `slug` is UNIQUE per table, and each
-    // side resolves its own only — `profiles::resolve_token` behind
+    // side resolves its own only, `profiles::resolve_token` behind
     // `/sub/{id}` (serve.rs:234) and `sources::resolve_token` behind
     // `/src/{id}` (serve.rs:295), each querying one table. The same slug is
     // therefore legal on a source and on a profile, and must survive the
@@ -749,7 +749,7 @@ async fn apply_import(
         // to sources missing from the file are dropped with a warning.
         // A reference repeated inside one profile collapses to its first
         // position: `profile_sources` is keyed by (profile_id, source_id),
-        // so writing it twice aborts the whole composition insert — after
+        // so writing it twice aborts the whole composition insert, after
         // the profile row was already committed, leaving an empty profile
         // behind a 500. `/admin/export` never emits a duplicate ref, so
         // this only ever sees a hand-edited file.

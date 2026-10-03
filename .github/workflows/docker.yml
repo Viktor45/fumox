@@ -15,11 +15,11 @@
 #   push v0.2.0       -> 0.2.0, 0.2, sha-<shortsha>, latest
 #   workflow_dispatch -> ref/sha tags from docker/metadata-action (no `latest`
 #                        unless the dispatched ref is main or a v* tag).
-# There is no automatic rebuild on push to `main` — only `v*` tags and manual
+# There is no automatic rebuild on push to `main`, only `v*` tags and manual
 # dispatch trigger this workflow (see the `on:` block below).
 #
 # Run the image (see Dockerfile header for details; admin stays loopback-only
-# on the host, and the probe runs as the command argument — tini remains the
+# on the host, and the probe runs as the command argument, tini remains the
 # entrypoint):
 #   docker run -d --name fumox \
 #     -e FUMOX_ADMIN__TOKEN=secret \
@@ -182,7 +182,7 @@ jobs:
           IMAGE: ${{ steps.image.outputs.name }}
         run: |
           # The digest is the FILENAME (one empty file per pushed arch).
-          # Quote into an array explicitly — `printf '%s@sha256:%s ' "$IMAGE" *`
+          # Quote into an array explicitly, `printf '%s@sha256:%s ' "$IMAGE" *`
           # reuses its format for every glob element and would emit
           # "<digest2>@sha256:" for each source after the first.
           sources=()

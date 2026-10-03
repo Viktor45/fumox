@@ -51,7 +51,7 @@ toml = "1"
 toml_edit = { version = "0.25", features = ["display"] }
 
 # Database
-# sqlx 0.9: query*() takes `impl SqlSafeStr` — `&'static str` directly,
+# sqlx 0.9: query*() takes `impl SqlSafeStr`, `&'static str` directly,
 # dynamic SQL wrapped in `sqlx::AssertSqlSafe`.
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
 

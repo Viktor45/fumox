@@ -4,7 +4,7 @@
 //! every migration's content in the `_sqlx_migrations` table, and any
 //! post-apply edit to the file fails the next `migrate()` call with
 //! "migration N was previously applied but has been modified". The
-//! correct long-term answer is to never edit applied migrations — new
+//! correct long-term answer is to never edit applied migrations, new
 //! changes belong in a new migration file.
 //!
 //! This utility exists for one narrow case: a comment-only edit that
@@ -20,7 +20,7 @@
 //! already-applied file needs a new migration file.
 //!
 //! The database must be fully in sync with this build's embedded set
-//! in both directions — a migration this build does not know about
+//! in both directions, a migration this build does not know about
 //! means the database was migrated by a newer Fumox, and the tool
 //! refuses rather than leaving `migrate()` to fail with
 //! `VersionMissing`.
@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!(
             "note: the re-stamp only rewrites bookkeeping. sqlx never re-runs an \
              applied migration, so if the edit was not comment-only the schema \
-             on disk is behind the files — ship a new migration file for the DDL."
+             on disk is behind the files, ship a new migration file for the DDL."
         );
     }
     Ok(())

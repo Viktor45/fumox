@@ -448,7 +448,7 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
 }
 
 /// What a drop-rule pass hands back: the surviving entries, the stamps that
-/// belong to exactly those entries (same length, same order — reconcile
+/// belong to exactly those entries (same length, same order, reconcile
 /// pairs the two by index), and how many entries were discarded.
 type DropOutcome = (Vec<ProxyEntry>, Vec<Option<proxies::GeoStamp>>, usize);
 
@@ -921,7 +921,7 @@ mod tests {
     /// must be shortened with it. Returning the survivors alone made
     /// `reconcile_source` pair entry *n* with the stamp of entry *n-1* (or
     /// worse, from the start of the feed), so a proxy was stored carrying
-    /// another host's country and ASN — and one IP could end up stamped
+    /// another host's country and ASN, and one IP could end up stamped
     /// with several different AS numbers. Every surviving entry must keep
     /// the stamp its own host resolved to.
     #[test]

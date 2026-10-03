@@ -1,4 +1,4 @@
-# Fumox pod — quadlet equivalent of docker-compose.yml.
+# Fumox pod, quadlet equivalent of docker-compose.yml.
 #
 # One systemd-managed pod ("fumox") holding all three compose services in a
 # single network namespace: fumox-server, fumox-probe and the meow-rs kernel.
@@ -8,7 +8,7 @@
 #   systemctl --user daemon-reload
 #   systemctl --user start fumox-pod.service
 #
-# Pod-internal wiring (containers in one pod share loopback — there is no
+# Pod-internal wiring (containers in one pod share loopback, there is no
 # per-container DNS like in compose):
 #   probe -> meow REST API   127.0.0.1:9090   (see fumox-probe.container)
 #   server + probe -> SQLite /app/data        (fumox-data volume)

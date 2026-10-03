@@ -124,7 +124,7 @@ pub fn validate_request_host(
 /// link) to `http://name@evil.com/export/alive/{token}` with the token as
 /// the query of an attacker-controlled host. The canonicalizer is the same
 /// one the gate uses, so the two consumers can never disagree about what a
-/// Host means, and the check runs even with an empty allowlist — that is
+/// Host means, and the check runs even with an empty allowlist, that is
 /// exactly the configuration the gate skips.
 fn serve_link_host(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::HOST).and_then(|v| v.to_str().ok())?;

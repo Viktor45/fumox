@@ -254,7 +254,7 @@ impl AdminState {
     /// Gating on both lists instead would only move the failure: `Err`
     /// reaches handlers that render a hard 500 through `server_error`, and
     /// those call sites live outside this module. The 500 is the worse of
-    /// the two — it breaks the whole page, not just one link — so the
+    /// the two, it breaks the whole page, not just one link, so the
     /// panel list wins and the 404-on-click tradeoff is recorded here
     /// instead of being silently dropped.
     fn serve_base(
@@ -321,7 +321,7 @@ pub(crate) fn parse_trusted_cidrs(raw: &[String]) -> Vec<ipnet::IpNet> {
 /// The setting is documented as "hostnames / IPs allowed to reach the
 /// admin listener" and editable on the settings screen, but the
 /// request-time gate only ever ran for the public listener's alive-export
-/// links and the serve-link builder — no admin request passed through it
+/// links and the serve-link builder, no admin request passed through it
 /// (security review f3). Gating here also removes the inconsistent fail
 /// mode where a non-matching Host was served by every page except the
 /// three that render serve links, which answered 500 from
@@ -949,7 +949,7 @@ mod tests {
         // The remaining tradeoff, recorded in `serve_base`: the link is not
         // rewritten to the host the public listener does allow, so with the
         // two lists pointing at different hosts that link 404s on click.
-        // The page itself must render — that is the half this fixes.
+        // The page itself must render, that is the half this fixes.
         assert!(
             !html.contains("vpn.example.com"),
             "the link must not be silently swapped for another host: {html:.400}"
@@ -1415,7 +1415,7 @@ mod tests {
         // Append-mode proxy (security review f2): the client sends its own
         // XFF prefix and the trusted proxy appends the observed client IP,
         // so the header is "<client-forged>, 9.9.9.9". The right-most
-        // non-trusted entry — what the proxy appended — must key the
+        // non-trusted entry, what the proxy appended, must key the
         // window, and re-forging the prefix must not open a new one.
         let response = app
             .clone()

@@ -26,7 +26,7 @@ config/meow.yaml
 *.db-wal
 *.db-shm
 
-# Local environment (docker compose) — may carry the admin token
+# Local environment (docker compose), may carry the admin token
 .env
 .DS_Store
 
@@ -45,14 +45,14 @@ gui-test-screenshots/
 anti-slop/
 audit-context/
 out/
-# Debug-only parser fixture: may contain non-public confidential data —
+# Debug-only parser fixture: may contain non-public confidential data,
 # never commit it. Recreate locally from public subscriptions if needed;
 # fixture tests skip themselves when the file is absent.
 test.txt
 
 test2.txt
 
-# Debug-only parser fixtures: may contain non-public confidential data —
+# Debug-only parser fixtures: may contain non-public confidential data,
 # never commit them. Recreate locally if needed; fixture tests skip
 # themselves when the files are absent.
 test-sing.txt

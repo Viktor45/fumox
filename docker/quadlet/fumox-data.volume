@@ -1,5 +1,5 @@
 # SQLite database (compose named volume "fumox-data"), shared by
-# fumox-server and fumox-probe — both processes write the same WAL-mode DB.
+# fumox-server and fumox-probe, both processes write the same WAL-mode DB.
 # Referenced from the .container units as: Volume=fumox-data.volume:/app/data
 
 [Unit]

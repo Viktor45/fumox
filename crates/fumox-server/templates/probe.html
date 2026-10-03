@@ -70,7 +70,7 @@
         <div class="label">meow-rs (T2)</div>
         <div class="sub">{{ self.t("probe.last_contact") }} {{ self.ts(ts) | safe }}</div>
         {% if self.has_mem() %}
-          <div class="sub">{{ self.mem_line() }}</div>
+          <div class="sub">{{ self.mem_line() }} · {{ self.ts(&self.mem_ts()) | safe }}</div>
         {% endif %}
       {% when None %}
         <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>

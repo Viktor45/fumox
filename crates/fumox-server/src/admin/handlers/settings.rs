@@ -1393,7 +1393,7 @@ fn string_list(
 /// An empty list is refused even though the loader accepts one: for the
 /// only field using this helper today, the recheck ladder, `[]` means
 /// «remove the proxy right after the failed second chance», and the field
-/// hint never says so, silently emptying the textarea would disable the
+/// hint never says so: silently emptying the textarea would disable the
 /// quarantine ladder behind a success toast. An operator who wants that
 /// configures the file directly.
 #[allow(clippy::too_many_arguments)]

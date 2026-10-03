@@ -57,3 +57,4 @@ test2.txt
 # themselves when the files are absent.
 test-sing.txt
 test-sing2.txt
+.zcodeignore

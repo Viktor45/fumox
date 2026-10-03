@@ -79,6 +79,41 @@ impl MeowMemoryView {
     }
 }
 
+/// Human-readable byte count, one decimal above a KiB.
+///
+/// Unlike the settings page's whole-unit formatter (that one renders file
+/// sizes), RSS moves continuously, so exact divisibility would print
+/// `10412 KiB`.
+fn fmt_rss_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The kernel RSS line, e.g. `RSS 24.5 MiB · 1.2% / 2.0 GiB`.
+///
+/// Plain text, and it has to stay that way: `probe.html` renders it through
+/// an escaping handle, so any markup folded in here (a `time` element, say)
+/// reaches the reader as literal `<time ...>` source. The timestamp is
+/// rendered by the template instead, through `ts(..) | safe`.
+fn rss_line(mem: &MeowMemoryView) -> String {
+    let mut line = format!("RSS {}", fmt_rss_bytes(mem.rss_bytes));
+    if let Some(pct) = mem.percent_of_limit() {
+        line.push_str(&format!(
+            " · {pct:.1}% / {}",
+            fmt_rss_bytes(mem.os_limit_bytes)
+        ));
+    }
+    line
+}
+
 #[derive(Template)]
 #[template(path = "probe.html")]
 struct ProbeTemplate {
@@ -185,7 +220,7 @@ struct BacklogFactor {
 /// One concrete suggested change. `target_value` is the new value the
 /// recommendation asks for (rendered into the localized label and used
 /// by tests). `key` maps to a `probe.rec_<key>` i18n entry, `args` are
-/// the named placeholders that entry needs, the label is resolved
+/// the named placeholders that entry needs. The label is resolved
 /// through the catalog, never formatted here.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -358,7 +393,7 @@ fn derive_cycle_model(
 /// `oldest_quarantined_age_secs` = `now - MIN(quarantined_at)` if any
 /// quarantine row exists, `None` otherwise. `heartbeat_age_secs` is
 /// `now - heartbeat.ts` when a heartbeat row exists, `None` when it
-/// does not, a *missing* heartbeat is not a dead daemon, it is a
+/// does not. A *missing* heartbeat is not a dead daemon, it is a
 /// daemon that has not beaten yet (surfaced on the card instead).
 /// The server applies one threshold, [`heartbeat_stale_after`], to
 /// both the daemon card and this banner, so the two never disagree.
@@ -513,7 +548,7 @@ fn compute_recs(cfg: &ProbeConfig, model: &CycleModel) -> Vec<TuningRec> {
 
     // (1) Throughput. Gated on the queue actually holding more due
     // rows than a cycle can take, and capped at the number of rows
-    // that can ever be due, a sample larger than `due_count` retires
+    // that can ever be due. A sample larger than `due_count` retires
     // exactly as many rows, so recommending it buys nothing.
     if model.due_count > model.sample_size as i64 {
         let required = ceil_div(
@@ -613,34 +648,15 @@ impl ProbeTemplate {
     ///
     /// One decimal, unlike the settings page's whole-unit formatter: RSS
     /// moves continuously, so exact divisibility would print `10412 KiB`.
-    fn bytes(&self, bytes: &u64) -> String {
-        const MIB: f64 = 1024.0 * 1024.0;
-        const KIB: f64 = 1024.0;
-        let b = *bytes as f64;
-        if b >= MIB {
-            format!("{:.1} MiB", b / MIB)
-        } else if b >= KIB {
-            format!("{:.0} KiB", b / KIB)
-        } else {
-            format!("{bytes} B")
-        }
-    }
-    /// The kernel's RSS line, e.g. `RSS 24.5 MiB · 1.2% / 2.0 GiB`. `None`
-    /// when the probe has not published a reading yet (or none is due, if no
-    /// T2 batch has reloaded meow-rs lately).
+    /// The kernel RSS line for the card, empty when there is no reading.
     fn mem_line(&self) -> String {
-        let Some(mem) = self.meow_memory.as_ref() else {
-            return String::new();
-        };
-        let mut line = format!("RSS {}", self.bytes(&mem.rss_bytes));
-        if let Some(pct) = mem.percent_of_limit() {
-            line.push_str(&format!(
-                " · {pct:.1}% / {}",
-                self.bytes(&mem.os_limit_bytes)
-            ));
-        }
-        line.push_str(&format!(" · {}", self.ts(&mem.ts)));
-        line
+        self.meow_memory.as_ref().map_or_else(String::new, rss_line)
+    }
+
+    /// When the reading was taken, for the template to render as a `time`
+    /// element beside the rest of the line.
+    fn mem_ts(&self) -> i64 {
+        self.meow_memory.as_ref().map_or(0, |mem| mem.ts)
     }
 
     /// Whether a reading is worth showing at all.
@@ -748,7 +764,7 @@ impl ProbeTemplate {
             // instead of recomputing it: there is no second formula on
             // the rendering side that could drift from the one the
             // gate used. `drain_minutes` is `Some` in both arms by
-            // construction, a missing figure is the `all_idle` arm.
+            // construction. A missing figure is the `all_idle` arm.
             "drain_over_target" | "all_ok" => self.lang.t_named(
                 &key,
                 &[
@@ -1162,7 +1178,7 @@ mod tests {
     }
 
     /// The 20 % margin: a queue one row over the sample must not get a
-    /// "recommend 51" nudge. It is a noise floor, not a gate, the
+    /// "recommend 51" nudge. It is a noise floor, not a gate: the
     /// concurrency rec still fires.
     #[test]
     fn sample_size_rec_respects_the_twenty_percent_margin() {
@@ -1228,7 +1244,7 @@ mod tests {
         );
 
         // 389 rows in a lane need 980 s at any concurrency up to 64, so
-        // no parallelism value is printed, one that did not fit would
+        // no parallelism value is printed. One that did not fit would
         // be a knob the operator turns for nothing.
         let model = CycleModel::new(&cfg, 10_000, 10_000);
         assert_eq!(model.drain_minutes, Some(467));
@@ -1341,7 +1357,7 @@ mod tests {
 
     /// The third recommendation shortens the cycle. With aggressive
     /// timeouts the modelled lane is short enough that the arithmetic
-    /// lands on a 2-second cycle, a period faster than the daemon's own
+    /// lands on a 2-second cycle. A period faster than the daemon's own
     /// beat floor, which is churn the operator cannot use. The gate
     /// stays silent instead of printing it, while a period it can
     /// certify above the floor still prints.
@@ -1420,5 +1436,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Regression: the RSS line is rendered through an escaping handle, so
+    /// it once shipped a `time` element inside and the reader saw literal
+    /// `<time class="ts" ...>` source in the card, wrapped over four lines.
+    /// The timestamp belongs to the template (`ts(..) | safe`); the line
+    /// stays plain text.
+    #[test]
+    fn rss_line_carries_no_markup() {
+        let mem = MeowMemoryView {
+            rss_bytes: 25_780_224,
+            os_limit_bytes: 2_147_483_648,
+            ts: 1_700_000_000,
+        };
+        let line = rss_line(&mem);
+        assert!(!line.contains('<'), "markup leaked into the line: {line}");
+        assert!(!line.contains('>'), "markup leaked into the line: {line}");
+        assert!(line.contains("24.6 MiB"), "{line}");
+        // A missing limit hides the share instead of dividing by zero.
+        let no_limit = MeowMemoryView {
+            os_limit_bytes: 0,
+            ..mem
+        };
+        assert_eq!(rss_line(&no_limit), "RSS 24.6 MiB");
     }
 }

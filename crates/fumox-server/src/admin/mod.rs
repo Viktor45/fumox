@@ -949,7 +949,7 @@ mod tests {
         // The remaining tradeoff, recorded in `serve_base`: the link is not
         // rewritten to the host the public listener does allow, so with the
         // two lists pointing at different hosts that link 404s on click.
-        // The page itself must render, that is the half this fixes.
+        // The page itself must render. That is the half this fixes.
         assert!(
             !html.contains("vpn.example.com"),
             "the link must not be silently swapped for another host: {html:.400}"

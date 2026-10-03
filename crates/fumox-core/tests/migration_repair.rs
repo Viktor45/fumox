@@ -197,7 +197,7 @@ async fn migrate_propagates_non_mismatch_errors_untouched() {
     // The auto-repair only fires for `MigrateError::VersionMismatch`.
     // A pristine DB exercises a different code path (first-time apply);
     // it must not be turned into a repair. We assert the call simply
-    // succeeds, the negative case (a dirty DB, a missing file) is
+    // succeeds. The negative case (a dirty DB, a missing file) is
     // covered by sqlx's own tests, not duplicated here.
     let path = temp_db_path("first_run");
     let cfg = DatabaseConfig {
@@ -250,7 +250,7 @@ fn run_repair_tool(bin: &Path, db_path: &Path) -> std::process::Output {
 /// build does not embed was migrated by a *newer* Fumox, and re-stamping
 /// the versions we do know would leave sqlx refusing to start with
 /// `VersionMissing(99)` anyway. The tool must refuse, name the version,
-/// and touch nothing, otherwise it silently "repairs" a half-understood
+/// and touch nothing, or it silently "repairs" a half-understood
 /// database.
 ///
 /// The first run over the pristine database is the control: exit 0 there

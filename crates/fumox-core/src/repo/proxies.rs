@@ -155,7 +155,7 @@ impl ProxyRow {
 ///
 /// `keep_alive_linger`: when `[ingest].drop_gate` is `false` (the
 /// default), a proxy that vanished from the feed is nobody's business but
-/// the probe's, this pass never retires anything, and it keeps the link
+/// the probe's. This pass never retires anything, and it keeps the link
 /// on every status the probe still owns (`alive`, `ready`, `unknown`,
 /// `quarantine`), so upstream churn cannot end a node that has not
 /// failed. The recheck ladder and the priority queue keep working on the
@@ -325,7 +325,7 @@ pub async fn reconcile_source(
     // means the probe alone retires a proxy, and a proxy that dropped out
     // of the feed has not failed anything. Retiring it here judged it
     // without a verdict. `quarantine` lingers along with the live tiers
-    // for the same reason, unlinking it would strand a row in no probe
+    // for the same reason: unlinking it would strand a row in no probe
     // lane, which kills it just as surely as the sweep did, only without
     // the record.
     if !keep_alive_linger {
@@ -398,7 +398,7 @@ pub async fn update_geo(pool: &DbPool, id: i64, geo: &GeoStamp) -> crate::Result
 /// `COALESCE`, exactly like the reconcile upsert: a `None` field means
 /// "not known from this lookup", never "erase". The resolver merges the
 /// databases with an `any`-hit, so a stamp can be partial where the others
-/// are silent, an ASN-only hit (the City record decodes with an empty
+/// are silent. An ASN-only hit (the City record decodes with an empty
 /// country, as it does for the Cloudflare `104.16.0.0/12` block) must not
 /// wipe a country the ingest path already resolved. `resolved_ip` is
 /// always a concrete address from the lookup that just ran and is
@@ -736,7 +736,7 @@ pub async fn reset_status(pool: &DbPool, id: i64) -> crate::Result<bool> {
 /// ([`select_t1_candidates`], [`crate::repo::probe::select_queued_checks`])
 /// and the T2 sample ([`select_t2_candidates`]) all need a live
 /// `proxy_source_links` row, so a link-less row moved back to `unknown`
-/// is a row the probe can never look at again, the panel would report
+/// is a row the probe can never look at again. The panel would report
 /// it revived and the next reconcile would retire it once more. It is
 /// called right after reconciliation re-stamped the links of everything
 /// this fetch carried, so the predicate costs nothing there.
@@ -744,7 +744,7 @@ pub async fn reset_status(pool: &DbPool, id: i64) -> crate::Result<bool> {
 /// `last_t2_failed_at` goes with the rest of the lifecycle: a revival
 /// is an operator decision to re-check the row from scratch (the same
 /// one *Reset status* makes), and a row that keeps a stale T2 block is
-/// in no lane at all, the T1 sample and the priority queue both filter
+/// in no lane at all. The T1 sample and the priority queue both filter
 /// on `last_t2_failed_at IS NULL`, and the T2 sample wants `alive` or
 /// `ready` rows, not a fresh `unknown`.
 pub async fn revive_removed(
@@ -924,7 +924,7 @@ pub async fn revive_removed_without_probe_history(
 /// clears, `quarantined_at`, `ladder_at`, `ladder_step`, `fail_count`.
 /// `removed_at` stays NULL because quarantined rows never had a
 /// `removed_at`. Returns the revived ids for enqueueing; link-less rows
-/// stay `quarantine` (see [`revive_removed`], a revived row with no
+/// stay `quarantine` (see [`revive_removed`]: a revived row with no
 /// source link is in no probe lane, the ladder it was on is exactly the
 /// one this call drops). `last_t2_failed_at` is cleared like everywhere
 /// else a revival happens, for the same reason.
@@ -3108,7 +3108,7 @@ mod tests {
     /// a read-modify-write, so the read and the write have to be one
     /// atomic step. Two checks of the same row in flight at once (the
     /// probe can pick the same proxy up in two lanes, and the admin
-    /// actions write to the same table) must both count, split into a
+    /// actions write to the same table) must both count: split into a
     /// read statement and a write statement, the second one writes back
     /// the value it read before the first bump landed and the failure is
     /// lost. Repeated: a single lost update is a scheduling accident,
@@ -3899,7 +3899,7 @@ mod tests {
 
     /// The admin card refresh resolves a host and writes the whole stamp
     /// back. The resolver merges the databases with an `any`-hit, so one
-    /// stamp can be partial where the others are silent, an ASN-only hit
+    /// stamp can be partial where the others are silent. An ASN-only hit
     /// (the City record decodes with an empty country, as it does for the
     /// Cloudflare `104.16.0.0/12` block) must not erase the country the
     /// ingest path already resolved, same invariant the reconcile upsert

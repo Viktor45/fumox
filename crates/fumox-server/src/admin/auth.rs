@@ -44,7 +44,7 @@ enum Forwarded {
     TrustedChain,
     /// No usable entry at all: the header is absent, empty, unparsable, or
     /// deliberately opaque (`for=_hidden`, `for=unknown`). This is silence,
-    /// not evidence, a proxy that hides the client writes exactly this,
+    /// not evidence. A proxy that hides the client writes exactly this,
     /// and so does a client that sends a header the proxy ignores.
     Nothing,
 }

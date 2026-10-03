@@ -176,7 +176,12 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
                 m.insert("tls".into(), minimal_tls(entry));
             }
         }
-        Scheme::Naive | Scheme::Tuic | Scheme::Mieru => return None,
+        // sing-box has no outbound type for either, and guessing a field
+        // layout would hand it a config it cannot start. `None` is
+        // `filter_map`ped away, so they are left out of the export.
+        Scheme::Naive | Scheme::Tuic | Scheme::Mieru | Scheme::Snell | Scheme::AnyTls => {
+            return None;
+        }
     }
 
     Some(Value::Object(m))

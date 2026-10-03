@@ -25,6 +25,13 @@ pub enum Scheme {
     Mieru,
     Socks5,
     Naive,
+    /// Snell (v1-v6), an obfuscated TCP proxy. meow-rs gained v6 in
+    /// 0.22.0 (`default`/`unshaped`/`unsafe-raw` record modes, pooled
+    /// connections); older servers keep their own version in `params`.
+    Snell,
+    /// AnyTLS, a TLS-shaped proxy that pads to traffic shape. Native in
+    /// meow-rs since 0.21.x.
+    AnyTls,
 }
 
 impl Scheme {
@@ -39,6 +46,8 @@ impl Scheme {
             Scheme::Mieru => "mieru",
             Scheme::Socks5 => "socks5",
             Scheme::Naive => "naive",
+            Scheme::Snell => "snell",
+            Scheme::AnyTls => "anytls",
         }
     }
 
@@ -54,6 +63,8 @@ impl Scheme {
             Scheme::Mieru,
             Scheme::Socks5,
             Scheme::Naive,
+            Scheme::Snell,
+            Scheme::AnyTls,
         ]
     }
 
@@ -86,6 +97,8 @@ impl FromStr for Scheme {
             "mieru" => Scheme::Mieru,
             "socks5" => Scheme::Socks5,
             "naive" => Scheme::Naive,
+            "snell" => Scheme::Snell,
+            "anytls" => Scheme::AnyTls,
             other => {
                 return Err(crate::Error::Parse(format!("unknown scheme: {other:?}")));
             }

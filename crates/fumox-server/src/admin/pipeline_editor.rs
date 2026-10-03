@@ -2097,7 +2097,9 @@ mod tests {
                 "tuic",
                 "mieru",
                 "socks5",
-                "naive"
+                "naive",
+                "snell",
+                "anytls"
             ]
         );
         assert_eq!(

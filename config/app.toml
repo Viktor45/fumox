@@ -491,6 +491,19 @@ backoff_initial_secs = 60
 # Range: 1..=86400 seconds (form).
 # Ceiling of the same backoff: doubling stops here instead of growing on.
 backoff_max_secs = 900
+# Диапазон: true | false. Попадает в генерируемый meow-конфиг как ключ `ipv6`.
+# meow-rs 0.22.0 сделал этот ключ действующим от начала до конца: при false
+# AAAA не опрашиваются, а direct-исходящий отвечает только IPv4. В Fumox через
+# резолвер проходит только хост test_url (серверы прокси пинятся в проверенный
+# IP-литерал), так что менять имеет смысл лишь на IPv6-only исходящем трафике
+# или когда test_url доступен исключительно по AAAA. Дефолт как в meow-rs.
+# Range: true | false. Rendered into the generated meow config as `ipv6`.
+# meow-rs 0.22.0 made the key effective end-to-end: under `false` AAAA lookups
+# are skipped and the direct outbound answers IPv4-only. Only the test-URL
+# host is resolved here (proxy servers are pinned to a vetted IP literal), so
+# this matters solely on IPv6-only egress or an AAAA-only test URL. Default
+# matches meow-rs.
+ipv6 = false
 
 [retention]
 # Диапазон: 1..=3650 дней (форма), то есть до 10 лет. Меньше 1 отвергнуть

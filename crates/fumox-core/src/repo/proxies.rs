@@ -1227,7 +1227,16 @@ pub const T1_EXCLUDED_SCHEMES: &[&str] = &["hysteria2", "tuic", "mieru"];
 /// the SQL, so the selector must not offer rows that would only be dropped
 /// again: under the recency-priority order a perpetually uncheckable row
 /// would otherwise sit at the head of the sample forever (starvation).
-pub const T2_SCHEMES: &[&str] = &["vless", "vmess", "trojan", "ss", "hysteria2", "socks5"];
+pub const T2_SCHEMES: &[&str] = &[
+    "vless",
+    "vmess",
+    "trojan",
+    "ss",
+    "hysteria2",
+    "socks5",
+    "snell",
+    "anytls",
+];
 
 /// Random sample of probeable proxies for one T1 cycle.
 ///

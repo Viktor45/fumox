@@ -223,6 +223,8 @@
 "set.auth_fail_limit" = "Лимит ошибок авторизации (403)"
 "set.backoff_initial" = "Backoff: начальный"
 "set.backoff_max" = "Backoff: максимум"
+"set.meow_ipv6" = "Резолвить test URL и по IPv6"
+"set.meow_ipv6_hint" = "С meow-rs 0.22.0 ключ действует по-настоящему: off = только IPv4 (дефолт meow-rs), on = dual-stack. Имеет значение только при IPv6-only исходящем трафике или test URL только по AAAA."
 "set.banner" = "Значения задаются в config/app.toml (или переменными FUMOX_*) и применяются после рестарта соответствующего процесса (сервера или чекера)."
 "set.bind" = "Адрес слушателя"
 "set.bytes" = "байт"

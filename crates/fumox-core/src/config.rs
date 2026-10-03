@@ -622,6 +622,13 @@ pub struct MeowConfig {
     /// Upper bound of the meow-rs retry backoff.
     #[serde(default = "defaults::meow_backoff_max_secs")]
     pub backoff_max_secs: u64,
+    /// Resolve the T2 test URL over IPv4 only (meow-rs' own default).
+    ///
+    /// Only the *test URL* host is resolved through meow (proxy servers
+    /// are pinned to an IP literal), so this matters solely on IPv6-only
+    /// egress or an AAAA-only test URL.
+    #[serde(default = "defaults::meow_ipv6")]
+    pub ipv6: bool,
 }
 
 impl Default for MeowConfig {
@@ -633,6 +640,7 @@ impl Default for MeowConfig {
             timeout_secs: defaults::meow_timeout_secs(),
             backoff_initial_secs: defaults::meow_backoff_initial_secs(),
             backoff_max_secs: defaults::meow_backoff_max_secs(),
+            ipv6: defaults::meow_ipv6(),
         }
     }
 }
@@ -1159,6 +1167,10 @@ mod defaults {
     }
     pub const fn meow_backoff_max_secs() -> u64 {
         15 * 60
+    }
+    /// meow-rs' own `ipv6` default (mihomo parity): IPv4-only resolution.
+    pub const fn meow_ipv6() -> bool {
+        false
     }
     pub fn meow_api_addr() -> String {
         "127.0.0.1:9090".to_string()

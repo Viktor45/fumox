@@ -145,6 +145,28 @@ pub static SOCKS5_SPEC: UriSchemeSpec = UriSchemeSpec {
     credential_required: false,
 };
 
+/// `snell://<psk>@host:port?version=4&obfs=http&obfs-host=...`
+///
+/// The psk is the userinfo, like trojan's password. meow-rs rejects `obfs`
+/// on v6, so both keys stay ordinary and the engine refuses the illegal
+/// combination itself.
+pub static SNELL_SPEC: UriSchemeSpec = UriSchemeSpec {
+    scheme: Scheme::Snell,
+    prefix: "snell://",
+    known_keys: &["version", "mode", "obfs", "obfs-host", "reuse", "udp"],
+    credential_required: true,
+};
+
+/// `anytls://<password>@host:port?sni=...&insecure=1`
+///
+/// A TLS-shaped protocol, so it carries the usual TLS knobs.
+pub static ANYTLS_SPEC: UriSchemeSpec = UriSchemeSpec {
+    scheme: Scheme::AnyTls,
+    prefix: "anytls://",
+    known_keys: &["sni", "alpn", "fp", "insecure", "allowinsecure", "udp"],
+    credential_required: true,
+};
+
 pub static NAIVE_SPEC: UriSchemeSpec = UriSchemeSpec {
     scheme: Scheme::Naive,
     prefix: "naive+https://",
@@ -776,5 +798,69 @@ mod tests {
             serialize_query(&params),
             "path=/a%2Fb%20c?d=1&host=%.DE&raw=50%off%26тест"
         );
+    }
+
+    /// A `snell://` line must round-trip: the psk is the userinfo, the
+    /// version/obfs travel as ordinary params, and serializing the parsed
+    /// entry must reproduce a line the parser accepts again.
+    #[test]
+    fn snell_line_round_trips() {
+        let line = "snell://psk123@h.example.com:44046?version=4&obfs=http&obfs-host=bing.com#sn";
+        let entry = parse_with_spec(
+            &SNELL_SPEC,
+            "psk123@h.example.com:44046?version=4&obfs=http&obfs-host=bing.com#sn",
+            line,
+        )
+        .unwrap();
+        assert_eq!(entry.scheme, Scheme::Snell);
+        assert_eq!(entry.host, "h.example.com");
+        assert_eq!(entry.port, 44046);
+        assert_eq!(entry.credential, "psk123");
+        assert_eq!(entry.param("version"), Some("4"));
+        assert_eq!(entry.param("obfs"), Some("http"));
+        assert_eq!(entry.param("obfs-host"), Some("bing.com"));
+
+        let out = serialize_with_spec(&SNELL_SPEC, &entry);
+        assert!(out.starts_with("snell://"), "{out}");
+        let back =
+            parse_with_spec(&SNELL_SPEC, out.strip_prefix("snell://").unwrap(), &out).unwrap();
+        assert_eq!(back.credential, entry.credential);
+        assert_eq!(back.param("obfs-host"), Some("bing.com"));
+    }
+
+    /// Same for `anytls://`: the password is the userinfo, `sni` rides as a
+    /// parameter.
+    #[test]
+    fn anytls_line_round_trips() {
+        let rest = "pw@h.example.com:443?sni=a.example.com#at";
+        let line = format!("anytls://{rest}");
+        let entry = parse_with_spec(&ANYTLS_SPEC, rest, &line).unwrap();
+        assert_eq!(entry.scheme, Scheme::AnyTls);
+        assert_eq!(entry.credential, "pw");
+        assert_eq!(entry.param("sni"), Some("a.example.com"));
+
+        let out = serialize_with_spec(&ANYTLS_SPEC, &entry);
+        assert!(out.starts_with("anytls://"), "{out}");
+        let back =
+            parse_with_spec(&ANYTLS_SPEC, out.strip_prefix("anytls://").unwrap(), &out).unwrap();
+        assert_eq!(back.credential, "pw");
+        assert_eq!(back.param("sni"), Some("a.example.com"));
+    }
+
+    /// Both schemes carry a secret, so a line without one is unusable and
+    /// must be rejected rather than stored as a credential-less proxy.
+    #[test]
+    fn snell_and_anytls_require_a_credential() {
+        for (spec, rest) in [
+            (&SNELL_SPEC, "h.example.com:44046"),
+            (&ANYTLS_SPEC, "h.example.com:443"),
+        ] {
+            let line = rest.to_string();
+            assert!(
+                parse_with_spec(spec, rest, &line).is_err(),
+                "{} must reject a credential-less line",
+                spec.prefix
+            );
+        }
     }
 }

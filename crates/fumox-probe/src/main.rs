@@ -738,7 +738,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
         return Ok(batch.len() + blocked);
     }
 
-    let (yaml, included) = clash::generate(&batch, &pins)?;
+    let (yaml, included) = clash::generate(&batch, &pins, ctx.config.meow.ipv6)?;
     let config_path = &ctx.config.meow.config_path;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -772,6 +772,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     if let Err(error) = meta_set(&ctx.pool, "meow_last_ok", &now_ts().to_string()).await {
         tracing::warn!(%error, "failed to stamp meow_last_ok");
     }
+    stamp_meow_memory(&ctx).await;
 
     let semaphore = Arc::new(Semaphore::new(ctx.config.probe.concurrency.max(1)));
     // Set by the first task to see the engine fail mid-batch: every proxy
@@ -1033,6 +1034,27 @@ async fn journal_engine_failure(ctx: &Context, batch: &[proxies::ProxyRow], reas
 /// wipe the whole history on every cycle, so it is clamped to one day.
 fn retention_cutoff(now: i64, days: u32) -> i64 {
     now - i64::from(days.max(1)) * 86_400
+}
+
+/// Publish the proxy kernel's RSS for the admin panel.
+///
+/// Purely observational: failures touch neither the fail ladder nor the
+/// backoff. Only cycles that reload meow-rs refresh it, so a stale number
+/// means "no T2 batch ran lately", not "the kernel shrank".
+async fn stamp_meow_memory(ctx: &Context) {
+    match ctx.meow.memory().await {
+        Ok(mem) => {
+            let payload = serde_json::json!({
+                "rss_bytes": mem.rss_bytes,
+                "os_limit_bytes": mem.os_limit_bytes,
+                "ts": now_ts(),
+            });
+            if let Err(error) = meta_set(&ctx.pool, "meow_memory", &payload.to_string()).await {
+                tracing::debug!(%error, "failed to stamp meow_memory");
+            }
+        }
+        Err(error) => tracing::debug!(%error, "meow-rs /memory unavailable"),
+    }
 }
 
 /// Periodically upsert `probe_heartbeat` into `meta` so the admin panel can
@@ -1850,6 +1872,7 @@ mod tests {
                 timeout_secs: 3,
                 backoff_initial_secs: 60,
                 backoff_max_secs: 900,
+                ipv6: false,
             },
             ..Default::default()
         }

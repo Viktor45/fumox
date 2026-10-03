@@ -62,6 +62,23 @@ struct Heartbeat {
     alive: bool,
 }
 
+/// Parsed `meow_memory` meta value, stamped by the probe daemon from
+/// meow-rs' `GET /memory`.
+#[derive(serde::Deserialize)]
+struct MeowMemoryView {
+    rss_bytes: u64,
+    os_limit_bytes: u64,
+    ts: i64,
+}
+
+impl MeowMemoryView {
+    /// RSS as a share of the limit, when meow-rs resolved one.
+    fn percent_of_limit(&self) -> Option<f64> {
+        (self.os_limit_bytes > 0)
+            .then(|| self.rss_bytes as f64 * 100.0 / self.os_limit_bytes as f64)
+    }
+}
+
 #[derive(Template)]
 #[template(path = "probe.html")]
 struct ProbeTemplate {
@@ -73,6 +90,8 @@ struct ProbeTemplate {
     proxy_counts: Vec<(String, i64)>,
     heartbeat: Option<Heartbeat>,
     meow_last_ok: Option<i64>,
+    /// Kernel RSS as published by the probe daemon (`meow_memory` meta).
+    meow_memory: Option<MeowMemoryView>,
     /// Check-coverage buckets (`none`/`t1_only`/`t2_only`/`both`), fixed
     /// order, zero-filled, each links into the filtered proxy browser.
     coverage: Vec<(String, i64)>,
@@ -590,6 +609,44 @@ impl ProbeTemplate {
     fn queue_shown(&self) -> i64 {
         self.queue.len() as i64
     }
+    /// Human-readable byte count for the kernel RSS card.
+    ///
+    /// One decimal, unlike the settings page's whole-unit formatter: RSS
+    /// moves continuously, so exact divisibility would print `10412 KiB`.
+    fn bytes(&self, bytes: &u64) -> String {
+        const MIB: f64 = 1024.0 * 1024.0;
+        const KIB: f64 = 1024.0;
+        let b = *bytes as f64;
+        if b >= MIB {
+            format!("{:.1} MiB", b / MIB)
+        } else if b >= KIB {
+            format!("{:.0} KiB", b / KIB)
+        } else {
+            format!("{bytes} B")
+        }
+    }
+    /// The kernel's RSS line, e.g. `RSS 24.5 MiB · 1.2% / 2.0 GiB`. `None`
+    /// when the probe has not published a reading yet (or none is due, if no
+    /// T2 batch has reloaded meow-rs lately).
+    fn mem_line(&self) -> String {
+        let Some(mem) = self.meow_memory.as_ref() else {
+            return String::new();
+        };
+        let mut line = format!("RSS {}", self.bytes(&mem.rss_bytes));
+        if let Some(pct) = mem.percent_of_limit() {
+            line.push_str(&format!(
+                " · {pct:.1}% / {}",
+                self.bytes(&mem.os_limit_bytes)
+            ));
+        }
+        line.push_str(&format!(" · {}", self.ts(&mem.ts)));
+        line
+    }
+
+    /// Whether a reading is worth showing at all.
+    fn has_mem(&self) -> bool {
+        self.meow_memory.is_some()
+    }
     /// The next scheduled check for a quarantined proxy.
     fn next_check(&self, row: &QuarantineRow) -> String {
         fmt_opt_ts_element(row.ladder_at)
@@ -776,6 +833,12 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
         Err(err) => return server_error(lang, &err),
     };
 
+    let meow_memory = match meta_get(pool, "meow_memory").await {
+        Ok(Some(raw)) => serde_json::from_str::<MeowMemoryView>(&raw).ok(),
+        Ok(None) => None,
+        Err(err) => return server_error(lang, &err),
+    };
+
     let coverage = match proxies::count_by_check_coverage(pool).await {
         Ok(coverage) => coverage,
         Err(err) => return server_error(lang, &err),
@@ -841,6 +904,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
             proxy_counts,
             heartbeat,
             meow_last_ok,
+            meow_memory,
             coverage,
             quarantine_count,
             queue,

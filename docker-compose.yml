@@ -143,7 +143,7 @@ services:
       args:
         # "latest" (default) resolves the newest meow-rs release at build
         # time via the GitHub API. Set MEOW_VERSION in .env to a tag
-        # (e.g. v0.21.2) to pin a specific release instead.
+        # (e.g. v0.22.0) to pin a specific release instead.
         MEOW_VERSION: ${MEOW_VERSION:-latest}
     image: ghcr.io/viktor45/fumox-meow:latest
     volumes:

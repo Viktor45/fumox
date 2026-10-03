@@ -432,6 +432,10 @@ fn raw_from_config(c: &AppConfig) -> HashMap<String, String> {
         "meow.backoff_max_secs".into(),
         m.backoff_max_secs.to_string(),
     );
+    // `bool_to_raw`, not `to_string()`: the edit page reads presence as
+    // truth (an unchecked checkbox is simply absent from the form), so a
+    // literal "false" would render the box as checked.
+    raw.insert("meow.ipv6".into(), bool_to_raw(m.ipv6));
 
     raw.insert(
         "retention.probe_results_days".into(),
@@ -1124,6 +1128,7 @@ fn apply_all(
         lang,
         errors,
     );
+    bool_field(raw, "meow.ipv6", cfg, "meow.ipv6", errors);
 
     // --- retention ---
     u32_field(
@@ -1697,6 +1702,28 @@ mod tests {
             "expected cross-field error, got {errors:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `false` boolean must reach the edit page as an ABSENT raw value:
+    /// `bool_value` reads presence as truth, so storing the literal "false"
+    /// would render the box as checked: the raw map is the whole contract.
+    #[test]
+    fn meow_ipv6_raw_value_round_trips_as_a_checkbox() {
+        // `bool_value` reads a non-empty value as true, so `false` has to
+        // land as an empty string, the literal "false" would check the box.
+        let mut cfg = AppConfig::default();
+        cfg.meow.ipv6 = false;
+        assert_eq!(
+            raw_from_config(&cfg).get("meow.ipv6").map(String::as_str),
+            Some(""),
+            "false must map to an empty raw value, not the literal"
+        );
+
+        cfg.meow.ipv6 = true;
+        assert_eq!(
+            raw_from_config(&cfg).get("meow.ipv6").map(String::as_str),
+            Some("on")
+        );
     }
 
     #[test]

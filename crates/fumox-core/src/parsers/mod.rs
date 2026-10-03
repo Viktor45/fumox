@@ -60,6 +60,8 @@ pub fn parse_line(line: &str) -> LineOutcome {
         "tuic" => parsed(uri::parse_with_spec(&uri::TUIC_SPEC, rest, line)),
         "mieru" => parsed(uri::parse_with_spec(&uri::MIERU_SPEC, rest, line)),
         "socks5" => parsed(uri::parse_with_spec(&uri::SOCKS5_SPEC, rest, line)),
+        "snell" => parsed(uri::parse_with_spec(&uri::SNELL_SPEC, rest, line)),
+        "anytls" => parsed(uri::parse_with_spec(&uri::ANYTLS_SPEC, rest, line)),
         "ss" => parsed(ss::parse(rest, line)),
         "vmess" => parsed(vmess::parse(rest, line)),
         // happ:// is recognized and deliberately discarded (MVP decision).
@@ -295,6 +297,8 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         Scheme::Tuic => uri::serialize_with_spec(&uri::TUIC_SPEC, entry),
         Scheme::Mieru => uri::serialize_with_spec(&uri::MIERU_SPEC, entry),
         Scheme::Socks5 => uri::serialize_with_spec(&uri::SOCKS5_SPEC, entry),
+        Scheme::Snell => uri::serialize_with_spec(&uri::SNELL_SPEC, entry),
+        Scheme::AnyTls => uri::serialize_with_spec(&uri::ANYTLS_SPEC, entry),
         Scheme::Naive => serialize_naive(entry),
         Scheme::Ss => ss::serialize(entry),
         Scheme::Vmess => vmess::serialize(entry),

@@ -121,6 +121,33 @@ const SOCKS5_SPEC: ClashTypeSpec = ClashTypeSpec {
     known_fields: &["udp"],
 };
 
+/// `type: snell`: meow names the secret `psk`; it is a single required
+/// credential field, so the stored credential is the bare psk.
+const SNELL_SPEC: ClashTypeSpec = ClashTypeSpec {
+    scheme: Scheme::Snell,
+    credential_fields: &["psk"],
+    optional_credential_fields: false,
+    known_fields: &[
+        "version",
+        "mode",
+        "reuse",
+        "udp",
+        "obfs",
+        "obfs-host",
+        // The nested block a Clash feed spells obfs in; kept known so the
+        // Clash writer can re-emit it as a block rather than a scalar.
+        "obfs-opts",
+    ],
+};
+
+/// `type: anytls`: single required `password`, like trojan's.
+const ANYTLS_SPEC: ClashTypeSpec = ClashTypeSpec {
+    scheme: Scheme::AnyTls,
+    credential_fields: &["password"],
+    optional_credential_fields: false,
+    known_fields: &["sni", "udp", "skip-cert-verify", "insecure"],
+};
+
 /// Fields consumed structurally and never duplicated into params.
 const STRUCTURAL_FIELDS: &[&str] = &["name", "type", "server", "port"];
 
@@ -179,6 +206,8 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
         "hysteria2" => &HYSTERIA2_SPEC,
         "vless" => &VLESS_SPEC,
         "socks5" => &SOCKS5_SPEC,
+        "snell" => &SNELL_SPEC,
+        "anytls" => &ANYTLS_SPEC,
         _ => return Ok(None),
     };
 
@@ -342,11 +371,26 @@ proxies:
     skip-cert-verify: true
     obfs: salamander
     obfs-password: of-pass
-  - name: legacy-node
+  - name: snell-node
     type: snell
     server: 1.2.3.4
+    port: 44046
+    psk: snellpsk
+    version: 4
+    obfs-opts:
+      mode: http
+      host: bing.com
+  - name: anytls-node
+    type: anytls
+    server: 5.6.7.8
     port: 443
-    psk: abc
+    password: atls-pass
+    sni: atls.example.com
+    skip-cert-verify: true
+  - name: legacy-node
+    type: mieru
+    server: 9.9.9.9
+    port: 443
 proxy-groups:
   - name: auto
     type: url-test
@@ -356,8 +400,8 @@ proxy-groups:
     #[test]
     fn parses_supported_items_and_skips_the_rest() {
         let result = parse_payload(SAMPLE).unwrap();
-        assert_eq!(result.entries.len(), 2);
-        assert_eq!(result.unsupported, 1); // snell
+        assert_eq!(result.entries.len(), 4);
+        assert_eq!(result.unsupported, 1); // mieru
         assert_eq!(result.invalid, 0);
 
         let ss = &result.entries[0];
@@ -374,6 +418,87 @@ proxy-groups:
         assert_eq!(hy2.param("obfs"), Some("salamander"));
         assert_eq!(hy2.param("skip-cert-verify"), Some("true"));
         assert!(hy2.params.iter().find(|p| p.key == "sni").unwrap().known);
+
+        // snell: the psk is the whole credential, and the nested obfs block
+        // survives as a mapping the Clash writer can re-emit.
+        let snell = &result.entries[2];
+        assert_eq!(snell.scheme, Scheme::Snell);
+        assert_eq!(snell.host, "1.2.3.4");
+        assert_eq!(snell.port, 44046);
+        assert_eq!(snell.credential, "snellpsk");
+        assert_eq!(snell.param("version"), Some("4"));
+        assert!(
+            snell
+                .params
+                .iter()
+                .find(|p| p.key == "obfs-opts")
+                .unwrap()
+                .known
+        );
+
+        let anytls = &result.entries[3];
+        assert_eq!(anytls.scheme, Scheme::AnyTls);
+        assert_eq!(anytls.credential, "atls-pass");
+        assert_eq!(anytls.param("sni"), Some("atls.example.com"));
+        assert!(
+            anytls
+                .params
+                .iter()
+                .find(|p| p.key == "skip-cert-verify")
+                .unwrap()
+                .known
+        );
+    }
+
+    /// The two schemes must survive a Clash round-trip: a feed entry
+    /// parsed to an entry must render back to something meow-rs accepts,
+    /// otherwise a Clash subscription would lose them on every export.
+    #[test]
+    fn snell_and_anytls_round_trip_through_the_clash_writer() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: s, type: snell, server: 1.2.3.4, port: 44046, psk: psk, ",
+            "version: 6, mode: unshaped, reuse: true, ",
+            "obfs-opts: {mode: tls, host: bing.com}}\n",
+            "  - {name: a, type: anytls, server: 5.6.7.8, port: 443, ",
+            "password: pw, sni: a.example.com, skip-cert-verify: true}\n",
+        );
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.entries.len(), 2);
+
+        let snell = crate::formats::clash::entry_to_clash(&result.entries[0]).unwrap();
+        assert_eq!(snell.get("type").and_then(|v| v.as_str()), Some("snell"));
+        assert_eq!(snell.get("psk").and_then(|v| v.as_str()), Some("psk"));
+        assert_eq!(snell.get("version").and_then(|v| v.as_str()), Some("6"));
+        assert_eq!(snell.get("mode").and_then(|v| v.as_str()), Some("unshaped"));
+        assert_eq!(snell.get("reuse").and_then(|v| v.as_bool()), Some(true));
+        // meow-rs reads obfs as a block; the writer must not flatten it.
+        assert_eq!(
+            snell
+                .get("obfs-opts")
+                .and_then(|v| v.get("mode"))
+                .and_then(|v| v.as_str()),
+            Some("tls")
+        );
+        assert_eq!(
+            snell
+                .get("obfs-opts")
+                .and_then(|v| v.get("host"))
+                .and_then(|v| v.as_str()),
+            Some("bing.com")
+        );
+
+        let anytls = crate::formats::clash::entry_to_clash(&result.entries[1]).unwrap();
+        assert_eq!(anytls.get("type").and_then(|v| v.as_str()), Some("anytls"));
+        assert_eq!(anytls.get("password").and_then(|v| v.as_str()), Some("pw"));
+        assert_eq!(
+            anytls.get("sni").and_then(|v| v.as_str()),
+            Some("a.example.com")
+        );
+        assert_eq!(
+            anytls.get("skip-cert-verify").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]

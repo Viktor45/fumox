@@ -223,6 +223,8 @@
 "set.auth_fail_limit" = "Failed-auth rate limit (403)"
 "set.backoff_initial" = "Backoff: initial"
 "set.backoff_max" = "Backoff: maximum"
+"set.meow_ipv6" = "Resolve test URL over IPv6 too"
+"set.meow_ipv6_hint" = "meow-rs 0.22.0 makes this effective: off = IPv4-only resolution (meow-rs default), on = dual-stack. Only matters on IPv6-only egress or an AAAA-only test URL."
 "set.banner" = "Values are set in config/app.toml (or FUMOX_* environment variables) and apply after the owning process restarts (the server or the probe daemon)."
 "set.bind" = "Bind address"
 "set.bytes" = "bytes"

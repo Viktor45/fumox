@@ -368,6 +368,14 @@
         {% match self.range_text("meow.backoff_max_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("meow.backoff_max_secs") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
+      <div class="field">
+        <span class="check-row">
+          <input type="hidden" name="meow.ipv6" value="off">
+          <input type="checkbox" name="meow.ipv6" value="on" id="meow-ipv6" {% if self.bool_value("meow.ipv6") %}checked{% endif %}>
+          <label for="meow-ipv6">{{ self.t("set.meow_ipv6") }}</label>
+        </span>
+        <div class="hint">{{ self.t("set.meow_ipv6_hint") }}</div>
+      </div>
     </div>
 
     <div class="panel">

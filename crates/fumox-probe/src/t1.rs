@@ -36,7 +36,6 @@ impl CheckKind {
 pub fn check_kind(scheme: Scheme, params_json: Option<&str>) -> CheckKind {
     match scheme {
         Scheme::Trojan | Scheme::Naive => CheckKind::Tls,
-        Scheme::Ss | Scheme::Socks5 => CheckKind::Tcp,
         Scheme::Vless | Scheme::Vmess => {
             if params_enable_tls(params_json) {
                 CheckKind::Tls
@@ -44,7 +43,14 @@ pub fn check_kind(scheme: Scheme, params_json: Option<&str>) -> CheckKind {
                 CheckKind::Tcp
             }
         }
+        // Snell is a plain TCP protocol (its obfs is a wrapper the tunnel
+        // itself speaks, not a handshake T1 could validate), so a connect
+        // is the honest reachability signal.
+        Scheme::Ss | Scheme::Socks5 | Scheme::Snell => CheckKind::Tcp,
         Scheme::Hysteria2 | Scheme::Tuic | Scheme::Mieru => CheckKind::Tcp,
+        // AnyTLS speaks TLS to its server, so a handshake is a stronger
+        // liveness signal than a bare connect and matches trojan's tier.
+        Scheme::AnyTls => CheckKind::Tls,
     }
 }
 

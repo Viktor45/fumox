@@ -3,14 +3,14 @@
 # combined multi-arch manifest to GHCR (ghcr.io/viktor45/fumox-meow).
 #
 # MANUAL ONLY: this workflow never runs on push or tags — dispatch it from
-# the Actions tab (or `gh workflow run docker-meow.yml [-f meow_version=v0.21.2]`).
+# the Actions tab (or `gh workflow run docker-meow.yml [-f meow_version=v0.22.0]`).
 #
 # The MEOW_VERSION input picks the packaged meow-rs release, exactly like the
 # MEOW_VERSION build arg of docker/meow/Dockerfile (and .env for local
 # builds): `latest` (default) resolves the newest upstream release at build
-# time through the GitHub API; a tag (e.g. v0.21.2) pins one. The input value
+# time through the GitHub API; a tag (e.g. v0.22.0) pins one. The input value
 # (whitespace-trimmed) is also applied as an image tag, so a pinned build is
-# addressable as ghcr.io/viktor45/fumox-meow:v0.21.2.
+# addressable as ghcr.io/viktor45/fumox-meow:v0.22.0.
 #
 # Strategy: same as docker.yml — each architecture is built NATIVELY on a
 # matching GitHub runner (the fetch stage runs apt-get, which is painfully
@@ -21,7 +21,7 @@
 # Resulting tags:
 #   MEOW_VERSION=latest  -> latest, main, sha-<shortsha>   (latest only from
 #                           main or a v* tag, same ref gate docker.yml uses)
-#   MEOW_VERSION=v0.21.2 -> v0.21.2, main, sha-<shortsha>  (from any ref)
+#   MEOW_VERSION=v0.22.0 -> v0.22.0, main, sha-<shortsha>  (from any ref)
 #
 # The compose/quadlet stacks use the locally built `fumox-meow:local`; this
 # GHCR image exists for deployments that prefer to pull — point the compose
@@ -33,7 +33,7 @@ on:
   workflow_dispatch:
     inputs:
       meow_version:
-        description: "meow-rs release to package (tag like v0.21.2, or latest)"
+        description: "meow-rs release to package (tag like v0.22.0, or latest)"
         required: false
         default: "latest"
 
@@ -75,7 +75,7 @@ jobs:
           # the published tag list, or the image itself (supply-chain
           # hygiene: the value is operator input, but fail fast anyway).
           if ! [[ "$MEOW_VERSION" =~ ^(latest|v?[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "::error::meow_version must be 'latest' or a tag like v0.21.2, got: $MEOW_VERSION" >&2
+            echo "::error::meow_version must be 'latest' or a tag like v0.22.0, got: $MEOW_VERSION" >&2
             exit 1
           fi
           echo "MEOW_VERSION=${MEOW_VERSION}" >> "$GITHUB_ENV"
@@ -172,7 +172,7 @@ jobs:
           # the published tag list, or the image itself (supply-chain
           # hygiene: the value is operator input, but fail fast anyway).
           if ! [[ "$MEOW_VERSION" =~ ^(latest|v?[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "::error::meow_version must be 'latest' or a tag like v0.21.2, got: $MEOW_VERSION" >&2
+            echo "::error::meow_version must be 'latest' or a tag like v0.22.0, got: $MEOW_VERSION" >&2
             exit 1
           fi
           echo "MEOW_VERSION=${MEOW_VERSION}" >> "$GITHUB_ENV"

@@ -146,6 +146,59 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
                 put("tls", Value::Bool(true));
             }
         }
+        Scheme::Snell => {
+            put("type", Value::String("snell".into()));
+            // meow-rs names the secret `psk`; the URI keeps it as the
+            // userinfo, so the credential maps straight across.
+            put("psk", Value::String(entry.credential.clone()));
+            // Omitted entirely when the feed does not say: meow's own
+            // default is v4, and writing an explicit default here would
+            // pin every entry to a value the operator never chose.
+            if let Some(version) = super::param_value(entry, "version") {
+                put("version", Value::String(version.to_string()));
+            }
+            // Only emitted when asked, so a false cannot become "true"
+            // through a string round-trip. `udp` comes from the shared
+            // tail below, which also covers the Clash-input case.
+            if super::param_truthy(entry, "reuse") {
+                put("reuse", Value::Bool(true));
+            }
+            // Both keys pass through verbatim, including the combinations
+            // meow rejects (obfs-opts on v6, mode on older). It drops those
+            // items rather than failing the config, so the T2 check 404s and
+            // charges the proxy, which is the honest verdict.
+            if let Some(mode) = super::param_value(entry, "mode") {
+                put("mode", Value::String(mode.to_string()));
+            }
+            // A Clash feed keeps the nested `obfs-opts` block, a URI feed the
+            // flat `obfs` / `obfs-host` pair. The flat form wins, as in put_ws_opts.
+            let obfs_yaml = super::param_map(entry, "obfs-opts");
+            let obfs =
+                super::param_value(entry, "obfs").or_else(|| super::map_str(&obfs_yaml, "mode"));
+            let obfs_host = super::param_value(entry, "obfs-host")
+                .or_else(|| super::map_str(&obfs_yaml, "host"));
+            if obfs.is_some() || obfs_host.is_some() {
+                let mut opts = Mapping::new();
+                // meow treats an absent obfs as off, and so do we: only a
+                // host without a mode would be ambiguous.
+                opts.insert(
+                    Value::String("mode".into()),
+                    Value::String(obfs.clone().unwrap_or_else(|| "off".to_string())),
+                );
+                if let Some(host) = obfs_host {
+                    opts.insert(Value::String("host".into()), Value::String(host));
+                }
+                put("obfs-opts", Value::Mapping(opts));
+            }
+        }
+        Scheme::AnyTls => {
+            put("type", Value::String("anytls".into()));
+            put("password", Value::String(entry.credential.clone()));
+            // meow's anytls parser reads `sni` only; it has no
+            // client-fingerprint knob, so `fp` is deliberately not mapped.
+            copy_param(entry, "sni", "sni", &mut put);
+            // skip-cert-verify and udp come from the shared tail below.
+        }
         Scheme::Naive | Scheme::Tuic | Scheme::Mieru => return None,
     }
 

@@ -70,8 +70,11 @@ Concretely, Fumox:
   sing-box JSON).
 - **Parses** every proxy line into a normalized model. Supported protocols:
   `vless`, `vmess`, `trojan`, `ss` (Shadowsocks), `hysteria2`, `tuic`, `mieru`,
-  `socks5`, `naive+https`. Parameters Fumox doesn't recognize are carried
-  through untouched: nothing is ever lost.
+  `socks5`, `naive+https`, `snell`, `anytls`. Parameters Fumox doesn't
+  recognize are carried through untouched: nothing is ever lost. Note that
+  sing-box output has no outbound type for Snell or AnyTLS, so a sing-box
+  export leaves those proxies out rather than emitting a block it cannot
+  start; the Clash and URI outputs carry them in full.
 - **Processes** proxies through a configurable pipeline: protocol filters,
   regex renaming, geo-tagging with country flags, health filtering,
   deduplication, sorting.
@@ -199,7 +202,7 @@ Useful `.env` variables (all except the token are optional):
 | `FUMOX_MEOW__TEST_URL`            | `http://www.gstatic.com/generate_204` | URL used for T2 delay tests. Override if it is blocked in your region (e.g. `http://cp.cloudflare.com`).                                                         |
 | `FUMOX_ADMIN__ALLOW_PRIVATE_URLS` | `false`                               | Allow source URLs pointing at private/loopback addresses (disables the SSRF guard). Local testing only.                                                          |
 | `FUMOX_CONFIG_ACCESS`             | `rw`                                  | Mount mode for `./config` in the **server** container. `rw` lets the admin *Edit settings* page save `app.toml`; `ro` mounts it read-only, which turns that page into a read-only view. The probe container is always `:ro`. |
-| `MEOW_VERSION`                    | `latest`                              | The meow-rs release for **local builds** of the wrapper image (`--build` mode; no effect when pulling). `latest` resolves the newest release via the GitHub API; a tag (e.g. `v0.21.2`) pins one. |
+| `MEOW_VERSION`                    | `latest`                              | The meow-rs release for **local builds** of the wrapper image (`--build` mode; no effect when pulling). `latest` resolves the newest release via the GitHub API; a tag (e.g. `v0.22.0`) pins one. |
 
 Notes:
 
@@ -247,6 +250,23 @@ Notes:
   ready-made from GHCR or built in `--build` mode; it is published manually
   by the `docker-meow.yml` workflow (see Option B). Its REST API (port 9090)
   is only reachable from the probe over the internal network.
+- **Upgrading the engine.** Fumox drives meow-rs over a small, stable slice
+  of its REST API (`GET /version`, `PUT /configs`, `GET /proxies/{name}/delay`),
+  and that slice is unchanged across releases: 0.21.2 → 0.22.0 shipped an
+  identical 26-route surface, identical delay parameters and identical
+  404/504/503 semantics, so an upgrade is a rebuild, not a code change. Set
+  `MEOW_VERSION=v0.22.0` in `.env` to pin one (leave it `latest` to track
+  upstream HEAD). Note that 0.22.0 replaced rustls with BoringSSL runtime-wide
+  upstream HEAD). Note that 0.22.0 replaced rustls with BoringSSL runtime-wide
+  and made `ipv6` effective end-to-end, see `[meow].ipv6` below.
+- **What the 0.22.0 upgrade buys T2 immediately**, with no Fumox change: the
+  `xhttp` transport is now a real outbound (0.21.x had no XHTTP at all, so
+  such entries could not be checked), and SIP003 Shadowsocks plugins
+  (`shadow-tls`, `restls`, `jls`, `kcptun`, `gost-plugin`) run in-process
+  instead of spawning a helper binary: the `fumox-meow` image ships only the
+  `meow` binary, so plugin-backed entries that used to fail T2 now work. Both
+  were already rendered correctly by Fumox's Clash writer; only the engine
+  gained the ability to honour them.
 - **Disposable smoke stand:** `scripts/smoke-up.sh` brings the same stack up
   as a second, isolated compose project (`fumox-smoke`) on shifted ports
   (18080 public / 18081 admin; override with `SMOKE_PUBLIC_PORT` /
@@ -295,7 +315,7 @@ The meow-rs wrapper (`docker/meow/Dockerfile`) is on GHCR too,
 `ghcr.io/viktor45/fumox-meow`, but it is published **manually only**: the
 `docker-meow.yml` workflow never runs on push or tags; dispatch it from the
 Actions tab (the `meow_version` input: `latest`, the freshest release at
-build time, or a tag like `v0.21.2`). Resulting tags: the `meow_version`
+build time, or a tag like `v0.22.0`). Resulting tags: the `meow_version`
 value, `main` and `sha-<short sha>`; the attestation is the same, per
 platform. The Option A stack already references this image: `docker compose
 up -d` pulls it, `--build` compiles the wrapper locally (the `.env`
@@ -457,9 +477,10 @@ was rendered. Proxy clients skip `#` lines, so the block is inert for them,
 and for another fumox consuming the link as a source. Base64 profiles do
 not carry the block: the blob must stay a plain encoded list.
 
-Clash and sing-box output can only represent vless, vmess, trojan, ss,
-hysteria2 and socks5; proxies of other protocols (tuic, mieru, naive) are
-skipped with a log entry, not an error. Duplicate display names get automatic
+Clash output can represent vless, vmess, trojan, ss, hysteria2, socks5, snell
+and anytls; sing-box has no outbound type for the last two, so they are left
+out of a sing-box export. Proxies of the remaining protocols (tuic, mieru,
+naive) are skipped with a log entry, not an error. Duplicate display names get automatic
 suffixes: `Name`, `Name (2)`, `Name (3)`…
 
 ### Country filter
@@ -523,7 +544,7 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 | **Profiles**        | Create/edit profiles: composition and order of sources, output format, pipeline overrides, access token, slug; output preview (first 50 lines)                                                        |
 | **Proxies**         | Filterable browser of all proxies (status, protocol, country, source, search by host/name); detail card with parameters, geo, lifecycle timestamps and probe history; *Reset status*; *Purge removed* |
 | **Fetch log**       | Journal of every source fetch: time, status, bytes, proxies found, error class                                                                                                                        |
-| **Probe**           | Health-check daemon status: heartbeat, meow-rs status, quarantine queue with scheduled second chances                                                                                                 |
+| **Probe**           | Health-check daemon status: heartbeat, meow-rs status with the kernel's live RSS (from meow-rs `GET /memory`, refreshed whenever a T2 batch reloads the engine), quarantine queue with scheduled second chances                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
 | **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels: nearly every `config/app.toml` knob, and never the admin token. Two keys are file-only and have no field on the page: `[server].export_max_rows` and `[geo].startup_download_budget_secs`; the file values still apply, the panel just cannot show or edit them. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
 
@@ -738,6 +759,7 @@ tuned values that differ for some keys.
 | `timeout_secs`         | `10`                                                                                    | Per-check timeout                                                                                                                                                                                                                                                                                                                 |
 | `backoff_initial_secs` | `60`                                                                                    | Initial T2 backoff while meow-rs is unavailable (doubles per consecutive failure)                                                                                                                                                                                                                                                 |
 | `backoff_max_secs`     | `900`                                                                                   | T2 backoff ceiling (15 min); a dead meow-rs is never mistaken for dead proxies                                                                                                                                                                                                                                                   |
+| `ipv6`                 | `false`                                                                                  | Rendered into the generated meow config as `ipv6`. meow-rs **0.22.0 made this key effective end-to-end**: under `false` it skips AAAA lookups and its direct outbound answers IPv4-only, where 0.21.x resolved both families whatever the key said. Only the *test URL* host goes through the resolver here: proxy servers are pinned to a vetted IP literal by the generator: so change it solely on IPv6-only egress or an AAAA-only test URL. Default matches meow-rs |
 
 ### `[retention]` – history rotation
 
@@ -879,7 +901,7 @@ are never queued (they could not be checked anyway), and a proxy that leaves
 | Level            | What it proves                                               | Applies to                                  |
 | ---------------- | ------------------------------------------------------------ | ------------------------------------------- |
 | **T1** (TCP/TLS) | The server is reachable at `host:port`                       | vless, vmess, trojan, ss, socks5, naive     |
-| **T2** (tunnel)  | The proxy *actually works*: credentials valid, traffic flows | vless, vmess, trojan, ss, hysteria2, socks5 |
+| **T2** (tunnel)  | The proxy *actually works*: credentials valid, traffic flows | vless, vmess, trojan, ss, hysteria2, socks5, snell, anytls |
 
 QUIC protocols (hysteria2, tuic) skip T1: a TCP connect to a UDP port proves
 nothing. **hysteria2** is not hurt by that: a fresh `unknown` hysteria2 goes

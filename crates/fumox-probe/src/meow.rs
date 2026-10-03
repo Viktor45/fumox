@@ -17,15 +17,28 @@ pub struct MeowClient {
     timeout: Duration,
 }
 
+/// One sample of the proxy kernel's memory use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeowMemory {
+    /// Resident set size of the meow-rs process, in bytes.
+    pub rss_bytes: u64,
+    /// Host cgroup/system memory limit meow-rs resolved, in bytes.
+    pub os_limit_bytes: u64,
+}
+
 /// Outcome of one delay measurement.
 #[derive(Debug)]
 pub enum DelayOutcome {
     /// Tunnel established; latency in milliseconds.
     Ok(u64),
-    /// meow-rs answered, but the proxy failed the tunnel test.
+    /// meow-rs answered, but the proxy failed the tunnel test. This is the
+    /// outcome meow reports for a dead or unusably slow proxy (its 503 and
+    /// 504), and it never contributes to the engine-down abort.
     ProxyFailed(String),
     /// meow-rs itself is unreachable or misbehaving, the batch must be
-    /// aborted without touching proxy statuses.
+    /// aborted without touching proxy statuses. Reserved for the failures
+    /// the delay endpoint cannot report as a verdict: no answer at all, an
+    /// unparseable body, or a status meow does not use for a probe result.
     ServiceUnavailable(String),
 }
 
@@ -89,6 +102,53 @@ impl MeowClient {
             .to_string())
     }
 
+    /// `GET /memory`, the proxy kernel's own RSS reading.
+    ///
+    /// Not a JSON document but an endless newline-delimited feed, whose
+    /// first frame is a hardcoded zero placeholder. Real numbers start one
+    /// frame later, so the first is dropped rather than shown as "0 bytes".
+    pub async fn memory(&self) -> Result<MeowMemory, String> {
+        let mut response = self
+            .http
+            .get(format!("{}/memory", self.base_url))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| format!("meow-rs unreachable: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("meow-rs /memory returned {}", response.status()));
+        }
+
+        // The feed never ends, so read frames until one is a real sample.
+        let mut buf = Vec::new();
+        let deadline = Duration::from_secs(5);
+        let mut seen = 0usize;
+        while seen < 2 {
+            let chunk = tokio::time::timeout(deadline, response.chunk())
+                .await
+                .map_err(|_| "meow-rs /memory feed stalled before a sample".to_string())?
+                .map_err(|e| format!("meow-rs /memory read failed: {e}"))?
+                .ok_or_else(|| "meow-rs /memory feed closed early".to_string())?;
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                seen += 1;
+                if seen < 2 {
+                    // Frame 1 is the zero placeholder, keep reading.
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&line);
+                let frame: serde_json::Value = serde_json::from_str(text.trim())
+                    .map_err(|e| format!("bad /memory frame: {e}"))?;
+                return Ok(MeowMemory {
+                    rss_bytes: frame.get("inuse").and_then(|v| v.as_u64()).unwrap_or(0),
+                    os_limit_bytes: frame.get("oslimit").and_then(|v| v.as_u64()).unwrap_or(0),
+                });
+            }
+        }
+        Err("meow-rs /memory feed produced no sample".into())
+    }
+
     /// `PUT /configs`, hot-reload the generated Clash YAML without
     /// restarting the meow-rs process.
     pub async fn reload_config(&self, path: &std::path::Path) -> Result<(), String> {
@@ -148,28 +208,27 @@ impl MeowClient {
             return DelayOutcome::ServiceUnavailable("delay response has no delay field".into());
         }
 
-        // 4xx from the delay endpoint means meow tried the tunnel and it
-        // failed; 5xx means meow itself had a problem.
+        // The delay endpoint reports the tunnel outcome and nothing else:
+        // 503 a transport failure, 504 a missed deadline, both a verdict
+        // about this proxy. Engine trouble is an unreachable endpoint, a
+        // body that is not JSON, or a status meow never uses for a probe.
         let message = body
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown error")
             .to_string();
-        if status.is_client_error() {
-            DelayOutcome::ProxyFailed(message)
-        } else {
-            DelayOutcome::ServiceUnavailable(format!("{status}: {message}"))
+        match status.as_u16() {
+            // meow's own probe-result codes: the tunnel failed or timed out.
+            503 | 504 => DelayOutcome::ProxyFailed(message),
+            // 4xx: a request the engine rejected, not an engine outage.
+            400..=499 => DelayOutcome::ProxyFailed(message),
+            _ => DelayOutcome::ServiceUnavailable(format!("{status}: {message}")),
         }
     }
 
-    /// Same as `check_delay` but retries `ServiceUnavailable` up to
-    /// `attempts` times with `backoff` between tries. `Ok` and
-    /// `ProxyFailed` are returned on first sight, the engine spoke
-    /// authoritatively in those branches and re-asking the same request
-    /// does not help. Only transport-level glitches (connection drops,
-    /// transient 5xx, one-shot malformed payloads) are absorbed here, so
-    /// the caller's `ServiceUnavailable` handling now sees a strictly
-    /// smaller set of cases, most of them genuine engine outages.
+    /// `check_delay`, retrying only `ServiceUnavailable`. A `ProxyFailed`
+    /// tunnel fails the same way on a second ask, so it is returned on
+    /// first sight and a batch of dead proxies costs one request each.
     pub async fn check_delay_with_retry(
         &self,
         name: &str,
@@ -230,6 +289,20 @@ mod tests {
                     }
                 }),
             )
+            // Mirrors the real /memory feed, zero placeholder first.
+            .route(
+                "/memory",
+                get(|| async {
+                    let mut body = String::from("{\"inuse\":0,\"oslimit\":0}\n");
+                    for _ in 0..3 {
+                        body.push_str("{\"inuse\":25780224,\"oslimit\":2147483648}\n");
+                    }
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }),
+            )
             .route(
                 "/proxies/{name}/delay",
                 get(
@@ -272,6 +345,7 @@ mod tests {
             timeout_secs: 5,
             backoff_initial_secs: 60,
             backoff_max_secs: 900,
+            ipv6: false,
         };
         (addr.to_string(), config, seen_test_urls)
     }
@@ -311,6 +385,7 @@ mod tests {
             timeout_secs: 2,
             backoff_initial_secs: 60,
             backoff_max_secs: 900,
+            ipv6: false,
         };
         let client = MeowClient::new(&config);
         assert!(client.ping().await.is_err());
@@ -406,6 +481,7 @@ mod tests {
             timeout_secs: 5,
             backoff_initial_secs: 60,
             backoff_max_secs: 900,
+            ipv6: false,
         };
         let client = MeowClient::new(&config);
         // Two attempts, 50ms between, first fails, second succeeds.
@@ -457,6 +533,7 @@ mod tests {
             timeout_secs: 5,
             backoff_initial_secs: 60,
             backoff_max_secs: 900,
+            ipv6: false,
         };
         let client = MeowClient::new(&config);
         match client
@@ -467,5 +544,126 @@ mod tests {
             other => panic!("expected ProxyFailed, got {other:?}"),
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// meow-rs answers /memory with a live feed whose first frame is a
+    /// hardcoded zero placeholder. Reporting that as "0 bytes" would show a
+    /// dead-looking kernel on the admin card, so the first frame is dropped.
+    #[tokio::test]
+    async fn memory_skips_the_zero_placeholder_frame() {
+        let (_addr, config, _) = mock_api(Arc::default()).await;
+        let client = MeowClient::new(&config);
+
+        let mem = client.memory().await.expect("memory sample");
+        assert_eq!(mem.rss_bytes, 25_780_224);
+        assert_eq!(mem.os_limit_bytes, 2_147_483_648);
+
+        // `os_limit_bytes` is passed through verbatim: meow-rs resolves it
+        // from the cgroup, and a container without one reports 0, which the
+        // panel renders as "no percentage" rather than dividing by it.
+    }
+
+    /// meow-rs reports a failed tunnel as 503 or 504. Both are the one
+    /// proxy's verdict, so they charge it and must not be retried.
+    #[tokio::test]
+    async fn meow_probe_statuses_charge_the_proxy_without_retrying() {
+        for (status, label) in [
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "503"),
+            (axum::http::StatusCode::GATEWAY_TIMEOUT, "504"),
+        ] {
+            let requests: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+            let counter = requests.clone();
+            let app = Router::new()
+                .route(
+                    "/version",
+                    get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+                )
+                .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+                .route(
+                    "/proxies/{name}/delay",
+                    get(move |Path(_name): Path<String>| {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            (
+                                status,
+                                Json(serde_json::json!({
+                                    "message": "An error occurred in the delay test"
+                                })),
+                            )
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let config = MeowConfig {
+                api_addr: addr,
+                config_path: std::env::temp_dir().join("fumox-meow-probefail.yaml"),
+                test_url: vec!["http://cp.cloudflare.com".to_string()],
+                timeout_secs: 5,
+                backoff_initial_secs: 60,
+                backoff_max_secs: 900,
+                ipv6: false,
+            };
+            let client = MeowClient::new(&config);
+
+            match client
+                .check_delay_with_retry("fumox-dead", 3, Duration::from_millis(10))
+                .await
+            {
+                DelayOutcome::ProxyFailed(msg) => {
+                    assert_eq!(msg, "An error occurred in the delay test", "{label}");
+                }
+                other => panic!("{label} must be ProxyFailed, got {other:?}"),
+            }
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                1,
+                "{label} must not be retried"
+            );
+        }
+    }
+
+    /// A status meow never uses for a probe result is engine trouble, and
+    /// must still reach the retry/abort path.
+    #[tokio::test]
+    async fn unexpected_server_error_stays_service_unavailable() {
+        let app = Router::new()
+            .route(
+                "/version",
+                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+            )
+            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/proxies/{name}/delay",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"message": "boom"})),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = MeowConfig {
+            api_addr: addr,
+            config_path: std::env::temp_dir().join("fumox-meow-boom.yaml"),
+            test_url: vec!["http://cp.cloudflare.com".to_string()],
+            timeout_secs: 5,
+            backoff_initial_secs: 60,
+            backoff_max_secs: 900,
+            ipv6: false,
+        };
+        let client = MeowClient::new(&config);
+        match client.check_delay("fumox-x").await {
+            DelayOutcome::ServiceUnavailable(err) => assert!(err.contains("boom"), "{err}"),
+            other => panic!("500 must stay ServiceUnavailable, got {other:?}"),
+        }
     }
 }

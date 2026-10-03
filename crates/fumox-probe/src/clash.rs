@@ -21,6 +21,8 @@ pub fn is_supported(scheme: Scheme) -> bool {
             | Scheme::Ss
             | Scheme::Hysteria2
             | Scheme::Socks5
+            | Scheme::Snell
+            | Scheme::AnyTls
     )
 }
 
@@ -43,6 +45,7 @@ fn num(value: i64) -> Value {
 pub fn generate(
     rows: &[ProxyRow],
     pins: &std::collections::HashMap<String, std::net::IpAddr>,
+    ipv6: bool,
 ) -> serde_norway::Result<(String, Vec<i64>)> {
     let mut included = Vec::new();
     let mut proxies = Vec::new();
@@ -62,6 +65,10 @@ pub fn generate(
         Value::String("log-level".into()),
         Value::String("silent".into()),
     );
+    // Emitted explicitly, never left to the engine default: meow-rs 0.22.0
+    // made `ipv6` effective end-to-end, so an omitted key is a real
+    // behavioural choice (IPv4-only) that `[meow].ipv6` should own.
+    root.insert(Value::String("ipv6".into()), Value::Bool(ipv6));
     root.insert(Value::String("proxies".into()), Value::Sequence(proxies));
     Ok((serde_norway::to_string(&Value::Mapping(root))?, included))
 }
@@ -114,8 +121,20 @@ fn proxy_to_value(
 fn server_name_sources(scheme: Scheme) -> Option<(&'static str, &'static [&'static str])> {
     match scheme {
         Scheme::Vless | Scheme::Vmess => Some(("servername", &["servername", "sni"])),
-        Scheme::Trojan | Scheme::Hysteria2 => Some(("sni", &["sni", "servername"])),
-        Scheme::Ss | Scheme::Socks5 | Scheme::Naive | Scheme::Tuic | Scheme::Mieru => None,
+        // AnyTLS is TLS to its server and meow reads `sni` alone, so it
+        // pins exactly like trojan.
+        Scheme::Trojan | Scheme::Hysteria2 | Scheme::AnyTls => {
+            Some(("sni", &["sni", "servername"]))
+        }
+        // Snell carries no top-level server name: its obfs name lives in
+        // `obfs-opts.host`, which the Clash mapping emits untouched, and
+        // with no obfs there is nothing to pin at all.
+        Scheme::Ss
+        | Scheme::Socks5
+        | Scheme::Naive
+        | Scheme::Tuic
+        | Scheme::Mieru
+        | Scheme::Snell => None,
     }
 }
 
@@ -245,7 +264,7 @@ mod tests {
             ),
         ];
 
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies.len(), 6);
@@ -301,7 +320,7 @@ mod tests {
         assert!(!is_supported(Scheme::Naive));
 
         let rows = vec![row_from_entry(9, entry(Scheme::Tuic, "c", &[]))];
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert!(parsed["proxies"].as_sequence().unwrap().is_empty());
     }
@@ -321,7 +340,7 @@ mod tests {
                 entry(Scheme::Trojan, "pass", &[("skip-cert-verify", "true")]),
             ),
         ];
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
 
@@ -354,7 +373,7 @@ mod tests {
             "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
         );
 
-        let (yaml, included) = generate(&rows, &pins).unwrap();
+        let (yaml, included) = generate(&rows, &pins, false).unwrap();
         assert_eq!(included, vec![1]);
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
@@ -371,7 +390,7 @@ mod tests {
             1,
             entry(Scheme::Trojan, "pass", &[("sni", "t.example.com")]),
         )];
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
+        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
         assert_eq!(proxy["server"].as_str(), Some("h.example.com"));
@@ -394,7 +413,7 @@ mod tests {
             "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
         );
 
-        let (yaml, _) = generate(&rows, &pins).unwrap();
+        let (yaml, _) = generate(&rows, &pins, false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies[0]["server"].as_str(), Some("203.0.113.10"));
@@ -421,7 +440,7 @@ mod tests {
             "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
         );
 
-        let (yaml, included) = generate(&rows, &pins).unwrap();
+        let (yaml, included) = generate(&rows, &pins, false).unwrap();
         assert_eq!(included, vec![1, 2, 3, 4]);
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
@@ -501,8 +520,8 @@ mod tests {
             "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
         );
 
-        let (plain, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
-        let (pinned, _) = generate(&rows, &pins).unwrap();
+        let (plain, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
+        let (pinned, _) = generate(&rows, &pins, false).unwrap();
         let plain: serde_norway::Value = serde_norway::from_str(&plain).unwrap();
         let pinned: serde_norway::Value = serde_norway::from_str(&pinned).unwrap();
         let plain = plain["proxies"].as_sequence().unwrap();
@@ -555,8 +574,8 @@ mod tests {
             "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
         );
 
-        let (plain, _) = generate(&rows, &std::collections::HashMap::new()).unwrap();
-        let (pinned, _) = generate(&rows, &pins).unwrap();
+        let (plain, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
+        let (pinned, _) = generate(&rows, &pins, false).unwrap();
         let plain: serde_norway::Value = serde_norway::from_str(&plain).unwrap();
         let pinned: serde_norway::Value = serde_norway::from_str(&pinned).unwrap();
         let plain = plain["proxies"].as_sequence().unwrap();
@@ -583,10 +602,27 @@ mod tests {
         let mut pins = std::collections::HashMap::new();
         pins.insert("203.0.113.10".to_string(), "203.0.113.10".parse().unwrap());
 
-        let (yaml, _) = generate(&[row], &pins).unwrap();
+        let (yaml, _) = generate(&[row], &pins, false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
         assert_eq!(proxy["server"].as_str(), Some("203.0.113.10"));
         assert!(proxy.get("sni").is_none(), "{yaml}");
+    }
+
+    /// `ipv6` rides into the rendered config: meow-rs 0.22.0 made the key
+    /// effective end-to-end, so an omitted one would silently mean
+    /// "IPv4 only" no matter what `[meow].ipv6` says.
+    #[test]
+    fn ipv6_flag_is_rendered_explicitly() {
+        let rows = vec![row_from_entry(7, entry(Scheme::Vless, "uuid-7", &[]))];
+        let pins = std::collections::HashMap::new();
+
+        let (off, _) = generate(&rows, &pins, false).unwrap();
+        let (on, _) = generate(&rows, &pins, true).unwrap();
+        let off: serde_norway::Value = serde_norway::from_str(&off).unwrap();
+        let on: serde_norway::Value = serde_norway::from_str(&on).unwrap();
+
+        assert_eq!(off["ipv6"].as_bool(), Some(false));
+        assert_eq!(on["ipv6"].as_bool(), Some(true));
     }
 }

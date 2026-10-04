@@ -329,7 +329,8 @@ pub struct CompiledPipeline {
     filter_asns: Option<Vec<u32>>,
     exclude_asns: Option<Vec<u32>>,
     /// Drop any proxy that allows insecure TLS (a truthy
-    /// certificate-verification alias, see [`allows_insecure`]).
+    /// certificate-verification alias, see
+    /// [`fumox_core::models::is_insecure_param`]).
     forbid_insecure: bool,
     rename: Vec<CompiledRename>,
     drop: Vec<CompiledDrop>,
@@ -569,13 +570,6 @@ impl CompiledPipeline {
         }
     }
 
-    /// Statuses this pipeline excludes, used by the admin preview and
-    /// proxy browser queries.
-    #[allow(dead_code)] // consumed by admin handlers in Phase 2.5
-    pub fn exclude_statuses(&self) -> &[ProxyStatus] {
-        &self.exclude_statuses
-    }
-
     /// Run the full pipeline over candidates already loaded from the DB.
     /// Used by `/src` (single source, one pipeline).
     pub async fn apply(&self, candidates: Vec<Candidate>, geo: &GeoResolver) -> Vec<Candidate> {
@@ -696,7 +690,12 @@ impl CompiledPipeline {
         // any spelling. Falsy toggles (`insecure=0`) and
         // alias-free entries survive; the DB row is never touched.
         if self.forbid_insecure {
-            candidates.retain(|c| !allows_insecure(&c.entry.params));
+            candidates.retain(|c| {
+                !c.entry
+                    .params
+                    .iter()
+                    .any(fumox_core::models::is_insecure_param)
+            });
         }
 
         // drop, discard rules. Deliberately before
@@ -977,25 +976,6 @@ fn parse_asn_list(
     Some(asns)
 }
 
-/// Whether any certificate-verification alias is switched to a truthy
-/// value. Key match is case-insensitive; the value is compared after trim
-/// and lower-casing, like every other consumer of the toggle. The
-/// underscore `allow_insecure` spelling is included because it is the
-/// canonical form of tuic links, which pass it through as an unknown
-/// parameter.
-fn allows_insecure(params: &[fumox_core::models::Param]) -> bool {
-    const ALIASES: [&str; 4] = [
-        "insecure",
-        "allowinsecure",
-        "skip-cert-verify",
-        "allow_insecure",
-    ];
-    params.iter().any(|p| {
-        ALIASES.contains(&p.key.to_ascii_lowercase().as_str())
-            && matches!(p.value.trim().to_ascii_lowercase().as_str(), "1" | "true")
-    })
-}
-
 /// One proxy on its way through the pipeline: the entry plus the DB-side
 /// context the steps need (status, latency, source order, stored geo).
 #[derive(Debug, Clone)]
@@ -1054,8 +1034,8 @@ mod tests {
         assert!(CompiledPipeline::from_json(Some(&json!({}))).is_ok());
         let compiled = CompiledPipeline::from_json(None).unwrap();
         assert_eq!(
-            compiled.exclude_statuses(),
-            &[ProxyStatus::Quarantine, ProxyStatus::Removed]
+            compiled.exclude_statuses,
+            vec![ProxyStatus::Quarantine, ProxyStatus::Removed]
         );
     }
 

@@ -14,7 +14,8 @@
 //!   `X-Fumox-Warning: all-proxies-quarantined`.
 
 use crate::admin::auth::RateLimiter;
-use crate::cache::{Caches, InlineRenderGuard, Rendered};
+use crate::admin::fmt_rfc3339_utc;
+use crate::cache::{Caches, InlineClaim, InlineOutcome, Rendered};
 use crate::pipeline::{self, Candidate, CompiledPipeline, PipelineIssue};
 use axum::Router;
 use axum::body::Body;
@@ -49,16 +50,19 @@ use std::time::Duration;
 /// this costs one background re-render per window, never a 5xx.
 const RENDER_FRESHNESS_CAP_SECS: i64 = 30;
 
+/// Deadline for one inline (cache-miss) render, and the same deadline a
+/// waiter gives the leader it is waiting behind. Generous next to a real
+/// render (milliseconds on a warm database) and short enough that a render
+/// wedged on the write lock answers instead of holding every request for
+/// that key open.
+const WAIT_FOR_LEADER: Duration = Duration::from_secs(30);
+
 /// Shared state of the public listener.
 #[derive(Clone)]
 pub struct AppState {
     pub pool: DbPool,
     pub caches: Caches,
     pub geo: Arc<GeoResolver>,
-    /// Immediate-refresh channel into the scheduler (source ids);
-    /// posted to by the admin *Refresh now* handler.
-    #[allow(dead_code)]
-    pub refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Public-listener rate limiters (`[server].rate_limit` /
     /// `[server].auth_fail_rate_limit`).
     pub limits: PublicRateLimits,
@@ -129,6 +133,60 @@ pub fn router(state: AppState) -> Router {
             public_rate_limit,
         ))
         .with_state(state)
+}
+
+/// The complete public application: the subscription surface plus the
+/// liveness endpoint.
+///
+/// `/healthz` is added *after* the rate-limit layer on purpose: an
+/// exhausted public window must not make an orchestrator's probe answer
+/// 429 and restart a healthy instance. Kept as one function so the
+/// layering is testable without binding listeners.
+/// `health_pool` is a pool reserved for `/healthz` alone, not the render
+/// pool. The liveness answer must not depend on render load: a saturated
+/// pool is this process's own load, and an orchestrator reads 503 as
+/// "restart me", so sharing the pool turns a busy minute into a restart
+/// loop. The dedicated pool holds one connection and is only ever asked
+/// `SELECT 1`.
+pub fn public_app(state: AppState, health_pool: DbPool) -> Router {
+    router(state).route(
+        "/healthz",
+        get(move || {
+            let pool = health_pool.clone();
+            async move { healthz(pool).await }
+        }),
+    )
+}
+
+/// Liveness probe: 200 while the database answers a trivial query, 503
+/// once it does not. Deliberately shallow: a stalled scheduler or a quiet
+/// pool is not process liveness, an unwritable or unreachable database is
+/// the one dependency the whole surface shares. The scheduler's own
+/// liveness is recorded under `meta.server_cycle` for the admin panel.
+///
+/// A short acquire timeout, because this answer is read by an
+/// orchestrator that restarts the instance on 503. Waiting out sqlx's
+/// default 30 s to then say "unavailable" is the worst of both: the probe
+/// is what a restart is triggered by, so it must distinguish "the database
+/// is gone" from "the render pool is busy", and the busy case is this
+/// process's own load, not a fault worth restarting over.
+async fn healthz(pool: DbPool) -> Response {
+    const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+    match tokio::time::timeout(ACQUIRE_TIMEOUT, sqlx::query("SELECT 1").fetch_one(&pool)).await {
+        Ok(Ok(_)) => (StatusCode::OK, "ok\n").into_response(),
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "/healthz database check failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable\n").into_response()
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = ACQUIRE_TIMEOUT.as_secs(),
+                "/healthz gave up waiting for a pool connection; \
+                 reporting the instance busy rather than down"
+            );
+            (StatusCode::SERVICE_UNAVAILABLE, "database busy\n").into_response()
+        }
+    }
 }
 
 /// Per-IP limiting: every request counts against `[server].rate_limit`, a 403
@@ -332,8 +390,8 @@ async fn member_source_ids(state: &AppState, profile_id: &str) -> Vec<String> {
 
 /// Cache lookup with stale-while-revalidate: a fresh entry is
 /// served as-is; a stale one is served immediately while a background
-/// re-render refreshes the entry; a miss renders inline. Only 200
-/// responses are stored.
+/// re-render refreshes the entry; a miss renders inline, single-flighted
+/// through the cache's inline-render claim. Only 200 responses are stored.
 async fn serve_cached<F, Fut, S, SFut>(
     state: &AppState,
     key: String,
@@ -343,7 +401,7 @@ async fn serve_cached<F, Fut, S, SFut>(
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = Result<Rendered, ErrorReply>> + Send + 'static,
-    // `key_sources`: the sources the render draws from, resolved on the miss
+    // `key_sources`: the sources the render draws from, resolved on the cold
     // path only. The inline-render claim is scoped to them, so an ingest of
     // an unrelated source cannot refuse this key's put.
     S: FnOnce() -> SFut,
@@ -395,49 +453,103 @@ where
         return to_response(&rendered);
     }
 
-    // The inline render is claimed before it starts, for the same reason the
-    // background one is: this key has no entry, so without the claim an
-    // invalidation landing now would not see it and the put below would
-    // store pre-change rows as fresh for a full TTL.
-    let claim = state
-        .caches
-        .begin_inline_render(&key, key_sources().await)
-        .await;
-    let generation = claim.as_ref().map(InlineRenderGuard::generation);
-    match make_render().await {
-        Ok(rendered) => {
-            let rendered = Arc::new(rendered);
-            let cached = if rendered.status == 200 {
-                match generation {
-                    Some(generation) => {
-                        let stored = state
-                            .caches
-                            .processed_put_guarded(&key, rendered.clone(), generation)
-                            .await;
-                        if stored.is_none() {
-                            tracing::debug!(
-                                key = %key,
-                                "inline render not cached: the key was invalidated while rendering"
-                            );
-                        }
-                        stored
-                    }
-                    // Another render of this key is already in flight and
-                    // will store its own (identical) body; this one is
-                    // served without caching it.
-                    None => None,
+    // Cold key: claim the render so a burst of requests on a
+    // just-invalidated key runs one render instead of one per request.
+    // The leader renders; a waiter wakes when the leader's claim ends and
+    // serves the stored entry, claiming its own render only when the
+    // leader stored none. A leader that *failed* publishes the failure, so
+    // a broken upstream costs one render rather than one per waiter.
+    // Claiming before rendering stays mandatory for the same reason as
+    // before: this key has no entry, so without the claim an invalidation
+    // landing now would not see it and the put below would store
+    // pre-change rows as fresh for a full TTL.
+    //
+    // The claim's sources are resolved once, here: the waiter loop can run
+    // several times and the lookup is a database query.
+    let claim_sources = key_sources().await;
+    let claim = loop {
+        match state
+            .caches
+            .begin_inline_render(&key, claim_sources.clone())
+            .await
+        {
+            InlineClaim::Leader(claim) => break claim,
+            InlineClaim::Wait(mut ended) => {
+                // The leader's guard drop is the wake-up. The channel then
+                // carries what the leader did, and keeps it after the
+                // close, so a wake on close still reads the verdict.
+                if tokio::time::timeout(WAIT_FOR_LEADER, ended.changed())
+                    .await
+                    .is_err()
+                {
+                    // A leader this slow is wedged (blocked on the write
+                    // lock, say). Answering beats parking the connection
+                    // for as long as the leader lives.
+                    tracing::warn!(key = %key, "inline render leader did not finish in time");
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "render in progress, try again",
+                    );
                 }
-            } else {
-                None
-            };
-            drop(claim);
-            to_response(cached.as_ref().unwrap_or(&rendered))
+                match ended.borrow_and_update().clone() {
+                    InlineOutcome::Failed { status, message } => {
+                        return error_response(
+                            StatusCode::from_u16(status)
+                                .unwrap_or(StatusCode::BAD_GATEWAY),
+                            &message,
+                        );
+                    }
+                    InlineOutcome::Stored => {}
+                }
+                if let Some(rendered) = state.caches.processed_get(&key).await
+                    && rendered.is_fresh(fumox_core::models::now_ts())
+                {
+                    return to_response(&rendered);
+                }
+            }
         }
-        Err(err) => {
+    };
+    let generation = claim.generation();
+    // The leader gets the same deadline as its waiters: without one it can
+    // hold the claim (and every waiter behind it) for as long as the render
+    // blocks.
+    let rendered = match tokio::time::timeout(WAIT_FOR_LEADER, make_render()).await {
+        Ok(Ok(rendered)) => rendered,
+        Ok(Err(err)) => {
+            claim.fail(err.status.as_u16(), err.message.clone());
             drop(claim);
-            error_response(err.status, &err.message)
+            return error_response(err.status, &err.message);
         }
-    }
+        Err(_) => {
+            claim.fail(
+                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "render timed out".to_string(),
+            );
+            drop(claim);
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "render timed out",
+            );
+        }
+    };
+    let rendered = Arc::new(rendered);
+    let cached = if rendered.status == 200 {
+        let stored = state
+            .caches
+            .processed_put_guarded(&key, rendered.clone(), generation)
+            .await;
+        if stored.is_none() {
+            tracing::debug!(
+                key = %key,
+                "inline render not cached: the key was invalidated while rendering"
+            );
+        }
+        stored
+    } else {
+        None
+    };
+    drop(claim);
+    to_response(cached.as_ref().unwrap_or(&rendered))
 }
 
 /// Render a profile: per-source merged pipelines (each capped by its own
@@ -619,7 +731,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         .max(1);
     Ok(Rendered {
         status: 200,
-        body,
+        body: body.into(),
         content_type,
         extra_headers,
         fresh_until: fumox_core::models::now_ts() + min_ttl.min(RENDER_FRESHNESS_CAP_SECS),
@@ -680,7 +792,7 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
 
     Ok(Rendered {
         status: 200,
-        body,
+        body: body.into(),
         content_type,
         extra_headers,
         fresh_until: fumox_core::models::now_ts()
@@ -702,7 +814,7 @@ pub(crate) async fn preview_sub(
     let text = if profile.output_format == OutputFormat::Base64 {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&rendered.body)
-            .unwrap_or_else(|_| rendered.body.clone());
+            .unwrap_or_else(|_| rendered.body.to_vec());
         String::from_utf8_lossy(&decoded).into_owned()
     } else {
         String::from_utf8_lossy(&rendered.body).into_owned()
@@ -814,16 +926,6 @@ pub(crate) fn url_list_header_block(title: &str, interval_hours: u64, count: usi
     )
 }
 
-/// RFC 3339 UTC form of a Unix timestamp (second precision).
-fn fmt_rfc3339_utc(ts: i64) -> String {
-    const FMT: &[time::format_description::FormatItem<'static>] =
-        time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-    time::OffsetDateTime::from_unix_timestamp(ts)
-        .ok()
-        .and_then(|dt| dt.format(FMT).ok())
-        .unwrap_or_else(|| ts.to_string())
-}
-
 /// The pipeline config the merged-list `finalize` step runs with: the
 /// profile's own config, plus the `sort` section of the source that won the
 /// sort contest when the profile does not set one.
@@ -913,6 +1015,7 @@ pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
     use axum::http::Request;
     use fumox_core::models::{OutputFormat, Param, ProxyEntry, Scheme};
     use fumox_core::repo::sources::FetchOutcome;
@@ -923,8 +1026,9 @@ mod tests {
         state_with_limits(PublicRateLimits::unlimited()).await
     }
 
-    /// A state whose public rate limiters use the given window sizes.
-    async fn state_with_limits(limits: PublicRateLimits) -> AppState {
+    /// A state whose public rate limiters use the given window sizes, with
+    /// the backing pool returned so tests can close or probe it directly.
+    async fn state_and_pool_with_limits(limits: PublicRateLimits) -> (AppState, DbPool) {
         let dir =
             std::env::temp_dir().join(format!("fumox-serve-test-{}", fumox_core::models::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -934,22 +1038,27 @@ mod tests {
         };
         let pool = fumox_core::db::connect_pool(&cfg).await.unwrap();
         fumox_core::db::migrate(&pool).await.unwrap();
-        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-        std::mem::forget(refresh_rx); // keep the channel open for sends
         let geo_cfg = fumox_core::config::GeoConfig {
             enabled: false,
             ..Default::default()
         };
-        AppState {
+        (
+            AppState {
+                pool: pool.clone(),
+                caches: Caches::new(),
+                geo: Arc::new(GeoResolver::new(&geo_cfg)),
+                limits,
+                trusted_cidrs: Vec::new(),
+                allowed_hosts: Vec::new(),
+                export_max_rows: fumox_core::config::ServerConfig::default().export_max_rows,
+            },
             pool,
-            caches: Caches::new(),
-            geo: Arc::new(GeoResolver::new(&geo_cfg)),
-            refresh_tx,
-            limits,
-            trusted_cidrs: Vec::new(),
-            allowed_hosts: Vec::new(),
-            export_max_rows: fumox_core::config::ServerConfig::default().export_max_rows,
-        }
+        )
+    }
+
+    /// A state whose public rate limiters use the given window sizes.
+    async fn state_with_limits(limits: PublicRateLimits) -> AppState {
+        state_and_pool_with_limits(limits).await.0
     }
 
     /// Perform one GET carrying a peer-address extension, the public
@@ -985,6 +1094,136 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    /// `/healthz` sits outside the public rate-limit layer: an exhausted
+    /// window must not make an orchestrator's probe answer 429 and restart
+    /// a healthy instance.
+    #[tokio::test]
+    async fn healthz_stays_outside_the_public_rate_limit() {
+        let (state, pool) = state_and_pool_with_limits(PublicRateLimits::new(1, 1)).await;
+        let app = public_app(state, pool);
+        // Exhaust the single-request window from one IP.
+        assert_eq!(
+            get_with_ip(app.clone(), "/sub/missing", "10.0.0.1").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_with_ip(app.clone(), "/sub/missing", "10.0.0.1").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            get_with_ip(app, "/healthz", "10.0.0.1").await,
+            StatusCode::OK
+        );
+    }
+
+    /// The probe reports 503 once the database stops answering; a 200 on a
+    /// dead pool would let an orchestrator keep routing traffic here.
+    #[tokio::test]
+    async fn healthz_goes_red_when_the_database_is_closed() {
+        let (state, pool) = state_and_pool_with_limits(PublicRateLimits::unlimited()).await;
+        let app = public_app(state, pool.clone());
+        assert_eq!(
+            get_with_ip(app.clone(), "/healthz", "10.0.0.1").await,
+            StatusCode::OK
+        );
+        pool.close().await;
+        assert_eq!(
+            get_with_ip(app, "/healthz", "10.0.0.1").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// A cold burst must collapse into one render: the first request claims
+    /// the key, the rest wait for its guard and serve the stored entry.
+    #[tokio::test]
+    async fn concurrent_cold_requests_share_one_render() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = test_state().await;
+        let renders = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let renders = renders.clone();
+            tasks.spawn(async move {
+                let counter = renders;
+                serve_cached(
+                    &state,
+                    "sub:cold-burst".to_string(),
+                    || async { Vec::<String>::new() },
+                    move || {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(Rendered {
+                                status: 200,
+                                body: Bytes::from_static(b"one-body"),
+                                content_type: "text/plain".to_string(),
+                                extra_headers: Vec::new(),
+                                fresh_until: fumox_core::models::now_ts() + 300,
+                                source_ids: Vec::new(),
+                            })
+                        }
+                    },
+                )
+                .await
+                .status()
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            assert_eq!(joined.unwrap(), StatusCode::OK);
+        }
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            1,
+            "a burst on a missing key must run exactly one render"
+        );
+    }
+
+    /// A failing cold render must not be retried once per waiter. The
+    /// leader publishes its failure, so the burst costs one render and
+    /// every request gets the leader's status.
+    #[tokio::test]
+    async fn a_failing_cold_render_costs_one_attempt_not_one_per_waiter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = test_state().await;
+        let renders = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let renders = renders.clone();
+            tasks.spawn(async move {
+                let counter = renders;
+                serve_cached(
+                    &state,
+                    "sub:failing-burst".to_string(),
+                    || async { Vec::<String>::new() },
+                    move || {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Err(ErrorReply::upstream_unavailable(
+                                StatusCode::BAD_GATEWAY,
+                                "upstream is down".to_string(),
+                            ))
+                        }
+                    },
+                )
+                .await
+                .status()
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            assert_eq!(joined.unwrap(), StatusCode::BAD_GATEWAY);
+        }
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            1,
+            "a failing cold render must be attempted once, not once per waiter"
+        );
     }
 
     #[tokio::test]

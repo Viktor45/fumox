@@ -779,7 +779,6 @@ pub async fn profile_detail(
         pool: state.pool.clone(),
         caches: state.caches.clone(),
         geo: state.geo.clone(),
-        refresh_tx: state.refresh_tx.clone(),
         // The preview renders in-process and never crosses the public
         // rate-limit middleware; fresh counters here are never consulted.
         limits: crate::serve::PublicRateLimits::unlimited(),
@@ -803,13 +802,23 @@ pub async fn profile_detail(
         "/sub/{}",
         profile.slug.clone().unwrap_or_else(|| profile.id.clone())
     );
+    // A token-protected profile answers 403 without its token, and the
+    // token row below is masked, so the copyable endpoint link has to
+    // carry the secret in the query string or it could never be used.
+    // The token charset is unreserved ASCII only (`is_ascii_alphanumeric`
+    // plus `-_.~`), so it needs no escaping.
+    let serve_query = profile
+        .access_token
+        .as_deref()
+        .map(|token| format!("?token={token}"))
+        .unwrap_or_default();
     // Absolute serve link: the host the admin panel was opened on with the
     // public port from [server].bind.
     let base = match state.serve_base(peer, &headers) {
         Ok(b) => b,
         Err(err) => return super::server_error(lang, &fumox_core::Error::Config(err.to_string())),
     };
-    let serve_url = format!("{base}{serve_path}");
+    let serve_url = format!("{base}{serve_path}{serve_query}");
 
     let token_display = profile
         .access_token
@@ -881,13 +890,15 @@ pub async fn profile_toggle(
         // The wrapper id must survive the swap (the form's hx-target points
         // at it), and the toggle button must flip with the state, it lives
         // outside the badge, so it travels along as an out-of-band swap.
+        // The aria attributes mirror the initial template: dropping them
+        // would end both the badge announcements and the pressed state.
         format!(
-            r##"<span id="enabled-badge"><span class="badge {}">{}</span></span>
+            r##"<span id="enabled-badge" aria-live="polite" aria-atomic="true"><span class="badge {}">{}</span></span>
                <form id="toggle-form" method="post" action="/admin/profiles/{id}/toggle"
                      hx-post="/admin/profiles/{id}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML"
                      hx-swap-oob="outerHTML:#toggle-form">
                  <input type="hidden" name="_csrf" value="{}">
-                 <button class="btn" type="submit">{}</button>
+                 <button class="btn" type="submit" aria-pressed="{}">{}</button>
                </form>"##,
             if profile.enabled { "on" } else { "off" },
             if profile.enabled {
@@ -896,6 +907,7 @@ pub async fn profile_toggle(
                 lang.t("common.off")
             },
             state.csrf_for(&headers),
+            if profile.enabled { "true" } else { "false" },
             if profile.enabled {
                 lang.t("common.disable")
             } else {
@@ -934,31 +946,7 @@ mod tests {
     /// Admin state on a throwaway migrated database: the form builder
     /// only touches the pool (slug/target lookups, stored token).
     async fn test_state() -> AdminState {
-        let dir = std::env::temp_dir().join(format!("fumox-profile-test-{}", new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        fumox_core::db::migrate(&pool).await.unwrap();
-        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-        std::mem::forget(refresh_rx); // keep the channel open for sends
-        let config = fumox_core::AppConfig::default();
-        let fetcher =
-            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.geo.dns_timeout());
-        AdminState::new(
-            pool,
-            crate::cache::Caches::new(),
-            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
-            refresh_tx,
-            crate::scheduler::SchedulerState::new(1),
-            crate::events::EventBus::new(),
-            fetcher,
-            config,
-            fumox_core::config::ResolvedConfigPath::Missing,
-        )
+        crate::admin::test_admin_state(Default::default(), Default::default()).await
     }
 
     fn stored_profile(token: Option<&str>) -> Profile {

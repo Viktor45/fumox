@@ -300,11 +300,24 @@ pub async fn repair_migration_checksums(
         }
     }
     // Force the WAL log through so a second `migrate()` from the same
-    // process sees the new values without a checkpoint race.
-    sqlx::query("PRAGMA wal_checkpoint(PASS)")
-        .execute(pool)
-        .await
-        .ok();
+    // process sees the new values without a checkpoint race. Best-effort: a
+    // concurrent reader can make the PASS checkpoint return busy, and the
+    // re-stamp is idempotent, so the failure is logged, not fatal.
+    //
+    // `wal_checkpoint` reports busy as a *row* (`busy, log, checkpointed`),
+    // not as an error, so `execute` discarded it and this line could never
+    // fire for the case the comment names. Read the row.
+    match sqlx::query("PRAGMA wal_checkpoint(PASS)").fetch_one(pool).await {
+        Ok(row) => {
+            let busy: i64 = sqlx::Row::try_get(&row, 0).unwrap_or_default();
+            if busy != 0 {
+                tracing::debug!("wal_checkpoint(PASS) after migration re-stamp was busy");
+            }
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "wal_checkpoint(PASS) after migration re-stamp failed")
+        }
+    }
     Ok(re_stamped)
 }
 

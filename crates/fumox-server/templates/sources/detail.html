@@ -137,7 +137,8 @@
   {% endif %}
 </div>
 
-<dialog id="delete-dialog">
+<dialog id="delete-dialog" aria-labelledby="delete-dialog-title">
+  <h2 id="delete-dialog-title" class="visually-hidden">{{ self.t("src.delete_confirm") }}</h2>
   <form method="post" action="/admin/sources/{{ source.id }}/delete">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <p>{{ self.t("src.delete_confirm") }} <b>{{ source.name }}</b>?</p>

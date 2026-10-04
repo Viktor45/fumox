@@ -1,0 +1,16 @@
+{#- Shared page-number strip for the admin tables. The including template
+    binds `page_base` (its list path) and carries `pages`, `per_page` and
+    `query_suffix()` in its context. -#}
+{% if pages.len() > 1 %}
+  <div class="pagination">
+    {% for (p, current) in pages %}
+      {% if *p == 0 %}
+        <span class="page gap">…</span>
+      {% else if current %}
+        <span class="page current" aria-current="page">{{ p }}</span>
+      {% else %}
+        <a class="page" href="{{ page_base }}?page={{ p }}&amp;per_page={{ per_page }}{{ self.query_suffix() }}">{{ p }}</a>
+      {% endif %}
+    {% endfor %}
+  </div>
+{% endif %}

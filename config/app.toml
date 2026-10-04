@@ -414,20 +414,21 @@ backlog_target_drain_minutes = 60
 # 86400 s (one day) pairs with [retention].*_days so rotation runs once per
 # day and matches the retention window.
 retention_interval_secs = 86400
-# Диапазон: true | false. В сборке дефолт false.
-# В этом примере стоит true, поэтому запрета ниже сейчас нет: без этого флага
-# демон не подключается к loopback/RFC1918/link-local/CGNAT целям, фид может
-# подсунуть «прокси» с адресом внутренней сети. Отказ регистрируется как
-# проваленная проверка: заблокированная цель проходит обычную лестницу
-# фейлов, а не зависает в очередях навсегда.
-# With this flag unset the daemon never dials loopback/RFC1918/link-local/
-# CGNAT targets coming from feeds, and a refusal counts as a failed check
-# (see the fail ladder above). A feed can plant a «proxy» pointing inside
-# your network; the refusal sends it through the ordinary fail ladder
-# instead of clogging the queues forever. This example ships true, so that
-# guard is off here; the built-in default is false.
-# Range: true | false; the built-in default is false. This example ships true.
-allow_private_targets = true
+# Диапазон: true | false. В сборке дефолт false, и в этом примере тоже false:
+# фид может подсунуть «прокси» с адресом внутренней сети, и без этого флага
+# демон не подключается к loopback/RFC1918/link-local/CGNAT целям. Отказ
+# регистрируется как проваленная проверка: заблокированная цель проходит
+# обычную лестницу фейлов, а не зависает в очередях навсегда. Включайте true
+# только осознанно, для изолированного тестового стенда, где все цели заведомо
+# свои.
+# Range: true | false; the built-in default is false and this example ships
+# false too. A feed can plant a «proxy» pointing inside your network; without
+# this flag the daemon never dials loopback/RFC1918/link-local/CGNAT targets
+# coming from feeds, and a refusal counts as a failed check (see the fail
+# ladder above) instead of clogging the queues forever. Set true only as an
+# explicit opt-in for isolated test infrastructure where every target is
+# trusted.
+allow_private_targets = false
 
 [meow]
 # Сокет в виде host:port, без диапазона: адрес, на котором поднят meow-rs.

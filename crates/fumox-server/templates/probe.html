@@ -56,7 +56,7 @@
           <div class="num"><span class="badge error">{{ self.t("probe.dead") }}</span></div>
         {% endif %}
         <div class="label">{{ self.t("probe.daemon") }}</div>
-        <div class="sub">heartbeat: {{ self.ts(hb.ts) | safe }} · pid {{ hb.pid }} · v{{ hb.version }}</div>
+        <div class="sub">{{ self.t("probe.last_beat") }} {{ self.ts(hb.ts) | safe }} · pid {{ hb.pid }} · v{{ hb.version }}</div>
       {% when None %}
         <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>
         <div class="label">{{ self.t("probe.daemon") }}</div>
@@ -65,10 +65,14 @@
   </div>
   <div class="panel stat-card">
     {% match meow_last_ok %}
-      {% when Some with (ts) %}
-        <div class="num"><span class="badge alive">{{ self.t("probe.available") }}</span></div>
+      {% when Some with (contact) %}
+        {% if contact.alive %}
+          <div class="num"><span class="badge alive">{{ self.t("probe.available") }}</span></div>
+        {% else %}
+          <div class="num"><span class="badge error">{{ self.t("probe.stale") }}</span></div>
+        {% endif %}
         <div class="label">meow-rs (T2)</div>
-        <div class="sub">{{ self.t("probe.last_contact") }} {{ self.ts(ts) | safe }}</div>
+        <div class="sub">{{ self.t("probe.last_contact") }} {{ self.ts(contact.ts) | safe }}</div>
         {% if self.has_mem() %}
           <div class="sub">{{ self.mem_line() }} · {{ self.ts(&self.mem_ts()) | safe }}</div>
         {% endif %}
@@ -108,6 +112,17 @@
       </tbody>
     </table>
   </div>
+</div>
+
+<div class="panel">
+  <h2>{{ self.t("probe.retention_title") }}</h2>
+  {% match last_rotation %}
+    {% when Some with (rot) %}
+      <p class="muted small">{{ self.t("probe.retention_last") }} {{ self.ts(rot.ts) | safe }} · {{ self.t_args("probe.retention_deleted", &[rot.probe_results.to_string(), rot.fetch_log.to_string()][..]) }}</p>
+    {% when None %}
+      <p class="muted small">{{ self.t("probe.retention_never") }}</p>
+  {% endmatch %}
+  <p class="muted small">{{ self.t_args("probe.retention_rows", &[journal_probe_rows.to_string(), journal_fetch_rows.to_string()][..]) }}</p>
 </div>
 
 <div class="panel">

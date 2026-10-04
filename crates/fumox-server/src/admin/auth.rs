@@ -626,7 +626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limiter_enforces_limit_then_resets() {
+    async fn rate_limiter_enforces_the_limit_per_key() {
         let limiter = RateLimiter::new(3, Duration::from_secs(60));
         assert!(limiter.allow("ip1").await);
         assert!(limiter.allow("ip1").await);
@@ -634,6 +634,22 @@ mod tests {
         assert!(!limiter.allow("ip1").await);
         // Other keys are independent.
         assert!(limiter.allow("ip2").await);
+    }
+
+    /// The window *is* the reset mechanism: there is no explicit
+    /// bookkeeping, the moka TTL expiring the counter is what opens the
+    /// quota again. A real (short) sleep: the TTL runs on moka's own
+    /// clock, so a paused tokio clock would not move it.
+    #[tokio::test]
+    async fn rate_limiter_reopens_after_the_window() {
+        let limiter = RateLimiter::new(1, Duration::from_millis(50));
+        assert!(limiter.allow("ip1").await);
+        assert!(!limiter.allow("ip1").await, "window is exhausted");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            limiter.allow("ip1").await,
+            "the counter must expire with its TTL and reopen the quota"
+        );
     }
 
     /// A refunded hit opens the window slot it consumed: a request that passed this limiter but was rejected by

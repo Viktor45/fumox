@@ -96,6 +96,17 @@ services:
       - "${FUMOX_ADMIN_BIND:-127.0.0.1}:${FUMOX_ADMIN_PORT:-8081}:8081"   # admin panel: loopback-only by
       # default; put a reverse proxy / SSH tunnel in
       # front to expose it
+    # Readiness gate for the probe below. The server runs its migrations
+    # before the listeners bind, so a 200 here means the schema is current
+    # and the probe cannot race the server into a second CREATE INDEX on a
+    # large `proxies` table. The runtime image ships no curl or wget, so
+    # the probe is the binary itself.
+    healthcheck:
+      test: ["CMD", "fumox-server", "--health-check"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
       #
       # HTTPS front (optional): docker/nginx/ holds a ready example,
       # an nginx container terminating TLS for /sub (→ server:8080) and
@@ -116,8 +127,13 @@ services:
     image: ghcr.io/viktor45/fumox:latest         # same image as server, different command
     command: ["fumox-probe"]
     depends_on:
-      - server                 # let the server create/migrate the DB first
-      - meow                   # probe seeds /shared through the meow image
+      # service_healthy, not a bare list entry: `depends_on` without a
+      # condition only waits for the container to start, which said nothing
+      # about whether the server had finished migrating the shared volume.
+      server:
+        condition: service_healthy
+      meow:                    # probe seeds /shared through the meow image
+        condition: service_started
     environment:
       FUMOX_CONFIG: ${FUMOX_CONFIG:-/app/config/app.toml}
       FUMOX_GEO__DB_DIR: /shared
@@ -125,6 +141,11 @@ services:
       FUMOX_MEOW__CONFIG_PATH: /shared/meow.yaml
       # Override in .env if the default test URL is blocked in your region.
       FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-http://www.gstatic.com/generate_204}
+      # SSRF guard for dial targets, mirroring the server's
+      # ALLOW_PRIVATE_URLS handling: feeds are untrusted, so the probe must
+      # not dial loopback/RFC1918/link-local/CGNAT addresses they carry.
+      # Set true in .env only for isolated test infrastructure.
+      FUMOX_PROBE__ALLOW_PRIVATE_TARGETS: ${FUMOX_PROBE__ALLOW_PRIVATE_TARGETS:-false}
     volumes:
       # Probe only reads app.toml at startup, never writes. Read-only mount
       # means a buggy probe can never mangle the config the server is also

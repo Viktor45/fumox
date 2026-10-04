@@ -54,6 +54,10 @@ struct DashboardTemplate {
     proxy_counts: Vec<(String, i64)>,
     fetch_total_24h: i64,
     fetch_ok_24h: i64,
+    /// Age in seconds of the last scheduler sweep start (stamped into
+    /// `meta.server_cycle` in `scheduler::sweep`), rendered as a sub-line
+    /// of the fetches card. `None` until the first sweep ever ran.
+    server_cycle_age_secs: Option<i64>,
     recent_errors: Vec<SourceErrorRow>,
     /// Per-source health counters (the former stats screen table).
     sources: Vec<SourceStatRow>,
@@ -434,6 +438,15 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
         .max()
         .unwrap_or(0);
 
+    // Age of the scheduler's last sweep (the stamp is written at sweep
+    // start, so a hung sweep shows as aging). A negative clock skew clamps
+    // to zero rather than rendering "-3 s".
+    let server_cycle_age_secs = match fumox_core::repo::meta_get(pool, "server_cycle").await {
+        Ok(Some(raw)) => raw.parse::<i64>().ok().map(|ts| (now - ts).max(0)),
+        Ok(None) => None,
+        Err(err) => return server_error(lang, &err),
+    };
+
     render_html(
         lang.clone(),
         &DashboardTemplate {
@@ -449,6 +462,7 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
             proxy_counts,
             fetch_total_24h,
             fetch_ok_24h,
+            server_cycle_age_secs,
             recent_errors,
             sources,
             top_alive,
@@ -553,8 +567,10 @@ pub fn fmt_ts(ts: i64) -> String {
     }
 }
 
-/// RFC 3339 UTC form for the `datetime` attribute of a `<time>` element.
-fn fmt_ts_attr(ts: i64) -> String {
+/// RFC 3339 UTC form of a Unix timestamp (second precision). Shared by the
+/// `datetime` attribute of the `<time>` elements below and the timestamp
+/// line of the subscription header block in [`crate::serve`].
+pub(crate) fn fmt_rfc3339_utc(ts: i64) -> String {
     const FMT: &[time::format_description::FormatItem<'static>] =
         time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
     match time::OffsetDateTime::from_unix_timestamp(ts) {
@@ -574,15 +590,15 @@ fn fmt_ts_attr(ts: i64) -> String {
 pub fn fmt_ts_element(ts: i64) -> String {
     format!(
         "<time class=\"ts\" datetime=\"{}\">{}</time>",
-        fmt_ts_attr(ts),
+        fmt_rfc3339_utc(ts),
         fmt_ts(ts)
     )
 }
 
-/// [`fmt_ts_element`] for optional timestamps; `None` renders the em dash
+/// [`fmt_ts_element`] for optional timestamps; `None` renders the en dash
 /// used across the admin tables (plain text, no element).
 pub fn fmt_opt_ts_element(ts: Option<i64>) -> String {
-    ts.map(fmt_ts_element).unwrap_or_else(|| ",".into())
+    ts.map(fmt_ts_element).unwrap_or_else(|| "–".into())
 }
 
 /// Render a Unix timestamp as a `<time class="ts day">` element carrying the
@@ -596,7 +612,7 @@ pub fn fmt_opt_ts_element(ts: Option<i64>) -> String {
 pub fn fmt_day_element(ts: i64) -> String {
     format!(
         "<time class=\"ts day\" datetime=\"{}\">{}</time>",
-        fmt_ts_attr(ts),
+        fmt_rfc3339_utc(ts),
         fmt_day_plain(ts)
     )
 }
@@ -732,18 +748,41 @@ fn action_response_with_level(
             fragment_html,
         )
             .into_response();
-        let payload = format!(
-            "{{\"toast\": {{\"message\": \"{}\", \"level\": \"{level}\"}}}}",
-            header_safe(toast)
-        );
-        response.headers_mut().insert(
-            "HX-Trigger",
-            HeaderValue::from_str(&payload).expect("header_safe output is visible ASCII"),
-        );
+        response
+            .headers_mut()
+            .insert("HX-Trigger", toast_trigger(level, toast));
         response
     } else {
-        Redirect::to(redirect_to).into_response()
+        // Plain-browser path: an HTMX-only toast would be lost here, so
+        // the message rides back on the redirect URL and the layout shows
+        // it once on load (see base.html).
+        flash_redirect(redirect_to, toast, level)
     }
+}
+
+/// Redirect carrying one toast for the plain-browser path, as `flash` /
+/// `flash_level` query parameters (percent-encoded via [`header_safe`]).
+/// The layout consumes and strips them on load, so a refresh or a shared
+/// URL does not replay a stale toast.
+pub(super) fn flash_redirect(redirect_to: &str, toast: &str, level: &str) -> Response {
+    let separator = if redirect_to.contains('?') { '&' } else { '?' };
+    Redirect::to(&format!(
+        "{redirect_to}{separator}flash={}&flash_level={level}",
+        header_safe(toast)
+    ))
+    .into_response()
+}
+
+/// `HX-Trigger` value for one toast. The message is percent-encoded for
+/// the same reason as [`header_safe`] (header bytes are Latin-1 on the
+/// wire, raw UTF-8 would mojibake) and because a raw `"` in the message
+/// would break the JSON envelope.
+pub(super) fn toast_trigger(level: &str, message: &str) -> HeaderValue {
+    let payload = format!(
+        "{{\"toast\": {{\"message\": \"{}\", \"level\": \"{level}\"}}}}",
+        header_safe(message)
+    );
+    HeaderValue::from_str(&payload).expect("header_safe output is visible ASCII")
 }
 
 fn is_htmx(headers: &HeaderMap) -> bool {
@@ -911,7 +950,7 @@ mod tests {
             "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
         );
 
-        assert_eq!(fmt_opt_ts_element(None), ",");
+        assert_eq!(fmt_opt_ts_element(None), "–");
         assert_eq!(
             fmt_opt_ts_element(Some(1_700_000_000)),
             "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
@@ -965,6 +1004,35 @@ mod tests {
         let response = action_response(false, "/admin/sources", String::new(), "готово");
         assert!(response.headers().get("HX-Trigger").is_none());
         assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+        // The toast rides on the Location as a query parameter instead;
+        // percent-encoded so the wire stays ASCII.
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("plain path must redirect")
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("/admin/sources?flash="), "{location}");
+        assert!(location.ends_with("&flash_level=ok"), "{location}");
+        assert!(location.is_ascii(), "{location}");
+    }
+
+    /// A redirect target that already carries a query keeps its existing
+    /// parameters; the flash is appended with `&`.
+    #[test]
+    fn flash_redirect_merges_into_an_existing_query() {
+        let response = flash_redirect("/admin/proxies?page=2", "done", "error");
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("flash_redirect must carry a Location")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.starts_with("/admin/proxies?page=2&flash="),
+            "{location}"
+        );
+        assert!(location.ends_with("&flash_level=error"), "{location}");
     }
 
     /// `?page=i64::MAX` overflowed the offset multiply: a debug build panicked

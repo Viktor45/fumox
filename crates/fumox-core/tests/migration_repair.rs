@@ -212,6 +212,72 @@ async fn migrate_propagates_non_mismatch_errors_untouched() {
     cleanup_files(&path);
 }
 
+/// The empty-repair re-raise arm: when `VersionMismatch` fires but the
+/// repair rewrites nothing, `migrate()` must surface the *original* error
+/// and must not claim a repair it did not make (no
+/// `meta.migrations_repaired` breadcrumb).
+///
+/// The repair's UPDATE is scoped to `success = 1` rows while sqlx's
+/// mismatch check compares the version and checksum of every row in
+/// `_sqlx_migrations` (the pre-flight dirty check only rejects
+/// `success = false`). A row outside that overlap therefore produces a
+/// mismatch the repair cannot rewrite, the deterministic stand-in for the
+/// concurrent-repair race this arm guards.
+#[tokio::test]
+async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
+    let path = temp_db_path("empty-repair");
+    let cfg = DatabaseConfig {
+        path: path.clone(),
+        ..Default::default()
+    };
+    let pool = db::connect_pool(&cfg).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // `success = 2` is neither the dirty check's `false` nor the repair's
+    // `1`: the mismatch is visible to sqlx, untouchable by the repair.
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00', success = 2 WHERE version = ?")
+        .bind(version)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = db::migrate(&pool)
+        .await
+        .expect_err("a mismatch the repair cannot rewrite must surface");
+    assert!(
+        err.to_string()
+            .contains("was previously applied but has been modified"),
+        "the original VersionMismatch must be re-raised, got: {err}"
+    );
+
+    // No repair was performed: the bad checksum survives and the durable
+    // breadcrumb must not exist (nothing may claim a repair that did not
+    // happen).
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?")
+            .bind(version)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, vec![0u8], "the row must be left exactly as it was");
+    let recorded: Option<String> =
+        sqlx::query_scalar("SELECT value FROM meta WHERE key = 'migrations_repaired'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(
+        recorded.is_none(),
+        "an empty repair must not write the breadcrumb: {recorded:?}"
+    );
+
+    drop(pool);
+    cleanup_files(&path);
+}
+
 /// The compiled `repair_migration_checksums` example, next to this test
 /// binary in `<target>/debug/examples/`. `cargo test` builds the workspace
 /// examples before running the integration tests; a targeted

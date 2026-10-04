@@ -30,6 +30,8 @@ pub fn is_supported(scheme: Scheme) -> bool {
             | Scheme::Ss
             | Scheme::Hysteria2
             | Scheme::Socks5
+            | Scheme::Snell
+            | Scheme::AnyTls
     )
 }
 
@@ -969,6 +971,57 @@ mod tests {
         assert!(entry_to_clash(&entry(Scheme::Tuic, "c", &[])).is_none());
         assert!(entry_to_clash(&entry(Scheme::Mieru, "c", &[])).is_none());
         assert!(entry_to_clash(&entry(Scheme::Naive, "c", &[])).is_none());
+        // snell/anytls have mapping arms and are meow-tunnelable; a
+        // regression here silently strips them from Clash subscriptions.
+        assert!(entry_to_clash(&entry(Scheme::Snell, "c", &[])).is_some());
+        assert!(entry_to_clash(&entry(Scheme::AnyTls, "c", &[])).is_some());
+    }
+
+    #[test]
+    fn snell_and_anytls_are_supported_and_rendered() {
+        assert!(is_supported(Scheme::Snell));
+        assert!(is_supported(Scheme::AnyTls));
+
+        let snell = entry(
+            Scheme::Snell,
+            "psk-1",
+            &[
+                ("version", "4"),
+                ("obfs", "http"),
+                ("obfs-host", "o.example.com"),
+            ],
+        );
+        let v = entry_to_clash(&snell).unwrap();
+        assert_eq!(str_field(&v, "type"), Some("snell"));
+        assert_eq!(str_field(&v, "psk"), Some("psk-1"));
+        assert_eq!(str_field(&v, "version"), Some("4"));
+        let obfs = field(&v, "obfs-opts").unwrap().as_mapping().unwrap();
+        assert_eq!(
+            obfs.get(Value::from("mode")).and_then(Value::as_str),
+            Some("http")
+        );
+        assert_eq!(
+            obfs.get(Value::from("host")).and_then(Value::as_str),
+            Some("o.example.com")
+        );
+
+        let anytls = entry(
+            Scheme::AnyTls,
+            "pw-1",
+            &[("sni", "a.example.com"), ("skip-cert-verify", "true")],
+        );
+        let v = entry_to_clash(&anytls).unwrap();
+        assert_eq!(str_field(&v, "type"), Some("anytls"));
+        assert_eq!(str_field(&v, "password"), Some("pw-1"));
+        assert_eq!(str_field(&v, "sni"), Some("a.example.com"));
+        assert_eq!(
+            field(&v, "skip-cert-verify").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // The end-to-end dispatch must not filter them out either.
+        let yaml = encode_clash(&[entry(Scheme::Snell, "psk-2", &[])]);
+        assert!(yaml.contains("type: snell"), "yaml was: {yaml}");
     }
 
     #[test]

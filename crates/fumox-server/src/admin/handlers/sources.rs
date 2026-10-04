@@ -1076,13 +1076,16 @@ pub async fn source_toggle(
         // The wrapper id must survive the swap (the form's hx-target points
         // at it), and the toggle button must flip with the state, it lives
         // outside the badge, so it travels along as an out-of-band swap.
+        // The aria attributes are part of the contract: the initial
+        // template announces the badge and reports the button's pressed
+        // state, and a swap that drops them silently ends both.
         format!(
-            r##"<span id="enabled-badge"><span class="badge {}">{}</span></span>
+            r##"<span id="enabled-badge" aria-live="polite" aria-atomic="true"><span class="badge {}">{}</span></span>
                <form id="toggle-form" method="post" action="/admin/sources/{id}/toggle"
                      hx-post="/admin/sources/{id}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML"
                      hx-swap-oob="outerHTML:#toggle-form">
                  <input type="hidden" name="_csrf" value="{}">
-                 <button class="btn" type="submit">{}</button>
+                 <button class="btn" type="submit" aria-pressed="{}">{}</button>
                </form>"##,
             if source.enabled { "on" } else { "off" },
             if source.enabled {
@@ -1091,6 +1094,7 @@ pub async fn source_toggle(
                 lang.t("common.off")
             },
             state.csrf_for(&headers),
+            if source.enabled { "true" } else { "false" },
             if source.enabled {
                 lang.t("common.disable")
             } else {

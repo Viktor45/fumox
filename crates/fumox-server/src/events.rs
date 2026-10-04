@@ -1,10 +1,11 @@
 //! In-process event bus for admin-panel push updates.
 //!
 //! The scheduler publishes fetch lifecycle events here; the SSE endpoint
-//! (`GET /admin/events`) subscribes and forwards them to the browser,
-//! interleaving periodic `probe.stats` / `heartbeat` events read from the
-//! database. Polling fragments keep working as the no-JS fallback, SSE is
-//! a pure enhancement.
+//! (`GET /admin/events`) subscribes and forwards them to the browser as
+//! one-shot notifications. Polling fragments keep working as the no-JS
+//! fallback, SSE is a pure enhancement: a missed event (for example a
+//! lagged subscriber) costs a delayed update, not state, since every fragment
+//! a `fetch.*` event triggers a refresh for polls on its own too.
 
 use tokio::sync::broadcast;
 
@@ -30,8 +31,9 @@ impl Default for EventBus {
 
 impl EventBus {
     pub fn new() -> Self {
-        // Small buffer: SSE consumers tolerate dropped events (the next
-        // periodic stats tick repairs any missed state).
+        // Small buffer: SSE consumers tolerate dropped events (they are
+        // notifications, the fragments they trigger refresh on their own
+        // cadence: the polls and page loads are the source of truth).
         let (tx, _) = broadcast::channel(64);
         Self { tx }
     }
@@ -63,6 +65,6 @@ mod tests {
     #[tokio::test]
     async fn publish_without_subscribers_is_fine() {
         let bus = EventBus::new();
-        bus.publish("heartbeat", serde_json::json!({}));
+        bus.publish("fetch.done", serde_json::json!({}));
     }
 }

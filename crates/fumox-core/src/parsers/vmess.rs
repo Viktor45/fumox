@@ -20,7 +20,7 @@ use crate::models::{Param, ProxyEntry, Scheme};
 use serde_json::Value;
 
 use super::ss::decode_b64_lenient;
-use super::uri::{encode_fragment, split_fragment};
+use super::uri::split_fragment;
 
 /// Lower-cased JSON fields defined by the vmess URI convention. Anything
 /// else is preserved as an unknown pass-through parameter.
@@ -149,7 +149,15 @@ pub fn serialize(entry: &ProxyEntry) -> String {
     object.insert("port".into(), Value::String(entry.port.to_string()));
     object.insert("id".into(), Value::String(entry.credential.clone()));
     for p in &entry.params {
-        if p.key.eq_ignore_ascii_case("v") {
+        // The structured fields are the single source of truth: a stray
+        // parameter spelled `add`/`port`/`ps`/`id` (Clash passes unknown
+        // fields through, a vmess JSON can carry `PS` next to `ps`) must
+        // not overwrite the host, port, name or credential on output.
+        if p.key.eq_ignore_ascii_case("v")
+            || CONSUMED_FIELDS
+                .iter()
+                .any(|field| p.key.eq_ignore_ascii_case(field))
+        {
             continue;
         }
         object.insert(p.key.clone(), Value::String(p.value.clone()));
@@ -161,17 +169,6 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         json.as_bytes(),
     );
     format!("vmess://{b64}")
-}
-
-/// Re-encode the display name as a fragment; used only by tools that want
-/// the redundant `#name` form. The canonical serializer drops it.
-#[allow(dead_code)]
-pub fn serialize_with_fragment(entry: &ProxyEntry) -> String {
-    if entry.name.is_empty() {
-        serialize(entry)
-    } else {
-        format!("{}#{}", serialize(entry), encode_fragment(&entry.name))
-    }
 }
 
 fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
@@ -293,6 +290,68 @@ mod tests {
         a.sort_by(|x, y| x.key.cmp(&y.key));
         b.sort_by(|x, y| x.key.cmp(&y.key));
         assert_eq!(a, b);
+    }
+
+    /// A stray parameter whose name collides with a consumed field
+    /// (case-insensitively) must not overwrite the structured one: a
+    /// Clash item passing `add` through used to serialize a line whose
+    /// host, port, name or credential differed from the stored entry.
+    #[test]
+    fn consumed_fields_win_over_colliding_params() {
+        let entry = ProxyEntry {
+            scheme: Scheme::Vmess,
+            name: "real-name".into(),
+            host: "real.example.com".into(),
+            port: 443,
+            credential: "uuid-1".into(),
+            params: vec![
+                Param {
+                    key: "v".into(),
+                    value: "2".into(),
+                    known: true,
+                },
+                Param {
+                    key: "add".into(),
+                    value: "evil.example.com".into(),
+                    known: false,
+                },
+                Param {
+                    key: "PS".into(),
+                    value: "evil-name".into(),
+                    known: false,
+                },
+                Param {
+                    key: "PORT".into(),
+                    value: "1".into(),
+                    known: false,
+                },
+                Param {
+                    key: "id".into(),
+                    value: "evil-id".into(),
+                    known: false,
+                },
+                Param {
+                    key: "net".into(),
+                    value: "ws".into(),
+                    known: true,
+                },
+            ],
+            raw_path: String::new(),
+            raw_line: String::new(),
+        };
+        let line = serialize(&entry);
+        let back = parse(line.strip_prefix("vmess://").unwrap(), &line).unwrap();
+        assert_eq!(back.name, "real-name");
+        assert_eq!(back.host, "real.example.com");
+        assert_eq!(back.port, 443);
+        assert_eq!(back.credential, "uuid-1");
+        assert_eq!(back.param("net"), Some("ws"));
+        for gone in ["add", "ps", "port", "id"] {
+            assert!(
+                back.param_ignore_case(gone).is_none(),
+                "{gone} leaked through"
+            );
+        }
     }
 
     #[test]

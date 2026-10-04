@@ -19,6 +19,10 @@ use std::os::unix::fs::PermissionsExt;
 
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
+/// Re-exported so callers of [`EditableConfig::set`] can name the value
+/// type without taking a direct `toml_edit` dependency.
+pub use toml_edit::Item as ConfigItem;
+
 /// Failure mode of [`EditableConfig`] operations.
 #[derive(Debug)]
 pub enum ConfigWriteError {
@@ -85,7 +89,11 @@ impl From<std::io::Error> for ConfigWriteError {
 pub struct EditableConfig {
     path: PathBuf,
     doc: DocumentMut,
-    _lock: EditLock,
+    /// Held from `load` to drop (see [`EDITOR_LOCK`]). Poisoning is
+    /// ignored on purpose: the guarded state is `()`, a panicking
+    /// editor cannot leave it inconsistent, and a poisoned handle
+    /// must not lock the admin out of its own config file.
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl std::fmt::Debug for EditableConfig {
@@ -107,7 +115,9 @@ impl EditableConfig {
     /// the current state of the file and no save can land between the
     /// read and the mutation that follows it.
     pub fn load(path: &Path) -> Result<Self, ConfigWriteError> {
-        let lock = EditLock::acquire();
+        let lock = EDITOR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let doc = match std::fs::read_to_string(path) {
             Ok(s) => DocumentMut::from_str(&s).map_err(|e| ConfigWriteError::Parse {
                 path: path.to_path_buf(),
@@ -246,45 +256,10 @@ static SAVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// One process-wide lock, not one per path: the admin panel edits exactly
 /// one config, and keying by path would have to reconcile relative and
-/// absolute spellings of the same file. Not reentrant: the flag is held from
-/// `load` to drop, so `config::load_config` must never take it (the admin
-/// handler re-reads the config through it while the handle is alive).
-struct EditLock;
-
-impl EditLock {
-    fn acquire() -> Self {
-        // Spin with `yield_now` first, then back off, so a handler that
-        // only holds the lock across a handful of syscalls does not
-        // burn a core for its whole duration while a sibling is in a
-        // blocking write.
-        let mut spins = 0u32;
-        while EDITOR_LOCK
-            .compare_exchange_weak(
-                false,
-                true,
-                std::sync::atomic::Ordering::Acquire,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            if spins < 128 {
-                spins += 1;
-                std::thread::yield_now();
-            } else {
-                std::thread::sleep(std::time::Duration::from_micros(200));
-            }
-        }
-        Self
-    }
-}
-
-impl Drop for EditLock {
-    fn drop(&mut self) {
-        EDITOR_LOCK.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
-static EDITOR_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// absolute spellings of the same file. Not reentrant: the guard is held
+/// from `load` to drop, so `config::load_config` must never take it (the
+/// admin handler re-reads the config through it while the handle is alive).
+static EDITOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Write the tmp file with the original file's permission mode.
 ///
@@ -773,7 +748,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Pins the scope of [`EditLock`]: it guards this module's
+    /// Pins the scope of [`EDITOR_LOCK`]: it guards this module's
     /// read-modify-write path and nothing else. The plain figment
     /// loader (`config::load` / `load_config`) reads the same file
     /// without it, and it has to keep doing so, the admin handler
@@ -800,7 +775,7 @@ mod tests {
             tx.send(()).unwrap();
         });
 
-        // A lock the loader also took would spin here until the timeout.
+        // A lock the loader also took would block here until the timeout.
         let returned = rx.recv_timeout(std::time::Duration::from_secs(5));
         drop(_cfg);
 

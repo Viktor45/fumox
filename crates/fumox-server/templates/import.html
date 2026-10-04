@@ -65,7 +65,9 @@
       </tbody>
     </table>
   </div>
-  <form method="post" action="/admin/import/alive-token" class="rotate-actions">
+  <form method="post" action="/admin/import/alive-token" class="rotate-actions"
+        data-confirm="{{ self.t("io.alive_rotate_confirm") }}"
+        onsubmit="return confirm(this.dataset.confirm)">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <button class="btn" type="submit">{{ self.t("io.alive_rotate") }}</button>
     <span class="hint">{{ self.t("io.rotate_hint") }}</span>
@@ -85,7 +87,7 @@
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <div class="field">
       <label for="io-payload">{{ self.t("io.payload_label") }}</label>
-      <textarea class="mono" id="io-payload" name="payload" rows="12" placeholder='{ "version": 1, … }'></textarea>
+      <textarea class="mono" id="io-payload" name="payload" rows="12" placeholder='{ "version": 1, … }'>{{ payload }}</textarea>
       <div class="hint">{{ self.t("io.payload_hint") }}</div>
     </div>
     <div class="field">

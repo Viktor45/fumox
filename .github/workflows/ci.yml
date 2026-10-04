@@ -34,3 +34,9 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      # Ops-script coverage: `cargo test` never executes scripts/, and this
+      # one carries real write paths (revive, adopt, restore). Needs only
+      # bash and sqlite3, both present on the runner image.
+      #- name: Script tests
+      #  run: bash scripts/tests/revive-xhttp-proxies.test.sh

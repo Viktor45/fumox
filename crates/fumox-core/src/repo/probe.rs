@@ -49,6 +49,15 @@ pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
     Ok(affected)
 }
 
+/// Total journal size. Reported on the probe page next to the rotation
+/// stamp: a fresh stamp on a table that keeps growing is still a leak.
+pub async fn count_all(pool: &DbPool) -> crate::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_results")
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
 /// The `probe_kind` of the most recent failed attempt for a proxy, or `None`
 /// when it has no failed attempts. Newest first via the
 /// `idx_probe_proxy_time` index. Feeds the strict T2-priority rule:

@@ -1,0 +1,12 @@
+-- The admin proxies list defaults to `ORDER BY p.updated_at DESC, p.id DESC`
+-- and paginates with LIMIT/OFFSET, so without an index every page, and the
+-- matching COUNT, walks the whole table. The id tiebreaker is part of the
+-- order, so it is part of the index.
+--
+-- First migration whose cost scales with `proxies`, and sqlx-sqlite wraps
+-- every migration in one write transaction, so this holds the WAL write
+-- lock for the whole build. That is why the probe waits on the server's
+-- healthcheck rather than a bare `depends_on`: the server finishes its
+-- schema before the probe opens the file. `no_tx` is not available here,
+-- sqlx parses that directive for Postgres only.
+CREATE INDEX idx_proxies_updated_at ON proxies(updated_at DESC, id DESC);

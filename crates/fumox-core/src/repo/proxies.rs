@@ -144,7 +144,11 @@ impl ProxyRow {
 }
 
 /// Upsert all entries of one fetch and reconcile links for the source.
-/// Runs in a single transaction.
+/// Runs in a single transaction, and inside it the per-row work is
+/// batched into multi-row statements (see the upsert loop): the
+/// transaction is what makes the link sweep sound, the batching is what
+/// keeps its write-lock span short enough that the probe daemon's
+/// concurrent writes survive `busy_timeout` on large feeds.
 ///
 /// `geo` runs parallel to `entries` (indexed access; a shorter slice or a
 /// `None` element means "no fresh geo facts", the COALESCE upsert branch
@@ -222,24 +226,35 @@ pub async fn reconcile_source(
     // identity fields only. Lifecycle fields (status, fail_count, quarantine
     // schedules, removed_at) are deliberately absent: the probe state
     // machine is their sole owner, and a reappearing proxy keeps its state.
+    //
+    // One multi-row statement per `UPSERT_CHUNK` entries, so the
+    // transaction holds the WAL write lock for few round-trips: a per-row
+    // loop kept it long enough for a large refresh to overrun the probe
+    // daemon's `busy_timeout` and drop its journals.
+    //
+    // Two ceilings bound this, both of which "optimizing" it upward would
+    // hit: 250 * 14 columns = 3500 binds, against SQLite's 32766-variable
+    // limit, and a multi-row VALUES is a compound SELECT, against
+    // SQLITE_MAX_COMPOUND_SELECT (500 in the bundled build, 256 in some
+    // others). The link stamp below uses 500, which is at that ceiling.
+    const UPSERT_CHUNK: usize = 250;
+    // Keyed by fingerprint because RETURNING emits rows in unspecified
+    // order, and duplicate fingerprints in one batch must collapse onto
+    // the one id.
+    let mut ids_by_fingerprint: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::with_capacity(entries.len());
     let mut proxy_ids: Vec<i64> = Vec::with_capacity(entries.len());
     let mut seen_in_batch: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (idx, (entry, fingerprint)) in entries.iter().zip(&fingerprints).enumerate() {
-        let params_json =
-            super::json_to_text(&serde_json::Value::Object(entry.known_params_json()))?;
-        let unknown_json =
-            super::json_to_text(&serde_json::Value::Object(entry.unknown_params_json()))?;
-        let geo = geo
-            .get(idx)
-            .and_then(|stamp| stamp.as_ref())
-            .cloned()
-            .unwrap_or_default();
-        let (id,): (i64,) = sqlx::query_as(
+    for (chunk_idx, chunk) in entries.chunks(UPSERT_CHUNK).enumerate() {
+        let base = chunk_idx * UPSERT_CHUNK;
+        let placeholders =
+            vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+        let sql = format!(
             "INSERT INTO proxies
                 (fingerprint, scheme, name, host, port, credential,
                  params, unknown_params, raw_line,
                  geo_country, geo_city, geo_asn, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES {placeholders}
              ON CONFLICT(fingerprint) DO UPDATE SET
                 name = excluded.name,
                 params = excluded.params,
@@ -249,27 +264,56 @@ pub async fn reconcile_source(
                 geo_city = COALESCE(excluded.geo_city, proxies.geo_city),
                 geo_asn = COALESCE(excluded.geo_asn, proxies.geo_asn),
                 updated_at = excluded.updated_at
-             RETURNING id",
-        )
-        .bind(fingerprint)
-        .bind(entry.scheme.as_str())
-        .bind(&entry.name)
-        .bind(&entry.host)
-        .bind(entry.port)
-        .bind(&entry.credential)
-        .bind(&params_json)
-        .bind(&unknown_json)
-        .bind(&entry.raw_line)
-        .bind(&geo.country)
-        .bind(&geo.city)
-        .bind(&geo.asn)
-        .bind(now)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await?;
+             RETURNING id, fingerprint"
+        );
+        // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
+        let mut query = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql.as_str()));
+        for (idx, entry) in chunk.iter().enumerate() {
+            let fingerprint = fingerprints[base + idx].as_str();
+            let params_json =
+                super::json_to_text(&serde_json::Value::Object(entry.known_params_json()))?;
+            let unknown_json =
+                super::json_to_text(&serde_json::Value::Object(entry.unknown_params_json()))?;
+            let geostamp = geo
+                .get(base + idx)
+                .and_then(|stamp| stamp.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            query = query
+                .bind(fingerprint)
+                .bind(entry.scheme.as_str())
+                .bind(&entry.name)
+                .bind(&entry.host)
+                .bind(entry.port)
+                .bind(&entry.credential)
+                .bind(params_json)
+                .bind(unknown_json)
+                .bind(&entry.raw_line)
+                .bind(geostamp.country)
+                .bind(geostamp.city)
+                .bind(geostamp.asn)
+                .bind(now)
+                .bind(now);
+        }
+        let rows: Vec<(i64, String)> = query.fetch_all(&mut *tx).await?;
+        for (id, fingerprint) in rows {
+            ids_by_fingerprint.insert(fingerprint, id);
+        }
+    }
+
+    // Rebuild the per-entry id list in entry order and do the
+    // insert/update accounting. A fingerprint already in the DB, or
+    // already seen earlier in this same batch, counts as an update.
+    for fingerprint in &fingerprints {
+        let id = ids_by_fingerprint
+            .get(fingerprint.as_str())
+            .copied()
+            .ok_or_else(|| {
+                crate::Error::Database(
+                    "reconcile_source: upsert returned no id for a bound fingerprint".to_string(),
+                )
+            })?;
         proxy_ids.push(id);
-        // A fingerprint already in the DB, or already upserted earlier in
-        // this same batch, counts as an update.
         if existing.contains(fingerprint.as_str()) || !seen_in_batch.insert(fingerprint.as_str()) {
             stats.updated += 1;
         } else {
@@ -278,18 +322,20 @@ pub async fn reconcile_source(
         }
     }
 
-    // Stamp the links of everything still present in this source.
-    for id in &proxy_ids {
-        sqlx::query(
+    // Stamp the links of everything still present in this source,
+    // batched like the upserts (3 binds per row).
+    for chunk in proxy_ids.chunks(500) {
+        let placeholders = vec!["(?, ?, ?)"; chunk.len()].join(", ");
+        let sql = format!(
             "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
-             VALUES (?, ?, ?)
-             ON CONFLICT(proxy_id, source_id) DO UPDATE SET seen_at = excluded.seen_at",
-        )
-        .bind(id)
-        .bind(source_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+             VALUES {placeholders}
+             ON CONFLICT(proxy_id, source_id) DO UPDATE SET seen_at = excluded.seen_at"
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        for id in chunk {
+            query = query.bind(id).bind(source_id).bind(now);
+        }
+        query.execute(&mut *tx).await?;
     }
 
     // Drop links this fetch no longer saw, then mark orphaned proxies
@@ -378,6 +424,19 @@ pub async fn list_missing_geo(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// How many rows still have every geo column NULL. The backfill summary
+/// reports this: rows the resolver cannot answer stay NULL and are retried
+/// on the next start, so the count is the honest "still missing" figure.
+pub async fn count_missing_geo(pool: &DbPool) -> crate::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM proxies
+         WHERE geo_country IS NULL AND geo_city IS NULL AND geo_asn IS NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
 }
 
 /// Store resolved geo facts on one proxy row.
@@ -494,56 +553,6 @@ pub async fn count_by_check_coverage(pool: &DbPool) -> crate::Result<Vec<(String
         }
     }
     Ok(out)
-}
-
-/// Load the deduplicated proxy set reachable from a list of sources, excluding
-/// the given lifecycle statuses (health-filter).
-///
-/// A proxy linked from several of the selected sources is returned once.
-/// Ordering is stable (by id) so callers can apply their own `sort.by`.
-pub async fn list_for_sources(
-    pool: &DbPool,
-    source_ids: &[String],
-    exclude_statuses: &[crate::models::ProxyStatus],
-) -> crate::Result<Vec<ProxyRow>> {
-    if source_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let src_ph = vec!["?"; source_ids.len()].join(", ");
-    // Never exclude by an empty NOT IN list, build a harmless always-false
-    // placeholder set when nothing is excluded.
-    let excluded: Vec<&str> = exclude_statuses
-        .iter()
-        .map(|status| status.as_str())
-        .collect();
-    let stat_ph = if excluded.is_empty() {
-        "''".to_string()
-    } else {
-        vec!["?"; excluded.len()].join(", ")
-    };
-    let sql = format!(
-        "SELECT p.* FROM proxies p
-         WHERE p.id IN (
-             SELECT l.proxy_id FROM proxy_source_links l WHERE l.source_id IN ({src_ph})
-         )
-         AND p.status NOT IN ({stat_ph})
-         ORDER BY p.id"
-    );
-    // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
-    let mut query = sqlx::query_as::<_, ProxyRow>(sqlx::AssertSqlSafe(sql.as_str()));
-    for id in source_ids {
-        query = query.bind(id);
-    }
-    if !excluded.is_empty() {
-        for status in &excluded {
-            query = query.bind(status);
-        }
-    }
-    let rows = query.fetch_all(pool).await?;
-    // A proxy linked from multiple selected sources appears once thanks to
-    // the IN-subquery, but guard defensively just in case.
-    let mut seen = std::collections::HashSet::new();
-    Ok(rows.into_iter().filter(|row| seen.insert(row.id)).collect())
 }
 
 /// A proxy row joined with the source it is linked to (`#[sqlx(flatten)]`
@@ -1288,20 +1297,26 @@ pub async fn select_t1_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
 /// order is id-ascending, which spreads the batch across the pool as it
 /// cycles through it.
 pub async fn select_t2_candidates(pool: &DbPool, limit: u32) -> crate::Result<Vec<ProxyRow>> {
-    let rows: Vec<ProxyRow> = sqlx::query_as(
+    // The allowlist is built from `T2_SCHEMES` so the SQL can never drift
+    // from the const the mirror test pins (a hardcoded literal used to omit
+    // snell/anytls, which silently kept those rows out of every T2 batch).
+    let supported = vec!["?"; T2_SCHEMES.len()].join(", ");
+    let sql = format!(
         "SELECT p.*
          FROM proxies p
          WHERE (p.status IN ('alive', 'ready') OR (p.status = 'unknown' AND p.scheme = 'hysteria2'))
-           AND p.scheme IN ('vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'socks5')
+           AND p.scheme IN ({supported})
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
          ORDER BY (SELECT MAX(r.checked_at) FROM probe_results r
                    WHERE r.proxy_id = p.id AND r.probe_kind = 't2') ASC,
                   p.id ASC
-         LIMIT ?",
-    )
-    .bind(i64::from(limit))
-    .fetch_all(pool)
-    .await?;
+         LIMIT ?"
+    );
+    let mut query = sqlx::query_as::<_, ProxyRow>(sqlx::AssertSqlSafe(sql.as_str()));
+    for scheme in T2_SCHEMES {
+        query = query.bind(scheme);
+    }
+    let rows: Vec<ProxyRow> = query.bind(i64::from(limit)).fetch_all(pool).await?;
     Ok(rows)
 }
 
@@ -1803,6 +1818,61 @@ mod tests {
             .unwrap();
         assert_eq!(stats.updated, 2);
         assert!(stats.inserted_ids.is_empty());
+    }
+
+    /// A feed larger than one upsert chunk drives the batched multi-row
+    /// statements end to end: the chunk boundaries must not lose or
+    /// duplicate rows, and duplicate fingerprints must still collapse onto
+    /// one row whether the repeat lands inside its own chunk (the
+    /// second values-row conflicts with the first row of the same
+    /// statement) or in a later one (it conflicts with a row this
+    /// transaction wrote earlier). The per-row loop this replaced could
+    /// not fail these assertions by construction; the batched form can
+    /// (bad placeholder count, mis-sized RETURNING map, conflated ids).
+    #[tokio::test]
+    async fn reconcile_batches_large_feeds_with_duplicate_fingerprints() {
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        // 600 unique entries: two full chunks of 250 plus a partial third.
+        let mut entries: Vec<ProxyEntry> = (0..600)
+            .map(|i| entry(&format!("p{i}"), &format!("h{i}.example.com"), 443))
+            .collect();
+        // Same-chunk duplicate: right after the first chunk's last entry.
+        entries.insert(251, entries[250].clone());
+        // Cross-chunk duplicate: position 601 lands in the third chunk,
+        // the original sits in the first.
+        entries.push(entries[0].clone());
+        let unique = 600;
+        let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
+            .await
+            .unwrap();
+        assert_eq!(stats.inserted, unique);
+        assert_eq!(stats.updated, 2, "both repeats count as updates");
+        assert_eq!(stats.inserted_ids.len(), unique);
+        assert_eq!(stats.removed, 0);
+
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, unique as i64);
+        // Every unique proxy carries a link even though two fingerprints
+        // were stamped twice: the ON CONFLICT branch folds the repeats.
+        let (links,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxy_source_links")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(links, unique as i64);
+
+        // A refetch updates every entry (repeats included) and the sweep
+        // finds nothing to retire.
+        let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 2000, false)
+            .await
+            .unwrap();
+        assert_eq!(stats.updated, entries.len());
+        assert_eq!(stats.inserted, 0);
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.unlinked, 0);
     }
 
     /// A stamp slice longer than the entry list means the caller filtered
@@ -2546,71 +2616,6 @@ mod tests {
         assert_eq!(back.param("security"), Some("reality"));
         // Same fingerprint even after the DB round trip.
         assert_eq!(back.fingerprint(), e.fingerprint());
-    }
-
-    #[tokio::test]
-    async fn list_for_sources_filters_and_dedups() {
-        use crate::models::ProxyStatus;
-        let pool = temp_pool().await;
-        make_source(&pool, "srcA0000000").await;
-        make_source(&pool, "srcB0000000").await;
-
-        let shared = entry("shared", "h1.example.com", 443);
-        let only_a = entry("only-a", "h2.example.com", 443);
-        let quarantined = entry("sick", "h3.example.com", 443);
-
-        reconcile_source(
-            &pool,
-            "srcA0000000",
-            &[shared.clone(), only_a.clone(), quarantined.clone()],
-            &[],
-            1000,
-            false,
-        )
-        .await
-        .unwrap();
-        reconcile_source(
-            &pool,
-            "srcB0000000",
-            std::slice::from_ref(&shared),
-            &[],
-            1100,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Put one proxy into quarantine.
-        sqlx::query("UPDATE proxies SET status = 'quarantine' WHERE fingerprint = ?")
-            .bind(quarantined.fingerprint())
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let ids = vec!["srcA0000000".to_string(), "srcB0000000".to_string()];
-        let rows = list_for_sources(
-            &pool,
-            &ids,
-            &[ProxyStatus::Quarantine, ProxyStatus::Removed],
-        )
-        .await
-        .unwrap();
-        // shared (deduped across both sources) + only_a; quarantined excluded.
-        assert_eq!(rows.len(), 2);
-        let hosts: Vec<&str> = rows.iter().map(|r| r.host.as_str()).collect();
-        assert!(hosts.contains(&"h1.example.com"));
-        assert!(hosts.contains(&"h2.example.com"));
-        assert!(!hosts.contains(&"h3.example.com"));
-
-        // Excluding nothing returns all three.
-        let all = list_for_sources(&pool, &ids, &[]).await.unwrap();
-        assert_eq!(all.len(), 3);
-
-        // Empty source list short-circuits.
-        let none = list_for_sources(&pool, &[], &[ProxyStatus::Removed])
-            .await
-            .unwrap();
-        assert!(none.is_empty());
     }
 
     #[tokio::test]
@@ -3792,8 +3797,8 @@ mod tests {
     /// divergence would either drop rows the SQL offered, under the
     /// recency order a perpetually uncheckable row (e.g. naive) would
     /// starve the whole batch, or skip schemes meow-rs handles fine.
-    #[test]
-    fn t2_scheme_allowlist_mirrors_meow_support() {
+    #[tokio::test]
+    async fn t2_scheme_allowlist_mirrors_meow_support() {
         use crate::models::Scheme;
         // The mirror lives in fumox-probe::clash::is_supported; the core
         // crate cannot depend on it, so assert the exact expected set
@@ -3805,6 +3810,40 @@ mod tests {
             .map(|scheme| scheme.as_str())
             .collect();
         assert_eq!(T2_SCHEMES, meow_supported.as_slice());
+
+        // And the selector must actually offer that set: the IN-list was
+        // once a hardcoded six-scheme literal that omitted snell/anytls,
+        // so those rows could never receive a T2 verdict and never leave
+        // `alive` for `ready`.
+        let pool = temp_pool().await;
+        make_source(&pool, "srcA0000000").await;
+        let mk = |scheme: Scheme, host: &str| ProxyEntry {
+            scheme,
+            name: host.to_string(),
+            host: host.to_string(),
+            port: 443,
+            credential: "c1".to_string(),
+            params: Vec::new(),
+            raw_path: String::new(),
+            raw_line: String::new(),
+        };
+        let entries = vec![
+            mk(Scheme::Snell, "snell.example.com"),
+            mk(Scheme::AnyTls, "anytls.example.com"),
+            mk(Scheme::Naive, "naive.example.com"),
+        ];
+        reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET status = 'alive'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let candidates = select_t2_candidates(&pool, 100).await.unwrap();
+        let schemes: Vec<&str> = candidates.iter().map(|row| row.scheme.as_str()).collect();
+        assert!(schemes.contains(&"snell"), "candidates: {schemes:?}");
+        assert!(schemes.contains(&"anytls"), "candidates: {schemes:?}");
+        assert!(!schemes.contains(&"naive"), "candidates: {schemes:?}");
     }
 
     #[tokio::test]

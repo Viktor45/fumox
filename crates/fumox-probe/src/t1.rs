@@ -245,6 +245,16 @@ mod tests {
         assert_eq!(check_kind(Scheme::Naive, None), CheckKind::Tls);
         assert_eq!(check_kind(Scheme::Ss, None), CheckKind::Tcp);
         assert_eq!(check_kind(Scheme::Socks5, None), CheckKind::Tcp);
+        // Snell's obfs is spoken inside the tunnel, not a handshake T1
+        // could validate: connect-only, the T2 tunnel is the verification.
+        assert_eq!(check_kind(Scheme::Snell, None), CheckKind::Tcp);
+        // AnyTLS speaks TLS; the verdict ignores params (there is no
+        // plain-TCP spelling of the protocol to fall back to).
+        assert_eq!(check_kind(Scheme::AnyTls, None), CheckKind::Tls);
+        assert_eq!(
+            check_kind(Scheme::AnyTls, params(r#"{"tls":"false"}"#)),
+            CheckKind::Tls
+        );
         assert_eq!(
             check_kind(Scheme::Vless, params(r#"{"security":"reality"}"#)),
             CheckKind::Tls

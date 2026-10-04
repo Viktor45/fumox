@@ -540,12 +540,12 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 
 | Screen              | What you do there                                                                                                                                                                                     |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Dashboard**       | Totals: sources (enabled/errored), profiles, proxies by status, 24h fetch success rate, probe heartbeat, recent errors and fetches                                                                    |
+| **Dashboard**       | Totals: sources (enabled/errored), profiles, proxies by status, 24h fetch success rate with the age of the last scheduler sweep, probe heartbeat, recent errors and fetches                                                                    |
 | **Sources**         | Create/edit/enable/delete sources; *Refresh now*; per-source fetch log with error classes; the `/src/…` link                                                                                          |
 | **Profiles**        | Create/edit profiles: composition and order of sources, output format, pipeline overrides, access token, slug; output preview (first 50 lines)                                                        |
 | **Proxies**         | Filterable browser of all proxies (status, protocol, country, source, search by host/name); detail card with parameters, geo, lifecycle timestamps and probe history; *Reset status*; *Purge removed* |
 | **Fetch log**       | Journal of every source fetch: time, status, bytes, proxies found, error class                                                                                                                        |
-| **Probe**           | Health-check daemon status: heartbeat, meow-rs status with the kernel's live RSS (from meow-rs `GET /memory`, refreshed whenever a T2 batch reloads the engine), quarantine queue with scheduled second chances                                                                                                 |
+| **Probe**           | Health-check daemon status: heartbeat, meow-rs status with the kernel's live RSS (from meow-rs `GET /memory`, refreshed whenever a T2 batch reloads the engine), quarantine queue with scheduled second chances, and the history rotation panel (when the last retention run happened, what it deleted, journal size now)                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
 | **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels: nearly every `config/app.toml` knob, and never the admin token. Two keys are file-only and have no field on the page: `[server].export_max_rows` and `[geo].startup_download_budget_secs`; the file values still apply, the panel just cannot show or edit them. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
 
@@ -598,11 +598,10 @@ Both links are snapshots, not live views, and are bounded twice:
   than the pool.
 - **Cached for 30 seconds.** A burst of downloads inside one window is
   served from the same body, so the common case costs one render rather
-  than one per request. The window is a cache TTL, not a lock: a request
-  that arrives after the window has expired re-renders the tier itself,
-  so a herd landing exactly on the boundary does one render per request
-  (the database pool still caps how many of those run at once). The
-  other trade-off is staleness: a proxy that dies can still appear in a
+  than one per request. Refreshing the body is single-flighted too: when
+  the window has expired, the first request renders and the rest wait
+  for its fresh body rather than each rendering the tier. The
+  trade-off is staleness: a proxy that dies can still appear in a
   body for up to 30 seconds after the change. A download is a snapshot
   by definition, and an outdated one served quietly is worse than a
   slightly slower request: an expired body is re-rendered, never
@@ -1162,9 +1161,13 @@ throughput tops out at `concurrency / check` rows per second, so a
 tighter target is a throughput limit, not something scheduling can fix.
 
 **Two rules worth knowing.** The daemon card and the backlog banner both
-call a heartbeat dead after `max(heartbeat_interval_secs, 5) × 3`; the
-`.max(5)` mirrors the daemon's own beat period, so configuring a period
-below 5 s cannot make a healthy daemon look dead. And `queue_stale_days = 0`
+call a heartbeat dead after `max(period, 5) × 3`, where the period is
+the one the daemon reports in its own heartbeat (a record from before
+that field existed falls back to this server's
+`heartbeat_interval_secs`), so a server and a probe reading different
+config files still agree on the daemon's own schedule. The `.max(5)`
+mirrors the daemon's own beat floor, so configuring a period below 5 s
+cannot make a healthy daemon look dead. And `queue_stale_days = 0`
 behaves as 1 in the banner, exactly as in the daemon's retention.
 
 ## 11. Geo enrichment
@@ -1280,7 +1283,9 @@ stored.
 - [ ] `allow_private_urls` set to `false` (the built-in default, SSRF
       protection). The shipped `config/app.toml` example sets it to `true`,
       so change it unless you have a specific trusted-internal-source
-      reason. The same holds for `[probe].allow_private_targets`.
+      reason. `[probe].allow_private_targets` needs no such check: this
+      example ships `false` like its built-in default, and `true` is an
+      explicit opt-in for isolated test infrastructure.
 - [ ] One `fumox-server` + one `fumox-probe` against the same database file;
       `busy_timeout_ms` stays set.
 - [ ] meow-rs runs as its own long-lived service (systemd unit / container

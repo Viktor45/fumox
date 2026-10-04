@@ -160,6 +160,19 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+    // figment layers `FUMOX_*` variables over the file; count them so a
+    // surprise override is at least attributable; names and values stay
+    // out of the log. The resolved database path matters here as much as
+    // on the server: pointing the probe at a different file than the
+    // server would otherwise be invisible until the journals diverge.
+    let env_overrides = std::env::vars()
+        .filter(|(key, _)| key.starts_with("FUMOX_"))
+        .count();
+    tracing::info!(
+        path = %config.database.path.display(),
+        env_overrides,
+        "database configured"
+    );
     let pool = fumox_core::db::connect_pool(&config.database).await?;
     fumox_core::db::migrate(&pool).await?;
 
@@ -215,12 +228,14 @@ async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
     let quarantine = probe_due_quarantine(ctx.clone(), now).await?;
     let queued = probe_queued_checks(ctx.clone()).await?;
     let t1_checked = probe_t1_sample(ctx.clone(), &queued.claimed).await?;
-    let t2_checked = probe_t2_batch(ctx).await?;
+    let t2 = probe_t2_batch(ctx).await?;
     tracing::info!(
         quarantine_checked = quarantine,
         queued_checked = queued.checked,
         t1_checked,
-        t2_checked,
+        t2_checked = t2.checked,
+        t2_aborted = t2.aborted,
+        t2_skipped = t2.skipped,
         "probe cycle done"
     );
     Ok(())
@@ -293,6 +308,9 @@ async fn run_t1_checks(
     let semaphore = Arc::new(Semaphore::new(ctx.config.probe.concurrency.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     let mut blocked = 0usize;
+    // Parse and port checks come first so the vetting pass below only
+    // covers rows that can actually be dialed.
+    let mut ready: Vec<(proxies::T1Candidate, t1::CheckKind, u16)> = Vec::new();
     for candidate in candidates {
         let Ok(scheme) = candidate.scheme.parse::<Scheme>() else {
             tracing::warn!(id = candidate.id, scheme = %candidate.scheme, "unknown scheme, skipped");
@@ -307,7 +325,11 @@ async fn run_t1_checks(
             continue;
         };
         let kind = t1::check_kind(scheme, candidate.params.as_deref());
-        let vetted = match vet_target_addrs(&ctx, &candidate.host).await {
+        ready.push((candidate, kind, port));
+    }
+    let hosts: Vec<String> = ready.iter().map(|(c, _, _)| c.host.clone()).collect();
+    for ((candidate, kind, port), verdict) in ready.into_iter().zip(vet_hosts(&ctx, &hosts).await) {
+        let vetted = match verdict {
             Ok(addrs) => addrs,
             Err(reason) => {
                 tracing::warn!(id = candidate.id, %reason, "probe target blocked by the private-address policy, journaled as a failed check");
@@ -355,6 +377,50 @@ async fn vet_target_addrs(ctx: &Context, host: &str) -> Result<Vec<std::net::IpA
         ctx.config.geo.dns_timeout(),
     )
     .await
+}
+
+/// Vet every host concurrently, preserving the input order. Each vetting
+/// pass is a DNS lookup bounded by `dns_timeout` (5 s by default), the
+/// lanes used to run these serially in their select loops before spawning
+/// any check, so a batch full of dead names queued one timeout per
+/// candidate ahead of every real verdict while the check semaphore sat
+/// idle. Concurrency is bounded by `probe.concurrency`, the same budget
+/// the checks themselves run under.
+async fn vet_hosts(
+    ctx: &Arc<Context>,
+    hosts: &[String],
+) -> Vec<Result<Vec<std::net::IpAddr>, String>> {
+    let semaphore = Arc::new(Semaphore::new(ctx.config.probe.concurrency.max(1)));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, host) in hosts.iter().enumerate() {
+        let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
+        let host = host.clone();
+        tasks.spawn(async move {
+            let _permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                // Structurally impossible: the semaphore lives in this
+                // scope and cannot close before the join loop below.
+                Err(_) => return (index, Err("vetting lane closed".to_string())),
+            };
+            (index, vet_target_addrs(&ctx, &host).await)
+        });
+    }
+    let mut verdicts: Vec<Option<Result<Vec<std::net::IpAddr>, String>>> =
+        (0..hosts.len()).map(|_| None).collect();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((index, verdict)) => verdicts[index] = Some(verdict),
+            Err(error) => tracing::warn!(%error, "vetting task panicked"),
+        }
+    }
+    verdicts
+        .into_iter()
+        .map(|verdict| {
+            // A panicked task leaves a hole; refusing the target keeps the
+            // row on the ordinary fail ladder instead of buffering it.
+            verdict.unwrap_or_else(|| Err("vetting task panicked".to_string()))
+        })
+        .collect()
 }
 
 /// A vet-refused target is a *failed check*, not a skip: the policy blocks exactly what a dead proxy looks like ,
@@ -489,6 +555,9 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
     let semaphore = Arc::new(Semaphore::new(ctx.config.probe.concurrency.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     let mut blocked = 0usize;
+    // Parse and port checks first: the vetting pass only covers rows that
+    // can actually be dialed.
+    let mut ready: Vec<(proxies::DueQuarantine, t1::CheckKind, u16)> = Vec::new();
     for row in due {
         let Ok(scheme) = row.scheme.parse::<Scheme>() else {
             tracing::warn!(id = row.id, scheme = %row.scheme, "unknown scheme in quarantine, skipped");
@@ -503,18 +572,16 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
             continue;
         };
         let kind = t1::check_kind(scheme, row.params.as_deref());
-        let vetted = match vet_target_addrs(&ctx, &row.host).await {
+        ready.push((row, kind, port));
+    }
+    let hosts: Vec<String> = ready.iter().map(|(r, _, _)| r.host.clone()).collect();
+    for ((row, kind, port), verdict) in ready.into_iter().zip(vet_hosts(&ctx, &hosts).await) {
+        let vetted = match verdict {
             Ok(addrs) => addrs,
             Err(reason) => {
                 tracing::warn!(id = row.id, %reason, "quarantine target blocked by the private-address policy, journaled as a failed recheck");
-                apply_quarantine_vet_block(
-                    &ctx,
-                    row.id,
-                    t1::check_kind(scheme, row.params.as_deref()).as_str(),
-                    row.ladder_step,
-                    &reason,
-                )
-                .await;
+                apply_quarantine_vet_block(&ctx, row.id, kind.as_str(), row.ladder_step, &reason)
+                    .await;
                 blocked += 1;
                 continue;
             }
@@ -648,6 +715,28 @@ async fn perform_quarantine_check(
     }
 }
 
+/// What one T2 batch produced, for the cycle log. `checked` counts rows
+/// that got a real verdict (an engine contact or a policy refusal, both
+/// journaled); `aborted` counts rows an engine-wide outage kept away from
+/// meow-rs (ping/reload failure or the mid-batch guard); `skipped` counts
+/// rows `clash::generate` could not serialize. Folding the aborted rows
+/// into `checked` made an outage cycle read as a healthy batch in exactly
+/// the situation the counter is watched for.
+#[derive(Default)]
+struct T2Outcome {
+    checked: usize,
+    aborted: usize,
+    skipped: usize,
+}
+
+/// Per-task result of the T2 batch. `Checked` contacted the engine (any
+/// verdict); `Aborted` took the guard's early return without a request.
+#[derive(Clone, Copy)]
+enum T2Task {
+    Checked,
+    Aborted,
+}
+
 /// Generate a Clash batch, reload meow-rs, and delay-test every proxy
 /// through a real tunnel.
 ///
@@ -660,11 +749,11 @@ async fn perform_quarantine_check(
 /// path stay untouched, so an outage cannot retire a healthy pool
 /// ([`journal_engine_fault`]). The cycle still
 /// backs off so a dead meow-rs is not hammered every minute.
-async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
+async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<T2Outcome> {
     let now = now_ts();
     if now < ctx.meow_retry_at.load(Ordering::Relaxed) {
         tracing::debug!("meow-rs in backoff, T2 skipped");
-        return Ok(0);
+        return Ok(T2Outcome::default());
     }
 
     let rows = proxies::select_t2_candidates(&ctx.pool, ctx.config.probe.sample_size).await?;
@@ -673,7 +762,6 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     // policy blocks unresolvable names and internal addresses, and a skip
     // left such rows at the head of the recency queue forever (they never
     // got a t2 row, so the selector re-served them every cycle).
-    let mut batch: Vec<_> = Vec::with_capacity(rows.len());
     let fail_limit = ctx.config.probe.fail_limit;
     let min_secs = i64::try_from(
         ctx.config
@@ -692,12 +780,18 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     let mut blocked = 0usize;
     let mut pins: std::collections::HashMap<String, std::net::IpAddr> =
         std::collections::HashMap::new();
+    let mut to_vet: Vec<proxies::ProxyRow> = Vec::new();
     for row in rows {
         let scheme = row.scheme.parse::<Scheme>().ok();
         if !scheme.is_some_and(clash::is_supported) {
             continue;
         }
-        match vet_target_addrs(&ctx, &row.host).await {
+        to_vet.push(row);
+    }
+    let hosts: Vec<String> = to_vet.iter().map(|row| row.host.clone()).collect();
+    let mut batch: Vec<proxies::ProxyRow> = Vec::with_capacity(to_vet.len());
+    for (row, verdict) in to_vet.into_iter().zip(vet_hosts(&ctx, &hosts).await) {
+        match verdict {
             Ok(vetted) => {
                 if let Some(ip) =
                     fumox_core::ssrf::pick_vetted(&vetted, fumox_core::models::IpFamily::Any)
@@ -725,7 +819,10 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     }
     if batch.is_empty() {
         tracing::info!(blocked, "T2 batch empty after vetting");
-        return Ok(blocked);
+        return Ok(T2Outcome {
+            checked: blocked,
+            ..T2Outcome::default()
+        });
     }
 
     // Cheap liveness check first: no point rewriting the config file when
@@ -735,7 +832,11 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
         tracing::warn!(%error, "meow-rs unavailable, T2 batch failed with backoff");
         ctx.backoff_meow();
         journal_engine_failure(&ctx, &batch, &format!("meow-rs unavailable: {error}")).await;
-        return Ok(batch.len() + blocked);
+        return Ok(T2Outcome {
+            checked: blocked,
+            aborted: batch.len(),
+            skipped: 0,
+        });
     }
 
     let (yaml, included) = clash::generate(&batch, &pins, ctx.config.meow.ipv6)?;
@@ -746,17 +847,23 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     // The YAML carries every proxy credential of the batch in plain text ,
     // same exposure as the SQLite database, same 0600 answer (the DB chmod
     // rationale lives in fumox-core/src/db.rs). The mode is set at creation
-    // time so the file is never briefly world-readable.
+    // time so the file is never briefly world-readable, and re-asserted on
+    // the open fd afterwards: a pre-existing file (older binary, hand-copied
+    // sample, restored backup) keeps its old mode through `create` alone and
+    // must be corrected, not truncated with fresh credentials under whatever
+    // permissions it happens to have.
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(config_path)?;
+        // fchmod on the open fd, no path re-resolution between check and use.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(yaml.as_bytes())?;
     }
     #[cfg(not(unix))]
@@ -766,7 +873,11 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
         tracing::warn!(%error, "meow-rs unavailable, T2 batch failed with backoff");
         ctx.backoff_meow();
         journal_engine_failure(&ctx, &batch, &format!("meow-rs unavailable: {error}")).await;
-        return Ok(batch.len() + blocked);
+        return Ok(T2Outcome {
+            checked: blocked,
+            aborted: batch.len(),
+            skipped: 0,
+        });
     }
     ctx.meow_recovered();
     if let Err(error) = meta_set(&ctx.pool, "meow_last_ok", &now_ts().to_string()).await {
@@ -780,6 +891,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
     // without hammering a dying meow-rs with further requests.
     let batch_guard = Arc::new(BatchGuard::new(MEOW_ABORT_THRESHOLD));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut skipped = 0usize;
     for row in batch {
         // Rows that never made it into the generated config (their entry
         // could not be serialized, `clash::generate` skipped them) must get
@@ -792,6 +904,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                 "proxy entry cannot be serialized for the T2 engine config",
             )
             .await;
+            skipped += 1;
             continue;
         }
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
@@ -801,7 +914,10 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
             // returns; a closed semaphore here is structurally impossible.
             let _permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
-                Err(_) => return,
+                // Structurally impossible, and counted as aborted rather
+                // than checked so an impossible close cannot inflate the
+                // real-check counter.
+                Err(_) => return T2Task::Aborted,
             };
             if batch_guard.is_aborted() {
                 journal_engine_fault(
@@ -810,7 +926,7 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                     "aborted: meow-rs became unavailable mid-batch",
                 )
                 .await;
-                return;
+                return T2Task::Aborted;
             }
             let name = clash::proxy_name(row.id);
             let now = now_ts();
@@ -940,10 +1056,27 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<usize> {
                     }
                 }
             }
+            T2Task::Checked
         });
     }
-    let done = collect_tasks(&mut tasks).await;
-    Ok(done + blocked)
+    // The counters the cycle log prints, kept honest during an outage:
+    // only tasks that reached `T2Task::Checked` are real engine contacts,
+    // the guard's early returns count as aborted and serialize skips as
+    // skipped, never folded into `checked`.
+    let mut checked = blocked;
+    let mut aborted = 0usize;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(T2Task::Checked) => checked += 1,
+            Ok(T2Task::Aborted) => aborted += 1,
+            Err(error) => tracing::warn!(%error, "T2 check task panicked"),
+        }
+    }
+    Ok(T2Outcome {
+        checked,
+        aborted,
+        skipped,
+    })
 }
 
 /// Journal one failed T2 attempt and run the fail ladder: a proxy that got
@@ -1057,21 +1190,37 @@ async fn stamp_meow_memory(ctx: &Context) {
     }
 }
 
+/// Build the `probe_heartbeat` payload. `interval_secs` is the daemon's
+/// effective beat period and `cycle_interval_secs` its effective cycle
+/// period: the admin panel thresholds staleness against the schedules the
+/// daemon actually runs, since server and probe may read different config
+/// files (see [`heartbeat_loop`]).
+fn heartbeat_payload(interval_secs: u64, cycle_interval_secs: u64) -> String {
+    serde_json::json!({
+        "ts": now_ts(),
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "interval_secs": interval_secs,
+        "cycle_interval_secs": cycle_interval_secs,
+    })
+    .to_string()
+}
+
 /// Periodically upsert `probe_heartbeat` into `meta` so the admin panel can
-/// tell the daemon is alive.
+/// tell the daemon is alive. The payload carries the daemon's effective
+/// beat and cycle periods: server and probe may read different config files
+/// (or a different env overlay), so the panel must threshold against the
+/// schedule actually running, not against its own copy of the config.
 async fn heartbeat_loop(ctx: Arc<Context>) {
     let period = Duration::from_secs(ctx.config.probe.heartbeat_interval_secs.max(5));
+    let cycle_secs = ctx.config.probe.cycle_interval_secs.max(1);
     let mut ticker = tokio::time::interval(period);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         ticker.tick().await;
-        let payload = serde_json::json!({
-            "ts": now_ts(),
-            "pid": std::process::id(),
-            "version": env!("CARGO_PKG_VERSION"),
-        });
-        if let Err(error) = meta_set(&ctx.pool, "probe_heartbeat", &payload.to_string()).await {
+        let payload = heartbeat_payload(period.as_secs(), cycle_secs);
+        if let Err(error) = meta_set(&ctx.pool, "probe_heartbeat", &payload).await {
             tracing::warn!(%error, "failed to write probe heartbeat");
         }
     }
@@ -1096,14 +1245,23 @@ async fn run_retention(ctx: &Context) {
     let probe_cutoff = retention_cutoff(now, ctx.config.retention.probe_results_days);
     let fetch_cutoff = retention_cutoff(now, ctx.config.retention.fetch_log_days);
 
+    let mut deleted_probe = 0u64;
+    let mut deleted_fetch = 0u64;
+    let mut deleted_requests = 0u64;
     match probe_repo::purge_before(&ctx.pool, probe_cutoff).await {
         Ok(0) => {}
-        Ok(deleted) => tracing::info!(deleted, "rotated probe_results"),
+        Ok(deleted) => {
+            deleted_probe = deleted;
+            tracing::info!(deleted, "rotated probe_results");
+        }
         Err(error) => tracing::warn!(%error, "probe_results rotation failed"),
     }
     match fetch_log::purge_before(&ctx.pool, fetch_cutoff).await {
         Ok(0) => {}
-        Ok(deleted) => tracing::info!(deleted, "rotated fetch_log"),
+        Ok(deleted) => {
+            deleted_fetch = deleted;
+            tracing::info!(deleted, "rotated fetch_log");
+        }
         Err(error) => tracing::warn!(%error, "fetch_log rotation failed"),
     }
     // Priority queue housekeeping: requests whose proxy already
@@ -1117,16 +1275,35 @@ async fn run_retention(ctx: &Context) {
     let queue_cutoff = now - stale_days * 86_400;
     match probe_repo::purge_requests_before(&ctx.pool, queue_cutoff).await {
         Ok(0) => {}
-        Ok(deleted) => tracing::info!(deleted, "rotated stale probe_requests"),
+        Ok(deleted) => {
+            deleted_requests = deleted;
+            tracing::info!(deleted, "rotated stale probe_requests");
+        }
         Err(error) => tracing::warn!(%error, "probe_requests rotation failed"),
+    }
+    // Stamp the run so /admin/probe can surface it: the info lines above
+    // are not a surface an operator looks at, and a probe daemon that
+    // stopped rotating would otherwise grow both journals with nothing
+    // saying so.
+    let stamp = serde_json::json!({
+        "ts": now_ts(),
+        "probe_results": deleted_probe,
+        "fetch_log": deleted_fetch,
+        "probe_requests": deleted_requests,
+    });
+    if let Err(error) = meta_set(&ctx.pool, "last_rotation", &stamp.to_string()).await {
+        tracing::warn!(%error, "failed to stamp last_rotation");
     }
 }
 
-/// Journal one probe attempt; a failed write is logged but does not stop
-/// the state machine (the lifecycle transition is the source of truth).
+/// Journal one probe attempt; a failed write is logged at error level but
+/// does not stop the state machine (the lifecycle transition is the source
+/// of truth). Error level because a drop means the history row for a
+/// verdict that *did* land is gone for good, and a burst of these is the
+/// only symptom when the database is locked or unwritable.
 async fn journal(ctx: &Context, entry: ProbeResultEntry<'_>) {
     if let Err(error) = probe_repo::insert(&ctx.pool, &entry).await {
-        tracing::warn!(id = entry.proxy_id, %error, "failed to journal probe result");
+        tracing::error!(id = entry.proxy_id, %error, "failed to journal probe result");
     }
 }
 
@@ -1242,6 +1419,55 @@ mod tests {
         assert_eq!(row.status, "quarantine");
         assert_eq!(row.fail_count, 1);
         assert!(row.ladder_at.is_some());
+    }
+
+    /// Concurrent vetting must hand the verdicts back in the input order
+    /// (the lanes zip them onto their candidates) and must apply the same
+    /// per-address policy the serial pass did. IP literals keep the test
+    /// off DNS.
+    #[tokio::test]
+    async fn vet_hosts_preserves_order_and_policy() {
+        let pool = temp_pool().await;
+        let hosts = vec![
+            "192.168.7.7".to_string(),
+            "169.254.169.254".to_string(),
+            "127.0.0.1".to_string(),
+        ];
+
+        // Guard on: every verdict is a refusal with the host's own reason,
+        // in order.
+        let mut config = test_config(
+            3,
+            "127.0.0.1:1",
+            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
+        );
+        config.probe.allow_private_targets = false;
+        let ctx = Arc::new(Context::new(config.clone(), pool.clone()));
+        let verdicts = vet_hosts(&ctx, &hosts).await;
+        let reasons: Vec<&str> = verdicts
+            .iter()
+            .map(|verdict| verdict.as_ref().expect_err("must be refused"))
+            .map(String::as_str)
+            .collect();
+        assert!(reasons[0].contains("RFC1918"), "{}", reasons[0]);
+        assert!(reasons[1].contains("link-local"), "{}", reasons[1]);
+        assert!(reasons[2].contains("loopback"), "{}", reasons[2]);
+
+        // Guard off: the same list vets in order.
+        config.probe.allow_private_targets = true;
+        let ctx = Arc::new(Context::new(config, pool));
+        let verdicts = vet_hosts(&ctx, &hosts).await;
+        let vetted: Vec<std::net::IpAddr> = verdicts
+            .into_iter()
+            .map(|verdict| verdict.expect("must be allowed")[0])
+            .collect();
+        assert_eq!(
+            vetted,
+            hosts
+                .iter()
+                .map(|host| host.parse::<std::net::IpAddr>().unwrap())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The T2 counterpart: a vet-refused T2
@@ -1559,6 +1785,85 @@ mod tests {
             mid_batch >= 1,
             "at least one task must have crossed the threshold"
         );
+    }
+
+    /// The cycle counters must not fold an engine-wide outage into
+    /// `t2_checked`: with meow-rs down before the batch starts, every due
+    /// proxy is journaled unverified and reported as aborted, and no row is
+    /// claimed as a real check.
+    #[tokio::test]
+    async fn t2_outage_counters_report_aborted_not_checked() {
+        let pool = temp_pool().await;
+        for _ in 0..3 {
+            seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
+        }
+
+        // meow-rs is unreachable on a closed port.
+        let mut config = test_config(
+            3,
+            "127.0.0.1:1",
+            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
+        );
+        config.probe.allow_private_targets = true;
+        let ctx = Arc::new(Context::new(config, pool.clone()));
+
+        let outcome = probe_t2_batch(ctx).await.unwrap();
+        assert_eq!(outcome.checked, 0, "an outage produces no real checks");
+        assert_eq!(outcome.aborted, 3, "every due proxy is aborted unverified");
+        assert_eq!(outcome.skipped, 0);
+
+        // All three were journaled as t2 failures, so the recency queue
+        // moves past them despite the outage.
+        let (rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE ok = 0 AND probe_kind = 't2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 3);
+    }
+
+    /// The healthy-path counterpart: real engine contacts land in
+    /// `checked`, nothing else moves.
+    #[tokio::test]
+    async fn t2_live_engine_counters_count_real_checks() {
+        let pool = temp_pool().await;
+
+        let app = Router::new()
+            .route(
+                "/version",
+                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+            )
+            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/proxies/{name}/delay",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(serde_json::json!({"delay": 42})),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let meow_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
+        seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
+
+        let config_path = std::env::temp_dir().join(format!(
+            "fumox-probe-test-{}.yaml",
+            fumox_core::models::new_id()
+        ));
+        let mut config = test_config(3, &meow_addr, config_path);
+        config.probe.allow_private_targets = true;
+        let ctx = Arc::new(Context::new(config, pool.clone()));
+
+        let outcome = probe_t2_batch(ctx).await.unwrap();
+        assert_eq!(outcome.checked, 2);
+        assert_eq!(outcome.aborted, 0);
+        assert_eq!(outcome.skipped, 0);
     }
 
     /// Per-request blip: every delay check fails with 5xx, but /version
@@ -2093,6 +2398,92 @@ mod tests {
             .await
             .unwrap();
         assert!(stamp.is_some());
+    }
+
+    /// The meow.yaml chmod is re-asserted on every write: a pre-existing
+    /// file (older binary, hand-copied sample, restored backup) must not
+    /// keep its old, possibly world-readable mode while the probe
+    /// truncates and rewrites it with fresh proxy credentials.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn meow_config_permissions_are_reasserted_on_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pool = temp_pool().await;
+
+        let app = Router::new()
+            .route(
+                "/version",
+                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+            )
+            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/proxies/{name}/delay",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"message":"invalid credential"})),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let meow_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // A live T1 listener so the row is an `alive` T2 candidate.
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = match tcp.accept().await {
+                    Ok(ok) => ok,
+                    Err(_) => break,
+                };
+                drop(socket);
+            }
+        });
+        seed_proxy(&pool, "vless", "127.0.0.1", tcp_port, "alive").await;
+
+        // Pre-create the config file world-readable, as an operator
+        // copying a sample config into the shared volume would.
+        let config_path = std::env::temp_dir().join(format!(
+            "fumox-probe-test-{}.yaml",
+            fumox_core::models::new_id()
+        ));
+        std::fs::write(&config_path, "proxies: []\n").unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let ctx = Arc::new(Context::new(
+            test_config(3, &meow_addr, config_path.clone()),
+            pool,
+        ));
+        run_cycle(ctx).await.unwrap();
+
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "pre-existing permissions must be corrected on every write"
+        );
+    }
+
+    /// The heartbeat payload is a cross-process contract: the admin panel
+    /// thresholds daemon staleness (beat) and meow-contact staleness
+    /// (cycle) against the reported periods, so both fields must survive
+    /// every payload change.
+    #[test]
+    fn heartbeat_payload_reports_the_effective_beat_and_cycle_periods() {
+        let payload: serde_json::Value = serde_json::from_str(&heartbeat_payload(30, 60)).unwrap();
+        assert_eq!(payload["interval_secs"], 30);
+        assert_eq!(payload["cycle_interval_secs"], 60);
+        assert!(payload["ts"].as_i64().is_some());
+        assert!(payload["pid"].as_u64().is_some());
+        assert!(payload["version"].as_str().is_some());
     }
 
     /// Strict T2 priority: a tunnel-dead proxy

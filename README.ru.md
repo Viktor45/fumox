@@ -94,8 +94,8 @@ GeoLite2-базы MaxMind (`.mmdb`) не входят в репозиторий,
   (`admin logged in` в логах), за которым следует постоянный редирект на
   `/admin/login`.
   Ставьте `true`, только если TLS терминируется на reverse-proxy.
-  Дефолт в файле — `false`, но `docker-compose.yml` ставит ENV-override
-  в `true` (готовность к HTTPS-фронту) — для plain-HTTP `docker compose
+  Дефолт в файле: `false`, но `docker-compose.yml` ставит ENV-override
+  в `true` (готовность к HTTPS-фронту), а для plain-HTTP `docker compose
   up` задайте `FUMOX_ADMIN__SECURE_COOKIES=false` в `.env`.
 
 ---

@@ -148,6 +148,28 @@ a:hover { text-decoration: underline; }
 .topbar .spacer { flex: 1; }
 .topbar form.inline { margin: 0; }
 
+/* SSE connection chip: a state-coloured dot plus its label ("live
+   updates" / "connection lost"), hidden until the EventSource opens at
+   least once so polling-only browsers see nothing. It rides the dark
+   topbar in both themes, so the dot uses fixed dark-palette values. */
+.sse-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--topbar-link);
+  white-space: nowrap;
+}
+.sse-status::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #d9a441;
+}
+.sse-status[data-state="live"]::before { background: #4cc38a; }
+.sse-status[data-state="stale"]::before { background: #d9a441; }
+
 /* language/theme switchers (topbar: dark context, login box: page context) */
 .lang-switch { display: inline-flex; gap: 2px; }
 /* Theme icons (sun/moon, inline SVG, no icon font: offline-safe) are
@@ -768,6 +790,18 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
    segments (widths via the inline --w custom property) and clickable
    per-status counters. */
 .stat-split { display: flex; flex-direction: column; gap: 8px; }
+/* Legend: makes the status->colour mapping of the bars and counter badges
+   visible instead of tooltip-only. The dots reuse the segment colours. */
+.stat-split-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.stat-split-legend .legend { display: inline-flex; align-items: center; gap: 5px; }
+.legend-dot { width: 8px; height: 8px; border-radius: 50%; }
 .stat-split-row {
   display: flex;
   align-items: center;
@@ -791,11 +825,12 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   background: var(--badge-neutral-bg);
 }
 .stat-split-seg { height: 100%; width: var(--w, 0%); }
-.stat-split-seg.alive { background: var(--ok); }
-.stat-split-seg.ready { background: var(--ready); }
-.stat-split-seg.quarantine { background: var(--warn); }
-.stat-split-seg.unknown { background: var(--accent); }
-.stat-split-seg.removed { background: var(--danger); }
+.stat-split-seg.alive, .legend-dot.alive { background: var(--ok); }
+.stat-split-seg.ready, .legend-dot.ready { background: var(--ready); }
+.stat-split-seg.quarantine, .legend-dot.quarantine { background: var(--warn); }
+.stat-split-seg.unknown, .legend-dot.unknown { background: var(--accent); }
+.stat-split-seg.removed, .legend-dot.removed { background: var(--danger); }
+.legend-dot.neutral { background: var(--muted); }
 .stat-split-counts {
   display: flex;
   gap: 4px;
@@ -915,12 +950,15 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 }
 
 /* topbar wrap (tablets and small laptops) */
-/* The single-row topbar fits only above ~1180px: eight nav items plus
-   switchers. Below that it wraps into two rows: brand + switchers +
-   logout, then the nav as a horizontally scrollable strip (no burger
-   menu, no JavaScript needed). Without this the squeezed row lets
+/* The single-row topbar fits only above ~1300px: eight nav items, the
+   switchers and the SSE status chip. The chip is what moved the
+   threshold, it adds 56px plus a 24px gap and the row was already
+   within 7px of overflowing at 1265px without it. Below the threshold
+   it wraps into two rows: brand + chip + switchers + logout, then the
+   nav as a horizontally scrollable strip (no burger menu, no
+   JavaScript needed). Without this the squeezed row lets
    `overflow-wrap: anywhere` break the labels mid-word. */
-@media (max-width: 1180px) {
+@media (max-width: 1300px) {
   .topbar {
     flex-wrap: wrap;
     height: auto;
@@ -951,7 +989,7 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
     align-items: center;
     min-height: 44px;
   }
-  /* Below 1180px the topbar wraps to two rows (~110px): the 64px base
+  /* Below 1300px the topbar wraps to two rows (~110px): the 64px base
      scroll-margin drops anchors and validation focus behind the header. */
   input, select, textarea, button, a, [tabindex] {
     scroll-margin-top: 120px;
@@ -975,9 +1013,11 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .field input[type="password"], .field input[type="url"],
   .field select, .field textarea,
   .filters .field input, .filters .field select,
+  .cleanup-op input, .cleanup-op select,
   .topn-picker select { font-size: 16px; }
   /* 16px text only lifts a select to 39px, still under the target. */
   .field select, .filters .field select, .ped-row select,
+  .cleanup-op input, .cleanup-op select,
   .topn-picker select { min-height: 44px; }
 
   /* A number and its unit go back to one per line on a phone: at this

@@ -15,6 +15,10 @@ fumox-core = { path = "crates/fumox-core" }
 # Async runtime / HTTP
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
+# `ServiceExt::oneshot` drives the router in the fumox-server tests;
+# `BodyExt::collect` reads response bodies there.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 # reqwest 0.13: rustls is the default TLS backend and `rustls-tls` became
 # `rustls`. The provider is aws-lc by default; we stay on ring to match the
 # `rustls` crate's provider above (one crypto provider in the process).
@@ -71,6 +75,7 @@ nanoid = "0.5"
 regex = "1"
 base64 = "0.23"
 url = "2"
+ipnet = "2"
 percent-encoding = "2"
 sha2 = "0.11"
 hmac = "0.13"

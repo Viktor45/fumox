@@ -42,17 +42,12 @@ pub fn dedupe_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String>
     out
 }
 
-/// Whether the entry carries a truthy insecure toggle under any of its
-/// spelling aliases. Output formats only ever *reflect* an entry's own
-/// request: the entry's original spelling is kept verbatim.
-/// The underscore `allow_insecure` form is deliberately not here, it
-/// never arrives from parsed feeds that these writers target.
+/// Whether the entry carries a truthy insecure toggle under any of the
+/// spelling aliases ([`crate::models::INSECURE_ALIASES`]). Output formats
+/// only ever *reflect* an entry's own request: the entry's original spelling
+/// is kept verbatim in the emitted document.
 pub(crate) fn is_insecure(params: &[crate::models::Param]) -> bool {
-    const ALIASES: [&str; 3] = ["insecure", "allowinsecure", "skip-cert-verify"];
-    params.iter().any(|p| {
-        ALIASES.contains(&p.key.to_ascii_lowercase().as_str())
-            && matches!(p.value.trim().to_ascii_lowercase().as_str(), "1" | "true")
-    })
+    params.iter().any(crate::models::is_insecure_param)
 }
 
 /// Parameter value by case-insensitive key, empty values dropped.
@@ -200,7 +195,9 @@ mod tests {
         assert!(is_insecure(&[param("allowInsecure", "1")]));
         assert!(is_insecure(&[param("insecure", "true")]));
         assert!(is_insecure(&[param("skip-cert-verify", " TRUE ")]));
+        assert!(is_insecure(&[param("allow_insecure", "1")]));
         assert!(!is_insecure(&[param("allowInsecure", "0")]));
+        assert!(!is_insecure(&[param("allow_insecure", "false")]));
         assert!(!is_insecure(&[param("sni", "example.com")]));
         assert!(!is_insecure(&[]));
     }

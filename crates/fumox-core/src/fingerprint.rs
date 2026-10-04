@@ -55,10 +55,12 @@ const SECURITY_PARAMS: &[&str] = &[
     "aid",
     // wire encoding
     "packetencoding",
-    // cert-verification toggles (aliases, normalized below)
+    // cert-verification toggles (aliases, normalized below; the canonical
+    // alias list lives in `models::INSECURE_ALIASES`)
     "insecure",
     "allowinsecure",
     "skip-cert-verify",
+    "allow_insecure",
     // hysteria2 / quic extras
     "servicename",
     // Clash structured blocks, stored verbatim: they have no URI spelling
@@ -177,15 +179,19 @@ fn escape(value: &str) -> String {
 }
 
 /// Merge the certificate-verification spellings (`insecure`, `allowInsecure`,
-/// `skip-cert-verify`) into a single canonical `insecure` flag.
+/// `skip-cert-verify`, `allow_insecure`) into a single canonical `insecure`
+/// flag.
 ///
 /// A falsy or absent toggle means the same thing (verification on), so falsy
 /// values are dropped entirely, `allowInsecure=0`, `insecure=false` and no
-/// toggle at all produce identical fingerprints.
+/// toggle at all produce identical fingerprints. Folding every spelling onto
+/// one flag also lets the same server advertised with different toggle
+/// spellings (say a tuic link's `allow_insecure` and a Clash document's
+/// `skip-cert-verify`) land on one row.
 fn normalize_insecure_alias(key: &str, value: &str) -> Option<(String, String)> {
-    if matches!(key, "insecure" | "allowinsecure" | "skip-cert-verify") {
-        let truthy = matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true");
-        return truthy.then(|| ("insecure".to_string(), "1".to_string()));
+    if crate::models::INSECURE_ALIASES.contains(&key) {
+        return crate::models::is_truthy_toggle(value)
+            .then(|| ("insecure".to_string(), "1".to_string()));
     }
     Some((key.to_string(), value.to_string()))
 }
@@ -287,8 +293,12 @@ mod tests {
         let a = entry("n", "h", vec![param("allowInsecure", "1")]);
         let b = entry("n", "h", vec![param("insecure", "true")]);
         let c = entry("n", "h", vec![param("skip-cert-verify", "1")]);
+        let d = entry("n", "h", vec![param("allow_insecure", "1")]);
         assert_eq!(fingerprint(&a), fingerprint(&b));
         assert_eq!(fingerprint(&b), fingerprint(&c));
+        // The underscore spelling of sing-box / tuic links dedupes with the
+        // rest instead of contributing its own pre-image pair.
+        assert_eq!(fingerprint(&c), fingerprint(&d));
     }
 
     #[test]
@@ -296,8 +306,10 @@ mod tests {
         let absent = entry("n", "h", vec![]);
         let zero = entry("n", "h", vec![param("allowInsecure", "0")]);
         let false_ = entry("n", "h", vec![param("skip-cert-verify", "false")]);
+        let underscore = entry("n", "h", vec![param("allow_insecure", "0")]);
         assert_eq!(fingerprint(&absent), fingerprint(&zero));
         assert_eq!(fingerprint(&absent), fingerprint(&false_));
+        assert_eq!(fingerprint(&absent), fingerprint(&underscore));
 
         let truthy = entry("n", "h", vec![param("allowInsecure", "1")]);
         assert_ne!(fingerprint(&absent), fingerprint(&truthy));

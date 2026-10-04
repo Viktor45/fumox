@@ -31,11 +31,10 @@
 //! download is a snapshot by definition and a quietly outdated one is worse
 //! than a slow request.
 //!
-//! The window is a cache TTL and not a lock: requests are not deduplicated
-//! on a cold or expired entry, so a burst landing exactly on the boundary
-//! renders once per request. The database pool caps how many of those
-//! render at the same time, so this amplifies latency rather than
-//! throughput.
+//! The window is a cache TTL, and the render behind a cold or expired
+//! entry is single-flighted: a burst landing exactly on the boundary
+//! renders once, the rest wait for the fresh entry. The database pool caps
+//! how many *different* tiers render at the same time.
 //!
 //! The window bounds the *rate*; `[server].export_max_rows` bounds the
 //! *size*.
@@ -46,7 +45,7 @@
 //! the backing query and only after the host and token gates.
 
 use crate::admin::host_gate;
-use crate::cache::Rendered;
+use crate::cache::{InlineClaim, Rendered};
 use crate::serve::{self, AppState};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -56,7 +55,8 @@ use fumox_core::repo;
 use fumox_core::repo::proxies;
 use fumox_core::repo::proxies::ProxyRow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// `meta` key holding the capability token shared by both export links.
 pub(crate) const TOKEN_KEY: &str = "alive_export_token";
@@ -67,6 +67,11 @@ pub(crate) const TOKEN_KEY: &str = "alive_export_token";
 /// enough to collapse a burst of downloads into one query, far shorter than
 /// a probe cycle.
 const EXPORT_TTL_SECS: i64 = 30;
+
+/// How long a waiter queues behind the leader of an export render before
+/// rendering the body itself. The render is one bounded query, so this only
+/// ever fires when the leader is stuck.
+const EXPORT_RENDER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The current token, generating and persisting one on first use. Called
 /// from `main` at startup; every later call is a single meta read.
@@ -93,6 +98,125 @@ pub(crate) fn export_date() -> String {
     time::OffsetDateTime::now_utc()
         .format(FMT)
         .unwrap_or_else(|_| "export".to_string())
+}
+
+/// Window within which a repeated host-gate rejection stays at debug
+/// level. The gate runs before the token check on a public route, so the
+/// log line has to serve two opposite extremes: a misconfigured allowlist
+/// (the operator's own domain missing) must be visible immediately, while
+/// a scan sweeping random `Host` headers must not get one warn per
+/// request.
+const HOST_REJECT_WARN_WINDOW: Duration = Duration::from_secs(3_600);
+
+/// Distinct rejected hosts kept in the registry, bounding the memory a
+/// flood of distinct random hosts could pin. Hitting this count does not
+/// silence new hosts: it bounds tracking, not warnings (see
+/// [`HostRejectLog::should_warn`]).
+const HOST_REJECT_MAX_TRACKED: usize = 1_024;
+
+/// Warns this registry may emit per [`HOST_REJECT_WARN_WINDOW`]. Past it,
+/// rejections drop to debug, but the first suppressed host of the window
+/// is named in a summary when the window rolls over.
+const HOST_REJECT_MAX_WARNS: u32 = 64;
+
+/// Per-host warn registry for the host gate, see
+/// [`HostRejectLog::should_warn`].
+static HOST_REJECT_LOG: LazyLock<Mutex<HostRejectLog>> =
+    LazyLock::new(|| Mutex::new(HostRejectLog::default()));
+
+#[derive(Default)]
+struct HostRejectLog {
+    seen: HashMap<String, Instant>,
+    /// Start of the current warn window, and how much of
+    /// [`HOST_REJECT_MAX_WARNS`] it has spent.
+    window_start: Option<Instant>,
+    warns_emitted: u32,
+    /// First host the window could not warn about, kept so the rollover
+    /// summary can name it.
+    suppressed: Option<String>,
+    /// Suppressed hosts in the current window, for the rollover count.
+    suppressed_total: u64,
+}
+
+impl HostRejectLog {
+    /// Roll the window over if it has elapsed. Returns a summary to log
+    /// when the window that just closed had suppressed hosts.
+    fn roll_window(&mut self, now: Instant) -> Option<String> {
+        let Some(start) = self.window_start else {
+            // First rejection ever: open the window, report nothing.
+            self.window_start = Some(now);
+            return None;
+        };
+        if now.duration_since(start) < HOST_REJECT_WARN_WINDOW {
+            return None;
+        }
+        let suppressed = self.suppressed.take();
+        let total = std::mem::take(&mut self.suppressed_total);
+        self.warns_emitted = 0;
+        self.window_start = Some(now);
+        suppressed.map(|host| {
+            format!(
+                "host-gate rejections: {total} dropped to debug this window, \
+                 first suppressed host {host}"
+            )
+        })
+    }
+
+    /// `true` when this rejection of `host` should warn, plus a summary to
+    /// log when a window rolls over (see [`Self::roll_window`]).
+    ///
+    /// Three rules, in order: a host already warned inside the window is
+    /// quiet; a host past [`HOST_REJECT_MAX_WARNS`] for the window is quiet
+    /// but remembered for the summary; otherwise it warns. The per-window
+    /// budget is what stops a scan sweeping random `Host` headers from
+    /// mirroring itself into the log, and the summary is what stops a
+    /// misconfigured allowlist from going unseen: the operator's own domain
+    /// is rejected on every request under a broken allowlist, so even as
+    /// the hundred-and-first host of a busy hour it is named once at the
+    /// rollover.
+    fn should_warn(&mut self, host: &str, now: Instant) -> (bool, Option<String>) {
+        let summary = self.roll_window(now);
+        if let Some(first) = self.seen.get(host) {
+            if now.duration_since(*first) < HOST_REJECT_WARN_WINDOW {
+                return (false, summary);
+            }
+            self.seen.insert(host.to_string(), now);
+            return (true, summary);
+        }
+        if self.seen.len() >= HOST_REJECT_MAX_TRACKED {
+            // Bound the map, not the warnings: drop the oldest entry.
+            if let Some(oldest) = self
+                .seen
+                .iter()
+                .min_by_key(|(_, first)| **first)
+                .map(|(host, _)| host.clone())
+            {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.insert(host.to_string(), now);
+        if self.warns_emitted >= HOST_REJECT_MAX_WARNS {
+            self.suppressed.get_or_insert_with(|| host.to_string());
+            self.suppressed_total += 1;
+            return (false, summary);
+        }
+        self.warns_emitted += 1;
+        (true, summary)
+    }
+}
+
+/// Whether a host-gate rejection should be logged at warn rather than
+/// debug (see [`HostRejectLog::should_warn`]). Logs the window summary when
+/// one came due, before the verdict for the request in hand.
+fn should_warn_host_reject(host: &str, now: Instant) -> bool {
+    let (warn, summary) = HOST_REJECT_LOG
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .should_warn(host, now);
+    if let Some(summary) = summary {
+        tracing::warn!(summary);
+    }
+    warn
 }
 
 /// `GET /export/alive/{token}`, the url_list of all alive proxies, or 404
@@ -132,7 +256,19 @@ async fn serve_tier(
     // identical to a wrong token (404 "link not found") so probing cannot
     // distinguish "bad host" from "bad token".
     if let Err(err) = host_gate::validate_request_host(&headers, &state.allowed_hosts) {
-        tracing::debug!(error = %err, "alive-export: host not in allowlist");
+        let host = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<missing>");
+        if should_warn_host_reject(host, Instant::now()) {
+            tracing::warn!(
+                host,
+                error = %err,
+                "alive-export: host rejected by the allowlist"
+            );
+        } else {
+            tracing::debug!(host, error = %err, "alive-export: host rejected by the allowlist");
+        }
         return serve::error_response(StatusCode::NOT_FOUND, "link not found");
     }
     if params.contains_key("format") {
@@ -190,12 +326,17 @@ fn cache_key(tier: &str) -> String {
 
 /// The rendered export body, cached for [`EXPORT_TTL_SECS`].
 ///
-/// "Cached for the window" is the guarantee, not "rendered once": there is
-/// no single-flight claim here, so two requests that both observe an
-/// expired entry both render it. `serve_cached` in `serve.rs` is the
-/// path that does claim the work; this one cannot reuse it because the
-/// export deliberately refuses to serve a stale body to a waiting
-/// requester.
+/// "Cached for the window" is the guarantee; a burst that observes the
+/// expired entry is single-flighted through the cache's inline-render
+/// claim: the first requester renders, the rest wake when its claim ends
+/// and serve the fresh entry (or re-render, when the leader stored none).
+/// The exports deliberately never serve a stale body, not even to a
+/// waiter, so only the claim is shared, never a half-rendered body.
+///
+/// The claim carries no sources and the put is not generation-guarded: an
+/// export rendering answers only from proxy statuses and its entry sits
+/// outside per-source invalidation (see `source_ids` in [`render_tier`]),
+/// so no invalidation can ever supersede a fill.
 ///
 /// The row cap is applied here, *after* the host and token gates in
 /// [`serve_tier`]: a rejected request must not be able to tell a capped
@@ -209,8 +350,32 @@ async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fu
     {
         return Ok(cached);
     }
-    let rendered = render_tier(&state.pool, tier, state.export_max_rows).await?;
-    Ok(state.caches.processed_put(&key, rendered).await)
+    // Single-flight, but for one round only. A waiter gives the leader
+    // [`EXPORT_RENDER_DEADLINE`] and then renders itself rather than
+    // queueing behind a leader that is not finishing, which is what an
+    // unbounded `changed().await` did. Export keys carry an empty
+    // `source_ids`, so no per-source invalidation can race the put and the
+    // claim is here purely to collapse a download burst.
+    match state.caches.begin_inline_render(&key, Vec::new()).await {
+        InlineClaim::Leader(claim) => {
+            let rendered = render_tier(&state.pool, tier, state.export_max_rows).await?;
+            let stored = state.caches.processed_put(&key, rendered).await;
+            drop(claim);
+            Ok(stored)
+        }
+        InlineClaim::Wait(mut ended) => {
+            if tokio::time::timeout(EXPORT_RENDER_DEADLINE, ended.changed())
+                .await
+                .is_ok()
+                && let Some(cached) = state.caches.processed_get(&key).await
+                && cached.is_fresh(fumox_core::models::now_ts())
+            {
+                return Ok(cached);
+            }
+            let rendered = render_tier(&state.pool, tier, state.export_max_rows).await?;
+            Ok(state.caches.processed_put(&key, rendered).await)
+        }
+    }
 }
 
 /// Read the tier and serialize it as a url_list, bounded to `limit` rows
@@ -244,7 +409,7 @@ async fn render_tier(pool: &DbPool, tier: &str, limit: u32) -> Result<Rendered, 
     let body = format!("{header}{}", lines.join("\n"));
     Ok(Rendered {
         status: 200,
-        body: body.into_bytes(),
+        body: body.into_bytes().into(),
         content_type: "text/plain; charset=utf-8".to_string(),
         extra_headers: Vec::new(),
         fresh_until: fumox_core::models::now_ts() + EXPORT_TTL_SECS,
@@ -301,10 +466,6 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            refresh_tx: {
-                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-                tx
-            },
             limits: crate::serve::PublicRateLimits::unlimited(),
             trusted_cidrs: Vec::new(),
             allowed_hosts,
@@ -545,7 +706,7 @@ mod tests {
                 "export:alive",
                 Rendered {
                     status: 200,
-                    body: first.into_bytes(),
+                    body: first.into_bytes().into(),
                     content_type: "text/plain; charset=utf-8".to_string(),
                     extra_headers: Vec::new(),
                     fresh_until: 0,
@@ -716,6 +877,79 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(String::from_utf8_lossy(&bytes), "link not found\n");
+        }
+    }
+
+    /// One warn per rejected host per window, then debug: a misconfigured
+    /// allowlist must be visible without mirroring every request of the
+    /// operator's own traffic into the log.
+    #[test]
+    fn host_reject_warns_once_per_host_per_window() {
+        let mut log = HostRejectLog::default();
+        let t0 = Instant::now();
+        assert!(log.should_warn("warn-once.example", t0).0);
+        assert!(!log.should_warn("warn-once.example", t0).0);
+        assert!(!log.should_warn("warn-once.example", t0 + Duration::from_secs(60)).0);
+        assert!(log.should_warn("warn-once.example", t0 + Duration::from_secs(3_601)).0);
+    }
+
+    /// A flood of distinct fresh hosts must stop producing warns at the
+    /// per-window budget instead of turning the log into a mirror of the
+    /// scan, and the hosts it swallowed are named when the window rolls.
+    #[test]
+    fn host_reject_log_is_bounded_under_a_flood() {
+        let mut log = HostRejectLog::default();
+        let t0 = Instant::now();
+        let warned = (0..HOST_REJECT_MAX_TRACKED + 100)
+            .filter(|i| log.should_warn(&format!("flood-{i}.example"), t0).0)
+            .count();
+        // The per-window budget caps the warns, not the tracked set: the
+        // log must not mirror the scan.
+        assert_eq!(warned, HOST_REJECT_MAX_WARNS as usize);
+        assert_eq!(log.seen.len(), HOST_REJECT_MAX_TRACKED);
+        // A tracked host stays quiet inside its window...
+        assert!(!log.should_warn("flood-0.example", t0).0);
+        // ...and warns again once the window has rolled over, handing back
+        // the summary that names what the window swallowed.
+        let (warn, summary) = log.should_warn("flood-0.example", t0 + Duration::from_secs(3_601));
+        assert!(warn);
+        let summary = summary.expect("a window that suppressed hosts must summarise them");
+        assert!(summary.contains("flood-64.example"), "summary: {summary}");
+    }
+
+    /// The registry must not let a flood of tracked hosts hide the one that
+    /// matters: the operator's own domain, rejected on every request under
+    /// a misconfigured allowlist. It arrives after the budget is spent and
+    /// still has to be named.
+    #[test]
+    fn a_misconfigured_allowlist_is_still_named_after_a_flood() {
+        let mut log = HostRejectLog::default();
+        let t0 = Instant::now();
+        for i in 0..HOST_REJECT_MAX_WARNS {
+            assert!(log.should_warn(&format!("flood-{i}.example"), t0).0);
+        }
+        // Budget spent: this one is suppressed, not warned...
+        let (warn, _) = log.should_warn("operator.example", t0);
+        assert!(!warn);
+        // ...and the rollover summary is what surfaces it.
+        let (warn, summary) = log.should_warn("operator.example", t0 + Duration::from_secs(3_601));
+        assert!(warn);
+        let summary = summary.unwrap_or_default();
+        assert!(
+            summary.contains("operator.example"),
+            "the suppressed host must be named, got {summary:?}"
+        );
+    }
+
+    /// The tracked set stays bounded no matter how many distinct hosts
+    /// arrive, which is the memory half of the cap.
+    #[test]
+    fn tracking_stays_bounded_across_windows() {
+        let mut log = HostRejectLog::default();
+        let t0 = Instant::now();
+        for i in 0..HOST_REJECT_MAX_TRACKED * 3 {
+            log.should_warn(&format!("h-{i}.example"), t0);
+            assert!(log.seen.len() <= HOST_REJECT_MAX_TRACKED);
         }
     }
 }

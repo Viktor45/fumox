@@ -2,10 +2,12 @@
 //!
 //! Two layers, both acceleration only, SQLite stays the source of truth:
 //!
-//! 1. **Raw cache**, the last successfully fetched payload per source.
-//!    Freshness is `fetched_at + source.cache_ttl_seconds`; a fresh entry
-//!    lets an on-demand revalidation skip the HTTP fetch entirely (the DB
-//!    is already reconciled from that payload).
+//! 1. **Raw cache**, a freshness marker per source: the `fetched_at` of
+//!    the last successfully fetched payload. Freshness is
+//!    `fetched_at + source.cache_ttl_seconds`; a fresh entry lets an
+//!    on-demand revalidation skip the HTTP fetch entirely (the DB is
+//!    already reconciled from that payload). The payload bytes themselves
+//!    are not retained here, no reader ever consumed them back.
 //! 2. **Processed cache**, the rendered subscription output per endpoint
 //!    key (`sub:{profile_id}` / `src:{source_id}`). Entries carry their
 //!    own `fresh_until`; a stale entry is still served
@@ -28,32 +30,24 @@
 //! with the cache layer for the duration of its render precisely so that
 //! invalidations can see it.
 
-use crate::fetcher::FetchedPayload;
+use axum::body::Bytes;
 use moka::future::Cache;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 /// Safety net so abandoned entries eventually leave the caches even without
 /// explicit invalidation (e.g. a deleted source).
 const ENTRY_IDLE_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Raw source payload snapshot (layer 1).
-#[derive(Debug)]
-pub struct RawSnapshot {
-    /// Consumed by the SWR re-parse path (Phase 3 refinement); kept fresh
-    /// by [`Caches::raw_is_fresh`] today.
-    #[allow(dead_code)]
-    pub payload: FetchedPayload,
-    pub fetched_at: i64,
-}
-
 /// Rendered subscription output (layer 2).
 #[derive(Debug)]
 pub struct Rendered {
     pub status: u16,
-    pub body: Vec<u8>,
+    /// Shared byte body: concurrent responses of one cached rendering clone
+    /// a refcount, not the multi-MB payload.
+    pub body: Bytes,
     pub content_type: String,
     /// Response headers beyond status/content-type: `profile-title`,
     /// `profile-update-interval`, `X-Fumox-Stale`, `X-Fumox-Warning`.
@@ -74,7 +68,7 @@ impl Rendered {
 /// Shared cache handle (cheap to clone, used by serving and admin handlers).
 #[derive(Clone)]
 pub struct Caches {
-    raw: Cache<String, Arc<RawSnapshot>>,
+    raw: Cache<String, i64>,
     processed: Cache<String, Arc<Rendered>>,
     /// Invalidation counter per processed key, bumped on every invalidation
     /// of that key. Bounded exactly like the processed layer it guards.
@@ -83,13 +77,54 @@ pub struct Caches {
     /// concurrent stale requests from spawning duplicate re-renders.
     revalidating: Arc<Mutex<HashSet<String>>>,
     /// Processed keys currently being rendered inline (the cache-miss path),
-    /// mapped to the sources that render draws from. Such a key has no entry
-    /// yet, so it is invisible to the iteration in
+    /// mapped to the render's scope: the sources it draws from plus a
+    /// wait-channel that wakes the requests which arrived while it runs. Such
+    /// a key has no entry yet, so it is invisible to the iteration in
     /// [`Caches::invalidate_processed_for_source`]; the claim is what lets an
     /// invalidation supersede a render that is still running. The source set
     /// keeps that supersession narrow: an ingest of a source this render
     /// cannot touch must not refuse its put.
-    inline_rendering: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    inline_rendering: Arc<Mutex<HashMap<String, InlineRenderState>>>,
+    /// Serializes the read-modify-write in [`Caches::bump_generation`].
+    bump_lock: Arc<Mutex<()>>,
+}
+
+/// One in-flight inline (cache-miss) render.
+struct InlineRenderState {
+    /// The sources the render draws from; scopes the claim's invalidation
+    /// reach.
+    sources: HashSet<String>,
+    /// Wake-up for requests that found the claim taken, carrying what the
+    /// leader did. Dropping the entry (with the leader's guard) closes it
+    /// and resolves every waiter's `changed()`; the last value outlives the
+    /// close, so a waiter woken by the close still reads the verdict.
+    done: watch::Sender<InlineOutcome>,
+}
+
+/// What the leader of an inline render did, published to its waiters so a
+/// failing render costs one attempt rather than one per waiter.
+#[derive(Clone, Debug, Default)]
+pub enum InlineOutcome {
+    /// No failure published: the leader either stored an entry or stored
+    /// none because an invalidation superseded its put. The waiter decides
+    /// by looking at the cache, as it did before outcomes existed.
+    #[default]
+    Stored,
+    /// The leader's render failed. Waiters answer from this instead of
+    /// re-running a render that is already known to fail.
+    Failed { status: u16, message: String },
+}
+
+/// Outcome of [`Caches::begin_inline_render`]: the caller either owns the
+/// render or waits for the one already running.
+pub enum InlineClaim {
+    /// No render of the key is in flight: the caller renders it and stores
+    /// the result through the guard's generation.
+    Leader(InlineRenderGuard),
+    /// Another render of the key is in flight; awaiting `changed()` on the
+    /// receiver resolves when that claim ends, including on unwind. The
+    /// channel then carries what the leader did.
+    Wait(watch::Receiver<InlineOutcome>),
 }
 
 impl Caches {
@@ -109,31 +144,22 @@ impl Caches {
                 .build(),
             revalidating: Arc::new(Mutex::new(HashSet::new())),
             inline_rendering: Arc::new(Mutex::new(HashMap::new())),
+            bump_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    pub async fn raw_get(&self, source_id: &str) -> Option<Arc<RawSnapshot>> {
-        self.raw.get(&source_id.to_string()).await
-    }
-
-    /// Whether the raw snapshot exists and is younger than the source TTL.
+    /// Whether the source has a freshness marker younger than its TTL.
     pub async fn raw_is_fresh(&self, source_id: &str, ttl_seconds: i64) -> bool {
-        match self.raw_get(source_id).await {
-            Some(snapshot) => fumox_core::models::now_ts() - snapshot.fetched_at < ttl_seconds,
+        match self.raw.get(&source_id.to_string()).await {
+            Some(fetched_at) => fumox_core::models::now_ts() - fetched_at < ttl_seconds,
             None => false,
         }
     }
 
-    pub async fn raw_put(&self, source_id: &str, payload: FetchedPayload, fetched_at: i64) {
-        self.raw
-            .insert(
-                source_id.to_string(),
-                Arc::new(RawSnapshot {
-                    payload,
-                    fetched_at,
-                }),
-            )
-            .await;
+    /// Record that the database is reconciled from a payload fetched at
+    /// `fetched_at`: the marker [`Caches::raw_is_fresh`] checks.
+    pub async fn raw_put(&self, source_id: &str, fetched_at: i64) {
+        self.raw.insert(source_id.to_string(), fetched_at).await;
     }
 
     pub async fn processed_get(&self, key: &str) -> Option<Arc<Rendered>> {
@@ -176,8 +202,8 @@ impl Caches {
         self.processed_get(key).await
     }
 
-    /// Called by the admin save handlers (Phase 2.5).
-    #[allow(dead_code)]
+    /// Drop a rendered output and bump its generation, so a render still
+    /// in flight for it cannot store behind the invalidation.
     pub async fn processed_invalidate(&self, key: &str) {
         self.bump_generation(key).await;
         self.processed.invalidate(&key.to_string()).await;
@@ -190,16 +216,22 @@ impl Caches {
     }
 
     /// Mark every rendering of `key` produced up to now as superseded.
+    ///
+    /// The read-modify-write runs under a lock: two invalidations of the
+    /// same key (two sources feeding one profile, ingesting at once) would
+    /// otherwise read the same generation and both write G+1, losing a
+    /// bump and letting a render claimed in between store pre-change rows
+    /// as fresh.
     async fn bump_generation(&self, key: &str) {
+        let _serialized = self.bump_lock.lock().await;
         let key = key.to_string();
         let next = self.generation(&key).await + 1;
         self.generations.insert(key, next).await;
     }
 
     /// Source changed (url/encoding/input_format/protocols/headers/TTL/
-    /// pipeline/enabled): drop its raw snapshot and every rendered output
-    /// that contains it.
-    #[allow(dead_code)] // wired to the admin source form in Phase 2.5
+    /// pipeline/enabled): drop its freshness marker and every rendered
+    /// output that contains it.
     pub async fn invalidate_source(&self, source_id: &str) {
         self.raw.invalidate(&source_id.to_string()).await;
         self.invalidate_processed_for_source(source_id).await;
@@ -208,8 +240,8 @@ impl Caches {
     /// Source data refreshed (a successful ingest reconciled at least one
     /// row): drop every rendered output that contains the source so clients
     /// see the new proxies immediately, and supersede every cold render that
-    /// is still running over it. The raw snapshot is kept, the ingest that
-    /// triggers this just wrote it.
+    /// is still running over it. The freshness marker is kept, the ingest
+    /// that triggers this just wrote it.
     pub async fn invalidate_processed_for_source(&self, source_id: &str) {
         let mut affected: Vec<String> = self
             .processed
@@ -228,7 +260,7 @@ impl Caches {
         affected.extend(
             inline
                 .iter()
-                .filter(|(_, sources)| sources.iter().any(|id| id == source_id))
+                .filter(|(_, state)| state.sources.iter().any(|id| id == source_id))
                 .map(|(key, _)| key.clone()),
         );
         drop(inline);
@@ -240,7 +272,6 @@ impl Caches {
 
     /// Profile changed (composition/format/pipeline/enabled): drop its
     /// rendered output.
-    #[allow(dead_code)] // wired to the admin profile form in Phase 2.5
     pub async fn invalidate_profile(&self, profile_id: &str) {
         self.processed_invalidate(&format!("sub:{profile_id}"))
             .await;
@@ -275,10 +306,11 @@ impl Caches {
     }
 
     /// Claim an inline render of a key the processed layer does not hold.
-    /// Returns a guard carrying the generation the render must still hold to
-    /// be storable, or `None` when another render of the same key is already
-    /// in flight: a burst of requests on a cold key renders the same body
-    /// once for the cache and answers the rest without storing it.
+    /// The first caller becomes the [`InlineClaim::Leader`] and renders;
+    /// every request arriving while that render runs gets an
+    /// [`InlineClaim::Wait`] receiver that resolves when the leader's claim
+    /// ends. A burst of requests on a cold key therefore runs one render
+    /// instead of one per request, and no duplicate rendering is stored.
     ///
     /// The guard also keeps the key visible to
     /// [`Caches::invalidate_processed_for_source`]: without an entry there
@@ -288,23 +320,24 @@ impl Caches {
     /// `source_ids` are the sources the rendering can draw from; they scope
     /// the claim's reach, so an ingest of a source this render cannot touch
     /// leaves its put alone instead of starving the cache of valid fills. A
-    /// superset is safe, an empty list is not (it would make the claim
-    /// invisible to every invalidation).
-    pub async fn begin_inline_render(
-        &self,
-        key: &str,
-        source_ids: Vec<String>,
-    ) -> Option<InlineRenderGuard> {
-        let claimed = self
-            .inline_rendering
-            .lock()
-            .await
-            .insert(key.to_string(), source_ids.into_iter().collect())
-            .is_none();
-        if !claimed {
-            return None;
+    /// superset is safe; an empty list is only for keys that never
+    /// participate in per-source invalidation (the exports), elsewhere it
+    /// makes the claim invisible to every invalidation.
+    pub async fn begin_inline_render(&self, key: &str, source_ids: Vec<String>) -> InlineClaim {
+        let mut map = self.inline_rendering.lock().await;
+        if let Some(state) = map.get(key) {
+            return InlineClaim::Wait(state.done.subscribe());
         }
-        Some(InlineRenderGuard {
+        let (done, _) = watch::channel(InlineOutcome::Stored);
+        map.insert(
+            key.to_string(),
+            InlineRenderState {
+                sources: source_ids.into_iter().collect(),
+                done,
+            },
+        );
+        drop(map);
+        InlineClaim::Leader(InlineRenderGuard {
             inline_rendering: self.inline_rendering.clone(),
             key: key.to_string(),
             generation: self.generation(key).await,
@@ -313,9 +346,11 @@ impl Caches {
 }
 
 /// Releases one inline-render claim when dropped, including while a panic
-/// unwinds the rendering task.
+/// unwinds the rendering task. The drop also removes the claim's entry, and
+/// with it the wait-channel: every [`InlineClaim::Wait`] receiver resolves
+/// at that moment.
 pub struct InlineRenderGuard {
-    inline_rendering: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    inline_rendering: Arc<Mutex<HashMap<String, InlineRenderState>>>,
     key: String,
     /// Invalidation generation of the key at claim time; the rendering this
     /// claim covers may only be stored while it still holds.
@@ -326,6 +361,24 @@ impl InlineRenderGuard {
     /// Generation to hand back to [`Caches::processed_put_guarded`].
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Publish a failed render to the claim's waiters, so they answer from
+    /// it instead of each re-running a render that is known to fail. Call
+    /// this before the guard drops.
+    ///
+    /// Best-effort by design: the map lock is only ever held for a set
+    /// insert or remove, so losing this race is close to impossible, and a
+    /// waiter that misses the verdict simply falls back to claiming the
+    /// render itself, which is what it did before outcomes existed.
+    pub fn fail(&self, status: u16, message: String) {
+        if let Ok(map) = self.inline_rendering.try_lock()
+            && let Some(state) = map.get(&self.key)
+        {
+            state
+                .done
+                .send_replace(InlineOutcome::Failed { status, message });
+        }
     }
 }
 
@@ -394,7 +447,7 @@ mod tests {
     fn rendered(fresh_until: i64, sources: &[&str]) -> Rendered {
         Rendered {
             status: 200,
-            body: Vec::new(),
+            body: Bytes::new(),
             content_type: "text/plain".to_string(),
             extra_headers: Vec::new(),
             fresh_until,
@@ -402,11 +455,14 @@ mod tests {
         }
     }
 
-    fn payload() -> FetchedPayload {
-        FetchedPayload {
-            http_status: 200,
-            bytes: 3,
-            body: b"abc".to_vec(),
+    /// Claim a cold render, expecting to be its single-flight leader.
+    async fn claim_inline(caches: &Caches, key: &str, sources: &[&str]) -> InlineRenderGuard {
+        match caches
+            .begin_inline_render(key, sources.iter().map(|s| s.to_string()).collect())
+            .await
+        {
+            InlineClaim::Leader(guard) => guard,
+            InlineClaim::Wait(_) => panic!("expected to lead the cold render of {key}"),
         }
     }
 
@@ -414,7 +470,7 @@ mod tests {
     async fn raw_freshness_follows_source_ttl() {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
-        caches.raw_put("s1", payload(), now - 100).await;
+        caches.raw_put("s1", now - 100).await;
         assert!(caches.raw_is_fresh("s1", 3600).await);
         assert!(!caches.raw_is_fresh("s1", 50).await);
         assert!(!caches.raw_is_fresh("missing", 3600).await);
@@ -424,7 +480,7 @@ mod tests {
     async fn invalidate_source_clears_raw_and_dependent_renderings() {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
-        caches.raw_put("s1", payload(), now).await;
+        caches.raw_put("s1", now).await;
         caches
             .processed_put("sub:p1", rendered(now + 60, &["s1", "s2"]))
             .await;
@@ -437,7 +493,7 @@ mod tests {
 
         caches.invalidate_source("s1").await;
 
-        assert!(caches.raw_get("s1").await.is_none());
+        assert!(!caches.raw_is_fresh("s1", 86_400).await);
         assert!(caches.processed_get("sub:p1").await.is_none());
         assert!(caches.processed_get("src:s1").await.is_none());
         // Unrelated profile survives.
@@ -448,7 +504,7 @@ mod tests {
     async fn ingest_invalidation_clears_renderings_but_keeps_raw() {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
-        caches.raw_put("s1", payload(), now).await;
+        caches.raw_put("s1", now).await;
         caches
             .processed_put("sub:p1", rendered(now + 60, &["s1", "s2"]))
             .await;
@@ -461,8 +517,8 @@ mod tests {
 
         caches.invalidate_processed_for_source("s1").await;
 
-        // The just-ingested raw snapshot stays; dependent renderings go.
-        assert!(caches.raw_get("s1").await.is_some());
+        // The just-ingested freshness marker stays; dependent renderings go.
+        assert!(caches.raw_is_fresh("s1", 86_400).await);
         assert!(caches.processed_get("sub:p1").await.is_none());
         assert!(caches.processed_get("src:s1").await.is_none());
         assert!(caches.processed_get("sub:p2").await.is_some());
@@ -578,10 +634,7 @@ mod tests {
         let now = fumox_core::models::now_ts();
 
         // A cache miss: the inline render of an empty key claims it.
-        let claim = caches
-            .begin_inline_render("sub:p1", vec!["s1".to_string()])
-            .await
-            .expect("the first cold render claims the key");
+        let claim = claim_inline(&caches, "sub:p1", &["s1"]).await;
 
         // The ingest commits while that render is still running.
         caches.invalidate_processed_for_source("s1").await;
@@ -606,10 +659,7 @@ mod tests {
     async fn inline_render_without_an_invalidation_still_stores() {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
-        let claim = caches
-            .begin_inline_render("sub:p1", vec!["s1".to_string()])
-            .await
-            .unwrap();
+        let claim = claim_inline(&caches, "sub:p1", &["s1"]).await;
         let stored = caches
             .processed_put_guarded(
                 "sub:p1",
@@ -619,13 +669,57 @@ mod tests {
             .await;
         assert!(stored.is_some());
         drop(claim);
-        assert!(
-            caches
-                .begin_inline_render("sub:p1", vec!["s1".to_string()])
-                .await
-                .is_some(),
-            "the claim must be released when the render ends"
-        );
+        // Released: a fresh cold render leads again.
+        let _ = claim_inline(&caches, "sub:p1", &["s1"]).await;
+    }
+
+    /// Concurrent invalidations of one key must each leave their mark: a
+    /// lost bump lets a render claimed after the first invalidation store
+    /// rows the second one already superseded, for a full TTL.
+    #[tokio::test]
+    async fn concurrent_invalidations_do_not_lose_a_generation() {
+        let caches = Caches::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let caches = caches.clone();
+            tasks.spawn(async move { caches.processed_invalidate("sub:race").await });
+        }
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(caches.generation("sub:race").await, 64);
+    }
+
+    /// A request that finds the claim taken must be handed a wake-up that
+    /// resolves when the leader's claim ends, and that is what lets the burst
+    /// wait for one render instead of running one each. The release must
+    /// also happen on unwind (the guard removes the entry in `Drop`).
+    #[tokio::test]
+    async fn a_taken_claim_hands_waiters_a_wake_up() {
+        let caches = Caches::new();
+        let leader = claim_inline(&caches, "sub:p1", &["s1"]).await;
+
+        let mut waiter = match caches.begin_inline_render("sub:p1", Vec::new()).await {
+            InlineClaim::Wait(rx) => rx,
+            InlineClaim::Leader(_) => panic!("a taken claim cannot be led"),
+        };
+        let parked = tokio::spawn(async move { waiter.changed().await });
+
+        // The leader panics: the guard's `Drop` still releases the claim
+        // and closes the channel.
+        let crashed = tokio::spawn(async move {
+            let _leader = leader;
+            tokio::task::yield_now().await;
+            panic!("render blew up");
+        });
+        assert!(crashed.await.is_err());
+
+        let woke = tokio::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("the waiter must wake when the leader's claim ends")
+            .unwrap();
+        // Closed channel (no value is ever sent) is the expected wake-up.
+        assert!(woke.is_err());
+        // The claim is gone: the next arrival leads its own render.
+        let _ = claim_inline(&caches, "sub:p1", &["s1"]).await;
     }
 
     /// An ingest of one source must not discard the in-flight cold render of
@@ -637,10 +731,7 @@ mod tests {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
         // A cold render of a profile over "s2", while "s1" gets ingested.
-        let claim = caches
-            .begin_inline_render("sub:p1", vec!["s2".to_string()])
-            .await
-            .expect("the first cold render claims the key");
+        let claim = claim_inline(&caches, "sub:p1", &["s2"]).await;
         caches.invalidate_processed_for_source("s1").await;
 
         let stored = caches

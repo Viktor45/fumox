@@ -11,25 +11,43 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use fumox_core::config::ProbeConfig;
-use fumox_core::repo::{meta_get, proxies};
+use fumox_core::repo::{fetch_log, meta_get, probe as probe_repo, proxies};
 use futures_util::Stream;
 use std::convert::Infallible;
 use std::time::Duration;
 
 /// How old the probe heartbeat may be before the daemon is considered
-/// down, in seconds. Follows the operator's setting: three beat
-/// periods. The `.max(5)` mirrors the daemon's own beat period
-/// (`heartbeat_interval_secs.max(5)`, `fumox-probe/src/main.rs`), which
-/// is what keeps a daemon beating on schedule from being reported dead
-/// when the operator configures a period below 5 s, the settings form
-/// accepts `1..=86400`. Used for both the daemon card and the backlog
-/// banner, so the two never disagree.
-fn heartbeat_stale_after(cfg: &ProbeConfig) -> i64 {
-    (cfg.heartbeat_interval_secs.max(5) as i64).saturating_mul(3)
+/// down, in seconds: three beat periods. Used for both the daemon card
+/// and the backlog banner, so the two never disagree.
+///
+/// `reported_secs` is the beat period the daemon published in its own
+/// heartbeat payload. Server and probe may read different config files
+/// (or a different env overlay), so the record's own value is
+/// authoritative when present; `None` (a record from an older daemon)
+/// falls back to this server's config. The `.max(5)` mirrors the
+/// daemon's own beat floor (`fumox-probe/src/main.rs`), so a period
+/// configured under it is not reported dead.
+fn heartbeat_stale_after(cfg: &ProbeConfig, reported_secs: Option<u64>) -> i64 {
+    let secs = reported_secs.unwrap_or(cfg.heartbeat_interval_secs);
+    (secs.max(5) as i64).saturating_mul(3)
 }
 
-/// Period for the `probe.stats` and `heartbeat` SSE events.
-const STATS_INTERVAL: Duration = Duration::from_secs(30);
+/// How old the last successful meow-rs contact may be before the engine
+/// card calls the contact stale, in seconds: three probe cycles. A healthy
+/// engine is contacted once per cycle (the T2 batch), so three cycles of
+/// silence means the daemon is not feeding it, or the pool has no T2
+/// candidates at all, which the card reports as stale rather than dead
+/// for exactly that ambiguity.
+///
+/// `reported_secs` is the cycle period the daemon published in its own
+/// heartbeat payload (`cycle_interval_secs`). Authoritative when present,
+/// same reason as in [`heartbeat_stale_after`]; `None` (a record from an
+/// older daemon) falls back to this server's config.
+fn meow_stale_after(cfg: &ProbeConfig, reported_secs: Option<u64>) -> i64 {
+    let secs = reported_secs.unwrap_or(cfg.cycle_interval_secs);
+    (secs.max(5) as i64).saturating_mul(3)
+}
+
 /// Lifetime cap on a single SSE connection: even with `keep_alive`
 /// keepalive pings, a slow-loris client that
 /// never reads from the stream would otherwise sit on a per-IP admin slot
@@ -59,6 +77,14 @@ struct Heartbeat {
     ts: i64,
     pid: u32,
     version: String,
+    /// Effective beat period reported by the daemon. `None` for records
+    /// written before the field existed; the staleness check then falls
+    /// back to the server's own config.
+    interval_secs: Option<u64>,
+    /// Effective cycle period reported by the daemon (same contract as
+    /// `interval_secs`): the meow-contact staleness must threshold against
+    /// the cycle the daemon actually runs, not this server's config copy.
+    cycle_interval_secs: Option<u64>,
     alive: bool,
 }
 
@@ -69,6 +95,23 @@ struct MeowMemoryView {
     rss_bytes: u64,
     os_limit_bytes: u64,
     ts: i64,
+}
+
+/// Parsed `meow_last_ok` contact stamp with its staleness verdict. A
+/// historical timestamp alone must not render as "available": the card
+/// used to show green for a contact from any point in the past.
+struct MeowContact {
+    ts: i64,
+    alive: bool,
+}
+
+/// Parsed `last_rotation` meta value (JSON), stamped by the probe
+/// daemon's retention loop on every run, including runs that deleted
+/// nothing, so the age of `ts` is the "retention is alive" signal.
+struct LastRotation {
+    ts: i64,
+    probe_results: u64,
+    fetch_log: u64,
 }
 
 impl MeowMemoryView {
@@ -124,7 +167,14 @@ struct ProbeTemplate {
     csrf: String,
     proxy_counts: Vec<(String, i64)>,
     heartbeat: Option<Heartbeat>,
-    meow_last_ok: Option<i64>,
+    meow_last_ok: Option<MeowContact>,
+    /// Last retention run of the probe daemon (`last_rotation` meta),
+    /// rendered with the current journal row counts.
+    last_rotation: Option<LastRotation>,
+    /// Current `probe_results` / `fetch_log` sizes, read against the
+    /// rotation stamp: a fresh stamp on a growing table is still a leak.
+    journal_probe_rows: i64,
+    journal_fetch_rows: i64,
     /// Kernel RSS as published by the probe daemon (`meow_memory` meta).
     meow_memory: Option<MeowMemoryView>,
     /// Check-coverage buckets (`none`/`t1_only`/`t2_only`/`both`), fixed
@@ -145,26 +195,19 @@ struct ProbeTemplate {
 }
 
 /// Read-only DTO of the `[probe]` block: only the fields the
-/// `/admin/probe` page actually surfaces. Decouples the template from
-/// `ProbeConfig`'s serde internals.
+/// `/admin/probe` page actually surfaces (the config-snapshot line).
+/// Decouples the template from `ProbeConfig`'s serde internals.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 struct ProbeView {
     cycle_interval_secs: u64,
-    sample_size: u32,
     concurrency: usize,
-    queue_stale_days: u64,
-    backlog_target_drain_minutes: u64,
 }
 
 impl ProbeView {
     fn from(cfg: &ProbeConfig) -> Self {
         Self {
             cycle_interval_secs: cfg.cycle_interval_secs,
-            sample_size: cfg.sample_size,
             concurrency: cfg.concurrency,
-            queue_stale_days: cfg.queue_stale_days,
-            backlog_target_drain_minutes: cfg.backlog_target_drain_minutes,
         }
     }
 }
@@ -209,24 +252,20 @@ impl BacklogLevel {
 }
 
 /// One trigger that fired. `key` maps to a `probe.factor_<key>`
-/// i18n entry, `severity` feeds the banner level.
+/// i18n entry; the banner level is escalated at each push site, not
+/// derived from this list.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 struct BacklogFactor {
     key: &'static str,
-    severity: BacklogLevel,
 }
 
-/// One concrete suggested change. `target_value` is the new value the
-/// recommendation asks for (rendered into the localized label and used
-/// by tests). `key` maps to a `probe.rec_<key>` i18n entry, `args` are
-/// the named placeholders that entry needs. The label is resolved
+/// One concrete suggested change. `key` maps to a `probe.rec_<key>`
+/// i18n entry, `args` are the named placeholders that entry needs (the
+/// new value rides in them under `target`). The label is resolved
 /// through the catalog, never formatted here.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct TuningRec {
     key: &'static str,
-    target_value: String,
     /// Named substitutions for the `probe.rec_<key>` entry.
     args: Vec<(&'static str, String)>,
 }
@@ -395,6 +434,8 @@ fn derive_cycle_model(
 /// `now - heartbeat.ts` when a heartbeat row exists, `None` when it
 /// does not. A *missing* heartbeat is not a dead daemon, it is a
 /// daemon that has not beaten yet (surfaced on the card instead).
+/// `reported_heartbeat_secs` is the beat period the daemon published in its
+/// payload (`None` for records from older daemons).
 /// The server applies one threshold, [`heartbeat_stale_after`], to
 /// both the daemon card and this banner, so the two never disagree.
 fn compute_backlog(
@@ -402,6 +443,7 @@ fn compute_backlog(
     due_count: i64,
     oldest_quarantined_age_secs: Option<i64>,
     heartbeat_age_secs: Option<i64>,
+    reported_heartbeat_secs: Option<u64>,
     cfg: &ProbeConfig,
 ) -> Option<BacklogDiagnostic> {
     // The raw configured value, not a clamped one. `sample_size = 0` is
@@ -424,15 +466,11 @@ fn compute_backlog(
     let mut factors: Vec<BacklogFactor> = Vec::new();
 
     if sample_size > 0 && quarantine_count > sample_size * 20 {
-        factors.push(BacklogFactor {
-            key: "deep_queue",
-            severity: BacklogLevel::Warning,
-        });
+        factors.push(BacklogFactor { key: "deep_queue" });
     }
     if sample_size > 0 && due_count > sample_size * 5 {
         factors.push(BacklogFactor {
             key: "due_overflow",
-            severity: BacklogLevel::Warning,
         });
     }
     if let Some(age) = oldest_quarantined_age_secs {
@@ -445,17 +483,15 @@ fn compute_backlog(
             level = level.escalate(BacklogLevel::Danger);
             factors.push(BacklogFactor {
                 key: "stale_oldest",
-                severity: BacklogLevel::Danger,
             });
         }
     }
     if let Some(age) = heartbeat_age_secs
-        && age > heartbeat_stale_after(cfg)
+        && age > heartbeat_stale_after(cfg, reported_heartbeat_secs)
     {
         level = level.escalate(BacklogLevel::Danger);
         factors.push(BacklogFactor {
             key: "heartbeat_dead",
-            severity: BacklogLevel::Danger,
         });
     }
 
@@ -468,10 +504,7 @@ fn compute_backlog(
     // what the cycle took rather than asserting why, which is the only
     // claim the page can actually support.
     if model.retire_per_cycle == 0 {
-        factors.push(BacklogFactor {
-            key: "all_idle",
-            severity: BacklogLevel::Ok,
-        });
+        factors.push(BacklogFactor { key: "all_idle" });
         if !hard_factors {
             level = BacklogLevel::Ok;
         }
@@ -479,13 +512,9 @@ fn compute_backlog(
         if over_target {
             factors.push(BacklogFactor {
                 key: "drain_over_target",
-                severity: BacklogLevel::Warning,
             });
         } else {
-            factors.push(BacklogFactor {
-                key: "all_ok",
-                severity: BacklogLevel::Ok,
-            });
+            factors.push(BacklogFactor { key: "all_ok" });
             level = BacklogLevel::Ok;
         }
     }
@@ -566,7 +595,6 @@ fn compute_recs(cfg: &ProbeConfig, model: &CycleModel) -> Vec<TuningRec> {
         {
             out.push(TuningRec {
                 key: "sample_size",
-                target_value: required.to_string(),
                 args: vec![
                     ("target", required.to_string()),
                     ("current", model.sample_size.to_string()),
@@ -590,7 +618,6 @@ fn compute_recs(cfg: &ProbeConfig, model: &CycleModel) -> Vec<TuningRec> {
             let lane_secs = planned.with_concurrency(c).lane_secs;
             out.push(TuningRec {
                 key: "concurrency",
-                target_value: c.to_string(),
                 args: vec![
                     ("target", c.to_string()),
                     ("current", planned.concurrency.to_string()),
@@ -617,7 +644,6 @@ fn compute_recs(cfg: &ProbeConfig, model: &CycleModel) -> Vec<TuningRec> {
         {
             out.push(TuningRec {
                 key: "cycle_interval_secs",
-                target_value: required_period.to_string(),
                 args: vec![
                     ("target", required_period.to_string()),
                     ("current", planned.cycle_interval_secs.to_string()),
@@ -813,18 +839,22 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
     let pool = &state.pool;
+    let now = fumox_core::models::now_ts();
 
     let proxy_counts = match proxies::count_by_status(pool).await {
         Ok(counts) => counts,
         Err(err) => return server_error(lang, &err),
     };
 
-    let heartbeat_stale_after = heartbeat_stale_after(&state.probe);
     let heartbeat = match meta_get(pool, "probe_heartbeat").await {
         Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|value| {
                 let ts = value.get("ts")?.as_i64()?;
+                // The daemon's own beat period, when the record carries it.
+                let interval_secs = value.get("interval_secs").and_then(|v| v.as_u64());
+                // Same for its cycle period, which thresholds the meow card.
+                let cycle_interval_secs = value.get("cycle_interval_secs").and_then(|v| v.as_u64());
                 Some(Heartbeat {
                     ts,
                     pid: value.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
@@ -836,7 +866,9 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
                     // Same threshold the banner applies, so the card and
                     // the banner can never call the same daemon alive in
                     // one place and dead in the other.
-                    alive: fumox_core::models::now_ts() - ts <= heartbeat_stale_after,
+                    alive: now - ts <= heartbeat_stale_after(&state.probe, interval_secs),
+                    interval_secs,
+                    cycle_interval_secs,
                 })
             }),
         Ok(None) => None,
@@ -844,7 +876,17 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     };
 
     let meow_last_ok = match meta_get(pool, "meow_last_ok").await {
-        Ok(Some(raw)) => raw.parse::<i64>().ok(),
+        Ok(Some(raw)) => raw.parse::<i64>().ok().map(|ts| MeowContact {
+            ts,
+            // Without this verdict a contact from last month rendered as
+            // a green "available". The cycle period the daemon reported in
+            // its own heartbeat outranks this server's config copy.
+            alive: now - ts
+                <= meow_stale_after(
+                    &state.probe,
+                    heartbeat.as_ref().and_then(|hb| hb.cycle_interval_secs),
+                ),
+        }),
         Ok(None) => None,
         Err(err) => return server_error(lang, &err),
     };
@@ -852,6 +894,31 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     let meow_memory = match meta_get(pool, "meow_memory").await {
         Ok(Some(raw)) => serde_json::from_str::<MeowMemoryView>(&raw).ok(),
         Ok(None) => None,
+        Err(err) => return server_error(lang, &err),
+    };
+
+    let last_rotation = match meta_get(pool, "last_rotation").await {
+        Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|value| {
+                Some(LastRotation {
+                    ts: value.get("ts")?.as_i64()?,
+                    probe_results: value
+                        .get("probe_results")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    fetch_log: value.get("fetch_log").and_then(|v| v.as_u64()).unwrap_or(0),
+                })
+            }),
+        Ok(None) => None,
+        Err(err) => return server_error(lang, &err),
+    };
+    let journal_probe_rows = match probe_repo::count_all(pool).await {
+        Ok(count) => count,
+        Err(err) => return server_error(lang, &err),
+    };
+    let journal_fetch_rows = match fetch_log::count_all(pool).await {
+        Ok(count) => count,
         Err(err) => return server_error(lang, &err),
     };
 
@@ -887,7 +954,6 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     // Backlog-banner inputs. Two extra SQL queries, both are index hits
     // on `proxies(status, ladder_at)` and `proxies(status, quarantined_at)`
     // and run once per page render (not per row).
-    let now = fumox_core::models::now_ts();
     let due_count = match proxies::count_due_quarantine(pool, now).await {
         Ok(n) => n,
         Err(err) => return server_error(lang, &err),
@@ -905,6 +971,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
         due_count,
         oldest_quarantined_age_secs,
         heartbeat_age_secs,
+        heartbeat.as_ref().and_then(|hb| hb.interval_secs),
         &state.probe,
     );
 
@@ -920,6 +987,9 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
             proxy_counts,
             heartbeat,
             meow_last_ok,
+            last_rotation,
+            journal_probe_rows,
+            journal_fetch_rows,
             meow_memory,
             coverage,
             quarantine_count,
@@ -933,29 +1003,17 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
 
 // SSE stream.
 
-/// SSE endpoint: forwards scheduler fetch events from the
-/// event bus and interleaves periodic `probe.stats` / `heartbeat` events
-/// read from the database. The browser wires this via `EventSource` in the
-/// base template; without JS the polling fragments keep working.
+/// SSE endpoint: forwards scheduler fetch events from the event bus to
+/// the browser. The events are one-shot notifications: the browser reacts
+/// to `fetch.*` by refreshing fragments that poll on their own cadence
+/// anyway, and without JS those fragments keep working. SSE is a pure
+/// enhancement, so a missed event only delays an update.
 pub async fn events_stream(
     State(state): State<AdminState>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let mut receiver = state.events.subscribe();
-    let pool = state.pool.clone();
 
     let stream = async_stream::stream! {
-        // Emit an initial stats snapshot so a freshly opened page has data
-        // without waiting for the first interval tick.
-        if let Ok(counts) = proxies::count_by_status(&pool).await {
-            let payload = serde_json::to_value(&counts).unwrap_or_default();
-            yield Ok(SseEvent::default()
-                .event("probe.stats")
-                .data(payload.to_string()));
-        }
-
-        let mut tick = tokio::time::interval(STATS_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick.tick().await; // consume the immediate first tick
         let mut idle = tokio::time::interval(SSE_IDLE_TIMEOUT);
         idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         idle.tick().await; // first idle deadline is SSE_IDLE_TIMEOUT from now
@@ -969,28 +1027,20 @@ pub async fn events_stream(
                                 .event(event.name)
                                 .data(event.data.to_string()));
                         }
-                        // Lagged: skip the lost events; the next periodic
-                        // tick repairs the client's state.
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        // Lagged: the consumer lost events, not state,
+                        // every fetch.* event merely tells the page to
+                        // refresh a fragment that polls on its own, so the
+                        // only cost is a delayed update. Logged so a
+                        // persistently slow consumer stays visible.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                skipped,
+                                "SSE client lagged; dropped event(s), a delayed refresh at most"
+                            );
+                            continue;
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                }
-                _ = tick.tick() => {
-                    if let Ok(counts) = proxies::count_by_status(&pool).await {
-                        let payload = serde_json::to_value(&counts).unwrap_or_default();
-                        yield Ok(SseEvent::default()
-                            .event("probe.stats")
-                            .data(payload.to_string()));
-                    }
-                    let heartbeat = meta_get(&pool, "probe_heartbeat").await.ok().flatten();
-                    let meow = meta_get(&pool, "meow_last_ok").await.ok().flatten();
-                    let payload = serde_json::json!({
-                        "probe_heartbeat": heartbeat,
-                        "meow_last_ok": meow,
-                    });
-                    yield Ok(SseEvent::default()
-                        .event("heartbeat")
-                        .data(payload.to_string()));
                 }
                 // Connection lifetime cap:
                 // the stream never outlives SSE_IDLE_TIMEOUT (10 min) even
@@ -1030,14 +1080,23 @@ mod tests {
     /// No quarantined row old enough to trip `stale_oldest` and no
     /// heartbeat: isolates the queue-driven factors.
     fn backlog(quarantine_count: i64, due_count: i64, cfg: &ProbeConfig) -> BacklogDiagnostic {
-        compute_backlog(quarantine_count, due_count, None, None, cfg)
+        compute_backlog(quarantine_count, due_count, None, None, None, cfg)
             .expect("compute_backlog always returns a diagnostic")
     }
 
     fn rec_pairs(diag: &BacklogDiagnostic) -> Vec<(&'static str, String)> {
         diag.recs
             .iter()
-            .map(|r| (r.key, r.target_value.clone()))
+            .map(|r| {
+                let target = r
+                    .args
+                    .iter()
+                    .find(|(k, _)| *k == "target")
+                    .expect("every rec carries its new value as the `target` arg")
+                    .1
+                    .clone();
+                (r.key, target)
+            })
             .collect()
     }
 
@@ -1281,20 +1340,44 @@ mod tests {
 
     /// Three beat periods, with the daemon's own `.max(5)` floor on the
     /// period: at `heartbeat_interval_secs = 1` a daemon beating every
-    /// 5 s is not dead after 3 s.
+    /// 5 s is not dead after 3 s. A period reported in the heartbeat
+    /// payload outranks the server's config, the two may read different
+    /// files.
     #[test]
     fn heartbeat_threshold_mirrors_the_daemon_beat_period() {
-        let stale_after = |secs: u64| {
-            let cfg = ProbeConfig {
-                heartbeat_interval_secs: secs,
-                ..ProbeConfig::default()
-            };
-            heartbeat_stale_after(&cfg)
+        let cfg = |secs: u64| ProbeConfig {
+            heartbeat_interval_secs: secs,
+            ..ProbeConfig::default()
         };
-        assert_eq!(stale_after(1), 15);
-        assert_eq!(stale_after(5), 15);
-        assert_eq!(stale_after(30), 90);
-        assert_eq!(stale_after(300), 900);
+        assert_eq!(heartbeat_stale_after(&cfg(1), None), 15);
+        assert_eq!(heartbeat_stale_after(&cfg(5), None), 15);
+        assert_eq!(heartbeat_stale_after(&cfg(30), None), 90);
+        assert_eq!(heartbeat_stale_after(&cfg(300), None), 900);
+        // The daemon's reported period wins over the server's config.
+        assert_eq!(heartbeat_stale_after(&cfg(300), Some(30)), 90);
+        // A payload period below the daemon floor still clamps.
+        assert_eq!(heartbeat_stale_after(&cfg(300), Some(1)), 15);
+    }
+
+    /// Three probe cycles, floored at 5 s so a cycle configured down to
+    /// `1` still leaves a working window: a meow contact stamped one
+    /// cycle ago is fresh, one stamped four cycles ago is stale. A cycle
+    /// period reported in the heartbeat payload outranks the server's
+    /// config, the two may read different files.
+    #[test]
+    fn meow_stale_threshold_is_three_cycles() {
+        let cfg = |secs: u64| ProbeConfig {
+            cycle_interval_secs: secs,
+            ..ProbeConfig::default()
+        };
+        assert_eq!(meow_stale_after(&cfg(1), None), 15);
+        assert_eq!(meow_stale_after(&cfg(5), None), 15);
+        assert_eq!(meow_stale_after(&cfg(60), None), 180);
+        assert_eq!(meow_stale_after(&cfg(3_600), None), 10_800);
+        // The daemon's reported period wins over the server's config.
+        assert_eq!(meow_stale_after(&cfg(3_600), Some(30)), 90);
+        // A payload period below the floor still clamps.
+        assert_eq!(meow_stale_after(&cfg(3_600), Some(1)), 15);
     }
 
     /// `queue_stale_days = 0` means "keep one day" to the daemon's
@@ -1307,14 +1390,14 @@ mod tests {
             ..ProbeConfig::default()
         };
         let two_hours = 2 * 3_600;
-        let diag = compute_backlog(1, 0, Some(two_hours), None, &cfg).unwrap();
+        let diag = compute_backlog(1, 0, Some(two_hours), None, None, &cfg).unwrap();
         assert_eq!(diag.stale_days, 1);
         assert_ne!(diag.level, BacklogLevel::Danger);
         assert!(!factor_keys(&diag).contains(&"stale_oldest"));
 
         // The clamp is a clamp, not a switch-off: 30 days is still stale.
         cfg.queue_stale_days = 7;
-        let diag = compute_backlog(1, 0, Some(30 * 86_400), None, &cfg).unwrap();
+        let diag = compute_backlog(1, 0, Some(30 * 86_400), None, None, &cfg).unwrap();
         assert_eq!(diag.level, BacklogLevel::Danger);
         assert!(factor_keys(&diag).contains(&"stale_oldest"));
     }
@@ -1343,7 +1426,7 @@ mod tests {
 
         // A dead daemon and a stale row still speak over it: those are
         // measured in seconds and days, not against the sample.
-        let diag = compute_backlog(400, 400, Some(9 * 86_400), Some(600), &cfg).unwrap();
+        let diag = compute_backlog(400, 400, Some(9 * 86_400), Some(600), None, &cfg).unwrap();
         assert_eq!(diag.level, BacklogLevel::Danger);
         assert!(factor_keys(&diag).contains(&"stale_oldest"));
         assert!(factor_keys(&diag).contains(&"heartbeat_dead"));

@@ -83,6 +83,10 @@
   <div class="panel stat-card">
     <div class="num">{{ fetch_ok_24h }} / {{ fetch_total_24h }}</div>
     <div class="label">{{ self.t("dash.fetches_24h") }}</div>
+    {% match server_cycle_age_secs %}
+      {% when Some with (age) %}<div class="sub">{{ self.t("dash.last_sweep").replace("{}", &age.to_string()) }}</div>
+      {% when None %}<div class="sub">{{ self.t("dash.no_sweep") }}</div>
+    {% endmatch %}
   </div>
 </div>
 
@@ -272,6 +276,14 @@
     {% if schemes.is_empty() %}
       <p class="muted">{{ self.t("stats.no_proxies") }}</p>
     {% else %}
+      <div class="stat-split-legend">
+        <span class="legend"><span class="legend-dot alive"></span>{{ self.t("common.status_alive") }}</span>
+        <span class="legend"><span class="legend-dot ready"></span>{{ self.t("common.status_ready") }}</span>
+        <span class="legend"><span class="legend-dot quarantine"></span>{{ self.t("common.status_quarantine") }}</span>
+        <span class="legend"><span class="legend-dot unknown"></span>{{ self.t("common.status_unknown") }}</span>
+        <span class="legend"><span class="legend-dot removed"></span>{{ self.t("common.status_removed") }}</span>
+        <span class="legend"><span class="legend-dot neutral"></span>{{ self.t("common.total") }}</span>
+      </div>
       <div class="stat-split">
         {% for row in schemes %}
         <div class="stat-split-row">
@@ -294,12 +306,12 @@
             {% endif %}
           </div>
           <div class="stat-split-counts">
-            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=alive" class="badge alive" title="{{ self.t("common.status_alive") }}">{{ row.alive }}</a>
-            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=ready" class="badge ready" title="{{ self.t("common.status_ready") }}">{{ row.ready }}</a>
-            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=quarantine" class="badge quarantine" title="{{ self.t("common.status_quarantine") }}">{{ row.quarantine }}</a>
-            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=unknown" class="badge unknown" title="{{ self.t("common.status_unknown") }}">{{ row.unknown }}</a>
-            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=removed" class="badge removed" title="{{ self.t("common.status_removed") }}">{{ row.removed }}</a>
-            <span class="badge neutral" title="{{ self.t("common.total") }}">{{ row.total }}</span>
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=alive" class="badge alive" title="{{ self.t("common.status_alive") }}" aria-label="{{ self.t("common.status_alive") }}: {{ row.alive }}">{{ row.alive }}</a>
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=ready" class="badge ready" title="{{ self.t("common.status_ready") }}" aria-label="{{ self.t("common.status_ready") }}: {{ row.ready }}">{{ row.ready }}</a>
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=quarantine" class="badge quarantine" title="{{ self.t("common.status_quarantine") }}" aria-label="{{ self.t("common.status_quarantine") }}: {{ row.quarantine }}">{{ row.quarantine }}</a>
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=unknown" class="badge unknown" title="{{ self.t("common.status_unknown") }}" aria-label="{{ self.t("common.status_unknown") }}: {{ row.unknown }}">{{ row.unknown }}</a>
+            <a href="/admin/proxies?scheme={{ row.value }}&amp;status=removed" class="badge removed" title="{{ self.t("common.status_removed") }}" aria-label="{{ self.t("common.status_removed") }}: {{ row.removed }}">{{ row.removed }}</a>
+            <span class="badge neutral" title="{{ self.t("common.total") }}" aria-label="{{ self.t("common.total") }}: {{ row.total }}">{{ row.total }}</span>
           </div>
         </div>
         {% endfor %}
@@ -313,6 +325,14 @@
     {% if countries.is_empty() %}
       <p class="muted">{{ self.t("stats.no_proxies") }}</p>
     {% else %}
+      <div class="stat-split-legend">
+        <span class="legend"><span class="legend-dot alive"></span>{{ self.t("common.status_alive") }}</span>
+        <span class="legend"><span class="legend-dot ready"></span>{{ self.t("common.status_ready") }}</span>
+        <span class="legend"><span class="legend-dot quarantine"></span>{{ self.t("common.status_quarantine") }}</span>
+        <span class="legend"><span class="legend-dot unknown"></span>{{ self.t("common.status_unknown") }}</span>
+        <span class="legend"><span class="legend-dot removed"></span>{{ self.t("common.status_removed") }}</span>
+        <span class="legend"><span class="legend-dot neutral"></span>{{ self.t("common.total") }}</span>
+      </div>
       <div class="stat-split">
         {% for row in countries %}
         {% if loop.index as i64 <= top_n.as_i64() %}
@@ -343,19 +363,19 @@
           <div class="stat-split-counts">
             {% match row.value %}
               {% when Some with (country) %}
-                <a href="/admin/proxies?country={{ country }}&amp;status=alive" class="badge alive" title="{{ self.t("common.status_alive") }}">{{ row.alive }}</a>
-                <a href="/admin/proxies?country={{ country }}&amp;status=ready" class="badge ready" title="{{ self.t("common.status_ready") }}">{{ row.ready }}</a>
-                <a href="/admin/proxies?country={{ country }}&amp;status=quarantine" class="badge quarantine" title="{{ self.t("common.status_quarantine") }}">{{ row.quarantine }}</a>
-                <a href="/admin/proxies?country={{ country }}&amp;status=unknown" class="badge unknown" title="{{ self.t("common.status_unknown") }}">{{ row.unknown }}</a>
-                <a href="/admin/proxies?country={{ country }}&amp;status=removed" class="badge removed" title="{{ self.t("common.status_removed") }}">{{ row.removed }}</a>
+                <a href="/admin/proxies?country={{ country }}&amp;status=alive" class="badge alive" title="{{ self.t("common.status_alive") }}" aria-label="{{ self.t("common.status_alive") }}: {{ row.alive }}">{{ row.alive }}</a>
+                <a href="/admin/proxies?country={{ country }}&amp;status=ready" class="badge ready" title="{{ self.t("common.status_ready") }}" aria-label="{{ self.t("common.status_ready") }}: {{ row.ready }}">{{ row.ready }}</a>
+                <a href="/admin/proxies?country={{ country }}&amp;status=quarantine" class="badge quarantine" title="{{ self.t("common.status_quarantine") }}" aria-label="{{ self.t("common.status_quarantine") }}: {{ row.quarantine }}">{{ row.quarantine }}</a>
+                <a href="/admin/proxies?country={{ country }}&amp;status=unknown" class="badge unknown" title="{{ self.t("common.status_unknown") }}" aria-label="{{ self.t("common.status_unknown") }}: {{ row.unknown }}">{{ row.unknown }}</a>
+                <a href="/admin/proxies?country={{ country }}&amp;status=removed" class="badge removed" title="{{ self.t("common.status_removed") }}" aria-label="{{ self.t("common.status_removed") }}: {{ row.removed }}">{{ row.removed }}</a>
               {% when None %}
-                <span class="badge alive">{{ row.alive }}</span>
-                <span class="badge ready">{{ row.ready }}</span>
-                <span class="badge quarantine">{{ row.quarantine }}</span>
-                <span class="badge unknown">{{ row.unknown }}</span>
-                <span class="badge removed">{{ row.removed }}</span>
+                <span class="badge alive" aria-label="{{ self.t("common.status_alive") }}: {{ row.alive }}">{{ row.alive }}</span>
+                <span class="badge ready" aria-label="{{ self.t("common.status_ready") }}: {{ row.ready }}">{{ row.ready }}</span>
+                <span class="badge quarantine" aria-label="{{ self.t("common.status_quarantine") }}: {{ row.quarantine }}">{{ row.quarantine }}</span>
+                <span class="badge unknown" aria-label="{{ self.t("common.status_unknown") }}: {{ row.unknown }}">{{ row.unknown }}</span>
+                <span class="badge removed" aria-label="{{ self.t("common.status_removed") }}: {{ row.removed }}">{{ row.removed }}</span>
             {% endmatch %}
-            <span class="badge neutral" title="{{ self.t("common.total") }}">{{ row.total }}</span>
+            <span class="badge neutral" title="{{ self.t("common.total") }}" aria-label="{{ self.t("common.total") }}: {{ row.total }}">{{ row.total }}</span>
           </div>
         </div>
         {% endif %}

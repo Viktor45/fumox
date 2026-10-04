@@ -22,7 +22,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::get;
 use clap::Parser;
 
 use crate::cache::Caches;
@@ -36,6 +35,12 @@ struct Cli {
     /// location is config/app.toml if present).
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Probe the running server's /healthz and exit 0 when it answers 200,
+    /// 1 otherwise. Used as the container healthcheck: the runtime image
+    /// ships no curl or wget, and the binary already has an HTTP client.
+    #[arg(long)]
+    health_check: bool,
 }
 
 #[tokio::main]
@@ -43,6 +48,21 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let loaded = fumox_core::config::load(cli.config.as_deref())?;
     let config = loaded.config;
+
+    // Before tracing, the pool and the migrations: a probe must not make
+    // any of that side effect happen just to be measured. It reports the
+    // server's readiness, and migrations complete before the listeners
+    // bind, so a 200 here means the schema is current.
+    if cli.health_check {
+        return match probe_healthz(config.server.bind.port()).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("/healthz did not answer 200: {error}");
+                std::process::exit(1);
+            }
+        };
+    }
+
     fumox_core::logging::init_tracing(config.log.server);
 
     // Security audit (2026-08-30): running the panel with the built-in
@@ -69,9 +89,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // figment layers `FUMOX_*` variables over the file (config.rs, `Env::
+    // prefixed("FUMOX_")`); count them so a surprise override is at least
+    // attributable; names and values stay out of the log. The resolved
+    // database path is otherwise only visible on /admin/settings.
+    let env_overrides = std::env::vars()
+        .filter(|(key, _)| key.starts_with("FUMOX_"))
+        .count();
+    tracing::info!(
+        path = %config.database.path.display(),
+        env_overrides,
+        "database configured"
+    );
+
     let pool = fumox_core::db::connect_pool(&config.database).await?;
     fumox_core::db::migrate(&pool).await?;
-
     // The public «all alive» export link: generate the
     // capability token on first startup; it persists in `meta`, so the
     // link is stable across restarts until rotated from the admin panel.
@@ -114,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     // refresh; the sender lives in the serving state, the receiver drives
     // the scheduler loop.
     let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    tokio::spawn(scheduler::run(
+    let scheduler_task = tokio::spawn(scheduler::run(
         scheduler::IngestEnv {
             pool: pool.clone(),
             fetcher: fetcher.clone(),
@@ -132,17 +164,24 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Public listener: /sub/{id}, /src/{id} and /export/alive/{token}.
+    //
+    // `/healthz` gets a pool of its own, one connection, so its answer does
+    // not queue behind renders. An orchestrator reads 503 as "restart me",
+    // and a busy render pool is this process's own load, not a fault.
+    let mut health_cfg = config.database.clone();
+    health_cfg.max_connections = 1;
+    let health_pool = fumox_core::db::connect_pool(&health_cfg).await?;
+
     let state = serve::AppState {
         pool: pool.clone(),
         caches: caches.clone(),
         geo: geo.clone(),
-        refresh_tx: refresh_tx.clone(),
         limits: serve::PublicRateLimits::from_config(&config.server),
         trusted_cidrs: admin::parse_trusted_cidrs(&config.server.trust_proxy_ips),
         allowed_hosts: config.server.allowed_hosts.clone(),
         export_max_rows: config.server.export_max_rows,
     };
-    let app = serve::router(state).route("/healthz", get(|| async { "ok\n" }));
+    let app = serve::public_app(state, health_pool.clone());
 
     // Admin listener: a separate loopback interface. With
     // an empty token or enabled=false the panel is inert, the listener
@@ -182,9 +221,50 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal());
 
-    tokio::try_join!(public_server, admin_server)?;
+    // Drain the background scheduler even when a listener failed: the
+    // `?` used to return here first, so a bind error skipped the drain and
+    // the process exited with the scheduler's in-flight fetches unnamed.
+    let serving = tokio::try_join!(public_server, admin_server);
+
+    // Dropping `refresh_tx` (the admin router's clone went with its
+    // server) closes the channel, and the loop treats that as its
+    // shutdown signal. The await is bounded so a wedged loop cannot hold
+    // the process past its shutdown.
+    drop(refresh_tx);
+    match tokio::time::timeout(Duration::from_secs(5), scheduler_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!(error = %err, "scheduler task ended with a join error"),
+        Err(_) => tracing::warn!("scheduler task did not stop within 5 s; abandoning it"),
+    }
+    // In-flight fetches are detached tasks and cannot be awaited here;
+    // name what is being abandoned so a gap in an upstream's log or in
+    // `fetch_log` has an explanation in this one.
+    let abandoned = scheduler_state.in_flight_ids().await;
+    if !abandoned.is_empty() {
+        tracing::warn!(
+            count = abandoned.len(),
+            sources = ?abandoned,
+            "shutdown: fetches in flight are abandoned mid-request"
+        );
+    }
 
     tracing::info!("shutdown complete");
+    serving?;
+    Ok(())
+}
+
+/// GET the local public listener's `/healthz` and accept only 200. The
+/// probe carries no token, which is the point: the endpoint is the one
+/// unauthenticated route on the public listener.
+async fn probe_healthz(port: u16) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{port}/healthz");
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?;
     Ok(())
 }
 

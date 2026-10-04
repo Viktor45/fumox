@@ -14,6 +14,12 @@
 //! fragments and standard formatting; vmess and ss normalize encoding and
 //! guarantee semantic round-trip instead (`parse ∘ serialize ∘ parse`
 //! equals the first parse). Unknown parameters always pass through untouched.
+//!
+//! Entries that never had a source line (Clash YAML, sing-box JSON) are the
+//! exception: their parameters may carry mihomo field names, which the URI
+//! serializers translate onto the canonical vocabulary first (see
+//! `canonical_uri_entry`). The translation is output-only, stored
+//! parameters are not rewritten.
 
 pub mod clash;
 pub mod singbox;
@@ -21,7 +27,9 @@ pub mod ss;
 pub mod uri;
 pub mod vmess;
 
-use crate::models::{Encoding, InputFormat, ProxyEntry, Scheme};
+use std::collections::HashSet;
+
+use crate::models::{Encoding, InputFormat, Param, ProxyEntry, Scheme};
 
 /// Outcome of parsing a single non-comment line.
 #[derive(Debug)]
@@ -283,11 +291,23 @@ fn parse_naive(transport: &str, rest: &str, line: &str) -> LineOutcome {
 
 /// Serialize an entry back into a subscription line.
 ///
+/// Entries with a source line are emitted with their query bytes (almost)
+/// untouched; entries without one (Clash YAML, sing-box JSON) go through
+/// [`canonical_uri_entry`] first, so a Clash item's mihomo field names
+/// become the URI vocabulary a client understands.
+///
 /// Guaranteed to return a single line: `sanitize_for_output` strips line
 /// breaks from the fields the serializers emit verbatim. Parsers reject such
 /// values up front, so this only catches rows that predate the check or were
 /// written directly into SQLite.
 pub fn serialize(entry: &ProxyEntry) -> String {
+    let translated;
+    let entry = if entry.raw_line.is_empty() {
+        translated = canonical_uri_entry(entry);
+        &translated
+    } else {
+        entry
+    };
     let sanitized = sanitize_for_output(entry);
     let entry = sanitized.as_ref().unwrap_or(entry);
     match entry.scheme {
@@ -302,6 +322,265 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         Scheme::Naive => serialize_naive(entry),
         Scheme::Ss => ss::serialize(entry),
         Scheme::Vmess => vmess::serialize(entry),
+    }
+}
+
+/// Translate an entry's parameters from mihomo (Clash) spellings onto the
+/// canonical URI vocabulary, flattening the structured blocks Clash keeps
+/// as YAML text.
+///
+/// Emitted verbatim into a URI query, a mihomo field name is either
+/// ignored by the client (`network` selects no transport, `tls=true`
+/// enables no TLS, `servername` sets no SNI) or is outright unparseable
+/// (`ws-opts` is a multi-line YAML block). Only entries without a source
+/// line reach this: URI-parsed entries keep their stored spellings
+/// byte-for-byte, and the Clash/sing-box writers read both vocabularies,
+/// so the stored parameters are deliberately not touched.
+///
+/// When a translated key collides with one already present (`servername`
+/// next to a real `sni`), the first occurrence in stored order wins.
+///
+/// REALITY needs a value rewrite of its own: mihomo spells it as
+/// `tls: true` + `reality-opts`, so flattening the block to `pbk`/`sid`
+/// while the `tls` arm still emitted `security=tls` (or nothing at all)
+/// handed clients a plain TLS node that drops the REALITY keys.
+fn canonical_uri_entry(entry: &ProxyEntry) -> ProxyEntry {
+    let mut out = entry.clone();
+    out.params.clear();
+    for param in &entry.params {
+        translate_uri_param(entry.scheme, param, &mut out.params);
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    out.params
+        .retain(|p| seen.insert(p.key.to_ascii_lowercase()));
+    // Force the one key the translation cannot know about: a public key
+    // makes this a REALITY node whatever `security` says (or omits).
+    if matches!(entry.scheme, Scheme::Vless | Scheme::Trojan)
+        && crate::formats::reality_public_key(entry).is_some()
+    {
+        match out
+            .params
+            .iter_mut()
+            .find(|p| p.key.eq_ignore_ascii_case("security"))
+        {
+            Some(security) => security.value = "reality".to_string(),
+            None => push(&mut out.params, "security", "reality"),
+        }
+    }
+    out
+}
+
+fn translate_uri_param(scheme: Scheme, param: &Param, out: &mut Vec<Param>) {
+    let key = param.key.to_ascii_lowercase();
+    let value = param.value.trim();
+    match key.as_str() {
+        "servername" => push(out, "sni", value),
+        "network" => push(
+            out,
+            if scheme == Scheme::Vmess {
+                "net"
+            } else {
+                "type"
+            },
+            value,
+        ),
+        "ws-path" => push(out, "path", value),
+        "client-fingerprint" => push(out, "fp", value),
+        "grpc-service-name" => push(out, "servicename", value),
+        "fingerprint" => push(out, "pinsha256", value),
+        // vmess JSON spells the cipher `scy` and the alter id `aid`.
+        "cipher" if scheme == Scheme::Vmess => push(out, "scy", value),
+        "alterid" if scheme == Scheme::Vmess => push(out, "aid", value),
+        "alpn" => push(out, "alpn", &joined_alpn(value)),
+        // Clash's `tls` boolean against the URI spellings: `security=tls`
+        // for the URI-family schemes, the `tls: "tls"` string for vmess
+        // JSON (which is also what the sing-box parser stores, hence the
+        // literal check). A falsy toggle means plaintext, i.e. nothing.
+        "tls" => match scheme {
+            Scheme::Vless | Scheme::Trojan => {
+                if truthy(value) || value.eq_ignore_ascii_case("tls") {
+                    push(out, "security", "tls");
+                }
+            }
+            Scheme::Vmess => {
+                if truthy(value) || value.eq_ignore_ascii_case("tls") {
+                    push(out, "tls", "tls");
+                }
+            }
+            _ => out.push(param.clone()),
+        },
+        // The one Clash-only toggle spelling: mihomo writes
+        // `skip-cert-verify`, the URI family reads `allowInsecure` (vless,
+        // trojan, vmess JSON) or `insecure` (hysteria2, anytls). A falsy
+        // toggle means verification on, i.e. nothing to emit. The
+        // `insecure`/`allowInsecure` spellings themselves pass through
+        // untouched wherever the source already used them.
+        "skip-cert-verify" => {
+            if truthy(value) {
+                match scheme {
+                    Scheme::Vless | Scheme::Trojan | Scheme::Vmess => {
+                        push(out, "allowInsecure", "1")
+                    }
+                    Scheme::Hysteria2 | Scheme::AnyTls => push(out, "insecure", "1"),
+                    _ => {}
+                }
+            }
+        }
+        "ws-opts" => flatten_ws_opts(value, out),
+        "ws-headers" => {
+            if let Some(map) = yaml_mapping(value) {
+                push_opt(out, "host", block_string(&map, "host"));
+            }
+        }
+        "reality-opts" => {
+            if let Some(map) = yaml_mapping(value) {
+                push_opt(
+                    out,
+                    "pbk",
+                    block_string(&map, "public-key").or_else(|| block_string(&map, "public_key")),
+                );
+                push_opt(
+                    out,
+                    "sid",
+                    block_string(&map, "short-id").or_else(|| block_string(&map, "short_id")),
+                );
+            }
+        }
+        "grpc-opts" => {
+            if let Some(map) = yaml_mapping(value) {
+                push_opt(
+                    out,
+                    "servicename",
+                    block_string(&map, "grpc-service-name")
+                        .or_else(|| block_string(&map, "serviceName")),
+                );
+            }
+        }
+        "h2-opts" => {
+            if let Some(map) = yaml_mapping(value) {
+                push_opt(out, "host", block_string(&map, "host"));
+                push_opt(out, "path", block_string(&map, "path"));
+            }
+        }
+        "http-opts" => {
+            if let Some(map) = yaml_mapping(value) {
+                push_opt(out, "path", block_string(&map, "path"));
+                if let Some(headers) = block_value(&map, "headers").and_then(|v| v.as_mapping()) {
+                    push_opt(out, "host", block_string(headers, "host"));
+                }
+            }
+        }
+        // Snell spells its obfuscation as a nested block; the URI form is
+        // the flat `obfs` / `obfs-host` pair.
+        "obfs-opts" => {
+            if let Some(map) = yaml_mapping(value) {
+                push_opt(out, "obfs", block_string(&map, "mode"));
+                push_opt(out, "obfs-host", block_string(&map, "host"));
+            }
+        }
+        _ => out.push(param.clone()),
+    }
+}
+
+/// `ws-opts: {path: /ws, headers: {Host: h}}` → URI `path` + `host`.
+/// The remaining mihomo knobs (`max-early-data`, `early-data-header-name`)
+/// have no URI spelling and are dropped rather than emitted as YAML text.
+fn flatten_ws_opts(value: &str, out: &mut Vec<Param>) {
+    let Some(map) = yaml_mapping(value) else {
+        return;
+    };
+    push_opt(out, "path", block_string(&map, "path"));
+    if let Some(headers) = block_value(&map, "headers").and_then(|v| v.as_mapping()) {
+        push_opt(out, "host", block_string(headers, "host"));
+    }
+}
+
+fn push(out: &mut Vec<Param>, key: &str, value: &str) {
+    if !value.is_empty() {
+        out.push(Param {
+            key: key.to_string(),
+            value: value.to_string(),
+            known: true,
+        });
+    }
+}
+
+fn push_opt(out: &mut Vec<Param>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        push(out, key, &value);
+    }
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// URI `alpn` is one comma-joined value; Clash feeds list it as a YAML
+/// sequence (`alpn: [h2, http/1.1]`), which the Clash parser stores as
+/// YAML text and a URI client cannot read. Plain scalars pass through.
+fn joined_alpn(value: &str) -> String {
+    match yaml_value(value) {
+        Some(serde_norway::Value::Sequence(items)) => {
+            let items: Vec<String> = items.iter().filter_map(yaml_scalar).collect();
+            if items.is_empty() {
+                value.to_string()
+            } else {
+                items.join(",")
+            }
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Parse stored YAML text back into a value, refusing alias references
+/// first: block values are feed-controlled like any other parameter (see
+/// [`reject_yaml_aliases`]).
+fn yaml_value(text: &str) -> Option<serde_norway::Value> {
+    if reject_yaml_aliases(text).is_err() {
+        return None;
+    }
+    serde_norway::from_str(text).ok()
+}
+
+/// Parse a stored structured block (`ws-opts`, `reality-opts`, …) into a
+/// mapping; `None` for anything else, including unparseable text.
+fn yaml_mapping(text: &str) -> Option<serde_norway::Mapping> {
+    match yaml_value(text) {
+        Some(serde_norway::Value::Mapping(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// Case-insensitive lookup inside a parsed block.
+fn block_value<'a>(map: &'a serde_norway::Mapping, key: &str) -> Option<&'a serde_norway::Value> {
+    map.iter()
+        .find(|(k, _)| k.as_str().is_some_and(|k| k.eq_ignore_ascii_case(key)))
+        .map(|(_, v)| v)
+}
+
+/// Scalar under `key` inside a parsed block, as the text a URI value
+/// needs. A sequence collapses to its items joined with `,` (Clash lists
+/// hosts); anything else has no URI scalar form.
+fn block_string(map: &serde_norway::Mapping, key: &str) -> Option<String> {
+    match block_value(map, key)? {
+        serde_norway::Value::Sequence(items) => {
+            let items: Vec<String> = items.iter().filter_map(yaml_scalar).collect();
+            (!items.is_empty()).then(|| items.join(","))
+        }
+        other => yaml_scalar(other).filter(|s| !s.is_empty()),
+    }
+}
+
+/// Scalar value as text; sequences and mappings have no scalar form.
+fn yaml_scalar(value: &serde_norway::Value) -> Option<String> {
+    match value {
+        serde_norway::Value::String(s) => Some(s.clone()),
+        serde_norway::Value::Number(n) => Some(n.to_string()),
+        serde_norway::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
 }
 
@@ -418,7 +697,10 @@ fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<String> {
 }
 
 fn decode_base64_text(input: &str) -> Option<String> {
-    let bytes = ss::decode_b64_lenient(input.trim())?;
+    // Feeds wrap long payloads at 76 columns or pad them with blank lines;
+    // base64 has no whitespace of its own, so interior whitespace (which
+    // also breaks the length-modulo check) is stripped before decoding.
+    let bytes = ss::decode_b64_lenient(&input.split_whitespace().collect::<String>())?;
     // A subscription is text; reject binary garbage.
     let text = String::from_utf8(bytes).ok()?;
     (!text.trim().is_empty()).then_some(text)
@@ -510,6 +792,213 @@ mod tests {
         let entry = entry_for(line);
         assert_eq!(entry.scheme, Scheme::Naive);
         assert_eq!(entry.param("naive_transport"), Some("https"));
+        assert_eq!(serialize(&entry), line);
+    }
+
+    fn clash_entries(yaml: &str) -> Vec<ProxyEntry> {
+        parse_subscription(yaml, Encoding::Plain, Some(InputFormat::ClashYaml))
+            .unwrap()
+            .entries
+    }
+
+    /// A Clash vless item carries mihomo field names; served as a URI it
+    /// must come out in the vocabulary a URI client understands, otherwise
+    /// the node connects without TLS or transport, or not at all.
+    #[test]
+    fn clash_vless_item_serializes_onto_the_uri_vocabulary() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - name: ws-node\n",
+            "    type: vless\n",
+            "    server: h.example.com\n",
+            "    port: 443\n",
+            "    uuid: uuid-1\n",
+            "    tls: true\n",
+            "    servername: s.example.com\n",
+            "    network: ws\n",
+            "    client-fingerprint: chrome\n",
+            "    flow: xtls-rprx-vision\n",
+            "    skip-cert-verify: true\n",
+            "    alpn: [h2, http/1.1]\n",
+            "    ws-opts:\n",
+            "      path: /ws\n",
+            "      headers:\n",
+            "        Host: ws.example.com\n",
+        );
+        let line = serialize(&clash_entries(yaml)[0]);
+        assert!(
+            line.starts_with("vless://uuid-1@h.example.com:443?"),
+            "{line}"
+        );
+        for expected in [
+            "security=tls",
+            "sni=s.example.com",
+            "type=ws",
+            "path=/ws",
+            "host=ws.example.com",
+            "fp=chrome",
+            "flow=xtls-rprx-vision",
+            "allowInsecure=1",
+            "alpn=h2,http/1.1",
+        ] {
+            assert!(line.contains(expected), "missing {expected:?} in {line}");
+        }
+        for gone in [
+            "network=",
+            "servername",
+            "ws-opts",
+            "skip-cert-verify",
+            "tls=true",
+        ] {
+            assert!(!line.contains(gone), "{gone:?} still in {line}");
+        }
+        assert!(line.ends_with("#ws-node"), "{line}");
+
+        // The emitted line re-parses into the equivalent entry.
+        let back = entry_for(&line);
+        assert_eq!(back.param("security"), Some("tls"));
+        assert_eq!(back.param("sni"), Some("s.example.com"));
+        assert_eq!(back.param("type"), Some("ws"));
+        assert_eq!(back.param("path"), Some("/ws"));
+        assert_eq!(back.param("host"), Some("ws.example.com"));
+        assert_eq!(back.param("allowInsecure"), Some("1"));
+    }
+
+    /// A Clash vmess item is re-encoded with the vmess JSON vocabulary
+    /// (`scy`/`aid`/`net`, `tls` as a string), not the mihomo one.
+    #[test]
+    fn clash_vmess_item_serializes_onto_the_vmess_json_vocabulary() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: vm, type: vmess, server: h.example.com, port: 443, uuid: uuid-2, ",
+            "alterId: 4, cipher: aes-128-gcm, network: ws, ws-path: /wsp, ",
+            "ws-headers: {Host: vh.example.com}, tls: true}\n",
+        );
+        let line = serialize(&clash_entries(yaml)[0]);
+        assert!(line.starts_with("vmess://"), "{line}");
+        let back = entry_for(&line);
+        assert_eq!(back.scheme, Scheme::Vmess);
+        assert_eq!(back.host, "h.example.com");
+        assert_eq!(back.param("scy"), Some("aes-128-gcm"));
+        assert_eq!(back.param("aid"), Some("4"));
+        assert_eq!(back.param("net"), Some("ws"));
+        assert_eq!(back.param("path"), Some("/wsp"));
+        assert_eq!(back.param("host"), Some("vh.example.com"));
+        assert_eq!(back.param("tls"), Some("tls"));
+        for gone in ["cipher", "network", "ws-path", "ws-headers", "alterId"] {
+            assert!(
+                back.param_ignore_case(gone).is_none(),
+                "{gone} still present"
+            );
+        }
+    }
+
+    /// The structured blocks Clash keeps as YAML text (`reality-opts`,
+    /// `grpc-opts`) flatten onto the URI scalars; the block text itself
+    /// must never leak into the query.
+    #[test]
+    fn clash_structured_blocks_flatten_onto_uri_params() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - name: r\n",
+            "    type: vless\n",
+            "    server: h.example.com\n",
+            "    port: 443\n",
+            "    uuid: u\n",
+            "    network: grpc\n",
+            "    grpc-opts:\n",
+            "      grpc-service-name: svc\n",
+            "    reality-opts:\n",
+            "      public-key: PBK123\n",
+            "      short-id: ab12\n",
+        );
+        let line = serialize(&clash_entries(yaml)[0]);
+        assert!(line.contains("type=grpc"), "{line}");
+        assert!(line.contains("servicename=svc"), "{line}");
+        assert!(line.contains("pbk=PBK123"), "{line}");
+        assert!(line.contains("sid=ab12"), "{line}");
+        assert!(!line.contains("grpc-opts"), "{line}");
+        assert!(!line.contains("reality-opts"), "{line}");
+        let back = entry_for(&line);
+        assert_eq!(back.param("pbk"), Some("PBK123"));
+        assert_eq!(back.param("sid"), Some("ab12"));
+        assert_eq!(back.param("servicename"), Some("svc"));
+    }
+
+    /// mihomo spells REALITY as `tls: true` + `reality-opts`; the URI
+    /// vocabulary is `security=reality`. Flattening only the block while
+    /// the `tls` boolean still emitted `security=tls` handed the client a
+    /// plain TLS node that drops the REALITY keys.
+    #[test]
+    fn clash_vless_reality_item_serializes_with_security_reality() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - name: rl\n",
+            "    type: vless\n",
+            "    server: h.example.com\n",
+            "    port: 443\n",
+            "    uuid: u-1\n",
+            "    tls: true\n",
+            "    servername: s.example.com\n",
+            "    client-fingerprint: chrome\n",
+            "    reality-opts:\n",
+            "      public-key: PBK123\n",
+            "      short-id: ab12\n",
+            "    network: tcp\n",
+        );
+        let line = serialize(&clash_entries(yaml)[0]);
+        assert!(line.starts_with("vless://u-1@h.example.com:443?"), "{line}");
+        assert!(line.contains("security=reality"), "{line}");
+        assert!(!line.contains("security=tls"), "{line}");
+        for expected in ["pbk=PBK123", "sid=ab12", "sni=s.example.com", "fp=chrome"] {
+            assert!(line.contains(expected), "missing {expected:?} in {line}");
+        }
+        let back = entry_for(&line);
+        assert_eq!(back.param("security"), Some("reality"));
+        assert_eq!(back.param("pbk"), Some("PBK123"));
+        assert_eq!(back.param("sid"), Some("ab12"));
+    }
+
+    /// Snell spells its obfuscation as a nested block; the URI form is the
+    /// flat `obfs` / `obfs-host` pair.
+    #[test]
+    fn clash_snell_obfs_block_flattens_to_obfs_params() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: sn, type: snell, server: 1.2.3.4, port: 44046, psk: psk1, ",
+            "version: 4, obfs-opts: {mode: http, host: bing.com}}\n",
+        );
+        let line = serialize(&clash_entries(yaml)[0]);
+        assert!(line.starts_with("snell://psk1@1.2.3.4:44046?"), "{line}");
+        assert!(line.contains("obfs=http"), "{line}");
+        assert!(line.contains("obfs-host=bing.com"), "{line}");
+        assert!(!line.contains("obfs-opts"), "{line}");
+        let back = entry_for(&line);
+        assert_eq!(back.param("obfs"), Some("http"));
+        assert_eq!(back.param("obfs-host"), Some("bing.com"));
+        assert_eq!(back.param("version"), Some("4"));
+    }
+
+    /// A falsy toggle is indistinguishable from no toggle: nothing is
+    /// emitted, the line stays clean.
+    #[test]
+    fn clash_falsy_toggles_are_dropped() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: n, type: vless, server: h.example.com, port: 443, uuid: u, ",
+            "tls: false, skip-cert-verify: false}\n",
+        );
+        let line = serialize(&clash_entries(yaml)[0]);
+        assert_eq!(line, "vless://u@h.example.com:443#n");
+    }
+
+    /// The translation is for line-less entries only: a URI line keeps its
+    /// stored spelling in the output, mihomo-looking or not (the fixture
+    /// test pins the same invariant for real feeds).
+    #[test]
+    fn uri_sourced_entries_are_not_translated() {
+        let line = "vless://u@h.example.com:443?network=ws&servername=x.example.com&tls=true#n";
+        let entry = entry_for(line);
         assert_eq!(serialize(&entry), line);
     }
 
@@ -672,6 +1161,31 @@ mod tests {
         let result = parse_subscription(&wrapped, Encoding::Auto, None).unwrap();
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.format, InputFormat::UriList);
+    }
+
+    /// Real producers wrap the payload at 76 columns (email-style) or add
+    /// blank lines. Interior whitespace is not base64, breaks the
+    /// length-modulo check and used to make the whole payload fall back to
+    /// being parsed as plain text, silently yielding zero entries.
+    #[test]
+    fn line_wrapped_base64_payload_decodes() {
+        use base64::Engine;
+        let inner = "vless://uuid@1.2.3.4:443?security=reality#A\nvless://uuid2@5.6.7.8:8443#B\n";
+        let compact = base64::engine::general_purpose::STANDARD.encode(inner);
+        let wrapped: String = compact
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(16)
+            .map(|chunk| chunk.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let result = parse_subscription(&wrapped, Encoding::Auto, None).unwrap();
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.format, InputFormat::UriList);
+        // The pinned encoding takes the wrapped form too.
+        let result = parse_subscription(&wrapped, Encoding::Base64, None).unwrap();
+        assert_eq!(result.entries.len(), 2);
     }
 
     #[test]

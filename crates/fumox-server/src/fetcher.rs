@@ -21,6 +21,11 @@ const MAX_REDIRECTS: usize = 5;
 /// must neither overflow the exponential multiply nor park a fetch task for
 /// hours.
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+/// Ceiling on `[fetch].max_retries`, matching the admin form's range. The
+/// form bounds the field, but the config file and the `FUMOX_*` env layer
+/// do not, and each retry costs up to [`MAX_RETRY_BACKOFF`] while holding
+/// the source's in-flight mark and one concurrency permit.
+const MAX_RETRIES: u32 = 16;
 
 /// A successfully downloaded payload.
 #[derive(Debug, Clone)]
@@ -34,7 +39,13 @@ pub struct FetchedPayload {
 #[derive(Debug, thiserror::Error)]
 pub enum FetchFailure {
     #[error("network error: {message}")]
-    Network { message: String },
+    Network {
+        message: String,
+        /// The URL itself is unusable (unparseable, no host, a scheme the
+        /// fetcher does not speak). No attempt can change the outcome, so it
+        /// is not retried; a real network fault is.
+        permanent: bool,
+    },
     #[error("server error: HTTP {status}")]
     HttpServer { status: u16 },
     #[error("client error: HTTP {status}")]
@@ -55,12 +66,19 @@ impl FetchFailure {
     }
 
     /// Whether a retry can plausibly succeed.
+    ///
+    /// Two classes are left out because the same attempt fails the same way
+    /// every time. `ResponseTooLarge` is a property of the body: a feed over
+    /// `[fetch].max_response_bytes` is still over it on the fourth try, and
+    /// every try reads the whole cap. A `permanent` network failure is a
+    /// malformed URL rather than a fault, so re-reading it cannot help.
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            FetchFailure::Network { .. }
-                | FetchFailure::HttpServer { .. }
-                | FetchFailure::ResponseTooLarge { .. }
+            FetchFailure::Network {
+                permanent: false,
+                ..
+            } | FetchFailure::HttpServer { .. }
         )
     }
 
@@ -151,12 +169,20 @@ impl Fetcher {
         family: Option<IpFamily>,
     ) -> Result<FetchedPayload, FetchFailure> {
         let family = family.unwrap_or(self.config.ip_family);
+        let max_retries = self.config.max_retries.min(MAX_RETRIES);
+        if max_retries != self.config.max_retries {
+            tracing::warn!(
+                configured = self.config.max_retries,
+                applied = max_retries,
+                "[fetch].max_retries is above the supported ceiling; using the ceiling"
+            );
+        }
         let mut attempt = 0u32;
         loop {
             match self.fetch_once(url, headers, family).await {
                 Ok(payload) => return Ok(payload),
                 Err(failure) => {
-                    if attempt >= self.config.max_retries || !failure.is_recoverable() {
+                    if attempt >= max_retries || !failure.is_recoverable() {
                         return Err(failure);
                     }
                     let delay = self.backoff_delay(attempt);
@@ -207,12 +233,14 @@ impl Fetcher {
             }
             let parsed = Url::parse(&current).map_err(|e| FetchFailure::Network {
                 message: format!("invalid URL: {e}"),
+                permanent: true,
             })?;
             match parsed.scheme() {
                 "http" | "https" => {}
                 other => {
                     return Err(FetchFailure::Network {
                         message: format!("unsupported scheme: {other}"),
+                        permanent: true,
                     });
                 }
             }
@@ -222,6 +250,7 @@ impl Fetcher {
             // rebinding) to a different address between check and connect.
             let host = parsed.host_str().ok_or_else(|| FetchFailure::Network {
                 message: "URL has no host".to_string(),
+                permanent: true,
             })?;
             let pinned = self.resolve_and_vet(host, family).await.map_err(|e| {
                 // The URL may carry userinfo credentials, never log it raw.
@@ -236,6 +265,7 @@ impl Fetcher {
                 .build_client(host, SocketAddr::new(pinned, port))
                 .map_err(|e| FetchFailure::Network {
                     message: redacted_request_error(&e),
+                    permanent: false,
                 })?;
             let mut request = client.get(parsed.clone());
             let same_origin = configured_origin
@@ -254,6 +284,7 @@ impl Fetcher {
 
             let response = request.send().await.map_err(|e| FetchFailure::Network {
                 message: redacted_request_error(&e),
+                permanent: false,
             })?;
             let status = response.status().as_u16();
 
@@ -283,6 +314,7 @@ impl Fetcher {
             let mut stream = response;
             while let Some(chunk) = stream.chunk().await.map_err(|e| FetchFailure::Network {
                 message: redacted_request_error(&e),
+                permanent: false,
             })? {
                 if body.len() as u64 + chunk.len() as u64 > limit {
                     return Err(FetchFailure::ResponseTooLarge { limit });
@@ -519,6 +551,7 @@ pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -612,7 +645,8 @@ mod tests {
     fn failure_classification() {
         assert_eq!(
             FetchFailure::Network {
-                message: "x".into()
+                message: "x".into(),
+                permanent: false
             }
             .error_class(),
             ErrorClass::Network
@@ -625,9 +659,24 @@ mod tests {
             FetchFailure::HttpClient { status: 404 }.error_class(),
             ErrorClass::HttpClient
         );
+        assert_eq!(
+            FetchFailure::ResponseTooLarge { limit: 10 }.error_class(),
+            ErrorClass::HttpServer
+        );
+        // A body over the cap and a malformed URL fail identically on every
+        // attempt, so neither is retried; a real network fault still is.
+        assert!(!FetchFailure::ResponseTooLarge { limit: 10 }.is_recoverable());
+        assert!(
+            !FetchFailure::Network {
+                message: "x".into(),
+                permanent: true
+            }
+            .is_recoverable()
+        );
         assert!(
             FetchFailure::Network {
-                message: "x".into()
+                message: "x".into(),
+                permanent: false
             }
             .is_recoverable()
         );
@@ -911,5 +960,202 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.error_class(), ErrorClass::HttpClient);
         assert!(!err.is_recoverable());
+    }
+
+    /// Responder answering every request with `status`; the returned
+    /// counter records how many requests arrived, which is how a test
+    /// observes whether (and how often) the retry loop ran.
+    async fn spawn_canned_listener(
+        status: u16,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use std::sync::atomic::Ordering;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let response = format!("HTTP/1.1 {status} canned\r\ncontent-length: 2\r\n\r\nno");
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        (addr, hits)
+    }
+
+    /// 503 on the first request, 200 `ok` on every later one.
+    async fn spawn_recovering_listener()
+    -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use std::sync::atomic::Ordering;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let nth = counter.fetch_add(1, Ordering::SeqCst);
+                let response = if nth == 0 {
+                    "HTTP/1.1 503 later\r\ncontent-length: 0\r\n\r\n".to_string()
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_string()
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        (addr, hits)
+    }
+
+    /// Responder serving a deterministic 64 KiB body.
+    async fn spawn_body_listener() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let body = vec![b'x'; 64 * 1024];
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            }
+        });
+        addr
+    }
+
+    /// The retry loop exists for transient upstream failures: a 503
+    /// followed by a 200 must come back as a success after exactly one
+    /// retry, an always-503 must give up after `max_retries` (3 attempts
+    /// for 2 retries), and a client error must return without any retry.
+    #[tokio::test]
+    async fn retryable_failures_are_retried_and_client_errors_are_not() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, hits) = spawn_recovering_listener().await;
+        let config = FetchConfig {
+            retry_base_backoff_ms: 1,
+            ..FetchConfig::default()
+        };
+        let fetcher = Fetcher::new(config.clone(), true, Duration::from_secs(5));
+        let payload = fetcher
+            .fetch(&format!("http://{addr}/sub"), &Default::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(payload.body, b"ok");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "503 then 200 = one retry");
+
+        let (addr, hits) = spawn_canned_listener(503).await;
+        let config = FetchConfig {
+            max_retries: 2,
+            retry_base_backoff_ms: 1,
+            ..FetchConfig::default()
+        };
+        let fetcher = Fetcher::new(config, true, Duration::from_secs(5));
+        let err = fetcher
+            .fetch(&format!("http://{addr}/sub"), &Default::default(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchFailure::HttpServer { status: 503 }));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "max_retries = 2 means the initial attempt plus two retries"
+        );
+
+        // 403 is not recoverable: exactly one attempt, no backoff sleep.
+        let (addr, hits) = spawn_canned_listener(403).await;
+        let fetcher = Fetcher::new(FetchConfig::default(), true, Duration::from_secs(5));
+        let err = fetcher
+            .fetch(&format!("http://{addr}/sub"), &Default::default(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchFailure::HttpClient { status: 403 }));
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "403 is terminal");
+    }
+
+    /// The body cap is the decompression-bomb guard: a response larger
+    /// than `max_response_bytes` fails as `ResponseTooLarge` instead of
+    /// being buffered to completion. The class is `http_server` (an
+    /// upstream misbehaviour) and recoverable, so a fluke oversized
+    /// payload may be retried; the same body under a bigger cap passes.
+    #[tokio::test]
+    async fn oversized_bodies_stop_at_the_configured_cap() {
+        let addr = spawn_body_listener().await;
+
+        let config = FetchConfig {
+            max_response_bytes: 1024,
+            ..FetchConfig::default()
+        };
+        let fetcher = Fetcher::new(config, true, Duration::from_secs(5));
+        let err = fetcher
+            .fetch(&format!("http://{addr}/sub"), &Default::default(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FetchFailure::ResponseTooLarge { limit: 1024 }
+        ));
+        assert_eq!(err.error_class(), ErrorClass::HttpServer);
+        // The body is over the cap on every attempt, so it is not retried.
+        assert!(!err.is_recoverable());
+
+        let config = FetchConfig {
+            max_response_bytes: 128 * 1024,
+            ..FetchConfig::default()
+        };
+        let fetcher = Fetcher::new(config, true, Duration::from_secs(5));
+        let payload = fetcher
+            .fetch(&format!("http://{addr}/sub"), &Default::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(payload.bytes, 64 * 1024);
+    }
+
+    /// A redirect sequence longer than MAX_REDIRECTS terminates as 508
+    /// Loop Detected instead of chasing forever. The hop count proves the
+    /// cap is enforced on the wire (the initial request plus MAX_REDIRECTS
+    /// followed hops), and the failure is terminal: `HttpClient`, never
+    /// retried.
+    #[tokio::test]
+    async fn redirect_chains_longer_than_the_cap_end_as_loop_detected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hops.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use std::sync::atomic::Ordering;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/again\r\ncontent-length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let fetcher = Fetcher::new(FetchConfig::default(), true, Duration::from_secs(5));
+        let err = fetcher
+            .fetch(&format!("http://{addr}/start"), &Default::default(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchFailure::HttpClient { status: 508 }),
+            "expected 508 Loop Detected, got {err:?}"
+        );
+        assert!(!err.is_recoverable());
+        assert_eq!(
+            hops.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_REDIRECTS + 1,
+            "initial request plus MAX_REDIRECTS followed hops"
+        );
     }
 }

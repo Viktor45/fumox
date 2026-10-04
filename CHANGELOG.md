@@ -25,20 +25,20 @@ Changes in the working tree, not yet on a published image.
   (`FUMOX_GEO__STARTUP_DOWNLOAD_BUDGET_SECS`).
 - Snell and AnyTLS proxy protocols: parsed from subscriptions (URI
   and Clash YAML), rendered into the Clash output and the URI list,
-  and covered by T2 tunnel checks. sing-box exports leave them out —
-  the sing-box outbound set has no type for either — rather than
-  emitting a block it cannot start.
+  and covered by T2 tunnel checks. sing-box exports leave them out:
+  the sing-box outbound set has no type for either, so emitting one
+  would hand the client a block it cannot start.
 - meow-rs 0.22.0 gains for T2, with no further Fumox change: the
   `xhttp` transport is a real outbound (0.21.x had no XHTTP at all,
   so such entries could not be checked), and SIP003 Shadowsocks
   plugins (`shadow-tls`, `restls`, `jls`, `kcptun`, `gost-plugin`)
   run in-process instead of spawning a helper binary the `fumox-meow`
-  image does not ship — plugin-backed entries that used to fail T2
+  image does not ship, so plugin-backed entries that used to fail T2
   now work. Fumox already rendered both correctly; only the engine
   gained the ability to honour them.
 - `[meow].ipv6` (default `false`, matching meow-rs): rendered into
   the generated meow config. 0.22.0 made the key effective
-  end-to-end — under `false` AAAA lookups are skipped and the direct
+  end-to-end: under `false` AAAA lookups are skipped and the direct
   outbound answers IPv4-only, where 0.21.x resolved both families
   whatever the key said. Only the test-URL host goes through the
   resolver (proxy servers are pinned to a vetted IP literal), so it
@@ -46,6 +46,24 @@ Changes in the working tree, not yet on a published image.
 - The probe screen shows the meow-rs kernel's live RSS (from
   `GET /memory`, refreshed whenever a T2 batch reloads the engine),
   with the OS memory limit and the share of it when one is set.
+- The probe screen grew a *History rotation* panel. The daemon's
+  retention loop deleted old `probe_results` and `fetch_log` rows
+  with nothing but a per-run info line to show for it, so a probe
+  whose retention loop had wedged looked identical to one on
+  schedule until the database grew. The loop now stamps a
+  `last_rotation` record on every run, including runs that deleted
+  nothing, so the age of the stamp itself is the "retention is
+  alive" signal. The panel renders it: when the last rotation
+  ran, how many rows each journal lost, and how many rows each
+  holds now. Before the first run it says the probe daemon owns the
+  loop instead of rendering a blank.
+- The dashboard's *fetches in 24h* card shows how long ago the
+  scheduler's last sweep started (`last sweep: N s ago`), or that
+  none has run yet. A scheduler that died or wedged mid-run left
+  the card reading `0 / 0` with nothing to separate it from an
+  idle deployment, exactly the state an operator cannot see from
+  outside. The sweep stamps `server_cycle` at its start, so a hung
+  sweep ages the line instead of looking healthy.
 
 ### Fixed
 
@@ -186,15 +204,6 @@ Changes in the working tree, not yet on a published image.
   route moved inside, where `require_auth` and `csrf_protect` both
   run; the form in `base.html` already ships the `_csrf` field. Guarded
   by `logout_requires_session_and_csrf`.
-- The *Import / Export* screen built its serve links against
-  `[admin].allowed_hosts` while the export endpoints gate on
-  `[server].allowed_hosts`. The two lists could diverge silently: a
-  host allowlisted for the panel but not for the public listener
-  produced `/export/alive/{token}` links that answer 404 "link not
-  found" on every click, and the reverse direction rendered a host
-  the export gate had never agreed to serve. `serve_base` validates
-  against the list the public listener actually gates on. Guarded by
-  `serve_base_validates_against_the_server_host_allowlist`.
 - A `Host` header holding userinfo leaked the export token into a
   link. The link-builder stripped the port with its own parser and
   never canonicalized, so `name@evil.com` was emitted verbatim into
@@ -620,6 +629,15 @@ Changes in the working tree, not yet on a published image.
   on a split allowlist it still 404s when the public listener is
   clicked; that trade-off is documented in place of the 500.
   Guarded by `serve_link_pages_render_for_an_admin_allowlisted_host`.
+- The copyable endpoint link on a token-protected profile's page
+  answered 403 when clicked: the serve endpoint's token gate rejects
+  a URL without `?token=`, and the link was built without one. The
+  link now carries the token in its query string. Deliberate despite
+  the masked token row beside it: the mask keeps the stored secret
+  from casual display, while the link is the artifact the operator
+  hands to clients and cannot work without the secret. The token
+  charset cap (alphanumeric plus `-_.~`) keeps it URL-safe without
+  escaping.
 - A cold render could be cached as fresh for a full source TTL after
   an ingest. The generation counter exists so an invalidation drops a
   rendering computed from pre-ingest rows, but the cold path stored
@@ -627,8 +645,14 @@ Changes in the working tree, not yet on a published image.
   bump keys it found by iterating existing entries, so a key with no
   entry yet, which is exactly an in-flight cold render, was invisible
   to it. The cold path now claims the key before rendering and stores
-  through the same guarded put the stale path already used. Guarded by
-  `inline_render_started_before_an_ingest_does_not_store_its_rendering`.
+  through the same guarded put the stale path already used. The bump
+  itself was a read-modify-write: two invalidations of the same key
+  (two sources feeding one profile, ingesting at once) could both
+  read G and write G+1, losing a bump and letting a render claimed
+  in between store behind the second one; bumps are serialized now.
+  Guarded by
+  `inline_render_started_before_an_ingest_does_not_store_its_rendering`
+  and `concurrent_invalidations_do_not_lose_a_generation`.
 - `X-Fumox-Warning: all-proxies-quarantined` was sent for profiles
   where nothing was quarantined. The predicate counted `ready` as a
   hidden tier, contradicting the comment three lines above it, and
@@ -697,13 +721,13 @@ Changes in the working tree, not yet on a published image.
   together with the geo stamps resolved for the list *before* the
   drop. The two are paired by index, so every proxy past the first
   dropped entry was stored carrying a neighbouring host's country
-  and ASN — one IP could end up stamped with several autonomous
+  and ASN, so one IP could end up stamped with several autonomous
   systems, and the admin ASN cleanup buttons then acted on that
   noise. The drop pass now returns the stamps that belong to exactly
   the surviving entries.
   `scripts/repair-geo-stamps.sh` rewrites the already-corrupted
   rows: it clears the three `geo_*` columns (after a backup) and
-  lets the startup backfill re-resolve every row from its own host —
+  lets the startup backfill re-resolve every row from its own host,
   verified on a copy of a production database, 23249 rows
   re-stamped, 1162784 stamped rows re-checked against the resolver,
   0 wrong, and the number of hosts carrying more than one ASN went
@@ -715,13 +739,13 @@ Changes in the working tree, not yet on a published image.
   plain text now (`RSS 24.5 MiB · 1.2% / 2.0 GiB`) and the timestamp
   is rendered by the template as a proper `time` element beside it.
 - `scripts/revive-xhttp-proxies.sh`: a one-shot repair for the
-  vless+xhttp rows the pre-0.22 engine stranded in `removed` — the
+  vless+xhttp rows the pre-0.22 engine stranded in `removed`: the
   transport did not exist there, every T2 check failed, the fail
   ladder ran its course, and only the terminal status is wrong
   (Fumox rendered the transport correctly all along). Linked rows
   are revived and enqueued for priority checking;
   `--include-unlinked` also adopts link-less rows into a source,
-  because every probe lane selects on the `proxy_source_links` row —
+  because every probe lane selects on the `proxy_source_links` row,
   a revived row without a link sits in no lane at all and stays dead
   whatever its feed does later. `--adopt-source` names the adoptive
   source explicitly, `--no-adopt` revives without linking.
@@ -734,6 +758,259 @@ Changes in the working tree, not yet on a published image.
   worse, quietly: the log fits, the copy "succeeds",
   `PRAGMA integrity_check` prints `ok`, and the database holds the
   pre-restore data after all.
+- The admin event stream paid for events nobody consumed. It ran
+  `count_by_status` when a connection opened and, every 30 s
+  thereafter, the counts plus two `meta` reads, emitting
+  `probe.stats` and `heartbeat` events; no
+  template ever listened to either (the panel reacts to `fetch.*`
+  only, re-broadcast as `fumox:refresh`), so every admin tab held a
+  query loop whose output was dropped on arrival. The tick is gone:
+  the stream forwards bus events, keeps its keep-alive and idle
+  hard cap, a lagged consumer logs what it lost instead of assuming
+  a periodic tick repairs state (nothing did), and the layout shows
+  a connection chip instead: hidden until the `EventSource` opens,
+  flipping to a *stale* state while the browser reconnects,
+  announced via `role=status`. Guarded by
+  `sse_stream_forwards_bus_events`.
+- The probe screen judged the daemon against the *server's* config.
+  `probe_heartbeat` carried only `{ts, pid, version}`, so the panel
+  thresholded staleness with its own `[probe].heartbeat_interval_secs`,
+  and the meow card rendered green for a `meow_last_ok` contact from
+  any point in the past. Server and probe may read different config
+  files (or env overlays), and a probe on a slower schedule than the
+  server's copy turned its still-alive badge stale. The heartbeat now
+  reports the daemon's effective beat and cycle periods, the panel
+  prefers the reported values (falling back to its own config, floor
+  5 s), the heartbeat verdict keeps its 3× rule, and the meow contact
+  goes stale after three daemon cycles. Guarded by
+  `heartbeat_threshold_mirrors_the_daemon_beat_period`,
+  `meow_stale_threshold_is_three_cycles` and
+  `heartbeat_payload_reports_the_effective_beat_and_cycle_periods`.
+- Neither daemon said which database it opened. The resolved
+  `[database].path` is otherwise visible only on *Settings*, so a
+  stream of scratch instances, containers and volume mounts made
+  "which file am I on" a guess, and pointing the probe at a
+  different file than the server surfaced only when the journals
+  diverged. Both processes now log `database configured` at startup
+  with the resolved path and the count of `FUMOX_*` overrides; the
+  count, not the names or values, so a surprise override is
+  attributable without logging secrets.
+- A panic inside one scheduler sweep silently stopped every later
+  one. The detached sweep task reset the overlap flag after the
+  `await`, so an unwind left `sweeping` stuck at `true` and the loop
+  skipped every future tick: no fetches, no error, only a dashboard
+  staying quiet. The flag now travels in a drop guard that resets it
+  on the normal path and on unwind alike. A panicked ingest task
+  names its source instead of vanishing into `is_some()`, and
+  shutdown got its missing half: `main` drops the refresh channel
+  (closing it is the scheduler's shutdown signal), awaits the loop
+  for at most 5 s so a wedged sweep cannot hold the process past its
+  budget, and names the sources still in flight as abandoned
+  mid-request, so a gap in `fetch_log` or an upstream's request log
+  has an explanation in ours. Guarded by
+  `sweep_guard_resets_the_flag_on_unwind`.
+- `/healthz` answered `ok` with a dead database. The route returned
+  a static string, so an instance whose only shared dependency was
+  gone kept telling the orchestrator it was fine while every
+  subscription 500'd. It now runs `SELECT 1` and answers
+  `503 database unavailable` when the pool stops answering, and it
+  *stays* after the public rate-limit layer on purpose: an exhausted
+  window must not make the liveness probe answer 429 and restart a
+  healthy instance. Both properties are pinned by tests that
+  exercise the layering without binding listeners:
+  `healthz_stays_outside_the_public_rate_limit`,
+  `healthz_goes_red_when_the_database_is_closed`.
+- A scanner sending random `Host` headers to the export links
+  logged one warning per request. The gate runs before the token
+  check, so the warn is the only signal a misconfigured allowlist
+  leaves, but it was also a line a sweep of random hosts could
+  amplify indefinitely. Rejections now warn once per host per hour
+  (repeats drop to debug) and the registry is capped at 1024
+  distinct hosts, aged out by the same window, so an
+  unauthenticated flood can neither mirror itself into the log nor
+  pin memory. Guarded by
+  `host_reject_warns_once_per_host_per_window`,
+  `host_reject_log_is_bounded_under_a_flood`.
+- A burst of requests on a cold subscription key rendered it once
+  per request. Each caller ran the full render (database reads plus
+  serialization) and all but one dropped the result, and the export
+  links' 30 s window had the same hole: every request landing on an
+  expired entry re-rendered the tier. Both paths now go through the
+  cache's inline-render claim: the first request renders, the rest
+  wake when its claim ends and serve the stored entry, claiming a
+  render only when the leader stored none (it failed, or an
+  invalidation superseded its put). The exports still never serve a
+  stale body, not even to a waiter. Guarded by
+  `concurrent_cold_requests_share_one_render`.
+- The raw source cache stored whole fetched payloads nothing read.
+  Only `fetched_at` was ever consulted (`raw_is_fresh` checked the
+  age and nothing wanted the snapshot back), so the last payload of
+  every source sat in memory as dead weight; the layer now stores
+  the freshness marker alone. Rendered bodies are `Bytes` instead
+  of `Vec<u8>`, so concurrent responses of one cached rendering
+  share an allocation instead of copying the whole body per
+  request.
+- A settings save could report success for a setting that was never
+  written. `EditableConfig::set` fails when the slot on disk holds a
+  non-table value (say `server = 42` where the editor needs
+  `[server]` to dive into), and every call site discarded the
+  result: the save wrote the untouched document back and the
+  operator got a green toast. The failure now surfaces as a
+  per-field error, and unrelated edits of the same save still
+  apply. Guarded by
+  `apply_all_surfaces_unsettable_slot_instead_of_swallowing_it`.
+- A base64 subscription wrapped at 76 columns parsed as zero
+  entries. Interior whitespace is not base64, broke the
+  length-modulo check and made the payload fall back to being read
+  as plain text, silently yielding nothing, while real producers
+  do wrap (email-style line breaks, stray blank lines), so a whole
+  feed could count as empty. The decoder strips whitespace before
+  decoding, under auto-detection and a pinned `base64` encoding
+  alike. Guarded by `line_wrapped_base64_payload_decodes`.
+- A vmess line could serialize with a host, port, name or
+  credential different from the stored entry. The JSON writer lays
+  the structured fields down first and then inserted every
+  pass-through parameter verbatim, so a stray `add` / `port` /
+  `ps` / `id` parameter (Clash passes unknown fields through; a
+  vmess JSON can carry `PS` next to `ps`) overwrote them in the
+  emitted object. The reserved field names are skipped like `v`
+  already was, case-insensitively. Guarded by
+  `consumed_fields_win_over_colliding_params`.
+- Clash-sourced entries serialized onto the URI list with mihomo
+  field names. An entry that never had a source line (Clash YAML,
+  sing-box JSON) carries mihomo spellings (`network`, `servername`,
+  `client-fingerprint`, multi-line `ws-opts` YAML blocks) that a
+  URI client either ignores (`network` selects no transport,
+  `tls=true` enables no TLS) or cannot parse at all, so exporting a
+  Clash-fed source through the URI serializer produced lines that
+  did not mean what the entry said. Entries without a source line
+  now pass through a translation onto the canonical URI vocabulary
+  first: `servername`→`sni`, `network`→`net` (vmess) / `type`,
+  `ws-path`→`path`, `client-fingerprint`→`fp`, the structured
+  blocks (`ws-opts`, `reality-opts`, `grpc-opts`, `h2-opts`,
+  `http-opts`, `obfs-opts`) flattened onto their URI parameters,
+  `tls` / `skip-cert-verify` booleans mapped onto the spellings each
+  scheme's clients read, and the first occurrence winning a
+  collision. REALITY initially escaped that treatment: mihomo writes
+  it as `tls: true` + `reality-opts`, so the flattened `pbk`/`sid`
+  sat next to `security=tls` (or no `security` at all) and the
+  client dropped the REALITY keys. For vless and trojan the
+  `security` key is forced to `reality` whenever a public key is
+  present, however `tls` was spelled.
+  URI-sourced entries keep their stored bytes untouched;
+  the translation is output-only. Guarded by
+  `clash_vless_item_serializes_onto_the_uri_vocabulary`,
+  `clash_vless_reality_item_serializes_with_security_reality` and the
+  sibling `clash_*` serialization tests.
+- The certificate-verification toggles had a different spelling list
+  per consumer. `formats::is_insecure` (behind the sing-box and
+  Clash writers) recognized three aliases, and its comment claimed
+  the underscore `allow_insecure`, the spelling sing-box and tuic
+  links actually use, as "never arrives from parsed feeds", so those
+  writers emitted no `insecure` flag for a node that requested one
+  and the client then verified certificates the server never
+  presented; the fingerprint normalization recognized the same
+  three, so the same server advertised once with `allow_insecure`
+  and once with `skip-cert-verify` deduplicated as two rows; and
+  the pipeline's forbid-insecure filter carried its own fourth copy
+  of the list. One list (`models::INSECURE_ALIASES`) and one
+  truthiness rule now back all three. One-time churn to expect:
+  `allow_insecure`-spelled nodes fingerprint differently than
+  before, so the first ingest after upgrading re-inserts them as
+  new rows and the old rows retire through the ordinary reconcile
+  pass.
+- Geo problems were invisible exactly where they mattered. A geo
+  directory with no usable database, or one missing a single kind,
+  produced one vague warn at best while rows silently stayed
+  unenriched, and the startup backfill summary reported only the
+  rows that happened to resolve, so "0 updated" read the same
+  whether the pool was fully stamped or the resolver could answer
+  nothing. Startup now names the files that opened (one info line),
+  each missing kind gets its own warn naming the file and the
+  directory, and the backfill summary carries the `remaining` count
+  of rows with every geo column NULL, retried on the next start,
+  so a broken directory is visible instead of indistinguishable
+  from a healthy run.
+- Probe lanes vetted candidate hosts one DNS lookup at a time,
+  ahead of every real verdict. Each lookup is bounded by
+  `[geo].dns_timeout` (5 s by default) and the lanes ran them
+  serially in their select loops before spawning any check, so a
+  batch full of dead names queued one timeout per candidate while
+  the check semaphore sat idle. Vetting is now concurrent under the
+  same `probe.concurrency` budget and order-preserving, in the T1
+  sample, the quarantine recheck and the T2 lanes alike; a closed
+  lane or a panicked vetting task refuses that target so the row
+  stays on the ordinary fail ladder. Guarded by
+  `vet_hosts_preserves_order_and_policy`.
+- The meow config file's 0600 mode was only applied at creation.
+  `create(true).mode(0o600)` leaves a pre-existing file's mode
+  alone, so a `meow.yaml` from an older binary, a hand-copied
+  sample or a restored backup kept whatever permissions it had
+  while the daemon rewrote it in place with every proxy credential
+  in plain text. The mode is re-asserted with an `fchmod` on the
+  open file descriptor, after the open has resolved the path, so
+  no second path resolution can be swapped in between. Guarded by
+  `meow_config_permissions_are_reasserted_on_an_existing_file`.
+- T2 outage cycles read as healthy batches. The batch folded
+  every row into one `t2_checked` counter, including rows an
+  engine-wide outage kept away from meow-rs (ping/reload failure,
+  the mid-batch abort guard) and rows `clash::generate` could not
+  serialize, exactly the situation the counter is watched for. The
+  cycle log now separates them: `t2_checked` counts only rows that
+  got a real verdict, `t2_aborted` the outage casualties and
+  `t2_skipped` the unserializable ones. Guarded by
+  `t2_outage_counters_report_aborted_not_checked`,
+  `t2_live_engine_counters_count_real_checks`.
+- A failed probe journal write logged at warn and vanished into
+  the noise. The write failure means the history row for a verdict
+  that *did* land is gone for good (the lifecycle transition
+  succeeds regardless), and a burst of them is the only symptom
+  when the database is locked or unwritable. The level is error
+  now.
+- Ingesting a large feed held the WAL write lock past the probe's
+  patience. The reconcile transaction ran two statements per entry
+  (upsert, then link stamp), so a refresh of tens of thousands of
+  entries outlived the probe daemon's `busy_timeout` and its
+  journals were dropped. The upsert is one multi-row
+  `INSERT .. ON CONFLICT .. RETURNING` per 250 entries and the
+  link sweep one per 500 (3 binds a row), keeping the lock span
+  short while the transaction still makes the link sweep sound;
+  duplicate fingerprints inside a batch collapse onto one id as
+  the per-row upserts did.
+- Toasts for the plain-browser path did not exist. HTMX callers
+  got `HX-Trigger` toasts, but a browser that posted a form without
+  HTMX got a bare redirect with the message dropped, so on the
+  shared pages (rotate the export token, purge removed) the action
+  left no visible confirmation. Redirects now carry `flash` /
+  `flash_level` query parameters that the layout turns into a toast
+  and strips from the URL immediately, so a refresh or a copied URL
+  does not replay it. Appended with `&` when the target already
+  carries a query. The import form echoes the submitted payload
+  back on a 422 so a fix-and-retry does not start from an empty
+  textarea, token rotation confirms through the same toast
+  mechanism, the purge dialog shows how many `removed` rows it is
+  about to delete (unfiltered, the count it acts on), and the empty
+  proxies list offers a *clear filters* link when a filter is what
+  hid the rows. Guarded by `flash_redirect_merges_into_an_existing_query`.
+- Accessibility of the admin's live pieces. The toggle swaps on
+  sources and profiles replaced the badge and button without the
+  `aria-live` / `aria-atomic` attributes and `aria-pressed` state
+  the initial render carries, silently ending the announcements a
+  screen reader had; keyboard focus fell to `<body>` after every
+  toggle because the button that was activated is re-created, so
+  focus is now restored onto the fresh button, only when it was
+  not moved elsewhere in the meantime. The schema and country stat
+  tables' colour-coded badges had `title` but no accessible name
+  and their dot colours were unexplained: a legend and per-badge
+  `aria-label`s ("alive: 12") now name both. The dialogs on
+  *Proxies*, *Sources* and *Profiles* gained `aria-labelledby`
+  pointing at their headings.
+- Placeholder cells rendered a bare comma. `fmt_opt_ts_element(None)`
+  and the proxies list's T1/T2 coverage column both returned `,`
+  where they meant "no value", so the timestamp tables showed an
+  orphan comma under "last seen" and a row with neither check got a
+  `,` in the coverage cell. Both use the en dash the rest of the
+  tables use.
 
 ### Docs
 
@@ -823,12 +1100,13 @@ Changes in the working tree, not yet on a published image.
   unlimited: the value clamps up to 1 row, so the body serves a
   single node. The config reference (both languages) now says so,
   next to the sibling keys that do give `0` a meaning.
-- The export links were documented as "rendered at most once every
-  30 s". That holds per request, not per window: the cache has no
-  single-flight claim, so a burst landing on the boundary renders
-  once per request (the pool caps the concurrency, so the cost is
-  latency rather than throughput). Wording corrected in both guides
-  and on the code.
+- The export links were first documented as "rendered at most once
+  every 30 s", then corrected to "that holds per request, not per
+  window" (the cache had no single-flight claim). That correction is
+  itself superseded now: the render behind a cold or expired export
+  entry *is* single-flighted, so a burst landing exactly on the
+  boundary runs one render and the rest wait for its fresh entry.
+  Both guides state the current behaviour.
 - Corrected code comments that asserted more than the code
   delivers: the `check_ip` policy no longer claims to cover "every
   IPv6 form that carries an IPv4 address" (the IPv4-translated
@@ -839,9 +1117,11 @@ Changes in the working tree, not yet on a published image.
   `pipeline_size` no longer claims to match *both* form modes (the
   raw form measures pretty-printed JSON, so a document in the window
   between the two sizes imports and then fails to save); and the
-  real-`.mmdb` test says that its assertion also covers file age, so
-  it goes red with "looks stale" once a developer's copies are a
-  month old.
+  real-`.mmdb` test asserts content only: its old age assertion
+  read the developer's own file mtimes and went red with "looks
+  stale" on untouched machines after a month, so freshness is
+  covered deterministically (via `set_modified`) by the fresh/stale
+  test above instead.
 - The pipeline tables in both guides described `limit.count` as
   capping "the final, deduplicated and sorted list" on a source as well
   as on a profile. A source-level cap applies to that source's own
@@ -915,6 +1195,22 @@ Changes in the working tree, not yet on a published image.
   (`GEO_LOOKUP_CONCURRENCY`), keeping the input order the drop rules
   and the reconcile upsert rely on (`buffered`, not
   `buffer_unordered`).
+- The shipped `config/app.toml` no longer enables
+  `[probe].allow_private_targets`. The probe dials targets carried
+  by *feeds*, untrusted input, so the example now ships the same
+  `false` the built-in default uses, with the comment rewritten to
+  say what the flag actually disables (loopback / RFC1918 /
+  link-local / CGNAT) and that `true` is an explicit opt-in for
+  isolated test infrastructure. The Compose probe service passes
+  the variable explicitly
+  (`FUMOX_PROBE__ALLOW_PRIVATE_TARGETS`, default `false`, so the
+  environment outranks a hand-edited file the way every other key
+  does) and `.env.example` documents it.
+- `migration 0008` adds `idx_proxies_updated_at`, covering the
+  admin proxies list's default `ORDER BY p.updated_at DESC, p.id
+  DESC` (the id tiebreaker is part of the index, it is part of the
+  order). Without it every page of the list, and the matching
+  `COUNT`, walked the whole table.
 
 ## 2026-09-23 · sha-b72b03f
 

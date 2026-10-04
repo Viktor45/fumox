@@ -20,12 +20,12 @@ use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
 use askama::Template;
 use axum::extract::{Form, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use fumox_core::config::{
     AppConfig, DEFAULT_CONFIG_PATH, GeoDbKind, RateLimit, ResolvedConfigPath, bounds,
 };
-use fumox_core::config_writer::{EditableConfig, item};
+use fumox_core::config_writer::{ConfigItem, EditableConfig, item};
 use fumox_core::models::IpFamily;
 
 /// Settings overview template (read-only).
@@ -605,24 +605,24 @@ pub async fn settings_update(
     if headers.get("HX-Request").is_some() {
         return htmx_redirect_with_toast("/admin/settings", &toast);
     }
-    Redirect::to("/admin/settings").into_response()
+    super::flash_redirect("/admin/settings", &toast, "ok")
 }
 
 fn htmx_redirect_with_toast(redirect_to: &str, toast: &str) -> Response {
-    let trigger = json_trigger("ok", toast);
     (
         StatusCode::SEE_OTHER,
         [
-            ("HX-Redirect", redirect_to.to_string()),
-            ("HX-Trigger", trigger),
+            (
+                HeaderName::from_static("hx-redirect"),
+                HeaderValue::from_str(redirect_to).expect("static settings path"),
+            ),
+            (
+                HeaderName::from_static("hx-trigger"),
+                super::toast_trigger("ok", toast),
+            ),
         ],
     )
         .into_response()
-}
-
-fn json_trigger(level: &str, message: &str) -> String {
-    // Match the shape the toast listener in `base.html` expects.
-    serde_json::json!({ "toast": { "level": level, "message": message } }).to_string()
 }
 
 fn settings_edit_unwritable(state: &AdminState, headers: &HeaderMap) -> Response {
@@ -676,7 +676,7 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
     let target = editing_target(&state);
 
     if target.exists() {
-        return redirect_after_create(&target, lang.t("set.file_created_noop").to_string());
+        return redirect_after_create(lang.t("set.file_created_noop").to_string());
     }
 
     if !fumox_core::config_writer::is_writable(target.parent().unwrap_or(Path::new("."))) {
@@ -698,23 +698,11 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
 
     let path = target.display().to_string();
     let msg = lang.t_named("set.file_created_toast", &[("path", path)]);
-    redirect_after_create(&target, msg)
+    redirect_after_create(msg)
 }
 
-fn redirect_after_create(target: &Path, toast: String) -> Response {
-    let is_htmx = false; // form posts here are never htmx-driven
-    let _ = is_htmx;
-    let path = target.display().to_string();
-    let _ = path;
-    let trigger = json_trigger("ok", &toast);
-    (
-        StatusCode::SEE_OTHER,
-        [
-            ("Location", "/admin/settings/edit".to_string()),
-            ("HX-Trigger", trigger),
-        ],
-    )
-        .into_response()
+fn redirect_after_create(toast: String) -> Response {
+    super::flash_redirect("/admin/settings/edit", &toast, "ok")
 }
 
 // Validation / application.
@@ -1203,6 +1191,23 @@ fn raw_get<'a>(raw: &'a HashMap<String, String>, field: &str) -> Option<&'a str>
     raw.get(field).map(String::as_str)
 }
 
+/// [`EditableConfig::set`] with the failure surfaced in the per-field
+/// error list. A swallowed `UnknownSection` (the slot on disk holds a
+/// non-table value) used to save the untouched document and report
+/// success: the operator saw a green toast for a setting that was not
+/// written.
+fn set_field(
+    cfg: &mut EditableConfig,
+    field: &str,
+    target: &str,
+    value: ConfigItem,
+    errors: &mut Vec<(String, String)>,
+) {
+    if let Err(err) = cfg.set(target, value) {
+        errors.push((field.into(), err.to_string()));
+    }
+}
+
 fn bind(
     raw: &HashMap<String, String>,
     field: &str,
@@ -1214,7 +1219,7 @@ fn bind(
     let v = v.trim();
     match v.parse::<SocketAddr>() {
         Ok(addr) => {
-            let _ = cfg.set(field, item::string(addr.to_string()));
+            set_field(cfg, field, field, item::string(addr.to_string()), errors);
         }
         Err(_) => {
             errors.push((field.into(), lang.t("val.invalid_bind").into()));
@@ -1236,7 +1241,7 @@ fn string_field(
         errors.push((field.into(), lang.t("val.required").into()));
         return;
     }
-    let _ = cfg.set(target, item::string(v.to_string()));
+    set_field(cfg, field, target, item::string(v.to_string()), errors);
 }
 
 /// The error text for a value outside its setting's range. Reads the
@@ -1275,7 +1280,7 @@ fn u64_field(
         errors.push((field.into(), out_of_range(field, parsed, lang)));
         return;
     }
-    let _ = cfg.set(target, item::integer(parsed as i64));
+    set_field(cfg, field, target, item::integer(parsed as i64), errors);
 }
 
 fn u32_field(
@@ -1299,7 +1304,7 @@ fn u32_field(
         errors.push((field.into(), out_of_range(field, u64::from(parsed), lang)));
         return;
     }
-    let _ = cfg.set(target, item::integer(i64::from(parsed)));
+    set_field(cfg, field, target, item::integer(i64::from(parsed)), errors);
 }
 
 fn usize_field(
@@ -1323,7 +1328,7 @@ fn usize_field(
         errors.push((field.into(), out_of_range(field, parsed as u64, lang)));
         return;
     }
-    let _ = cfg.set(target, item::integer(parsed as i64));
+    set_field(cfg, field, target, item::integer(parsed as i64), errors);
 }
 
 fn bool_field(
@@ -1344,7 +1349,7 @@ fn bool_field(
             return;
         }
     };
-    let _ = cfg.set(target, item::boolean(b));
+    set_field(cfg, field, target, item::boolean(b), errors);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1364,7 +1369,7 @@ fn enum_field(
         errors.push((field.into(), msg));
         return;
     };
-    let _ = cfg.set(target, item::string(value));
+    set_field(cfg, field, target, item::string(value), errors);
 }
 
 fn string_list(
@@ -1373,7 +1378,7 @@ fn string_list(
     cfg: &mut EditableConfig,
     target: &str,
     _lang: &Lang,
-    _errors: &mut Vec<(String, String)>,
+    errors: &mut Vec<(String, String)>,
 ) {
     let Some(v) = raw_get(raw, field) else { return };
     let items: Vec<String> = v
@@ -1381,7 +1386,7 @@ fn string_list(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let _ = cfg.set(target, item::string_array(items));
+    set_field(cfg, field, target, item::string_array(items), errors);
 }
 
 /// One integer per line, bounded the way the canonical loader bounds the
@@ -1453,7 +1458,7 @@ fn i64_list_field(
             return;
         }
     }
-    let _ = cfg.set(target, item::i64_array(parsed));
+    set_field(cfg, field, target, item::i64_array(parsed), errors);
 }
 
 fn rate_limit(
@@ -1505,11 +1510,13 @@ fn rate_limit(
             return;
         }
     };
-    let _ = cfg.set(
+    set_field(
+        cfg,
+        &field,
         target,
         item::string(format!("{}/{}", limit, unit_for_secs(secs))),
+        errors,
     );
-    let _ = lang;
 }
 
 fn unit_for_secs(secs: u64) -> &'static str {
@@ -1637,6 +1644,37 @@ mod tests {
         apply_all(&raw, &mut cfg, &lang, &mut errors);
 
         assert!(collect_field(&errors, "fetch.ip_family").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: `cfg.set` returns `UnknownSection` when the slot on
+    /// disk holds a non-table value, and every call site used to discard
+    /// that result. The save then wrote the untouched document and the
+    /// operator got a success toast for a setting that was never
+    /// applied. The failure must surface as a per-field error.
+    #[test]
+    fn apply_all_surfaces_unsettable_slot_instead_of_swallowing_it() {
+        let dir = temp_dir("unsettable");
+        let path = dir.join("app.toml");
+        // `server` is a scalar where the editor needs a table to dive
+        // into for `server.bind`.
+        std::fs::write(&path, "server = 42\n[probe]\nfail_limit = 3\n").unwrap();
+
+        let mut raw = HashMap::new();
+        raw.insert("server.bind".into(), "127.0.0.1:9999".into());
+        raw.insert("probe.fail_limit".into(), "5".into());
+
+        let lang = test_lang();
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+        assert!(
+            collect_field(&errors, "server.bind").is_some(),
+            "a failed set must surface as a field error, got {errors:?}"
+        );
+        // The failure is per-field: unrelated edits still applied.
+        assert!(cfg.doc().to_string().contains("fail_limit = 5"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

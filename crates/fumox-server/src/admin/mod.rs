@@ -7,6 +7,9 @@
 pub mod auth;
 mod dash_top_n;
 mod handlers;
+// `crate::serve` reuses the timestamp formatter for the subscription
+// header block.
+pub(crate) use handlers::fmt_rfc3339_utc;
 pub mod host_gate;
 pub mod i18n;
 pub(crate) mod pipeline_editor;
@@ -605,6 +608,51 @@ fn request_is_https(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipne
             })
 }
 
+/// Admin state on a throwaway migrated database, for the admin test
+/// modules (this file, handlers/profiles, handlers/import_export): they all
+/// need the same wiring, an empty dependency set on a fresh pool, and
+/// differ only in the config served.
+#[cfg(test)]
+pub(crate) async fn test_admin_state(admin: AdminConfig, server: ServerConfig) -> AdminState {
+    let dir =
+        std::env::temp_dir().join(format!("fumox-admin-test-{}", fumox_core::models::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = fumox_core::db::connect_pool(&DatabaseConfig {
+        path: dir.join("test.db"),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    fumox_core::db::migrate(&pool).await.unwrap();
+    let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::mem::forget(refresh_rx); // keep the channel open for sends
+    let geo_cfg = GeoConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    let config = fumox_core::AppConfig {
+        admin,
+        server,
+        ..Default::default()
+    };
+    let fetcher = Fetcher::new(
+        config.fetch.clone(),
+        config.admin.allow_private_urls,
+        config.geo.dns_timeout(),
+    );
+    AdminState::new(
+        pool,
+        crate::cache::Caches::new(),
+        std::sync::Arc::new(GeoResolver::new(&geo_cfg)),
+        refresh_tx,
+        SchedulerState::new(1),
+        EventBus::new(),
+        fetcher,
+        config,
+        ResolvedConfigPath::Missing,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,7 +904,7 @@ mod tests {
     }
 
     async fn test_state(admin_limit: u32) -> AdminState {
-        test_state_with_admin(admin_config(admin_limit)).await
+        test_admin_state(admin_config(admin_limit), Default::default()).await
     }
 
     /// The serve links are built against the same `[admin].allowed_hosts`
@@ -872,7 +920,7 @@ mod tests {
             allowed_hosts: vec!["vpn.example.com".to_string()],
             ..Default::default()
         };
-        let state = test_state_with_configs(admin, server).await;
+        let state = test_admin_state(admin, server).await;
         let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
 
         // The host the panel was opened on builds its serve link even when
@@ -903,7 +951,7 @@ mod tests {
             allowed_hosts: vec!["vpn.example.com".to_string()],
             ..Default::default()
         };
-        let state = test_state_with_configs(admin, server).await;
+        let state = test_admin_state(admin, server).await;
         let app = router(state);
 
         let with_host = |method: &str, uri: &str, body: &str, cookie: Option<&str>| {
@@ -957,49 +1005,7 @@ mod tests {
     }
 
     async fn test_state_with_admin(admin: AdminConfig) -> AdminState {
-        test_state_with_configs(admin, Default::default()).await
-    }
-
-    async fn test_state_with_configs(
-        admin: AdminConfig,
-        server: fumox_core::config::ServerConfig,
-    ) -> AdminState {
-        let dir =
-            std::env::temp_dir().join(format!("fumox-admin-test-{}", fumox_core::models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
-            ..Default::default()
-        };
-        let pool = fumox_core::db::connect_pool(&cfg).await.unwrap();
-        fumox_core::db::migrate(&pool).await.unwrap();
-        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-        std::mem::forget(refresh_rx); // keep the channel open for sends
-        let geo_cfg = fumox_core::config::GeoConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let config = fumox_core::AppConfig {
-            admin,
-            server,
-            ..Default::default()
-        };
-        let fetcher = Fetcher::new(
-            config.fetch.clone(),
-            config.admin.allow_private_urls,
-            config.geo.dns_timeout(),
-        );
-        AdminState::new(
-            pool,
-            crate::cache::Caches::new(),
-            Arc::new(GeoResolver::new(&geo_cfg)),
-            refresh_tx,
-            SchedulerState::new(1),
-            EventBus::new(),
-            fetcher,
-            config,
-            ResolvedConfigPath::Missing,
-        )
+        test_admin_state(admin, Default::default()).await
     }
 
     /// Build a request with the ConnectInfo extension the rate limiter
@@ -3657,8 +3663,12 @@ mod tests {
         assert_eq!(log_count, 0);
     }
 
+    /// The stream forwards bus events verbatim: publishing a fetch event
+    /// after the connection opens must reach it. The endpoint renders no
+    /// periodic database snapshots any more (nothing consumed them), so
+    /// the bus event is the only payload asserted here.
     #[tokio::test]
-    async fn sse_stream_emits_stats_and_fetch_events() {
+    async fn sse_stream_forwards_bus_events() {
         let state = test_state(1000).await;
         let events = state.events.clone();
         let app = router(state.clone());
@@ -3685,22 +3695,7 @@ mod tests {
         let mut buf = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
-        // The initial probe.stats snapshot arrives immediately.
-        loop {
-            let frame = tokio::time::timeout_at(deadline, body.frame())
-                .await
-                .expect("timed out waiting for the initial SSE frame")
-                .unwrap()
-                .unwrap();
-            if let Some(chunk) = frame.data_ref() {
-                buf.extend_from_slice(chunk);
-            }
-            if String::from_utf8_lossy(&buf).contains("probe.stats") {
-                break;
-            }
-        }
-
-        // A published fetch event reaches the same open stream.
+        // A published fetch event reaches the open stream.
         events.publish(
             "fetch.done",
             serde_json::json!({"source_id": "srcA0000000", "ok": true}),

@@ -125,13 +125,14 @@ mod tests {
             "idx_speed_proxy_time",
             "idx_fetch_source_time",
             "idx_fetch_time",
+            "idx_proxies_updated_at",
         ] {
             assert!(indexes.contains(&expected), "missing index {expected}");
         }
 
         // Schema version is stamped into meta by db::migrate.
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("7"));
+        assert_eq!(version.as_deref(), Some("8"));
 
         // WAL is active on the connection.
         let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")

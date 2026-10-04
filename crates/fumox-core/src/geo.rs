@@ -165,9 +165,11 @@ pub struct GeoResolver {
 impl GeoResolver {
     /// Build a resolver from config. Every GeoLite2 database found in
     /// `[geo].db_dir` is opened and all of them contribute facts, a name
-    /// template can mix `{country}`, `{city}` and `{asn}` freely. Returns a
-    /// no-op resolver (with a warning logged) when geo is disabled or no
-    /// database file could be opened.
+    /// template can mix `{country}`, `{city}` and `{asn}` freely. The
+    /// files that opened are named in one startup info line; a missing
+    /// kind gets its own warn (only while geo is enabled, its facts are
+    /// simply skipped). Returns a no-op resolver (with a warning logged)
+    /// when geo is disabled or no database file could be opened.
     pub fn new(cfg: &GeoConfig) -> Self {
         let cache = Cache::builder().max_capacity(cfg.cache_max_entries).build();
         let dns_timeout = cfg.dns_timeout();
@@ -179,6 +181,36 @@ impl GeoResolver {
             };
         }
         let backends = Backends::from_dir(&cfg.db_dir);
+        let kinds = [
+            (GeoDbKind::City, backends.city.is_some()),
+            (GeoDbKind::Asn, backends.asn.is_some()),
+        ];
+        let opened: Vec<&str> = kinds
+            .iter()
+            .filter(|(_, loaded)| *loaded)
+            .map(|(kind, _)| kind.file_name())
+            .collect();
+        for (kind, loaded) in kinds {
+            if !loaded {
+                // Debug while another backend is open: a deliberate
+                // ASN-only or City-only setup is a supported configuration,
+                // and warning about it on every start would drown the
+                // warning below, which is the one that means geo is off.
+                if backends.is_empty() {
+                    tracing::warn!(
+                        file = kind.file_name(),
+                        dir = %cfg.db_dir.display(),
+                        "GeoLite2 database missing; its facts are skipped"
+                    );
+                } else {
+                    tracing::debug!(
+                        file = kind.file_name(),
+                        dir = %cfg.db_dir.display(),
+                        "GeoLite2 database missing; its facts are skipped"
+                    );
+                }
+            }
+        }
         if backends.is_empty() {
             tracing::warn!(
                 dir = %cfg.db_dir.display(),
@@ -190,6 +222,11 @@ impl GeoResolver {
                 dns_timeout,
             };
         }
+        tracing::info!(
+            dir = %cfg.db_dir.display(),
+            files = opened.join(", "),
+            "geo enrichment enabled"
+        );
         Self {
             backends: Some(Arc::new(backends)),
             cache,

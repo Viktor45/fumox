@@ -92,7 +92,7 @@ configuration reference and the production checklist for context.
   followed by a permanent redirect to `/admin/login`. Set `true` only
   when TLS is terminated at a reverse proxy. The file default is
   `false`, but `docker-compose.yml` defaults the env override to `true`
-  (ready for an HTTPS front) — a plain-HTTP `docker compose up` must
+  (ready for an HTTPS front): a plain-HTTP `docker compose up` must
   therefore set `FUMOX_ADMIN__SECURE_COOKIES=false` in `.env`.
 
 ---

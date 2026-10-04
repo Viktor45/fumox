@@ -659,6 +659,11 @@ mod tests {
         assert!(entry_to_outbound(&entry(Scheme::Tuic, "c", &[])).is_none());
         assert!(entry_to_outbound(&entry(Scheme::Mieru, "c", &[])).is_none());
         assert!(entry_to_outbound(&entry(Scheme::Naive, "c", &[])).is_none());
+        // No sing-box outbound type exists for either: guessing a field
+        // layout would hand the client a config it cannot start, so the
+        // export leaves them out (clash/sing-box `is_supported` agree).
+        assert!(entry_to_outbound(&entry(Scheme::Snell, "c", &[])).is_none());
+        assert!(entry_to_outbound(&entry(Scheme::AnyTls, "c", &[])).is_none());
     }
 
     #[test]

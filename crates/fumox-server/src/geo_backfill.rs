@@ -59,9 +59,15 @@ pub async fn backfill_missing_geo(pool: DbPool, geo: Arc<GeoResolver>) {
             break;
         }
     }
-    if updated > 0 {
+    // Rows the resolver could not answer stay NULL and are retried on the
+    // next start; the summary names how many are still missing so a
+    // directory without a usable database (or a broken one) is visible
+    // instead of only the rows that happened to resolve.
+    let remaining = proxies::count_missing_geo(&pool).await.ok();
+    if updated > 0 || remaining != Some(0) {
         tracing::info!(
             updated,
+            remaining = ?remaining,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "geo backfill complete"
         );

@@ -101,19 +101,8 @@
       </table>
     </div>
 
-    {% if pages.len() > 1 %}
-      <div class="pagination">
-        {% for (p, current) in pages %}
-          {% if *p == 0 %}
-            <span class="page gap">…</span>
-          {% else if current %}
-            <span class="page current" aria-current="page">{{ p }}</span>
-          {% else %}
-            <a class="page" href="/admin/logs/fetch?page={{ p }}&amp;per_page={{ per_page }}{{ self.query_suffix() }}">{{ p }}</a>
-          {% endif %}
-        {% endfor %}
-      </div>
-    {% endif %}
+    {% let page_base = "/admin/logs/fetch" %}
+    {% include "_pagination.html" %}
   {% endif %}
 </div>
 {% endblock %}

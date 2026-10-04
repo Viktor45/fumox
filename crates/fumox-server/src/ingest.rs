@@ -33,14 +33,6 @@ pub enum IngestOutcome {
     ParseFailed { message: String },
 }
 
-impl IngestOutcome {
-    /// Used by the admin panel's "refresh now" handler (Phase 2.5).
-    #[allow(dead_code)]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, IngestOutcome::Ok { .. })
-    }
-}
-
 /// Fixed ingest settings from the config, everything not per-source.
 #[derive(Debug, Clone, Copy)]
 pub struct IngestSettings {
@@ -151,11 +143,11 @@ pub async fn ingest_source(
             .await
             {
                 Ok(stats) => {
-                    // The payload is now the content of the database, so it
-                    // may serve as this source's freshness marker until the
-                    // TTL elapses.
-                    caches.raw_put(&source.id, payload.clone(), now).await;
+                    // The database is now the content of this payload, so
+                    // stamp the source's freshness marker: the TTL
+                    // short-circuit checks it before the next re-fetch.
                     journal_success(pool, source, &payload, recognised, now).await;
+                    caches.raw_put(&source.id, now).await;
                     if dropped_by_pipeline > 0 {
                         tracing::info!(
                             source = %source.id,

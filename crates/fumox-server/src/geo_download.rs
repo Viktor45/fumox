@@ -486,11 +486,12 @@ mod tests {
     /// would re-download ~78 MB for nothing. Skips itself when the
     /// gitignored `.mmdb` files are absent (CI runs without them).
     ///
-    /// `needs_download` also carries the 30-day freshness rule, so this
-    /// assertion folds in the age of the developer's own copies: they pass
-    /// now and start failing with "looks stale" once the files are a month
-    /// old, which is the one case the content check is not about. Re-touch
-    /// the files or delete them to get a green run back.
+    /// Only the content half of `needs_download` is asserted: the
+    /// freshness half reads the files' mtime, so a developer's own copies
+    /// age out of the 30-day window on their own and used to turn this
+    /// test red on untouched machines. Freshness is covered
+    /// deterministically (with `set_modified`) by the fresh/stale test
+    /// above.
     #[test]
     fn real_workspace_databases_pass_the_content_check() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
@@ -502,7 +503,6 @@ mod tests {
                 continue;
             }
             assert!(verified_mmdb(&path, file.db_type), "{name} rejected");
-            assert!(!needs_download(&path, file.db_type), "{name} looks stale");
         }
     }
 

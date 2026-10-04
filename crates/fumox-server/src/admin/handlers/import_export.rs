@@ -29,7 +29,7 @@ use crate::pipeline::CompiledPipeline;
 use askama::Template;
 use axum::extract::{ConnectInfo, Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use fumox_core::models::{self, Encoding, InputFormat, IpFamily, OutputFormat, Scheme};
 use fumox_core::repo::{profiles, proxies, sources};
 use serde::{Deserialize, Serialize};
@@ -222,6 +222,9 @@ struct ImportTemplate {
     csrf: String,
     /// Hard validation errors (import aborted, nothing written).
     errors: Vec<String>,
+    /// The submitted payload echoed back on an error so a fix-and-retry
+    /// does not start from an empty textarea. Empty on a fresh page.
+    payload: String,
     /// Present only after a successful import.
     summary: Option<ImportSummary>,
     /// Absolute public URL of the «all alive» export link, token included.
@@ -246,6 +249,7 @@ struct RenderArgs<'a> {
     headers: &'a HeaderMap,
     status: StatusCode,
     errors: Vec<String>,
+    payload: Option<String>,
     summary: Option<ImportSummary>,
 }
 
@@ -261,6 +265,7 @@ async fn render_page(state: &AdminState, args: RenderArgs<'_>) -> Response {
         headers,
         status,
         errors,
+        payload,
         summary,
     } = args;
     let token = match alive_export::ensure_token(&state.pool).await {
@@ -290,6 +295,7 @@ async fn render_page(state: &AdminState, args: RenderArgs<'_>) -> Response {
             active: "import",
             csrf: state.csrf_for(headers),
             errors,
+            payload: payload.unwrap_or_default(),
             summary,
             alive_url,
             alive_count,
@@ -317,6 +323,7 @@ pub async fn import_form(
             headers: &headers,
             status: StatusCode::OK,
             errors: Vec::new(),
+            payload: None,
             summary: None,
         },
     )
@@ -347,6 +354,7 @@ pub async fn import_submit(
                     headers: &headers,
                     status: StatusCode::UNPROCESSABLE_ENTITY,
                     errors,
+                    payload: Some(payload),
                     summary: None,
                 },
             )
@@ -367,6 +375,7 @@ pub async fn import_submit(
                 headers: &headers,
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 errors,
+                payload: Some(payload),
                 summary: None,
             },
         )
@@ -385,6 +394,7 @@ pub async fn import_submit(
                 headers: &headers,
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 errors,
+                payload: Some(payload),
                 summary: None,
             },
         )
@@ -407,6 +417,7 @@ pub async fn import_submit(
                     headers: &headers,
                     status: StatusCode::OK,
                     errors: Vec::new(),
+                    payload: None,
                     summary: Some(summary),
                 },
             )
@@ -421,7 +432,7 @@ pub async fn import_submit(
 pub async fn rotate_alive_token(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     match alive_export::rotate_token(&state.pool).await {
-        Ok(_) => Redirect::to("/admin/import").into_response(),
+        Ok(_) => super::flash_redirect("/admin/import", lang.t("io.alive_rotated"), "ok"),
         Err(err) => super::server_error(lang, &err),
     }
 }
@@ -850,31 +861,7 @@ mod tests {
     /// Admin state on a throwaway database; the import path itself needs
     /// nothing but the pool, the caches and the config.
     async fn test_state() -> AdminState {
-        let dir = std::env::temp_dir().join(format!("fumox-import-test-{}", models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        fumox_core::db::migrate(&pool).await.unwrap();
-        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-        std::mem::forget(refresh_rx); // keep the channel open for sends
-        let config = fumox_core::AppConfig::default();
-        let fetcher =
-            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.geo.dns_timeout());
-        AdminState::new(
-            pool,
-            crate::cache::Caches::new(),
-            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
-            refresh_tx,
-            crate::scheduler::SchedulerState::new(1),
-            crate::events::EventBus::new(),
-            fetcher,
-            config,
-            fumox_core::config::ResolvedConfigPath::Missing,
-        )
+        crate::admin::test_admin_state(Default::default(), Default::default()).await
     }
 
     #[test]
@@ -951,33 +938,7 @@ mod tests {
     /// access-token floor are hard errors, nothing is written.
     #[tokio::test]
     async fn import_rejects_row_floods_and_short_tokens() {
-        // A minimal admin state (tests in admin::mod keep their own; this
-        // one only needs the fetcher defaults and the config).
-        let dir = std::env::temp_dir().join(format!("fumox-import-test-{}", models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        fumox_core::db::migrate(&pool).await.unwrap();
-        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-        std::mem::forget(refresh_rx);
-        let config = fumox_core::AppConfig::default();
-        let fetcher =
-            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.geo.dns_timeout());
-        let state = crate::admin::AdminState::new(
-            pool,
-            crate::cache::Caches::new(),
-            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
-            refresh_tx,
-            crate::scheduler::SchedulerState::new(1),
-            crate::events::EventBus::new(),
-            fetcher,
-            config,
-            fumox_core::config::ResolvedConfigPath::Missing,
-        );
+        let state = crate::admin::test_admin_state(Default::default(), Default::default()).await;
         let lang = state.locales.default_lang();
 
         // 501 sources trip the row cap before any DNS work happens.

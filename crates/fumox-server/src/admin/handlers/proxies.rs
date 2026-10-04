@@ -82,6 +82,9 @@ struct ProxiesListTemplate {
     csrf: String,
     rows: Vec<ProxyListRow>,
     total: i64,
+    /// Count of `removed` rows (unfiltered); the purge dialog shows it so
+    /// the destructive confirm does not hide its blast radius.
+    removed_count: i64,
     pages: Vec<(i64, bool)>,
     per_page: i64,
     f_statuses: Vec<String>,
@@ -119,6 +122,17 @@ impl ProxiesListTemplate {
             let truncated: String = name.chars().take(59).collect();
             format!("{truncated}…")
         }
+    }
+
+    /// Whether any filter narrows the list; drives the empty-state
+    /// "clear filters" link (sorting alone never hides rows).
+    fn filters_active(&self) -> bool {
+        !self.f_statuses.is_empty()
+            || !self.f_scheme.is_empty()
+            || !self.f_country.is_empty()
+            || !self.f_source.is_empty()
+            || !self.f_q.is_empty()
+            || !self.f_coverage.is_empty()
     }
 
     /// Preserve the current filters in pagination links.
@@ -171,7 +185,9 @@ impl ProxiesListTemplate {
             (true, true) => "T1+T2".to_string(),
             (true, false) => "T1".to_string(),
             (false, true) => "T2".to_string(),
-            (false, false) => ",".to_string(),
+            // Same placeholder the timestamp cells use, a bare comma here
+            // read as a typo.
+            (false, false) => "–".to_string(),
         }
     }
 }
@@ -283,6 +299,17 @@ pub async fn proxies_list(
         }
     };
 
+    // The purge dialog acts on every `removed` row regardless of the
+    // active filters, so the count it shows is unfiltered too.
+    let removed_count: i64 =
+        match sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE status = 'removed'")
+            .fetch_one(&state.pool)
+            .await
+        {
+            Ok(count) => count,
+            Err(err) => return server_error(lang, &err),
+        };
+
     let rows: Vec<ProxyListRow> = {
         let sql = format!(
             "SELECT p.id, p.scheme, p.name, p.host, p.port, p.status, p.latency_ms, p.geo_country,
@@ -349,6 +376,7 @@ pub async fn proxies_list(
                 .collect(),
             rows,
             total,
+            removed_count,
             pages: pagination_pages(page, total, per_page),
             per_page,
             f_statuses,
@@ -959,7 +987,7 @@ fn status_badge(lang: &Lang, status: &str) -> String {
         _ => ("unknown", "common.status_unknown"),
     };
     format!(
-        r#"<span id="status-badge"><span class="badge {class}">{}</span></span>"#,
+        r#"<span id="status-badge" aria-live="polite" aria-atomic="true"><span class="badge {class}">{}</span></span>"#,
         lang.t(key)
     )
 }
@@ -1000,8 +1028,9 @@ pub async fn proxy_reset(
         &format!("/admin/proxies/{id}"),
         // The wrapper id must survive the swap: the form's hx-target points
         // at it, so losing it kills the button for every subsequent click.
+        // The aria attributes keep the initial template's announcements.
         format!(
-            r#"<span id="status-badge"><span class="badge unknown">{}</span></span>"#,
+            r#"<span id="status-badge" aria-live="polite" aria-atomic="true"><span class="badge unknown">{}</span></span>"#,
             lang.t("common.status_unknown"),
         ),
         lang.t("px.reset_toast"),

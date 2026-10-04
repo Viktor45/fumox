@@ -149,6 +149,14 @@ impl SchedulerState {
     pub async fn is_in_flight(&self, source_id: &str) -> bool {
         self.in_flight.lock().await.contains(source_id)
     }
+
+    /// Source ids currently marked in flight. The shutdown path names
+    /// them in the log: their tasks are detached, so whatever is still
+    /// here when `main` returns is dropped by runtime teardown, and a
+    /// bare "shutdown complete" would hide that.
+    pub async fn in_flight_ids(&self) -> Vec<String> {
+        self.in_flight.lock().await.iter().cloned().collect()
+    }
 }
 
 /// Clears the in-flight mark of one source when dropped, including while a
@@ -187,6 +195,18 @@ pub struct IngestEnv {
     pub settings: crate::ingest::IngestSettings,
 }
 
+/// Resets the sweep-overlap flag when the detached sweep task ends, on
+/// the normal path and on unwind alike. A panic inside `sweep` would
+/// otherwise strand `sweeping == true` and silently stop all future
+/// sweeps.
+struct SweepGuard(Arc<AtomicBool>);
+
+impl Drop for SweepGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Run the scheduler until the process shuts down.
 ///
 /// `refresh_rx` carries source ids that must be refreshed immediately
@@ -216,10 +236,10 @@ pub async fn run(
                 let env = env.clone();
                 let state = state.clone();
                 let events = events.clone();
-                let sweeping_done = sweeping.clone();
+                let sweeping_done = SweepGuard(sweeping.clone());
                 tokio::spawn(async move {
+                    let _guard = sweeping_done;
                     sweep(&env, &state, &events).await;
-                    sweeping_done.store(false, Ordering::SeqCst);
                 });
             }
             maybe_id = refresh_rx.recv() => {
@@ -239,6 +259,16 @@ pub async fn run(
 
 /// One scheduler sweep: ingest every enabled source that is due.
 async fn sweep(env: &IngestEnv, state: &SchedulerState, events: &EventBus) {
+    // Stamped at the start, not the end: the age of this stamp is "time
+    // since the loop last got a sweep underway", so a sweep hung inside
+    // its own body ages the stamp instead of looking healthy.
+    let started_at = fumox_core::models::now_ts();
+    if let Err(err) =
+        fumox_core::repo::meta_set(&env.pool, "server_cycle", &started_at.to_string()).await
+    {
+        tracing::warn!(error = %err, "scheduler sweep: cannot stamp server_cycle");
+    }
+
     let due = match sources::list(&env.pool, true).await {
         Ok(all) => {
             let now = fumox_core::models::now_ts();
@@ -276,11 +306,25 @@ async fn sweep(env: &IngestEnv, state: &SchedulerState, events: &EventBus) {
 
     let mut tasks = JoinSet::new();
     for source in due {
+        let source_id = source.id.clone();
         if let Some(handle) = spawn_ingest(env, state, events, source, false) {
-            tasks.spawn(handle);
+            // The id travels with the handle so a JoinError (a panic in
+            // the ingest task) names the source that died instead of
+            // vanishing into `is_some()`.
+            tasks.spawn(async move { (source_id, handle.await) });
         }
     }
-    while tasks.join_next().await.is_some() {}
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((_source_id, Ok(()))) => {}
+            Ok((source_id, Err(err))) => {
+                tracing::warn!(error = %err, source = %source_id, "scheduler sweep: ingest task panicked");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "scheduler sweep: sweep task itself failed");
+            }
+        }
+    }
 }
 
 /// Spawn one ingestion task if the source is not already in flight.
@@ -704,5 +748,24 @@ mod tests {
             "unwinding must release the in-flight mark"
         );
         assert!(state.acquire_source("src1").await.is_some());
+    }
+
+    /// A panic inside `sweep` must not strand the overlap flag: a flag
+    /// stuck at `true` silently disables every future sweep.
+    #[test]
+    fn sweep_guard_resets_the_flag_on_unwind() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = SweepGuard(flag.clone());
+        let panicked = std::thread::spawn(move || {
+            let _guard = guard;
+            panic!("sweep blew up");
+        })
+        .join()
+        .is_err();
+        assert!(panicked, "the thread is expected to panic");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "unwinding must release the sweep-overlap flag"
+        );
     }
 }

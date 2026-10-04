@@ -16,8 +16,8 @@
      action here transitions rows into `removed` (a soft state); the
      actual delete from the database stays the "purge removed" button
      above. Keeping the two buttons apart makes a mistake reversible. -->
-<dialog id="cleanup-dialog">
-  <h2>{{ self.t("px.cleanup_title") }}</h2>
+<dialog id="cleanup-dialog" aria-labelledby="cleanup-dialog-title">
+  <h2 id="cleanup-dialog-title">{{ self.t("px.cleanup_title") }}</h2>
   <p class="muted small">{{ self.t("px.cleanup_note") }}</p>
   <ul class="cleanup-ops">
     <li>
@@ -97,9 +97,11 @@
   </div>
 </dialog>
 
-<dialog id="purge-dialog">
+<dialog id="purge-dialog" aria-labelledby="purge-dialog-title">
+  <h2 id="purge-dialog-title">{{ self.t("px.purge_button") }}</h2>
   <form method="post" action="/admin/proxies/purge-removed">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <p class="muted small">{{ self.t("px.purge_count").replace("{}", &removed_count.to_string()) }}</p>
     <p>{{ self.t("px.purge_confirm") }}</p>
     <p class="muted small">{{ self.t("px.purge_note") }}</p>
     <div class="form-actions">
@@ -113,8 +115,8 @@
      back to `unknown`, not to `removed`. Revived ids are enqueued for
      priority probing so the daemon picks them up on its next cycle
      instead of waiting for the random sample. -->
-<dialog id="revive-dialog">
-  <h2>{{ self.t("px.revive_title") }}</h2>
+<dialog id="revive-dialog" aria-labelledby="revive-dialog-title">
+  <h2 id="revive-dialog-title">{{ self.t("px.revive_title") }}</h2>
   <p class="muted small">{{ self.t("px.revive_note") }}</p>
   <ul class="cleanup-ops">
     <li>
@@ -252,7 +254,10 @@
 
 <div class="panel">
   {% if rows.is_empty() %}
-    <p class="muted">{{ self.t("px.nothing_found") }}</p>
+    <p class="muted">
+      {{ self.t("px.nothing_found") }}
+      {% if self.filters_active() %} <a href="/admin/proxies">{{ self.t("px.clear_filters") }}</a>{% endif %}
+    </p>
   {% else %}
     <div class="table-scroll">
       <table class="data">
@@ -302,19 +307,8 @@
       </table>
     </div>
 
-    {% if pages.len() > 1 %}
-      <div class="pagination">
-        {% for (p, current) in pages %}
-          {% if *p == 0 %}
-            <span class="page gap">…</span>
-          {% else if current %}
-            <span class="page current" aria-current="page">{{ p }}</span>
-          {% else %}
-            <a class="page" href="/admin/proxies?page={{ p }}&amp;per_page={{ per_page }}{{ self.query_suffix() }}">{{ p }}</a>
-          {% endif %}
-        {% endfor %}
-      </div>
-    {% endif %}
+    {% let page_base = "/admin/proxies" %}
+    {% include "_pagination.html" %}
   {% endif %}
 </div>
 {% endblock %}

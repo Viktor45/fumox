@@ -98,7 +98,8 @@
   {% endif %}
 </div>
 
-<dialog id="delete-dialog">
+<dialog id="delete-dialog" aria-labelledby="delete-dialog-title">
+  <h2 id="delete-dialog-title" class="visually-hidden">{{ self.t("prof.delete_confirm") }}</h2>
   <form method="post" action="/admin/profiles/{{ profile.id }}/delete">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <p>{{ self.t("prof.delete_confirm") }} <b>{{ profile.name }}</b>?</p>

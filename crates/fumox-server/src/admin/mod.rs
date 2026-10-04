@@ -2219,7 +2219,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let html = response.into_body().collect().await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        assert!(html.contains("Чекер"));
+        assert!(html.contains("Тестер"));
         assert!(html.contains("4242")); // pid from the heartbeat
         assert!(html.contains("sick-proxy")); // quarantine queue row
         assert!(html.contains("q.example.com"));
@@ -2698,7 +2698,7 @@ mod tests {
             "danger banner expected: {html}"
         );
         assert!(
-            html.contains("Heartbeat чекера отсутствует 600 с"),
+            html.contains("Heartbeat тестера отсутствует 600 с"),
             "heartbeat_dead factor missing: {html}"
         );
     }

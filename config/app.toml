@@ -400,8 +400,8 @@ recheck_delays_secs = [600, 900]   # 10 мин → 15 мин / 10m → 15m
 # Priority-queue entries (probe_requests) older than this are purged.
 queue_stale_days = 7
 # Диапазон: 5..=1440 минут (форма), то есть от 5 минут до суток.
-# Целевое время, за которое чекер на /admin/probe пытается осушить текущий
-# карантин. Если затраты при текущих настройках превышают это число, чекер
+# Целевое время, за которое тестер на /admin/probe пытается осушить текущий
+# карантин. Если затраты при текущих настройках превышают это число, тестер
 # предложит конкретные [probe].sample_size / cycle_interval_secs / concurrency.
 # Range: 5..=1440 minutes (form), i.e. 5 minutes to a day.
 # Target drain time (min) used by the /admin/probe backlog banner when

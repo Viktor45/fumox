@@ -87,11 +87,13 @@ configuration reference and the production checklist for context.
 
 - `[admin].secure_cookies` (or the matching `FUMOX_ADMIN__SECURE_COOKIES`
   env override): keep `false` when the panel is reached over plain HTTP
-  (the `docker-compose.yml` default, `http://127.0.0.1:8081`). Browsers
-  silently drop `Secure` cookies on `http://`, so a successful login
-  (`admin logged in` in logs) gets followed by a permanent redirect to
-  `/admin/login`. Set `true` only when TLS is terminated at a reverse
-  proxy.
+  (`http://127.0.0.1:8081`). Browsers silently drop `Secure` cookies on
+  `http://`, so a successful login (`admin logged in` in logs) gets
+  followed by a permanent redirect to `/admin/login`. Set `true` only
+  when TLS is terminated at a reverse proxy. The file default is
+  `false`, but `docker-compose.yml` defaults the env override to `true`
+  (ready for an HTTPS front) — a plain-HTTP `docker compose up` must
+  therefore set `FUMOX_ADMIN__SECURE_COOKIES=false` in `.env`.
 
 ---
 

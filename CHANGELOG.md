@@ -10,9 +10,9 @@ The categories follow [Keep a Changelog](https://keepachangelog.com/);
 `Docs` covers the user guide and READMEs, `Internal` (dependency bumps,
 CI plumbing) is omitted: it never changes the shipped image.
 
-## Unreleased (2026-09-29)
+## Unreleased (2026-10-04)
 
-Defect fixes in the working tree, not yet on a published image.
+Changes in the working tree, not yet on a published image.
 
 ### Added
 
@@ -23,6 +23,29 @@ Defect fixes in the working tree, not yet on a published image.
   it the download continues detached and that run serves without geo
   enrichment until the next start. Tunable like every other key
   (`FUMOX_GEO__STARTUP_DOWNLOAD_BUDGET_SECS`).
+- Snell and AnyTLS proxy protocols: parsed from subscriptions (URI
+  and Clash YAML), rendered into the Clash output and the URI list,
+  and covered by T2 tunnel checks. sing-box exports leave them out —
+  the sing-box outbound set has no type for either — rather than
+  emitting a block it cannot start.
+- meow-rs 0.22.0 gains for T2, with no further Fumox change: the
+  `xhttp` transport is a real outbound (0.21.x had no XHTTP at all,
+  so such entries could not be checked), and SIP003 Shadowsocks
+  plugins (`shadow-tls`, `restls`, `jls`, `kcptun`, `gost-plugin`)
+  run in-process instead of spawning a helper binary the `fumox-meow`
+  image does not ship — plugin-backed entries that used to fail T2
+  now work. Fumox already rendered both correctly; only the engine
+  gained the ability to honour them.
+- `[meow].ipv6` (default `false`, matching meow-rs): rendered into
+  the generated meow config. 0.22.0 made the key effective
+  end-to-end — under `false` AAAA lookups are skipped and the direct
+  outbound answers IPv4-only, where 0.21.x resolved both families
+  whatever the key said. Only the test-URL host goes through the
+  resolver (proxy servers are pinned to a vetted IP literal), so it
+  matters solely on IPv6-only egress or an AAAA-only test URL.
+- The probe screen shows the meow-rs kernel's live RSS (from
+  `GET /memory`, refreshed whenever a T2 batch reloads the engine),
+  with the OS memory limit and the share of it when one is set.
 
 ### Fixed
 
@@ -668,6 +691,49 @@ Defect fixes in the working tree, not yet on a published image.
   `period_rec_never_lands_below_the_beating_floor`, and the whole
   value space is swept by `recs_stay_inside_the_range_the_form_accepts`
   so no knob can print a value outside the settings form's own range.
+- Drop rules corrupted the geo pairing of everything after the
+  first dropped entry. The ingest path handed `reconcile_source` the
+  entry list after a source's pipeline drop rules had shortened it,
+  together with the geo stamps resolved for the list *before* the
+  drop. The two are paired by index, so every proxy past the first
+  dropped entry was stored carrying a neighbouring host's country
+  and ASN — one IP could end up stamped with several autonomous
+  systems, and the admin ASN cleanup buttons then acted on that
+  noise. The drop pass now returns the stamps that belong to exactly
+  the surviving entries.
+  `scripts/repair-geo-stamps.sh` rewrites the already-corrupted
+  rows: it clears the three `geo_*` columns (after a backup) and
+  lets the startup backfill re-resolve every row from its own host —
+  verified on a copy of a production database, 23249 rows
+  re-stamped, 1162784 stamped rows re-checked against the resolver,
+  0 wrong, and the number of hosts carrying more than one ASN went
+  2510 → 0.
+- The probe card's kernel RSS line reached the reader as literal
+  HTML source: it was assembled with a `<time>` element inside and
+  rendered through an escaping handle, so the card showed
+  `<time class="ts" …>` text wrapped over four lines. The line is
+  plain text now (`RSS 24.5 MiB · 1.2% / 2.0 GiB`) and the timestamp
+  is rendered by the template as a proper `time` element beside it.
+- `scripts/revive-xhttp-proxies.sh`: a one-shot repair for the
+  vless+xhttp rows the pre-0.22 engine stranded in `removed` — the
+  transport did not exist there, every T2 check failed, the fail
+  ladder ran its course, and only the terminal status is wrong
+  (Fumox rendered the transport correctly all along). Linked rows
+  are revived and enqueued for priority checking;
+  `--include-unlinked` also adopts link-less rows into a source,
+  because every probe lane selects on the `proxy_source_links` row —
+  a revived row without a link sits in no lane at all and stays dead
+  whatever its feed does later. `--adopt-source` names the adoptive
+  source explicitly, `--no-adopt` revives without linking.
+  `--restore` undoes a run safely: it verifies the backup before
+  touching anything, refuses while anything has the database open,
+  snapshots what it is about to overwrite, deletes the write-ahead
+  log that would otherwise be replayed on top of the restored file,
+  and integrity-checks the result. The bare `cp` the script used to
+  suggest fails either loudly (`database disk image is malformed`) or,
+  worse, quietly: the log fits, the copy "succeeds",
+  `PRAGMA integrity_check` prints `ok`, and the database holds the
+  pre-restore data after all.
 
 ### Docs
 

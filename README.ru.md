@@ -88,12 +88,15 @@ GeoLite2-базы MaxMind (`.mmdb`) не входят в репозиторий,
 и в контрольном списке для продакшена.
 
 - `[admin].secure_cookies` (или ENV-переменная `FUMOX_ADMIN__SECURE_COOKIES`):
-  оставляйте `false`, когда панель доступна по plain HTTP (дефолт
-  `docker-compose.yml`, `http://127.0.0.1:8081`). Браузер молча отбрасывает
+  оставляйте `false`, когда панель доступна по plain HTTP
+  (`http://127.0.0.1:8081`). Браузер молча отбрасывает
   `Secure`-cookie на `http://`, и со стороны выглядит как успешный вход
   (`admin logged in` в логах), за которым следует постоянный редирект на
   `/admin/login`.
   Ставьте `true`, только если TLS терминируется на reverse-proxy.
+  Дефолт в файле — `false`, но `docker-compose.yml` ставит ENV-override
+  в `true` (готовность к HTTPS-фронту) — для plain-HTTP `docker compose
+  up` задайте `FUMOX_ADMIN__SECURE_COOKIES=false` в `.env`.
 
 ---
 

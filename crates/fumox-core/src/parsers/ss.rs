@@ -15,6 +15,8 @@
 //! Xray-isms copied from vless templates; they are kept as unknown
 //! pass-through parameters so nothing is lost on re-serialization.
 
+use std::borrow::Cow;
+
 use crate::models::{ProxyEntry, Scheme};
 use base64::Engine;
 
@@ -90,7 +92,13 @@ fn parse_legacy(before_query: &str) -> Result<(String, String, u16, String), Str
 /// Serialize back to the SIP002 form with unpadded standard base64, the
 /// dominant style in real feeds.
 pub fn serialize(entry: &ProxyEntry) -> String {
-    let blob = base64::engine::general_purpose::STANDARD_NO_PAD.encode(entry.credential.as_bytes());
+    // A Clash ss item without `cipher` stores a bare password; a colon-less
+    // SIP002 userinfo is unparsable, so default the method like the Clash writer.
+    let credential = match entry.credential.split_once(':') {
+        Some(_) => Cow::Borrowed(entry.credential.as_str()),
+        None => Cow::Owned(format!("chacha20-ietf-poly1305:{}", entry.credential)),
+    };
+    let blob = base64::engine::general_purpose::STANDARD_NO_PAD.encode(credential.as_bytes());
     let mut out = String::with_capacity(96);
     out.push_str("ss://");
     out.push_str(&blob);
@@ -229,5 +237,22 @@ mod tests {
             .encode(b"aes-256-gcm:pw\nsmuggled@9.9.9.9:8388");
         let line = format!("ss://{legacy}#n");
         assert!(parse(&line[5..], &line).is_err());
+    }
+
+    /// A Clash ss item without `cipher` carries a colon-less credential;
+    /// the export defaults the method exactly like the Clash writer.
+    #[test]
+    fn clash_ss_without_cipher_defaults_the_method_on_export() {
+        let yaml =
+            "proxies:\n  - {name: s, type: ss, server: h.example.com, port: 8388, password: pw}\n";
+        let entry = &crate::parsers::clash::parse_payload(yaml).unwrap().entries[0];
+        assert_eq!(entry.credential, "pw");
+
+        let line = serialize(entry);
+        let back = parse(line.strip_prefix("ss://").unwrap(), &line).unwrap();
+        assert_eq!(back.credential, "chacha20-ietf-poly1305:pw");
+        // The defaulted line is stable: the re-parse carries the method
+        // embedded, so a second serialization reproduces the same bytes.
+        assert_eq!(serialize(&back), line);
     }
 }

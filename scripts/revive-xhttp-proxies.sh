@@ -129,6 +129,12 @@ DB="${DB:-fumox.db}"
 # probe's own throttle would apply either way, but the admin revival path
 # caps its enqueue the same way, and the script reports if the cap bit.
 ENQUEUE_LIMIT="${FUMOX_REFRESH_CHECK_LIMIT:-100}"
+# Interpolated into the LIMIT clause below, so only a plain number may sit
+# there: an environment value is user input just like a flag is.
+if ! [[ "$ENQUEUE_LIMIT" =~ ^[0-9]+$ ]]; then
+    echo "error: FUMOX_REFRESH_CHECK_LIMIT must be a number, got '${ENQUEUE_LIMIT}'" >&2
+    exit 64
+fi
 
 # The daemon may be running against the same file. The sqlite3 CLI defaults to
 # a zero busy timeout, which would turn a momentary lock into an immediate
@@ -323,7 +329,10 @@ XHTTP="scheme = 'vless' AND lower(json_extract(params, '\$.type')) = 'xhttp'"
 # The selection, shared by every report and by the update. json_extract keeps
 # this exact: a LIKE over `params` would also match an xhttp string living in
 # a path or a host, which is not the same thing as an xhttp transport.
-IFS='|' read -r TOTAL LIVE UNLINKED_REMOVED LINKED_REMOVED <<<"$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" <<SQL
+#
+# The census decides whether the run says "Nothing to revive." and exits 0, so
+# a database that cannot be read must not be mistaken for an empty one.
+CENSUS="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" <<SQL
 SELECT
   (SELECT COUNT(*) FROM proxies p WHERE ${XHTTP}),
   (SELECT COUNT(*) FROM proxies p WHERE ${XHTTP} AND status != 'removed'),
@@ -332,7 +341,21 @@ SELECT
   (SELECT COUNT(*) FROM proxies p
     WHERE ${XHTTP} AND status = 'removed' AND ${LINKED});
 SQL
-)"
+)" || {
+    echo >&2
+    echo "error: could not read the census from ${DB}: sqlite3 failed." >&2
+    echo "A database locked by another writer reads the same as an empty one," >&2
+    echo "and an empty one becomes a quiet 'Nothing to revive.' Stop whatever" >&2
+    echo "writes to ${DB} and re-run." >&2
+    exit 75
+}
+IFS='|' read -r TOTAL LIVE UNLINKED_REMOVED LINKED_REMOVED <<<"$CENSUS"
+if ! [[ "$TOTAL" =~ ^[0-9]+$ && "$LIVE" =~ ^[0-9]+$ && \
+        "$UNLINKED_REMOVED" =~ ^[0-9]+$ && "$LINKED_REMOVED" =~ ^[0-9]+$ ]]; then
+    echo >&2
+    echo "error: the census from ${DB} is not four counts: ${CENSUS:-<empty>}" >&2
+    exit 70
+fi
 
 if [[ "$INCLUDE_UNLINKED" -eq 1 ]]; then
     REVIVABLE=$((LINKED_REMOVED + UNLINKED_REMOVED))
@@ -375,13 +398,21 @@ if [[ "$INCLUDE_UNLINKED" -eq 1 && "$UNLINKED_REMOVED" -gt 0 ]]; then
     elif [[ -n "$ADOPT_SOURCE" ]]; then
         # An explicit target is matched on id, then slug, then name, and an
         # ambiguous name is refused rather than resolved by row order: a
-        # wrong source here is a link nothing will ever reconcile.
-        IFS='|' read -r MATCHES ADOPT_ID ADOPT_NAME ADOPT_ENABLED ADOPT_DROPS <<<"$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" <<SQL
-SELECT COUNT(*), id, name, enabled,
-       COALESCE(json_array_length(json_extract(pipeline, '\$.drop')), 0)
+        # wrong source here is a link nothing will ever reconcile. The value
+        # reaches single-quoted SQL literals below, so its single quotes are
+        # doubled. The replacement goes through a variable because bash 3.2
+        # keeps the backslashes of an escaped replacement in ${var//pat/repl}.
+        QUOTED_QUOTE="''"
+        ADOPT_SOURCE_SQL="${ADOPT_SOURCE//\'/$QUOTED_QUOTE}"
+        # Name selected last: read hands the last variable everything after
+        # the third separator, so a pipe in a name cannot shift the fields.
+        IFS='|' read -r MATCHES ADOPT_ID ADOPT_ENABLED ADOPT_DROPS ADOPT_NAME <<<"$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" <<SQL
+SELECT COUNT(*), id, enabled,
+       COALESCE(json_array_length(json_extract(pipeline, '\$.drop')), 0),
+       name
   FROM sources
- WHERE id = '${ADOPT_SOURCE}' OR slug = '${ADOPT_SOURCE}' OR name = '${ADOPT_SOURCE}'
- ORDER BY (id = '${ADOPT_SOURCE}') DESC, id
+ WHERE id = '${ADOPT_SOURCE_SQL}' OR slug = '${ADOPT_SOURCE_SQL}' OR name = '${ADOPT_SOURCE_SQL}'
+ ORDER BY (id = '${ADOPT_SOURCE_SQL}') DESC, id
  LIMIT 1;
 SQL
 )"
@@ -390,18 +421,19 @@ SQL
             echo "error: no source matches '${ADOPT_SOURCE}' (looked at id, slug and name)" >&2
             exit 67
         fi
-        AMBIGUOUS="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" "SELECT COUNT(*) FROM sources WHERE name = '${ADOPT_SOURCE}' AND id != '${ADOPT_ID}'")"
+        # The id reaches a SQL string literal just below, so it is checked
+        # against the shape nanoid(12) produces rather than trusted - and
+        # checked before the first literal it reaches, not after.
+        if ! [[ "$ADOPT_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+            echo >&2
+            echo "error: source id '${ADOPT_ID}' is not a plain nanoid, refusing to interpolate it" >&2
+            exit 67
+        fi
+        AMBIGUOUS="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" "SELECT COUNT(*) FROM sources WHERE name = '${ADOPT_SOURCE_SQL}' AND id != '${ADOPT_ID}'")"
         if [[ "$AMBIGUOUS" -gt 0 ]]; then
             echo >&2
             echo "error: '${ADOPT_SOURCE}' matches ${AMBIGUOUS} other sources by name" >&2
             echo "pass the id or the slug instead" >&2
-            exit 67
-        fi
-        # The id reaches a SQL string literal further down, so it is checked
-        # against the shape nanoid(12) produces rather than trusted.
-        if ! [[ "$ADOPT_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
-            echo >&2
-            echo "error: source id '${ADOPT_ID}' is not a plain nanoid, refusing to interpolate it" >&2
             exit 67
         fi
     else
@@ -412,13 +444,15 @@ SQL
         # serves nothing, and a source with drop rules is only safe while
         # drop_gate is off, which is a config fact this script does not
         # read, so it goes last and gets a warning.
-        IFS='|' read -r ADOPT_ID ADOPT_NAME ADOPT_ENABLED ADOPT_DROPS <<<"$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" <<SQL
+        # Name last, as above: a pipe in a name must not shift the drop-rule
+        # count, which would move the source into the wrong safety branch.
+        IFS='|' read -r ADOPT_ID ADOPT_ENABLED ADOPT_DROPS ADOPT_NAME <<<"$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" <<SQL
 WITH ranked AS (
   SELECT id, name, enabled, created_at,
          COALESCE(json_array_length(json_extract(pipeline, '\$.drop')), 0) AS drops
     FROM sources
 )
-SELECT id, name, enabled, drops
+SELECT id, enabled, drops, name
   FROM ranked
  ORDER BY CASE WHEN enabled = 1 AND drops = 0 THEN 0
                WHEN enabled = 0 THEN 1
@@ -499,6 +533,15 @@ pass it while holding the wrong data.
 EOF
 }
 
+# The shorter advice for the aborts after the backup. Never a bare cp: the
+# header explains what the current -wal/-shm do to a restored file.
+undo_hint() {
+    echo "the backup ${BACKUP} is intact. To undo, stop the daemon, delete" >&2
+    echo "${DB}-wal and ${DB}-shm, copy the backup over ${DB}, and check it" >&2
+    echo "with 'PRAGMA integrity_check;'. A bare cp leaves the current" >&2
+    echo "database's write-ahead log next to the restored file." >&2
+}
+
 NOW="$(date +%s)"
 
 # From here on the backup exists, so any abort must say how to undo itself:
@@ -509,10 +552,7 @@ on_err() {
     echo "error: aborted with code ${code}; the database may be half-written" >&2
     if [[ -n "${BACKUP:-}" && -f "${BACKUP}" ]]; then
         echo >&2
-        echo "the backup ${BACKUP} is intact. To undo, stop the daemon, delete" >&2
-        echo "${DB}-wal and ${DB}-shm, copy the backup over ${DB}, and check it" >&2
-        echo "with 'PRAGMA integrity_check;'. A bare cp leaves the current" >&2
-        echo "database's write-ahead log next to the restored file." >&2
+        undo_hint
     fi
     exit "$code"
 }
@@ -592,13 +632,13 @@ QUEUED="$(read_count queued)"
 for pair in "revived:${REVIVED}" "linked:${REVIVED_LINKED}" "queued:${QUEUED}"; do
     if ! [[ "${pair#*:}" =~ ^[0-9]+$ ]]; then
         echo "error: could not read the ${pair%%:*} count back from sqlite3" >&2
-        echo "restore with: cp ${BACKUP} ${DB}" >&2
+        undo_hint
         exit 70
     fi
 done
 if [[ -n "$ADOPT_SQL" && ! "${ADOPTED:-}" =~ ^[0-9]+$ ]]; then
     echo "error: could not read the adopted count back from sqlite3" >&2
-    echo "restore with: cp ${BACKUP} ${DB}" >&2
+    undo_hint
     exit 70
 fi
 ADOPTED="${ADOPTED:-0}"

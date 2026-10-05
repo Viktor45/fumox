@@ -189,6 +189,9 @@ impl EditableConfig {
     /// rename over the original. Falls back to direct `write` on
     /// filesystems that reject `rename` (some NFS / SMB mounts).
     ///
+    /// The tmp is fsynced before the rename and the parent dir after it, so a
+    /// committed save survives a crash; a failed save leaves no tmp behind.
+    ///
     /// The handle owns the editor lock, so no other live
     /// [`EditableConfig`] in this process can have snapshotted the file
     /// before the mutation that produced this document: the second
@@ -219,7 +222,12 @@ impl EditableConfig {
         let tmp_path = parent.join(&tmp_name);
 
         let serialized = self.doc.to_string();
-        write_tmp_preserving_mode(&self.path, &tmp_path, serialized.as_bytes())?;
+        if let Err(e) = write_tmp_preserving_mode(&self.path, &tmp_path, serialized.as_bytes()) {
+            // A failed save must not leak the tmp: it carries the same
+            // secrets as the real config.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
 
         if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
             // Atomic rename is not universally supported. If it fails,
@@ -233,7 +241,8 @@ impl EditableConfig {
                 path = %self.path.display(),
                 "atomic rename failed; falling back to direct write"
             );
-            std::fs::write(&self.path, serialized.as_bytes())?;
+            let direct = std::fs::write(&self.path, serialized.as_bytes());
+            // The tmp is redundant now: stale, or a leak if the write failed.
             if let Err(rm_err) = std::fs::remove_file(&tmp_path) {
                 // The tmp file leaked. Not fatal, the real config has
                 // been written, but the operator should know so they can
@@ -244,7 +253,9 @@ impl EditableConfig {
                     "could not remove leftover tmp file after fallback write"
                 );
             }
+            direct?;
         }
+        sync_parent_dir(parent);
         Ok(())
     }
 }
@@ -273,6 +284,9 @@ static EDITOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// applied at tmp creation, so the file holding the token is never briefly
 /// world-readable between a write and a chmod. A missing original (the
 /// *Create from defaults* path) falls back to 0644.
+///
+/// The body is fsynced before the handle drops: the save commits by rename,
+/// and without the flush a crash could leave a truncated config in place.
 #[cfg(unix)]
 fn write_tmp_preserving_mode(original: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -286,13 +300,30 @@ fn write_tmp_preserving_mode(original: &Path, tmp: &Path, bytes: &[u8]) -> std::
         .create_new(true)
         .mode(mode)
         .open(tmp)?;
-    file.write_all(bytes)
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 #[cfg(not(unix))]
 fn write_tmp_preserving_mode(_original: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(tmp, bytes)
+    use std::io::Write;
+    let mut file = std::fs::File::create(tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
+
+/// Best-effort `fsync` of the config's parent dir, so the rename is durable
+/// too. Some filesystems refuse directory syncs; failures are ignored on
+/// purpose, the data itself was already fsynced by [`write_tmp_preserving_mode`].
+#[cfg(unix)]
+fn sync_parent_dir(dir: &Path) {
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_dir: &Path) {}
 
 /// Move `current` into the table at `segment`, creating an empty table
 /// if the slot was absent or held a non-table value.
@@ -548,6 +579,36 @@ mod tests {
         assert!(on_disk.contains("127.0.0.1:9999"));
 
         // No stray tmp files left behind.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "tmp file leaked: {:?}", leftover);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: a failed rename + failed fallback write used to leak the
+    /// tmp (a config copy with `[admin].token`); modeled by a directory swap.
+    #[test]
+    fn failed_fallback_write_still_removes_the_tmp() {
+        let dir = tmp_dir("fallback-leak");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
+
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        cfg.set("server.bind", item::string("127.0.0.1:9999"))
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let err = cfg.save().unwrap_err();
+        assert!(
+            matches!(err, ConfigWriteError::Io(_)),
+            "expected an i/o error, got {err:?}"
+        );
+
         let leftover: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)

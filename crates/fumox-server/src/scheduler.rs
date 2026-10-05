@@ -246,13 +246,35 @@ pub async fn run(
                 let Some(source_id) = maybe_id else {
                     break; // channel closed, shutting down
                 };
-                if let Ok(Some(source)) = sources::get(&env.pool, &source_id).await {
-                    // Explicit "refresh now": always hit the network.
-                    spawn_ingest(&env, &state, &events, source, true);
-                } else {
-                    tracing::warn!(source = %source_id, "refresh requested for unknown source");
-                }
+                dispatch_refresh(&env, &state, &events, &source_id).await;
             }
+        }
+    }
+}
+
+/// Handle one *Refresh now* id from the admin panel: look the row up and spawn
+/// the ingest. A stale panel id is a warning, a failed lookup an error naming
+/// the source — a broken database must not masquerade as "unknown source".
+async fn dispatch_refresh(
+    env: &IngestEnv,
+    state: &SchedulerState,
+    events: &EventBus,
+    source_id: &str,
+) {
+    match sources::get(&env.pool, source_id).await {
+        // Explicit "refresh now": always hit the network.
+        Ok(Some(source)) => {
+            spawn_ingest(env, state, events, source, true);
+        }
+        Ok(None) => {
+            tracing::warn!(source = %source_id, "refresh requested for unknown source");
+        }
+        Err(err) => {
+            tracing::error!(
+                source = %source_id,
+                error = %err,
+                "refresh requested: cannot look up the source"
+            );
         }
     }
 }
@@ -560,6 +582,55 @@ mod tests {
         refresh_tx.send("srcFast0000".to_string()).unwrap();
         await_fetch_started(&mut rx, "srcFast0000").await;
         scheduler.abort();
+    }
+
+    /// A database failure while looking up a *Refresh now* target must be logged
+    /// as an error naming the source, not folded into the "unknown source" warning.
+    #[tokio::test]
+    async fn refresh_lookup_failure_is_logged_as_an_error() {
+        let pool = test_pool().await;
+        let (env, state, events) = test_env(pool.clone()).await;
+        // The only way to reach the `Err` arm deterministically: a pool
+        // that answers nothing anymore.
+        env.pool.close().await;
+
+        // A writer funneling the subscriber's output into a shared buffer
+        // (same trick as `fumox_core::logging`). The filter only lets ERROR
+        // through, so any output at all proves the failure was logged as an error.
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || Captured(Arc::clone(&make_writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        dispatch_refresh(&env, &state, &events, "srcLost0000").await;
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.is_empty(),
+            "a failed lookup must be reported at ERROR level"
+        );
+        assert!(
+            logs.contains("srcLost0000"),
+            "the error must name the requested source: {logs}"
+        );
+        assert!(
+            !logs.contains("unknown source"),
+            "a database failure must not be mislabeled as an unknown source: {logs}"
+        );
     }
 
     /// A local upstream that answers every request with 401 (a permanently

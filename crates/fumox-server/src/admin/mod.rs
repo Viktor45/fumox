@@ -2703,9 +2703,17 @@ mod tests {
             html.contains("flash danger") && html.contains("backlog-banner"),
             "danger banner expected: {html}"
         );
+        // The age is recomputed from the wall clock at render time
+        // (handlers/probe.rs), so assert a range, not an exact string.
+        let secs = regex::Regex::new(r"Heartbeat тестера отсутствует (\d+) с")
+            .expect("valid regex")
+            .captures(&html)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().parse::<i64>().unwrap())
+            .unwrap_or_else(|| panic!("heartbeat_dead factor missing: {html}"));
         assert!(
-            html.contains("Heartbeat тестера отсутствует 600 с"),
-            "heartbeat_dead factor missing: {html}"
+            (600..=660).contains(&secs),
+            "heartbeat age {secs} s outside the seeded 600 s window: {html}"
         );
     }
 

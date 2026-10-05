@@ -889,8 +889,14 @@ mod tests {
         let t0 = Instant::now();
         assert!(log.should_warn("warn-once.example", t0).0);
         assert!(!log.should_warn("warn-once.example", t0).0);
-        assert!(!log.should_warn("warn-once.example", t0 + Duration::from_secs(60)).0);
-        assert!(log.should_warn("warn-once.example", t0 + Duration::from_secs(3_601)).0);
+        assert!(
+            !log.should_warn("warn-once.example", t0 + Duration::from_secs(60))
+                .0
+        );
+        assert!(
+            log.should_warn("warn-once.example", t0 + Duration::from_secs(3_601))
+                .0
+        );
     }
 
     /// A flood of distinct fresh hosts must stop producing warns at the

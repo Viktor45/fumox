@@ -864,6 +864,13 @@ impl<'de> Deserialize<'de> for RateLimit {
                 let limit = u32::try_from(v).map_err(serde::de::Error::custom)?;
                 Ok(RateLimit::new(limit, Duration::from_secs(60)))
             }
+
+            // figment's TOML pipeline delivers integers as `i64`, not `u64`
+            // like serde_json: without this a bare `rate_limit = 300` broke boot.
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<RateLimit, E> {
+                let v = u64::try_from(v).map_err(serde::de::Error::custom)?;
+                self.visit_u64(v)
+            }
         }
 
         deserializer.deserialize_any(Visitor)
@@ -1371,6 +1378,30 @@ mod tests {
         assert_eq!(from_str, RateLimit::new(5, Duration::from_secs(60)));
         let from_int: RateLimit = serde_json::from_str("42").unwrap();
         assert_eq!(from_int, RateLimit::new(42, Duration::from_secs(60)));
+    }
+
+    /// Regression: figment's TOML pipeline hands the visitor `i64`, not
+    /// `u64` like serde_json, so a bare `rate_limit = 300` aborted boot.
+    #[test]
+    fn rate_limit_deserializes_from_bare_toml_integer() {
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-rl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.toml");
+
+        std::fs::write(&file, "[server]\nrate_limit = 300\n").unwrap();
+        let cfg = load_config(Some(&file)).expect("bare TOML integer rate limit must load");
+        assert_eq!(
+            cfg.server.rate_limit,
+            RateLimit::new(300, Duration::from_secs(60))
+        );
+
+        std::fs::write(&file, "[server]\nrate_limit = -1\n").unwrap();
+        assert!(
+            load_config(Some(&file)).is_err(),
+            "a negative rate limit must be rejected"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

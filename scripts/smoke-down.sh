@@ -30,5 +30,9 @@ else
 fi
 
 echo ">> tearing down the smoke stand: project=$SMOKE_PROJECT"
-"${COMPOSE[@]}" -p "$SMOKE_PROJECT" down --remove-orphans "${VOLUME_FLAGS[@]}"
+# An empty "${arr[@]}" is fatal under `set -u` on the stock macOS bash 3.2,
+# which is what --keep-data does to VOLUME_FLAGS; the + guard expands to
+# nothing there. COMPOSE is never empty today, but is guarded the same way.
+${COMPOSE[@]+"${COMPOSE[@]}"} -p "$SMOKE_PROJECT" down --remove-orphans \
+    ${VOLUME_FLAGS[@]+"${VOLUME_FLAGS[@]}"}
 echo ">> done (images kept: ghcr.io/viktor45/fumox:latest, ghcr.io/viktor45/fumox-meow:latest)"

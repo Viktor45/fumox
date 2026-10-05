@@ -189,8 +189,14 @@ fn scan_yaml_line(
         // whitespace or a structural character. `:` counts even without a
         // following space: block-context `key:*a` is a plain scalar, but a
         // missed alias is a hole while a rejected odd scalar is only a
-        // parse error, so the boundary set is biased wide.
-        let boundary = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b',' | b'[' | b'{' | b':');
+        // parse error, so the boundary set is biased wide. `?` too: in flow
+        // context libyaml's scanner emits a key token for a bare `?` and
+        // reads `?*a` as an alias even without a space.
+        let boundary = i == 0
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b',' | b'[' | b'{' | b':' | b'?'
+            );
         if *in_double {
             match b {
                 // Escaped byte (possibly a quote): skip it.
@@ -1070,6 +1076,9 @@ mod tests {
             "key:*a\n",
             "x: &a 1\ny: *a\n",
             "folded: >\n  text\nnext: *a\n",
+            // libyaml scans `?*a` in flow context as an alias even without a
+            // space, so a bomb hides behind a `?` from whitespace-only checks.
+            "a: [?*a, ?*b]\n",
         ] {
             assert!(
                 reject_yaml_aliases(payload).is_err(),

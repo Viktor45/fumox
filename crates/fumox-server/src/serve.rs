@@ -494,8 +494,7 @@ where
                 match ended.borrow_and_update().clone() {
                     InlineOutcome::Failed { status, message } => {
                         return error_response(
-                            StatusCode::from_u16(status)
-                                .unwrap_or(StatusCode::BAD_GATEWAY),
+                            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                             &message,
                         );
                     }
@@ -526,10 +525,7 @@ where
                 "render timed out".to_string(),
             );
             drop(claim);
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "render timed out",
-            );
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "render timed out");
         }
     };
     let rendered = Arc::new(rendered);

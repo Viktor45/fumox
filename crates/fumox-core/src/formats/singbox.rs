@@ -58,12 +58,14 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
             m.insert("server".into(), Value::String(entry.host.clone()));
             m.insert("server_port".into(), num(entry.port));
             m.insert("uuid".into(), Value::String(entry.credential.clone()));
-            m.insert(
-                "security".into(),
-                Value::String(entry.param("scy").unwrap_or("auto").to_string()),
-            );
-            let alter_id = entry
-                .param("aid")
+            // vmess JSON spells the cipher `scy` and the alter id `aid`, Clash
+            // YAML `cipher`/`alterId`; read both or the proxy silently defaults.
+            let cipher = super::param_value(entry, "scy")
+                .or_else(|| super::param_value(entry, "cipher"))
+                .unwrap_or_else(|| "auto".into());
+            m.insert("security".into(), Value::String(cipher));
+            let alter_id = super::param_value(entry, "aid")
+                .or_else(|| super::param_value(entry, "alterId"))
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
             // `as u16` silently truncated (aid=65536 became 0) while the
@@ -463,6 +465,34 @@ mod tests {
         assert_eq!(
             clash.get("servername").and_then(|v| v.as_str()),
             Some("s.example.com")
+        );
+    }
+
+    /// A Clash vmess item spells the cipher `cipher` and the alter id
+    /// `alterId`; the outbound writer must keep both, not default them.
+    #[test]
+    fn vmess_from_clash_input_keeps_cipher_and_alter_id() {
+        let yaml = "proxies:\n  - {name: c, type: vmess, server: h.example.com, port: 443, \
+                    uuid: uuid-2, cipher: aes-128-gcm, alterId: 4}\n";
+        let e = &crate::parsers::clash::parse_payload(yaml).unwrap().entries[0];
+
+        let v = entry_to_outbound(e).unwrap();
+        assert_eq!(str_field(&v, "security"), Some("aes-128-gcm"));
+        assert_eq!(field(&v, "alter_id").and_then(Value::as_u64), Some(4));
+
+        // The two writers must agree for the same entry.
+        let clash = crate::formats::clash::entry_to_clash(e).unwrap();
+        assert_eq!(
+            clash
+                .get(serde_norway::Value::from("cipher"))
+                .and_then(serde_norway::Value::as_str),
+            Some("aes-128-gcm")
+        );
+        assert_eq!(
+            clash
+                .get(serde_norway::Value::from("alterId"))
+                .and_then(serde_norway::Value::as_u64),
+            Some(4)
         );
     }
 

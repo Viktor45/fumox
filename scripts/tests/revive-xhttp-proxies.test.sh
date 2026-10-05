@@ -55,6 +55,14 @@ $1"
     note "output matches /$2/"
 }
 
+assert_no_output() { # output pattern
+    if grep -Eq "$2" <<<"$1"; then
+        fail "expected no output matching /$2/, got:
+$1"
+    fi
+    note "no output matches /$2/"
+}
+
 # ── Scratch database ─────────────────────────────────────────────
 # Mirrors the production column names/types the script reads and writes
 # (proxies, sources, proxy_source_links, probe_requests), not the whole
@@ -177,6 +185,117 @@ expect_eq "unlinked row adopted into the source" \
     "$(q "SELECT COUNT(*) FROM proxy_source_links WHERE proxy_id = 2 AND source_id = 'srcA0000000'")" "1"
 expect_eq "both rows enqueued" "$(q "SELECT COUNT(*) FROM probe_requests")" "2"
 expect_eq "non-xhttp row still untouched" "$(q "SELECT status FROM proxies WHERE id = 3")" "removed"
+
+# ── --adopt-source never reaches SQL raw ─────────────────────────
+# A fresh unlinked removed row so the adoption block runs below; every run
+# in this block is dry, so it survives all of them.
+q "INSERT INTO proxies (id, scheme, params, status, fail_count, removed_at, updated_at)
+   VALUES (5, 'vless', '{\"type\":\"xhttp\"}', 'removed', 1, 500, 500)"
+
+# The injection payload: interpolated raw this dropped the proxies table
+# before any backup was taken, even in a dry run.
+set +e
+OUT="$("$SCRIPT" --dry-run --include-unlinked --adopt-source "x'; DROP TABLE proxies;--" "$DB" 2>&1)"
+CODE=$?
+set -e
+expect_eq "injection attempt exit code" "$CODE" "67"
+assert_output "$OUT" "no source matches"
+expect_eq "injection left the proxies table in place" "$(q 'SELECT COUNT(*) FROM proxies')" "5"
+
+# Escaping rather than refusing: a legitimate name that carries quotes must
+# still match, or every source with an apostrophe would become unadoptable.
+q "INSERT INTO sources (id, slug, name, enabled, pipeline, created_at)
+   VALUES ('srcC0000000', 'quoted', 'O''Brien''s list', 1, NULL, 1200)"
+OUT="$("$SCRIPT" --dry-run --include-unlinked --adopt-source "O'Brien's list" "$DB" 2>&1)" || fail "quoted-name run failed:
+$OUT"
+assert_output "$OUT" "adopt into: O'Brien's list \(srcC0000000\)"
+assert_output "$OUT" "enabled, no drop rules"
+assert_output "$OUT" "would revive 1 row\(s\)"
+expect_eq "dry run still writes no backup" "$(count_backups)" "2"
+
+# ── a pipe in a source name cannot shift the report's split ──────
+# The name rides last in the sqlite3 rows so the fields the classification
+# reads (enabled, drops) cannot be pushed out of place by a 'foo|bar' name.
+q "INSERT INTO sources (id, slug, name, enabled, pipeline, created_at)
+   VALUES ('srcB0000000', 'beta', 'Beta|Gamma', 1, NULL, 900)"
+
+# Ranked path: created_at 900 makes the pipe-named source the preferred
+# adoption target over Alpha, so it is the one the report has to classify.
+OUT="$("$SCRIPT" --dry-run --include-unlinked "$DB" 2>&1)" || fail "ranked adoption run failed:
+$OUT"
+assert_output "$OUT" "adopt into: Beta|Gamma \(srcB0000000\)"
+assert_output "$OUT" "enabled, no drop rules"
+assert_no_output "$OUT" "has 1 drop rule"
+
+# Explicit path: matched by the pipe-bearing name itself.
+OUT="$("$SCRIPT" --dry-run --include-unlinked --adopt-source 'Beta|Gamma' "$DB" 2>&1)" || fail "pipe-name run failed:
+$OUT"
+assert_output "$OUT" "adopt into: Beta|Gamma \(srcB0000000\)"
+assert_output "$OUT" "enabled, no drop rules"
+assert_no_output "$OUT" "has 1 drop rule"
+
+# ── a database the script cannot read is a hard error ────────────
+# An exclusive lock used to leave the census empty and the run saying
+# "Nothing to revive." with exit 0, with no hint anything had gone wrong.
+LOCK_FIFO="$WORK/census-lock.fifo"
+mkfifo "$LOCK_FIFO"
+sqlite3 "$DB" <"$LOCK_FIFO" >/dev/null 2>&1 &
+LOCK_PID=$!
+exec 9>"$LOCK_FIFO"
+# The BEGIN is re-issued until the lock actually bites: the locker's own
+# busy timeout is 0, so one that races a lock the previous scenario was
+# still releasing fails once and would otherwise idle for good.
+LOCKED=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    kill -0 "$LOCK_PID" 2>/dev/null || break
+    printf 'BEGIN EXCLUSIVE;\n' >&9 2>/dev/null || break
+    if ! sqlite3 -cmd ".timeout 0" "$DB" 'SELECT count(*) FROM sqlite_master;' >/dev/null 2>&1; then
+        LOCKED=1
+        break
+    fi
+    sleep 0.1
+done
+[[ "$LOCKED" -eq 1 ]] || fail "could not take the exclusive lock this test needs"
+set +e
+OUT="$(FUMOX_SQLITE_BUSY_TIMEOUT_MS=50 "$SCRIPT" --dry-run "$DB" 2>&1)"
+CODE=$?
+set -e
+printf '.quit\n' >&9
+exec 9>&-
+wait "$LOCK_PID" 2>/dev/null || true
+expect_eq "locked census exit code" "$CODE" "75"
+assert_output "$OUT" "could not read the census"
+# The success verdict as its own line must be gone (the error text itself
+# mentions the phrase, so the pattern is anchored to the whole line).
+assert_no_output "$OUT" '^Nothing to revive\.$'
+expect_eq "locked run left the row removed" "$(q 'SELECT status FROM proxies WHERE id = 5')" "removed"
+
+# ── the error path cannot offer the bare cp the header forbids ───
+# A stub sqlite3 that corrupts exactly the revival batch drives the run
+# down the count-parse-failure exit, whose undo advice must not be a bare cp.
+REAL_SQLITE3="$(command -v sqlite3)"
+mkdir -p "$WORK/stub"
+cat >"$WORK/stub/sqlite3" <<STUB
+#!/bin/sh
+input=\$(cat)
+case "\$input" in
+  *xhttp_revive*) printf 'stub noise, no pipe-separated counts here\n'; exit 0 ;;
+esac
+printf '%s' "\$input" | "$REAL_SQLITE3" "\$@"
+STUB
+chmod +x "$WORK/stub/sqlite3"
+set +e
+OUT="$(PATH="$WORK/stub:$PATH" "$SCRIPT" --include-unlinked "$DB" 2>&1 </dev/null)"
+CODE=$?
+set -e
+expect_eq "count parse failure exit code" "$CODE" "70"
+assert_output "$OUT" "could not read the revived count back from sqlite3"
+assert_output "$OUT" "the backup .* is intact. To undo, stop the daemon"
+assert_no_output "$OUT" "restore with: cp"
+BACKUP_PATH="$(grep -oE "$DB\.pre-xhttp-revival-[0-9]+-[0-9]+" <<<"$OUT" | head -1)"
+[[ -n "$BACKUP_PATH" && -f "$BACKUP_PATH" ]] || fail "the undo advice names a backup that does not exist: ${BACKUP_PATH:-<none>}"
+note "the undo advice names a backup that exists"
+expect_eq "parse failure left row 5 removed" "$(q 'SELECT status FROM proxies WHERE id = 5')" "removed"
 
 echo
 echo "revive-xhttp-proxies.sh: all checks passed"

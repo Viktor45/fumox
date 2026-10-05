@@ -638,6 +638,16 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
                     .replace("{}", &caps::ACCESS_TOKEN.to_string())
             ));
         }
+        // The serve link embeds the token unescaped in `?token=…`, so
+        // only unreserved ASCII (the profile form's charset) round-trips.
+        if let Some(token) = p.access_token.as_deref()
+            && !token.is_empty()
+            && !token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+        {
+            errors.push(format!("{ctx}: {}", lang.t("val.token_format")));
+        }
         if let Some(pipeline) = p.pipeline.as_ref() {
             if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
                 errors.push(format!(
@@ -969,6 +979,45 @@ mod tests {
         // A proper-length token passes validation.
         let mut ok = profile("p", None, &[]);
         ok.access_token = Some("a".repeat(32));
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: Vec::new(),
+            profiles: vec![ok],
+        };
+        let errors = validate_import(&state, &lang, &file).await;
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A third-party token must round-trip unescaped in `?token=…`, so
+    /// validation mirrors the profile form's unreserved-ASCII rule.
+    #[tokio::test]
+    async fn import_rejects_tokens_outside_the_url_charset() {
+        let state = test_state().await;
+        let lang = state.locales.default_lang();
+
+        // Right length, so only the charset rule can reject these.
+        for token in [
+            format!("{} ", "a".repeat(caps::IMPORT_TOKEN_MIN)),
+            "ё".repeat(caps::IMPORT_TOKEN_MIN),
+        ] {
+            let mut planted = profile("p", None, &[]);
+            planted.access_token = Some(token.clone());
+            let file = ConfigExport {
+                version: SUPPORTED_VERSION,
+                exported_at: 1,
+                sources: Vec::new(),
+                profiles: vec![planted],
+            };
+            let errors = validate_import(&state, &lang, &file).await;
+            assert!(
+                !errors.is_empty(),
+                "token {token:?} must be rejected by the charset rule"
+            );
+        }
+
+        let mut ok = profile("p", None, &[]);
+        ok.access_token = Some(format!("{}-_.~", "a".repeat(caps::IMPORT_TOKEN_MIN)));
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
             exported_at: 1,

@@ -1247,6 +1247,11 @@ pub const T2_SCHEMES: &[&str] = &[
     "anytls",
 ];
 
+/// Schemes whose quarantined rows revive through the T2 tunnel check — a TCP
+/// connect to a QUIC port proves nothing. Exactly hysteria2; tuic/mieru keep
+/// the T1 recheck ladder.
+pub const T2_REVIVAL_SCHEMES: &[&str] = &["hysteria2"];
+
 /// Random sample of probeable proxies for one T1 cycle.
 ///
 /// Eligible: `unknown` or `alive` (quarantine rows follow their own
@@ -1353,23 +1358,54 @@ pub async fn oldest_quarantined_at(pool: &DbPool) -> crate::Result<Option<i64>> 
 /// carries exactly one `ladder_at` (NULL only while a check is in flight),
 /// so a single comparison suffices and the failed step travels in
 /// `ladder_step`.
+///
+/// Rows of the [`T2_REVIVAL_SCHEMES`] schemes are not offered here — their
+/// lane is [`select_due_quarantine_t2`], so a due row is never charged by
+/// both lanes in one cycle.
 pub async fn select_due_quarantine(
     pool: &DbPool,
     now: i64,
     limit: u32,
 ) -> crate::Result<Vec<DueQuarantine>> {
-    let rows: Vec<DueQuarantine> = sqlx::query_as(
+    let excluded = vec!["?"; T2_REVIVAL_SCHEMES.len()].join(", ");
+    let sql = format!(
         "SELECT id, scheme, host, port, params, ladder_step
          FROM proxies
          WHERE status = 'quarantine' AND ladder_at IS NOT NULL AND ladder_at <= ?
+           AND scheme NOT IN ({excluded})
          ORDER BY RANDOM()
-         LIMIT ?",
-    )
-    .bind(now)
-    .bind(i64::from(limit))
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+         LIMIT ?"
+    );
+    let mut query = sqlx::query_as::<_, DueQuarantine>(sqlx::AssertSqlSafe(sql.as_str()));
+    query = query.bind(now);
+    for scheme in T2_REVIVAL_SCHEMES {
+        query = query.bind(scheme);
+    }
+    Ok(query.bind(i64::from(limit)).fetch_all(pool).await?)
+}
+
+/// The T2 counterpart of [`select_due_quarantine`]: due rows of the
+/// [`T2_REVIVAL_SCHEMES`] schemes, as full rows — the tunnel check needs the
+/// credentials and the ladder step that [`DueQuarantine`] omits.
+pub async fn select_due_quarantine_t2(
+    pool: &DbPool,
+    now: i64,
+    limit: u32,
+) -> crate::Result<Vec<ProxyRow>> {
+    let supported = vec!["?"; T2_REVIVAL_SCHEMES.len()].join(", ");
+    let sql = format!(
+        "SELECT p.* FROM proxies p
+         WHERE p.status = 'quarantine' AND p.ladder_at IS NOT NULL AND p.ladder_at <= ?
+           AND p.scheme IN ({supported})
+         ORDER BY RANDOM()
+         LIMIT ?"
+    );
+    let mut query = sqlx::query_as::<_, ProxyRow>(sqlx::AssertSqlSafe(sql.as_str()));
+    query = query.bind(now);
+    for scheme in T2_REVIVAL_SCHEMES {
+        query = query.bind(scheme);
+    }
+    Ok(query.bind(i64::from(limit)).fetch_all(pool).await?)
 }
 
 /// Apply a successful check: `status_to` picks the tier (a T1 success never
@@ -3477,6 +3513,70 @@ mod tests {
             due.into_iter().map(|d| (d.id, d.ladder_step)).collect();
         assert_eq!(steps[&early], 0);
         assert_eq!(steps[&ladder], 2);
+    }
+
+    /// Quarantine dues split by revival lane: [`T2_REVIVAL_SCHEMES`] rows come
+    /// back only from [`select_due_quarantine_t2`], everything else only from
+    /// [`select_due_quarantine`] — a due row must not be charged by both lanes.
+    #[tokio::test]
+    async fn quarantine_dues_split_by_revival_kind() {
+        let pool = temp_pool().await;
+        let vless = seed_proxy(&pool, "vless", "v.example.com").await;
+        let hysteria2 = seed_proxy(&pool, "hysteria2", "hy.example.com").await;
+        let tuic = seed_proxy(&pool, "tuic", "tu.example.com").await;
+        for id in [vless, hysteria2, tuic] {
+            sqlx::query(
+                "UPDATE proxies SET status = 'quarantine', quarantined_at = 0, ladder_at = 100, ladder_step = 0 WHERE id = ?",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let mut t1_ids: Vec<i64> = select_due_quarantine(&pool, 5_000, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|d| d.id)
+            .collect();
+        t1_ids.sort();
+        assert_eq!(t1_ids, vec![vless, tuic]);
+
+        // Full rows: the revival check needs credentials and the ladder step.
+        let t2_due = select_due_quarantine_t2(&pool, 5_000, 100).await.unwrap();
+        let t2_ids: Vec<i64> = t2_due.iter().map(|row| row.id).collect();
+        assert_eq!(t2_ids, vec![hysteria2]);
+        assert_eq!(t2_due[0].scheme, "hysteria2");
+        assert_eq!(t2_due[0].ladder_step, 0);
+
+        // Not yet due: nothing comes back from either lane.
+        assert!(
+            select_due_quarantine(&pool, 50, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            select_due_quarantine_t2(&pool, 50, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `T2_REVIVAL_SCHEMES` must equal the intersection of [`T1_EXCLUDED_SCHEMES`]
+    /// and [`T2_SCHEMES`]: a scheme entering or leaving either set updates this
+    /// const in the same change.
+    #[test]
+    fn t2_revival_schemes_intersect_t1_excluded_with_t2_supported() {
+        let revival: Vec<&str> = T1_EXCLUDED_SCHEMES
+            .iter()
+            .filter(|scheme| T2_SCHEMES.contains(scheme))
+            .copied()
+            .collect();
+        assert_eq!(T2_REVIVAL_SCHEMES, revival.as_slice());
+        assert_eq!(T2_REVIVAL_SCHEMES, ["hysteria2"]);
     }
 
     #[tokio::test]

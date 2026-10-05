@@ -144,8 +144,8 @@ struct SettingsEditTemplate {
     active: &'static str,
     csrf: String,
     state: AdminState,
-    /// Raw form values keyed by `<section>.<field>`. Booleans are
-    /// stored as `"on"` when the box was ticked, absent otherwise.
+    /// Raw form values keyed by `<section>.<field>`. Booleans carry the
+    /// checkbox literals: `"on"`, `"off"` (hidden input) or absent.
     raw: HashMap<String, String>,
     /// `(field, message)` pairs produced by the validator.
     errors: Vec<(String, String)>,
@@ -164,7 +164,9 @@ impl SettingsEditTemplate {
     }
 
     fn bool_value(&self, field: &str) -> bool {
-        self.raw.get(field).is_some_and(|v| !v.is_empty())
+        // Same literals the save parser accepts: the failed-save replay
+        // must re-render hidden `value="off"` inputs unchecked.
+        parse_bool_literal(self.raw_value(field)).unwrap_or(false)
     }
 
     /// First error message attached to a field, if any.
@@ -432,9 +434,8 @@ fn raw_from_config(c: &AppConfig) -> HashMap<String, String> {
         "meow.backoff_max_secs".into(),
         m.backoff_max_secs.to_string(),
     );
-    // `bool_to_raw`, not `to_string()`: the edit page reads presence as
-    // truth (an unchecked checkbox is simply absent from the form), so a
-    // literal "false" would render the box as checked.
+    // `bool_to_raw`, not `to_string()`: the edit page renders checkbox
+    // state from the raw map, where empty means unchecked.
     raw.insert("meow.ipv6".into(), bool_to_raw(m.ipv6));
 
     raw.insert(
@@ -465,6 +466,7 @@ fn rate_into(raw: &mut HashMap<String, String>, prefix: &str, rl: &RateLimit) {
     );
 }
 
+/// The raw-map render of a stored boolean; [`SettingsEditTemplate::bool_value`] reads it back.
 fn bool_to_raw(b: bool) -> String {
     if b { "on".to_string() } else { String::new() }
 }
@@ -487,6 +489,15 @@ fn geo_db_str(d: GeoDbKind) -> &'static str {
         GeoDbKind::Country => "country",
         GeoDbKind::City => "city",
         GeoDbKind::Asn => "asn",
+    }
+}
+
+/// Exactly the lowercase levels `LogLevel` deserializes: one bad value
+/// fails `config::load` and aborts both binaries at the next start.
+fn log_level_raw(s: &str) -> Option<String> {
+    match s {
+        "error" | "warn" | "info" | "debug" | "trace" => Some(s.to_string()),
+        _ => None,
     }
 }
 
@@ -1143,7 +1154,7 @@ fn apply_all(
         cfg,
         "log.server",
         &["error", "warn", "info", "debug", "trace"],
-        |s| Some(s.to_string()),
+        log_level_raw,
         lang,
         errors,
     );
@@ -1153,7 +1164,7 @@ fn apply_all(
         cfg,
         "log.probe",
         &["error", "warn", "info", "debug", "trace"],
-        |s| Some(s.to_string()),
+        log_level_raw,
         lang,
         errors,
     );
@@ -1280,6 +1291,12 @@ fn u64_field(
         errors.push((field.into(), out_of_range(field, parsed, lang)));
         return;
     }
+    // `item::integer` stores an `i64`, so a larger `u64` wraps negative
+    // on the write and the saved config fails to load at the next start.
+    if parsed > i64::MAX as u64 {
+        errors.push((field.into(), format!("must be at most {}", i64::MAX)));
+        return;
+    }
     set_field(cfg, field, target, item::integer(parsed as i64), errors);
 }
 
@@ -1331,6 +1348,16 @@ fn usize_field(
     set_field(cfg, field, target, item::integer(parsed as i64), errors);
 }
 
+/// The literals a settings checkbox can carry. Save and replay
+/// (`bool_value`) must accept exactly this set to agree.
+fn parse_bool_literal(v: &str) -> Option<bool> {
+    match v {
+        "" | "off" | "false" | "0" => Some(false),
+        "on" | "true" | "1" => Some(true),
+        _ => None,
+    }
+}
+
 fn bool_field(
     raw: &HashMap<String, String>,
     field: &str,
@@ -1341,13 +1368,9 @@ fn bool_field(
     // Booleans default to `false` when the checkbox was absent, the
     // browser drops unchecked checkboxes from the form submission.
     let v = raw_get(raw, field).unwrap_or("");
-    let b = match v {
-        "" | "off" | "false" | "0" => false,
-        "on" | "true" | "1" => true,
-        other => {
-            errors.push((field.into(), format!("unexpected bool literal: {other}")));
-            return;
-        }
+    let Some(b) = parse_bool_literal(v) else {
+        errors.push((field.into(), format!("unexpected bool literal: {v}")));
+        return;
     };
     set_field(cfg, field, target, item::boolean(b), errors);
 }
@@ -1742,13 +1765,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A `false` boolean must reach the edit page as an ABSENT raw value:
-    /// `bool_value` reads presence as truth, so storing the literal "false"
-    /// would render the box as checked: the raw map is the whole contract.
+    /// A `false` boolean must reach the edit page as an EMPTY raw value,
+    /// the unchecked render `bool_value` re-reads via `parse_bool_literal`.
     #[test]
     fn meow_ipv6_raw_value_round_trips_as_a_checkbox() {
-        // `bool_value` reads a non-empty value as true, so `false` has to
-        // land as an empty string, the literal "false" would check the box.
         let mut cfg = AppConfig::default();
         cfg.meow.ipv6 = false;
         assert_eq!(
@@ -2094,5 +2114,154 @@ mod tests {
             bounds::display("probe.sample_size", "and up").as_deref(),
             Some("0..=100000")
         );
+    }
+
+    /// Regression: the replay rendered every hidden `value="off"` input
+    /// as ticked, so resubmitting silently re-enabled settings.
+    #[test]
+    fn checkbox_replay_reads_the_literals_the_save_parser_accepts() {
+        for (literal, checked) in [
+            ("on", true),
+            ("true", true),
+            ("1", true),
+            ("off", false),
+            ("false", false),
+            ("0", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                parse_bool_literal(literal),
+                Some(checked),
+                "literal {literal:?} must parse as {checked}"
+            );
+        }
+        // An unknown literal is refused; an absent entry reads as the
+        // empty-string default.
+        assert_eq!(parse_bool_literal("maybe"), None);
+    }
+
+    /// Every hidden `value="off"` input must be followed by its checkbox
+    /// rendered through `bool_value`; anything else re-breaks the replay.
+    #[test]
+    fn every_hidden_off_pair_renders_through_bool_value() {
+        let template = include_str!("../../../templates/settings_edit.html");
+        let mut pairs = 0;
+        let mut lines = template.lines();
+        while let Some(line) = lines.next() {
+            if !line.contains(r#"type="hidden""#) || !line.contains(r#"value="off""#) {
+                continue;
+            }
+            pairs += 1;
+            let checkbox = lines.next().unwrap_or("");
+            assert!(
+                checkbox.contains(r#"type="checkbox""#) && checkbox.contains("self.bool_value("),
+                "hidden off input must be followed by its bool_value checkbox, got: {checkbox}"
+            );
+        }
+        assert!(pairs >= 8, "template parsing broke: {pairs} pairs");
+    }
+
+    /// Regression: the `[log]` dropdowns accepted any string, and a level
+    /// the canonical loader refuses aborts both binaries at the next start.
+    #[test]
+    fn apply_all_rejects_an_unknown_log_level() {
+        let dir = temp_dir("log-bad");
+        let path = write_minimal_config(&dir);
+
+        for field in ["log.server", "log.probe"] {
+            let mut raw = HashMap::new();
+            raw.insert(field.into(), "verbose".into());
+
+            let lang = test_lang();
+            let mut errors = Vec::new();
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+            assert!(
+                collect_field(&errors, field).is_some(),
+                "{field} = verbose must be refused, got {errors:?}"
+            );
+            assert!(
+                !cfg.doc().to_string().contains("verbose"),
+                "the refused level must not reach the document"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every dropdown level must save and reload through the canonical
+    /// loader; the set is `LogLevel`'s serde render.
+    #[test]
+    fn log_levels_round_trip_through_the_canonical_loader() {
+        use fumox_core::config::{LogLevel, load_config};
+
+        let dir = temp_dir("log-roundtrip");
+        let path = write_minimal_config(&dir);
+        let lang = test_lang();
+
+        for level in [
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            let mut raw = HashMap::new();
+            raw.insert("log.server".into(), level.as_str().into());
+            raw.insert("log.probe".into(), level.as_str().into());
+
+            let mut errors = Vec::new();
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            assert!(errors.is_empty(), "{level:?} must be accepted: {errors:?}");
+            cfg.save().unwrap();
+
+            let loaded = load_config(Some(&path)).expect("the saved level must load");
+            assert_eq!(loaded.log.server, level);
+            assert_eq!(loaded.log.probe, level);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: a value above `i64::MAX` wrapped negative on the
+    /// write, and the saved config failed `config::load`.
+    #[test]
+    fn u64_field_refuses_a_value_that_does_not_fit_the_document_i64() {
+        use fumox_core::config::load_config;
+
+        let dir = temp_dir("i64-fit");
+        let path = write_minimal_config(&dir);
+        let lang = test_lang();
+
+        for (value, accepted) in [
+            ("1024".to_string(), true),
+            (i64::MAX.to_string(), true),
+            ((i64::MAX as u64 + 1).to_string(), false),
+            (u64::MAX.to_string(), false),
+        ] {
+            let mut raw = HashMap::new();
+            raw.insert("fetch.max_response_bytes".into(), value.clone());
+
+            let mut errors = Vec::new();
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+            assert_eq!(
+                collect_field(&errors, "fetch.max_response_bytes").is_some(),
+                !accepted,
+                "fetch.max_response_bytes = {value}, errors: {errors:?}"
+            );
+            if accepted {
+                cfg.save().unwrap();
+                let loaded = load_config(Some(&path)).expect("the saved value must load");
+                assert_eq!(loaded.fetch.max_response_bytes.to_string(), value);
+            } else {
+                assert!(
+                    load_config(Some(&path)).is_ok(),
+                    "the refused value must not have been written"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

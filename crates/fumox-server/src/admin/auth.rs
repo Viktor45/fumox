@@ -318,9 +318,18 @@ impl RateLimiter {
     pub async fn refund(&self, key: &str) {
         let init = async { Ok::<_, std::convert::Infallible>(Arc::new(AtomicU64::new(0))) };
         if let Ok(counter) = self.counters.try_get_with(key.to_string(), init).await {
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |hits| {
-                Some(hits.saturating_sub(1))
-            });
+            let mut current = counter.load(Ordering::Relaxed);
+            loop {
+                match counter.compare_exchange_weak(
+                    current,
+                    current.saturating_sub(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
         }
     }
 }

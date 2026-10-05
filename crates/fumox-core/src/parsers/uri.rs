@@ -357,9 +357,10 @@ fn check_param_size(key: &str, value: &str) -> Result<(), String> {
 /// Empty-key params serialize as empty segments, reproducing the occasional
 /// `?&k=v` / `k=v&` quirks of real feeds.
 ///
-/// Keys and values go through `encode_query_delimiters` first: a value
-/// carrying a raw `&` or `#` would split into a bogus extra parameter and
-/// swallow the proxy name on re-parse.
+/// Keys go through `encode_query_key`, values through
+/// `encode_query_delimiters`: a key carrying a raw `=` would shift the
+/// first-`=` split on re-parse, and a value carrying a raw `&` or `#` would
+/// split into a bogus extra parameter and swallow the proxy name.
 pub fn serialize_query(params: &[Param]) -> String {
     params
         .iter()
@@ -369,7 +370,7 @@ pub fn serialize_query(params: &[Param]) -> String {
             } else {
                 format!(
                     "{}={}",
-                    encode_query_delimiters(&p.key),
+                    encode_query_key(&p.key),
                     encode_query_delimiters(&p.value)
                 )
             }
@@ -390,15 +391,26 @@ pub fn serialize_query(params: &[Param]) -> String {
 /// *decoded* text (`/search?q=1&host=evil`) come back out of a re-parse as
 /// the single value it was.
 fn encode_query_delimiters(raw: &str) -> Cow<'_, str> {
-    fn must_encode(ch: char) -> bool {
-        matches!(ch, '&' | '#' | ' ' | '\u{7f}') || ch.is_control()
+    encode_query_chars(raw, false)
+}
+
+/// The key half of a pair additionally escapes `=`: `parse_query` splits on
+/// the *first* `=`, so a raw `=` in a key shifts the split and forges a
+/// parameter. A value keeps its raw `=` and round-trips byte-for-byte.
+fn encode_query_key(raw: &str) -> Cow<'_, str> {
+    encode_query_chars(raw, true)
+}
+
+fn encode_query_chars(raw: &str, in_key: bool) -> Cow<'_, str> {
+    fn must_encode(ch: char, in_key: bool) -> bool {
+        matches!(ch, '&' | '#' | ' ' | '\u{7f}') || ch.is_control() || (in_key && ch == '=')
     }
-    if !raw.chars().any(must_encode) {
+    if !raw.chars().any(|ch| must_encode(ch, in_key)) {
         return Cow::Borrowed(raw);
     }
     let mut out = String::with_capacity(raw.len() * 3);
     for ch in raw.chars() {
-        if must_encode(ch) {
+        if must_encode(ch, in_key) {
             let mut buf = [0u8; 4];
             for byte in ch.encode_utf8(&mut buf).as_bytes() {
                 out.push_str(&format!("%{byte:02X}"));
@@ -798,6 +810,53 @@ mod tests {
             serialize_query(&params),
             "path=/a%2Fb%20c?d=1&host=%.DE&raw=50%off%26тест"
         );
+    }
+
+    /// A raw `=` in a key used to shift the first-`=` split on re-parse:
+    /// `allowInsecure=x` came back as a *present* `allowInsecure` parameter.
+    #[test]
+    fn equals_sign_in_a_param_key_is_escaped() {
+        let params = vec![Param {
+            key: "allowInsecure=x".into(),
+            value: "1".into(),
+            known: false,
+        }];
+        let query = serialize_query(&params);
+        assert_eq!(query, "allowInsecure%3Dx=1");
+
+        // Round-trip is stable: the escaped key re-serializes to the same
+        // bytes, so no parameter is forged on the way out.
+        let back = parse_query(&query).unwrap();
+        assert_eq!(back[0].key, "allowInsecure%3Dx");
+        assert_eq!(back[0].value, "1");
+        assert_eq!(serialize_query(&back), query);
+
+        // A value keeps its raw `=`.
+        let value = vec![Param {
+            key: "path".into(),
+            value: "/a=b".into(),
+            known: true,
+        }];
+        assert_eq!(serialize_query(&value), "path=/a=b");
+        let back = parse_query("path=/a=b").unwrap();
+        assert_eq!(back[0].key, "path");
+        assert_eq!(back[0].value, "/a=b");
+
+        // End to end: the full line survives a re-parse unchanged.
+        let entry = ProxyEntry {
+            scheme: Scheme::Vless,
+            name: "n".into(),
+            host: "h.example.com".into(),
+            port: 443,
+            credential: "u".into(),
+            params,
+            raw_path: String::new(),
+            raw_line: String::new(),
+        };
+        let out = serialize_with_spec(&VLESS_SPEC, &entry);
+        let back =
+            parse_with_spec(&VLESS_SPEC, out.strip_prefix("vless://").unwrap(), &out).unwrap();
+        assert_eq!(serialize_with_spec(&VLESS_SPEC, &back), out);
     }
 
     /// A `snell://` line must round-trip: the psk is the userinfo, the

@@ -307,7 +307,10 @@ pub async fn repair_migration_checksums(
     // `wal_checkpoint` reports busy as a *row* (`busy, log, checkpointed`),
     // not as an error, so `execute` discarded it and this line could never
     // fire for the case the comment names. Read the row.
-    match sqlx::query("PRAGMA wal_checkpoint(PASS)").fetch_one(pool).await {
+    match sqlx::query("PRAGMA wal_checkpoint(PASS)")
+        .fetch_one(pool)
+        .await
+    {
         Ok(row) => {
             let busy: i64 = sqlx::Row::try_get(&row, 0).unwrap_or_default();
             if busy != 0 {

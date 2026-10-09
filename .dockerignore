@@ -16,6 +16,24 @@ scripts
 .agents
 .zcode
 .mimosa
+.idea
+.vscode
+.DS_Store
+
+# Local tool/agent scratch dirs and review output. None of these reach the
+# image, but every unexcluded file is still transferred into the build
+# context and re-COPYed on each source change; gui-test-screenshots alone is
+# ~7 MB of PNGs.
+audit-context
+anti-slop
+.rust-review-results
+gui-test-screenshots
+out
+.cargo
+
+# Compose/CLI tooling, not build inputs
+docker-compose.yml
+cliff.toml
 
 # Local build artifacts and databases
 target
@@ -37,8 +55,3 @@ test*.txt
 # file the operator owns).
 config/*
 !config/app.toml
-
-# Editor / OS noise
-.DS_Store
-.idea
-.vscode

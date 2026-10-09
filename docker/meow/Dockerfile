@@ -20,11 +20,16 @@
 # platform.
 #
 # Multi-arch: BuildKit supplies TARGETARCH (linux/amd64, linux/arm64).
+#
+# Base image: debian:trixie-slim, the same base as the fumox-server runtime
+# stage, so both containers in the compose stack share a distro and glibc.
+# Nothing meow-rs needs is distro-sensitive (the binary is static musl; the
+# base only contributes ca-certificates and tini).
 
 ARG MEOW_VERSION=latest
 
 # ---- Stage 1: fetch the release binary ---------------------------------------
-FROM debian:bookworm-slim AS fetch
+FROM debian:trixie-slim AS fetch
 ARG MEOW_VERSION
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -54,7 +59,7 @@ RUN set -eux; \
     rm -rf /tmp/meow.tar.gz /tmp/meow-extract
 
 # ---- Stage 2: minimal runtime ------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \

@@ -392,7 +392,7 @@ second_chance_spread_hours = 1
 # schedules recheck N+1 after recheck_delays_secs[N-1]; failing the last
 # entry removes the proxy. Arbitrary length (up to 16 steps of at most 30
 # days); an empty list removes right after the failed second chance.
-recheck_delays_secs = [600, 900]   # 10 мин → 15 мин / 10m → 15m
+recheck_delays_secs = [900]   # 10 мин → 15 мин / 10m → 15m
 # Диапазон: 0..=365 дней (форма), 0 читается как 1 день.
 # Записи очереди приоритетных проверок (probe_requests) старше этого срока
 # удаляются (ежедневная задача ротации).

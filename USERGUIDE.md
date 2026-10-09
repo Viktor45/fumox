@@ -258,7 +258,6 @@ Notes:
   404/504/503 semantics, so an upgrade is a rebuild, not a code change. Set
   `MEOW_VERSION=v0.22.0` in `.env` to pin one (leave it `latest` to track
   upstream HEAD). Note that 0.22.0 replaced rustls with BoringSSL runtime-wide
-  upstream HEAD). Note that 0.22.0 replaced rustls with BoringSSL runtime-wide
   and made `ipv6` effective end-to-end, see `[meow].ipv6` below.
 - **What the 0.22.0 upgrade buys T2 immediately**, with no Fumox change: the
   `xhttp` transport is now a real outbound (0.21.x had no XHTTP at all, so
@@ -820,7 +819,7 @@ deduplicate by fingerprint". `"version": 1` is required.
 | Section  | What it does                                                 | Fields and defaults                                                                                                                |
 | -------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `filter` | Keep/drop protocols and AS numbers; drop proxies allowing insecure TLS | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null, matched against the stored `geo_asn`, the allowlist drops proxies whose ASN was never resolved (both `"24940"` and `"AS24940"` spellings work); `forbid_insecure`: default `true`, drops any proxy with a truthy `insecure`/`allowInsecure`/`skip-cert-verify`/`allow_insecure` toggle (the old `normalize_params` name is still accepted) |
-| `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` default, `host`, `port`, `param:KEY`); rules are OR-ed; default `[]`        |
+| `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` default, `host`, `port`, `param:KEY`, `asn`); an `asn` rule takes no `match`/`flags` and instead requires a non-empty per-rule `asns` list (`"24940"` and `"AS24940"` both work) matched against the proxy's resolved AS number; rules are OR-ed; default `[]` |
 | `rename` | Regex-based rewriting, rules applied in order                | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` default, `host`, `port`, `param:KEY`); default `[]` |
 | `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment))   |
 | `health` | Drop proxies by status                                       | `exclude_statuses`, default `["quarantine", "removed"]`                                                                            |
@@ -852,7 +851,12 @@ matching proxy is thrown away entirely: it never appears in the
 subscription, because it is never written to the database in the first place. The
 rules use the same selectors as rename (`match`, `flags`, `target`; no
 `replace`, the strict schema rejects it) and are OR-ed: a single match
-discards the proxy. They are applied twice, always before `rename` so both
+discards the proxy. The `asn` target is the exception to the regex
+selectors: it takes no `match`/`flags` (the strict schema rejects them) and
+instead requires a non-empty per-rule `asns` list — both `"24940"` and
+`"AS24940"` spellings work — discarding every proxy whose resolved AS
+number is in the list; a proxy whose ASN was never resolved matches
+nothing. They are applied twice, always before `rename` so both
 sides see the original values: at ingestion by the source's own pipeline
 (a matching proxy is not stored, geo-resolved or queued for probing; a
 corrupted config fails closed as a parse error, and if every proxy matches,
@@ -875,7 +879,8 @@ The `fumox-probe` daemon runs an endless cycle (default: every 60 s), each
 cycle in four passes:
 
 1. **Quarantine dues**: second chances and recheck-ladder steps whose moment
-   has arrived;
+   has arrived (quarantined hysteria2 is re-checked through the T2 tunnel,
+   see below);
 2. **Priority queue**: freshly inserted proxies the server queued at source
    refresh time (up to `[ingest].refresh_check_limit` per refresh), drained
    newest first, then removed from the queue before the checks run;
@@ -906,7 +911,11 @@ are never queued (they could not be checked anyway), and a proxy that leaves
 QUIC protocols (hysteria2, tuic) skip T1: a TCP connect to a UDP port proves
 nothing. **hysteria2** is not hurt by that: a fresh `unknown` hysteria2 goes
 straight into the T2 sample and from there follows the regular state machine
-(the failure counter is shared with T1). **tuic and mieru are unprobeable**
+(the failure counter is shared with T1). The T2 path stays open in quarantine:
+a quarantined hysteria2 is revived by a real tunnel check through meow-rs
+rather than a TCP connect that cannot succeed: success returns the row to
+the `ready` tier with a clean slate, and a failed tunnel check advances the
+same recheck ladder as any other scheme. **tuic and mieru are unprobeable**
 altogether (meow-rs doesn't support them): they keep status `unknown` forever,
 always pass health filters, and are badged "unprobeable" in the admin panel.
 Exclude them with `filter.protocols` if you don't want them in a profile.
@@ -925,6 +934,10 @@ stateDiagram-v2
         hysteria2 skips T1
         and goes straight to T2
     end note
+    note right of quarantine
+        quarantined hysteria2
+        revives via a T2 tunnel check
+    end note
 ```
 
 The rules in plain language:
@@ -941,12 +954,18 @@ The rules in plain language:
 - **Second chance.** At a random moment of the **[12 h, 16 h)** window after
   quarantine (`quarantined_at + second_chance_min_hours +
   U(0..second_chance_spread_hours)`, UTC, drawn once and stored) the proxy is
-  re-checked. Success → back to `alive`. The second chance and the ladder
-  steps are T1 checks: a quarantined proxy no longer enters the T2 sample.
+  re-checked. Success → back to `alive`. For every scheme except hysteria2
+  the second chance and the ladder steps are T1 checks, and a quarantined
+  proxy no longer enters the T2 sample. Quarantined hysteria2 is the one
+  exception: its second chance and ladder steps run as T2 tunnel checks
+  through meow-rs (a TCP connect cannot succeed against a QUIC port), and
+  a successful tunnel check revives it straight into `ready`.
 - **Recheck ladder.** After a failed second chance the proxy walks the ladder
   of `[probe].recheck_delays_secs` (default 15 min → 30 min → 1 h): failing
   step N schedules step N+1 after the Nth array entry; failing the last step
-  → `removed`. Any success → `alive`. The ladder length is arbitrary (up to
+  → `removed`. Any success → `alive`; for quarantined hysteria2 the
+  success comes from the T2 tunnel revival and lands in `ready`. The ladder
+  length is arbitrary (up to
   16 steps of at most 30 days); an empty list removes the proxy right after
   the failed second chance. With the defaults, the "quarantine → removed"
   path takes ~13 h 45 min – 17 h 45 min.

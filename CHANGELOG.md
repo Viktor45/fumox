@@ -10,11 +10,21 @@ The categories follow [Keep a Changelog](https://keepachangelog.com/);
 `Docs` covers the user guide and READMEs, `Internal` (dependency bumps,
 CI plumbing) is omitted: it never changes the shipped image.
 
-## Unreleased (2026-10-04)
+## Unreleased (2026-10-05)
 
 Changes in the working tree, not yet on a published image.
 
 ### Added
+
+- An integration test for `scripts/smoke-down.sh`
+  (`scripts/tests/smoke-down.test.sh`): it drives the teardown through
+  a stubbed `docker` and asserts on the compose command the script
+  builds, under the oldest bash on the machine, so the bash 3.2
+  empty-array guard is exercised where it is load-bearing. Needs
+  nothing but bash. The revive-script suite grew the matching negative
+  coverage: the SQL injection payload, a pipe-bearing source name, a
+  census locked by another writer, and the undo advice on the
+  count-parse failure path.
 
 - `[geo].startup_download_budget_secs` (default 60, `0` = do not
   wait): the ceiling on how long startup blocks on the GeoLite2
@@ -66,6 +76,89 @@ Changes in the working tree, not yet on a published image.
   sweep ages the line instead of looking healthy.
 
 ### Fixed
+
+- A quarantined hysteria2 could never come back. Its second chance and
+  ladder steps were plain TCP connects, and a TCP connect to a QUIC
+  port fails unconditionally, so a single T2-blip quarantine walked
+  the row to `removed` on verdicts no check it was given could actually
+  judge. Quarantined rows of the `T2_REVIVAL_SCHEMES` schemes (the
+  intersection of the T1-excluded and T2-supported sets: exactly
+  hysteria2) are now re-checked through a real meow-rs tunnel:
+  success revives the row into the `ready` tier with a clean slate, an
+  authoritative tunnel failure advances the same configured ladder,
+  and a meow-rs outage is journaled unverified and leaves the row due
+  for the next cycle. The two lanes are disjoint by construction, so a
+  due row is never charged twice in one cycle. Guarded by
+  `quarantined_hysteria2_is_revived_by_a_tunnel_check`,
+  `quarantined_hysteria2_tunnel_failure_walks_the_ladder_to_removal`
+  and `quarantined_hysteria2_is_not_charged_for_a_meow_outage`.
+- A bare integer `rate_limit = 300` in `config/app.toml` aborted boot:
+  figment's TOML pipeline delivers integers as `i64`, and the
+  `RateLimit` visitor only implemented `visit_u64`. Guarded by
+  `rate_limit_deserializes_from_bare_toml_integer`.
+- An operator's `RUST_LOG` was silently overridden for sqlx. The
+  `sqlx::query=warn` silencer was chained onto *every* filter, and
+  `EnvFilter::add_directive` replaces a same-target directive, so
+  `RUST_LOG=sqlx::query=debug` was downgraded to warn. The silencer
+  now lives in the fallback only, and a `RUST_LOG` that does not parse
+  falls back to the config level instead of leaving the process
+  without a filter. Guarded by
+  `explicit_rust_log_sqlx_directive_is_not_overridden`.
+- A failed config-editor save could leak the tmp file, which is a
+  full copy of the config carrying `[admin].token`, and a committed
+  save was not durable across a crash: the tmp is removed on failure
+  now, fsynced before the rename, and the parent directory is synced
+  after it. Guarded by `failed_fallback_write_still_removes_the_tmp`.
+- The settings editor accepted values that fail the next boot. A
+  `[log]` level outside the canonical set aborted both binaries at the
+  next start (the dropdowns now accept exactly what `LogLevel`
+  deserializes), and a `u64` field above `i64::MAX` wrapped negative
+  inside the `toml_edit` document, so the saved config failed
+  `config::load` at the next start. Guarded by
+  `apply_all_rejects_an_unknown_log_level` and
+  `u64_field_refuses_a_value_that_does_not_fit_the_document_i64`.
+- A database the revive script cannot read looked like an empty one:
+  an exclusive lock left the census empty and the run saying
+  "Nothing to revive." with exit 0. The census is validated now: a
+  sqlite3 failure exits 75 with instructions, a census that is not
+  four counts exits 70, and the post-backup abort advice comes from
+  one `undo_hint`, never a bare `cp`, which the script's own header
+  forbids.
+- A pipe in a source name shifted the revive script's adoption
+  classification: the name rode mid-row in the sqlite3 output, so a
+  `foo|bar` name pushed the `enabled`/`drops` fields out of place and
+  could route the adoption into the wrong safety branch. The name is
+  selected last now. Guarded by the pipe-name scenarios in
+  `scripts/tests/revive-xhttp-proxies.test.sh`.
+- The sing-box vmess output dropped a Clash-sourced cipher and alter
+  id: the writer read only the JSON spellings (`scy`/`aid`), so an
+  entry parsed from Clash YAML (`cipher`/`alterId`) silently exported
+  `security: auto` and `alter_id: 0`. Both spellings are read now.
+  Guarded by `vmess_from_clash_input_keeps_cipher_and_alter_id`.
+- A Shadowsocks entry parsed from a Clash item without `cipher`
+  serialized to an unparsable SIP002 userinfo (no colon between method
+  and password); the export defaults `chacha20-ietf-poly1305` now, the
+  same default the Clash writer applies. Guarded by
+  `clash_ss_without_cipher_defaults_the_method_on_export`.
+- A raw `=` in a URI parameter key forged a parameter on round-trip:
+  `parse_query` splits on the *first* `=`, so a key like
+  `allowInsecure=x` re-parsed as a *present* `allowInsecure`
+  parameter. Keys escape `=` now; values keep theirs byte-for-byte.
+  Guarded by `equals_sign_in_a_param_key_is_escaped`.
+- `scripts/smoke-down.sh --keep-data` aborted on the stock macOS bash
+  3.2: an unquoted empty-array expansion is fatal under `set -u`,
+  exactly the state `--keep-data` puts `VOLUME_FLAGS` in. Both arrays
+  carry the `${arr[@]+"${arr[@]}"}` guard now.
+- A failed database lookup during a *Refresh now* click was folded
+  into the "unknown source" warning; it is logged as an error naming
+  the source now, so a broken database does not masquerade as a stale
+  panel id. Guarded by `refresh_lookup_failure_is_logged_as_an_error`.
+- The rate limiter's `refund` used the deprecated
+  `AtomicU64::fetch_update`, which failed `cargo clippy -D warnings`
+  and broke the CI gate; replaced with a compare-and-swap loop.
+- The probe heartbeat test asserted an exact seconds count that is
+  recomputed from the wall clock at render time; it asserts a
+  600..=660 range now.
 
 - Every page heading collapsed to a character-wide column on a phone.
   `.page-head h1` carried `flex: 1`, which is `flex: 1 1 0%`: a zero
@@ -1011,6 +1104,44 @@ Changes in the working tree, not yet on a published image.
   orphan comma under "last seen" and a row with neither check got a
   `,` in the coverage cell. Both use the en dash the rest of the
   tables use.
+
+### Security
+
+- The settings editor re-enabled toggles on a failed save. Every
+  boolean on the edit form is a checkbox plus a hidden `value="off"`
+  input, and the failed-save replay rendered those hidden inputs
+  through `bool_value`, which read *presence* as truth, so the
+  replayed form came back with every `off` input ticked, and
+  resubmitting it silently turned the settings back on, the
+  security-relevant toggles included. Save and replay now share one
+  `parse_bool_literal` (`on`/`true`/`1` against `off`/`false`/`0`/
+  empty, anything else refused), and a template audit test pins every
+  hidden-off input to a `bool_value` checkbox. Guarded by
+  `checkbox_replay_reads_the_literals_the_save_parser_accepts` and
+  `every_hidden_off_pair_renders_through_bool_value`.
+- `scripts/revive-xhttp-proxies.sh` interpolated `--adopt-source` raw
+  into its sqlite SQL, so
+  `--adopt-source "x'; DROP TABLE proxies;--"` dropped the `proxies`
+  table even under `--dry-run`, before any backup existed. The value's
+  single quotes are doubled through a variable now (bash 3.2 keeps the
+  backslashes of an escaped replacement in `${var//pat/repl}`), the
+  resolved source id is shape-checked against a plain nanoid before
+  its first literal, and `FUMOX_REFRESH_CHECK_LIMIT` must be a plain
+  number before it reaches the `LIMIT` clause. A legitimate name
+  carrying an apostrophe still matches. Guarded by the injection and
+  quoted-name scenarios in `scripts/tests/revive-xhttp-proxies.test.sh`.
+- The YAML alias guard's boundary set missed `?`: in flow context
+  libyaml scans `?*a` as an alias even without a space, so an
+  alias-bomb payload hid behind a `?` from the whitespace-only
+  boundary check. `?` joined the boundary set and the bomb-payload
+  regression list. Guarded by the `a: [?*a, ?*b]` case in the
+  `reject_yaml_aliases` tests.
+- Config import accepted access tokens outside the URL charset. The
+  `/sub/{id}?token=…` serve link embeds the token unescaped, so a
+  token with a space or a non-ASCII character round-trips broken;
+  import now enforces the profile form's unreserved-ASCII rule
+  (`A-Za-z0-9-_.~`). Guarded by
+  `import_rejects_tokens_outside_the_url_charset`.
 
 ### Docs
 

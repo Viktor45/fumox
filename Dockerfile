@@ -1,4 +1,8 @@
-# syntax=docker/dockerfile:1
+# Frontend pinned by digest, not by the floating `:1` tag: an unpinned
+# frontend is re-resolved on every build (14 MB image, ~19 s on a cold
+# cache here) and a future release could change build semantics under us.
+# Bump both parts together: `docker buildx imagetools inspect docker/dockerfile:<ver>`.
+# syntax=docker/dockerfile:1.27@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 #
 # Fumox container image.
 #
@@ -31,16 +35,29 @@
 #       - layers (default): the classic cargo-chef image-layer caching,
 #         works on every builder (docker, podman, CI);
 #       - mounts: persistent BuildKit cache mounts hold the cargo registry
-#         and target dir and enable incremental release builds, so a
-#         source-only change recompiles just the touched crates, docker
-#         compose passes this (docker-compose.yml / FUMOX_BUILD_CACHE in
-#         .env.example).
+#         and target dir and compile a source-only change down to just the
+#         touched crates, docker compose passes this (docker-compose.yml /
+#         FUMOX_BUILD_CACHE in .env.example). It also relaxes the release
+#         profile (no LTO, 16 codegen units) because the persistent target
+#         dir is what makes those rebuilds cheap anyway.
+# CI deliberately stays on `layers`: BuildKit does not export cache-mount
+# contents through the type=gha backend, so the `mounts` incremental win
+# does not exist on a GitHub runner and would only cost the shared layer
+# cache. `layers` is also the only mode every builder (podman-compose)
+# understands.
 # The build is architecture-agnostic: linux/amd64 and linux/arm64 compile
 # natively (.github/workflows/docker.yml); mold and the prebuilt cargo-chef
 # ship for both.
 
 # Global build args (usable in the FROM lines below).
-ARG RUST_VERSION=1.98-slim
+# RUST_VERSION is a full image reference, pinned to the patch level on
+# purpose: a bare 1.98 tag floats, and any 1.98.x patch release rebuilds the
+# chef layer, which invalidates `cargo chef cook` and the whole type=gha
+# cache in CI (~7 min per architecture to recover). Bump it deliberately
+# when you want a toolchain update. `-slim-trixie` matches the runtime base
+# below (Debian 13) explicitly instead of relying on what the plain `-slim`
+# tag happens to alias to.
+ARG RUST_VERSION=1.98.1-slim-trixie
 ARG BUILD_CACHE=layers
 ARG CARGO_CHEF_VERSION=v0.1.78
 
@@ -48,6 +65,14 @@ ARG CARGO_CHEF_VERSION=v0.1.78
 # sqlx links the system SQLite (not bundled), so headers are needed at build;
 # curl + xz-utils fetch and unpack the cargo-chef tarball; mold is the linker.
 FROM rust:${RUST_VERSION} AS chef
+# Validate BUILD_CACHE first, before the apt and cargo-chef work: without this
+# a typo in FUMOX_BUILD_CACHE (.env) surfaces much later as BuildKit's
+# "unknown stage build-foo" from `FROM build-${BUILD_CACHE}`.
+ARG BUILD_CACHE
+RUN case "${BUILD_CACHE}" in \
+        layers|mounts) ;; \
+        *) echo "invalid BUILD_CACHE='${BUILD_CACHE}': expected 'layers' or 'mounts'" >&2; exit 1 ;; \
+    esac
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl libsqlite3-dev pkg-config xz-utils mold \
     && rm -rf /var/lib/apt/lists/*
@@ -102,10 +127,14 @@ RUN cargo build --release --locked \
 # image.
 FROM chef AS build-mounts
 ARG TARGETARCH
-# The persistent target dir below makes incremental release builds pay off:
-# a source-only change then recompiles just the touched crate instead of the
-# whole workspace (the stock release profile has incremental disabled).
-ENV CARGO_PROFILE_RELEASE_INCREMENTAL=true
+# This stage exists for fast LOCAL rebuilds (docker compose passes
+# BUILD_CACHE=mounts), so it trades runtime performance for compile speed:
+# with a persistent target dir below, LTO off + more codegen units means a
+# source-only change relinks quickly instead of re-running ThinLTO over the
+# whole workspace graph. The shipped-image path (BUILD_CACHE=layers, used by
+# CI) keeps the optimized profile from Cargo.toml untouched.
+ENV CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 COPY --from=planner /app/recipe.json .
 RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-target-${TARGETARCH},target=/app/target,sharing=locked \

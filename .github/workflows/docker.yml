@@ -42,6 +42,14 @@ permissions:
 env:
   REGISTRY: ghcr.io
 
+# Supersede in-flight image builds: two tags pushed minutes apart would
+# otherwise compile the same workspace twice (~7 min per architecture) and
+# race each other over the same tags. Manual dispatch is never cancelled,
+# so an operator can still re-run a build deliberately.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 jobs:
   build:
     permissions:

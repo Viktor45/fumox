@@ -44,6 +44,13 @@ permissions:
 env:
   REGISTRY: ghcr.io
 
+# This workflow is dispatch-only, so there is no tag-push stampede to
+# collapse; the group exists so two manual runs started minutes apart for
+# the same ref do not race each other over the same tags.
+concurrency:
+  group: docker-meow-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     permissions:

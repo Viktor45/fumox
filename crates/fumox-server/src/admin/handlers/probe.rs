@@ -1,6 +1,6 @@
 //! Probe overview screen and the SSE event stream.
 
-use super::{fmt_opt_ts_element, fmt_ts_element, server_error};
+use super::{fmt_opt_ts_element, server_error};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::render_html;
@@ -11,6 +11,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use fumox_core::config::ProbeConfig;
+use fumox_core::repo::probe::meta::{LastRotation, MeowMemory};
+use fumox_core::repo::proxies::QuarantineQueueRow;
 use fumox_core::repo::{fetch_log, meta_get, probe as probe_repo, proxies};
 use futures_util::Stream;
 use std::convert::Infallible;
@@ -59,20 +61,9 @@ const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 // Overview screen.
 
-#[derive(Debug, sqlx::FromRow)]
-struct QuarantineRow {
-    id: i64,
-    name: String,
-    host: String,
-    port: i64,
-    scheme: String,
-    quarantined_at: Option<i64>,
-    /// Next scheduled ladder check (0 = second chance, 1.. = recheck N).
-    ladder_at: Option<i64>,
-    ladder_step: i64,
-}
-
-/// Parsed `probe_heartbeat` meta value.
+/// Parsed `probe_heartbeat` meta value. The wire parsing goes through the
+/// shared [`fumox_core::repo::probe::meta::Heartbeat`] contract; this view
+/// adds the staleness verdict the card renders.
 struct Heartbeat {
     ts: i64,
     pid: u32,
@@ -88,15 +79,6 @@ struct Heartbeat {
     alive: bool,
 }
 
-/// Parsed `meow_memory` meta value, stamped by the probe daemon from
-/// meow-rs' `GET /memory`.
-#[derive(serde::Deserialize)]
-struct MeowMemoryView {
-    rss_bytes: u64,
-    os_limit_bytes: u64,
-    ts: i64,
-}
-
 /// Parsed `meow_last_ok` contact stamp with its staleness verdict. A
 /// historical timestamp alone must not render as "available": the card
 /// used to show green for a contact from any point in the past.
@@ -105,21 +87,9 @@ struct MeowContact {
     alive: bool,
 }
 
-/// Parsed `last_rotation` meta value (JSON), stamped by the probe
-/// daemon's retention loop on every run, including runs that deleted
-/// nothing, so the age of `ts` is the "retention is alive" signal.
-struct LastRotation {
-    ts: i64,
-    probe_results: u64,
-    fetch_log: u64,
-}
-
-impl MeowMemoryView {
-    /// RSS as a share of the limit, when meow-rs resolved one.
-    fn percent_of_limit(&self) -> Option<f64> {
-        (self.os_limit_bytes > 0)
-            .then(|| self.rss_bytes as f64 * 100.0 / self.os_limit_bytes as f64)
-    }
+/// RSS as a share of the limit, when meow-rs resolved one.
+fn percent_of_limit(mem: &MeowMemory) -> Option<f64> {
+    (mem.os_limit_bytes > 0).then(|| mem.rss_bytes as f64 * 100.0 / mem.os_limit_bytes as f64)
 }
 
 /// Human-readable byte count, one decimal above a KiB.
@@ -146,9 +116,9 @@ fn fmt_rss_bytes(bytes: u64) -> String {
 /// an escaping handle, so any markup folded in here (a `time` element, say)
 /// reaches the reader as literal `<time ...>` source. The timestamp is
 /// rendered by the template instead, through `ts(..) | safe`.
-fn rss_line(mem: &MeowMemoryView) -> String {
+fn rss_line(mem: &MeowMemory) -> String {
     let mut line = format!("RSS {}", fmt_rss_bytes(mem.rss_bytes));
-    if let Some(pct) = mem.percent_of_limit() {
+    if let Some(pct) = percent_of_limit(mem) {
         line.push_str(&format!(
             " · {pct:.1}% / {}",
             fmt_rss_bytes(mem.os_limit_bytes)
@@ -175,8 +145,9 @@ struct ProbeTemplate {
     /// rotation stamp: a fresh stamp on a growing table is still a leak.
     journal_probe_rows: i64,
     journal_fetch_rows: i64,
-    /// Kernel RSS as published by the probe daemon (`meow_memory` meta).
-    meow_memory: Option<MeowMemoryView>,
+    /// Kernel RSS as published by the probe daemon (`meow_memory` meta,
+    /// parsed through the shared `repo::probe::meta::MeowMemory` contract).
+    meow_memory: Option<MeowMemory>,
     /// Check-coverage buckets (`none`/`t1_only`/`t2_only`/`both`), fixed
     /// order, zero-filled, each links into the filtered proxy browser.
     coverage: Vec<(String, i64)>,
@@ -184,7 +155,7 @@ struct ProbeTemplate {
     /// `proxy_counts`). The `queue` table view is truncated to 50 rows,
     /// so it cannot be used to size the card.
     quarantine_count: i64,
-    queue: Vec<QuarantineRow>,
+    queue: Vec<QuarantineQueueRow>,
     /// Read-only view of `[probe]` settings used by the banner and the
     /// config-snapshot line. Sourced from `AdminState::probe` so the
     /// banner always sees the same config the rest of the page would.
@@ -656,12 +627,6 @@ fn compute_recs(cfg: &ProbeConfig, model: &CycleModel) -> Vec<TuningRec> {
 }
 
 impl ProbeTemplate {
-    fn ts(&self, ts: &i64) -> String {
-        fmt_ts_element(*ts)
-    }
-    fn opt_ts(&self, ts: &Option<i64>) -> String {
-        fmt_opt_ts_element(*ts)
-    }
     fn proxy_total(&self) -> i64 {
         self.proxy_counts.iter().map(|(_, count)| count).sum()
     }
@@ -690,12 +655,12 @@ impl ProbeTemplate {
         self.meow_memory.is_some()
     }
     /// The next scheduled check for a quarantined proxy.
-    fn next_check(&self, row: &QuarantineRow) -> String {
+    fn next_check(&self, row: &QuarantineQueueRow) -> String {
         fmt_opt_ts_element(row.ladder_at)
     }
 
     /// Ladder step label: *second chance* or *recheck N*.
-    fn step_label(&self, row: &QuarantineRow) -> String {
+    fn step_label(&self, row: &QuarantineQueueRow) -> String {
         if row.ladder_step < 1 {
             self.lang.t("probe.step_second_chance").to_string()
         } else {
@@ -846,36 +811,25 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
         Err(err) => return server_error(lang, &err),
     };
 
-    let heartbeat = match meta_get(pool, "probe_heartbeat").await {
-        Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
+    let heartbeat = match meta_get(pool, probe_repo::meta::HEARTBEAT_KEY).await {
+        Ok(Some(raw)) => serde_json::from_str::<probe_repo::meta::Heartbeat>(&raw)
             .ok()
-            .and_then(|value| {
-                let ts = value.get("ts")?.as_i64()?;
-                // The daemon's own beat period, when the record carries it.
-                let interval_secs = value.get("interval_secs").and_then(|v| v.as_u64());
-                // Same for its cycle period, which thresholds the meow card.
-                let cycle_interval_secs = value.get("cycle_interval_secs").and_then(|v| v.as_u64());
-                Some(Heartbeat {
-                    ts,
-                    pid: value.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                    version: value
-                        .get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    // Same threshold the banner applies, so the card and
-                    // the banner can never call the same daemon alive in
-                    // one place and dead in the other.
-                    alive: now - ts <= heartbeat_stale_after(&state.probe, interval_secs),
-                    interval_secs,
-                    cycle_interval_secs,
-                })
+            .map(|hb| Heartbeat {
+                ts: hb.ts,
+                pid: hb.pid,
+                version: hb.version,
+                // Same threshold the banner applies, so the card and
+                // the banner can never call the same daemon alive in
+                // one place and dead in the other.
+                alive: now - hb.ts <= heartbeat_stale_after(&state.probe(), hb.interval_secs),
+                interval_secs: hb.interval_secs,
+                cycle_interval_secs: hb.cycle_interval_secs,
             }),
         Ok(None) => None,
         Err(err) => return server_error(lang, &err),
     };
 
-    let meow_last_ok = match meta_get(pool, "meow_last_ok").await {
+    let meow_last_ok = match meta_get(pool, probe_repo::meta::MEOW_LAST_OK_KEY).await {
         Ok(Some(raw)) => raw.parse::<i64>().ok().map(|ts| MeowContact {
             ts,
             // Without this verdict a contact from last month rendered as
@@ -883,7 +837,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
             // its own heartbeat outranks this server's config copy.
             alive: now - ts
                 <= meow_stale_after(
-                    &state.probe,
+                    &state.probe(),
                     heartbeat.as_ref().and_then(|hb| hb.cycle_interval_secs),
                 ),
         }),
@@ -891,25 +845,14 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
         Err(err) => return server_error(lang, &err),
     };
 
-    let meow_memory = match meta_get(pool, "meow_memory").await {
-        Ok(Some(raw)) => serde_json::from_str::<MeowMemoryView>(&raw).ok(),
+    let meow_memory = match meta_get(pool, probe_repo::meta::MEOW_MEMORY_KEY).await {
+        Ok(Some(raw)) => serde_json::from_str::<MeowMemory>(&raw).ok(),
         Ok(None) => None,
         Err(err) => return server_error(lang, &err),
     };
 
-    let last_rotation = match meta_get(pool, "last_rotation").await {
-        Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|value| {
-                Some(LastRotation {
-                    ts: value.get("ts")?.as_i64()?,
-                    probe_results: value
-                        .get("probe_results")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    fetch_log: value.get("fetch_log").and_then(|v| v.as_u64()).unwrap_or(0),
-                })
-            }),
+    let last_rotation = match meta_get(pool, probe_repo::meta::LAST_ROTATION_KEY).await {
+        Ok(Some(raw)) => serde_json::from_str::<LastRotation>(&raw).ok(),
         Ok(None) => None,
         Err(err) => return server_error(lang, &err),
     };
@@ -928,16 +871,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     };
 
     // The 50 quarantined proxies with the nearest upcoming check.
-    let queue: Vec<QuarantineRow> = match sqlx::query_as(
-        "SELECT id, name, host, port, scheme, quarantined_at, ladder_at, ladder_step
-         FROM proxies
-         WHERE status = 'quarantine'
-         ORDER BY COALESCE(ladder_at, 0) ASC
-         LIMIT 50",
-    )
-    .fetch_all(pool)
-    .await
-    {
+    let queue: Vec<QuarantineQueueRow> = match proxies::list_quarantine_queue(pool, 50).await {
         Ok(rows) => rows,
         Err(err) => return server_error(lang, &err),
     };
@@ -965,14 +899,14 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
     let oldest_quarantined_age_secs = oldest_quarantined_at.map(|ts| (now - ts).max(0));
     let heartbeat_age_secs = heartbeat.as_ref().map(|hb| (now - hb.ts).max(0));
 
-    let probe_view = ProbeView::from(&state.probe);
+    let probe_view = ProbeView::from(&state.probe());
     let backlog = compute_backlog(
         quarantine_count,
         due_count,
         oldest_quarantined_age_secs,
         heartbeat_age_secs,
         heartbeat.as_ref().and_then(|hb| hb.interval_secs),
-        &state.probe,
+        &state.probe(),
     );
 
     let langs = state.locales.choices().to_vec();
@@ -1528,7 +1462,7 @@ mod tests {
     /// stays plain text.
     #[test]
     fn rss_line_carries_no_markup() {
-        let mem = MeowMemoryView {
+        let mem = MeowMemory {
             rss_bytes: 25_780_224,
             os_limit_bytes: 2_147_483_648,
             ts: 1_700_000_000,
@@ -1538,7 +1472,7 @@ mod tests {
         assert!(!line.contains('>'), "markup leaked into the line: {line}");
         assert!(line.contains("24.6 MiB"), "{line}");
         // A missing limit hides the share instead of dividing by zero.
-        let no_limit = MeowMemoryView {
+        let no_limit = MeowMemory {
             os_limit_bytes: 0,
             ..mem
         };

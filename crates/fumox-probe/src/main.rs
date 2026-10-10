@@ -1,12 +1,15 @@
 //! fumox-probe, health-check daemon.
 //!
-//! Every scheduling cycle runs three passes:
+//! Every scheduling cycle runs four passes:
 //!
 //! 1. **Quarantine dues**, second chances and recheck-ladder steps whose
 //!    scheduled moment has arrived;
-//! 2. **T1**, a random sample of TCP-connect / TLS-handshake checks over
+//! 2. **Priority queue**, T1 checks the server enqueued at source refresh
+//!    time for freshly inserted proxies, drained newest first and capped
+//!    by the same per-cycle quota as the T1 sample;
+//! 3. **T1**, a random sample of TCP-connect / TLS-handshake checks over
 //!    the `unknown`/`alive` population;
-//! 3. **T2**, real tunnel checks for `alive` proxies through the meow-rs
+//! 4. **T2**, real tunnel checks for `alive` proxies through the meow-rs
 //!    REST API, skipped with backoff when meow-rs is down.
 //!    The batch is recency-prioritized: proxies without a single T2
 //!    attempt first, then the ones whose last T2 check is the oldest.
@@ -218,21 +221,32 @@ async fn run(ctx: Arc<Context>) -> anyhow::Result<()> {
 /// then the priority queue (fresh proxies), then the T1 sample
 /// and the T2 batch.
 ///
-/// The random sample skips the rows the queue lane just covered: both lanes
-/// draw from the same `unknown` population and claiming a request only
-/// deletes its queue row, so without the hand-off one dead proxy in both
-/// selections collected two `fail_count` steps from this single cycle and
-/// quarantined in half the cycles `fail_limit` promises.
+/// The lanes that run later skip the rows an earlier lane already gave a
+/// verdict, because both sides of each overlap draw from the same
+/// population and both charge `fail_count` through `check_failed`:
+///
+/// * The random sample skips the rows the queue lane just covered — both
+///   draw from the same `unknown` population and claiming a request only
+///   deletes its queue row, so without the hand-off one dead proxy in both
+///   selections collected two `fail_count` steps from this single cycle
+///   and quarantined in half the cycles `fail_limit` promises.
+/// * The T2 batch skips the rows the T1 sample just covered — `alive` rows
+///   are in both selections, and a dead one drawn by both lanes quarantined
+///   in one cycle at `fail_limit = 2`.
+///
+/// A skipped row loses nothing: the queue's leftovers fall to the sample,
+/// and a T1-covered `alive` row is the head of the next cycle's T2 batch
+/// (the batch orders by the oldest last T2 check).
 async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
     let now = now_ts();
     let quarantine = probe_due_quarantine(ctx.clone(), now).await?;
     let queued = probe_queued_checks(ctx.clone()).await?;
-    let t1_checked = probe_t1_sample(ctx.clone(), &queued.claimed).await?;
-    let t2 = probe_t2_batch(ctx).await?;
+    let t1 = probe_t1_sample(ctx.clone(), &queued.claimed).await?;
+    let t2 = probe_t2_batch(ctx, &t1.claimed).await?;
     tracing::info!(
         quarantine_checked = quarantine,
         queued_checked = queued.checked,
-        t1_checked,
+        t1_checked = t1.checked,
         t2_checked = t2.checked,
         t2_aborted = t2.aborted,
         t2_skipped = t2.skipped,
@@ -241,9 +255,11 @@ async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What one T1 lane covered: `checked` is how many verdicts it produced
-/// (for the cycle log), `claimed` every row it took, whether the row
-/// produced a verdict (unknown scheme, unprobeable port) or a vet refusal.
+/// What one lane covered: `checked` is how many verdicts it produced (for
+/// the cycle log), `claimed` the rows the lane took for itself this cycle —
+/// the queue lane's up-front claims (verdict or not), the random sample's
+/// verdict rows. `run_cycle` hands each lane's `claimed` to the lane that
+/// runs next, so one proxy is never judged twice in a single cycle.
 struct LaneOutcome {
     checked: usize,
     claimed: Vec<i64>,
@@ -274,7 +290,7 @@ async fn probe_queued_checks(ctx: Arc<Context>) -> anyhow::Result<LaneOutcome> {
     probe_repo::claim_checks(&ctx.pool, &ids).await?;
     let checked = run_t1_checks(ctx, candidates).await?;
     Ok(LaneOutcome {
-        checked,
+        checked: checked.checked,
         claimed: ids,
     })
 }
@@ -283,10 +299,15 @@ async fn probe_queued_checks(ctx: Arc<Context>) -> anyhow::Result<LaneOutcome> {
 /// `already_checked` covered earlier in this cycle (the queue lane, see
 /// [`run_cycle`]). The sample is a random draw with a quota, so dropping
 /// the overlap simply leaves the cycle with a slightly smaller one.
-async fn probe_t1_sample(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::Result<usize> {
+/// Returns the rows it gave a verdict, the hand-off the T2 batch of the
+/// same cycle skips (see [`probe_t2_batch`]).
+async fn probe_t1_sample(
+    ctx: Arc<Context>,
+    already_checked: &[i64],
+) -> anyhow::Result<LaneOutcome> {
     let candidates = proxies::select_t1_candidates(&ctx.pool, ctx.config.probe.sample_size).await?;
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(LaneOutcome::empty());
     }
     let covered: std::collections::HashSet<i64> = already_checked.iter().copied().collect();
     let candidates: Vec<proxies::T1Candidate> = candidates
@@ -294,20 +315,23 @@ async fn probe_t1_sample(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::
         .filter(|c| !covered.contains(&c.id))
         .collect();
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(LaneOutcome::empty());
     }
     run_t1_checks(ctx, candidates).await
 }
 
 /// Run concurrent T1 checks for the candidates and apply each outcome to
-/// the lifecycle.
+/// the lifecycle. Returns the verdict count plus the ids of every row a
+/// verdict was produced for (vet-refused rows included, rows skipped for
+/// an unknown scheme or an out-of-range port not — they were not judged).
 async fn run_t1_checks(
     ctx: Arc<Context>,
     candidates: Vec<proxies::T1Candidate>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<LaneOutcome> {
     let semaphore = Arc::new(Semaphore::new(ctx.config.probe.concurrency.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     let mut blocked = 0usize;
+    let mut checked_ids: Vec<i64> = Vec::new();
     // Parse and port checks come first so the vetting pass below only
     // covers rows that can actually be dialed.
     let mut ready: Vec<(proxies::T1Candidate, t1::CheckKind, u16)> = Vec::new();
@@ -330,10 +354,14 @@ async fn run_t1_checks(
     let hosts: Vec<String> = ready.iter().map(|(c, _, _)| c.host.clone()).collect();
     for ((candidate, kind, port), verdict) in ready.into_iter().zip(vet_hosts(&ctx, &hosts).await) {
         let vetted = match verdict {
-            Ok(addrs) => addrs,
+            Ok(addrs) => {
+                checked_ids.push(candidate.id);
+                addrs
+            }
             Err(reason) => {
                 tracing::warn!(id = candidate.id, %reason, "probe target blocked by the private-address policy, journaled as a failed check");
                 apply_vet_block(&ctx, candidate.id, kind.as_str(), &reason).await;
+                checked_ids.push(candidate.id);
                 blocked += 1;
                 continue;
             }
@@ -358,7 +386,10 @@ async fn run_t1_checks(
         });
     }
     let done = collect_tasks(&mut tasks).await;
-    Ok(done + blocked)
+    Ok(LaneOutcome {
+        checked: done + blocked,
+        claimed: checked_ids,
+    })
 }
 
 /// SSRF gate for every dial target:
@@ -687,7 +718,13 @@ async fn revive_quarantined_via_t2(
         return Ok(checked);
     }
     ctx.meow_recovered();
-    if let Err(error) = meta_set(&ctx.pool, "meow_last_ok", &now_ts().to_string()).await {
+    if let Err(error) = meta_set(
+        &ctx.pool,
+        probe_repo::meta::MEOW_LAST_OK_KEY,
+        &now_ts().to_string(),
+    )
+    .await
+    {
         tracing::warn!(%error, "failed to stamp meow_last_ok");
     }
 
@@ -988,6 +1025,14 @@ fn write_meow_config(path: &std::path::Path, yaml: &str) -> std::io::Result<()> 
 /// Generate a Clash batch, reload meow-rs, and delay-test every proxy
 /// through a real tunnel.
 ///
+/// `already_checked` carries the ids the T1 lanes gave a verdict this
+/// cycle (see [`run_cycle`]); those rows are dropped from the batch, a
+/// dead one drawn by both lanes would otherwise collect one `fail_count`
+/// step from each and quarantine in half the cycles `fail_limit`
+/// promises. Dropping the overlap simply leaves the recency-prioritized
+/// batch slightly smaller; the dropped rows are the head of the next
+/// cycle's batch anyway.
+///
 /// Success is strict: only a tunnel that came
 /// up *and* answered with a measured `delay` counts, anything else the
 /// engine reports is a failure. A meow-rs outage is *not* charged to the
@@ -997,7 +1042,7 @@ fn write_meow_config(path: &std::path::Path, yaml: &str) -> std::io::Result<()> 
 /// path stay untouched, so an outage cannot retire a healthy pool
 /// ([`journal_engine_fault`]). The cycle still
 /// backs off so a dead meow-rs is not hammered every minute.
-async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<T2Outcome> {
+async fn probe_t2_batch(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::Result<T2Outcome> {
     let now = now_ts();
     if now < ctx.meow_retry_at.load(Ordering::Relaxed) {
         tracing::debug!("meow-rs in backoff, T2 skipped");
@@ -1005,6 +1050,13 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<T2Outcome> {
     }
 
     let rows = proxies::select_t2_candidates(&ctx.pool, ctx.config.probe.sample_size).await?;
+    // The hand-off from the T1 lanes: their verdict rows are already
+    // judged, re-judging them here would double-charge the fail ladder.
+    let covered: std::collections::HashSet<i64> = already_checked.iter().copied().collect();
+    let rows: Vec<proxies::ProxyRow> = rows
+        .into_iter()
+        .filter(|row| !covered.contains(&row.id))
+        .collect();
     // Vet every candidate before anything touches meow-rs. A refused target
     // is a *failed* t2 check, not a skip: the
     // policy blocks unresolvable names and internal addresses, and a skip
@@ -1102,7 +1154,13 @@ async fn probe_t2_batch(ctx: Arc<Context>) -> anyhow::Result<T2Outcome> {
         });
     }
     ctx.meow_recovered();
-    if let Err(error) = meta_set(&ctx.pool, "meow_last_ok", &now_ts().to_string()).await {
+    if let Err(error) = meta_set(
+        &ctx.pool,
+        probe_repo::meta::MEOW_LAST_OK_KEY,
+        &now_ts().to_string(),
+    )
+    .await
+    {
         tracing::warn!(%error, "failed to stamp meow_last_ok");
     }
     stamp_meow_memory(&ctx).await;
@@ -1399,12 +1457,18 @@ fn retention_cutoff(now: i64, days: u32) -> i64 {
 async fn stamp_meow_memory(ctx: &Context) {
     match ctx.meow.memory().await {
         Ok(mem) => {
-            let payload = serde_json::json!({
-                "rss_bytes": mem.rss_bytes,
-                "os_limit_bytes": mem.os_limit_bytes,
-                "ts": now_ts(),
-            });
-            if let Err(error) = meta_set(&ctx.pool, "meow_memory", &payload.to_string()).await {
+            let payload = probe_repo::meta::MeowMemory {
+                rss_bytes: mem.rss_bytes,
+                os_limit_bytes: mem.os_limit_bytes,
+                ts: now_ts(),
+            };
+            if let Err(error) = meta_set(
+                &ctx.pool,
+                probe_repo::meta::MEOW_MEMORY_KEY,
+                &meta_json(&payload),
+            )
+            .await
+            {
                 tracing::debug!(%error, "failed to stamp meow_memory");
             }
         }
@@ -1412,20 +1476,28 @@ async fn stamp_meow_memory(ctx: &Context) {
     }
 }
 
+/// Serialize a meta payload into its on-wire JSON. The payload structs in
+/// [`fumox_core::repo::probe::meta`] hold only JSON-native field types, so
+/// serialization cannot fail; the expectation documents that rather than
+/// guards a real risk.
+fn meta_json(payload: &impl serde::Serialize) -> String {
+    serde_json::to_string(payload).expect("meta payload holds only JSON-native fields")
+}
+
 /// Build the `probe_heartbeat` payload. `interval_secs` is the daemon's
 /// effective beat period and `cycle_interval_secs` its effective cycle
 /// period: the admin panel thresholds staleness against the schedules the
 /// daemon actually runs, since server and probe may read different config
-/// files (see [`heartbeat_loop`]).
+/// files (see [`heartbeat_loop`]). The shape is the shared
+/// [`fumox_core::repo::probe::meta::Heartbeat`] contract.
 fn heartbeat_payload(interval_secs: u64, cycle_interval_secs: u64) -> String {
-    serde_json::json!({
-        "ts": now_ts(),
-        "pid": std::process::id(),
-        "version": env!("CARGO_PKG_VERSION"),
-        "interval_secs": interval_secs,
-        "cycle_interval_secs": cycle_interval_secs,
+    meta_json(&probe_repo::meta::Heartbeat {
+        ts: now_ts(),
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        interval_secs: Some(interval_secs),
+        cycle_interval_secs: Some(cycle_interval_secs),
     })
-    .to_string()
 }
 
 /// Periodically upsert `probe_heartbeat` into `meta` so the admin panel can
@@ -1442,7 +1514,7 @@ async fn heartbeat_loop(ctx: Arc<Context>) {
     loop {
         ticker.tick().await;
         let payload = heartbeat_payload(period.as_secs(), cycle_secs);
-        if let Err(error) = meta_set(&ctx.pool, "probe_heartbeat", &payload).await {
+        if let Err(error) = meta_set(&ctx.pool, probe_repo::meta::HEARTBEAT_KEY, &payload).await {
             tracing::warn!(%error, "failed to write probe heartbeat");
         }
     }
@@ -1507,13 +1579,19 @@ async fn run_retention(ctx: &Context) {
     // are not a surface an operator looks at, and a probe daemon that
     // stopped rotating would otherwise grow both journals with nothing
     // saying so.
-    let stamp = serde_json::json!({
-        "ts": now_ts(),
-        "probe_results": deleted_probe,
-        "fetch_log": deleted_fetch,
-        "probe_requests": deleted_requests,
-    });
-    if let Err(error) = meta_set(&ctx.pool, "last_rotation", &stamp.to_string()).await {
+    let stamp = probe_repo::meta::LastRotation {
+        ts: now_ts(),
+        probe_results: deleted_probe,
+        fetch_log: deleted_fetch,
+        probe_requests: deleted_requests,
+    };
+    if let Err(error) = meta_set(
+        &ctx.pool,
+        probe_repo::meta::LAST_ROTATION_KEY,
+        &meta_json(&stamp),
+    )
+    .await
+    {
         tracing::warn!(%error, "failed to stamp last_rotation");
     }
 }
@@ -1569,1588 +1647,5 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::extract::Path;
-    use axum::routing::{get, put};
-    use axum::{Json, Router};
-
-    #[test]
-    fn zero_retention_window_is_clamped_to_one_day() {
-        assert_eq!(retention_cutoff(100_000, 0), 100_000 - 86_400);
-        assert_eq!(retention_cutoff(100_000, 7), 100_000 - 7 * 86_400);
-    }
-
-    /// Hardening: with
-    /// the default policy the daemon must refuse to *dial* loopback feed
-    /// targets, but the refusal itself is now a journaled failed check
-    /// (the fail ladder runs), so a blocked proxy cannot clog the queues
-    /// forever. A live loopback listener stays untouched, and the blocked
-    /// proxy collects a failure record instead of silence.
-    #[tokio::test]
-    async fn private_targets_are_not_dialed_by_default() {
-        let pool = temp_pool().await;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let live_port = listener.local_addr().unwrap().port();
-        let hit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let hit_clone = hit.clone();
-        tokio::spawn(async move {
-            loop {
-                let (socket, _) = match listener.accept().await {
-                    Ok(ok) => ok,
-                    Err(_) => break,
-                };
-                hit_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                drop(socket);
-            }
-        });
-        let id = seed_proxy(&pool, "vless", "127.0.0.1", live_port, "unknown").await;
-
-        // Default config: allow_private_targets = false; fail_limit = 1, so
-        // a single vet refusal must quarantine the proxy right away.
-        let mut config = test_config(
-            1,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        config.probe.allow_private_targets = false;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        // The listener saw no connection.
-        assert_eq!(hit.load(std::sync::atomic::Ordering::Relaxed), 0);
-        // The refusal is journaled as a failed check...
-        let (attempts, error, kind): (i64, String, String) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(MAX(error), ''), COALESCE(MAX(probe_kind), '')
-             FROM probe_results WHERE proxy_id = ? AND ok = 0",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(attempts, 1, "the vet refusal must be journaled");
-        assert!(
-            error.contains("blocked by the private-address policy"),
-            "{error}"
-        );
-        assert_eq!(kind, "tcp");
-        // ...and the fail ladder ran: fail_limit reached → quarantine.
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.status, "quarantine");
-        assert_eq!(row.fail_count, 1);
-        assert!(row.ladder_at.is_some());
-    }
-
-    /// Concurrent vetting must hand the verdicts back in the input order
-    /// (the lanes zip them onto their candidates) and must apply the same
-    /// per-address policy the serial pass did. IP literals keep the test
-    /// off DNS.
-    #[tokio::test]
-    async fn vet_hosts_preserves_order_and_policy() {
-        let pool = temp_pool().await;
-        let hosts = vec![
-            "192.168.7.7".to_string(),
-            "169.254.169.254".to_string(),
-            "127.0.0.1".to_string(),
-        ];
-
-        // Guard on: every verdict is a refusal with the host's own reason,
-        // in order.
-        let mut config = test_config(
-            3,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        config.probe.allow_private_targets = false;
-        let ctx = Arc::new(Context::new(config.clone(), pool.clone()));
-        let verdicts = vet_hosts(&ctx, &hosts).await;
-        let reasons: Vec<&str> = verdicts
-            .iter()
-            .map(|verdict| verdict.as_ref().expect_err("must be refused"))
-            .map(String::as_str)
-            .collect();
-        assert!(reasons[0].contains("RFC1918"), "{}", reasons[0]);
-        assert!(reasons[1].contains("link-local"), "{}", reasons[1]);
-        assert!(reasons[2].contains("loopback"), "{}", reasons[2]);
-
-        // Guard off: the same list vets in order.
-        config.probe.allow_private_targets = true;
-        let ctx = Arc::new(Context::new(config, pool));
-        let verdicts = vet_hosts(&ctx, &hosts).await;
-        let vetted: Vec<std::net::IpAddr> = verdicts
-            .into_iter()
-            .map(|verdict| verdict.expect("must be allowed")[0])
-            .collect();
-        assert_eq!(
-            vetted,
-            hosts
-                .iter()
-                .map(|host| host.parse::<std::net::IpAddr>().unwrap())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    /// The T2 counterpart: a vet-refused T2
-    /// candidate is journaled as a failed `t2` check even when meow-rs is
-    /// completely down, the journal row is what un-sticks the head of the
-    /// recency queue (the selector orders by the last t2 attempt).
-    #[tokio::test]
-    async fn t2_vet_block_is_journaled_even_without_meow() {
-        let pool = temp_pool().await;
-
-        // A private host that would never pass the gate; the proxy is
-        // `alive`, and the T1 pass blocks it too (same policy, same host)
-        //, so the cycle must journal both a failed tcp and a failed t2
-        // attempt. A high fail_limit keeps the row out of quarantine so
-        // both lanes get to record their refusal.
-        let id = seed_proxy(&pool, "vless", "127.0.0.1", 1, "alive").await;
-
-        // meow-rs is unreachable on a closed port.
-        let mut config = test_config(
-            3,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        config.probe.allow_private_targets = false;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        // The failed t2 row exists, exactly what keeps the recency
-        // selector moving past blocked rows.
-        let (t2_rows, error): (i64, String) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(MAX(error), '') FROM probe_results
-             WHERE proxy_id = ? AND ok = 0 AND probe_kind = 't2'",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(t2_rows, 1, "the T2 refusal must be journaled as t2");
-        assert!(
-            error.contains("blocked by the private-address policy"),
-            "{error}"
-        );
-        // The T1 lane recorded its own refusal as well, and the fail
-        // counter saw both.
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.status, "alive");
-        assert_eq!(row.fail_count, 2);
-    }
-
-    /// Engine failure (engine-failure branch 1): meow answers
-    /// /version but rejects the config reload, every proxy of the batch
-    /// gets a journaled failed t2 check (outage reason) and the recency
-    /// queue head cannot pin during the outage. The outage is *not*
-    /// charged to the proxies: only the T1 dial counts.
-    #[tokio::test]
-    async fn t2_engine_failure_at_reload_fails_the_batch() {
-        let pool = temp_pool().await;
-
-        // Mock meow-rs: /version alive, /configs broken.
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route(
-                "/configs",
-                put(|| async {
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"message":"reload failed"})),
-                    )
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // Two due proxies: both must receive the outage failure.
-        let a = seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
-        let b = seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        let mut config = test_config(3, &meow_addr, config_path.clone());
-        config.probe.allow_private_targets = true;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx.clone()).await.unwrap();
-
-        for id in [a, b] {
-            let (kind, error): (String, String) = sqlx::query_as(
-                "SELECT probe_kind, COALESCE(error, '') FROM probe_results
-                 WHERE proxy_id = ? AND ok = 0 ORDER BY id DESC LIMIT 1",
-            )
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert_eq!(kind, "t2", "the reload outage must be journaled as t2");
-            assert!(error.contains("meow-rs unavailable"), "id {id}: {error}");
-            let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-            // Only the T1 dial (nothing listens on 443) is charged: the
-            // engine outage stamps the outstanding T2 verdict but leaves
-            // the proxy's own fail budget alone.
-            assert_eq!(row.fail_count, 1, "id {id}");
-            assert!(
-                row.last_t2_failed_at.is_some(),
-                "id {id}: the outstanding T2 verdict must be stamped"
-            );
-        }
-
-        // The meow backoff is armed: a second immediate cycle sleeps
-        // silently instead of re-failing the pool (checked against the
-        // same ctx, whose retry gate now points into the future).
-        assert!(
-            fumox_core::models::now_ts()
-                < ctx.meow_retry_at.load(std::sync::atomic::Ordering::Relaxed),
-            "the reload outage must arm the meow backoff"
-        );
-    }
-
-    /// The regression this whole split exists for: a meow-rs outage must
-    /// not charge the proxies it skipped. With the shipped
-    /// `fail_limit = 2` two outage cycles used to quarantine a proxy
-    /// that had never failed a single check, dropping it out of both T2
-    /// selectors and out of `/export/alive` for a fault of the sidecar.
-    ///
-    /// The proxy here is genuinely healthy (a live TCP listener, so T1
-    /// passes every cycle) and sits in the tunnel-verified `ready` tier.
-    /// meow-rs is unreachable, so every cycle takes the ping-outage
-    /// branch. After two cycles the row must still be in service, with
-    /// the T2 verdict stamped (the `ready` tier does not survive an
-    /// outage) and the fail counter still at zero.
-    #[tokio::test]
-    async fn meow_outage_never_quarantines_a_healthy_proxy() {
-        let pool = temp_pool().await;
-
-        // A live listener so T1 passes and the only failure the proxy can
-        // collect is one the engine owes it.
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_port = tcp.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = match tcp.accept().await {
-                    Ok(ok) => ok,
-                    Err(_) => break,
-                };
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-        let id = seed_proxy(&pool, "vless", "127.0.0.1", tcp_port, "ready").await;
-
-        // The shipped fail_limit of 2, and meow-rs on a closed port.
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        let mut config = test_config(2, "127.0.0.1:1", config_path);
-        config.probe.allow_private_targets = true;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        for cycle in 1..=2 {
-            // The backoff gate would otherwise skip T2 on the second
-            // cycle; clear it so both cycles really reach the outage
-            // branch (the backoff itself is asserted in the reload test).
-            ctx.meow_retry_at.store(0, Ordering::Relaxed);
-            run_cycle(ctx.clone()).await.unwrap();
-
-            let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-            assert_ne!(
-                row.status, "quarantine",
-                "cycle {cycle}: an engine outage must not quarantine a healthy proxy"
-            );
-            assert_eq!(
-                row.fail_count, 0,
-                "cycle {cycle}: the outage must not charge the proxy's fail budget"
-            );
-            assert_eq!(
-                row.quarantined_at, None,
-                "cycle {cycle}: no second chance may be scheduled"
-            );
-            assert!(
-                row.last_t2_failed_at.is_some(),
-                "cycle {cycle}: the outstanding T2 verdict must be stamped"
-            );
-            assert_eq!(
-                row.status, "alive",
-                "cycle {cycle}: the ready tier must not outlive an engine outage"
-            );
-        }
-    }
-
-    /// Engine failure (engine-failure branch 2): meow dies
-    /// mid-batch, the pre-flight ping succeeded (so `reload_config` and
-    /// the fan-out began), but every delay request and the follow-up
-    /// `/version` ping now fail. The connected-engine check therefore
-    /// reports `engine_alive = false` for every task, the consecutive
-    /// counter crosses the threshold on the first task to record a
-    /// failure, and the rest of the tasks see the abort flag and journal
-    /// an aborted-failure record without further meow calls.
-    #[tokio::test]
-    async fn t2_engine_failure_mid_batch_aborts_the_rest() {
-        let pool = temp_pool().await;
-
-        // The pre-flight ping calls /version first, so the handler returns
-        // 200 on that call and 500 on every subsequent one. This
-        // models "engine crashed after the pre-flight passed".
-        let version_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let version_calls_inner = version_calls.clone();
-        let app = Router::new()
-            .route(
-                "/version",
-                get(move || {
-                    let version_calls = version_calls_inner.clone();
-                    async move {
-                        let n = version_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if n == 0 {
-                            (
-                                axum::http::StatusCode::OK,
-                                Json(serde_json::json!({"version":"mock"})),
-                            )
-                        } else {
-                            (
-                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({"message":"engine crashed"})),
-                            )
-                        }
-                    }
-                }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"message":"engine exploded"})),
-                    )
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // Four proxies: with threshold=3 the first three tasks record a
-        // failure (engine_alive = false) and the third one flips the
-        // abort flag. The fourth task, whichever side of the is_aborted() check
-        // it lands on, gets either a "mid-batch" record or an "aborted:"
-        // record, both are engine-outage texts.
-        let a = seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
-        let b = seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
-        let c = seed_proxy(&pool, "vmess", "127.0.0.1", 443, "alive").await;
-        let d = seed_proxy(&pool, "ss", "127.0.0.1", 443, "alive").await;
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        let mut config = test_config(3, &meow_addr, config_path);
-        config.probe.allow_private_targets = true;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        // Every proxy of the batch carries a journaled t2 failure:
-        // either the mid-batch reason (the task that crossed the
-        // threshold) or the aborted marker (a task that arrived after
-        // the flag was set). Both are engine-outage texts.
-        let mut aborted = 0;
-        let mut mid_batch = 0;
-        for id in [a, b, c, d] {
-            let (error,): (String,) = sqlx::query_as(
-                "SELECT COALESCE(error, '') FROM probe_results
-                 WHERE proxy_id = ? AND ok = 0 AND probe_kind = 't2'",
-            )
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert!(
-                error.contains("meow-rs unavailable mid-batch")
-                    || error.contains("aborted: meow-rs became unavailable"),
-                "id {id}: {error}"
-            );
-            if error.starts_with("aborted:") {
-                aborted += 1;
-            } else {
-                mid_batch += 1;
-            }
-            let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-            // Only the T1 dial (nothing listens on 443) is charged: an
-            // engine outage, mid-batch or aborted, stamps the outstanding
-            // T2 verdict without spending the proxy's fail budget.
-            assert_eq!(row.fail_count, 1, "id {id}");
-            assert!(
-                row.last_t2_failed_at.is_some(),
-                "id {id}: the outstanding T2 verdict must be stamped"
-            );
-        }
-        // With concurrency 4 the exact split between "mid_batch" and
-        // "aborted:" depends on the semaphore; the invariant is that
-        // every proxy got a failure record and at least one task
-        // crossed it (otherwise we would not have entered the threshold
-        // branch at all).
-        assert_eq!(aborted + mid_batch, 4);
-        assert!(
-            mid_batch >= 1,
-            "at least one task must have crossed the threshold"
-        );
-    }
-
-    /// The cycle counters must not fold an engine-wide outage into
-    /// `t2_checked`: with meow-rs down before the batch starts, every due
-    /// proxy is journaled unverified and reported as aborted, and no row is
-    /// claimed as a real check.
-    #[tokio::test]
-    async fn t2_outage_counters_report_aborted_not_checked() {
-        let pool = temp_pool().await;
-        for _ in 0..3 {
-            seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
-        }
-
-        // meow-rs is unreachable on a closed port.
-        let mut config = test_config(
-            3,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        config.probe.allow_private_targets = true;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        let outcome = probe_t2_batch(ctx).await.unwrap();
-        assert_eq!(outcome.checked, 0, "an outage produces no real checks");
-        assert_eq!(outcome.aborted, 3, "every due proxy is aborted unverified");
-        assert_eq!(outcome.skipped, 0);
-
-        // All three were journaled as t2 failures, so the recency queue
-        // moves past them despite the outage.
-        let (rows,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE ok = 0 AND probe_kind = 't2'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(rows, 3);
-    }
-
-    /// The healthy-path counterpart: real engine contacts land in
-    /// `checked`, nothing else moves.
-    #[tokio::test]
-    async fn t2_live_engine_counters_count_real_checks() {
-        let pool = temp_pool().await;
-
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::OK,
-                        Json(serde_json::json!({"delay": 42})),
-                    )
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
-        seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
-
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        let mut config = test_config(3, &meow_addr, config_path);
-        config.probe.allow_private_targets = true;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        let outcome = probe_t2_batch(ctx).await.unwrap();
-        assert_eq!(outcome.checked, 2);
-        assert_eq!(outcome.aborted, 0);
-        assert_eq!(outcome.skipped, 0);
-    }
-
-    /// Per-request blip: every delay check fails with 5xx, but /version
-    /// keeps answering 200, the engine is alive, the proxy names are
-    /// just bad. The ping-on-failure check must therefore skip the abort
-    /// counter and the batch keeps running: every proxy gets a "meow-rs
-    /// transient error" record instead of an "aborted:" one.
-    #[tokio::test]
-    async fn t2_per_request_blip_with_alive_engine_does_not_abort() {
-        let pool = temp_pool().await;
-
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"message":"proxy not found"})),
-                    )
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let a = seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
-        let b = seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
-        let c = seed_proxy(&pool, "vmess", "127.0.0.1", 443, "alive").await;
-        let d = seed_proxy(&pool, "ss", "127.0.0.1", 443, "alive").await;
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        let mut config = test_config(3, &meow_addr, config_path);
-        config.probe.allow_private_targets = true;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        // None of the four proxies crossed the abort threshold:
-        // /version answered 200 for every ping, so engine_alive was
-        // true for every task and the counter never advanced. No
-        // backoff was engaged either, meow_retry_at stays at 0.
-        for id in [a, b, c, d] {
-            let (error,): (String,) = sqlx::query_as(
-                "SELECT COALESCE(error, '') FROM probe_results
-                 WHERE proxy_id = ? AND ok = 0 AND probe_kind = 't2'",
-            )
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert!(
-                error.contains("meow-rs transient error"),
-                "alive engine, bad delay → transient error text; got {error}"
-            );
-            assert!(
-                !error.contains("aborted:") && !error.contains("mid-batch"),
-                "alive engine must never escalate to abort; got {error}"
-            );
-        }
-        let (retry_at,): (i64,) =
-            sqlx::query_as("SELECT COALESCE(value, '0') FROM meta WHERE key = 'meow_retry_at'")
-                .fetch_one(&pool)
-                .await
-                .unwrap_or((0,));
-        assert_eq!(
-            retry_at, 0,
-            "no backoff engaged when the engine is alive and only delay checks fail"
-        );
-    }
-
-    /// The retry absorbs a single transient 5xx on a per-proxy basis:
-    /// the first delay request 5xxes, the second succeeds, so the task
-    /// reports `Ok` and never touches the abort counter. The batch
-    /// keeps running for the rest of the proxies.
-    #[tokio::test]
-    async fn t2_retry_recovers_a_flaky_proxy() {
-        let pool = temp_pool().await;
-
-        // Delay handler: first call per name returns 500, second returns 200.
-        let delay_calls: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let delay_calls_inner = delay_calls.clone();
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(move |Path(name): Path<String>| {
-                    let delay_calls = delay_calls_inner.clone();
-                    async move {
-                        let mut guard = delay_calls.lock().unwrap();
-                        let n = guard.entry(name.clone()).or_insert(0);
-                        *n += 1;
-                        let attempt = *n;
-                        drop(guard);
-                        if attempt == 1 {
-                            (
-                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(serde_json::json!({"message":"blip"})),
-                            )
-                        } else {
-                            (
-                                axum::http::StatusCode::OK,
-                                Json(serde_json::json!({"delay": 42})),
-                            )
-                        }
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // One flaky proxy; the second proxy is there to confirm the
-        // batch keeps running and reports a clean Ok.
-        let flaky = seed_proxy(&pool, "vless", "127.0.0.1", 443, "alive").await;
-        let stable = seed_proxy(&pool, "trojan", "127.0.0.1", 443, "alive").await;
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        let mut config = test_config(3, &meow_addr, config_path);
-        config.probe.allow_private_targets = true;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        // The flaky proxy survived: the retry absorbed the first 5xx and
-        // the second attempt returned Ok. The row becomes `ready`.
-        let row = proxies::get_by_id(&pool, flaky).await.unwrap().unwrap();
-        assert_eq!(
-            row.status, "ready",
-            "retry should have rescued the flaky proxy from a transient blip"
-        );
-        let (ok_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND ok = 1")
-                .bind(flaky)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(ok_count, 1, "exactly one successful T2 for the flaky proxy");
-
-        // The stable proxy was not touched by the abort counter at all.
-        let row = proxies::get_by_id(&pool, stable).await.unwrap().unwrap();
-        assert_eq!(row.status, "ready");
-    }
-
-    /// The `ready` tier is demoted by every failed T2 outcome (owner
-    /// decision, 2026-09-10), here, by the meow outage itself: the proxy
-    /// was due a tunnel check, the engine was down, so the verification
-    /// no longer holds.
-    #[tokio::test]
-    async fn ready_is_demoted_by_engine_outage() {
-        let pool = temp_pool().await;
-
-        let id = seed_proxy(&pool, "vless", "127.0.0.1", 443, "ready").await;
-
-        // No meow-rs at all: the ping fails and the batch (this proxy)
-        // gets journaled engine failures.
-        let mut config = test_config(
-            3,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        config.probe.allow_private_targets = true;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(
-            row.status, "alive",
-            "an unverified-by-outage proxy loses the ready tier"
-        );
-        let (error,): (String,) = sqlx::query_as(
-            "SELECT COALESCE(error, '') FROM probe_results
-             WHERE proxy_id = ? AND probe_kind = 't2' AND ok = 0",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(error.contains("meow-rs unavailable"), "{error}");
-    }
-
-    /// A vet-refused T2 target loses the ready tier as well: the check it
-    /// was due could not run, and (as everywhere) the refusal is a failed
-    /// check on the ladder.
-    #[tokio::test]
-    async fn ready_is_demoted_by_vet_block() {
-        let pool = temp_pool().await;
-
-        let id = seed_proxy(&pool, "vless", "127.0.0.1", 1, "ready").await;
-
-        let mut config = test_config(
-            3,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        config.probe.allow_private_targets = false;
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(
-            row.status, "alive",
-            "the vet refusal demotes the ready tier"
-        );
-        let (kind, error): (String, String) = sqlx::query_as(
-            "SELECT probe_kind, COALESCE(error, '') FROM probe_results
-             WHERE proxy_id = ? AND probe_kind = 't2' AND ok = 0",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(kind, "t2");
-        assert!(
-            error.contains("blocked by the private-address policy"),
-            "{error}"
-        );
-    }
-
-    /// Fresh migrated SQLite in a temp directory.
-    async fn temp_pool() -> DbPool {
-        let dir =
-            std::env::temp_dir().join(format!("fumox-probe-test-{}", fumox_core::models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
-            ..Default::default()
-        };
-        let pool = fumox_core::db::connect_pool(&cfg).await.unwrap();
-        fumox_core::db::migrate(&pool).await.unwrap();
-        pool
-    }
-
-    /// Seed a linked proxy row; returns its id.
-    async fn seed_proxy(pool: &DbPool, scheme: &str, host: &str, port: u16, status: &str) -> i64 {
-        sqlx::query(
-            "INSERT OR IGNORE INTO sources (id, name, url, enabled, encoding, cache_ttl_seconds, created_at, updated_at)
-             VALUES ('srcT0000000', 'probe-test', 'https://example.com', 1, 'auto', 3600, 1, 1)",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        let (id,): (i64,) = sqlx::query_as(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-             VALUES (?, ?, 'n', ?, ?, 'c', ?, 1, 1)
-             RETURNING id",
-        )
-        .bind(format!("fp-{}", fumox_core::models::new_id()))
-        .bind(scheme)
-        .bind(host)
-        .bind(i64::from(port))
-        .bind(status)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, 'srcT0000000', 1)",
-        )
-        .bind(id)
-        .execute(pool)
-        .await
-        .unwrap();
-        id
-    }
-
-    fn test_config(fail_limit: u32, meow_addr: &str, meow_config: PathBuf) -> AppConfig {
-        AppConfig {
-            probe: fumox_core::config::ProbeConfig {
-                cycle_interval_secs: 60,
-                sample_size: 50,
-                fail_limit,
-                // The tests dial loopback listeners, which the default policy
-                // refuses.
-                allow_private_targets: true,
-                connect_timeout_secs: 2,
-                tls_timeout_secs: 2,
-                concurrency: 4,
-                heartbeat_interval_secs: 30,
-                // Deterministic second chance: exactly +24h, no jitter.
-                second_chance_min_hours: 24,
-                second_chance_spread_hours: 0,
-                // Default ladder: +15m, +30m, +1h.
-                recheck_delays_secs: vec![900, 1800, 3600],
-                queue_stale_days: 7,
-                retention_interval_secs: 86400,
-                backlog_target_drain_minutes: 60,
-            },
-            meow: fumox_core::config::MeowConfig {
-                api_addr: meow_addr.into(),
-                config_path: meow_config,
-                test_url: vec!["http://cp.cloudflare.com".to_string()],
-                timeout_secs: 3,
-                backoff_initial_secs: 60,
-                backoff_max_secs: 900,
-                ipv6: false,
-            },
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn t1_cycle_promotes_live_proxy_and_quarantines_dead_one() {
-        let pool = temp_pool().await;
-
-        // One proxy points at a live listener, the other at a closed port.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let live_port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = match listener.accept().await {
-                    Ok(ok) => ok,
-                    Err(_) => break,
-                };
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_port = dead.local_addr().unwrap().port();
-        drop(dead);
-
-        let live = seed_proxy(&pool, "vless", "127.0.0.1", live_port, "unknown").await;
-        let dying = seed_proxy(&pool, "vless", "127.0.0.1", dead_port, "unknown").await;
-
-        // meow-rs is absent: its T2 lane journals the due proxies
-        // (outage reason, not a silent skip) but does not charge them.
-        let config = test_config(
-            2,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        // Cycle 1: live proxy becomes alive (T1), dead one collects fail #1
-        // (T1); after promotion the live one enters the T2 batch, where the
-        // engine outage stamps the outstanding T2 verdict without touching
-        // the fail budget.
-        run_cycle(ctx.clone()).await.unwrap();
-        let row = proxies::get_by_id(&pool, live).await.unwrap().unwrap();
-        assert_eq!(row.status, "alive");
-        assert!(row.latency_ms.is_some());
-        assert_eq!(
-            row.fail_count, 0,
-            "the meow outage stamps the T2 verdict but must not fail the proxy"
-        );
-        assert!(row.last_t2_failed_at.is_some());
-        let row = proxies::get_by_id(&pool, dying).await.unwrap().unwrap();
-        assert_eq!(row.status, "unknown");
-        assert_eq!(row.fail_count, 1);
-        // The engine failure is journaled with the outage reason.
-        let (error,): (String,) = sqlx::query_as(
-            "SELECT COALESCE(error, '') FROM probe_results
-             WHERE proxy_id = ? AND probe_kind = 't2' AND ok = 0",
-        )
-        .bind(live)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(error.contains("meow-rs unavailable"), "{error}");
-
-        // Cycle 2: fail limit reached → quarantine with a scheduled second
-        // chance exactly 24h out (zero spread configured).
-        run_cycle(ctx.clone()).await.unwrap();
-        let row = proxies::get_by_id(&pool, dying).await.unwrap().unwrap();
-        assert_eq!(row.status, "quarantine");
-        assert_eq!(row.fail_count, 2);
-        let quarantined_at = row.quarantined_at.unwrap();
-        assert_eq!(row.ladder_at, Some(quarantined_at + 86_400));
-        assert_eq!(row.ladder_step, 0);
-
-        // The live proxy stayed alive: cycle 2 hit the meow backoff window
-        // (60s after the cycle-1 outage), so T2 slept silently, the
-        // outage is journaled once per backoff window, not every cycle.
-        let row = proxies::get_by_id(&pool, live).await.unwrap().unwrap();
-        assert_eq!(row.status, "alive");
-        // Exactly one successful T1: the cycle-2 batch is skipped because
-        // the cycle-1 T2 outage stamped `last_t2_failed_at`, and T2 itself
-        // is still under the meow backoff. The proxy waits in the recency
-        // queue for the next T2 verdict (T1 suppression after a T2 failure).
-        let (ok_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND ok = 1")
-                .bind(live)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(ok_count, 1);
-        let (fail_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND ok = 0")
-                .bind(dying)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(fail_count, 2);
-        let (kinds,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT probe_kind) FROM probe_results WHERE proxy_id = ? AND ok = 1",
-        )
-        .bind(live)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        // Only the T1 lane succeeded (the T2 attempts ended in the
-        // journaled engine outage).
-        assert_eq!(kinds, 1);
-        let (t1_kind,): (String,) = sqlx::query_as(
-            "SELECT DISTINCT probe_kind FROM probe_results WHERE proxy_id = ? AND ok = 1",
-        )
-        .bind(live)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(t1_kind, "tcp");
-    }
-
-    #[tokio::test]
-    async fn t2_cycle_distinguishes_bad_credential_from_live_proxy() {
-        let pool = temp_pool().await;
-
-        // Mock meow-rs: proxy 1 tunnels fine, proxy 2 fails with a
-        // credential-style error.
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(|Path(name): Path<String>| async move {
-                    if name == "fumox-1" {
-                        (
-                            axum::http::StatusCode::OK,
-                            Json(serde_json::json!({"delay": 42})),
-                        )
-                    } else {
-                        (
-                            axum::http::StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({"message":"invalid credential"})),
-                        )
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // Both proxies already passed T1 (alive); both point at a live
-        // listener so the T1 pass of the cycle stays green and only T2
-        // differentiates them.
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_port = tcp.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = match tcp.accept().await {
-                    Ok(ok) => ok,
-                    Err(_) => break,
-                };
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-        let good = seed_proxy(&pool, "vless", "127.0.0.1", tcp_port, "alive").await;
-        assert_eq!(good, 1);
-        let bad = seed_proxy(&pool, "vless", "127.0.0.1", tcp_port, "alive").await;
-        assert_eq!(bad, 2);
-
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        let config = test_config(3, &meow_addr, config_path.clone());
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        // The generated Clash config reached the disk with both proxies.
-        let yaml = std::fs::read_to_string(&config_path).unwrap();
-        assert!(yaml.contains("fumox-1"));
-        assert!(yaml.contains("fumox-2"));
-
-        // Good proxy: T2 confirmed the tunnel, it reaches the
-        // tunnel-verified `ready` tier,
-        // latency from the tunnel test.
-        let row = proxies::get_by_id(&pool, good).await.unwrap().unwrap();
-        assert_eq!(row.status, "ready");
-        assert_eq!(row.fail_count, 0);
-        assert_eq!(row.latency_ms, Some(42));
-
-        // Bad proxy: port is open (T1 green) but the tunnel failed ,
-        // exactly the case T2 exists for. It stays in the plain tier with
-        // the fail counted.
-        let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
-        assert_eq!(row.status, "alive");
-        assert_eq!(row.fail_count, 1);
-        let (error,): (String,) = sqlx::query_as(
-            "SELECT error FROM probe_results
-             WHERE proxy_id = ? AND probe_kind = 't2' AND ok = 0
-             ORDER BY checked_at DESC LIMIT 1",
-        )
-        .bind(bad)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(error.contains("invalid credential"));
-
-        // meow_last_ok was stamped.
-        let stamp = fumox_core::repo::meta_get(&pool, "meow_last_ok")
-            .await
-            .unwrap();
-        assert!(stamp.is_some());
-    }
-
-    /// The meow.yaml chmod is re-asserted on every write: a pre-existing
-    /// file (older binary, hand-copied sample, restored backup) must not
-    /// keep its old, possibly world-readable mode while the probe
-    /// truncates and rewrites it with fresh proxy credentials.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn meow_config_permissions_are_reasserted_on_an_existing_file() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let pool = temp_pool().await;
-
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"message":"invalid credential"})),
-                    )
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // A live T1 listener so the row is an `alive` T2 candidate.
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_port = tcp.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let (socket, _) = match tcp.accept().await {
-                    Ok(ok) => ok,
-                    Err(_) => break,
-                };
-                drop(socket);
-            }
-        });
-        seed_proxy(&pool, "vless", "127.0.0.1", tcp_port, "alive").await;
-
-        // Pre-create the config file world-readable, as an operator
-        // copying a sample config into the shared volume would.
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        std::fs::write(&config_path, "proxies: []\n").unwrap();
-        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let ctx = Arc::new(Context::new(
-            test_config(3, &meow_addr, config_path.clone()),
-            pool,
-        ));
-        run_cycle(ctx).await.unwrap();
-
-        let mode = std::fs::metadata(&config_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "pre-existing permissions must be corrected on every write"
-        );
-    }
-
-    /// The heartbeat payload is a cross-process contract: the admin panel
-    /// thresholds daemon staleness (beat) and meow-contact staleness
-    /// (cycle) against the reported periods, so both fields must survive
-    /// every payload change.
-    #[test]
-    fn heartbeat_payload_reports_the_effective_beat_and_cycle_periods() {
-        let payload: serde_json::Value = serde_json::from_str(&heartbeat_payload(30, 60)).unwrap();
-        assert_eq!(payload["interval_secs"], 30);
-        assert_eq!(payload["cycle_interval_secs"], 60);
-        assert!(payload["ts"].as_i64().is_some());
-        assert!(payload["pid"].as_u64().is_some());
-        assert!(payload["version"].as_str().is_some());
-    }
-
-    /// Strict T2 priority: a tunnel-dead proxy
-    /// that keeps passing T1 must still reach quarantine, the T1 success of
-    /// every cycle must not wipe the fail counter accumulated by T2.
-    #[tokio::test]
-    async fn t1_success_cannot_rescue_proxies_failing_t2() {
-        let pool = temp_pool().await;
-
-        // meow-rs mock: EVERY delay check fails with a credential error.
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"message":"invalid credential"})),
-                    )
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // The proxy passes T1 (open port) but fails T2 every cycle.
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_port = tcp.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = match tcp.accept().await {
-                    Ok(ok) => ok,
-                    Err(_) => break,
-                };
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-        let bad = seed_proxy(&pool, "vless", "127.0.0.1", tcp_port, "alive").await;
-
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        let config = test_config(3, &meow_addr, config_path.clone());
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        // Cycle 1: T1 success (no failures yet, counter resets), T2 fail → 1.
-        // Cycle 2: T1 success must NOT touch the T2 counter, T2 fail → 2.
-        for cycle in 1..=2i64 {
-            run_cycle(ctx.clone()).await.unwrap();
-            let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
-            assert_eq!(row.status, "alive");
-            assert_eq!(row.fail_count, cycle);
-        }
-
-        // Cycle 3: the third T2 failure reaches the limit → quarantine.
-        run_cycle(ctx.clone()).await.unwrap();
-        let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
-        assert_eq!(row.status, "quarantine");
-        assert_eq!(row.fail_count, 3);
-        assert!(row.ladder_at.is_some());
-
-        // Quarantined rows are sampled by nothing (T1 takes unknown/alive,
-        // T2 takes alive; the second chance is ~24h out): further cycles
-        // leave the proxy alone, no T1 success can revive it.
-        run_cycle(ctx).await.unwrap();
-        let row = proxies::get_by_id(&pool, bad).await.unwrap().unwrap();
-        assert_eq!(row.status, "quarantine");
-    }
-
-    #[tokio::test]
-    async fn quarantine_due_check_runs_after_second_chance_and_removes_after_ladder() {
-        let pool = temp_pool().await;
-
-        // Dead port: every recheck will fail.
-        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_port = dead.local_addr().unwrap().port();
-        drop(dead);
-        let id = seed_proxy(&pool, "vless", "127.0.0.1", dead_port, "quarantine").await;
-
-        // Second chance already due (in the past).
-        sqlx::query("UPDATE proxies SET quarantined_at = 100, ladder_at = 200, ladder_step = 0 WHERE id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let config = test_config(
-            2,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        // Each cycle advances one ladder step; the due moment is always in
-        // the past, so consecutive cycles walk the whole ladder.
-        run_cycle(ctx.clone()).await.unwrap();
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.status, "quarantine");
-        assert_eq!(row.ladder_step, 1);
-        assert!(row.ladder_at.is_some());
-        sqlx::query("UPDATE proxies SET ladder_at = 300 WHERE id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        run_cycle(ctx.clone()).await.unwrap();
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.ladder_step, 2);
-        sqlx::query("UPDATE proxies SET ladder_at = 400 WHERE id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        run_cycle(ctx.clone()).await.unwrap();
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.ladder_step, 3);
-        sqlx::query("UPDATE proxies SET ladder_at = 500 WHERE id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        run_cycle(ctx).await.unwrap();
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.status, "removed");
-        assert!(row.removed_at.is_some());
-    }
-
-    /// A quarantined hysteria2 row is revived by the T2 tunnel check, not a T1
-    /// connect (a TCP connect to a QUIC port proves nothing): the row comes back
-    /// in the `ready` tier with a clean slate, and no tcp attempt is journaled.
-    #[tokio::test]
-    async fn quarantined_hysteria2_is_revived_by_a_tunnel_check() {
-        let pool = temp_pool().await;
-
-        // Mock meow-rs: the revival tunnel check measures a real delay.
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::OK,
-                        Json(serde_json::json!({"delay": 42})),
-                    )
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let id = seed_proxy(&pool, "hysteria2", "127.0.0.1", 443, "quarantine").await;
-        // Second chance already due, mid-ladder to prove the slate clears.
-        sqlx::query(
-            "UPDATE proxies SET quarantined_at = 100, ladder_at = 200, ladder_step = 1 WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let config_path = std::env::temp_dir().join(format!(
-            "fumox-probe-test-{}.yaml",
-            fumox_core::models::new_id()
-        ));
-        let config = test_config(3, &meow_addr, config_path.clone());
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(
-            row.status, "ready",
-            "the tunnel check is the revival probe for a QUIC scheme"
-        );
-        assert_eq!(row.fail_count, 0);
-        assert_eq!(row.ladder_at, None, "the quarantine schedule must clear");
-        assert_eq!(row.ladder_step, 0);
-        assert_eq!(row.latency_ms, Some(42));
-
-        // The revival was a T2 verdict; the TCP connect never ran. (The same cycle's
-        // T2 batch may re-verify the row, so more than one ok t2 record is fine.)
-        let (tcp_rows,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND probe_kind = 'tcp'",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            tcp_rows, 0,
-            "a QUIC scheme must never get a T1 revival check"
-        );
-        let (ok_rows,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND probe_kind = 't2' AND ok = 1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(ok_rows >= 1, "the revival tunnel check must be journaled");
-
-        // The quarantined row reached the engine config by name.
-        let yaml = std::fs::read_to_string(&config_path).unwrap();
-        assert!(
-            yaml.contains(&clash::proxy_name(id)),
-            "the revival batch must carry the row into the meow config: {yaml}"
-        );
-    }
-
-    /// The revival check must not weaken the ladder: a tunnel the engine
-    /// authoritatively fails is a failed recheck, the row walks the same
-    /// configured steps and is removed after the last one.
-    #[tokio::test]
-    async fn quarantined_hysteria2_tunnel_failure_walks_the_ladder_to_removal() {
-        let pool = temp_pool().await;
-
-        // Mock meow-rs: the engine tried, the tunnel is dead (its own
-        // probe-result code, a verdict and not an outage).
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"message":"dial: connection refused"})),
-                    )
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let id = seed_proxy(&pool, "hysteria2", "127.0.0.1", 443, "quarantine").await;
-        sqlx::query(
-            "UPDATE proxies SET quarantined_at = 100, ladder_at = 200, ladder_step = 0 WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let config = test_config(
-            3,
-            &meow_addr,
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        // Each due cycle advances one ladder step (the due moment is poked back
-        // between cycles, the same walk the T1 quarantine test above runs).
-        for (due_at, expected_step) in [(200, 1), (300, 2), (400, 3)] {
-            sqlx::query("UPDATE proxies SET ladder_at = ? WHERE id = ?")
-                .bind(due_at)
-                .bind(id)
-                .execute(&pool)
-                .await
-                .unwrap();
-            run_cycle(ctx.clone()).await.unwrap();
-            let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-            assert_eq!(row.status, "quarantine");
-            assert_eq!(row.ladder_step, expected_step);
-            assert!(row.ladder_at.is_some());
-        }
-
-        sqlx::query("UPDATE proxies SET ladder_at = 500 WHERE id = ?")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        run_cycle(ctx).await.unwrap();
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.status, "removed", "the final failed recheck removes");
-        assert!(row.removed_at.is_some());
-
-        // The verdicts were the engine's own, journaled as t2 failures.
-        let (error,): (String,) = sqlx::query_as(
-            "SELECT COALESCE(error, '') FROM probe_results
-             WHERE proxy_id = ? AND probe_kind = 't2' AND ok = 0
-             ORDER BY id DESC LIMIT 1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(error.contains("dial: connection refused"), "{error}");
-    }
-
-    /// A meow-rs outage must not charge a quarantined row's ladder: the attempt
-    /// is journaled unverified, the row keeps its schedule and is retried on
-    /// the next cycle, where a recovered engine revives it.
-    #[tokio::test]
-    async fn quarantined_hysteria2_is_not_charged_for_a_meow_outage() {
-        let pool = temp_pool().await;
-
-        let id = seed_proxy(&pool, "hysteria2", "127.0.0.1", 443, "quarantine").await;
-        sqlx::query(
-            "UPDATE proxies SET quarantined_at = 100, ladder_at = 200, ladder_step = 1 WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Cycle 1: meow-rs unreachable on a closed port.
-        let config = test_config(
-            3,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-        run_cycle(ctx).await.unwrap();
-
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(
-            row.status, "quarantine",
-            "an engine outage must not retire a quarantined proxy"
-        );
-        assert_eq!(row.ladder_step, 1, "the outage is not a failed recheck");
-        assert_eq!(
-            row.ladder_at,
-            Some(200),
-            "the row stays due for the next cycle"
-        );
-        let (rows, error): (i64, String) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(MAX(error), '') FROM probe_results
-             WHERE proxy_id = ? AND probe_kind = 't2' AND ok = 0",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(rows, 1, "the skipped revival must be journaled");
-        assert!(error.contains("meow-rs unavailable"), "{error}");
-
-        // Cycle 2: the engine is back (healthy mock), the still-due row is
-        // retried and revived.
-        let app = Router::new()
-            .route(
-                "/version",
-                get(|| async { Json(serde_json::json!({"version":"mock"})) }),
-            )
-            .route("/configs", put(|| async { Json(serde_json::json!({})) }))
-            .route(
-                "/proxies/{name}/delay",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::OK,
-                        Json(serde_json::json!({"delay": 17})),
-                    )
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let meow_addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let config = test_config(
-            3,
-            &meow_addr,
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-        run_cycle(ctx).await.unwrap();
-
-        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.status, "ready", "the retried revival must succeed");
-    }
-
-    /// The two T1 lanes of one cycle must not both charge the same proxy.
-    /// They overlap completely (the priority queue and the random sample
-    /// draw from the same `unknown` population and claiming a request only
-    /// deletes the queue row), so a dead proxy in both lanes collected two
-    /// `fail_count` steps from a single cycle and quarantined twice as
-    /// fast as `fail_limit` says.
-    #[tokio::test]
-    async fn queued_and_random_t1_lanes_do_not_double_charge_a_cycle() {
-        let pool = temp_pool().await;
-
-        // Dead port: every T1 check of the cycle fails.
-        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_port = dead.local_addr().unwrap().port();
-        drop(dead);
-
-        // A pool smaller than twice `sample_size` (50), so the random
-        // sample necessarily overlaps the enqueued half.
-        let mut ids = Vec::new();
-        for _ in 0..20 {
-            ids.push(seed_proxy(&pool, "vless", "127.0.0.1", dead_port, "unknown").await);
-        }
-        let queued = probe_repo::enqueue_checks(&pool, &ids[..10], 50, now_ts())
-            .await
-            .unwrap();
-        assert_eq!(queued, 10, "the priority queue must be seeded");
-
-        // A fail limit the double charge would not reach in one cycle, so
-        // the assertion below is about the counter, not about quarantine.
-        let config = test_config(
-            5,
-            "127.0.0.1:1",
-            std::env::temp_dir().join("fumox-probe-test-meow.yaml"),
-        );
-        let ctx = Arc::new(Context::new(config, pool.clone()));
-
-        run_cycle(ctx).await.unwrap();
-
-        for id in &ids {
-            let row = proxies::get_by_id(&pool, *id).await.unwrap().unwrap();
-            assert_eq!(
-                row.fail_count, 1,
-                "id {id}: one cycle may charge one failure, whatever lane ran it"
-            );
-            let (attempts,): (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM probe_results WHERE proxy_id = ? AND ok = 0 AND probe_kind = 'tcp'",
-            )
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert_eq!(attempts, 1, "id {id}: the T1 verdict must be recorded once");
-        }
-    }
-}
+#[path = "main_tests.rs"]
+mod tests;

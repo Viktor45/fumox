@@ -3,43 +3,30 @@
 //! toggle / *Refresh now* / delete actions.
 
 use super::{
-    FormMap, action_response, caps, clamp_limit, fmt_bytes, fmt_opt_ts_element, fmt_ts_element,
-    is_htmx, mask_secret, not_found, page_offset, pagination_pages, server_error,
+    FormMap, action_response, caps, flash_redirect, fmt_bytes, is_htmx, mask_secret, not_found,
+    page_offset, pagination_pages, pipeline_from_form, server_error, validate_slug,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
-use crate::admin::pipeline_editor::{BuilderState, widget_from_posted, widget_from_stored};
+use crate::admin::pipeline_editor::{widget_from_posted, widget_from_stored};
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
 use crate::fetcher;
-use crate::pipeline::CompiledPipeline;
 use askama::Template;
 use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::models::{Encoding, InputFormat, IpFamily, Scheme, Source, new_id, now_ts};
-use fumox_core::repo::{proxies, sources};
+use fumox_core::repo::{fetch_log, proxies, sources};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-/// Slug rules: starts alphanumeric, then `[A-Za-z0-9_-]`,
-/// total length 2–64.
-const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
+/// Rows of the fetch log shown on the source card and its polled
+/// `sources/_log.html` fragment: one fixed page size, no query parameter
+/// (the log is a card detail, not a browsable list screen).
+const LOG_PAGE_SIZE: i64 = 20;
 
 // List
-
-#[derive(Debug, sqlx::FromRow)]
-struct SourceListRow {
-    id: String,
-    name: String,
-    slug: Option<String>,
-    url: String,
-    enabled: bool,
-    cache_ttl_seconds: i64,
-    last_fetched_at: Option<i64>,
-    error_class: Option<String>,
-    proxies_count: i64,
-}
 
 #[derive(Template)]
 #[template(path = "sources/list.html")]
@@ -49,7 +36,7 @@ struct SourcesListTemplate {
     theme: Theme,
     active: &'static str,
     csrf: String,
-    rows: Vec<SourceListRow>,
+    rows: Vec<sources::SourceListRow>,
     f_enabled: String,
     f_error: bool,
     f_tag: String,
@@ -71,52 +58,26 @@ pub async fn sources_list(
     let f_tag = params.get("tag").cloned().unwrap_or_default();
     let f_q = params.get("q").cloned().unwrap_or_default();
 
-    let mut sql = String::from(
-        "SELECT s.id, s.name, s.slug, s.url, s.enabled, s.cache_ttl_seconds,
-                s.last_fetched_at, s.error_class,
-                (SELECT COUNT(*) FROM proxy_source_links l WHERE l.source_id = s.id) AS proxies_count
-         FROM sources s",
-    );
-    let mut clauses: Vec<String> = Vec::new();
-    let mut binds: Vec<String> = Vec::new();
-    if f_enabled == "on" {
-        clauses.push("s.enabled = 1".into());
-    } else if f_enabled == "off" {
-        clauses.push("s.enabled = 0".into());
-    }
-    if f_error {
-        clauses.push("s.error_class IS NOT NULL".into());
-    }
-    if !f_tag.is_empty() {
-        clauses.push("EXISTS (SELECT 1 FROM json_each(s.tags) WHERE json_each.value = ?)".into());
-        binds.push(f_tag.clone());
-    }
-    if !f_q.is_empty() {
-        clauses.push("(s.name LIKE ? OR s.url LIKE ?)".into());
-        binds.push(format!("%{f_q}%"));
-        binds.push(format!("%{f_q}%"));
-    }
-    if !clauses.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&clauses.join(" AND "));
-    }
-    sql.push_str(" ORDER BY s.created_at DESC");
-
-    let mut query = sqlx::query_as::<_, SourceListRow>(sqlx::AssertSqlSafe(sql.as_str()));
-    for value in &binds {
-        query = query.bind(value);
-    }
-    let rows = match query.fetch_all(&state.pool).await {
+    // The filter clause set lives once in the repo (`SourceListFilter`);
+    // every value flows through a bind.
+    let filter = sources::SourceListFilter {
+        enabled: match f_enabled.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        },
+        with_errors: f_error,
+        tag: f_tag.clone(),
+        query: f_q.clone(),
+    };
+    let rows = match sources::list_filtered(&state.pool, &filter).await {
         Ok(rows) => rows,
         Err(err) => return server_error(lang, &err),
     };
 
-    let tags: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT json_each.value FROM sources, json_each(sources.tags) ORDER BY 1",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
+    let tags: Vec<String> = sources::distinct_tags(&state.pool)
+        .await
+        .unwrap_or_default();
 
     render_html(
         lang.clone(),
@@ -176,16 +137,7 @@ struct SourceFormTemplate {
     widget_html: String,
 }
 
-impl SourceFormTemplate {
-    fn error_for(&self, field: &str) -> Option<&str> {
-        self.errors
-            .iter()
-            .find(|(f, _)| f == field)
-            .map(|(_, m)| m.as_str())
-    }
-}
-
-impl_i18n!(SourceFormTemplate);
+impl_i18n!(SourceFormTemplate, errors);
 
 fn all_protocols_with_selection(selected: &[String]) -> Vec<(String, bool)> {
     Scheme::all()
@@ -360,18 +312,14 @@ async fn build_source_from_form(
     }
 
     let slug_raw = get("slug");
-    let slug = if slug_raw.is_empty() {
-        None
-    } else {
-        if !regex::Regex::new(SLUG_RE).is_ok_and(|re| re.is_match(&slug_raw)) {
-            errors.push(("slug".into(), lang.t("val.slug_format").into()));
-        } else if let Ok(Some(other)) = sources::get_by_slug(&state.pool, &slug_raw).await
-            && other.id != existing_id.unwrap_or_default()
-        {
-            errors.push(("slug".into(), lang.t("val.slug_taken").into()));
-        }
-        Some(slug_raw)
-    };
+    let slug = validate_slug(
+        &slug_raw,
+        existing_id,
+        lang,
+        &mut errors,
+        sources::get_by_slug(&state.pool, &slug_raw),
+    )
+    .await;
 
     // The preferred family is parsed before the URL so the save-time SSRF
     // check can vet the host under the source's own constraint.
@@ -399,7 +347,7 @@ async fn build_source_from_form(
         ));
     } else if let Err(issue) = fetcher::vet_url(
         &url,
-        state.admin.allow_private_urls,
+        state.admin().allow_private_urls,
         ip_family.unwrap_or_else(|| state.fetcher.default_family()),
         state.fetcher.dns_timeout,
     )
@@ -546,73 +494,10 @@ async fn build_source_from_form(
         headers_map.insert(key, value);
     }
 
-    // Pipeline: in builder mode the JSON is generated from
-    // the widget fields server-side (a stale `pipeline` textarea, if any,
-    // is ignored); in raw mode the textarea is the input, as before.
-    let pipeline = if get("pipeline_mode") == "builder" {
-        let generated = BuilderState::from_form(form).emit();
-        match generated {
-            None => None,
-            Some(value) => match CompiledPipeline::from_json(Some(&value)) {
-                Ok(_) => {
-                    // Same cap as raw mode: the
-                    // generated JSON is stored verbatim and re-rendered
-                    // into every edit form, so a form with thousands of
-                    // widget rows must not exceed the budget either.
-                    let bytes = serde_json::to_string(&value).map_or(usize::MAX, |text| text.len());
-                    if bytes > caps::PIPELINE_BYTES {
-                        errors.push((
-                            "pipeline".into(),
-                            lang.t("val.field_too_long")
-                                .replace("{}", &caps::PIPELINE_BYTES.to_string()),
-                        ));
-                        None
-                    } else {
-                        Some(value)
-                    }
-                }
-                Err(issues) => {
-                    for issue in issues {
-                        errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
-                    }
-                    None
-                }
-            },
-        }
-    } else {
-        let pipeline_raw = get("pipeline");
-        if pipeline_raw.trim().is_empty() {
-            None
-        } else if pipeline_raw.len() > caps::PIPELINE_BYTES {
-            // Pipeline cap: the JSON is stored
-            // verbatim and re-rendered into every edit form.
-            errors.push((
-                "pipeline".into(),
-                lang.t("val.field_too_long")
-                    .replace("{}", &caps::PIPELINE_BYTES.to_string()),
-            ));
-            None
-        } else {
-            match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {
-                Ok(value) => match CompiledPipeline::from_json(Some(&value)) {
-                    Ok(_) => Some(value),
-                    Err(issues) => {
-                        for issue in issues {
-                            errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
-                        }
-                        None
-                    }
-                },
-                Err(err) => {
-                    errors.push((
-                        "pipeline".into(),
-                        lang.t("val.invalid_json").replace("{}", &err.to_string()),
-                    ));
-                    None
-                }
-            }
-        }
-    };
+    // Pipeline: in builder mode the JSON is generated from the widget
+    // fields server-side (a stale `pipeline` textarea, if any, is ignored);
+    // in raw mode the textarea is the input, as before.
+    let pipeline = pipeline_from_form(form, lang, &mut errors);
 
     if !errors.is_empty() {
         return Err(errors);
@@ -837,8 +722,13 @@ pub async fn source_update(
     if let Err(err) = sources::update(&state.pool, &source).await {
         return server_error(lang, &err);
     }
-    // Saved → effective immediately.
-    state.caches.invalidate_source(&source.id).await;
+    // Saved → effective immediately. The freshness stamp lives on the
+    // source row (`sources::update` resets it when a fetch-relevant field
+    // changed); only the rendered outputs need dropping here.
+    state
+        .caches
+        .invalidate_processed_for_source(&source.id)
+        .await;
     tracing::info!(source = %source.id, "source updated");
     if is_htmx(&headers) {
         let target = format!("/admin/sources/{}", source.id);
@@ -853,17 +743,6 @@ pub async fn source_update(
 }
 
 // Card
-
-#[derive(Debug, sqlx::FromRow)]
-struct LogRow {
-    fetched_at: i64,
-    ok: i64,
-    http_status: Option<i64>,
-    bytes: Option<i64>,
-    proxies_found: Option<i64>,
-    error: Option<String>,
-    error_class: Option<String>,
-}
 
 #[derive(Template)]
 #[template(path = "sources/detail.html")]
@@ -880,8 +759,12 @@ struct SourceDetailTemplate {
     protocols_display: String,
     serve_url: String,
     counts: Vec<(String, i64)>,
-    log: Vec<LogRow>,
+    log: Vec<fetch_log::FetchLogRow>,
     pages: Vec<(i64, bool)>,
+    /// The card includes `sources/_toggle_form.html`, whose standalone
+    /// variant marks the form as an out-of-band swap in the toggle
+    /// response; the page itself always renders it plain.
+    swap_oob: bool,
 }
 
 impl_i18n!(SourceDetailTemplate);
@@ -904,25 +787,17 @@ pub async fn source_detail(
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
         .max(1);
-    let per_page = clamp_limit(params.get("per_page").and_then(|v| v.parse().ok()));
 
-    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM fetch_log WHERE source_id = ?")
-        .bind(&id)
-        .fetch_one(&state.pool)
-        .await
-    {
+    let total: i64 = match fetch_log::count_for_source(&state.pool, &id).await {
         Ok(total) => total,
         Err(err) => return server_error(lang, &err),
     };
-    let log: Vec<LogRow> = match sqlx::query_as(
-        "SELECT fetched_at, ok, http_status, bytes, proxies_found, error, error_class
-         FROM fetch_log WHERE source_id = ?
-         ORDER BY fetched_at DESC, id DESC LIMIT ? OFFSET ?",
+    let log: Vec<fetch_log::FetchLogRow> = match fetch_log::list_for_source(
+        &state.pool,
+        &id,
+        LOG_PAGE_SIZE,
+        page_offset(page, LOG_PAGE_SIZE),
     )
-    .bind(&id)
-    .bind(per_page.min(20))
-    .bind(page_offset(page, per_page.min(20)))
-    .fetch_all(&state.pool)
     .await
     {
         Ok(rows) => rows,
@@ -935,7 +810,7 @@ pub async fn source_detail(
     };
 
     render_source_detail(
-        &state, lang, peer, &headers, source, counts, log, page, per_page, total,
+        &state, lang, peer, &headers, source, counts, log, page, total,
     )
 }
 
@@ -947,9 +822,8 @@ fn render_source_detail(
     headers: &HeaderMap,
     source: Source,
     counts: Vec<(String, i64)>,
-    log: Vec<LogRow>,
+    log: Vec<fetch_log::FetchLogRow>,
     page: i64,
-    per_page: i64,
     total: i64,
 ) -> Response {
     let serve_path = format!(
@@ -1004,7 +878,8 @@ fn render_source_detail(
             serve_url,
             counts,
             log,
-            pages: pagination_pages(page, total, per_page.min(20)),
+            pages: pagination_pages(page, total, LOG_PAGE_SIZE),
+            swap_oob: false,
         },
         StatusCode::OK,
     )
@@ -1015,7 +890,7 @@ fn render_source_detail(
 #[template(path = "sources/_log.html")]
 struct SourceLogFragment {
     lang: Lang,
-    log: Vec<LogRow>,
+    log: Vec<fetch_log::FetchLogRow>,
 }
 
 impl_i18n!(SourceLogFragment);
@@ -1026,18 +901,11 @@ pub async fn source_log(
     headers: HeaderMap,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
-    let log: Vec<LogRow> = match sqlx::query_as(
-        "SELECT fetched_at, ok, http_status, bytes, proxies_found, error, error_class
-         FROM fetch_log WHERE source_id = ?
-         ORDER BY fetched_at DESC, id DESC LIMIT 20",
-    )
-    .bind(&id)
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
-    };
+    let log: Vec<fetch_log::FetchLogRow> =
+        match fetch_log::recent_for_source(&state.pool, &id, LOG_PAGE_SIZE).await {
+            Ok(rows) => rows,
+            Err(err) => return server_error(lang, &err),
+        };
     render_html(
         lang.clone(),
         &SourceLogFragment { lang, log },
@@ -1046,6 +914,55 @@ pub async fn source_log(
 }
 
 // Actions
+
+/// The enabled badge of the source card, as a standalone fragment: the
+/// detail page includes the same file, and the toggle action re-renders it
+/// after every swap, so the initial markup and the swap are one definition.
+#[derive(Template)]
+#[template(path = "sources/_enabled_badge.html")]
+struct EnabledBadgeFragment {
+    lang: Lang,
+    source: Source,
+}
+
+impl_i18n!(EnabledBadgeFragment);
+
+/// The toggle form of the source card, same include-as-initial-render
+/// pattern as [`EnabledBadgeFragment`]. `swap_oob` adds the
+/// `hx-swap-oob` attribute that makes the form in a toggle response
+/// replace itself out-of-band; the initial page renders it plain.
+#[derive(Template)]
+#[template(path = "sources/_toggle_form.html")]
+struct ToggleFormFragment {
+    lang: Lang,
+    source: Source,
+    csrf: String,
+    swap_oob: bool,
+}
+
+impl_i18n!(ToggleFormFragment);
+
+/// The toggle response body: the badge swapped into `#enabled-badge`
+/// normally plus the form marked out-of-band. Both halves come from the
+/// fragment templates the detail page includes, so the ids, aria
+/// attributes and the hx-* contract cannot drift from the initial render.
+fn toggle_swap_fragment(lang: &Lang, source: &Source, csrf: &str) -> String {
+    let badge = EnabledBadgeFragment {
+        lang: lang.clone(),
+        source: source.clone(),
+    }
+    .render()
+    .expect("badge fragment renders");
+    let form = ToggleFormFragment {
+        lang: lang.clone(),
+        source: source.clone(),
+        csrf: csrf.to_string(),
+        swap_oob: true,
+    }
+    .render()
+    .expect("toggle form fragment renders");
+    format!("{badge}\n{form}")
+}
 
 pub async fn source_toggle(
     State(state): State<AdminState>,
@@ -1063,7 +980,9 @@ pub async fn source_toggle(
     if let Err(err) = sources::update(&state.pool, &source).await {
         return server_error(lang, &err);
     }
-    state.caches.invalidate_source(&id).await;
+    // The enabled flip reset the row's freshness stamp (a fetch-relevant
+    // change, see `sources::update`); the rendered outputs go here.
+    state.caches.invalidate_processed_for_source(&id).await;
     let message = if source.enabled {
         lang.t("src.enabled_toast")
     } else {
@@ -1076,31 +995,10 @@ pub async fn source_toggle(
         // The wrapper id must survive the swap (the form's hx-target points
         // at it), and the toggle button must flip with the state, it lives
         // outside the badge, so it travels along as an out-of-band swap.
-        // The aria attributes are part of the contract: the initial
-        // template announces the badge and reports the button's pressed
-        // state, and a swap that drops them silently ends both.
-        format!(
-            r##"<span id="enabled-badge" aria-live="polite" aria-atomic="true"><span class="badge {}">{}</span></span>
-               <form id="toggle-form" method="post" action="/admin/sources/{id}/toggle"
-                     hx-post="/admin/sources/{id}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML"
-                     hx-swap-oob="outerHTML:#toggle-form">
-                 <input type="hidden" name="_csrf" value="{}">
-                 <button class="btn" type="submit" aria-pressed="{}">{}</button>
-               </form>"##,
-            if source.enabled { "on" } else { "off" },
-            if source.enabled {
-                lang.t("common.on")
-            } else {
-                lang.t("common.off")
-            },
-            state.csrf_for(&headers),
-            if source.enabled { "true" } else { "false" },
-            if source.enabled {
-                lang.t("common.disable")
-            } else {
-                lang.t("common.enable")
-            }
-        ),
+        // Both elements are rendered from the same fragment templates the
+        // detail page includes, so the swap cannot drop the aria attributes
+        // or drift from the initial markup.
+        toggle_swap_fragment(&lang, &source, &state.csrf_for(&headers)),
         message,
     )
 }
@@ -1165,12 +1063,6 @@ struct RefreshStatusFragment {
     /// Escaped human-readable fetch error; `None` while busy or on success.
     error_message: Option<String>,
     ok: bool,
-}
-
-impl RefreshStatusFragment {
-    fn ts(&self, ts: &i64) -> String {
-        fmt_ts_element(*ts)
-    }
 }
 
 impl_i18n!(RefreshStatusFragment);
@@ -1240,7 +1132,7 @@ pub async fn source_delete(
     // priority queue is the only authority on a not-yet-checked one.
     // With `drop_gate = true` the strict policy applies and every
     // orphan retires.
-    let protected: &[&str] = if state.ingest.drop_gate {
+    let protected: &[&str] = if state.ingest().drop_gate {
         &[]
     } else {
         &["ready", "unknown"]
@@ -1252,7 +1144,8 @@ pub async fn source_delete(
         Err(err) => tracing::error!(error = %err, "failed to mark orphans removed"),
         _ => {}
     }
-    state.caches.invalidate_source(&id).await;
+    // The row is gone; the rendered outputs that still name it go here.
+    state.caches.invalidate_processed_for_source(&id).await;
     tracing::info!(source = %id, "source deleted");
     action_response(
         is_htmx(&headers),
@@ -1351,27 +1244,31 @@ pub async fn source_dry_run(
             lang,
         },
     };
-    render_html(fragment.lang.clone(), &fragment, StatusCode::OK)
+    if is_htmx(&headers) {
+        render_html(fragment.lang.clone(), &fragment, StatusCode::OK)
+    } else {
+        // Plain-browser path: this fragment is the HTMX swap target inside
+        // the source card, so a plain POST would land on a chrome-less
+        // page. Redirect back to the card with the outcome as a flash
+        // message instead — the same plain-browser fallback as
+        // `source_refresh`.
+        flash_redirect(
+            &format!("/admin/sources/{id}"),
+            &fragment.message,
+            if fragment.ok { "ok" } else { "error" },
+        )
+    }
 }
 
 // Formatting helpers exposed to the askama templates of this module.
 // askama passes call arguments by reference, so every helper takes &T.
 impl SourcesListTemplate {
-    fn ts(&self, ts: &Option<i64>) -> String {
-        fmt_opt_ts_element(*ts)
-    }
     fn tag_selected(&self, tag: &str) -> bool {
         self.f_tag == tag
     }
 }
 
 impl SourceDetailTemplate {
-    fn ts(&self, ts: &i64) -> String {
-        fmt_ts_element(*ts)
-    }
-    fn opt_ts(&self, ts: &Option<i64>) -> String {
-        fmt_opt_ts_element(*ts)
-    }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|n| fmt_bytes(&self.lang, n))
             .unwrap_or_else(|| ",".into())
@@ -1379,9 +1276,6 @@ impl SourceDetailTemplate {
 }
 
 impl SourceLogFragment {
-    fn ts(&self, ts: &i64) -> String {
-        fmt_ts_element(*ts)
-    }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|n| fmt_bytes(&self.lang, n))
             .unwrap_or_else(|| ",".into())
@@ -1391,6 +1285,7 @@ impl SourceLogFragment {
 #[cfg(test)]
 mod tests {
     use super::restore_masked_headers;
+    use super::*;
     use std::collections::BTreeMap;
 
     fn headers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -1487,6 +1382,118 @@ mod tests {
         assert_eq!(
             submitted["X-Renamed"],
             super::mask_secret("eyJAAA-first-secret")
+        );
+    }
+
+    /// A source row as the toggle action holds it after the flip.
+    fn sample_source(enabled: bool) -> Source {
+        let now = now_ts();
+        Source {
+            id: new_id(),
+            slug: Some("s1".into()),
+            name: "s1".into(),
+            url: "https://example.com/sub".into(),
+            enabled,
+            encoding: Encoding::Auto,
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 3600,
+            tags: None,
+            pipeline: None,
+            headers: None,
+            ip_family: None,
+            created_at: now,
+            updated_at: now,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        }
+    }
+
+    fn test_lang() -> Lang {
+        crate::admin::i18n::Locales::load(std::path::Path::new("/nonexistent")).default_lang()
+    }
+
+    /// The toggle swap is rendered from the fragment templates the detail
+    /// page includes, so the ids, aria attributes and the hx-* contract
+    /// cannot drift apart: the badge half must announce itself as a live
+    /// region and the form half must replace itself out-of-band with the
+    /// pressed state flipped.
+    #[test]
+    fn toggle_swap_fragment_carries_the_page_contract() {
+        let lang = test_lang();
+        let source = sample_source(true);
+        let swap = toggle_swap_fragment(&lang, &source, "csrf-token");
+
+        assert!(
+            swap.contains(r#"<span id="enabled-badge" aria-live="polite" aria-atomic="true">"#),
+            "the badge half lost the live-region contract: {swap}"
+        );
+        assert!(swap.contains(r#"<span class="badge on">"#), "{swap}");
+        assert!(swap.contains(r#"id="toggle-form""#), "{swap}");
+        assert!(
+            swap.contains(&format!(r#"hx-post="/admin/sources/{}/toggle""#, source.id)),
+            "{swap}"
+        );
+        assert!(
+            swap.contains(r##"hx-target="#enabled-badge""##),
+            "the form must keep targeting the badge: {swap}"
+        );
+        assert!(
+            swap.contains(r#"hx-swap-oob="outerHTML:#toggle-form""#),
+            "the form must travel as an out-of-band swap: {swap}"
+        );
+        assert!(
+            swap.contains(r#"aria-pressed="true""#),
+            "the pressed state must flip with the badge: {swap}"
+        );
+        assert!(swap.contains(r#"value="csrf-token""#), "{swap}");
+        assert!(swap.contains(lang.t("common.disable")), "{swap}");
+        assert!(swap.contains(lang.t("common.on")), "{swap}");
+    }
+
+    /// The disabled flip: badge class, pressed state and button label all
+    /// follow the stored state.
+    #[test]
+    fn toggle_swap_fragment_flips_with_the_disabled_state() {
+        let lang = test_lang();
+        let swap = toggle_swap_fragment(&lang, &sample_source(false), "csrf-token");
+
+        assert!(swap.contains(r#"<span class="badge off">"#), "{swap}");
+        assert!(!swap.contains(r#"<span class="badge on">"#), "{swap}");
+        assert!(swap.contains(r#"aria-pressed="false""#), "{swap}");
+        assert!(swap.contains(lang.t("common.enable")), "{swap}");
+    }
+
+    /// Byte-compatibility: the page renders the form fragment with
+    /// `swap_oob = false`, the swap with `swap_oob = true`, and the two
+    /// outputs are identical apart from exactly the one attribute.
+    #[test]
+    fn the_oob_marker_is_the_only_difference_from_the_page_render() {
+        let lang = test_lang();
+        let source = sample_source(true);
+        let page_form = ToggleFormFragment {
+            lang: lang.clone(),
+            source: source.clone(),
+            csrf: "csrf-token".into(),
+            swap_oob: false,
+        }
+        .render()
+        .unwrap();
+        let swap_form = ToggleFormFragment {
+            lang: lang.clone(),
+            source,
+            csrf: "csrf-token".into(),
+            swap_oob: true,
+        }
+        .render()
+        .unwrap();
+
+        assert!(!page_form.contains("hx-swap-oob"), "{page_form}");
+        assert_eq!(
+            swap_form.replace(r#" hx-swap-oob="outerHTML:#toggle-form""#, ""),
+            page_form,
+            "the swap render must be the page render plus the oob marker"
         );
     }
 }

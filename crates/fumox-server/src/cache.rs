@@ -1,25 +1,23 @@
-//! In-memory cache layers.
+//! In-memory cache layer.
 //!
-//! Two layers, both acceleration only, SQLite stays the source of truth:
+//! Acceleration only, SQLite stays the source of truth:
 //!
-//! 1. **Raw cache**, a freshness marker per source: the `fetched_at` of
-//!    the last successfully fetched payload. Freshness is
-//!    `fetched_at + source.cache_ttl_seconds`; a fresh entry lets an
-//!    on-demand revalidation skip the HTTP fetch entirely (the DB is
-//!    already reconciled from that payload). The payload bytes themselves
-//!    are not retained here, no reader ever consumed them back.
-//! 2. **Processed cache**, the rendered subscription output per endpoint
-//!    key (`sub:{profile_id}` / `src:{source_id}`). Entries carry their
-//!    own `fresh_until`; a stale entry is still served
-//!    (stale-while-revalidate) while a background re-render is scheduled.
+//! **Processed cache**, the rendered subscription output per endpoint
+//! key (`sub:{profile_id}` / `src:{source_id}`). Entries carry their
+//! own `fresh_until`; a stale entry is still served
+//! (stale-while-revalidate) while a background re-render is scheduled.
+//!
+//! Freshness of the *underlying data* is not cached at all: it is derived
+//! from `sources.last_fetched_at`, the same row the ingest's TTL
+//! short-circuit reads (see `ingest::ingest_source`), so the fact "when was
+//! this payload fetched" has exactly one home.
 //!
 //! Only 200 responses are cached; 404/500 must stay fresh.
 //! Invalidation happens in the same handler that saves the
-//! change: a source change clears its raw entry plus every processed entry
-//! that contains the source; a profile change clears its processed entry. A
-//! successful ingest that reconciled new data clears every processed entry
-//! containing the source (but keeps the just-written raw snapshot), so clients
-//! see fresh proxies without waiting out the TTL.
+//! change: a source change clears every processed entry that contains the
+//! source; a profile change clears its processed entry. A successful ingest
+//! that reconciled new data clears every processed entry containing the
+//! source, so clients see fresh proxies without waiting out the TTL.
 //!
 //! Every invalidation also bumps that key's generation. A render, the
 //! background one of a stale entry or the inline one of a cache miss alike,
@@ -68,7 +66,6 @@ impl Rendered {
 /// Shared cache handle (cheap to clone, used by serving and admin handlers).
 #[derive(Clone)]
 pub struct Caches {
-    raw: Cache<String, i64>,
     processed: Cache<String, Arc<Rendered>>,
     /// Invalidation counter per processed key, bumped on every invalidation
     /// of that key. Bounded exactly like the processed layer it guards.
@@ -130,10 +127,6 @@ pub enum InlineClaim {
 impl Caches {
     pub fn new() -> Self {
         Self {
-            raw: Cache::builder()
-                .max_capacity(1_000)
-                .time_to_idle(ENTRY_IDLE_LIMIT)
-                .build(),
             processed: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_idle(ENTRY_IDLE_LIMIT)
@@ -146,20 +139,6 @@ impl Caches {
             inline_rendering: Arc::new(Mutex::new(HashMap::new())),
             bump_lock: Arc::new(Mutex::new(())),
         }
-    }
-
-    /// Whether the source has a freshness marker younger than its TTL.
-    pub async fn raw_is_fresh(&self, source_id: &str, ttl_seconds: i64) -> bool {
-        match self.raw.get(&source_id.to_string()).await {
-            Some(fetched_at) => fumox_core::models::now_ts() - fetched_at < ttl_seconds,
-            None => false,
-        }
-    }
-
-    /// Record that the database is reconciled from a payload fetched at
-    /// `fetched_at`: the marker [`Caches::raw_is_fresh`] checks.
-    pub async fn raw_put(&self, source_id: &str, fetched_at: i64) {
-        self.raw.insert(source_id.to_string(), fetched_at).await;
     }
 
     pub async fn processed_get(&self, key: &str) -> Option<Arc<Rendered>> {
@@ -229,19 +208,13 @@ impl Caches {
         self.generations.insert(key, next).await;
     }
 
-    /// Source changed (url/encoding/input_format/protocols/headers/TTL/
-    /// pipeline/enabled): drop its freshness marker and every rendered
-    /// output that contains it.
-    pub async fn invalidate_source(&self, source_id: &str) {
-        self.raw.invalidate(&source_id.to_string()).await;
-        self.invalidate_processed_for_source(source_id).await;
-    }
-
-    /// Source data refreshed (a successful ingest reconciled at least one
-    /// row): drop every rendered output that contains the source so clients
-    /// see the new proxies immediately, and supersede every cold render that
-    /// is still running over it. The freshness marker is kept, the ingest
-    /// that triggers this just wrote it.
+    /// Every rendered output that contains `source_id` is stale: dropped
+    /// (and its generation bumped, superseding renders still in flight).
+    /// Used both when a source's configuration changes (the admin save /
+    /// toggle / delete) and when an ingest reconciled new rows into it, so
+    /// clients see the new data immediately instead of waiting out the
+    /// processed TTL. `sources.last_fetched_at`, the freshness marker of
+    /// the underlying data, is of course untouched.
     pub async fn invalidate_processed_for_source(&self, source_id: &str) {
         let mut affected: Vec<String> = self
             .processed
@@ -466,45 +439,12 @@ mod tests {
         }
     }
 
+    /// A source change or a reconciling ingest clears every rendered output
+    /// that contains the source; renderings of unrelated sources survive.
     #[tokio::test]
-    async fn raw_freshness_follows_source_ttl() {
+    async fn source_invalidation_clears_dependent_renderings_only() {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
-        caches.raw_put("s1", now - 100).await;
-        assert!(caches.raw_is_fresh("s1", 3600).await);
-        assert!(!caches.raw_is_fresh("s1", 50).await);
-        assert!(!caches.raw_is_fresh("missing", 3600).await);
-    }
-
-    #[tokio::test]
-    async fn invalidate_source_clears_raw_and_dependent_renderings() {
-        let caches = Caches::new();
-        let now = fumox_core::models::now_ts();
-        caches.raw_put("s1", now).await;
-        caches
-            .processed_put("sub:p1", rendered(now + 60, &["s1", "s2"]))
-            .await;
-        caches
-            .processed_put("sub:p2", rendered(now + 60, &["s2"]))
-            .await;
-        caches
-            .processed_put("src:s1", rendered(now + 60, &["s1"]))
-            .await;
-
-        caches.invalidate_source("s1").await;
-
-        assert!(!caches.raw_is_fresh("s1", 86_400).await);
-        assert!(caches.processed_get("sub:p1").await.is_none());
-        assert!(caches.processed_get("src:s1").await.is_none());
-        // Unrelated profile survives.
-        assert!(caches.processed_get("sub:p2").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn ingest_invalidation_clears_renderings_but_keeps_raw() {
-        let caches = Caches::new();
-        let now = fumox_core::models::now_ts();
-        caches.raw_put("s1", now).await;
         caches
             .processed_put("sub:p1", rendered(now + 60, &["s1", "s2"]))
             .await;
@@ -517,10 +457,9 @@ mod tests {
 
         caches.invalidate_processed_for_source("s1").await;
 
-        // The just-ingested freshness marker stays; dependent renderings go.
-        assert!(caches.raw_is_fresh("s1", 86_400).await);
         assert!(caches.processed_get("sub:p1").await.is_none());
         assert!(caches.processed_get("src:s1").await.is_none());
+        // Unrelated profile survives.
         assert!(caches.processed_get("sub:p2").await.is_some());
     }
 

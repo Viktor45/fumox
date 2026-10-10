@@ -5,64 +5,65 @@
 //! server ran with `[geo].enabled = false`) have all three columns NULL.
 //! On every start, after the resolver has been built, this module walks
 //! those rows once, oldest id first, resolves each host and stores the
-//! facts. Rows the resolver cannot answer (DNS dead, no data in the
-//! database) are left NULL; the next server start tries again.
+//! facts. Host lookups run with the same bounded concurrency as the
+//! ingest path (a hanging DNS server must not stretch a batch into
+//! `[geo].dns_timeout` serial waits) and the whole pass is bounded by the
+//! geo startup budget, so a hopeless NULL set cannot hammer the resolver
+//! after every restart. Rows the resolver cannot answer (DNS dead, no
+//! data in the database) and rows the budget did not reach are left
+//! NULL; the next server start tries again within a fresh budget.
 
 use fumox_core::db::DbPool;
-use fumox_core::geo::GeoResolver;
+use fumox_core::geo::{GeoInfo, GeoResolver};
 use fumox_core::repo::proxies::{self, GeoStamp};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// How many rows to pull from the database per pass.
 const BATCH: i64 = 500;
 
-/// Fill geo facts for every proxy row that has none. Never blocks startup:
-/// call sites spawn it as a background task.
+/// Ceiling on concurrent host lookups inside one backfill pass, the same
+/// shape ingest uses (`GEO_LOOKUP_CONCURRENCY` there): every unseen
+/// domain host costs up to `[geo].dns_timeout` (5 s by default) when DNS
+/// hangs, so the lookups run concurrently instead of one await per row.
+const GEO_LOOKUP_CONCURRENCY: usize = 32;
+
+/// Wall-clock budget for one backfill pass, mirroring the geo download
+/// startup budget (`[geo].startup_download_budget_secs`, 60 s by default —
+/// the same bound `main` applies to `geo_download`). `main` passes the
+/// configured value straight through [`backfill_missing_geo_within_budget`];
+/// this default only backs [`backfill_missing_geo`], the config-less shape
+/// the tests drive. Past the budget the pass stops issuing lookups and the
+/// rows it did not reach stay NULL for the next start.
+const DEFAULT_STARTUP_BUDGET: Duration = Duration::from_secs(60);
+
+/// Fill geo facts for every proxy row that has none, bounded by
+/// [`DEFAULT_STARTUP_BUDGET`] (the tests' config-less shape; `main` calls
+/// [`backfill_missing_geo_within_budget`] with the configured budget).
+/// Never blocks startup: call sites spawn it as a background task.
 pub async fn backfill_missing_geo(pool: DbPool, geo: Arc<GeoResolver>) {
+    backfill_missing_geo_within_budget(pool, geo, DEFAULT_STARTUP_BUDGET).await;
+}
+
+/// [`backfill_missing_geo`] with an explicit wall-clock budget, for
+/// callers holding the config (pass
+/// `config.geo.startup_download_budget()`).
+pub async fn backfill_missing_geo_within_budget(
+    pool: DbPool,
+    geo: Arc<GeoResolver>,
+    budget: Duration,
+) {
     if !geo.is_active() {
         tracing::debug!("geo resolver inactive, skipping geo backfill");
         return;
     }
-    let mut cursor = 0i64;
-    let mut updated = 0usize;
     let started = std::time::Instant::now();
-    loop {
-        let rows = match proxies::list_missing_geo(&pool, cursor, BATCH).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(error = %err, "geo backfill: cannot list rows");
-                return;
-            }
-        };
-        if rows.is_empty() {
-            break;
-        }
-        for (id, host) in &rows {
-            cursor = (*id).max(cursor);
-            let Some(stamp) = geo
-                .resolve(host)
-                .await
-                .map(|info| GeoStamp::from_info(&info))
-            else {
-                continue; // unresolvable, stays NULL, retried next start
-            };
-            if stamp.is_empty() {
-                continue;
-            }
-            if let Err(err) = proxies::update_geo(&pool, *id, &stamp).await {
-                tracing::warn!(proxy = id, error = %err, "geo backfill: update failed");
-            } else {
-                updated += 1;
-            }
-        }
-        if (rows.len() as i64) < BATCH {
-            break;
-        }
-    }
-    // Rows the resolver could not answer stay NULL and are retried on the
-    // next start; the summary names how many are still missing so a
-    // directory without a usable database (or a broken one) is visible
-    // instead of only the rows that happened to resolve.
+    let updated = run_backfill(geo.as_ref(), &pool, budget).await;
+    // Rows the resolver could not answer (or the budget did not reach)
+    // stay NULL and are retried on the next start; the summary names how
+    // many are still missing so a directory without a usable database
+    // (or a broken one) is visible instead of only the rows that
+    // happened to resolve.
     let remaining = proxies::count_missing_geo(&pool).await.ok();
     if updated > 0 || remaining != Some(0) {
         tracing::info!(
@@ -76,12 +77,104 @@ pub async fn backfill_missing_geo(pool: DbPool, geo: Arc<GeoResolver>) {
     }
 }
 
+/// The one [`GeoResolver`] call the backfill makes. The real resolver
+/// implements it as-is; the seam exists so the lookup *shape* (concurrent,
+/// capped, budget-bounded, id-ordered) can be observed without a MaxMind
+/// database and a slow DNS server on the test machine, like the seam
+/// ingest resolves its stamps through.
+trait GeoLookup {
+    /// Resolve one host, `None` when nothing is known about it.
+    fn resolve_host(
+        &self,
+        host: &str,
+    ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send;
+}
+
+impl GeoLookup for GeoResolver {
+    fn resolve_host(
+        &self,
+        host: &str,
+    ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+        self.resolve(host)
+    }
+}
+
+/// Walk every row that has no geo facts, oldest id first. Resolves each
+/// batch's hosts with at most [`GEO_LOOKUP_CONCURRENCY`] lookups in
+/// flight and stops issuing lookups once `budget` has elapsed; returns
+/// how many rows it filled.
+async fn run_backfill<G: GeoLookup>(geo: &G, pool: &DbPool, budget: Duration) -> usize {
+    let deadline = std::time::Instant::now() + budget;
+    let mut cursor = 0i64;
+    let mut updated = 0usize;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                budget_secs = budget.as_secs(),
+                updated,
+                "geo backfill: startup budget elapsed before every missing row was \
+                 examined; the rest stay NULL and are retried on the next start"
+            );
+            break;
+        }
+        let rows = match proxies::list_missing_geo(pool, cursor, BATCH).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %err, "geo backfill: cannot list rows");
+                return updated;
+            }
+        };
+        if rows.is_empty() {
+            break;
+        }
+        use futures_util::StreamExt;
+        // `buffered` (not `buffer_unordered`) keeps the id order the
+        // cursor pagination walks, holding at most `GEO_LOOKUP_CONCURRENCY`
+        // lookups in flight; once the budget elapses the queued lookups
+        // short-circuit instead of piling onto the resolver.
+        let stamps = futures_util::stream::iter(
+            rows.iter()
+                .map(|(_, host)| async move {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    geo.resolve_host(host)
+                        .await
+                        .map(|info| GeoStamp::from_info(&info))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .buffered(GEO_LOOKUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for ((id, _), stamp) in rows.iter().zip(stamps) {
+            cursor = (*id).max(cursor);
+            let Some(stamp) = stamp else {
+                continue; // unresolvable or past budget: stays NULL, retried next start
+            };
+            if stamp.is_empty() {
+                continue;
+            }
+            if let Err(err) = proxies::update_geo(pool, *id, &stamp).await {
+                tracing::warn!(proxy = id, error = %err, "geo backfill: update failed");
+            } else {
+                updated += 1;
+            }
+        }
+        if (rows.len() as i64) < BATCH {
+            break;
+        }
+    }
+    updated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fumox_core::config::{DatabaseConfig, GeoConfig};
     use fumox_core::models::{ProxyEntry, Scheme, Source};
     use fumox_core::repo::proxies::ProxyRow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn temp_pool() -> DbPool {
         let dir = std::env::temp_dir().join(format!(
@@ -160,6 +253,63 @@ mod tests {
             .unwrap()
     }
 
+    /// Seed `count` proxy rows with no geo facts, each under its own
+    /// source (hosts carry the tag, so pools stay collision-free).
+    async fn seed_missing_rows(pool: &DbPool, count: usize, tag: u8) {
+        let src = source(&format!("srcBackfillSeed{tag}"));
+        fumox_core::repo::sources::create(pool, &src).await.unwrap();
+        let entries: Vec<ProxyEntry> = (0..count)
+            .map(|i| entry(&format!("198.51.{tag}.{i}")))
+            .collect();
+        proxies::reconcile_source(
+            pool,
+            &src.id,
+            &entries,
+            &[],
+            fumox_core::models::now_ts(),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Shared in-flight stats for the fake resolver.
+    #[derive(Default)]
+    struct LookupStats {
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    /// Fake resolver standing in for [`GeoResolver`]: records how many
+    /// lookups overlapped and takes a fixed real delay per host, so the
+    /// lookup *shape* (capped concurrency, budget cutoff) is observable
+    /// without a MaxMind database or a slow DNS server, like ingest's
+    /// `GeoLookup` seam.
+    struct FakeGeo {
+        delay: Duration,
+        stats: Arc<LookupStats>,
+    }
+
+    impl GeoLookup for FakeGeo {
+        fn resolve_host(
+            &self,
+            _host: &str,
+        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+            let delay = self.delay;
+            let stats = Arc::clone(&self.stats);
+            async move {
+                let now = stats.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                stats.peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Some(Arc::new(GeoInfo {
+                    country_code: Some("US".into()),
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+
     /// Rows ingested without geo (empty stamp slice, as an inactive resolver
     /// produces) start with NULL columns; the backfill fills them. Skipped
     /// without the mmdb file (CI runs without it).
@@ -223,5 +373,62 @@ mod tests {
         }));
         backfill_missing_geo(pool.clone(), inactive).await;
         assert_eq!(fetch_row(&pool, "8.8.8.8").await.geo_country, None);
+    }
+
+    /// The backfill resolves a batch's hosts concurrently, capped at
+    /// `GEO_LOOKUP_CONCURRENCY` in flight (the same shape ingest uses),
+    /// not one sequential await per row.
+    #[tokio::test]
+    async fn backfill_resolves_batch_with_capped_concurrency() {
+        let pool = temp_pool().await;
+        seed_missing_rows(&pool, 100, 1).await;
+        let stats = Arc::new(LookupStats::default());
+        let geo = FakeGeo {
+            delay: Duration::from_millis(5),
+            stats: Arc::clone(&stats),
+        };
+
+        let updated = run_backfill(&geo, &pool, Duration::from_secs(60)).await;
+
+        assert_eq!(updated, 100);
+        let peak = stats.peak.load(Ordering::SeqCst);
+        assert!(peak > 1, "lookups must overlap, peak was {peak}");
+        assert!(
+            peak <= GEO_LOOKUP_CONCURRENCY,
+            "peak {peak} exceeded the cap"
+        );
+        assert_eq!(proxies::count_missing_geo(&pool).await.unwrap(), 0);
+    }
+
+    /// The startup budget stops the pass: rows the budget did not reach
+    /// stay NULL (retried next start) instead of stretching the pass into
+    /// an unbounded lookup grind.
+    #[tokio::test]
+    async fn backfill_stops_issuing_lookups_once_budget_elapses() {
+        let pool = temp_pool().await;
+        seed_missing_rows(&pool, 400, 2).await;
+        let stats = Arc::new(LookupStats::default());
+        let geo = FakeGeo {
+            delay: Duration::from_millis(50),
+            stats: Arc::clone(&stats),
+        };
+
+        let started = std::time::Instant::now();
+        let updated = run_backfill(&geo, &pool, Duration::from_millis(300)).await;
+        let elapsed = started.elapsed();
+
+        // Every fake lookup takes ≥50 ms and at most 32 run at once, so
+        // the 300 ms budget can complete at most 32 × (300 / 50 + 1) = 224
+        // of the 400 rows, no matter how loaded the machine is.
+        assert!(updated > 0, "the first lookup wave must land in the budget");
+        assert!(
+            updated < 400,
+            "the budget must cut the pass short, updated {updated}"
+        );
+        assert_eq!(
+            proxies::count_missing_geo(&pool).await.unwrap(),
+            (400 - updated) as i64
+        );
+        assert!(elapsed < Duration::from_secs(10), "pass ran {elapsed:?}");
     }
 }

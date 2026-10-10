@@ -341,7 +341,27 @@ impl Fetcher {
     }
 }
 
-/// Strip userinfo (`user:pass@`) from a URL string. Applied on every path
+/// Query-parameter names whose values count as credentials. Matched as
+/// case-insensitive substrings, so `token`, `Token`, `api_key`,
+/// `AUTH_TOKEN`… all hit; a false positive merely masks a harmless value,
+/// a false negative would leak one. Subscription URLs carry their secret
+/// as a query parameter (`?token=…`) exactly the way source headers may
+/// carry one, and unlike the panel (which shows the source URL to the
+/// authenticated admin) tracing output and persisted error text land in
+/// stdout/journald and any log shipper.
+const SENSITIVE_QUERY_PARAMS: [&str; 5] = ["token", "key", "auth", "secret", "pass"];
+
+/// Whether a query-parameter name looks credential-bearing (see
+/// [`SENSITIVE_QUERY_PARAMS`]).
+fn is_sensitive_param(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SENSITIVE_QUERY_PARAMS
+        .iter()
+        .any(|stem| lower.contains(stem))
+}
+
+/// Strip userinfo (`user:pass@`) and mask the value of every
+/// credential-bearing query pair from a URL string. Applied on every path
 /// where a URL, or an error text embedding one, reaches the tracing log,
 /// `fetch_log` or `sources.last_error`.
 fn redact_url(url: &str) -> String {
@@ -349,11 +369,31 @@ fn redact_url(url: &str) -> String {
         Ok(mut parsed) => {
             let _ = parsed.set_username("");
             let _ = parsed.set_password(None);
+            if let Some(query) = parsed.query() {
+                parsed.set_query(Some(&redact_query(query)));
+            }
             parsed.to_string()
         }
         // Not a URL (the error text embedded something else), nothing to leak.
         Err(_) => url.to_string(),
     }
+}
+
+/// Mask the value of every credential-bearing pair of a raw query string,
+/// keeping the harmless pairs verbatim — they are the diagnostics. The
+/// raw string is edited in place rather than round-tripped through
+/// `query_pairs_mut`, whose form-encoding would rewrite benign values
+/// (`%20` → `+`) while "fixing" them.
+fn redact_query(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            // A bare name (`?token` without `=`) carries no value to leak.
+            Some((name, _)) if is_sensitive_param(name) => format!("{name}=[redacted]"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Scheme + host + effective port, the scope source headers are confined to.
@@ -558,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn redact_url_strips_userinfo() {
+    fn redact_url_strips_userinfo_and_secret_query_values() {
         assert_eq!(
             redact_url("https://user:pass@example.com/sub?a=1"),
             "https://example.com/sub?a=1"
@@ -570,6 +610,24 @@ mod tests {
         // Without userinfo the URL is untouched; non-URLs pass through.
         assert_eq!(redact_url("https://example.com/"), "https://example.com/");
         assert_eq!(redact_url("not a url"), "not a url");
+
+        // Credential-bearing query pairs are masked, benign pairs survive:
+        // the query is where a subscription token travels, and the
+        // redacted URL reaches tracing output and fetch_log verbatim.
+        assert_eq!(
+            redact_url("https://example.com/sub?token=SECRET&page=2"),
+            "https://example.com/sub?token=[redacted]&page=2"
+        );
+        // Case-insensitive, and the stem match covers compound names.
+        assert_eq!(
+            redact_url("https://example.com/sub?API_KEY=x&ok=1"),
+            "https://example.com/sub?API_KEY=[redacted]&ok=1"
+        );
+        // A bare name carries no value, so it survives untouched.
+        assert_eq!(
+            redact_url("https://example.com/sub?token&ok=1"),
+            "https://example.com/sub?token&ok=1"
+        );
     }
 
     #[test]

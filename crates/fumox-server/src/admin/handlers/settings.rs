@@ -23,10 +23,54 @@ use axum::extract::{Form, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use fumox_core::config::{
-    AppConfig, DEFAULT_CONFIG_PATH, GeoDbKind, RateLimit, ResolvedConfigPath, bounds,
+    AdminConfig, AppConfig, DEFAULT_CONFIG_PATH, DatabaseConfig, FetchConfig, GeoConfig,
+    IngestConfig, LogConfig, MeowConfig, ProbeConfig, RateLimit, ResolvedConfigPath,
+    RetentionConfig, ServerConfig, bounds,
 };
 use fumox_core::config_writer::{ConfigItem, EditableConfig, item};
 use fumox_core::models::IpFamily;
+
+/// Read-only config view the *Settings* overview renders: the same
+/// field names `templates/settings.html` has always used, populated
+/// from [`AdminState::live`] so the page shows the post-save state
+/// without a restart and without a frozen-field bridge. `config_path`
+/// rides along for the banner and the *Create from defaults* button;
+/// `config_writable` so a read-only deployment gets the same red banner
+/// on the overview the editor shows (USERGUIDE: "the same banner
+/// appears on the overview").
+struct SettingsView {
+    server: ServerConfig,
+    database: DatabaseConfig,
+    fetch: FetchConfig,
+    ingest: IngestConfig,
+    geo_config: GeoConfig,
+    admin: AdminConfig,
+    probe: ProbeConfig,
+    meow: MeowConfig,
+    retention: RetentionConfig,
+    log: LogConfig,
+    config_path: ResolvedConfigPath,
+    config_writable: bool,
+}
+
+impl SettingsView {
+    fn from_state(state: &AdminState) -> Self {
+        Self {
+            server: state.server(),
+            database: state.database(),
+            fetch: state.fetch(),
+            ingest: state.ingest(),
+            geo_config: state.geo_config(),
+            admin: state.admin(),
+            probe: state.probe(),
+            meow: state.meow(),
+            retention: state.retention(),
+            log: state.log(),
+            config_path: state.config_path.clone(),
+            config_writable: state.config_writable,
+        }
+    }
+}
 
 /// Settings overview template (read-only).
 #[derive(Template)]
@@ -37,7 +81,7 @@ struct SettingsTemplate {
     theme: Theme,
     active: &'static str,
     csrf: String,
-    state: AdminState,
+    state: SettingsView,
 }
 
 impl SettingsTemplate {
@@ -87,14 +131,6 @@ impl SettingsTemplate {
         format!("{}/{}", rl.limit, unit)
     }
 
-    fn geo_db(&self) -> &'static str {
-        match self.state.geo_config.db {
-            GeoDbKind::Country => "country",
-            GeoDbKind::City => "city",
-            GeoDbKind::Asn => "asn",
-        }
-    }
-
     /// The path actually written by the editor, `Missing` reads as the
     /// default location for the "would be" message.
     fn editing_path(&self) -> String {
@@ -107,6 +143,14 @@ impl SettingsTemplate {
     fn has_config_file(&self) -> bool {
         matches!(self.state.config_path, ResolvedConfigPath::Loaded(_))
     }
+
+    /// Whether the editor's target file can be written. Drives the
+    /// not-writable banner on the overview, the same one the editor
+    /// shows, so a read-only mount (`FUMOX_CONFIG_ACCESS=ro`) never
+    /// looks like a normal, editable deployment.
+    fn config_writable(&self) -> bool {
+        self.state.config_writable
+    }
 }
 
 impl_i18n!(SettingsTemplate);
@@ -114,19 +158,15 @@ impl_i18n!(SettingsTemplate);
 pub async fn settings_overview(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     // The overview prints the effective config (every panel under
-    // *Settings*). Pull from the figment-merged live view so an edit
-    // that landed between two page loads is visible without a restart
-    //, destructured `state.admin` / `state.fetch` / … stay frozen at
-    // startup, only `state.live_config` is refreshed by
-    // `settings_update`.
-    let state = state.with_fresh_config();
+    // *Settings*), pulled from the figment-merged live view so an edit
+    // that landed between two page loads is visible without a restart.
     let template = SettingsTemplate {
         langs: state.locales.choices().to_vec(),
         theme: theme::from_headers(&headers),
         lang,
         active: "settings",
         csrf: state.csrf_for(&headers),
-        state,
+        state: SettingsView::from_state(&state),
     };
     render_html(template.lang.clone(), &template, StatusCode::OK)
 }
@@ -167,14 +207,6 @@ impl SettingsEditTemplate {
         // Same literals the save parser accepts: the failed-save replay
         // must re-render hidden `value="off"` inputs unchecked.
         parse_bool_literal(self.raw_value(field)).unwrap_or(false)
-    }
-
-    /// First error message attached to a field, if any.
-    fn error_for(&self, field: &str) -> Option<&str> {
-        self.errors
-            .iter()
-            .find(|(f, _)| f == field)
-            .map(|(_, m)| m.as_str())
     }
 
     /// `min` for a number input, straight from the bounds table. An
@@ -221,9 +253,26 @@ impl SettingsEditTemplate {
                 .t_named("set.edit_unwritable", &[("path", path.clone())]),
         )
     }
+
+    /// `disabled` attribute carried by every visible control on the
+    /// form when the config file is not writable. USERGUIDE promises
+    /// "every control is disabled" for a read-only deployment; the save
+    /// path refuses the POST anyway (`settings_edit_unwritable`), so
+    /// the form must not invite edits it cannot keep. The hidden
+    /// `value="off"` inputs and the CSS-only tab radios stay enabled:
+    /// they carry no setting (the hidden pair only mirrors its
+    /// checkbox) or are navigation, and a disabled radio would freeze
+    /// the pane view instead of just the edits.
+    fn fields_disabled(&self) -> &'static str {
+        if self.state.config_writable {
+            ""
+        } else {
+            " disabled"
+        }
+    }
 }
 
-impl_i18n!(SettingsEditTemplate);
+impl_i18n!(SettingsEditTemplate, errors);
 
 /// Path that the editor writes to, deriving a default when no file was
 /// loaded at startup. Used by `settings_create` to know where to drop
@@ -235,221 +284,501 @@ fn editing_target(state: &AdminState) -> PathBuf {
     }
 }
 
-/// Reassemble the full `AppConfig` from the destructured fields the
-/// `AdminState` carries. Used by the unwritable / load-error fallback
-/// paths, where reading the file on disk is not an option but the form
-/// still needs sensible values to render.
-fn state_appconfig(state: &AdminState) -> AppConfig {
-    AppConfig {
-        server: state.server.clone(),
-        database: state.database.clone(),
-        fetch: state.fetch.clone(),
-        ingest: state.ingest.clone(),
-        geo: state.geo_config.clone(),
-        admin: state.admin.clone(),
-        probe: state.probe.clone(),
-        meow: state.meow.clone(),
-        retention: state.retention.clone(),
-        log: state.log.clone(),
-    }
+// Editable-settings registry.
+//
+// One row per setting the panel round-trips. `raw_from_config` (render
+// for the form) and `apply_all` (parse the submit into the TOML
+// document) both iterate this table, so a new field can no longer be
+// added to one side and silently forgotten on the other: the dotted
+// key, its render and its parse live in a single entry. The HTML form
+// remains the one hand-written list; the tests below pin it to this
+// table in both directions.
+
+/// Signature of a per-field parse/write step: read the submitted raw
+/// values for `key`, write into the document, append failures to
+/// `errors`. Missing keys are skipped (the editor only writes what the
+/// operator's browser posted).
+type ApplyField =
+    fn(&HashMap<String, String>, &str, &mut EditableConfig, &Lang, &mut Vec<(String, String)>);
+
+/// What one editable setting does. Function pointers so the table can
+/// live in a `static`.
+struct Setting {
+    /// Dotted config key — also the form field name and the
+    /// error-attribution key. Written exactly once, here.
+    key: &'static str,
+    /// Render the current value into the edit form's raw map. A
+    /// rate-limit row renders the pair `{key}.limit` + `{key}.unit`.
+    render: fn(&AppConfig, &str, &mut HashMap<String, String>),
+    /// Parse the submitted value and write it into the document.
+    apply: ApplyField,
 }
 
-/// Build the edit template's `raw` map from an `AppConfig`, using the
-/// canonical render of every field. Booleans become `"on"` when true,
-/// absent otherwise; enums become their short name.
-///
-/// Loaded from the file on every `GET /admin/settings/edit` so the
-/// form reflects the just-saved state, `state.config` is frozen at
-/// startup and would otherwise lag behind every admin save. ENV
-/// overrides keep their priority because `AppConfig::load` already
-/// merges them on top of the file.
-fn raw_from_config(c: &AppConfig) -> HashMap<String, String> {
-    let mut raw = HashMap::new();
-    let admin = &c.admin;
-    let s = &c.server;
-    let db = &c.database;
-    let f = &c.fetch;
-    let g = &c.geo;
-    let p = &c.probe;
-    let m = &c.meow;
-    let r = &c.retention;
+/// Exactly the lowercase levels `LogLevel` deserializes: one bad value
+/// fails `config::load` and aborts both binaries at the next start.
+const LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace"];
 
-    raw.insert("server.bind".into(), s.bind.to_string());
-    raw.insert(
-        "server.trust_proxy_ips".into(),
-        s.trust_proxy_ips.join("\n"),
-    );
-    raw.insert("server.allowed_hosts".into(), s.allowed_hosts.join("\n"));
-    rate_into(&mut raw, "server.rate_limit", &s.rate_limit);
-    rate_into(
-        &mut raw,
-        "server.auth_fail_rate_limit",
-        &s.auth_fail_rate_limit,
-    );
+/// The closed set `IpFamily` deserializes; same contract as
+/// [`LOG_LEVELS`], the strings are also what [`ip_family_str`] renders.
+const IP_FAMILIES: &[&str] = &["any", "ipv4", "ipv6"];
 
-    raw.insert("database.path".into(), db.path.display().to_string());
-    raw.insert(
-        "database.busy_timeout_ms".into(),
-        db.busy_timeout_ms.to_string(),
-    );
-    raw.insert(
-        "database.max_connections".into(),
-        db.max_connections.to_string(),
-    );
-
-    raw.insert(
-        "fetch.connect_timeout_secs".into(),
-        f.connect_timeout_secs.to_string(),
-    );
-    raw.insert(
-        "fetch.read_timeout_secs".into(),
-        f.read_timeout_secs.to_string(),
-    );
-    raw.insert(
-        "fetch.max_response_bytes".into(),
-        f.max_response_bytes.to_string(),
-    );
-    raw.insert(
-        "fetch.max_concurrency".into(),
-        f.max_concurrency.to_string(),
-    );
-    raw.insert("fetch.max_retries".into(), f.max_retries.to_string());
-    raw.insert(
-        "fetch.retry_base_backoff_ms".into(),
-        f.retry_base_backoff_ms.to_string(),
-    );
-    raw.insert("fetch.user_agent".into(), f.user_agent.clone());
-    raw.insert("fetch.ip_family".into(), ip_family_str(f.ip_family).into());
-
-    raw.insert(
-        "ingest.refresh_check_limit".into(),
-        c.ingest.refresh_check_limit.to_string(),
-    );
-    raw.insert("ingest.drop_gate".into(), bool_to_raw(c.ingest.drop_gate));
-    raw.insert(
-        "ingest.removed_as_unknown".into(),
-        bool_to_raw(c.ingest.removed_as_unknown),
-    );
-
-    raw.insert("geo.enabled".into(), bool_to_raw(g.enabled));
-    raw.insert("geo.db".into(), geo_db_str(g.db).into());
-    raw.insert("geo.db_dir".into(), g.db_dir.display().to_string());
-    raw.insert(
-        "geo.cache_max_entries".into(),
-        g.cache_max_entries.to_string(),
-    );
-    raw.insert(
-        "geo.dns_timeout_secs".into(),
-        g.dns_timeout_secs.to_string(),
-    );
-
-    raw.insert("admin.enabled".into(), bool_to_raw(admin.enabled));
-    raw.insert("admin.bind".into(), admin.bind.to_string());
-    raw.insert("admin.token".into(), admin.token.clone());
-    raw.insert(
-        "admin.session_ttl_hours".into(),
-        admin.session_ttl_hours.to_string(),
-    );
-    raw.insert(
-        "admin.allow_private_urls".into(),
-        bool_to_raw(admin.allow_private_urls),
-    );
-    rate_into(&mut raw, "admin.rate_limit", &admin.rate_limit);
-    rate_into(&mut raw, "admin.login_rate_limit", &admin.login_rate_limit);
-    raw.insert(
-        "admin.secure_cookies".into(),
-        bool_to_raw(admin.secure_cookies),
-    );
-    raw.insert("admin.locales_dir".into(), admin.locales_dir.clone());
-    raw.insert(
-        "admin.trust_proxy_ips".into(),
-        admin.trust_proxy_ips.join("\n"),
-    );
-    raw.insert("admin.allowed_hosts".into(), admin.allowed_hosts.join("\n"));
-
-    raw.insert("probe.fail_limit".into(), p.fail_limit.to_string());
-    raw.insert(
-        "probe.second_chance_min_hours".into(),
-        p.second_chance_min_hours.to_string(),
-    );
-    raw.insert(
-        "probe.second_chance_spread_hours".into(),
-        p.second_chance_spread_hours.to_string(),
-    );
-    raw.insert(
-        "probe.recheck_delays_secs".into(),
-        p.recheck_delays_secs
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    raw.insert(
-        "probe.queue_stale_days".into(),
-        p.queue_stale_days.to_string(),
-    );
-    raw.insert(
-        "probe.retention_interval_secs".into(),
-        p.retention_interval_secs.to_string(),
-    );
-    raw.insert(
-        "probe.cycle_interval_secs".into(),
-        p.cycle_interval_secs.to_string(),
-    );
-    raw.insert("probe.sample_size".into(), p.sample_size.to_string());
-    raw.insert(
-        "probe.allow_private_targets".into(),
-        bool_to_raw(p.allow_private_targets),
-    );
-    raw.insert(
-        "probe.connect_timeout_secs".into(),
-        p.connect_timeout_secs.to_string(),
-    );
-    raw.insert(
-        "probe.tls_timeout_secs".into(),
-        p.tls_timeout_secs.to_string(),
-    );
-    raw.insert("probe.concurrency".into(), p.concurrency.to_string());
-    raw.insert(
-        "probe.heartbeat_interval_secs".into(),
-        p.heartbeat_interval_secs.to_string(),
-    );
-    raw.insert(
-        "probe.backlog_target_drain_minutes".into(),
-        p.backlog_target_drain_minutes.to_string(),
-    );
-
-    raw.insert("meow.api_addr".into(), m.api_addr.clone());
-    raw.insert(
-        "meow.config_path".into(),
-        m.config_path.display().to_string(),
-    );
-    raw.insert("meow.test_url".into(), m.test_url.join("\n"));
-    raw.insert("meow.timeout_secs".into(), m.timeout_secs.to_string());
-    raw.insert(
-        "meow.backoff_initial_secs".into(),
-        m.backoff_initial_secs.to_string(),
-    );
-    raw.insert(
-        "meow.backoff_max_secs".into(),
-        m.backoff_max_secs.to_string(),
-    );
+static SETTINGS: &[Setting] = &[
+    // --- server ---
+    Setting {
+        key: "server.bind",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.server.bind.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| bind(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "server.trust_proxy_ips",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.server.trust_proxy_ips.join("\n"));
+        },
+        apply: |raw, key, cfg, lang, errors| cidr_list(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "server.allowed_hosts",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.server.allowed_hosts.join("\n"));
+        },
+        apply: |raw, key, cfg, lang, errors| string_list(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "server.rate_limit",
+        render: |c, key, raw| rate_into(raw, key, &c.server.rate_limit),
+        apply: |raw, key, cfg, lang, errors| rate_limit(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "server.auth_fail_rate_limit",
+        render: |c, key, raw| rate_into(raw, key, &c.server.auth_fail_rate_limit),
+        apply: |raw, key, cfg, lang, errors| rate_limit(raw, key, cfg, lang, errors),
+    },
+    // --- database ---
+    Setting {
+        key: "database.path",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.database.path.display().to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "database.busy_timeout_ms",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.database.busy_timeout_ms.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "database.max_connections",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.database.max_connections.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
+    // --- fetch ---
+    Setting {
+        key: "fetch.connect_timeout_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.fetch.connect_timeout_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "fetch.read_timeout_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.fetch.read_timeout_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "fetch.max_response_bytes",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.fetch.max_response_bytes.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "fetch.max_concurrency",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.fetch.max_concurrency.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| usize_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "fetch.max_retries",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.fetch.max_retries.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "fetch.retry_base_backoff_ms",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.fetch.retry_base_backoff_ms.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "fetch.user_agent",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.fetch.user_agent.clone());
+        },
+        apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "fetch.ip_family",
+        render: |c, key, raw| {
+            raw.insert(key.into(), ip_family_str(c.fetch.ip_family).into());
+        },
+        apply: |raw, key, cfg, lang, errors| enum_field(raw, key, cfg, IP_FAMILIES, lang, errors),
+    },
+    // --- ingest ---
+    Setting {
+        key: "ingest.refresh_check_limit",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.ingest.refresh_check_limit.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "ingest.drop_gate",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.ingest.drop_gate));
+        },
+        apply: |raw, key, cfg, _lang, errors| bool_field(raw, key, cfg, errors),
+    },
+    Setting {
+        key: "ingest.removed_as_unknown",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.ingest.removed_as_unknown));
+        },
+        apply: |raw, key, cfg, _lang, errors| bool_field(raw, key, cfg, errors),
+    },
+    // --- geo ---
+    Setting {
+        key: "geo.enabled",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.geo.enabled));
+        },
+        apply: |raw, key, cfg, _lang, errors| bool_field(raw, key, cfg, errors),
+    },
+    Setting {
+        key: "geo.db_dir",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.geo.db_dir.display().to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "geo.cache_max_entries",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.geo.cache_max_entries.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "geo.dns_timeout_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.geo.dns_timeout_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    // --- admin ---
+    Setting {
+        key: "admin.enabled",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.admin.enabled));
+        },
+        apply: |raw, key, cfg, _lang, errors| bool_field(raw, key, cfg, errors),
+    },
+    Setting {
+        key: "admin.bind",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.admin.bind.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| bind(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "admin.token",
+        // The live token must never reach the markup (USERGUIDE: "The
+        // admin token is never shown."): the field renders empty and an
+        // empty submit keeps the current token (`token_field`). The key
+        // still has to be present — `the_registry_covers_every_rendered_key`
+        // and the edit form's input both read it.
+        render: |_c, key, raw| {
+            raw.insert(key.into(), String::new());
+        },
+        apply: |raw, key, cfg, lang, errors| token_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "admin.session_ttl_hours",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.admin.session_ttl_hours.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "admin.allow_private_urls",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.admin.allow_private_urls));
+        },
+        apply: |raw, key, cfg, _lang, errors| bool_field(raw, key, cfg, errors),
+    },
+    Setting {
+        key: "admin.rate_limit",
+        render: |c, key, raw| rate_into(raw, key, &c.admin.rate_limit),
+        apply: |raw, key, cfg, lang, errors| rate_limit(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "admin.login_rate_limit",
+        render: |c, key, raw| rate_into(raw, key, &c.admin.login_rate_limit),
+        apply: |raw, key, cfg, lang, errors| rate_limit(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "admin.secure_cookies",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.admin.secure_cookies));
+        },
+        apply: |raw, key, cfg, _lang, errors| bool_field(raw, key, cfg, errors),
+    },
+    Setting {
+        key: "admin.locales_dir",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.admin.locales_dir.clone());
+        },
+        apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "admin.trust_proxy_ips",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.admin.trust_proxy_ips.join("\n"));
+        },
+        apply: |raw, key, cfg, lang, errors| cidr_list(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "admin.allowed_hosts",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.admin.allowed_hosts.join("\n"));
+        },
+        apply: |raw, key, cfg, lang, errors| string_list(raw, key, cfg, lang, errors),
+    },
+    // --- probe ---
+    Setting {
+        key: "probe.fail_limit",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.fail_limit.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.second_chance_min_hours",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.second_chance_min_hours.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.second_chance_spread_hours",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.second_chance_spread_hours.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.recheck_delays_secs",
+        render: |c, key, raw| {
+            raw.insert(
+                key.into(),
+                c.probe
+                    .recheck_delays_secs
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        },
+        apply: |raw, key, cfg, lang, errors| {
+            i64_list_field(
+                raw,
+                key,
+                cfg,
+                bounds::RECHECK_MAX_STEPS,
+                1,
+                bounds::RECHECK_MAX_DELAY_SECS,
+                lang,
+                errors,
+            )
+        },
+    },
+    Setting {
+        key: "probe.queue_stale_days",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.queue_stale_days.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.retention_interval_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.retention_interval_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.cycle_interval_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.cycle_interval_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.sample_size",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.sample_size.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.allow_private_targets",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.probe.allow_private_targets));
+        },
+        apply: |raw, key, cfg, _lang, errors| bool_field(raw, key, cfg, errors),
+    },
+    Setting {
+        key: "probe.connect_timeout_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.connect_timeout_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.tls_timeout_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.tls_timeout_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.concurrency",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.concurrency.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| usize_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.heartbeat_interval_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.heartbeat_interval_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "probe.backlog_target_drain_minutes",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.probe.backlog_target_drain_minutes.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    // --- meow ---
+    Setting {
+        key: "meow.api_addr",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.meow.api_addr.clone());
+        },
+        apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "meow.config_path",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.meow.config_path.display().to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| string_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "meow.test_url",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.meow.test_url.join("\n"));
+        },
+        apply: |raw, key, cfg, lang, errors| string_list(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "meow.timeout_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.meow.timeout_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "meow.backoff_initial_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.meow.backoff_initial_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "meow.backoff_max_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.meow.backoff_max_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
     // `bool_to_raw`, not `to_string()`: the edit page renders checkbox
     // state from the raw map, where empty means unchecked.
-    raw.insert("meow.ipv6".into(), bool_to_raw(m.ipv6));
+    Setting {
+        key: "meow.ipv6",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.meow.ipv6));
+        },
+        apply: |raw, key, cfg, _lang, errors| bool_field(raw, key, cfg, errors),
+    },
+    // --- retention ---
+    Setting {
+        key: "retention.probe_results_days",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.retention.probe_results_days.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "retention.fetch_log_days",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.retention.fetch_log_days.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
+    // --- log ---
+    Setting {
+        key: "log.server",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.log.server.as_str().into());
+        },
+        apply: |raw, key, cfg, lang, errors| enum_field(raw, key, cfg, LOG_LEVELS, lang, errors),
+    },
+    Setting {
+        key: "log.probe",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.log.probe.as_str().into());
+        },
+        apply: |raw, key, cfg, lang, errors| enum_field(raw, key, cfg, LOG_LEVELS, lang, errors),
+    },
+];
 
-    raw.insert(
-        "retention.probe_results_days".into(),
-        r.probe_results_days.to_string(),
-    );
-    raw.insert(
-        "retention.fetch_log_days".into(),
-        r.fetch_log_days.to_string(),
-    );
-
-    raw.insert("log.server".into(), c.log.server.as_str().into());
-    raw.insert("log.probe".into(), c.log.probe.as_str().into());
-
+/// Build the edit template's `raw` map from an `AppConfig`, using the
+/// canonical render of every registered field. Booleans become `"on"`
+/// when true, absent otherwise; enums become their short name.
+///
+/// Loaded from the file on every `GET /admin/settings/edit` so the
+/// form reflects the just-saved state (the live view is refreshed by
+/// `settings_update`). ENV overrides keep their priority because
+/// `AppConfig::load` already merges them on top of the file.
+fn raw_from_config(c: &AppConfig) -> HashMap<String, String> {
+    let mut raw = HashMap::new();
+    for setting in SETTINGS {
+        (setting.render)(c, setting.key, &mut raw);
+    }
     raw
 }
 
@@ -484,23 +813,6 @@ fn ip_family_str(f: IpFamily) -> &'static str {
     }
 }
 
-fn geo_db_str(d: GeoDbKind) -> &'static str {
-    match d {
-        GeoDbKind::Country => "country",
-        GeoDbKind::City => "city",
-        GeoDbKind::Asn => "asn",
-    }
-}
-
-/// Exactly the lowercase levels `LogLevel` deserializes: one bad value
-/// fails `config::load` and aborts both binaries at the next start.
-fn log_level_raw(s: &str) -> Option<String> {
-    match s {
-        "error" | "warn" | "info" | "debug" | "trace" => Some(s.to_string()),
-        _ => None,
-    }
-}
-
 pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
 
@@ -511,7 +823,9 @@ pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) 
     let target = editing_target(&state);
     let raw = match fumox_core::config::load(Some(&target)) {
         Ok(loaded) => raw_from_config(&loaded.config),
-        Err(_) => raw_from_config(&state_appconfig(&state)),
+        // The unwritable / load-error fallback: the file on disk is not
+        // an option, so the form renders the live in-memory view instead.
+        Err(_) => raw_from_config(&state.live()),
     };
 
     let banner = if !state.config_writable {
@@ -547,64 +861,89 @@ pub async fn settings_update(
 
     // Build a fresh `EditableConfig` so we can fail-and-replay the form
     // before touching disk. The validator only reads `raw` and the
-    // language catalog, no side effects.
-    let mut cfg = match EditableConfig::load(&editing_target(&state)) {
-        Ok(c) => c,
-        Err(err) => return settings_edit_load_error(&state, &headers, err.to_string()),
+    // language catalog, no side effects. The editor holds the
+    // process-wide config lock, so it is confined to this block: its
+    // guard must not ride across the awaits below.
+    let path = {
+        let mut cfg = match EditableConfig::load(&editing_target(&state)) {
+            Ok(c) => c,
+            Err(err) => return settings_edit_load_error(&state, &headers, err.to_string()),
+        };
+
+        let mut errors: Vec<(String, String)> = Vec::new();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+        if !errors.is_empty() {
+            let template = SettingsEditTemplate {
+                langs: state.locales.choices().to_vec(),
+                theme: theme::from_headers(&headers),
+                lang: lang.clone(),
+                active: "settings",
+                csrf: state.csrf_for(&headers),
+                state: state.clone(),
+                raw,
+                errors,
+                banner: None,
+            };
+            return render_html(
+                template.lang.clone(),
+                &template,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            );
+        }
+
+        // Persist atomically. On a backend that rejects `rename` (NFS / SMB),
+        // `save()` falls back to a direct write with a tracing warning.
+        if let Err(err) = cfg.save() {
+            tracing::error!(error = %err, path = %cfg.path().display(), "failed to save settings");
+            let template = SettingsEditTemplate {
+                langs: state.locales.choices().to_vec(),
+                theme: theme::from_headers(&headers),
+                lang: lang.clone(),
+                active: "settings",
+                csrf: state.csrf_for(&headers),
+                state: state.clone(),
+                raw,
+                errors: vec![(
+                    "".into(),
+                    lang.t_args("err.internal", &[format!("save: {err}")]),
+                )],
+                banner: None,
+            };
+            return render_html(
+                template.lang.clone(),
+                &template,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+
+        cfg.path().display().to_string()
     };
 
-    let mut errors: Vec<(String, String)> = Vec::new();
-    apply_all(&raw, &mut cfg, &lang, &mut errors);
-
-    if !errors.is_empty() {
-        let template = SettingsEditTemplate {
-            langs: state.locales.choices().to_vec(),
-            theme: theme::from_headers(&headers),
-            lang: lang.clone(),
-            active: "settings",
-            csrf: state.csrf_for(&headers),
-            state: state.clone(),
-            raw,
-            errors,
-            banner: None,
-        };
-        return render_html(
-            template.lang.clone(),
-            &template,
-            StatusCode::UNPROCESSABLE_ENTITY,
-        );
-    }
-
-    // Persist atomically. On a backend that rejects `rename` (NFS / SMB),
-    // `save()` falls back to a direct write with a tracing warning.
-    if let Err(err) = cfg.save() {
-        tracing::error!(error = %err, path = %cfg.path().display(), "failed to save settings");
-        let template = SettingsEditTemplate {
-            langs: state.locales.choices().to_vec(),
-            theme: theme::from_headers(&headers),
-            lang: lang.clone(),
-            active: "settings",
-            csrf: state.csrf_for(&headers),
-            state: state.clone(),
-            raw,
-            errors: vec![(
-                "".into(),
-                lang.t_args("err.internal", &[format!("save: {err}")]),
-            )],
-            banner: None,
-        };
-        return render_html(
-            template.lang.clone(),
-            &template,
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
-    }
-
-    let path = cfg.path().display().to_string();
     tracing::info!(path = %path, "settings saved");
 
+    // A token rotation through this form must also revoke the sessions
+    // minted under the old token: the session key is derived from the
+    // token at startup and stays frozen (`AdminState::session_key`), so
+    // without an epoch bump a stolen cookie keeps authenticating until
+    // the next restart. The comparison runs before `refresh_live_config`
+    // swaps the new token into the live config, and only on an actual
+    // change — an unconditional bump would log out the very session
+    // performing an unrelated save. An empty submit is NOT a change:
+    // `token_field` reads it as "keep the current token", so treating
+    // it as a rotation would log the operator out of every unrelated
+    // save (the field renders empty and untouched fields submit empty).
+    let submitted_token = raw
+        .get("admin.token")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    if !submitted_token.is_empty() && submitted_token != state.admin().token {
+        crate::admin::auth::revoke_all_sessions(&state.pool).await;
+    }
+
     // Refresh the figment-merged in-memory view so the next request to
-    // /admin/settings (or any handler that calls `state.with_fresh_config`)
+    // /admin/settings — and every handler reading the live config —
     // renders the values the operator just wrote, instead of the startup
     // snapshot. ENV overrides are re-applied by `config::load` itself, so
     // `FUMOX_*` env vars keep winning on top of the file.
@@ -645,7 +984,7 @@ fn settings_edit_unwritable(state: &AdminState, headers: &HeaderMap) -> Response
         active: "settings",
         csrf: state.csrf_for(headers),
         state: state.clone(),
-        raw: raw_from_config(&state_appconfig(state)),
+        raw: raw_from_config(&state.live()),
         errors: Vec::new(),
         banner: Some(Banner::Unwritable(
             editing_target(state).display().to_string(),
@@ -668,7 +1007,7 @@ fn settings_edit_load_error(state: &AdminState, headers: &HeaderMap, message: St
         active: "settings",
         csrf: state.csrf_for(headers),
         state: state.clone(),
-        raw: raw_from_config(&state_appconfig(state)),
+        raw: raw_from_config(&state.live()),
         errors: vec![("".into(), format!("{internal}: {message}"))],
         banner: None,
     };
@@ -718,456 +1057,19 @@ fn redirect_after_create(toast: String) -> Response {
 
 // Validation / application.
 
-/// Walk every supported setting. Each field is parsed in isolation ,
-/// errors accumulate without short-circuiting so the operator sees
-/// every problem on a single submit.
+/// Walk every registered setting and apply the ones the form carried.
+/// Each field is parsed in isolation, errors accumulate without
+/// short-circuiting so the operator sees every problem on a single
+/// submit.
 fn apply_all(
     raw: &HashMap<String, String>,
     cfg: &mut EditableConfig,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
-    // --- server ---
-    bind(raw, "server.bind", cfg, lang, errors);
-    string_list(
-        raw,
-        "server.trust_proxy_ips",
-        cfg,
-        "server.trust_proxy_ips",
-        lang,
-        errors,
-    );
-    string_list(
-        raw,
-        "server.allowed_hosts",
-        cfg,
-        "server.allowed_hosts",
-        lang,
-        errors,
-    );
-    rate_limit(
-        raw,
-        "server.rate_limit",
-        cfg,
-        "server.rate_limit",
-        lang,
-        errors,
-    );
-    rate_limit(
-        raw,
-        "server.auth_fail_rate_limit",
-        cfg,
-        "server.auth_fail_rate_limit",
-        lang,
-        errors,
-    );
-
-    // --- database ---
-    string_field(raw, "database.path", cfg, "database.path", lang, errors);
-    u64_field(
-        raw,
-        "database.busy_timeout_ms",
-        cfg,
-        "database.busy_timeout_ms",
-        lang,
-        errors,
-    );
-    u32_field(
-        raw,
-        "database.max_connections",
-        cfg,
-        "database.max_connections",
-        lang,
-        errors,
-    );
-
-    // --- fetch ---
-    u64_field(
-        raw,
-        "fetch.connect_timeout_secs",
-        cfg,
-        "fetch.connect_timeout_secs",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "fetch.read_timeout_secs",
-        cfg,
-        "fetch.read_timeout_secs",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "fetch.max_response_bytes",
-        cfg,
-        "fetch.max_response_bytes",
-        lang,
-        errors,
-    );
-    usize_field(
-        raw,
-        "fetch.max_concurrency",
-        cfg,
-        "fetch.max_concurrency",
-        lang,
-        errors,
-    );
-    u32_field(
-        raw,
-        "fetch.max_retries",
-        cfg,
-        "fetch.max_retries",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "fetch.retry_base_backoff_ms",
-        cfg,
-        "fetch.retry_base_backoff_ms",
-        lang,
-        errors,
-    );
-    string_field(
-        raw,
-        "fetch.user_agent",
-        cfg,
-        "fetch.user_agent",
-        lang,
-        errors,
-    );
-    enum_field(
-        raw,
-        "fetch.ip_family",
-        cfg,
-        "fetch.ip_family",
-        &["any", "ipv4", "ipv6"],
-        |s| match s {
-            "any" => Some("any".to_string()),
-            "ipv4" => Some("ipv4".to_string()),
-            "ipv6" => Some("ipv6".to_string()),
-            _ => None,
-        },
-        lang,
-        errors,
-    );
-
-    // --- ingest ---
-    u32_field(
-        raw,
-        "ingest.refresh_check_limit",
-        cfg,
-        "ingest.refresh_check_limit",
-        lang,
-        errors,
-    );
-    bool_field(raw, "ingest.drop_gate", cfg, "ingest.drop_gate", errors);
-    bool_field(
-        raw,
-        "ingest.removed_as_unknown",
-        cfg,
-        "ingest.removed_as_unknown",
-        errors,
-    );
-
-    // --- geo ---
-    bool_field(raw, "geo.enabled", cfg, "geo.enabled", errors);
-    enum_field(
-        raw,
-        "geo.db",
-        cfg,
-        "geo.db",
-        &["country", "city", "asn"],
-        |s| match s {
-            "country" => Some("country".to_string()),
-            "city" => Some("city".to_string()),
-            "asn" => Some("asn".to_string()),
-            _ => None,
-        },
-        lang,
-        errors,
-    );
-    string_field(raw, "geo.db_dir", cfg, "geo.db_dir", lang, errors);
-    u64_field(
-        raw,
-        "geo.cache_max_entries",
-        cfg,
-        "geo.cache_max_entries",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "geo.dns_timeout_secs",
-        cfg,
-        "geo.dns_timeout_secs",
-        lang,
-        errors,
-    );
-
-    // --- admin ---
-    bool_field(raw, "admin.enabled", cfg, "admin.enabled", errors);
-    bind(raw, "admin.bind", cfg, lang, errors);
-    string_field(raw, "admin.token", cfg, "admin.token", lang, errors);
-    u32_field(
-        raw,
-        "admin.session_ttl_hours",
-        cfg,
-        "admin.session_ttl_hours",
-        lang,
-        errors,
-    );
-    bool_field(
-        raw,
-        "admin.allow_private_urls",
-        cfg,
-        "admin.allow_private_urls",
-        errors,
-    );
-    rate_limit(
-        raw,
-        "admin.rate_limit",
-        cfg,
-        "admin.rate_limit",
-        lang,
-        errors,
-    );
-    rate_limit(
-        raw,
-        "admin.login_rate_limit",
-        cfg,
-        "admin.login_rate_limit",
-        lang,
-        errors,
-    );
-    bool_field(
-        raw,
-        "admin.secure_cookies",
-        cfg,
-        "admin.secure_cookies",
-        errors,
-    );
-    string_field(
-        raw,
-        "admin.locales_dir",
-        cfg,
-        "admin.locales_dir",
-        lang,
-        errors,
-    );
-    string_list(
-        raw,
-        "admin.trust_proxy_ips",
-        cfg,
-        "admin.trust_proxy_ips",
-        lang,
-        errors,
-    );
-    string_list(
-        raw,
-        "admin.allowed_hosts",
-        cfg,
-        "admin.allowed_hosts",
-        lang,
-        errors,
-    );
-
-    // --- probe ---
-    u32_field(
-        raw,
-        "probe.fail_limit",
-        cfg,
-        "probe.fail_limit",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "probe.second_chance_min_hours",
-        cfg,
-        "probe.second_chance_min_hours",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "probe.second_chance_spread_hours",
-        cfg,
-        "probe.second_chance_spread_hours",
-        lang,
-        errors,
-    );
-    // Bounds mirror `fumox_core::config::de_recheck_delays`, the parser
-    // both binaries load the file with: at most 16 steps of 1..=30 days.
-    i64_list_field(
-        raw,
-        "probe.recheck_delays_secs",
-        cfg,
-        "probe.recheck_delays_secs",
-        bounds::RECHECK_MAX_STEPS,
-        1,
-        bounds::RECHECK_MAX_DELAY_SECS,
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "probe.queue_stale_days",
-        cfg,
-        "probe.queue_stale_days",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "probe.retention_interval_secs",
-        cfg,
-        "probe.retention_interval_secs",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "probe.cycle_interval_secs",
-        cfg,
-        "probe.cycle_interval_secs",
-        lang,
-        errors,
-    );
-    u32_field(
-        raw,
-        "probe.sample_size",
-        cfg,
-        "probe.sample_size",
-        lang,
-        errors,
-    );
-    bool_field(
-        raw,
-        "probe.allow_private_targets",
-        cfg,
-        "probe.allow_private_targets",
-        errors,
-    );
-    u64_field(
-        raw,
-        "probe.connect_timeout_secs",
-        cfg,
-        "probe.connect_timeout_secs",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "probe.tls_timeout_secs",
-        cfg,
-        "probe.tls_timeout_secs",
-        lang,
-        errors,
-    );
-    usize_field(
-        raw,
-        "probe.concurrency",
-        cfg,
-        "probe.concurrency",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "probe.heartbeat_interval_secs",
-        cfg,
-        "probe.heartbeat_interval_secs",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "probe.backlog_target_drain_minutes",
-        cfg,
-        "probe.backlog_target_drain_minutes",
-        lang,
-        errors,
-    );
-
-    // --- meow ---
-    string_field(raw, "meow.api_addr", cfg, "meow.api_addr", lang, errors);
-    string_field(
-        raw,
-        "meow.config_path",
-        cfg,
-        "meow.config_path",
-        lang,
-        errors,
-    );
-    string_list(raw, "meow.test_url", cfg, "meow.test_url", lang, errors);
-    u64_field(
-        raw,
-        "meow.timeout_secs",
-        cfg,
-        "meow.timeout_secs",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "meow.backoff_initial_secs",
-        cfg,
-        "meow.backoff_initial_secs",
-        lang,
-        errors,
-    );
-    u64_field(
-        raw,
-        "meow.backoff_max_secs",
-        cfg,
-        "meow.backoff_max_secs",
-        lang,
-        errors,
-    );
-    bool_field(raw, "meow.ipv6", cfg, "meow.ipv6", errors);
-
-    // --- retention ---
-    u32_field(
-        raw,
-        "retention.probe_results_days",
-        cfg,
-        "retention.probe_results_days",
-        lang,
-        errors,
-    );
-    u32_field(
-        raw,
-        "retention.fetch_log_days",
-        cfg,
-        "retention.fetch_log_days",
-        lang,
-        errors,
-    );
-
-    // --- log ---
-    enum_field(
-        raw,
-        "log.server",
-        cfg,
-        "log.server",
-        &["error", "warn", "info", "debug", "trace"],
-        log_level_raw,
-        lang,
-        errors,
-    );
-    enum_field(
-        raw,
-        "log.probe",
-        cfg,
-        "log.probe",
-        &["error", "warn", "info", "debug", "trace"],
-        log_level_raw,
-        lang,
-        errors,
-    );
+    for setting in SETTINGS {
+        (setting.apply)(raw, setting.key, cfg, lang, errors);
+    }
 
     // Cross-field checks the serde model cannot express.
     let max = raw
@@ -1181,11 +1083,15 @@ fn apply_all(
     {
         errors.push((
             "meow.backoff_max_secs".into(),
-            lang.t_args("val.in_range", &[format!("≥ {min}"), min.to_string()]),
+            lang.t_args(
+                "val.in_range",
+                &[format!("\u{2265} {min}"), min.to_string()],
+            ),
         ));
     }
 }
 
+// Field helpers.
 // Field helpers.
 
 /// Bounds of the quarantine recheck ladder, copied from
@@ -1210,11 +1116,10 @@ fn raw_get<'a>(raw: &'a HashMap<String, String>, field: &str) -> Option<&'a str>
 fn set_field(
     cfg: &mut EditableConfig,
     field: &str,
-    target: &str,
     value: ConfigItem,
     errors: &mut Vec<(String, String)>,
 ) {
-    if let Err(err) = cfg.set(target, value) {
+    if let Err(err) = cfg.set(field, value) {
         errors.push((field.into(), err.to_string()));
     }
 }
@@ -1230,7 +1135,7 @@ fn bind(
     let v = v.trim();
     match v.parse::<SocketAddr>() {
         Ok(addr) => {
-            set_field(cfg, field, field, item::string(addr.to_string()), errors);
+            set_field(cfg, field, item::string(addr.to_string()), errors);
         }
         Err(_) => {
             errors.push((field.into(), lang.t("val.invalid_bind").into()));
@@ -1242,7 +1147,6 @@ fn string_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
-    target: &str,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1252,7 +1156,32 @@ fn string_field(
         errors.push((field.into(), lang.t("val.required").into()));
         return;
     }
-    set_field(cfg, field, target, item::string(v.to_string()), errors);
+    set_field(cfg, field, item::string(v.to_string()), errors);
+}
+
+/// The admin token. An empty submit keeps the current token — the
+/// documented contract (USERGUIDE: "sending the empty string keeps the
+/// current token … so the panel never silently disables itself") — and
+/// it is also what an untouched field submits, because the render never
+/// puts the live token into the form (see the `admin.token` render).
+/// `string_field` would refuse an empty submit with `val.required`,
+/// and a value of `""` written to the file would disable the panel at
+/// the next start.
+fn token_field(
+    raw: &HashMap<String, String>,
+    field: &str,
+    cfg: &mut EditableConfig,
+    _lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+) {
+    let Some(v) = raw_get(raw, field) else { return };
+    let v = v.trim();
+    if v.is_empty() {
+        // Keep-current: nothing is written, the document keeps the
+        // token it loaded from disk.
+        return;
+    }
+    set_field(cfg, field, item::string(v.to_string()), errors);
 }
 
 /// The error text for a value outside its setting's range. Reads the
@@ -1274,7 +1203,6 @@ fn u64_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
-    target: &str,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1297,14 +1225,13 @@ fn u64_field(
         errors.push((field.into(), format!("must be at most {}", i64::MAX)));
         return;
     }
-    set_field(cfg, field, target, item::integer(parsed as i64), errors);
+    set_field(cfg, field, item::integer(parsed as i64), errors);
 }
 
 fn u32_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
-    target: &str,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1321,14 +1248,13 @@ fn u32_field(
         errors.push((field.into(), out_of_range(field, u64::from(parsed), lang)));
         return;
     }
-    set_field(cfg, field, target, item::integer(i64::from(parsed)), errors);
+    set_field(cfg, field, item::integer(i64::from(parsed)), errors);
 }
 
 fn usize_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
-    target: &str,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1345,7 +1271,7 @@ fn usize_field(
         errors.push((field.into(), out_of_range(field, parsed as u64, lang)));
         return;
     }
-    set_field(cfg, field, target, item::integer(parsed as i64), errors);
+    set_field(cfg, field, item::integer(parsed as i64), errors);
 }
 
 /// The literals a settings checkbox can carry. Save and replay
@@ -1362,7 +1288,6 @@ fn bool_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
-    target: &str,
     errors: &mut Vec<(String, String)>,
 ) {
     // Booleans default to `false` when the checkbox was absent, the
@@ -1372,34 +1297,35 @@ fn bool_field(
         errors.push((field.into(), format!("unexpected bool literal: {v}")));
         return;
     };
-    set_field(cfg, field, target, item::boolean(b), errors);
+    set_field(cfg, field, item::boolean(b), errors);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Accepts exactly one of `choices` and writes it back verbatim: every
+/// enum the panel round-trips (`fetch.ip_family`, the `[log]` levels)
+/// has an identity render, so the membership check IS the parse. One
+/// value outside the set fails `config::load` and aborts both binaries
+/// at the next start.
 fn enum_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
-    target: &str,
     choices: &[&str],
-    map: impl Fn(&str) -> Option<String>,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
     let Some(v) = raw_get(raw, field) else { return };
-    let Some(value) = map(v) else {
+    if !choices.contains(&v) {
         let msg = lang.t_args("val.must_be_enum", &[choices.join(", ")]);
         errors.push((field.into(), msg));
         return;
-    };
-    set_field(cfg, field, target, item::string(value), errors);
+    }
+    set_field(cfg, field, item::string(v.to_string()), errors);
 }
 
 fn string_list(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
-    target: &str,
     _lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1409,7 +1335,45 @@ fn string_list(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    set_field(cfg, field, target, item::string_array(items), errors);
+    set_field(cfg, field, item::string_array(items), errors);
+}
+
+/// The trusted reverse-proxy lists (`server.trust_proxy_ips`,
+/// `admin.trust_proxy_ips`), validated with the same parser
+/// `crate::admin::parse_trusted_cidrs` applies at startup (and which
+/// feeds both per-IP rate limiters and the X-Forwarded-Proto scheme
+/// detection). The startup parser logs and DROPS an unparsable entry —
+/// fail-closed — so an entry it would drop must be refused here behind
+/// a field error, not persisted behind a success toast and silently
+/// emptied at the next restart. Bare-IP entries are accepted, `ipnet`
+/// reads them as host prefixes, exactly what the field hint advertises.
+/// Entries are written back verbatim, so what reloads is what was
+/// saved; an empty list stays valid (empty = never honor forwarded
+/// headers).
+fn cidr_list(
+    raw: &HashMap<String, String>,
+    field: &str,
+    cfg: &mut EditableConfig,
+    _lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+) {
+    let Some(v) = raw_get(raw, field) else { return };
+    let items: Vec<String> = v
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for entry in &items {
+        if crate::admin::parse_trusted_cidr_entry(entry).is_none() {
+            // No catalog key names a CIDR, and the locales are not this
+            // file's to extend, so the sentence is written out here —
+            // the same escape `i64_list_field` takes for the ladder
+            // length and `bool_field` for an unexpected literal.
+            errors.push((field.into(), format!("not a valid CIDR or IP: {entry}")));
+            return;
+        }
+    }
+    set_field(cfg, field, item::string_array(items), errors);
 }
 
 /// One integer per line, bounded the way the canonical loader bounds the
@@ -1429,7 +1393,6 @@ fn i64_list_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
-    target: &str,
     max_items: usize,
     min: i64,
     max: i64,
@@ -1481,14 +1444,13 @@ fn i64_list_field(
             return;
         }
     }
-    set_field(cfg, field, target, item::i64_array(parsed), errors);
+    set_field(cfg, field, item::i64_array(parsed), errors);
 }
 
 fn rate_limit(
     raw: &HashMap<String, String>,
     prefix: &str,
     cfg: &mut EditableConfig,
-    target: &str,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
@@ -1533,13 +1495,17 @@ fn rate_limit(
             return;
         }
     };
-    set_field(
-        cfg,
-        &field,
-        target,
+    // The one helper where the error key and the write path differ: the
+    // form and the bounds table know `{prefix}.limit`, but the document
+    // stores the whole `limit/unit` string under `{prefix}` itself. Like
+    // `set_field`, a rejected write must surface as a per-field error
+    // instead of being swallowed behind a success toast.
+    if let Err(err) = cfg.set(
+        prefix,
         item::string(format!("{}/{}", limit, unit_for_secs(secs))),
-        errors,
-    );
+    ) {
+        errors.push((field, err.to_string()));
+    }
 }
 
 fn unit_for_secs(secs: u64) -> &'static str {
@@ -1958,6 +1924,99 @@ mod tests {
         assert_eq!(s, "ok");
     }
 
+    /// Every dotted key the registry renders must be parseable back by
+    /// the very same registry, and the shipped defaults must validate
+    /// cleanly. This is the whole render→parse pairing in one shot: a
+    /// field added to one side but not the other, or a default outside
+    /// the advertised range, fails here instead of surfacing as a
+    /// silently reverted or unsaveable setting.
+    #[test]
+    fn the_registry_round_trips_the_default_config_with_zero_errors() {
+        let dir = temp_dir("registry-roundtrip");
+        let path = write_minimal_config(&dir);
+        let lang = test_lang();
+
+        let raw = raw_from_config(&AppConfig::default());
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+        assert!(errors.is_empty(), "defaults must validate: {errors:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The keys `raw_from_config` produces are exactly the registry's:
+    /// every registered key is rendered (a rate-limit entry as its
+    /// `.limit`/`.unit` pair), and nothing is rendered that the registry
+    /// does not own. A key that appears here but nowhere else is exactly
+    /// the silent drift this table exists to prevent.
+    #[test]
+    fn the_registry_covers_every_rendered_key() {
+        let raw = raw_from_config(&AppConfig::default());
+        let keys: Vec<&str> = SETTINGS.iter().map(|s| s.key).collect();
+
+        for key in &keys {
+            let direct = raw.contains_key(*key);
+            let rate_pair = raw.contains_key(&format!("{key}.limit"))
+                && raw.contains_key(&format!("{key}.unit"));
+            assert!(
+                direct || rate_pair,
+                "registry key {key} is rendered under neither its own name nor a limit/unit pair"
+            );
+        }
+        for rendered in raw.keys() {
+            let owned = keys.iter().any(|key| {
+                rendered == key
+                    || rendered.strip_suffix(".limit") == Some(key)
+                    || rendered.strip_suffix(".unit") == Some(key)
+            });
+            assert!(
+                owned,
+                "{rendered} is rendered but not owned by any registry entry"
+            );
+        }
+    }
+
+    /// The HTML form is the one hand-written artifact left: this test is
+    /// the stitch that keeps it honest. Every input the form posts must
+    /// belong to a registry entry, and every entry must be editable
+    /// through the form, either under its own `name=` or, for a
+    /// rate-limit pair, as `.limit` + `.unit`.
+    #[test]
+    fn the_form_posts_exactly_the_registered_settings() {
+        let template = include_str!("../../../templates/settings_edit.html");
+        let mut posted: Vec<String> = Vec::new();
+        let mut rest = template;
+        while let Some(pos) = rest.find("name=\"") {
+            rest = &rest[pos + 6..];
+            if let Some(end) = rest.find('"') {
+                posted.push(rest[..end].to_string());
+                rest = &rest[end..];
+            }
+        }
+        posted.retain(|name| name != "_csrf" && name != "settings-tab");
+
+        let keys: Vec<&str> = SETTINGS.iter().map(|s| s.key).collect();
+
+        for name in &posted {
+            let owned = keys.iter().any(|key| {
+                name == key
+                    || name.strip_suffix(".limit") == Some(*key)
+                    || name.strip_suffix(".unit") == Some(*key)
+            });
+            assert!(owned, "the form posts {name} but no registry entry owns it");
+        }
+        for key in &keys {
+            let direct = posted.iter().any(|name| name == key);
+            let rate_pair =
+                posted.contains(&format!("{key}.limit")) && posted.contains(&format!("{key}.unit"));
+            assert!(
+                direct || rate_pair,
+                "registry key {key} has no input in the form; add the field or drop the entry"
+            );
+        }
+    }
+
     /// Regression for the *Edit settings* bug where the page re-rendered
     /// stale `state.config` instead of reading the file the editor just
     /// wrote to. After `EditableConfig::save()`, a subsequent reload
@@ -2263,5 +2322,256 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The trust lists feed `crate::admin::parse_trusted_cidrs`, which
+    /// re-parses them at startup and DROPS what it cannot parse (fail
+    /// closed, pinned by the `parse_trusted_cidrs` tests in
+    /// `admin_tests.rs`). An entry the parser would drop must therefore
+    /// be refused here behind a field error: the old `string_list`
+    /// behavior persisted e.g. `10.0.0.0/33` behind a success toast and
+    /// silently emptied the entry at the next restart, degrading per-IP
+    /// rate limiting to peer-IP keying and switching the
+    /// X-Forwarded-Proto scheme detection off.
+    #[test]
+    fn apply_all_rejects_an_unparsable_trust_proxy_cidr() {
+        let dir = temp_dir("cidr-bad");
+        let path = write_minimal_config(&dir);
+        let lang = test_lang();
+
+        for field in ["server.trust_proxy_ips", "admin.trust_proxy_ips"] {
+            let mut raw = HashMap::new();
+            raw.insert(field.into(), "10.0.0.0/8\n10.0.0.0/33\nnot-a-cidr".into());
+
+            let mut errors = Vec::new();
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+            let message = collect_field(&errors, field).unwrap_or_else(|| {
+                panic!("unparsable CIDRs in {field} must be refused, got {errors:?}")
+            });
+            assert!(
+                message.contains("10.0.0.0/33"),
+                "the error must name the offending entry: {message}"
+            );
+            assert!(
+                !cfg.doc().to_string().contains("10.0.0.0/8"),
+                "a refused list must not be written, not even its valid entries"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A trust list the panel accepts must survive save → reload →
+    /// `parse_trusted_cidrs` unchanged, bare-IP entries included: that
+    /// chain feeds the per-IP rate-limit keys and the https scheme
+    /// detection after a restart, and the field hint advertises "one
+    /// CIDR or IP per line".
+    #[test]
+    fn trust_proxy_cidrs_round_trip_through_the_canonical_loader() {
+        use fumox_core::config::load_config;
+
+        let dir = temp_dir("cidr-roundtrip");
+        let path = write_minimal_config(&dir);
+        let lang = test_lang();
+
+        let mut raw = HashMap::new();
+        raw.insert(
+            "server.trust_proxy_ips".into(),
+            "10.0.0.0/8\n192.168.1.1".into(),
+        );
+        raw.insert("admin.trust_proxy_ips".into(), " 2.2.2.2/32 ".into());
+
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "valid CIDR lists must be accepted: {errors:?}"
+        );
+        cfg.save().unwrap();
+
+        let loaded = load_config(Some(&path)).expect("the saved trust lists must load");
+        assert_eq!(
+            loaded.server.trust_proxy_ips,
+            vec!["10.0.0.0/8", "192.168.1.1"]
+        );
+        assert_eq!(loaded.admin.trust_proxy_ips, vec!["2.2.2.2/32"]);
+        assert_eq!(
+            crate::admin::parse_trusted_cidrs(&loaded.server.trust_proxy_ips),
+            vec![
+                "10.0.0.0/8".parse().unwrap(),
+                "192.168.1.1/32".parse().unwrap(),
+            ]
+        );
+        assert_eq!(
+            crate::admin::parse_trusted_cidrs(&loaded.admin.trust_proxy_ips),
+            vec!["2.2.2.2/32".parse().unwrap()]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The admin token must never be rendered into the edit form
+    /// (USERGUIDE: "The admin token is never shown."), and an empty
+    /// submit must keep the current token (USERGUIDE: "sending the
+    /// empty string keeps the current token … so the panel never
+    /// silently disables itself") instead of erroring with
+    /// `val.required` — a `""` written to the file would disable the
+    /// panel at the next start.
+    #[test]
+    fn admin_token_renders_empty_and_an_empty_submit_keeps_the_current_one() {
+        use fumox_core::config::load_config;
+
+        let mut live = AppConfig::default();
+        live.admin.token = "live-secret".into();
+        let raw = raw_from_config(&live);
+        assert_eq!(
+            raw.get("admin.token").map(String::as_str),
+            Some(""),
+            "the render must not carry the live token into the form"
+        );
+
+        let dir = temp_dir("token-keep");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[admin]\ntoken = \"live-secret\"\n").unwrap();
+        let lang = test_lang();
+
+        // Empty and whitespace-only submits are keep-current: no error,
+        // the token on disk survives save → reload.
+        for submitted in ["", "   "] {
+            let mut raw = HashMap::new();
+            raw.insert("admin.token".into(), submitted.into());
+            let mut errors = Vec::new();
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            assert!(
+                errors.is_empty(),
+                "an empty token submit must keep the current token, not error: {errors:?}"
+            );
+            cfg.save().unwrap();
+            let loaded = load_config(Some(&path)).expect("the kept token must load");
+            assert_eq!(loaded.admin.token, "live-secret");
+        }
+
+        // A non-empty submit still rotates the token.
+        let mut raw = HashMap::new();
+        raw.insert("admin.token".into(), "  rotated-secret  ".into());
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        cfg.save().unwrap();
+        let loaded = load_config(Some(&path)).expect("the rotated token must load");
+        assert_eq!(
+            loaded.admin.token, "rotated-secret",
+            "the submitted token is trimmed on write"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The edit page as rendered: the live token must not appear
+    /// anywhere in the markup (the leak used to be the `value` attribute
+    /// of the password input on every GET), and a not-writable config
+    /// must disable the form controls (USERGUIDE: "every control is
+    /// disabled") on top of the banner the page already showed.
+    #[tokio::test]
+    async fn settings_edit_renders_without_the_token_and_disables_fields_when_unwritable() {
+        let (_dir, mut state) =
+            crate::admin::test_admin_state(AdminConfig::default(), ServerConfig::default()).await;
+        let token = state.admin().token;
+        assert!(!token.is_empty(), "the fixture needs a non-empty token");
+
+        // Not writable: every control disabled, token still absent.
+        state.config_writable = false;
+        let template = SettingsEditTemplate {
+            langs: Vec::new(),
+            theme: theme::from_headers(&HeaderMap::new()),
+            lang: test_lang(),
+            active: "settings",
+            csrf: String::new(),
+            state: state.clone(),
+            raw: raw_from_config(&state.live()),
+            errors: Vec::new(),
+            banner: Some(Banner::Unwritable("/unwritable/app.toml".into())),
+        };
+        let html = template.render().unwrap();
+        assert!(
+            !html.contains(&token),
+            "the live admin token must never appear in the edit form markup"
+        );
+        let disabled = html.matches(" disabled").count();
+        assert!(
+            disabled >= 60,
+            "every control must be disabled when the config is not writable, got {disabled}"
+        );
+
+        // Writable: nothing disabled, token still absent.
+        state.config_writable = true;
+        let template = SettingsEditTemplate {
+            langs: Vec::new(),
+            theme: theme::from_headers(&HeaderMap::new()),
+            lang: test_lang(),
+            active: "settings",
+            csrf: String::new(),
+            state: state.clone(),
+            raw: raw_from_config(&state.live()),
+            errors: Vec::new(),
+            banner: None,
+        };
+        let html = template.render().unwrap();
+        assert!(
+            !html.contains(&token),
+            "the live admin token must never appear in the edit form markup"
+        );
+        assert_eq!(
+            html.matches(" disabled").count(),
+            0,
+            "a writable config must leave every control editable"
+        );
+    }
+
+    /// USERGUIDE promises that on a not-writable config "the same banner
+    /// appears on the overview" (a first-class deployment mode via
+    /// `FUMOX_CONFIG_ACCESS=ro`). Render the real overview template for
+    /// both states so the promise cannot regress silently again.
+    #[test]
+    fn settings_overview_shows_the_unwritable_banner() {
+        let lang = test_lang();
+        let path = "/tmp/fumox-overview/app.toml";
+        let banner = lang.t_named("set.edit_unwritable", &[("path", path.to_string())]);
+
+        for (writable, want_banner) in [(false, true), (true, false)] {
+            let cfg = AppConfig::default();
+            let template = SettingsTemplate {
+                lang: lang.clone(),
+                langs: Vec::new(),
+                theme: theme::from_headers(&HeaderMap::new()),
+                active: "settings",
+                csrf: String::new(),
+                state: SettingsView {
+                    server: cfg.server.clone(),
+                    database: cfg.database.clone(),
+                    fetch: cfg.fetch.clone(),
+                    ingest: cfg.ingest.clone(),
+                    geo_config: cfg.geo.clone(),
+                    admin: cfg.admin.clone(),
+                    probe: cfg.probe.clone(),
+                    meow: cfg.meow.clone(),
+                    retention: cfg.retention.clone(),
+                    log: cfg.log.clone(),
+                    config_path: ResolvedConfigPath::Loaded(PathBuf::from(path)),
+                    config_writable: writable,
+                },
+            };
+            let html = template.render().unwrap();
+            assert_eq!(
+                html.contains(&banner),
+                want_banner,
+                "writable={writable}: the not-writable banner must {}appear on the overview",
+                if want_banner { "" } else { "not " }
+            );
+        }
     }
 }

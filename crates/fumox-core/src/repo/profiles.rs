@@ -229,6 +229,101 @@ pub async fn get_sources(pool: &DbPool, profile_id: &str) -> crate::Result<Vec<(
     Ok(rows)
 }
 
+// Admin profile screens
+//
+// Fixed-shape reads of the profiles list and card, typed so the admin
+// handlers go through the repository like every other caller.
+
+/// One row of the admin profiles list: the display columns plus the
+/// composition size and the ready-proxy count ([`list_with_counts`]).
+#[derive(Debug, FromRow)]
+pub struct ProfileListRow {
+    pub id: String,
+    pub name: String,
+    pub slug: Option<String>,
+    pub output_format: String,
+    pub enabled: bool,
+    /// Whether the profile carries an access token.
+    pub protected: bool,
+    /// Number of sources in the composition.
+    pub sources_count: i64,
+    /// Ready proxies reachable through the profile's sources: `status =
+    /// 'ready'`, i.e. the set the `/sub/{slug}` endpoint would actually
+    /// emit right now. A proxy reachable through more than one source in
+    /// the same profile is counted once.
+    pub proxies_count: i64,
+}
+
+/// The admin profiles list, oldest profile first.
+pub async fn list_with_counts(pool: &DbPool) -> crate::Result<Vec<ProfileListRow>> {
+    let rows: Vec<ProfileListRow> = sqlx::query_as(
+        "SELECT p.id, p.name, p.slug, p.output_format, p.enabled,
+                p.access_token IS NOT NULL AS protected,
+                (SELECT COUNT(*) FROM profile_sources ps WHERE ps.profile_id = p.id) AS sources_count,
+                (SELECT COUNT(DISTINCT px.id)
+                 FROM profile_sources ps
+                 JOIN proxy_source_links l ON l.source_id = ps.source_id
+                 JOIN proxies px ON px.id = l.proxy_id
+                 WHERE ps.profile_id = p.id
+                   AND px.status = 'ready') AS proxies_count
+         FROM profiles p
+         ORDER BY p.created_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// One row of the profile composition table: the linked source with its
+/// merge position. `name`/`enabled` come from the LEFT JOIN and are
+/// `None` when the source row is gone.
+#[derive(Debug, FromRow)]
+pub struct CompositionRow {
+    pub source_id: String,
+    pub position: i64,
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+/// The composition of one profile in merge order (profile card).
+pub async fn composition(pool: &DbPool, profile_id: &str) -> crate::Result<Vec<CompositionRow>> {
+    let rows: Vec<CompositionRow> = sqlx::query_as(
+        "SELECT ps.source_id, ps.position, s.name, s.enabled
+         FROM profile_sources ps LEFT JOIN sources s ON s.id = ps.source_id
+         WHERE ps.profile_id = ?
+         ORDER BY ps.position, ps.source_id",
+    )
+    .bind(profile_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Dedup statistics across a profile's composition (profile card).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupStats {
+    /// Total link rows reachable through the composition.
+    pub total: i64,
+    /// Distinct fingerprints among them.
+    pub unique: i64,
+}
+
+/// The dedup statistics of one profile's composition: total link rows vs
+/// distinct fingerprints.
+pub async fn dedup_stats(pool: &DbPool, profile_id: &str) -> crate::Result<DedupStats> {
+    let (total, unique): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(DISTINCT p.fingerprint)
+         FROM profile_sources ps
+         JOIN proxy_source_links l ON l.source_id = ps.source_id
+         JOIN proxies p ON p.id = l.proxy_id
+         WHERE ps.profile_id = ?",
+    )
+    .bind(profile_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(DedupStats { total, unique })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn profile_crud_round_trip() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let mut profile = sample_profile("prf1aaaaaaa");
         create(&pool, &profile).await.unwrap();
         assert_eq!(get(&pool, "prf1aaaaaaa").await.unwrap().unwrap(), profile);
@@ -315,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn profile_sources_composition() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let profile = sample_profile("prf2bbbbbbb");
         create(&pool, &profile).await.unwrap();
         for id in ["srcA0000000", "srcB0000000"] {
@@ -348,5 +443,95 @@ mod tests {
         // Deleting the profile cascades to the composition.
         delete(&pool, "prf2bbbbbbb").await.unwrap();
         assert!(get_sources(&pool, "prf2bbbbbbb").await.unwrap().is_empty());
+    }
+
+    /// Minimal proxies row for the admin list/card fixtures.
+    async fn insert_proxy(pool: &DbPool, fingerprint: &str, status: &str) -> i64 {
+        let now = crate::models::now_ts();
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             VALUES (?, 'vless', ?, ?, 443, 'u', ?, ?, ?) RETURNING id",
+        )
+        .bind(fingerprint)
+        .bind(fingerprint)
+        .bind(format!("{fingerprint}.example.com"))
+        .bind(status)
+        .bind(now)
+        .bind(now)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn link(pool: &DbPool, proxy_id: i64, source_id: &str) {
+        sqlx::query(
+            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, ?, 1)",
+        )
+        .bind(proxy_id)
+        .bind(source_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The admin profiles list counts the composition size and the
+    /// ready-proxy set (deduplicated across sources), and the card reads
+    /// resolve the composition and the dedup statistics.
+    #[tokio::test]
+    async fn admin_list_counts_and_card_stats() {
+        let (_dir, pool) = temp_pool().await;
+        let profile = sample_profile("prf3ccccccc");
+        create(&pool, &profile).await.unwrap();
+        for id in ["srcA0000000", "srcB0000000"] {
+            sources_repo::create(&pool, &sample_source(id))
+                .await
+                .unwrap();
+        }
+        set_sources(
+            &pool,
+            "prf3ccccccc",
+            &[("srcA0000000".into(), 0), ("srcB0000000".into(), 1)],
+        )
+        .await
+        .unwrap();
+
+        // X is ready and linked from both sources (counted once); Y is
+        // alive and linked from srcA only (outside the ready count).
+        let x = insert_proxy(&pool, "fp-x", "ready").await;
+        let y = insert_proxy(&pool, "fp-y", "alive").await;
+        link(&pool, x, "srcA0000000").await;
+        link(&pool, x, "srcB0000000").await;
+        link(&pool, y, "srcA0000000").await;
+
+        let rows = list_with_counts(&pool).await.unwrap();
+        let row = rows.iter().find(|r| r.id == "prf3ccccccc").unwrap();
+        assert!(row.protected, "sample_profile carries an access token");
+        assert!(row.enabled);
+        assert_eq!(row.sources_count, 2);
+        assert_eq!(row.proxies_count, 1, "only the ready proxy counts");
+        assert_eq!(row.output_format, "base64");
+
+        // Card: composition in merge order with resolved names.
+        let composition = composition(&pool, "prf3ccccccc").await.unwrap();
+        assert_eq!(
+            composition
+                .iter()
+                .map(|r| (r.source_id.as_str(), r.position))
+                .collect::<Vec<_>>(),
+            vec![("srcA0000000", 0), ("srcB0000000", 1)]
+        );
+        assert_eq!(composition[0].name.as_deref(), Some("s"));
+        assert_eq!(composition[0].enabled, Some(true));
+
+        // Card: three link rows, two distinct fingerprints.
+        let stats = dedup_stats(&pool, "prf3ccccccc").await.unwrap();
+        assert_eq!(
+            stats,
+            DedupStats {
+                total: 3,
+                unique: 2
+            }
+        );
     }
 }

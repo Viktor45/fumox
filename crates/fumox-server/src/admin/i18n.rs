@@ -264,12 +264,29 @@ pub fn lang_cookie(code: &str) -> String {
     format!("{LANG_COOKIE}={code}; Path=/; HttpOnly; SameSite=Lax; Max-Age={LANG_MAX_AGE_SECS}")
 }
 
-/// Add the `t()` and `lang_code()` template helpers to a template struct
-/// that carries a `lang: Lang` field. The result borrows from the struct,
-/// which owns (via `Arc`) the catalog. `allow` silences per-template
-/// unused-helper warnings: which helpers a template actually calls is only
-/// known to askama.
+/// Add the shared template helpers to a template struct that carries a
+/// `lang: Lang` field. The result borrows from the struct, which owns
+/// (via `Arc`) the catalog. `allow` silences per-template unused-helper
+/// warnings: which helpers a template actually calls is only known to
+/// askama.
+///
+/// Form templates that additionally carry an `errors: Vec<(String, String)>`
+/// field use the `impl_i18n!(Type, errors)` form, which adds `error_for`
+/// for the per-field validation messages.
 macro_rules! impl_i18n {
+    ($ty:ty, errors) => {
+        impl_i18n!($ty);
+        impl $ty {
+            /// First error message attached to a form field, if any.
+            #[allow(dead_code)]
+            fn error_for(&self, field: &str) -> Option<&str> {
+                self.errors
+                    .iter()
+                    .find(|(f, _)| f == field)
+                    .map(|(_, m)| m.as_str())
+            }
+        }
+    };
     ($ty:ty) => {
         impl $ty {
             #[allow(dead_code)]
@@ -314,6 +331,19 @@ macro_rules! impl_i18n {
                 } else {
                     name.to_string()
                 }
+            }
+            /// Render a Unix timestamp as a `<time class="ts">` element
+            /// (see [`crate::admin::handlers::fmt_ts_element`]); the
+            /// template emits it through `| safe`.
+            #[allow(dead_code)]
+            fn ts(&self, ts: &i64) -> String {
+                crate::admin::handlers::fmt_ts_element(*ts)
+            }
+            /// [`Self::ts`] for optional timestamps; `None` renders the en
+            /// dash used across the admin tables (plain text, no element).
+            #[allow(dead_code)]
+            fn opt_ts(&self, ts: &Option<i64>) -> String {
+                crate::admin::handlers::fmt_opt_ts_element(*ts)
             }
         }
     };
@@ -607,4 +637,36 @@ mod tests {
     static TEMPLATE_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"\b(?:t_args|t_named|t)\("([a-z0-9_.]+)""#).expect("valid regex")
     });
+
+    /// A form template as the macro consumers shape them: `lang` plus an
+    /// `errors` field, exercising both macro arms.
+    struct FakeFormTemplate {
+        lang: Lang,
+        errors: Vec<(String, String)>,
+    }
+
+    impl_i18n!(FakeFormTemplate, errors);
+
+    /// The timestamp and per-field-error helpers live in the macro, so a
+    /// change to one of them reaches every template at once.
+    #[test]
+    fn macro_helpers_render_timestamps_and_field_errors() {
+        let locales = Locales::load(Path::new("/nonexistent-locales-dir"));
+        let template = FakeFormTemplate {
+            lang: locales.resolve("en"),
+            errors: vec![("name".into(), "required".into())],
+        };
+
+        assert_eq!(
+            template.ts(&1_700_000_000),
+            "<time class=\"ts\" datetime=\"2023-11-14T22:13:20Z\">2023-11-14 22:13:20</time>"
+        );
+        assert_eq!(template.opt_ts(&None), "–");
+        assert_eq!(
+            template.opt_ts(&Some(1_700_000_000)),
+            template.ts(&1_700_000_000)
+        );
+        assert_eq!(template.error_for("name"), Some("required"));
+        assert_eq!(template.error_for("missing"), None);
+    }
 }

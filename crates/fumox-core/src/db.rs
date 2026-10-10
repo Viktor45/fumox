@@ -628,19 +628,36 @@ mod non_unix_db_tests {
     }
 }
 
-/// Minimal in-crate tempdir helper so we don't pull a dependency just for
-/// the db tests (Unix and non-Unix variants share it).
-#[cfg(test)]
-mod tempdir_lite {
+/// Minimal scoped-tempdir helper for the test modules of every workspace
+/// crate (fumox-core's own db tests, the server's and the probe daemon's):
+/// `TempDir::new` creates a fresh `fumox-test-<label>-<pid>-<n>` directory
+/// under the system temp dir and `Drop` removes the whole tree, so a test
+/// cannot leave its scratch database or config file behind. Deliberately
+/// compiled outside `cfg(test)`: the sibling crates' test builds link
+/// fumox-core as a plain dependency, where this crate's own `cfg(test)`
+/// never applies. It carries no dependencies and has no production call
+/// sites (re-exported from the crate root as `fumox_core::tempdir_lite`).
+pub mod tempdir_lite {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// Distinguishes concurrent `new` calls inside one process: parallel
+    /// tests share the pid, so label + pid alone would not name a unique
+    /// directory (and `new` clears its own path first).
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// A directory that removes itself (recursively) on drop.
     pub struct TempDir {
         path: PathBuf,
     }
     impl TempDir {
         pub fn new(label: &str) -> Self {
-            let base =
-                std::env::temp_dir().join(format!("fumox-db-test-{label}-{}", std::process::id(),));
+            let unique = SEQ.fetch_add(1, Ordering::Relaxed);
+            let base = std::env::temp_dir().join(format!(
+                "fumox-test-{label}-{}-{}",
+                std::process::id(),
+                unique
+            ));
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&base).unwrap();
             Self { path: base }
@@ -653,5 +670,28 @@ mod tempdir_lite {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tempdir_tests {
+    use super::tempdir_lite::TempDir;
+
+    /// Pins the helper's own contract: a fresh directory that exists while
+    /// held and is gone (recursively, with everything a test put inside)
+    /// once dropped.
+    #[test]
+    fn tempdir_removes_its_tree_on_drop() {
+        let dir = TempDir::new("selfclean");
+        let path = dir.path().to_path_buf();
+        let file = path.join("scratch.db");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(path.is_dir(), "TempDir::new must create the directory");
+        assert!(file.is_file(), "the test's own files live inside");
+        drop(dir);
+        assert!(
+            !path.exists(),
+            "the scoped tempdir must remove its tree on drop"
+        );
     }
 }

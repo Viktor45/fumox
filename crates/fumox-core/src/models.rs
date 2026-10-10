@@ -251,11 +251,18 @@ pub const INSECURE_ALIASES: [&str; 4] = [
     "allow_insecure",
 ];
 
-/// Whether `value` spells a truthy toggle (`1` / `true`, trimmed and
-/// case-insensitive), the value convention the certificate-verification
-/// aliases share.
+/// Whether `value` spells a truthy toggle (`1` / `true` / `yes` / `on`,
+/// trimmed and case-insensitive). The one vocabulary shared by every toggle
+/// consumer: the certificate-verification aliases (the fingerprint
+/// normalisation, the output writers, the forbid-insecure filter), the
+/// parsers' Clash booleans and the writers' `param_truthy`. Splitting it
+/// made `allowInsecure=yes` keep a node that `allowInsecure=1` dropped and
+/// let the fingerprint merge a `yes` row with the secure variant.
 pub(crate) fn is_truthy_toggle(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true")
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Whether the parameter switches certificate verification off: one of the
@@ -582,6 +589,16 @@ pub fn now_ts() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truthy_toggle_vocabulary_is_1_true_yes_on() {
+        for truthy in ["1", "true", "yes", "on", " TRUE ", "Yes"] {
+            assert!(is_truthy_toggle(truthy), "{truthy:?} must be truthy");
+        }
+        for falsy in ["0", "false", "no", "off", "", " enabled"] {
+            assert!(!is_truthy_toggle(falsy), "{falsy:?} must be falsy");
+        }
+    }
 
     #[test]
     fn scheme_wire_names_round_trip() {

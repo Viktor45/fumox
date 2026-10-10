@@ -26,11 +26,24 @@ pub enum IngestOutcome {
     Ok {
         proxies_found: usize,
         stats: proxies::ReconciliationStats,
+        /// Wall-clock duration of the fetch attempt in milliseconds,
+        /// retries and their backoff included; `None` when no fetch
+        /// happened at all (the freshness short-circuit answered from the
+        /// source row).
+        duration_ms: Option<i64>,
     },
     /// The fetch failed with a classified error (already journaled).
-    FetchFailed { failure: FetchFailure },
+    FetchFailed {
+        failure: FetchFailure,
+        /// Duration of the failed attempt, retries and backoff included.
+        duration_ms: i64,
+    },
     /// HTTP 200 but the payload did not parse (already journaled).
-    ParseFailed { message: String },
+    ParseFailed {
+        message: String,
+        /// Duration of the fetch that produced the payload.
+        duration_ms: i64,
+    },
 }
 
 /// Fixed ingest settings from the config, everything not per-source.
@@ -51,10 +64,10 @@ pub struct IngestSettings {
 
 /// Fetch, parse and reconcile one source; journal the result.
 ///
-/// With `force = false` a still-fresh raw snapshot (younger than the
-/// source TTL) short-circuits the HTTP fetch, the database is already
-/// reconciled from that payload. Forced refreshes (the admin
-/// *Refresh now* button) always hit the network.
+/// With `force = false` a `last_fetched_at` on the source row younger than
+/// the source TTL short-circuits the HTTP fetch: the database is already
+/// reconciled from that payload, so the row itself is the freshness marker.
+/// Forced refreshes (the admin *Refresh now* button) always hit the network.
 ///
 /// Geo facts are resolved per proxy host while the raw payload is already
 /// parsed (the resolver caches both DNS and lookups) and persisted onto the
@@ -66,10 +79,15 @@ pub struct IngestSettings {
 /// `settings.refresh_check_limit`): the probe drains the queue
 /// at the start of its next cycle, newest first, so new servers get
 /// verified instead of waiting out the random sample.
+///
+/// The `caches` handle stays in the signature for its callers (the
+/// scheduler hands one in; the invalidations happen at the call sites that
+/// know the outcome) — the freshness marker this function used to maintain
+/// in it now lives on the source row alone.
 pub async fn ingest_source(
     pool: &DbPool,
     fetcher: &Fetcher,
-    caches: &Caches,
+    _caches: &Caches,
     geo: &GeoResolver,
     settings: IngestSettings,
     source: &Source,
@@ -77,18 +95,33 @@ pub async fn ingest_source(
 ) -> IngestOutcome {
     let now = fumox_core::models::now_ts();
 
+    // The freshness check reads the source row the caller loaded (the
+    // scheduler re-reads every sweep, the admin *Refresh now* passes
+    // `force`): no in-memory marker of our own to keep in step with the DB
+    // stamp that `journal_success` writes. An unset or expired stamp means
+    // the payload must be fetched; the comparison mirrors `is_due` in the
+    // scheduler, of which this is the second, row-fresh guard.
     if !force
-        && caches
-            .raw_is_fresh(&source.id, source.cache_ttl_seconds)
-            .await
+        && source
+            .last_fetched_at
+            .is_some_and(|fetched_at| now.saturating_sub(fetched_at) < source.cache_ttl_seconds)
     {
-        tracing::debug!(source = %source.id, "raw cache fresh; skipping fetch");
+        tracing::debug!(source = %source.id, "raw snapshot still fresh; skipping fetch");
         return IngestOutcome::Ok {
             proxies_found: 0,
             stats: proxies::ReconciliationStats::default(),
+            duration_ms: None,
         };
     }
 
+    // The fetch clock starts here and stops at the verdict, retries and
+    // their backoff included: one `fetch` call can legitimately stretch far
+    // past a minute ([fetch].max_retries × capped backoff), holds a
+    // concurrency permit the whole time, and without a measurement a slow
+    // upstream is indistinguishable from a fast one. Journaled into
+    // `fetch_log.duration_ms` and carried on the outcome for the caller's
+    // logs and events.
+    let fetch_started = std::time::Instant::now();
     let payload = match fetcher
         .fetch(
             &source.url,
@@ -99,16 +132,22 @@ pub async fn ingest_source(
     {
         Ok(payload) => payload,
         Err(failure) => {
-            journal_failure(pool, source, &failure, None, now).await;
-            return IngestOutcome::FetchFailed { failure };
+            let duration_ms = elapsed_ms(fetch_started);
+            journal_failure(pool, source, &failure, None, now, duration_ms).await;
+            return IngestOutcome::FetchFailed {
+                failure,
+                duration_ms,
+            };
         }
     };
-    // The raw snapshot is a *freshness* marker, not a download log: it
+    let duration_ms = elapsed_ms(fetch_started);
+    // `last_fetched_at` is a *freshness* stamp, not a download log: it
     // stands for "the database is already reconciled from this payload"
-    // (see `Caches::raw_is_fresh`). It is therefore written only once the
-    // payload has parsed and reconciled, caching it before that made a
-    // single parse or DB failure suppress every non-forced re-fetch for a
-    // whole TTL while the scheduler kept reporting successful ingests.
+    // (the TTL short-circuit above reads it). It is therefore written only
+    // once the payload has parsed and reconciled — `journal_success` runs
+    // after the reconcile — stamping it before that made a single parse or
+    // DB failure suppress every non-forced re-fetch for a whole TTL while
+    // the scheduler kept reporting successful ingests.
 
     match parse_payload(source, &payload) {
         Ok(filtered) => {
@@ -122,8 +161,12 @@ pub async fn ingest_source(
                 match apply_drop_rules(source, filtered.entries, &geo_stamps) {
                     Ok(triple) => triple,
                     Err(message) => {
-                        journal_parse_failure(pool, source, &payload, &message, now).await;
-                        return IngestOutcome::ParseFailed { message };
+                        journal_parse_failure(pool, source, &payload, &message, now, duration_ms)
+                            .await;
+                        return IngestOutcome::ParseFailed {
+                            message,
+                            duration_ms,
+                        };
                     }
                 };
             let found = entries_after_drop.len(); // Alive-linger. `[ingest].drop_gate` decides whether
@@ -144,10 +187,10 @@ pub async fn ingest_source(
             {
                 Ok(stats) => {
                     // The database is now the content of this payload, so
-                    // stamp the source's freshness marker: the TTL
-                    // short-circuit checks it before the next re-fetch.
-                    journal_success(pool, source, &payload, recognised, now).await;
-                    caches.raw_put(&source.id, now).await;
+                    // `journal_success` stamps `last_fetched_at` — the
+                    // freshness marker the TTL short-circuit checks before
+                    // the next re-fetch.
+                    journal_success(pool, source, &payload, recognised, now, duration_ms).await;
                     if dropped_by_pipeline > 0 {
                         tracing::info!(
                             source = %source.id,
@@ -180,6 +223,7 @@ pub async fn ingest_source(
                     IngestOutcome::Ok {
                         proxies_found: recognised,
                         stats,
+                        duration_ms: Some(duration_ms),
                     }
                 }
                 Err(err) => {
@@ -187,16 +231,36 @@ pub async fn ingest_source(
                     // server-side (recoverable) problem.
                     let failure = FetchFailure::HttpServer { status: 500 };
                     tracing::error!(error = %err, source = %source.id, "reconciliation failed");
-                    journal_failure(pool, source, &failure, Some(&err.to_string()), now).await;
-                    IngestOutcome::FetchFailed { failure }
+                    journal_failure(
+                        pool,
+                        source,
+                        &failure,
+                        Some(&err.to_string()),
+                        now,
+                        duration_ms,
+                    )
+                    .await;
+                    IngestOutcome::FetchFailed {
+                        failure,
+                        duration_ms,
+                    }
                 }
             }
         }
         Err(message) => {
-            journal_parse_failure(pool, source, &payload, &message, now).await;
-            IngestOutcome::ParseFailed { message }
+            journal_parse_failure(pool, source, &payload, &message, now, duration_ms).await;
+            IngestOutcome::ParseFailed {
+                message,
+                duration_ms,
+            }
         }
     }
+}
+
+/// Milliseconds since `started`. The u128 elapsed only overflows i64 after
+/// roughly three hundred million years, so the clamp is formal.
+fn elapsed_ms(started: std::time::Instant) -> i64 {
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Result of an admin dry-run fetch: everything a real
@@ -475,6 +539,7 @@ async fn journal_success(
     payload: &FetchedPayload,
     found: usize,
     now: i64,
+    duration_ms: i64,
 ) {
     let log = fetch_log::FetchLogEntry {
         source_id: &source.id,
@@ -486,7 +551,7 @@ async fn journal_success(
         error: None,
         error_class: None,
     };
-    if let Err(err) = fetch_log::insert(pool, &log).await {
+    if let Err(err) = fetch_log::insert_timed(pool, &log, Some(duration_ms)).await {
         tracing::error!(error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
@@ -506,6 +571,7 @@ async fn journal_failure(
     failure: &FetchFailure,
     override_message: Option<&str>,
     now: i64,
+    duration_ms: i64,
 ) {
     let failure_text = failure.to_string();
     let message = override_message.unwrap_or(&failure_text);
@@ -520,7 +586,7 @@ async fn journal_failure(
         error: Some(message),
         error_class: Some(class),
     };
-    if let Err(err) = fetch_log::insert(pool, &log).await {
+    if let Err(err) = fetch_log::insert_timed(pool, &log, Some(duration_ms)).await {
         tracing::error!(error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
@@ -544,6 +610,7 @@ async fn journal_parse_failure(
     payload: &FetchedPayload,
     message: &str,
     now: i64,
+    duration_ms: i64,
 ) {
     let log = fetch_log::FetchLogEntry {
         source_id: &source.id,
@@ -555,7 +622,7 @@ async fn journal_parse_failure(
         error: Some(message),
         error_class: Some(fumox_core::models::ErrorClass::ParseError),
     };
-    if let Err(err) = fetch_log::insert(pool, &log).await {
+    if let Err(err) = fetch_log::insert_timed(pool, &log, Some(duration_ms)).await {
         tracing::error!(error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
@@ -615,12 +682,37 @@ mod tests {
     /// A `Fetcher` pointed at a one-shot local HTTP server, plus the
     /// database and caches one `ingest_source` call needs. The private-IP
     /// policy is switched off so the loopback test server is reachable.
-    async fn ingest_env(body: &'static str) -> (DbPool, Caches, Fetcher, Source) {
+    /// The counter tracks how many requests reached the upstream.
+    async fn ingest_env(body: &'static str) -> (DbPool, Caches, Fetcher, Source, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             while let Ok((mut sock, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                // Read the request out before answering, like a real HTTP
+                // server. Closing a socket that still holds unread client
+                // bytes makes the kernel send RST, which can clobber the
+                // client's buffered read of the response; the fetcher then
+                // retries, opening a second connection the counter sees —
+                // and the exact-fetch-count assertions below would flake.
+                let mut received = Vec::with_capacity(1024);
+                loop {
+                    let mut scratch = [0u8; 1024];
+                    match sock.read(&mut scratch).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            received.extend_from_slice(&scratch[..n]);
+                            if received.windows(4).any(|w| w == b"\r\n\r\n")
+                                || received.len() >= 16 * 1024
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
@@ -651,7 +743,7 @@ mod tests {
             true, // allow_private_urls: the mirror above is loopback
             std::time::Duration::from_secs(5),
         );
-        (pool, Caches::new(), fetcher, source)
+        (pool, Caches::new(), fetcher, source, requests)
     }
 
     fn settings() -> IngestSettings {
@@ -669,13 +761,14 @@ mod tests {
         }))
     }
 
-    /// The raw snapshot is the freshness marker for the *next* pass, so it
-    /// may only be written once the payload has been parsed and
-    /// reconciled. Caching it before that let one parse error suppress
+    /// The freshness stamp (`last_fetched_at`) is the marker for the *next*
+    /// pass, so it may only be written once the payload has been parsed and
+    /// reconciled. Stamping it before that let one parse error suppress
     /// every non-forced re-fetch for a whole TTL.
     #[tokio::test]
-    async fn a_parse_failure_leaves_no_fresh_raw_snapshot() {
-        let (pool, caches, fetcher, source) = ingest_env("this is not a subscription").await;
+    async fn a_parse_failure_leaves_no_freshness_stamp() {
+        let (pool, caches, fetcher, source, _requests) =
+            ingest_env("this is not a subscription").await;
         let outcome = ingest_source(
             &pool,
             &fetcher,
@@ -688,19 +781,20 @@ mod tests {
         .await;
         assert!(matches!(outcome, IngestOutcome::ParseFailed { .. }));
 
+        let stored = sources::get(&pool, &source.id).await.unwrap().unwrap();
         assert!(
-            !caches
-                .raw_is_fresh(&source.id, source.cache_ttl_seconds)
-                .await,
-            "a failed ingest must not mark the source fresh"
+            stored.last_fetched_at.is_none(),
+            "a failed ingest must not stamp the source as freshly fetched"
         );
     }
 
-    /// The converse: a reconciled payload is what the DB now holds, so it
-    /// is exactly what the freshness marker is allowed to claim.
+    /// The converse: a reconciled payload is what the DB now holds, so its
+    /// `last_fetched_at` stamp is exactly what the freshness short-circuit
+    /// may trust — the next non-forced pass skips the HTTP fetch entirely,
+    /// while a forced one always hits the network.
     #[tokio::test]
-    async fn a_reconciled_payload_is_cached_as_fresh() {
-        let (pool, caches, fetcher, source) =
+    async fn a_reconciled_payload_stamps_freshness_and_skips_the_next_fetch() {
+        let (pool, caches, fetcher, source, requests) =
             ingest_env("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
         let outcome = ingest_source(
             &pool,
@@ -713,11 +807,134 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome, IngestOutcome::Ok { .. }));
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "the first pass fetches");
 
+        let stamped = sources::get(&pool, &source.id).await.unwrap().unwrap();
         assert!(
-            caches
-                .raw_is_fresh(&source.id, source.cache_ttl_seconds)
+            stamped.last_fetched_at.is_some(),
+            "a reconciled payload stamps last_fetched_at"
+        );
+
+        // The next pass reads the stamp from a freshly loaded row, as the
+        // scheduler does every sweep: still younger than the TTL, so no
+        // fetch goes out and nothing is reconciled.
+        let outcome = ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &inactive_geo(),
+            settings(),
+            &stamped,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                IngestOutcome::Ok {
+                    proxies_found: 0,
+                    ..
+                }
+            ),
+            "a fresh stamp must short-circuit, got {outcome:?}"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a fresh stamp must skip the HTTP fetch"
+        );
+
+        // A forced refresh (the admin *Refresh now* button) bypasses the
+        // stamp and hits the network.
+        let outcome = ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &inactive_geo(),
+            settings(),
+            &stamped,
+            true,
+        )
+        .await;
+        assert!(matches!(outcome, IngestOutcome::Ok { .. }));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "a forced refresh must fetch even behind a fresh stamp"
+        );
+    }
+
+    /// The measured fetch duration is journaled and carried on the
+    /// outcome: a real fetch records `Some(ms)` in `fetch_log.duration_ms`
+    /// and on the `Ok` outcome, the freshness short-circuit measures
+    /// nothing (`None`) and writes no journal row at all. Without the
+    /// measurement a slow upstream — or a long retry-backoff chain — is
+    /// indistinguishable from a fast one.
+    #[tokio::test]
+    async fn fetch_duration_is_journaled_and_carried_in_the_outcome() {
+        let (pool, caches, fetcher, source, requests) =
+            ingest_env("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
+        let outcome = ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &inactive_geo(),
+            settings(),
+            &source,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::Ok { .. }),
+            "expected a successful ingest, got {outcome:?}"
+        );
+        let IngestOutcome::Ok { duration_ms, .. } = outcome else {
+            unreachable!("asserted above")
+        };
+        let measured = duration_ms.expect("a real fetch measures its duration");
+        assert!(measured >= 0);
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "the first pass fetches");
+
+        let rows = fetch_log::recent_for_source(&pool, &source.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].duration_ms,
+            Some(measured),
+            "the journaled row carries the measured duration"
+        );
+
+        // The short-circuit pass measures nothing and journals nothing.
+        let stamped = sources::get(&pool, &source.id).await.unwrap().unwrap();
+        let outcome = ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &inactive_geo(),
+            settings(),
+            &stamped,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::Ok { .. }),
+            "expected a successful ingest, got {outcome:?}"
+        );
+        let IngestOutcome::Ok { duration_ms, .. } = outcome else {
+            unreachable!("asserted above")
+        };
+        assert!(
+            duration_ms.is_none(),
+            "no fetch happened, so there is no measurement"
+        );
+        assert_eq!(
+            fetch_log::recent_for_source(&pool, &source.id, 10)
                 .await
+                .unwrap()
+                .len(),
+            1,
+            "the short-circuit pass writes no journal row"
         );
     }
 

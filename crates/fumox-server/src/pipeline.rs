@@ -18,7 +18,7 @@
 use fumox_core::geo::{GeoResolver, apply_template};
 use fumox_core::models::{ProxyEntry, ProxyStatus, Scheme};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
 
@@ -29,53 +29,64 @@ pub(crate) const DEFAULT_GEO_TEMPLATE: &str = "{flag} {country} · {name}";
 /// every level so unknown keys fail validation. `pub(crate)` so the admin
 /// pipeline editor's ingest parses JSON with the exact same definitions
 /// instead of mirroring them.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// The `Serialize` side carries the builder's omit-defaults emit policy:
+/// only non-default values are written (`Option`s when present,
+/// booleans and defaulted fields only when they differ from their schema
+/// default), so the editor builds a typed [`PipelineConfig`] and
+/// serializes it instead of restating every key literal in a hand-rolled
+/// writer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PipelineConfig {
     /// Schema version; must be `1`.
     pub(crate) version: u8,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) filter: Option<FilterConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rename: Option<Vec<RenameRule>>,
     /// Discard rules: a proxy matching any rule is never
     /// stored. Applied at ingestion (the source's own pipeline) and again
     /// on serving before `rename`, so both sides see the original values.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) drop: Option<Vec<DropRule>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) geo: Option<GeoStepConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) health: Option<HealthConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dedup: Option<DedupConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sort: Option<SortConfig>,
     /// Output-size cap: keep at most `count` proxies of
     /// the final, deduplicated and sorted list.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) limit: Option<LimitConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FilterConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) protocols: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exclude_protocols: Option<Vec<String>>,
     /// AS numbers to keep, bare digits (`"24940"`); the `AS24940` spelling
     /// is accepted and normalized to the number. null = no allowlist.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) asns: Option<Vec<String>>,
     /// AS numbers to drop, the same accepted format as [`Self::asns`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exclude_asns: Option<Vec<String>>,
     /// Drop proxies that allow insecure TLS: any
     /// certificate-verification alias set to a truthy value. Default on.
     /// `normalize_params` is the v1 name of the same switch (serde alias,
     /// accepted forever so old exports keep importing).
-    #[serde(default = "default_true", alias = "normalize_params")]
+    #[serde(
+        default = "default_true",
+        alias = "normalize_params",
+        skip_serializing_if = "is_true"
+    )]
     pub(crate) forbid_insecure: bool,
 }
 
@@ -83,18 +94,41 @@ const fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// `skip_serializing_if` predicates backing the omit-defaults emit policy:
+/// a field at its schema default is never written, the same rule the
+/// builder's emit applies to every section it builds.
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_default_geo_template(value: &String) -> bool {
+    value == DEFAULT_GEO_TEMPLATE
+}
+
+fn is_default_exclude_statuses(value: &Vec<String>) -> bool {
+    *value == default_exclude_statuses()
+}
+
+fn is_default_sort(value: &SortBy) -> bool {
+    *value == SortBy::Source
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RenameRule {
     #[serde(rename = "match")]
     pub(crate) match_pattern: String,
     pub(crate) replace: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) flags: String,
     /// What the regex rewrites: `name` (default), `host`, `port` or
     /// `param:KEY` (case-insensitive first match). Optional so every
     /// existing v1 config stays valid unchanged.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target: Option<String>,
 }
 
@@ -193,32 +227,35 @@ pub(crate) enum RenameTarget {
 ///   numbers. The two flavours are mutually exclusive at validation time:
 ///   `match` is meaningless against an ASN and `asns` is meaningless
 ///   against a regex.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DropRule {
     /// Regex pattern (regex targets only). Required for every non-ASN
     /// target; must be empty (or absent) for `target == "asn"`.
-    #[serde(rename = "match", default)]
+    #[serde(rename = "match", default, skip_serializing_if = "String::is_empty")]
     pub(crate) match_pattern: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) flags: String,
     /// Selector name: `name` (default), `host`, `port`, `param:KEY`,
     /// or `asn` (see `asns`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target: Option<String>,
     /// AS numbers for `target: "asn"`. Accepts both bare (`24940`) and
     /// prefixed (`AS24940`) spellings, normalised at validation. Required
     /// when `target == "asn"`; forbidden otherwise.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) asns: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GeoStepConfig {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub(crate) enabled: bool,
-    #[serde(default = "default_geo_template")]
+    #[serde(
+        default = "default_geo_template",
+        skip_serializing_if = "is_default_geo_template"
+    )]
     pub(crate) template: String,
 }
 
@@ -226,10 +263,13 @@ fn default_geo_template() -> String {
     DEFAULT_GEO_TEMPLATE.to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HealthConfig {
-    #[serde(default = "default_exclude_statuses")]
+    #[serde(
+        default = "default_exclude_statuses",
+        skip_serializing_if = "is_default_exclude_statuses"
+    )]
     pub(crate) exclude_statuses: Vec<String>,
 }
 
@@ -239,14 +279,14 @@ pub(crate) fn default_exclude_statuses() -> Vec<String> {
     vec!["quarantine".to_string(), "removed".to_string()]
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DedupConfig {
     #[serde(rename = "by")]
     pub(crate) by: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SortBy {
     Source,
@@ -274,20 +314,22 @@ impl SortBy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SortConfig {
-    #[serde(default = "default_sort_by")]
+    #[serde(default = "default_sort_by", skip_serializing_if = "is_default_sort")]
     pub(crate) by: SortBy,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) desc: bool,
 }
 
-/// Output-size cap. `count` is `i64` so that negative or
-/// fractional input fails with the field-level `pipeline.invalid_limit`
+/// Output-size cap. `count` is `i64` so that negative or fractional input
+/// fails with the field-level `pipeline.invalid_limit`
 /// error instead of an opaque serde type error; `null`/missing means "no
-/// cap", the explicit-defaults reset of the profile tri-state.
-#[derive(Debug, Clone, Deserialize)]
+/// cap", the explicit-defaults reset of the profile tri-state. Unlike the
+/// other fields, `count` serializes even when `None` — `"count": null` is
+/// the explicit no-cap reset the builder emits.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LimitConfig {
     #[serde(default)]
@@ -2103,6 +2145,10 @@ mod tests {
             ("skip-cert-verify", "true"),
             ("allow_insecure", "1"),
             ("INSECURE", " TRUE "),
+            // The yes/on spellings of the one shared toggle vocabulary: a
+            // `yes` node must drop like a `1` one, not survive the filter.
+            ("allowInsecure", "yes"),
+            ("skip-cert-verify", "on"),
         ] {
             let mut c = candidate(key, Scheme::Vless, &format!("{key}.example.com"));
             c.entry.params.push(Param {
@@ -2188,5 +2234,139 @@ mod tests {
             .apply(vec![c], &inactive_geo())
             .await;
         assert_eq!(out.len(), 1, "legacy false must disable the filter");
+    }
+
+    #[test]
+    fn typed_config_serializes_omitting_defaults() {
+        // The Serialize side is the builder emit's policy. A config with
+        // every section unset serializes to bare `{"version": 1}` — the
+        // JSON that makes the builder emit collapse to NULL.
+        let bare = PipelineConfig {
+            version: 1,
+            filter: None,
+            rename: None,
+            drop: None,
+            geo: None,
+            health: None,
+            dedup: None,
+            sort: None,
+            limit: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({ "version": 1 })
+        );
+
+        // Sections present but carrying only schema defaults serialize to
+        // the explicit empty blocks the profile tri-state pins: `{}` for
+        // the object sections, `[]` for the rule lists, `{"count": null}`
+        // for the cap. Fields at their schema default are never written.
+        let defaults = PipelineConfig {
+            filter: Some(FilterConfig {
+                protocols: None,
+                exclude_protocols: None,
+                asns: None,
+                exclude_asns: None,
+                forbid_insecure: true,
+            }),
+            rename: Some(Vec::new()),
+            drop: Some(Vec::new()),
+            geo: Some(GeoStepConfig {
+                enabled: true,
+                template: DEFAULT_GEO_TEMPLATE.to_string(),
+            }),
+            health: Some(HealthConfig {
+                exclude_statuses: default_exclude_statuses(),
+            }),
+            dedup: None,
+            sort: Some(SortConfig {
+                by: SortBy::Source,
+                desc: false,
+            }),
+            limit: Some(LimitConfig { count: None }),
+            ..bare
+        };
+        assert_eq!(
+            serde_json::to_value(&defaults).unwrap(),
+            json!({
+                "version": 1,
+                "filter": {},
+                "rename": [],
+                "drop": [],
+                "geo": {},
+                "health": {},
+                "sort": {},
+                "limit": { "count": null }
+            })
+        );
+    }
+
+    #[test]
+    fn typed_config_round_trips_through_its_own_serialization() {
+        // Every section at a non-default value: the serialized document
+        // must parse back to a config that serializes identically (no
+        // asymmetry between the skip predicates and the deserialize
+        // defaults) and must pass the strict validator.
+        let full = PipelineConfig {
+            version: 1,
+            filter: Some(FilterConfig {
+                protocols: Some(vec!["vless".into()]),
+                exclude_protocols: Some(vec!["ss".into()]),
+                asns: Some(vec!["24940".into()]),
+                exclude_asns: Some(vec!["AS9009".into()]),
+                forbid_insecure: false,
+            }),
+            rename: Some(vec![RenameRule {
+                match_pattern: "^free".into(),
+                replace: String::new(),
+                flags: "i".into(),
+                target: Some("param:fp".into()),
+            }]),
+            drop: Some(vec![
+                DropRule {
+                    match_pattern: "\\.cn$".into(),
+                    flags: String::new(),
+                    target: Some("host".into()),
+                    asns: None,
+                },
+                DropRule {
+                    match_pattern: String::new(),
+                    flags: String::new(),
+                    target: Some("asn".into()),
+                    asns: Some(vec!["24940".into()]),
+                },
+            ]),
+            geo: Some(GeoStepConfig {
+                enabled: false,
+                template: "{country} · {name}".into(),
+            }),
+            health: Some(HealthConfig {
+                exclude_statuses: vec!["removed".into()],
+            }),
+            dedup: Some(DedupConfig {
+                by: "fingerprint".into(),
+            }),
+            sort: Some(SortConfig {
+                by: SortBy::Latency,
+                desc: true,
+            }),
+            limit: Some(LimitConfig { count: Some(100) }),
+        };
+        let value = serde_json::to_value(&full).unwrap();
+        let parsed: PipelineConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), value);
+        assert!(
+            CompiledPipeline::from_json(Some(&value)).is_ok(),
+            "{value:?}"
+        );
+        // `limit: null` serializes explicitly (the no-cap reset).
+        let no_cap = PipelineConfig {
+            limit: Some(LimitConfig { count: None }),
+            ..full
+        };
+        assert_eq!(
+            serde_json::to_value(&no_cap).unwrap()["limit"],
+            json!({ "count": null })
+        );
     }
 }

@@ -31,12 +31,11 @@
 
 [server]
 # Сокет в виде host:port, без диапазона: любой адрес и порт, который можно
-# занять. Слушает только GET /sub/{id} и GET /src/{id}.
-# A host:port socket, no range: any address and port that can be bound.
-# Serves GET /sub/{id} and GET /src/{id} only.
-#
-# Socket as host:port, no range: any bindable address and port. Listens for
-# GET /sub/{id} and GET /src/{id} only.
+# занять. Публичный слушатель отдает GET /sub/{id}, GET /src/{id},
+# GET /healthz и ссылки /export/alive/{token}, /export/ready/{token}.
+# A host:port socket, no range: any address and port that can be bound. The
+# public listener serves GET /sub/{id}, GET /src/{id}, GET /healthz and the
+# /export/alive/{token} and /export/ready/{token} links.
 bind = "0.0.0.0:8080"
 # Список CIDR произвольной длины; пусто = не доверять forwarded-заголовкам (любой
 # клиент иначе мог бы подменить ключ per-IP rate-limit).

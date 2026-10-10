@@ -1,0 +1,7 @@
+{#- Fragment: the enabled badge of the profile card. The detail page
+    includes this file for the initial render and the toggle action
+    re-renders it for every HTMX swap, so the id, the aria attributes and
+    the on/off label are one definition. -#}
+<span id="enabled-badge" aria-live="polite" aria-atomic="true">
+  {% if profile.enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+</span>

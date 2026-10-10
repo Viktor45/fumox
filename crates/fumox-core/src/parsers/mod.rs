@@ -404,12 +404,12 @@ fn translate_uri_param(scheme: Scheme, param: &Param, out: &mut Vec<Param>) {
         // literal check). A falsy toggle means plaintext, i.e. nothing.
         "tls" => match scheme {
             Scheme::Vless | Scheme::Trojan => {
-                if truthy(value) || value.eq_ignore_ascii_case("tls") {
+                if crate::models::is_truthy_toggle(value) || value.eq_ignore_ascii_case("tls") {
                     push(out, "security", "tls");
                 }
             }
             Scheme::Vmess => {
-                if truthy(value) || value.eq_ignore_ascii_case("tls") {
+                if crate::models::is_truthy_toggle(value) || value.eq_ignore_ascii_case("tls") {
                     push(out, "tls", "tls");
                 }
             }
@@ -422,7 +422,7 @@ fn translate_uri_param(scheme: Scheme, param: &Param, out: &mut Vec<Param>) {
         // `insecure`/`allowInsecure` spellings themselves pass through
         // untouched wherever the source already used them.
         "skip-cert-verify" => {
-            if truthy(value) {
+            if crate::models::is_truthy_toggle(value) {
                 match scheme {
                     Scheme::Vless | Scheme::Trojan | Scheme::Vmess => {
                         push(out, "allowInsecure", "1")
@@ -515,13 +515,6 @@ fn push_opt(out: &mut Vec<Param>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         push(out, key, &value);
     }
-}
-
-fn truthy(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 /// URI `alpn` is one comma-joined value; Clash feeds list it as a YAML

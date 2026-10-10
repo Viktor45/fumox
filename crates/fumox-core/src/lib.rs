@@ -18,5 +18,6 @@ pub mod repo;
 pub mod ssrf;
 
 pub use config::{AppConfig, DEFAULT_CONFIG_PATH};
+pub use db::tempdir_lite;
 pub use error::{Error, Result};
 pub use models::{ProxyEntry, Scheme};

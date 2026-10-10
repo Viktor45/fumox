@@ -9,6 +9,12 @@
 //! The admin panel can request an immediate refresh through the mpsc
 //! channel; a per-source in-flight guard prevents duplicate fetches
 //! and always bypasses the backoff.
+//!
+//! The loop also owns the server's journal retention: `fetch_log` and
+//! `probe_requests` are swept on the `[probe].retention_interval_secs`
+//! cadence with the same windows the probe daemon's retention loop derives
+//! from the config, so a server-only deployment (no daemon) stays
+//! retention-bounded too (see [`retention_sweep`]).
 
 use crate::cache::Caches;
 use crate::events::EventBus;
@@ -17,7 +23,7 @@ use crate::ingest;
 use fumox_core::db::DbPool;
 use fumox_core::geo::GeoResolver;
 use fumox_core::models::Source;
-use fumox_core::repo::{fetch_log, sources};
+use fumox_core::repo::{fetch_log, probe, sources};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,7 +151,14 @@ impl SchedulerState {
         })
     }
 
-    /// Whether a source is currently being fetched (admin status fragment).
+    /// Whether a refresh of the source is pending or running (admin status
+    /// fragment). The mark spans the whole spawn-to-outcome window,
+    /// including the wait for a `[fetch].max_concurrency` permit: the
+    /// status fragment stops polling once this turns `false`, so a queued
+    /// *Refresh now* must not look finished while its task still sits on
+    /// the semaphore. The SSE stream carries the narrower signal —
+    /// `fetch.queued` at spawn, `fetch.started` once a request can actually
+    /// go out.
     pub async fn is_in_flight(&self, source_id: &str) -> bool {
         self.in_flight.lock().await.contains(source_id)
     }
@@ -207,6 +220,162 @@ impl Drop for SweepGuard {
     }
 }
 
+/// Retention windows the scheduler enforces itself, read once at startup.
+///
+/// The probe daemon runs the full retention loop, but the two binaries are
+/// independent and a server-only deployment — a state the architecture
+/// explicitly allows, the panel warning about a missing daemon rather than
+/// refusing to work — writes a `fetch_log` row per fetch attempt and
+/// enqueues `probe_requests` per refresh with nothing draining them. The
+/// scheduler therefore sweeps exactly the two tables the server itself
+/// writes with the same cutoffs the daemon's loop derives from the config
+/// (`[retention].fetch_log_days`, `[probe].queue_stale_days`), so a
+/// deployment without the daemon stays retention-bounded and a deployment
+/// with one merely repeats idempotent deletes. `probe_results` stays the
+/// daemon's alone: the server never writes it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServerRetention {
+    /// `[retention].fetch_log_days`.
+    fetch_log_days: u32,
+    /// `[probe].queue_stale_days`.
+    queue_stale_days: u64,
+    /// `[probe].retention_interval_secs`: how often the sweep runs.
+    interval_secs: u64,
+}
+
+impl Default for ServerRetention {
+    fn default() -> Self {
+        // The built-in defaults, so a failed config re-read below still
+        // bounds the tables instead of leaving them unbounded.
+        let probe = fumox_core::config::ProbeConfig::default();
+        Self {
+            fetch_log_days: fumox_core::config::RetentionConfig::default().fetch_log_days,
+            queue_stale_days: probe.queue_stale_days,
+            interval_secs: probe.retention_interval_secs,
+        }
+    }
+}
+
+/// The config file the process was started with, recovered from the process
+/// arguments. The scheduler re-reads the retention windows itself (its
+/// caller passes it no config), and the `--config`/`-c` flag is the one
+/// config pointer that exists only on the command line: without this scan a
+/// deployment started with `--config /etc/fumox/app.toml` would get its
+/// retention windows from `FUMOX_CONFIG` or the default location instead.
+/// `fumox_core::config::load` re-applies the rest of the documented
+/// precedence (`FUMOX_CONFIG`, then the default location) on its own.
+fn cli_config_path() -> Option<std::path::PathBuf> {
+    config_path_from_args(std::env::args_os().skip(1))
+}
+
+/// The pure half of [`cli_config_path`], split out so the flag spellings
+/// are testable without touching process state. Mirrors clap's two forms
+/// for the server binary's only path flag: `--config <path>` / `-c <path>`
+/// and `--config=<path>`.
+fn config_path_from_args<I>(args: I) -> Option<std::path::PathBuf>
+where
+    I: IntoIterator,
+    I::Item: Into<std::ffi::OsString>,
+{
+    let mut args = args.into_iter().map(Into::into);
+    while let Some(arg) = args.next() {
+        let arg = arg.to_string_lossy();
+        if let Some(value) = arg.strip_prefix("--config=") {
+            return Some(std::path::PathBuf::from(value));
+        }
+        if arg == "--config" || arg == "-c" {
+            return args.next().map(std::path::PathBuf::from);
+        }
+    }
+    None
+}
+
+/// Read the retention windows the scheduler enforces from the same config
+/// the process booted with. A failed re-read (the file vanished or was made
+/// invalid since startup) falls back to the built-in defaults with a
+/// warning: bounded tables on the default windows beat an unswept journal.
+fn load_server_retention() -> ServerRetention {
+    let path = cli_config_path();
+    match fumox_core::config::load(path.as_deref()) {
+        Ok(loaded) => ServerRetention {
+            fetch_log_days: loaded.config.retention.fetch_log_days,
+            queue_stale_days: loaded.config.probe.queue_stale_days,
+            interval_secs: loaded.config.probe.retention_interval_secs,
+        },
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "scheduler: cannot re-read the config for the retention windows; \
+                 using the built-in defaults"
+            );
+            ServerRetention::default()
+        }
+    }
+}
+
+/// One server-side retention pass: `fetch_log` and `probe_requests` older
+/// than the configured windows, plus queue rows whose proxy already left
+/// the `unknown` state. The server-side mirror of the probe daemon's
+/// retention loop for the two tables the server itself writes.
+async fn retention_sweep(pool: &DbPool, retention: &ServerRetention) {
+    let now = fumox_core::models::now_ts();
+    // A zero window would wipe the whole table on every pass; the same
+    // clamp the daemon's `retention_cutoff` applies.
+    let fetch_cutoff = now - i64::from(retention.fetch_log_days.max(1)) * 86_400;
+    let queue_cutoff = now - retention.queue_stale_days.max(1) as i64 * 86_400;
+
+    let mut deleted_fetch_log = 0u64;
+    let mut deleted_requests = 0u64;
+    match fetch_log::purge_before(pool, fetch_cutoff).await {
+        Ok(0) => {}
+        Ok(deleted) => {
+            deleted_fetch_log = deleted;
+            tracing::info!(deleted, "server retention: rotated fetch_log");
+        }
+        Err(error) => tracing::warn!(error = %error, "server retention: fetch_log rotation failed"),
+    }
+    // Priority-queue housekeeping, same as the daemon: rows whose proxy no
+    // longer needs the priority lane, and stale leftovers from a probe
+    // that is offline — or absent.
+    match probe::purge_settled_checks(pool).await {
+        Ok(0) => {}
+        Ok(deleted) => {
+            deleted_requests += deleted;
+            tracing::debug!(deleted, "server retention: dropped settled probe_requests")
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "server retention: probe_requests cleanup failed")
+        }
+    }
+    match probe::purge_requests_before(pool, queue_cutoff).await {
+        Ok(0) => {}
+        Ok(deleted) => {
+            deleted_requests += deleted;
+            tracing::info!(deleted, "server retention: rotated stale probe_requests");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "server retention: probe_requests rotation failed")
+        }
+    }
+    // Stamp the run so /admin/probe surfaces it even without the daemon:
+    // the stamp means "a retention pass ran recently", whoever ran it.
+    let stamp = probe::meta::LastRotation {
+        ts: now,
+        probe_results: 0,
+        fetch_log: deleted_fetch_log,
+        probe_requests: deleted_requests,
+    };
+    if let Err(error) = fumox_core::repo::meta_set(
+        pool,
+        probe::meta::LAST_ROTATION_KEY,
+        &serde_json::to_string(&stamp).expect("meta payload holds only JSON-native fields"),
+    )
+    .await
+    {
+        tracing::debug!(error = %error, "server retention: cannot stamp last_rotation");
+    }
+}
+
 /// Run the scheduler until the process shuts down.
 ///
 /// `refresh_rx` carries source ids that must be refreshed immediately
@@ -217,6 +386,23 @@ pub async fn run(
     events: EventBus,
     mut refresh_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
+    // Server-side journal retention on its own cadence (see
+    // [`retention_sweep`]). The first tick of a tokio interval is
+    // immediate, matching the daemon's run-at-startup, so a server-only
+    // deployment sheds an accumulated backlog at boot; running it in this
+    // select loop ties the sweep's lifetime to the scheduler's, and the
+    // bounded deletes cost the refresh channel a moment at most.
+    let retention = load_server_retention();
+    tracing::debug!(
+        fetch_log_days = retention.fetch_log_days,
+        queue_stale_days = retention.queue_stale_days,
+        interval_secs = retention.interval_secs,
+        "scheduler retention windows"
+    );
+    let mut retention_tick =
+        tokio::time::interval(Duration::from_secs(retention.interval_secs.max(60)));
+    retention_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let mut tick = tokio::time::interval(SWEEP_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // A sweep drains its whole JoinSet, so a slow source would otherwise
@@ -241,6 +427,9 @@ pub async fn run(
                     let _guard = sweeping_done;
                     sweep(&env, &state, &events).await;
                 });
+            }
+            _ = retention_tick.tick() => {
+                retention_sweep(&env.pool, &retention).await;
             }
             maybe_id = refresh_rx.recv() => {
                 let Some(source_id) = maybe_id else {
@@ -285,8 +474,12 @@ async fn sweep(env: &IngestEnv, state: &SchedulerState, events: &EventBus) {
     // since the loop last got a sweep underway", so a sweep hung inside
     // its own body ages the stamp instead of looking healthy.
     let started_at = fumox_core::models::now_ts();
-    if let Err(err) =
-        fumox_core::repo::meta_set(&env.pool, "server_cycle", &started_at.to_string()).await
+    if let Err(err) = fumox_core::repo::meta_set(
+        &env.pool,
+        fumox_core::repo::probe::meta::SERVER_CYCLE_KEY,
+        &started_at.to_string(),
+    )
+    .await
     {
         tracing::warn!(error = %err, "scheduler sweep: cannot stamp server_cycle");
     }
@@ -351,6 +544,13 @@ async fn sweep(env: &IngestEnv, state: &SchedulerState, events: &EventBus) {
 
 /// Spawn one ingestion task if the source is not already in flight.
 /// Returns the join handle, or `None` when skipped.
+///
+/// Event order: `fetch.queued` at spawn (the in-flight mark is held from
+/// here on, so duplicates are dropped), `fetch.started` once a concurrency
+/// permit is in hand and the fetch can actually go out, then the outcome
+/// event. Under `[fetch].max_concurrency` saturation the queued window can
+/// span many sweeps, and the panel's "fetching" notion must not start
+/// before any request is made.
 fn spawn_ingest(
     env: &IngestEnv,
     state: &SchedulerState,
@@ -377,14 +577,25 @@ fn spawn_ingest(
             tracing::debug!(source = %source_id, "source already fetching; skipping");
             return;
         };
+        // Queued, not started: under `[fetch].max_concurrency` saturation a
+        // task can sit on the semaphore for a long while before any request
+        // is made, and the panel's notion of "fetching" must not include
+        // that wait. `fetch.started` therefore fires only once a permit is
+        // in hand; `fetch.queued` announces the pending refresh in between
+        // (the SSE stream forwards every event, the browser reacts to the
+        // names it knows).
         events.publish(
-            "fetch.started",
+            "fetch.queued",
             serde_json::json!({ "source_id": source_id }),
         );
         let permit = match state.semaphore.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return, // semaphore closed during shutdown
         };
+        events.publish(
+            "fetch.started",
+            serde_json::json!({ "source_id": source_id }),
+        );
         let outcome =
             ingest::ingest_source(&pool, &fetcher, &caches, &geo, settings, &source, force).await;
         drop(permit);
@@ -393,6 +604,7 @@ fn spawn_ingest(
             ingest::IngestOutcome::Ok {
                 proxies_found,
                 stats,
+                duration_ms,
             } => {
                 // New/changed/removed rows → every rendered output containing
                 // this source is stale. Drop them now so clients see the fresh
@@ -407,6 +619,7 @@ fn spawn_ingest(
                         "source_id": source_id,
                         "ok": true,
                         "proxies_found": proxies_found,
+                        "duration_ms": duration_ms,
                     }),
                 );
                 tracing::info!(
@@ -415,10 +628,14 @@ fn spawn_ingest(
                     inserted = stats.inserted,
                     updated = stats.updated,
                     removed = stats.removed,
+                    duration_ms,
                     "source ingested"
                 );
             }
-            ingest::IngestOutcome::FetchFailed { failure } => {
+            ingest::IngestOutcome::FetchFailed {
+                failure,
+                duration_ms,
+            } => {
                 let class = failure.error_class();
                 events.publish(
                     "fetch.failed",
@@ -426,20 +643,35 @@ fn spawn_ingest(
                         "source_id": source_id,
                         "ok": false,
                         "error_class": class.as_str(),
+                        "duration_ms": duration_ms,
                     }),
                 );
-                tracing::warn!(source = %source_id, error = %failure, "source fetch failed");
+                tracing::warn!(
+                    source = %source_id,
+                    error = %failure,
+                    duration_ms,
+                    "source fetch failed"
+                );
             }
-            ingest::IngestOutcome::ParseFailed { message } => {
+            ingest::IngestOutcome::ParseFailed {
+                message,
+                duration_ms,
+            } => {
                 events.publish(
                     "fetch.failed",
                     serde_json::json!({
                         "source_id": source_id,
                         "ok": false,
                         "error_class": "parse_error",
+                        "duration_ms": duration_ms,
                     }),
                 );
-                tracing::warn!(source = %source_id, error = %message, "source parse failed");
+                tracing::warn!(
+                    source = %source_id,
+                    error = %message,
+                    duration_ms,
+                    "source parse failed"
+                );
             }
         }
     };
@@ -615,6 +847,13 @@ mod tests {
             .with_writer(move || Captured(Arc::clone(&make_writer)))
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        // Same call-site-interest caveat as the auth logging test: a call
+        // site first executed under another test's empty dispatcher caches
+        // as `never` for the whole process. Pin the registry to
+        // multi-dispatcher and re-evaluate, so the lines this test asserts
+        // on are observable through the subscriber above.
+        crate::admin::stabilize_callsite_interests();
+        tracing::callsite::rebuild_interest_cache();
 
         dispatch_refresh(&env, &state, &events, "srcLost0000").await;
 
@@ -838,5 +1077,329 @@ mod tests {
             !flag.load(Ordering::SeqCst),
             "unwinding must release the sweep-overlap flag"
         );
+    }
+
+    /// The `--config`/`-c` flag is the one config pointer that exists only
+    /// on the command line, and the scheduler re-reads the retention
+    /// windows from the config itself: the flag spellings must be
+    /// recovered exactly, everything else is left to `config::load`.
+    #[test]
+    fn cli_config_flag_is_recovered_from_process_arguments() {
+        assert_eq!(
+            config_path_from_args(["fumox-server", "--config", "/etc/fumox/app.toml"]),
+            Some(std::path::PathBuf::from("/etc/fumox/app.toml"))
+        );
+        assert_eq!(
+            config_path_from_args(["fumox-server", "-c", "app.toml"]),
+            Some(std::path::PathBuf::from("app.toml"))
+        );
+        assert_eq!(
+            config_path_from_args(["fumox-server", "--config=app.toml"]),
+            Some(std::path::PathBuf::from("app.toml"))
+        );
+        assert_eq!(config_path_from_args(["fumox-server"]), None);
+        assert_eq!(
+            config_path_from_args(["fumox-server", "--health-check"]),
+            None
+        );
+        assert_eq!(
+            config_path_from_args(Vec::<std::ffi::OsString>::new()),
+            None
+        );
+    }
+
+    /// One minimal `proxies` row for the `probe_requests` FK; returns its id.
+    async fn test_proxy(pool: &DbPool, fingerprint: &str) -> i64 {
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
+                                  created_at, updated_at)
+             VALUES (?, 'vless', 'n', 'h', 443, 'c', 1, 1) RETURNING id",
+        )
+        .bind(fingerprint)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// A server-only deployment (no probe daemon) still writes a `fetch_log`
+    /// row per fetch attempt and enqueues `probe_requests` per refresh, with
+    /// nothing draining either. The scheduler's own retention sweep must
+    /// shed both past the same windows the daemon's loop enforces, keep
+    /// everything inside them, drop queue rows whose proxy already left
+    /// `unknown`, and stamp the rotation the panel shows.
+    #[tokio::test]
+    async fn server_retention_sweep_purges_old_journal_and_queue_rows() {
+        let pool = test_pool().await;
+        sources::create(
+            &pool,
+            &test_source("srcRotat000", "https://example.com/sub".into(), 3600, None),
+        )
+        .await
+        .unwrap();
+
+        let now = fumox_core::models::now_ts();
+        let day = 86_400i64;
+        for (fetched_at, ok) in [(now - 40 * day, false), (now - day, true)] {
+            fetch_log::insert(
+                &pool,
+                &fetch_log::FetchLogEntry {
+                    source_id: "srcRotat000",
+                    fetched_at,
+                    ok,
+                    http_status: None,
+                    bytes: None,
+                    proxies_found: None,
+                    error: None,
+                    error_class: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let fresh_proxy = test_proxy(&pool, "fp-fresh").await;
+        let stale_proxy = test_proxy(&pool, "fp-stale").await;
+        let settled_proxy = test_proxy(&pool, "fp-settled").await;
+        sqlx::query("UPDATE proxies SET status = 'alive' WHERE id = ?")
+            .bind(settled_proxy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (proxy_id, requested_at) in [
+            (fresh_proxy, now),
+            (stale_proxy, now - 30 * day),
+            (settled_proxy, now),
+        ] {
+            sqlx::query("INSERT INTO probe_requests (proxy_id, requested_at) VALUES (?, ?)")
+                .bind(proxy_id)
+                .bind(requested_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let retention = ServerRetention {
+            fetch_log_days: 30,
+            queue_stale_days: 7,
+            interval_secs: 60,
+        };
+        retention_sweep(&pool, &retention).await;
+
+        assert_eq!(
+            fetch_log::count_all(&pool).await.unwrap(),
+            1,
+            "the row inside the window stays, the one past it goes"
+        );
+        let (queued,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued, 1,
+            "the fresh request stays, the stale and the settled ones go"
+        );
+
+        let stamp = fumox_core::repo::meta_get(&pool, probe::meta::LAST_ROTATION_KEY)
+            .await
+            .unwrap()
+            .expect("the sweep stamps its run");
+        let stamp: probe::meta::LastRotation = serde_json::from_str(&stamp).unwrap();
+        assert_eq!(stamp.fetch_log, 1);
+        assert_eq!(stamp.probe_requests, 2);
+    }
+
+    /// A local upstream that answers every request with the same 200 body
+    /// and counts the requests it received. Reads the request out before
+    /// answering, like a real HTTP server (see `ingest::ingest_env` for
+    /// why the extra care keeps fetch counts stable).
+    async fn ok_upstream(body: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut received = Vec::with_capacity(1024);
+                    loop {
+                        let mut scratch = [0u8; 1024];
+                        match sock.read(&mut scratch).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                received.extend_from_slice(&scratch[..n]);
+                                if received.windows(4).any(|w| w == b"\r\n\r\n")
+                                    || received.len() >= 16 * 1024
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    /// Seed a rendered output that names the source, the way a served
+    /// `/sub/{profile}` rendering would.
+    async fn seed_rendering(caches: &Caches, key: &str, source_id: &str) {
+        caches
+            .processed_put(
+                key,
+                crate::cache::Rendered {
+                    status: 200,
+                    body: axum::body::Bytes::from_static(b"stale rendering"),
+                    content_type: "text/plain; charset=utf-8".into(),
+                    extra_headers: Vec::new(),
+                    fresh_until: fumox_core::models::now_ts() + 3_600,
+                    source_ids: vec![source_id.to_string()],
+                },
+            )
+            .await;
+    }
+
+    /// The ingest outcome decides the renderings' fate: a reconcile that
+    /// changed rows (`inserted + updated + removed > 0`) drops every
+    /// rendered output containing the source, an ingest that changed
+    /// nothing (the freshness short-circuit, all-zero stats) keeps them.
+    /// The decision lives in `spawn_ingest`, so both branches of its
+    /// condition are pinned here — a regression that flips the condition
+    /// or misreads the stats now fails instead of passing silently.
+    #[tokio::test]
+    async fn a_data_changing_ingest_drops_renderings_and_a_quiet_one_keeps_them() {
+        let (addr, hits) =
+            ok_upstream("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
+        let pool = test_pool().await;
+        let source = test_source("srcCache000", format!("http://{addr}/sub"), 3600, None);
+        sources::create(&pool, &source).await.unwrap();
+        let (env, state, events) = test_env(pool.clone()).await;
+        let key = "sub:profCache0";
+
+        // Changed rows: the first reconcile inserts the proxy.
+        seed_rendering(&env.caches, key, &source.id).await;
+        spawn_ingest(&env, &state, &events, source.clone(), false)
+            .expect("the first spawn acquires the in-flight mark")
+            .await
+            .expect("the ingest task does not panic");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the first ingest fetches");
+        assert!(
+            env.caches.processed_get(key).await.is_none(),
+            "an ingest that inserted rows must drop renderings containing the source"
+        );
+
+        // Nothing changed: the freshness short-circuit answers with
+        // all-zero stats without touching the network, and the rendering
+        // stays valid. The row is handed over exactly as a sweep would
+        // (the scheduler re-reads every sweep, the freshness guard inside
+        // the ingest is the row-level second check).
+        let fresh = test_source(
+            "srcCache000",
+            format!("http://{addr}/sub"),
+            3600,
+            Some(fumox_core::models::now_ts()),
+        );
+        seed_rendering(&env.caches, key, &source.id).await;
+        spawn_ingest(&env, &state, &events, fresh, false)
+            .expect("spawn succeeds")
+            .await
+            .expect("the ingest task does not panic");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a fresh row short-circuits without a fetch"
+        );
+        assert!(
+            env.caches.processed_get(key).await.is_some(),
+            "an ingest that changed nothing must keep the rendering"
+        );
+    }
+
+    /// `fetch.started` must not fire before a concurrency permit is in
+    /// hand: under `[fetch].max_concurrency` saturation the spawned task
+    /// waits on the semaphore while already marked in-flight, and the
+    /// "fetching" notion has to begin with the request, not the queue
+    /// entry. The wait is announced as `fetch.queued` instead; the
+    /// in-flight mark still spans the whole window, so a duplicate
+    /// *Refresh now* stays dropped.
+    #[tokio::test]
+    async fn fetch_started_waits_for_the_concurrency_permit() {
+        let (addr, _hits) = dead_upstream().await;
+        let url = format!("http://{addr}/sub");
+        let pool = test_pool().await;
+        sources::create(&pool, &test_source("srcQueue000", url.clone(), 0, None))
+            .await
+            .unwrap();
+        let (env, _idle_state, events) = test_env(pool).await;
+        // One permit, and the test holds it: the spawned task must queue.
+        let state = SchedulerState::new(1);
+        let mut rx = events.subscribe();
+
+        // The only permit is held by the test, so the spawned task queues.
+        let permit = state.semaphore.clone().acquire_owned().await.unwrap();
+        spawn_ingest(
+            &env,
+            &state,
+            &events,
+            test_source("srcQueue000", url.clone(), 0, None),
+            false,
+        )
+        .expect("the first spawn acquires the in-flight mark");
+
+        // The queue announcement proves the in-flight mark is taken
+        // (acquire_source runs before the semaphore wait). A duplicate
+        // spawn is dropped by that mark inside its own task: it exits
+        // without publishing anything, so no second `fetch.queued` may
+        // appear while the first refresh is still queued.
+        let queued = rx.recv().await.expect("event bus stays open");
+        assert_eq!(queued.name, "fetch.queued");
+        assert_eq!(queued.data["source_id"], "srcQueue000");
+        spawn_ingest(
+            &env,
+            &state,
+            &events,
+            test_source("srcQueue000", url, 0, None),
+            false,
+        )
+        .expect("the duplicate spawn returns a task")
+        .await
+        .expect("the duplicate task does not panic");
+        assert!(
+            state.is_in_flight("srcQueue000").await,
+            "a queued refresh is marked in flight"
+        );
+        let duplicate_published = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            duplicate_published.is_err(),
+            "the duplicate must exit silently while the first refresh is queued, \
+             got {duplicate_published:?}"
+        );
+
+        let started_early = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let event = rx.recv().await.expect("event bus stays open");
+                if event.name == "fetch.started" {
+                    return event;
+                }
+            }
+        })
+        .await;
+        assert!(
+            started_early.is_err(),
+            "fetch.started must wait for the permit, got {started_early:?}"
+        );
+
+        drop(permit);
+        await_fetch_started(&mut rx, "srcQueue000").await;
     }
 }

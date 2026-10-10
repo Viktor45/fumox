@@ -61,14 +61,13 @@ pub(crate) fn param_value(entry: &crate::models::ProxyEntry, key: &str) -> Optio
 }
 
 /// Whether the parameter is present with a truthy value (`1`/`true`/`yes`/
-/// `on`, case-insensitive), how Clash YAML booleans land in params.
+/// `on`, case-insensitive), how Clash YAML booleans land in params. The
+/// vocabulary is the shared [`crate::models::is_truthy_toggle`], so the
+/// writers agree with the fingerprint and the forbid-insecure filter.
 pub(crate) fn param_truthy(entry: &crate::models::ProxyEntry, key: &str) -> bool {
-    entry.param_ignore_case(key).is_some_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    entry
+        .param_ignore_case(key)
+        .is_some_and(crate::models::is_truthy_toggle)
 }
 
 /// Parameter as a list: YAML sequences (Clash-input `alpn: [h2, http/1.1]`)
@@ -196,8 +195,14 @@ mod tests {
         assert!(is_insecure(&[param("insecure", "true")]));
         assert!(is_insecure(&[param("skip-cert-verify", " TRUE ")]));
         assert!(is_insecure(&[param("allow_insecure", "1")]));
+        // The yes/on spellings the shared toggle vocabulary accepts: a
+        // `allowInsecure=yes` node must be emitted with the insecure marker
+        // like an `allowInsecure=1` one, not silently secured on output.
+        assert!(is_insecure(&[param("allowInsecure", "yes")]));
+        assert!(is_insecure(&[param("skip-cert-verify", "on")]));
         assert!(!is_insecure(&[param("allowInsecure", "0")]));
         assert!(!is_insecure(&[param("allow_insecure", "false")]));
+        assert!(!is_insecure(&[param("insecure", "no")]));
         assert!(!is_insecure(&[param("sni", "example.com")]));
         assert!(!is_insecure(&[]));
     }

@@ -13,10 +13,9 @@
 //! - every proxy quarantined/removed → empty valid output +
 //!   `X-Fumox-Warning: all-proxies-quarantined`.
 
-use crate::admin::auth::RateLimiter;
-use crate::admin::fmt_rfc3339_utc;
 use crate::cache::{Caches, InlineClaim, InlineOutcome, Rendered};
 use crate::pipeline::{self, Candidate, CompiledPipeline, PipelineIssue};
+use crate::security::{RateLimiter, client_key, ct_eq, fmt_rfc3339_utc};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -32,8 +31,8 @@ use fumox_core::repo::{fetch_log, profiles, proxies, sources};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// Upper bound on how long a rendered subscription body is served from the
 /// processed cache as fresh, in seconds.
@@ -78,6 +77,33 @@ pub struct AppState {
     /// (`[server].export_max_rows`). The two links have no upstream cap of
     /// their own, so this is the only thing bounding one public request.
     pub export_max_rows: u32,
+}
+
+impl AppState {
+    /// Assemble the shared state of the public listener from its
+    /// dependencies. The single construction site for `AppState` — the
+    /// startup wiring in `main` and the admin panel's in-process preview
+    /// (`admin::handlers::profiles`) both go through it — so the two can
+    /// never drift apart on how the listener is configured.
+    pub fn new(
+        pool: DbPool,
+        caches: Caches,
+        geo: Arc<GeoResolver>,
+        limits: PublicRateLimits,
+        trusted_cidrs: Vec<ipnet::IpNet>,
+        allowed_hosts: Vec<String>,
+        export_max_rows: u32,
+    ) -> Self {
+        Self {
+            pool,
+            caches,
+            geo,
+            limits,
+            trusted_cidrs,
+            allowed_hosts,
+            export_max_rows,
+        }
+    }
 }
 
 /// Per-IP rate limiters of the public listener: a generous ceiling for
@@ -197,8 +223,7 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
     let Some(connect) = req.extensions().get::<ConnectInfo<SocketAddr>>().cloned() else {
         return next.run(req).await;
     };
-    let ip =
-        crate::admin::auth::client_key(connect.0, req.headers(), &state.trusted_cidrs).to_string();
+    let ip = client_key(connect.0, req.headers(), &state.trusted_cidrs).to_string();
     if !state.limits.all.allow(&ip).await {
         return error_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -206,17 +231,160 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
         );
     }
     let response = next.run(req).await;
+    if let Some(check) = response.extensions().get::<AuthFailure>().copied() {
+        // A failed secret check on a public route (profile access token,
+        // export capability token): warn once per client key per window,
+        // debug after — the same coalescing the host gate's
+        // `alive_export::HostRejectLog` uses — so a token-guessing campaign
+        // is visible without one log line per request. The client key is
+        // logged, never the rejected token value.
+        if should_warn_auth_failure(&ip) {
+            tracing::warn!(client = %ip, check = check.0, "public secret check failed");
+        } else {
+            tracing::debug!(client = %ip, check = check.0, "public secret check failed");
+        }
+    }
     if response.status() == StatusCode::FORBIDDEN && !state.limits.auth_failures.allow(&ip).await {
         // The failure window rejected the request, give the hit back to the
         // generous window so one brute-force attempt does not cost the
         // caller two windows.
         state.limits.all.refund(&ip).await;
+        tracing::warn!(
+            client = %ip,
+            "auth-failure rate limit window exhausted; rejecting the request"
+        );
         return error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed access attempts, try again later",
         );
     }
     response
+}
+
+/// Response extension a handler attaches when it rejected a request on a
+/// secret check (`/sub` access token, export capability token). The public
+/// rate-limit middleware reads it to log the failure with the client key it
+/// already computed — the handlers never see the peer address, so they
+/// cannot log one. The value names the check that failed; the checked
+/// token itself is never logged.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AuthFailure(pub(crate) &'static str);
+
+/// Window within which a repeated auth failure from the same client key
+/// stays at debug level. The failure paths sit on public routes, so the log
+/// line has to serve two opposite extremes: a token-guessing campaign
+/// against `/sub` or `/export` must be visible immediately, while it must
+/// not get one warn per request.
+const AUTH_FAIL_WARN_WINDOW: Duration = Duration::from_secs(3_600);
+
+/// Distinct client keys kept in the registry, bounding the memory a flood
+/// of distinct keys could pin. Hitting this count does not silence new
+/// keys: it bounds tracking, not warnings (see [`AuthFailLog::should_warn`]).
+const AUTH_FAIL_MAX_TRACKED: usize = 1_024;
+
+/// Warns this registry may emit per [`AUTH_FAIL_WARN_WINDOW`]. Past it,
+/// failures drop to debug, but the first suppressed client of the window is
+/// named in a summary when the window rolls over.
+const AUTH_FAIL_MAX_WARNS: u32 = 64;
+
+/// Per-client warn registry for failed secret checks on the public
+/// listener, see [`AuthFailLog::should_warn`]. The same deduplication
+/// pattern as the host gate's `alive_export::HostRejectLog`, keyed by
+/// client key instead of host.
+static AUTH_FAIL_LOG: LazyLock<Mutex<AuthFailLog>> =
+    LazyLock::new(|| Mutex::new(AuthFailLog::default()));
+
+#[derive(Default)]
+struct AuthFailLog {
+    seen: HashMap<String, Instant>,
+    /// Start of the current warn window, and how much of
+    /// [`AUTH_FAIL_MAX_WARNS`] it has spent.
+    window_start: Option<Instant>,
+    warns_emitted: u32,
+    /// First client the window could not warn about, kept so the rollover
+    /// summary can name it.
+    suppressed: Option<String>,
+    /// Suppressed clients in the current window, for the rollover count.
+    suppressed_total: u64,
+}
+
+impl AuthFailLog {
+    /// Roll the window over if it has elapsed. Returns a summary to log
+    /// when the window that just closed had suppressed clients.
+    fn roll_window(&mut self, now: Instant) -> Option<String> {
+        let Some(start) = self.window_start else {
+            // First failure ever: open the window, report nothing.
+            self.window_start = Some(now);
+            return None;
+        };
+        if now.duration_since(start) < AUTH_FAIL_WARN_WINDOW {
+            return None;
+        }
+        let suppressed = self.suppressed.take();
+        let total = std::mem::take(&mut self.suppressed_total);
+        self.warns_emitted = 0;
+        self.window_start = Some(now);
+        suppressed.map(|client| {
+            format!(
+                "public auth failures: {total} dropped to debug this window, \
+                 first suppressed client {client}"
+            )
+        })
+    }
+
+    /// `true` when this failure of `client` should warn, plus a summary to
+    /// log when a window rolls over (see [`Self::roll_window`]).
+    ///
+    /// Three rules, in order: a client already warned inside the window is
+    /// quiet; a client past [`AUTH_FAIL_MAX_WARNS`] for the window is quiet
+    /// but remembered for the summary; otherwise it warns. The per-window
+    /// budget is what stops a token-guessing campaign from mirroring itself
+    /// into the log, and the summary is what stops the campaign from going
+    /// unseen: even as the hundred-and-first client of a busy hour it is
+    /// named once at the rollover.
+    fn should_warn(&mut self, client: &str, now: Instant) -> (bool, Option<String>) {
+        let summary = self.roll_window(now);
+        if let Some(first) = self.seen.get(client) {
+            if now.duration_since(*first) < AUTH_FAIL_WARN_WINDOW {
+                return (false, summary);
+            }
+            self.seen.insert(client.to_string(), now);
+            return (true, summary);
+        }
+        if self.seen.len() >= AUTH_FAIL_MAX_TRACKED {
+            // Bound the map, not the warnings: drop the oldest entry.
+            if let Some(oldest) = self
+                .seen
+                .iter()
+                .min_by_key(|(_, first)| **first)
+                .map(|(client, _)| client.clone())
+            {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.insert(client.to_string(), now);
+        if self.warns_emitted >= AUTH_FAIL_MAX_WARNS {
+            self.suppressed.get_or_insert_with(|| client.to_string());
+            self.suppressed_total += 1;
+            return (false, summary);
+        }
+        self.warns_emitted += 1;
+        (true, summary)
+    }
+}
+
+/// Whether a failed secret check from `client` should be logged at warn
+/// rather than debug (see [`AuthFailLog::should_warn`]). Logs the window
+/// summary when one came due, before the verdict for the request in hand.
+fn should_warn_auth_failure(client: &str) -> bool {
+    let (warn, summary) = AUTH_FAIL_LOG
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .should_warn(client, Instant::now());
+    if let Some(summary) = summary {
+        tracing::warn!(summary);
+    }
+    warn
 }
 
 /// Non-cacheable error reply bubbling up from rendering.
@@ -298,9 +466,17 @@ async fn serve_sub(
         // public listener.
         let ok = provided
             .as_deref()
-            .is_some_and(|provided| crate::admin::auth::ct_eq(provided, required));
+            .is_some_and(|provided| ct_eq(provided, required));
         if !ok {
-            return error_response(StatusCode::FORBIDDEN, "access token is missing or invalid");
+            let mut response =
+                error_response(StatusCode::FORBIDDEN, "access token is missing or invalid");
+            // Flag the failure for the public rate-limit middleware, which
+            // logs it with the client key it computed; this handler never
+            // sees the peer address, and the token value is never logged.
+            response
+                .extensions_mut()
+                .insert(AuthFailure("profile access token"));
+            return response;
         }
     }
 
@@ -556,14 +732,20 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         .await
         .map_err(ErrorReply::internal)?;
 
-    // Load member sources in profile order; disabled or vanished sources
-    // drop out of the output.
+    // Load member sources in profile order with one `WHERE id IN (...)`
+    // read: the per-member indexed fetch this replaced ran one query per
+    // source, on the public serving path once per cold render. Disabled or
+    // vanished sources drop out of the output.
+    let member_ids: Vec<&str> = links
+        .iter()
+        .map(|(source_id, _)| source_id.as_str())
+        .collect();
+    let loaded = sources::get_many(&state.pool, &member_ids)
+        .await
+        .map_err(ErrorReply::internal)?;
     let mut members: Vec<(Source, CompiledPipeline)> = Vec::new();
     for (source_id, _position) in links {
-        let Some(source) = sources::get(&state.pool, &source_id)
-            .await
-            .map_err(ErrorReply::internal)?
-        else {
+        let Some(source) = loaded.get(&source_id) else {
             continue;
         };
         if !source.enabled {
@@ -573,7 +755,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         let compiled = CompiledPipeline::from_json(merged.as_ref()).map_err(|errors| {
             ErrorReply::corrupted_pipeline(&format!("sub:{}", profile.id), &errors)
         })?;
-        members.push((source, compiled));
+        members.push((source.clone(), compiled));
     }
 
     // An unrecoverable source error short-circuits the whole profile to
@@ -719,12 +901,11 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         ));
     }
 
-    let min_ttl = members
-        .iter()
-        .map(|(s, _)| s.cache_ttl_seconds)
-        .min()
-        .unwrap_or(60)
-        .max(1);
+    // The shortest member TTL bounds how long a cached render stays
+    // fresh; the freshness cap is smaller than every fallback in
+    // [`min_member_ttl`], so the empty-member case lands on the cap the
+    // way the former inline 60-second default did.
+    let min_ttl = min_member_ttl(&members);
     Ok(Rendered {
         status: 200,
         body: body.into(),
@@ -769,7 +950,7 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
 
     // Same ttl-derived interval rule as the sub profile: whole hours
     // rounded up from the source TTL, at least 1.
-    let interval_hours = (source.cache_ttl_seconds.max(1) + 3599) / 3600;
+    let interval_hours = whole_hours(source.cache_ttl_seconds);
     let (body, content_type) = encode(&out, OutputFormat::UriList, || {
         url_list_header_block(&source.name, interval_hours as u64, out.len())
     });
@@ -949,18 +1130,30 @@ fn finalize_config(
     Some(config)
 }
 
-/// `profile-update-interval` in whole hours (mihomo convention), rounded
-/// up from the shortest member-source TTL, at least 1.
-fn update_interval_hours(members: &[(Source, CompiledPipeline)]) -> String {
-    let min_ttl = members
+/// The shortest member-source cache TTL in seconds, at least 1; a
+/// profile with no member sources has no TTL to take the minimum of and
+/// falls back to one hour. Both the render freshness window and the
+/// `profile-update-interval` derive from this single computation over
+/// the same members list.
+fn min_member_ttl(members: &[(Source, CompiledPipeline)]) -> i64 {
+    members
         .iter()
         .map(|(s, _)| s.cache_ttl_seconds)
         .min()
         .unwrap_or(3600)
-        .max(1);
-    // Whole hours rounded up, at least one.
-    let hours = (min_ttl + 3599) / 3600;
-    hours.to_string()
+        .max(1)
+}
+
+/// Whole hours (mihomo convention), rounded up from a TTL in seconds, at
+/// least 1. The one ceil-division every interval computation shares.
+fn whole_hours(ttl_seconds: i64) -> i64 {
+    (ttl_seconds.max(1) + 3599) / 3600
+}
+
+/// `profile-update-interval` in whole hours (mihomo convention), rounded
+/// up from the shortest member-source TTL, at least 1.
+fn update_interval_hours(members: &[(Source, CompiledPipeline)]) -> String {
+    whole_hours(min_member_ttl(members)).to_string()
 }
 
 /// The upstream HTTP status of the source's latest fetch attempt, for the
@@ -1039,15 +1232,15 @@ mod tests {
             ..Default::default()
         };
         (
-            AppState {
-                pool: pool.clone(),
-                caches: Caches::new(),
-                geo: Arc::new(GeoResolver::new(&geo_cfg)),
+            AppState::new(
+                pool.clone(),
+                Caches::new(),
+                Arc::new(GeoResolver::new(&geo_cfg)),
                 limits,
-                trusted_cidrs: Vec::new(),
-                allowed_hosts: Vec::new(),
-                export_max_rows: fumox_core::config::ServerConfig::default().export_max_rows,
-            },
+                Vec::new(),
+                Vec::new(),
+                fumox_core::config::ServerConfig::default().export_max_rows,
+            ),
             pool,
         )
     }
@@ -1323,6 +1516,193 @@ mod tests {
         );
     }
 
+    /// End-to-end check that the shared `client_key` helper plumbs through
+    /// the public router's `trusted_cidrs` — the mirror of the admin
+    /// router's `rate_limit_uses_xff_ip_for_trusted_peer`, for the
+    /// deployment where a reverse proxy sits in front of `/sub` exactly
+    /// like in front of `/admin`. The claimed client IP a trusted proxy
+    /// appended (the right-most XFF entry) drives the per-IP windows: two
+    /// claimed clients behind the same trusted peer get independent
+    /// auth-failure windows, and a client-forged XFF prefix cannot open a
+    /// fresh one.
+    #[tokio::test]
+    async fn public_rate_limit_uses_xff_ip_for_trusted_peer() {
+        let (mut state, _pool) =
+            state_and_pool_with_limits(PublicRateLimits::new(1_000_000, 2)).await;
+        state.trusted_cidrs = vec!["2.2.2.2/32".parse().unwrap()];
+        let profile = make_profile(&state, "profXff000000", &[]).await;
+        sqlx::query("UPDATE profiles SET access_token = 'secret' WHERE id = ?")
+            .bind(&profile.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = router(state);
+        let uri = format!("/sub/{}?token=wrong", profile.id);
+
+        // One GET whose peer sits inside the trusted CIDR and whose
+        // X-Forwarded-For carries the claim, exactly what a trusted proxy
+        // forwards. The extension is inserted the way
+        // `into_make_service_with_connect_info` does in production.
+        let send = |app: Router, xff: &str| {
+            let mut request = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+            request
+                .headers_mut()
+                .insert("x-forwarded-for", xff.parse().unwrap());
+            request
+                .extensions_mut()
+                .insert(ConnectInfo::<SocketAddr>("2.2.2.2:41000".parse().unwrap()));
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+
+        // The two window slots of claimed client 1.2.3.4, then 429.
+        assert_eq!(send(app.clone(), "1.2.3.4").await, StatusCode::FORBIDDEN);
+        assert_eq!(send(app.clone(), "1.2.3.4").await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            send(app.clone(), "1.2.3.4").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        // Same trusted peer, different claimed client: a fresh window.
+        assert_eq!(send(app.clone(), "5.5.5.5").await, StatusCode::FORBIDDEN);
+
+        // Append-mode proxy: the trusted proxy appends the client IP it
+        // observed to whatever prefix the client sent, so the header is
+        // "<forged>, 9.9.9.9" and the right-most non-trusted entry keys
+        // the window. Two failures exhaust that window...
+        assert_eq!(
+            send(app.clone(), "1.2.3.4, 9.9.9.9").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(app.clone(), "6.6.6.6, 9.9.9.9").await,
+            StatusCode::FORBIDDEN
+        );
+        // ...and re-forging the prefix yet again cannot reset it: the key
+        // is still what the proxy appended, not the client-chosen text.
+        assert_eq!(
+            send(app, "7.7.7.7, 9.9.9.9").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    /// The failed-secret-check marker must ride on exactly the responses
+    /// the public rate-limit middleware logs from: a wrong profile access
+    /// token (403) and a wrong export capability token (404). A missing
+    /// profile is not a secret failure and must not be marked, and a
+    /// passing check carries no marker.
+    #[tokio::test]
+    async fn auth_failures_are_marked_for_the_rate_limit_middleware() {
+        let state = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        let mut profile = make_profile(&state, "profMark000000", &["srcA0000000"]).await;
+        profile.access_token = Some("secret".to_string());
+        profiles::update(&state.pool, &profile).await.unwrap();
+        // Seed the export token so the wrong-token branch below is the
+        // comparison failure, not a missing `meta` row (both answer 404,
+        // only the first is an auth failure).
+        let _export_token = crate::alive_export::ensure_token(&state.pool)
+            .await
+            .unwrap();
+        let app = router(state);
+
+        let marked = |response: Response| {
+            response
+                .extensions()
+                .get::<AuthFailure>()
+                .map(|check| check.0)
+        };
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sub/profMark000000?token=wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(marked(response), Some("profile access token"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/export/alive/wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(marked(response), Some("export capability token"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sub/missing000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(marked(response), None);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sub/profMark000000?token=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(marked(response), None);
+    }
+
+    /// One warn per client key per window, then debug: a token-guessing
+    /// campaign must be visible without mirroring every request into the
+    /// log.
+    #[test]
+    fn auth_fail_log_warns_once_per_client_per_window() {
+        let mut log = AuthFailLog::default();
+        let t0 = Instant::now();
+        assert!(log.should_warn("10.0.0.1", t0).0);
+        assert!(!log.should_warn("10.0.0.1", t0).0);
+        assert!(!log.should_warn("10.0.0.1", t0 + Duration::from_secs(60)).0);
+        assert!(
+            log.should_warn("10.0.0.1", t0 + Duration::from_secs(3_601))
+                .0
+        );
+    }
+
+    /// A flood of distinct client keys must stop producing warns at the
+    /// per-window budget instead of turning the log into a mirror of the
+    /// campaign, the tracked set stays bounded, and the first key the
+    /// window swallowed is named at the rollover.
+    #[test]
+    fn auth_fail_log_is_bounded_under_a_flood() {
+        let mut log = AuthFailLog::default();
+        let t0 = Instant::now();
+        let warned = (0..AUTH_FAIL_MAX_TRACKED + 100)
+            .filter(|i| log.should_warn(&format!("10.0.{i}.1"), t0).0)
+            .count();
+        // The per-window budget caps the warns, not the tracked set.
+        assert_eq!(warned, AUTH_FAIL_MAX_WARNS as usize);
+        assert_eq!(log.seen.len(), AUTH_FAIL_MAX_TRACKED);
+        // A tracked key stays quiet inside its window and warns again once
+        // it has rolled over, handing back the summary that names what the
+        // window swallowed.
+        let (warn, summary) = log.should_warn("10.0.0.1", t0 + Duration::from_secs(3_601));
+        assert!(warn);
+        let summary = summary.expect("a window that suppressed keys must summarise them");
+        assert!(summary.contains("10.0.64.1"), "summary: {summary}");
+    }
+
     fn entry(name: &str, host: &str, port: u16) -> ProxyEntry {
         ProxyEntry {
             scheme: Scheme::Vless,
@@ -1420,6 +1800,67 @@ mod tests {
 
     fn header_str<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
         headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// The shared member-TTL / whole-hours helpers keep the values the
+    /// former inline copies produced: the shortest member TTL wins, the
+    /// empty member list falls back to one hour, hours round up, and
+    /// render_sub's freshness cap sits below every fallback so the
+    /// empty-profile fresh_until is unchanged.
+    #[test]
+    fn min_member_ttl_and_whole_hours_match_the_inline_predecessors() {
+        fn source(ttl: i64) -> Source {
+            let now = fumox_core::models::now_ts();
+            Source {
+                id: "ttl-src".to_string(),
+                slug: None,
+                name: "ttl source".to_string(),
+                url: "https://example.com/list".to_string(),
+                enabled: true,
+                encoding: Default::default(),
+                input_format: None,
+                protocols: None,
+                cache_ttl_seconds: ttl,
+                tags: None,
+                pipeline: None,
+                headers: None,
+                ip_family: None,
+                created_at: now,
+                updated_at: now,
+                last_fetched_at: None,
+                last_error: None,
+                error_class: None,
+            }
+        }
+        let members = |ttls: &[i64]| -> Vec<(Source, CompiledPipeline)> {
+            ttls.iter()
+                .map(|&ttl| (source(ttl), CompiledPipeline::default()))
+                .collect()
+        };
+
+        // The shortest member TTL wins; a non-positive TTL clamps to 1.
+        assert_eq!(min_member_ttl(&members(&[7200, 1800, 3600])), 1800);
+        assert_eq!(min_member_ttl(&members(&[0, 7200])), 1);
+        // An empty member list falls back to the one-hour default.
+        assert_eq!(min_member_ttl(&members(&[])), 3600);
+
+        // Whole hours round up, at least one (the /src formula).
+        assert_eq!(whole_hours(3600), 1);
+        assert_eq!(whole_hours(1), 1);
+        assert_eq!(whole_hours(0), 1);
+        assert_eq!(whole_hours(3601), 2);
+        // The /sub interval string over the same members list.
+        assert_eq!(update_interval_hours(&members(&[7200, 1800])), "1");
+        assert_eq!(update_interval_hours(&members(&[7201])), "3");
+        assert_eq!(update_interval_hours(&members(&[])), "1");
+
+        // render_sub's fresh_until uses the raw seconds under the 30 s
+        // cap: the empty-member fallback (3600) caps to the same 30 s the
+        // former inline 60-second default produced.
+        assert_eq!(
+            min_member_ttl(&members(&[])).min(RENDER_FRESHNESS_CAP_SECS),
+            30
+        );
     }
 
     /// Proxy lines of a url_list body: everything that is not one of the

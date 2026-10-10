@@ -8,8 +8,10 @@
 #      GHCR ones (see docker/README.md) or build locally:
 #        podman build -t localhost/fumox:local .
 #        podman build -t localhost/fumox-meow:local docker/meow
-#   2. Adjust the hostPath "config" below: a directory with app.toml (and
-#      optional GeoLite2-*.mmdb files).
+#   2. Adjust the hostPath "config" below: a directory with app.toml.
+#      The GeoLite2 databases do not belong there: FUMOX_GEO__DB_DIR
+#      points them at the shared PVC mounted on /shared (see
+#      docker/README.md).
 #   3. Create the env secret (envFrom on server and probe):
 #        printf 'FUMOX_ADMIN__TOKEN=change-me\n' | podman secret create fumox-env -
 #      Append FUMOX_MEOW__TEST_URL / FUMOX_ADMIN__ALLOW_PRIVATE_URLS lines
@@ -100,7 +102,7 @@ spec:
   volumes:
     - name: config
       hostPath:
-        path: /opt/fumox/config # <-- adjust: must contain app.toml (+ mmdb)
+        path: /opt/fumox/config # <-- adjust: must contain app.toml (mmdb files come from /shared, see docker/README.md)
         type: Directory
     - name: data
       persistentVolumeClaim:

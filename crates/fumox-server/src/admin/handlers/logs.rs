@@ -3,9 +3,7 @@
 //! Probe history intentionally has no page of its own, it lives on the
 //! proxy card.
 
-use super::{
-    FormMap, clamp_limit, fmt_bytes, fmt_ts_element, page_offset, pagination_pages, server_error,
-};
+use super::{FormMap, clamp_limit, fmt_bytes, page_offset, pagination_pages, server_error};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::render_html;
@@ -14,19 +12,7 @@ use askama::Template;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-
-#[derive(Debug, sqlx::FromRow)]
-struct FetchLogListRow {
-    source_id: String,
-    source_name: Option<String>,
-    fetched_at: i64,
-    ok: i64,
-    http_status: Option<i64>,
-    bytes: Option<i64>,
-    proxies_found: Option<i64>,
-    error: Option<String>,
-    error_class: Option<String>,
-}
+use fumox_core::repo::fetch_log::{self, FetchLogFilter, FetchLogListRow};
 
 #[derive(Template)]
 #[template(path = "logs/fetch.html")]
@@ -47,9 +33,6 @@ struct FetchLogsTemplate {
 }
 
 impl FetchLogsTemplate {
-    fn ts(&self, ts: &i64) -> String {
-        fmt_ts_element(*ts)
-    }
     fn bytes(&self, n: &Option<i64>) -> String {
         n.map(|bytes| fmt_bytes(&self.lang, bytes))
             .unwrap_or_else(|| ",".into())
@@ -104,58 +87,31 @@ pub async fn fetch_logs(
         .max(1);
     let per_page = clamp_limit(params.get("per_page").and_then(|v| v.parse().ok()));
 
-    let mut clauses: Vec<String> = Vec::new();
-    let mut binds: Vec<String> = Vec::new();
-    if f_result == "ok" {
-        clauses.push("f.ok = 1".into());
-    } else if f_result == "error" {
-        clauses.push("f.ok = 0".into());
-    }
-    if !f_class.is_empty() {
-        clauses.push("f.error_class = ?".into());
-        binds.push(f_class.clone());
-    }
-    if !f_source.is_empty() {
-        clauses.push("f.source_id = ?".into());
-        binds.push(f_source.clone());
-    }
-    let where_sql = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", clauses.join(" AND "))
+    // The filter clause set lives once in the repo (`FetchLogFilter`):
+    // count and rows below apply exactly the same clauses, and every
+    // value flows through a bind.
+    let filter = FetchLogFilter {
+        ok: match f_result.as_str() {
+            "ok" => Some(true),
+            "error" => Some(false),
+            _ => None,
+        },
+        error_class: f_class.clone(),
+        source_id: f_source.clone(),
     };
 
-    let total: i64 = {
-        let sql = format!("SELECT COUNT(*) FROM fetch_log f{where_sql}");
-        let mut query = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()));
-        for value in &binds {
-            query = query.bind(value);
-        }
-        match query.fetch_one(&state.pool).await {
-            Ok(total) => total,
-            Err(err) => return server_error(lang, &err),
-        }
+    let total: i64 = match fetch_log::count_filtered(&state.pool, &filter).await {
+        Ok(total) => total,
+        Err(err) => return server_error(lang, &err),
     };
 
-    let rows: Vec<FetchLogListRow> = {
-        let sql = format!(
-            "SELECT f.source_id, s.name AS source_name, f.fetched_at, f.ok,
-                    f.http_status, f.bytes, f.proxies_found, f.error, f.error_class
-             FROM fetch_log f LEFT JOIN sources s ON s.id = f.source_id
-             {where_sql}
-             ORDER BY f.fetched_at DESC, f.id DESC
-             LIMIT ? OFFSET ?"
-        );
-        let mut query = sqlx::query_as::<_, FetchLogListRow>(sqlx::AssertSqlSafe(sql.as_str()));
-        for value in &binds {
-            query = query.bind(value);
-        }
-        query = query.bind(per_page).bind(page_offset(page, per_page));
-        match query.fetch_all(&state.pool).await {
+    let rows: Vec<FetchLogListRow> =
+        match fetch_log::list_page(&state.pool, &filter, per_page, page_offset(page, per_page))
+            .await
+        {
             Ok(rows) => rows,
             Err(err) => return server_error(lang, &err),
-        }
-    };
+        };
 
     let sources = match super::all_sources_for_selects(&state.pool).await {
         Ok(sources) => sources,

@@ -1,8 +1,10 @@
 //! CRUD for the `sources` table.
 
+use super::BindWhereFilter;
 use crate::db::DbPool;
 use crate::models::{ErrorClass, InputFormat, IpFamily, Scheme, Source};
 use sqlx::FromRow;
+use std::collections::HashMap;
 
 #[derive(FromRow)]
 struct SourceRow {
@@ -150,9 +152,36 @@ pub async fn create(pool: &DbPool, source: &Source) -> crate::Result<()> {
     Ok(())
 }
 
+/// The fields a change to which invalidates the freshness stamp
+/// (`last_fetched_at`): the stored rows were reconciled from a payload
+/// fetched under these settings, so after an edit the next ingest must
+/// re-fetch instead of trusting the old stamp (the TTL short-circuit of the
+/// server's `ingest::ingest_source` reads exactly this column). Cosmetic
+/// edits — name, slug, tags — keep the stamp.
+fn fetch_stamp_stale(old: &Source, new: &Source) -> bool {
+    old.url != new.url
+        || old.enabled != new.enabled
+        || old.encoding != new.encoding
+        || old.input_format != new.input_format
+        || old.protocols != new.protocols
+        || old.cache_ttl_seconds != new.cache_ttl_seconds
+        || old.pipeline != new.pipeline
+        || old.headers != new.headers
+        || old.ip_family != new.ip_family
+}
+
 /// Update mutable source fields. `id` and `created_at` are immutable;
 /// `updated_at` must be set by the caller.
+///
+/// A change to a fetch-relevant field (see [`fetch_stamp_stale`]) resets
+/// `last_fetched_at`, so the next ingest re-fetches under the new settings
+/// instead of riding out the TTL window on a payload reconciled under the
+/// old ones.
 pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
+    let last_fetched_at = match get(pool, &source.id).await? {
+        Some(existing) if fetch_stamp_stale(&existing, source) => None,
+        _ => source.last_fetched_at,
+    };
     let affected = sqlx::query(
         "UPDATE sources SET
             slug = ?, name = ?, url = ?, enabled = ?, encoding = ?, input_format = ?,
@@ -185,7 +214,7 @@ pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
     .bind(headers_json(&source.headers)?)
     .bind(source.ip_family.map(IpFamily::as_str))
     .bind(source.updated_at)
-    .bind(source.last_fetched_at)
+    .bind(last_fetched_at)
     .bind(&source.last_error)
     .bind(source.error_class.map(ErrorClass::as_str))
     .bind(&source.id)
@@ -206,6 +235,32 @@ pub async fn get(pool: &DbPool, id: &str) -> crate::Result<Option<Source>> {
     .fetch_optional(pool)
     .await?;
     row.map(Source::try_from).transpose()
+}
+
+/// Load several sources by id in one `WHERE id IN (...)` read, keyed by id.
+/// Ids with no row are absent from the map, duplicate ids read one row. The
+/// batched read backs `/sub`'s member load, which walks a profile's
+/// composition and would otherwise issue one indexed row-fetch per member
+/// on the public serving path; callers that need the ids in composition
+/// order order the results themselves from their link list.
+pub async fn get_many(pool: &DbPool, ids: &[&str]) -> crate::Result<HashMap<String, Source>> {
+    // `IN ()` is not valid SQLite; an empty request has an empty answer.
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!("SELECT {COLUMNS} FROM sources WHERE id IN ({placeholders})");
+    let mut query = sqlx::query_as::<_, SourceRow>(sqlx::AssertSqlSafe(sql.as_str()));
+    for id in ids {
+        query = query.bind(id);
+    }
+    let rows: Vec<SourceRow> = query.fetch_all(pool).await?;
+    let mut by_id = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let source = Source::try_from(row)?;
+        by_id.insert(source.id.clone(), source);
+    }
+    Ok(by_id)
 }
 
 pub async fn get_by_slug(pool: &DbPool, slug: &str) -> crate::Result<Option<Source>> {
@@ -240,6 +295,104 @@ pub async fn list(pool: &DbPool, enabled_only: bool) -> crate::Result<Vec<Source
         .fetch_all(pool)
         .await?;
     rows.into_iter().map(Source::try_from).collect()
+}
+
+// Admin sources list
+//
+// The dynamic list screen: filter clauses are whitelisted fragments
+// assembled through the shared [`super::WhereFilter`], every value flows
+// through a bind. The whole list is returned (no pagination — the screen
+// renders every source), so one query serves count and rows.
+
+/// One row of the admin sources list: the display columns plus the
+/// linked-proxy count subquery.
+#[derive(Debug, FromRow)]
+pub struct SourceListRow {
+    pub id: String,
+    pub name: String,
+    pub slug: Option<String>,
+    pub url: String,
+    pub enabled: bool,
+    pub cache_ttl_seconds: i64,
+    pub last_fetched_at: Option<i64>,
+    pub error_class: Option<String>,
+    /// Proxies currently linked to this source.
+    pub proxies_count: i64,
+}
+
+/// Filter parameters of the admin sources list ([`list_filtered`]). An
+/// empty string or `None` means "no constraint" for that field.
+#[derive(Debug, Clone, Default)]
+pub struct SourceListFilter {
+    /// `Some(true)` = enabled only, `Some(false)` = disabled only.
+    pub enabled: Option<bool>,
+    /// Only sources whose last fetch ended in an error.
+    pub with_errors: bool,
+    /// Exact tag membership.
+    pub tag: String,
+    /// Substring match against name and url (`LIKE %q%`).
+    pub query: String,
+}
+
+impl SourceListFilter {
+    /// The WHERE fragment and bound values of the list: the one place the
+    /// sources list's dynamic clause set is defined.
+    fn where_filter(&self) -> super::WhereFilter {
+        let mut wf = super::WhereFilter::new();
+        match self.enabled {
+            Some(true) => wf = wf.clause("s.enabled = 1"),
+            Some(false) => wf = wf.clause("s.enabled = 0"),
+            None => {}
+        }
+        if self.with_errors {
+            wf = wf.clause("s.error_class IS NOT NULL");
+        }
+        if !self.tag.is_empty() {
+            wf = wf.text(
+                "EXISTS (SELECT 1 FROM json_each(s.tags) WHERE json_each.value = ?)",
+                &self.tag,
+            );
+        }
+        if !self.query.is_empty() {
+            let needle = format!("%{}%", self.query);
+            wf = wf
+                .text("(s.name LIKE ? OR s.url LIKE ?)", needle.clone())
+                .text_value(needle);
+        }
+        wf
+    }
+}
+
+/// The admin sources list for `filter`, newest-created first.
+pub async fn list_filtered(
+    pool: &DbPool,
+    filter: &SourceListFilter,
+) -> crate::Result<Vec<SourceListRow>> {
+    let wf = filter.where_filter();
+    let sql = format!(
+        "SELECT s.id, s.name, s.slug, s.url, s.enabled, s.cache_ttl_seconds,
+                s.last_fetched_at, s.error_class,
+                (SELECT COUNT(*) FROM proxy_source_links l WHERE l.source_id = s.id) AS proxies_count
+         FROM sources s{}
+         ORDER BY s.created_at DESC",
+        wf.sql()
+    );
+    let rows = sqlx::query_as::<_, SourceListRow>(sqlx::AssertSqlSafe(sql))
+        .bind_where_filter(wf.values())
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// Distinct tags stored across all sources, ascending; the tag filter
+/// dropdown of the admin sources list. Unparsable tag JSON yields no tag.
+pub async fn distinct_tags(pool: &DbPool) -> crate::Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT json_each.value FROM sources, json_each(sources.tags) ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 pub async fn delete(pool: &DbPool, id: &str) -> crate::Result<bool> {
@@ -330,7 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_crud_round_trip() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let mut source = sample_source("src1aaaaaaaa");
         create(&pool, &source).await.unwrap();
 
@@ -379,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_outcome_updates_error_fields() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let source = sample_source("src2bbbbbbbb");
         create(&pool, &source).await.unwrap();
 
@@ -413,9 +566,44 @@ mod tests {
         assert_eq!(loaded.error_class, None);
     }
 
+    /// A change to a fetch-relevant field resets `last_fetched_at`, so the
+    /// next ingest re-fetches under the new settings; a cosmetic edit keeps
+    /// the stamp.
+    #[tokio::test]
+    async fn update_resets_the_freshness_stamp_on_a_fetch_relevant_change() {
+        let (_dir, pool) = temp_pool().await;
+        let mut source = sample_source("src5eeeeeeee");
+        source.last_fetched_at = Some(crate::models::now_ts());
+        create(&pool, &source).await.unwrap();
+
+        // Cosmetic edits: the stamp survives.
+        source.name = "Renamed".into();
+        source.slug = Some("renamed-slug".into());
+        source.tags = Some(vec!["misc".into()]);
+        source.updated_at += 5;
+        update(&pool, &source).await.unwrap();
+        let loaded = get(&pool, "src5eeeeeeee").await.unwrap().unwrap();
+        assert!(
+            loaded.last_fetched_at.is_some(),
+            "a cosmetic edit must keep the freshness stamp"
+        );
+
+        // A fetch-relevant edit resets the stamp; the rest of the row is
+        // written exactly as given.
+        source.url = "https://example.com/other".into();
+        update(&pool, &source).await.unwrap();
+        let loaded = get(&pool, "src5eeeeeeee").await.unwrap().unwrap();
+        assert_eq!(loaded.url, "https://example.com/other");
+        assert_eq!(loaded.name, "Renamed");
+        assert!(
+            loaded.last_fetched_at.is_none(),
+            "a fetch-relevant edit must reset the freshness stamp"
+        );
+    }
+
     #[tokio::test]
     async fn list_filters_enabled() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let a = sample_source("src3cccccccc");
         let mut b = sample_source("src4dddddddd");
         b.enabled = false;
@@ -424,5 +612,172 @@ mod tests {
         create(&pool, &b).await.unwrap();
         assert_eq!(list(&pool, false).await.unwrap().len(), 2);
         assert_eq!(list(&pool, true).await.unwrap().len(), 1);
+    }
+
+    /// The batched read behind `/sub`'s member load: several ids answer
+    /// from one query, keyed by id with rows mapped whole, a vanished id
+    /// is simply absent, duplicates collapse, and an empty request is an
+    /// empty map (no `IN ()` round trip).
+    #[tokio::test]
+    async fn get_many_loads_by_id_in_one_query() {
+        let (_dir, pool) = temp_pool().await;
+        let mut a = sample_source("src6ffffffff");
+        a.slug = None;
+        let mut b = sample_source("src7gggggggg");
+        b.slug = None;
+        b.enabled = false;
+        create(&pool, &a).await.unwrap();
+        create(&pool, &b).await.unwrap();
+
+        let loaded = get_many(&pool, &["src6ffffffff", "src7gggggggg"])
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["src6ffffffff"], a);
+        assert!(!loaded["src7gggggggg"].enabled);
+
+        // Missing ids are absent; duplicates collapse onto one row.
+        let loaded = get_many(&pool, &["src6ffffffff", "nope", "src6ffffffff"])
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["src6ffffffff"], a);
+
+        assert!(get_many(&pool, &[]).await.unwrap().is_empty());
+    }
+
+    /// The admin sources list: count/rows apply the same whitelist
+    /// clauses, the linked-proxy subquery counts through the link table,
+    /// and the tag dropdown enumerates every stored tag once.
+    #[tokio::test]
+    async fn admin_list_filter_and_tags() {
+        let (_dir, pool) = temp_pool().await;
+        let mut a = sample_source("src1aaaaaaaa"); // enabled, tags paid+eu
+        a.created_at = 100;
+        let mut b = sample_source("src2bbbbbbbb"); // disabled, untagged
+        b.enabled = false;
+        b.slug = None;
+        b.tags = None;
+        b.created_at = 200;
+        let mut c = sample_source("src3cccccccc"); // enabled, erroring, tag eu
+        c.name = "Gamma News".into();
+        c.tags = Some(vec!["eu".into()]);
+        c.error_class = Some(ErrorClass::Network);
+        c.created_at = 300;
+        create(&pool, &a).await.unwrap();
+        create(&pool, &b).await.unwrap();
+        create(&pool, &c).await.unwrap();
+
+        // A proxy linked to `a` exercises the proxies_count subquery.
+        let (pid,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             VALUES ('fp-src', 'vless', 'fp-src', 'fp-src.example.com', 443, 'u', 'alive', 1, 1)
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, 'src1aaaaaaaa', 1)")
+            .bind(pid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Unfiltered: every source, newest created first.
+        let rows = list_filtered(&pool, &SourceListFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["src3cccccccc", "src2bbbbbbbb", "src1aaaaaaaa"]
+        );
+        assert_eq!(rows[2].proxies_count, 1, "the linked proxy counts on a");
+
+        // Enabled / disabled toggles.
+        let filter = SourceListFilter {
+            enabled: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_filtered(&pool, &filter)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src3cccccccc", "src1aaaaaaaa"]
+        );
+        let filter = SourceListFilter {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_filtered(&pool, &filter)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src2bbbbbbbb"]
+        );
+
+        // Error filter.
+        let filter = SourceListFilter {
+            with_errors: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            list_filtered(&pool, &filter)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src3cccccccc"]
+        );
+
+        // Tag membership and substring query.
+        let filter = SourceListFilter {
+            tag: "eu".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_filtered(&pool, &filter)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src3cccccccc", "src1aaaaaaaa"]
+        );
+        let filter = SourceListFilter {
+            tag: "paid".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_filtered(&pool, &filter)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src1aaaaaaaa"]
+        );
+        let filter = SourceListFilter {
+            query: "gamma".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_filtered(&pool, &filter)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src3cccccccc"]
+        );
+
+        // Tag dropdown: every stored tag once, ascending.
+        assert_eq!(distinct_tags(&pool).await.unwrap(), vec!["eu", "paid"]);
     }
 }

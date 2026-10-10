@@ -49,7 +49,7 @@
             <th>{{ self.t("common.time") }}</th>
             <th>{{ self.t("common.source") }}</th>
             <th>{{ self.t("common.result") }}</th>
-            <th>HTTP</th>
+            <th>{{ self.t("common.http") }}</th>
             <th class="col-optional">{{ self.t("common.size") }}</th>
             <th>{{ self.t("nav.proxies") }}</th>
             <th>{{ self.t("common.error") }}</th>
@@ -58,7 +58,7 @@
         <tbody>
           {% for row in rows %}
           <tr>
-            <td class="small muted">{{ self.ts(row.fetched_at) | safe }}</td>
+            <td class="small muted">{{ self.ts(row.fetched_at) | safe }}{% match row.duration_ms %}{% when Some with (ms) %} · {{ ms }} {{ self.t("common.ms") }}{% when None %}{% endmatch %}</td>
             <td>
               {% match row.source_name %}
                 {% when Some with (name) %}<a class="cell-link" href="/admin/sources/{{ row.source_id }}">{{ name }}</a>

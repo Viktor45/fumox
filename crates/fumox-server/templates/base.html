@@ -6,6 +6,21 @@
   <title>{% block title %}{{ self.t("common.admin") }}{% endblock %} · Fumox</title>
   <link rel="stylesheet" href="/admin/static/app.css">
   <script src="/admin/static/htmx.min.js" defer></script>
+  {#- No-JS fallback for the destructive dialogs (source/profile delete,
+      proxies revive/cleanup/purge): a closed <dialog> is display:none and
+      showModal() never fires without JavaScript, so the POST forms inside
+      would be unreachable. When scripting is disabled, render dialogs as
+      plain inline panels (their forms are ordinary POSTs) and hide the
+      JS-only pieces: the showModal() triggers and the cancel buttons that
+      only call dialog.close(). With JavaScript enabled the contents of
+      <noscript> are not parsed, so the dialog UX is unchanged. -#}
+  <noscript>
+    <style>
+      dialog { display: block; position: static; margin: 16px 0; }
+      dialog button[type="button"] { display: none; }
+      button[aria-haspopup="dialog"] { display: none; }
+    </style>
+  </noscript>
 </head>
 <body>
   <div class="topbar">
@@ -38,17 +53,15 @@
     <span class="lang-switch theme-switch" role="group" aria-label="{{ self.t("nav.theme") }}">
       <a href="/admin/set-theme?theme=light"
          aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
-         aria-pressed="{% if theme.is_light() %}true{% else %}false{% endif %}"
          onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
-         {% if theme.is_light() %}class="active"{% endif %}>
+         {% if theme.is_light() %}class="active" aria-current="true"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
         <span class="theme-label">{{ self.t("theme.light") }}</span>
       </a>
       <a href="/admin/set-theme?theme=dark"
          aria-label="{{ self.t("theme.dark") }}" title="{{ self.t("theme.dark") }}"
-         aria-pressed="{% if theme.is_dark() %}true{% else %}false{% endif %}"
          onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
-         {% if theme.is_dark() %}class="active"{% endif %}>
+         {% if theme.is_dark() %}class="active" aria-current="true"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
         <span class="theme-label">{{ self.t("theme.dark") }}</span>
       </a>

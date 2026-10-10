@@ -15,6 +15,11 @@
       </select>
     </label>
     <input type="hidden" name="next" value="/admin">
+    {#- No-JS fallback: without JavaScript onchange never fires and the
+        knob would be inert. JS browsers submit on change and never see
+        this button (<noscript> content is not parsed when scripting is
+        enabled). -#}
+    <noscript><button class="btn small" type="submit">{{ self.t("common.apply") }}</button></noscript>
   </form>
 </div>
 

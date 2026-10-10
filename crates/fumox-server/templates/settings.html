@@ -20,6 +20,13 @@
   <div class="flash error">
     {{ self.t_named("set.no_file_banner", &[("path", self.editing_path())][..]) }}
   </div>
+{% else if !self.config_writable() %}
+  {# Read-only deployment (e.g. FUMOX_CONFIG_ACCESS=ro): the same banner
+     the editor shows must appear here too, so the overview does not
+     look like a normal, editable deployment. #}
+  <div class="flash error" role="alert">
+    {{ self.t_named("set.edit_unwritable", &[("path", self.editing_path())][..]) }}
+  </div>
 {% else %}
   <p class="small muted">{{ self.t_named("set.editing_path", &[("path", self.editing_path())][..]) }}</p>
 {% endif %}
@@ -113,7 +120,6 @@
         <tr><th>{{ self.t("set.geo_db_dir") }}</th><td class="mono small">{{ state.geo_config.db_dir.display() }}</td></tr>
         <tr><th>{{ self.t("set.geo_cache") }}</th><td>{{ state.geo_config.cache_max_entries }}</td></tr>
         <tr><th>{{ self.t("set.dns_timeout") }}</th><td>{{ state.geo_config.dns_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
-        <tr><th>{{ self.t("set.geo_db") }}</th><td>{{ self.geo_db() }} <span class="hint">{{ self.t("set.legacy") }}</span></td></tr>
       </tbody>
     </table>
   </div>

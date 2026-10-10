@@ -44,8 +44,8 @@
 //! whole tier on a public cacheable URL. The cap is applied in the SQL of
 //! the backing query and only after the host and token gates.
 
-use crate::admin::host_gate;
 use crate::cache::{InlineClaim, Rendered};
+use crate::host_gate;
 use crate::serve::{self, AppState};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -289,8 +289,15 @@ async fn serve_tier(
         }
     };
     // Constant-time comparison: the token is a public capability link.
-    if !crate::admin::auth::ct_eq(&expected, &token) {
-        return serve::error_response(StatusCode::NOT_FOUND, "link not found");
+    if !crate::security::ct_eq(&expected, &token) {
+        let mut response = serve::error_response(StatusCode::NOT_FOUND, "link not found");
+        // Flag the failure for the public rate-limit middleware, which
+        // logs it with the client key it computed (this handler never sees
+        // the peer address); the token value itself is never logged.
+        response
+            .extensions_mut()
+            .insert(serve::AuthFailure("export capability token"));
+        return response;
     }
 
     let rendered = match cached_render(&state, tier).await {
@@ -457,20 +464,20 @@ mod tests {
             .await
             .unwrap();
 
-        let state = crate::serve::AppState {
+        let state = crate::serve::AppState::new(
             pool,
-            caches: crate::cache::Caches::new(),
-            geo: std::sync::Arc::new(fumox_core::geo::GeoResolver::new(
+            crate::cache::Caches::new(),
+            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(
                 &fumox_core::config::GeoConfig {
                     enabled: false,
                     ..Default::default()
                 },
             )),
-            limits: crate::serve::PublicRateLimits::unlimited(),
-            trusted_cidrs: Vec::new(),
+            crate::serve::PublicRateLimits::unlimited(),
+            Vec::new(),
             allowed_hosts,
             export_max_rows,
-        };
+        );
         let app = crate::serve::router(state.clone());
         (app, token, state)
     }

@@ -300,6 +300,9 @@ impl GeoResolver {
 fn first_ip(lookup: impl Iterator<Item = std::net::SocketAddr>) -> Option<IpAddr> {
     let mut addrs = lookup.map(|addr| addr.ip());
     let first = addrs.next()?;
+    if first.is_ipv4() {
+        return Some(first);
+    }
     Some(addrs.find(IpAddr::is_ipv4).unwrap_or(first))
 }
 
@@ -493,6 +496,30 @@ mod tests {
                 "🇺🇸 United States · AS15169 Google LLC · Node-1"
             );
         }
+    }
+
+    /// The first IPv4 answer wins even when it is the very first record: a
+    /// host with two A records must geo-resolve through the one the fetcher
+    /// dials, not through the second record.
+    #[test]
+    fn first_ip_prefers_the_first_ipv4_answer() {
+        let sa = |ip: &str| std::net::SocketAddr::new(ip.parse().unwrap(), 0);
+        // The first answer is already IPv4: it must win, not be skipped.
+        assert_eq!(
+            first_ip([sa("1.1.1.1"), sa("2.2.2.2")].into_iter()),
+            Some("1.1.1.1".parse().unwrap())
+        );
+        // IPv6 first: the first IPv4 among the rest is preferred.
+        assert_eq!(
+            first_ip([sa("2606:4700::1"), sa("1.1.1.1"), sa("2.2.2.2")].into_iter()),
+            Some("1.1.1.1".parse().unwrap())
+        );
+        // Only IPv6 answers: fall back to whatever came first.
+        assert_eq!(
+            first_ip([sa("2606:4700::1"), sa("2606:4700::2")].into_iter()),
+            Some("2606:4700::1".parse().unwrap())
+        );
+        assert_eq!(first_ip(std::iter::empty()), None);
     }
 
     #[test]

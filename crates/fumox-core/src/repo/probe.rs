@@ -7,6 +7,158 @@
 
 use crate::db::DbPool;
 use crate::repo::proxies::{T1_EXCLUDED_SCHEMES, T1Candidate};
+use sqlx::FromRow;
+
+// Cross-process `meta` payloads (probe daemon <-> admin panel)
+
+/// Wire contracts of the `meta` stamps the probe daemon and the admin
+/// panel exchange: every key name and JSON payload shape is defined once
+/// here and used by both the writer (probe daemon, server scheduler) and
+/// the reader (admin handlers), so a rename is a compile error on both
+/// sides instead of a panel card silently collapsing to `unknown`.
+///
+/// The on-wire JSON is exactly what the hand-built payloads always were:
+/// these types state the existing shapes, they do not change them.
+pub mod meta {
+    use serde::{Deserialize, Serialize};
+
+    /// `meta` key of the probe daemon heartbeat ([`Heartbeat`], JSON).
+    pub const HEARTBEAT_KEY: &str = "probe_heartbeat";
+    /// `meta` key of the last successful meow-rs contact (unix seconds
+    /// as plain text).
+    pub const MEOW_LAST_OK_KEY: &str = "meow_last_ok";
+    /// `meta` key of the meow-rs memory stamp ([`MeowMemory`], JSON).
+    pub const MEOW_MEMORY_KEY: &str = "meow_memory";
+    /// `meta` key of the probe retention stamp ([`LastRotation`], JSON).
+    pub const LAST_ROTATION_KEY: &str = "last_rotation";
+    /// `meta` key of the server scheduler sweep stamp (unix seconds as
+    /// plain text; deliberately not JSON, the reader only needs the age).
+    pub const SERVER_CYCLE_KEY: &str = "server_cycle";
+
+    /// `probe_heartbeat`: the daemon's liveness stamp, upserted on every
+    /// beat. `interval_secs` and `cycle_interval_secs` are the beat and
+    /// cycle periods the daemon actually runs — server and probe may read
+    /// different config files, so the panel thresholds staleness against
+    /// these rather than its own config copy. Both optional: stamps
+    /// written before the fields existed must still parse, the reader
+    /// then falls back to its own config.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct Heartbeat {
+        pub ts: i64,
+        #[serde(default)]
+        pub pid: u32,
+        #[serde(default = "unknown_version")]
+        pub version: String,
+        #[serde(default)]
+        pub interval_secs: Option<u64>,
+        #[serde(default)]
+        pub cycle_interval_secs: Option<u64>,
+    }
+
+    /// Reader-side stand-in for a stamp that carries no `version`.
+    fn unknown_version() -> String {
+        "?".to_string()
+    }
+
+    /// `meow_memory`: the meow-rs kernel RSS, stamped after every T2
+    /// batch that reloaded the engine. Purely observational.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct MeowMemory {
+        pub rss_bytes: u64,
+        pub os_limit_bytes: u64,
+        pub ts: i64,
+    }
+
+    /// `last_rotation`: one run of the probe daemon's retention loop,
+    /// including runs that deleted nothing, so the age of `ts` is the
+    /// "retention is alive" signal.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct LastRotation {
+        pub ts: i64,
+        #[serde(default)]
+        pub probe_results: u64,
+        #[serde(default)]
+        pub fetch_log: u64,
+        #[serde(default)]
+        pub probe_requests: u64,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Round-trip: the writer's payload survives serialize +
+        /// deserialize unchanged.
+        #[test]
+        fn heartbeat_round_trips() {
+            let payload = Heartbeat {
+                ts: 1_700_000_000,
+                pid: 4242,
+                version: "0.1.0".to_string(),
+                interval_secs: Some(30),
+                cycle_interval_secs: Some(60),
+            };
+            let raw = serde_json::to_string(&payload).unwrap();
+            assert_eq!(serde_json::from_str::<Heartbeat>(&raw).unwrap(), payload);
+        }
+
+        /// Stamps written by older daemons (no beat/cycle periods) and
+        /// hand-written fixtures (no pid/version) must still parse, with
+        /// the same fallbacks the previous hand-parsing applied.
+        #[test]
+        fn heartbeat_parses_legacy_stamps() {
+            let hb: Heartbeat =
+                serde_json::from_str(r#"{"ts":123,"pid":7,"version":"x"}"#).unwrap();
+            assert_eq!(hb.ts, 123);
+            assert_eq!(hb.pid, 7);
+            assert_eq!(hb.version, "x");
+            assert_eq!(hb.interval_secs, None);
+            assert_eq!(hb.cycle_interval_secs, None);
+
+            let minimal: Heartbeat = serde_json::from_str(r#"{"ts":5}"#).unwrap();
+            assert_eq!(minimal.pid, 0);
+            assert_eq!(minimal.version, "?");
+        }
+
+        /// A stamp without the queue counter parses (the field was added
+        /// later than the other two), and the full payload round-trips.
+        #[test]
+        fn last_rotation_parses_partial_and_round_trips() {
+            let rot: LastRotation =
+                serde_json::from_str(r#"{"ts":9,"probe_results":3,"fetch_log":1}"#).unwrap();
+            assert_eq!(rot.ts, 9);
+            assert_eq!(rot.probe_results, 3);
+            assert_eq!(rot.fetch_log, 1);
+            assert_eq!(rot.probe_requests, 0);
+
+            let full = LastRotation {
+                ts: 9,
+                probe_results: 3,
+                fetch_log: 1,
+                probe_requests: 2,
+            };
+            let raw = serde_json::to_string(&full).unwrap();
+            assert_eq!(serde_json::from_str::<LastRotation>(&raw).unwrap(), full);
+        }
+
+        /// The on-wire JSON keeps the key names the hand-built payload
+        /// always used.
+        #[test]
+        fn meow_memory_keeps_the_wire_keys() {
+            let mem = MeowMemory {
+                rss_bytes: 25_780_224,
+                os_limit_bytes: 2_147_483_648,
+                ts: 7,
+            };
+            let raw = serde_json::to_string(&mem).unwrap();
+            assert_eq!(
+                raw,
+                r#"{"rss_bytes":25780224,"os_limit_bytes":2147483648,"ts":7}"#
+            );
+            assert_eq!(serde_json::from_str::<MeowMemory>(&raw).unwrap(), mem);
+        }
+    }
+}
 
 /// One probe attempt to be journaled.
 #[derive(Debug, Clone)]
@@ -63,11 +215,17 @@ pub async fn count_all(pool: &DbPool) -> crate::Result<i64> {
 /// `idx_probe_proxy_time` index. Feeds the strict T2-priority rule:
 /// a T1 success must not wipe the fail counter accumulated by
 /// T2 failures, so the caller needs to know what the last failure was.
+///
+/// `checked_at` has one-second resolution and the T1 sample and the T2
+/// batch of one cycle both journal into it, so two failures can share a
+/// timestamp; `id DESC` breaks the tie by insertion order (the column is
+/// an `AUTOINCREMENT` primary key), so the newest journaled failure wins
+/// deterministically.
 pub async fn last_failed_kind(pool: &DbPool, proxy_id: i64) -> crate::Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT probe_kind FROM probe_results
          WHERE proxy_id = ? AND ok = 0
-         ORDER BY checked_at DESC LIMIT 1",
+         ORDER BY checked_at DESC, id DESC LIMIT 1",
     )
     .bind(proxy_id)
     .fetch_optional(pool)
@@ -96,6 +254,37 @@ pub async fn top_failure_reasons(
          LIMIT ?",
     )
     .bind(since_ts)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// One row of the proxy card's probe history: a preserved check attempt.
+#[derive(Debug, FromRow)]
+pub struct ProbeHistoryRow {
+    pub checked_at: i64,
+    pub ok: i64,
+    pub latency_ms: Option<i64>,
+    pub error: Option<String>,
+    pub probe_kind: String,
+}
+
+/// The last `limit` probe attempts of one proxy, newest first (proxy card
+/// history table). Same rows the daemon journals; the table rotates with
+/// `[retention].probe_results_days`, so old attempts disappear from the
+/// card exactly as they do from the coverage counters.
+pub async fn recent_for_proxy(
+    pool: &DbPool,
+    proxy_id: i64,
+    limit: i64,
+) -> crate::Result<Vec<ProbeHistoryRow>> {
+    let rows: Vec<ProbeHistoryRow> = sqlx::query_as(
+        "SELECT checked_at, ok, latency_ms, error, probe_kind
+         FROM probe_results WHERE proxy_id = ?
+         ORDER BY checked_at DESC, id DESC LIMIT ?",
+    )
+    .bind(proxy_id)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -247,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_and_purge_history() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         // probe_results has an FK to proxies; create a minimal row first.
         sqlx::query(
             "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, created_at, updated_at)
@@ -302,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_failed_kind_returns_the_newest_failure() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let id = insert_proxy(&pool, "fp-kind", "vless", "alive", true).await;
 
         // No failed attempts yet.
@@ -377,9 +566,109 @@ mod tests {
         );
     }
 
+    /// The proxy card history: the newest attempts first, capped, with the
+    /// columns the history table renders.
+    #[tokio::test]
+    async fn recent_for_proxy_returns_the_newest_attempts_capped() {
+        let (_dir, pool) = temp_pool().await;
+        let id = insert_proxy(&pool, "fp-history", "vless", "alive", true).await;
+        for (at, ok, latency, error, kind) in [
+            (1000, false, None, Some("timeout"), "tcp"),
+            (1100, true, Some(30), None, "tcp"),
+            (1200, false, None, Some("invalid credential"), "t2"),
+        ] {
+            insert(
+                &pool,
+                &ProbeResultEntry {
+                    proxy_id: id,
+                    checked_at: at,
+                    ok,
+                    latency_ms: latency,
+                    error,
+                    probe_kind: kind,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = recent_for_proxy(&pool, id, 2).await.unwrap();
+        assert_eq!(rows.len(), 2, "the cap holds");
+        assert_eq!(rows[0].checked_at, 1200);
+        assert_eq!(rows[0].probe_kind, "t2");
+        assert_eq!(rows[0].error.as_deref(), Some("invalid credential"));
+        assert_eq!(rows[0].ok, 0);
+        assert_eq!(rows[1].checked_at, 1100);
+        assert_eq!(rows[1].latency_ms, Some(30));
+
+        // Uncapped: everything, oldest last.
+        let rows = recent_for_proxy(&pool, id, 20).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.checked_at).collect::<Vec<_>>(),
+            vec![1200, 1100, 1000]
+        );
+
+        // Another proxy's history stays separate.
+        let other = insert_proxy(&pool, "fp-history-2", "vless", "alive", true).await;
+        assert!(recent_for_proxy(&pool, other, 20).await.unwrap().is_empty());
+    }
+
+    /// Two failures journaled in the same second (the T1 sample and the T2
+    /// batch of one cycle both run on `alive` proxies) must resolve to the
+    /// newest *inserted* row, not to an arbitrary one of the two.
+    #[tokio::test]
+    async fn last_failed_kind_breaks_same_second_ties_by_insertion_order() {
+        let (_dir, pool) = temp_pool().await;
+
+        // t2 journaled after tcp: the tie resolves to t2.
+        let first = insert_proxy(&pool, "fp-tie1", "vless", "alive", true).await;
+        for (kind, error) in [("tcp", "timeout"), ("t2", "invalid credential")] {
+            insert(
+                &pool,
+                &ProbeResultEntry {
+                    proxy_id: first,
+                    checked_at: 2000,
+                    ok: false,
+                    latency_ms: None,
+                    error: Some(error),
+                    probe_kind: kind,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            last_failed_kind(&pool, first).await.unwrap().as_deref(),
+            Some("t2")
+        );
+
+        // The mirror order resolves to tcp: the tie-break is insertion
+        // order (id DESC), not the probe_kind's own sort order.
+        let second = insert_proxy(&pool, "fp-tie2", "vless", "alive", true).await;
+        for (kind, error) in [("t2", "invalid credential"), ("tcp", "timeout")] {
+            insert(
+                &pool,
+                &ProbeResultEntry {
+                    proxy_id: second,
+                    checked_at: 2000,
+                    ok: false,
+                    latency_ms: None,
+                    error: Some(error),
+                    probe_kind: kind,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            last_failed_kind(&pool, second).await.unwrap().as_deref(),
+            Some("tcp")
+        );
+    }
+
     #[tokio::test]
     async fn top_failure_reasons_groups_by_error_and_orders_by_hits() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let id = insert_proxy(&pool, "fp-fail", "vless", "alive", false).await;
 
         // Five distinct failure reasons with hit counts 3, 5, 1 plus one
@@ -493,7 +782,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_round_trip_filters_and_prioritizes_newest() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let trojan = insert_proxy(&pool, "fp-t1", "trojan", "unknown", true).await;
         let vless_old = insert_proxy(&pool, "fp-t2", "vless", "unknown", true).await;
         let tuic = insert_proxy(&pool, "fp-t3", "tuic", "unknown", true).await;
@@ -545,7 +834,7 @@ mod tests {
     /// to keep it out of.
     #[tokio::test]
     async fn queue_drain_skips_rows_under_a_t2_block() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let free = insert_proxy(&pool, "fp-free", "trojan", "unknown", true).await;
         let blocked = insert_proxy(&pool, "fp-blocked", "trojan", "unknown", true).await;
         sqlx::query("UPDATE proxies SET last_t2_failed_at = 1_000 WHERE id = ?")
@@ -574,7 +863,7 @@ mod tests {
     /// revival population) must still enqueue the highest ids.
     #[tokio::test]
     async fn enqueue_prefers_the_newest_ids_across_chunk_boundaries() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         sqlx::query(
             "INSERT OR IGNORE INTO sources (id, name, url, enabled, cache_ttl_seconds, created_at, updated_at)
              VALUES ('srcA0000000', 's', 'https://example.com', 1, 3600, 1, 1)",
@@ -621,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_purge_drops_settled_and_stale() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let fresh_unknown = insert_proxy(&pool, "fp-p1", "trojan", "unknown", true).await;
         let now_alive = insert_proxy(&pool, "fp-p2", "trojan", "unknown", true).await;
         enqueue_checks(&pool, &[fresh_unknown, now_alive], 10, 1000)
@@ -648,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_cascade_on_proxy_delete() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         let id = insert_proxy(&pool, "fp-p3", "trojan", "unknown", true).await;
         enqueue_checks(&pool, &[id], 10, 1000).await.unwrap();
         sqlx::query("DELETE FROM proxies WHERE id = ?")

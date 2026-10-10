@@ -1,0 +1,11 @@
+{#- Fragment: the toggle form of the profile card, included by the detail
+    page for the initial render and re-rendered by the toggle action. In
+    the swap response `swap_oob` adds the hx-swap-oob attribute so the
+    form replaces itself out-of-band; the page renders it plain. The
+    aria-pressed state and the button label flip with `profile.enabled`,
+    exactly like the badge. -#}
+<form id="toggle-form" method="post" action="/admin/profiles/{{ profile.id }}/toggle"
+      hx-post="/admin/profiles/{{ profile.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML"{% if swap_oob %} hx-swap-oob="outerHTML:#toggle-form"{% endif %}>
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button class="btn" type="submit" aria-pressed="{% if profile.enabled %}true{% else %}false{% endif %}">{% if profile.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
+</form>

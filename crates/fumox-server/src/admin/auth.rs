@@ -2,206 +2,30 @@
 //! per-IP rate limiting.
 //!
 //! The session key is derived from `[admin].token`, so rotating the token
-//! instantly revokes every session. The
+//! across a restart instantly revokes every session. On top of it, a
+//! server-side revocation epoch (a counter in the `meta` table) is mixed
+//! into every session MAC and bumped on logout, so a copied cookie dies
+//! there too instead of working until the TTL. The
 //! panel is single-user by design; there is no user table.
 
 use crate::admin::AdminState;
 use crate::admin::i18n::{self, Lang};
 use crate::admin::theme::{self, Theme};
+use crate::security::{client_key, ct_eq};
 use askama::Template;
 use axum::extract::{ConnectInfo, Form, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use hmac::{Hmac, KeyInit, Mac};
-use moka::future::Cache;
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 /// Session cookie name.
 pub const SESSION_COOKIE: &str = "fumox_session";
 
-/// What one forwarded header says about the request it arrived on.
-///
-/// The three cases are not interchangeable. "Found no address" and "found
-/// an address" tell [`client_key`] nothing about who wrote the *other*
-/// header, but "every entry was inside the trust list" does: a trusted
-/// address can only sit in a chain there because a trusted hop put it
-/// there, and a chain of nothing-but-trusted hops is a chain that ran
-/// *past* the client address this header is responsible for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Forwarded {
-    /// An originating-client address, with the trusted-CIDR entries
-    /// skipped from the right.
-    Client(IpAddr),
-    /// The header parsed, and every entry it holds is inside the trust
-    /// list. The client address is not in this header; something further
-    /// left in the chain, or another header, carries it.
-    TrustedChain,
-    /// No usable entry at all: the header is absent, empty, unparsable, or
-    /// deliberately opaque (`for=_hidden`, `for=unknown`). This is silence,
-    /// not evidence. A proxy that hides the client writes exactly this,
-    /// and so does a client that sends a header the proxy ignores.
-    Nothing,
-}
-
-/// The one address a single header names, if it names one.
-fn sole(found: Forwarded, peer: SocketAddr) -> IpAddr {
-    match found {
-        Forwarded::Client(ip) => ip,
-        Forwarded::TrustedChain | Forwarded::Nothing => peer.ip(),
-    }
-}
-
-/// Compute the per-IP rate-limit key for the incoming request.
-///
-/// The two early-return conditions stay as two distinct code paths (a single
-/// combined `if` would let a "trusted proxy, peer is the trusted CIDR" case
-/// fall through to header inspection when `trusted_cidrs` is empty by
-/// accident, easy bug, hard to catch in review).
-///
-/// 1. No trusted proxies configured ⇒ never honor forwarded headers.
-/// 2. Peer is not in any trusted CIDR ⇒ the header is untrusted.
-/// 3. Trusted peer, exactly one forwarded header present ⇒ whatever that
-///    one walk returns, else the peer.
-/// 4. Both headers present and both name the same IP ⇒ that IP.
-/// 5. Both present, one names a client and the other is an exhausted
-///    trusted chain ⇒ that client.
-/// 6. Anything else ⇒ the peer IP.
-///
-/// No precedence between `Forwarded` and `X-Forwarded-For`: the walk cannot
-/// tell a proxy-appended entry from a client-authored one, so either fixed
-/// order is client-chosen.
-pub fn client_key(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> IpAddr {
-    // 1. No trusted proxies configured ⇒ never honor forwarded headers.
-    if trusted_cidrs.is_empty() {
-        return peer.ip();
-    }
-    // 2. Peer is not in any trusted CIDR ⇒ the header is untrusted.
-    if !trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) {
-        return peer.ip();
-    }
-    // 3. Which headers the request carries, not which of them resolves.
-    let xff = headers.contains_key("x-forwarded-for");
-    let forwarded = headers.contains_key(axum::http::header::FORWARDED);
-    match (xff, forwarded) {
-        (true, false) => sole(walk_xff(headers, trusted_cidrs), peer),
-        (false, true) => sole(walk_forwarded(headers, trusted_cidrs), peer),
-        (false, false) => peer.ip(),
-        // 4/5/6. Both present: agreement, an exhausted chain, or the peer.
-        (true, true) => match (
-            walk_xff(headers, trusted_cidrs),
-            walk_forwarded(headers, trusted_cidrs),
-        ) {
-            (Forwarded::Client(a), Forwarded::Client(b)) if a == b => a,
-            (Forwarded::Client(a), Forwarded::TrustedChain) => a,
-            (Forwarded::TrustedChain, Forwarded::Client(b)) => b,
-            _ => peer.ip(),
-        },
-    }
-}
-
-/// Walk `X-Forwarded-For` right-to-left, starting at the entry next to the
-/// peer. A trusted proxy either appends the address it observed (nginx
-/// `$proxy_add_x_forwarded_for`) or overwrites the header wholesale, so the
-/// entry closest to the peer is the client IP as seen by the innermost
-/// trusted hop; scanning toward the left then skips further trusted hops
-/// and lands on the first non-trusted IP.
-///
-/// The previous left-to-right walk took the left-most non-trusted entry,
-/// which is text the *client* chose whenever it sends its own XFF and the
-/// trusted proxy merely appends: every forged IP then got a fresh
-/// rate-limit window, voiding the login brute-force cap (security review
-/// f2). The right-to-left walk is the mirror image, so a client-supplied
-/// prefix no longer wins.
-///
-/// What the walk does *not* do is prove authorship: a single-element XFF
-/// reads the same whether the trusted proxy appended it or the client
-/// authored it, since the proxy either appends or overwrites. Callers must
-/// therefore establish that the trusted hop writes this header at all,
-/// see [`client_key`], which does it from which headers the request
-/// carries. A trust list broad enough to contain the clients themselves
-/// (`0.0.0.0/0`, a `/8` the subscribers live in) also erases the
-/// distinction: their addresses are skipped like a hop's.
-fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
-    let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
-        return Forwarded::Nothing;
-    };
-    let mut parsed_any = false;
-    for raw in value.split(',').rev() {
-        let candidate = raw.trim();
-        let Ok(ip) = candidate.parse::<IpAddr>() else {
-            continue;
-        };
-        parsed_any = true;
-        if !trusted_cidrs.iter().any(|net| net.contains(&ip)) {
-            return Forwarded::Client(ip);
-        }
-    }
-    if parsed_any {
-        Forwarded::TrustedChain
-    } else {
-        Forwarded::Nothing
-    }
-}
-
-/// Walk RFC 7239 `Forwarded: for=…` right-to-left from the peer, the same
-/// direction [`walk_xff`] scans and for the same reason, and to the same
-/// three-way outcome. Bracket-strip IPv6 literals; skip `for=_hidden` and
-/// `for=unknown`, both mean the proxy declined to name the client, which
-/// is [`Forwarded::Nothing`], never a chain that ran past it.
-fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
-    let Some(value) = headers
-        .get(axum::http::header::FORWARDED)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return Forwarded::Nothing;
-    };
-    let mut parsed_any = false;
-    for raw in value.split(',').rev() {
-        let entry = raw.trim();
-        // Each Forwarded element is a `;`-separated list of parameters.
-        for param in entry.split(';') {
-            let param = param.trim();
-            let Some(value) = param.strip_prefix("for=") else {
-                continue;
-            };
-            let value = strip_obfuscation(value.trim_matches('"'));
-            if value == "_hidden" || value.eq_ignore_ascii_case("unknown") {
-                break;
-            }
-            let value = value
-                .strip_prefix('[')
-                .and_then(|v| v.strip_suffix(']'))
-                .unwrap_or(value);
-            let Ok(ip) = value.parse::<IpAddr>() else {
-                continue;
-            };
-            parsed_any = true;
-            if !trusted_cidrs.iter().any(|net| net.contains(&ip)) {
-                return Forwarded::Client(ip);
-            }
-        }
-    }
-    if parsed_any {
-        Forwarded::TrustedChain
-    } else {
-        Forwarded::Nothing
-    }
-}
-
-/// Strip RFC 7239 §6.3 obfuscation (`for=_hidden`, `for=unknown`) and
-/// surrounding quotes; returns the inner value.
-fn strip_obfuscation(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .unwrap_or(value)
-}
 /// Upper bound for buffered POST bodies (CSRF inspection).
 const MAX_BODY_BYTES: usize = 1 << 20;
 
@@ -227,35 +51,87 @@ fn mac_hex(key: &[u8], message: &str) -> String {
     out
 }
 
-/// Constant-time string equality (cookie/CSRF comparison). Also used for
-/// the public capability-token checks (`/sub` access token, alive-export
-/// link) so every secret comparison goes through one implementation.
-pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
-    let (ab, bb) = (a.as_bytes(), b.as_bytes());
-    if ab.len() != bb.len() {
-        return false;
+/// `meta` key holding the session-revocation epoch, written by
+/// [`revoke_all_sessions`].
+const SESSION_EPOCH_KEY: &str = "admin_session_epoch";
+
+/// The current session-revocation epoch, persisted in `meta`. Session
+/// cookies are MACed over this value ([`epoch_session_key`]), so bumping
+/// it invalidates every cookie minted before the bump without touching
+/// `[admin].token`. 0 until the first bump (nothing has been revoked yet).
+///
+/// Read on every session check instead of cached per process: one indexed
+/// SELECT on the tiny `meta` table is noise next to a panel request, and a
+/// per-process cache would go stale against the source of truth the moment
+/// anything but this process writes the row. A read error yields 0 without
+/// failing the request — a stricter epoch, never a looser one, so live
+/// cookies either verify as usual or fail closed (the panel is useless
+/// with the database down anyway).
+async fn session_epoch(pool: &fumox_core::db::DbPool) -> u64 {
+    match fumox_core::repo::meta_get(pool, SESSION_EPOCH_KEY).await {
+        Ok(Some(value)) => value.trim().parse().unwrap_or(0),
+        Ok(None) => 0,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot read the session epoch; failing closed to 0");
+            0
+        }
     }
-    let mut diff = 0u8;
-    for (x, y) in ab.iter().zip(bb) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
-/// Mint a session cookie value: `{expires_unix}.{hmac(expires_unix)}`.
-pub fn issue_session(key: &[u8], ttl: Duration) -> String {
+/// Bump the session-revocation epoch in `meta`: every cookie minted before
+/// this call stops verifying. Called on logout and when the settings
+/// screen rotates `[admin].token` (the session key itself is frozen at
+/// startup, so the epoch is the only revocation that survives a
+/// mid-run credential change). Returns `false` when the bump could not be
+/// persisted (database error); the caller then still clears the cookie,
+/// but a copy of it keeps working until the TTL or the next successful
+/// bump.
+pub(crate) async fn revoke_all_sessions(pool: &fumox_core::db::DbPool) -> bool {
+    match fumox_core::repo::meta_increment(pool, SESSION_EPOCH_KEY).await {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "cannot persist the session-epoch bump; cleared-cookie copies may stay valid"
+            );
+            false
+        }
+    }
+}
+
+/// Mix the revocation epoch into the effective session key with
+/// `HMAC(session_key, epoch_be_bytes)`: a bump changes the effective key,
+/// so every cookie minted before it stops verifying even though
+/// `[admin].token` — and with it the stored session key — did not change.
+/// This also rejects pre-epoch cookies, which MACed the bare session key:
+/// they match no epoch, so upgrading costs one re-login.
+fn epoch_session_key(key: &[u8], epoch: u64) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&epoch.to_be_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Mint a session cookie value: `{expires_unix}.{hmac(epoch, expires_unix)}`
+/// over the epoch-mixed session key. `epoch` must be the value
+/// [`session_epoch`] returned for the request that issues the cookie.
+pub fn issue_session(key: &[u8], ttl: Duration, epoch: u64) -> String {
     let expires = fumox_core::models::now_ts() + ttl.as_secs() as i64;
-    format!("{expires}.{}", mac_hex(key, &expires.to_string()))
+    format!(
+        "{expires}.{}",
+        mac_hex(&epoch_session_key(key, epoch), &expires.to_string())
+    )
 }
 
 /// Verify a session cookie value; returns the expiry timestamp when valid.
-pub fn verify_session(key: &[u8], value: &str) -> Option<i64> {
+/// `epoch` must be the current server-side epoch: a cookie minted under an
+/// older one — before a logout bump — is rejected here.
+pub fn verify_session(key: &[u8], value: &str, epoch: u64) -> Option<i64> {
     let (expires, provided) = value.split_once('.')?;
     let expires_ts: i64 = expires.parse().ok()?;
     if expires_ts <= fumox_core::models::now_ts() {
         return None;
     }
-    ct_eq(&mac_hex(key, expires), provided).then_some(expires_ts)
+    ct_eq(&mac_hex(&epoch_session_key(key, epoch), expires), provided).then_some(expires_ts)
 }
 
 /// CSRF token bound to the session cookie value; deterministic, so no
@@ -281,56 +157,113 @@ pub fn session_cookie_value(headers: &axum::http::HeaderMap) -> Option<String> {
     None
 }
 
-/// Fixed-window per-key rate limiter: counters live in a moka cache with
-/// TTL = window, so expiry resets the window.
-pub struct RateLimiter {
-    counters: Cache<String, Arc<AtomicU64>>,
-    limit: u64,
+/// Trimmed header value as UTF-8, or nothing. Empty values carry no
+/// signal either way.
+fn header_str<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
-impl RateLimiter {
-    pub fn new(limit: u64, window: Duration) -> Self {
-        Self {
-            counters: Cache::builder()
-                .max_capacity(100_000)
-                .time_to_live(window)
-                .build(),
-            limit,
-        }
+/// `(host, port)` of a `host[:port]` authority, IPv6-bracket aware.
+/// `None` for anything outside that grammar — unparsable means "cannot
+/// establish same-origin", which callers treat as the cross-site direction.
+fn authority_parts(authority: &str) -> Option<(&str, Option<u16>)> {
+    let authority = authority.trim();
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let (host, after) = (&rest[..end], &rest[end + 1..]);
+        let port = after.strip_prefix(':').and_then(|p| p.parse().ok());
+        return Some((host, port));
     }
-
-    /// Count one hit for `key`; `true` while under the limit.
-    pub async fn allow(&self, key: &str) -> bool {
-        // moka's future cache expects a future (not a closure) as the init.
-        let init = async { Ok::<_, std::convert::Infallible>(Arc::new(AtomicU64::new(0))) };
-        let Ok(counter) = self.counters.try_get_with(key.to_string(), init).await else {
-            return true; // cache hiccup must not lock the admin out
-        };
-        counter.fetch_add(1, Ordering::Relaxed) < self.limit
-    }
-
-    /// Give one hit back to `key`'s window: the outer middleware counts
-    /// every request up front, but a deeper rate-limiting layer may reject
-    /// the very same request too, without the refund the outer window pays
-    /// for hits the inner limiter already punished. Saturating: a refund for a key whose counter already
-    /// expired with its window (or never existed) must never wrap below
-    /// zero, the wrap would blacklist the key for the whole window.
-    pub async fn refund(&self, key: &str) {
-        let init = async { Ok::<_, std::convert::Infallible>(Arc::new(AtomicU64::new(0))) };
-        if let Ok(counter) = self.counters.try_get_with(key.to_string(), init).await {
-            let mut current = counter.load(Ordering::Relaxed);
-            loop {
-                match counter.compare_exchange_weak(
-                    current,
-                    current.saturating_sub(1),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(observed) => current = observed,
-                }
-            }
+    match authority.rsplit_once(':') {
+        // host:port — the port side must be digits, else this is a bare
+        // (unbracketed, technically illegal) IPv6 literal.
+        Some((host, port))
+            if !host.is_empty()
+                && !host.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            Some((host, Some(port.parse::<u16>().ok()?)))
         }
+        _ => Some((authority, None)),
+    }
+}
+
+/// Ports match when equal, or when one side is absent and the other spells
+/// the scheme default: origin serialization omits default ports while a
+/// proxy-written `Host` may spell them out.
+fn same_port(a: Option<u16>, b: Option<u16>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => true,
+        (None, Some(p)) | (Some(p), None) => p == 80 || p == 443,
+    }
+}
+
+/// Same request authority, comparing host names case-insensitively. An
+/// unparsable authority on either side cannot establish same-origin.
+fn same_authority(a: &str, b: &str) -> bool {
+    match (authority_parts(a), authority_parts(b)) {
+        (Some((host_a, port_a)), Some((host_b, port_b))) => {
+            host_a.eq_ignore_ascii_case(host_b) && same_port(port_a, port_b)
+        }
+        _ => false,
+    }
+}
+
+/// Positive evidence that the request was issued from a cross-site context
+/// — a web page on another origin driving the operator's browser.
+///
+/// Primary signal: the Fetch Metadata `Sec-Fetch-Site` header, set by the
+/// browser itself and not forgeable from page scripts. Any value that is
+/// not positively `cross-site` (same-origin, same-site, none, absent)
+/// keeps the count-everything behavior. A cross-site *top-level GET
+/// navigation* (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`)
+/// is the one cross-site shape that is not hostile: the operator following
+/// a link from another page, cookie attached via SameSite=Lax, ending up
+/// on the panel. It is processed and counted like a same-origin request.
+///
+/// Without Fetch Metadata (older browsers) the `Origin` header decides:
+/// cross-origin GET navigations carry no Origin, so an Origin here is a
+/// POST or a CORS-mode fetch — never a plain link click. `Origin: null`
+/// (sandboxed frame, opaque origin) and an unparsable mismatch count as
+/// cross-site. The comparison inherits the panel's existing assumption
+/// that any reverse proxy preserves the `Host` header (`host_gate`,
+/// `serve_base` build on it).
+///
+/// Absence of all signals — curl, health checks, monitoring — is not
+/// evidence and never rejects.
+fn cross_site_context(method: &Method, headers: &HeaderMap) -> bool {
+    if let Some(site) = header_str(headers, "sec-fetch-site") {
+        if !site.eq_ignore_ascii_case("cross-site") {
+            return false;
+        }
+        return !(method == Method::GET
+            && header_str(headers, "sec-fetch-mode")
+                .is_some_and(|m| m.eq_ignore_ascii_case("navigate"))
+            && header_str(headers, "sec-fetch-dest")
+                .is_some_and(|d| d.eq_ignore_ascii_case("document")));
+    }
+    let Some(origin) = header_str(headers, "origin") else {
+        return false;
+    };
+    if origin.eq_ignore_ascii_case("null") {
+        return true;
+    }
+    // Origin is scheme://host[:port] only; scheme is not comparable against
+    // the scheme-less Host header and a scheme mismatch alone never makes a
+    // same-host request hostile.
+    let Some((_, authority)) = origin.split_once("://") else {
+        return true;
+    };
+    let authority = authority.split(['/', '?']).next().unwrap_or(authority);
+    match header_str(headers, "host") {
+        Some(host) => !same_authority(authority, host),
+        None => true,
     }
 }
 
@@ -343,6 +276,12 @@ impl RateLimiter {
 /// page referencing them re-opens after a burst of fragment loads could be
 /// pushed to 429 by asset fetches alone, and an anonymous passer-by could
 /// exhaust someone else's NAT-shared window with cheap GETs of the CSS.
+///
+/// Cross-site requests are rejected *without counting*: the windows exist
+/// to cap the operator's own panel usage and login brute-force, and before
+/// this gate any web page the operator visited could pin their IP at the
+/// 429 ceiling with auto-issued cross-site requests. Same-site and
+/// same-origin requests keep counting.
 pub async fn rate_limit(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -352,6 +291,11 @@ pub async fn rate_limit(
     let path = req.uri().path();
     if req.method() == Method::HEAD || path.starts_with("/admin/static/") {
         return next.run(req).await;
+    }
+    if cross_site_context(req.method(), req.headers()) {
+        tracing::warn!(path = %path, "cross-site admin request rejected without counting");
+        let lang = state.locales.lang_from_headers(req.headers());
+        return plain(StatusCode::FORBIDDEN, lang.t("err.cross_site"));
     }
     let ip = client_key(addr, req.headers(), &state.trusted_cidrs).to_string();
     let is_login = req.method() == Method::POST && path == "/admin/login";
@@ -370,12 +314,24 @@ pub async fn rate_limit(
         )
             .into_response();
     }
+    // The failed-login attribution below runs after `req` is consumed;
+    // keep owned copies of the request identity for it.
+    let method = req.method().clone();
+    let path = path.to_owned();
     let response = next.run(req).await;
     // A rejected response was already punished by a stricter limiter (the
     // login one) or is not this layer's business at all: the outer window
     // must not pay for it twice.
     if response.status() == StatusCode::TOO_MANY_REQUESTS {
         limiter.refund(&ip).await;
+    }
+    // A failed login is the panel's primary brute-force audit signal, but
+    // the handler never sees the client address (it extracts no
+    // ConnectInfo). Attribute the 422 it renders to its source here, where
+    // the per-IP key is already computed; the 429 warn above only covers
+    // the exhausted-window case.
+    if is_login && response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+        tracing::warn!(ip = %ip, method = %method, path = %path, "failed admin login attempt");
     }
     response
 }
@@ -384,8 +340,9 @@ pub async fn rate_limit(
 /// redirected; HTMX requests get an `HX-Redirect` so the whole page
 /// transitions to the login screen.
 pub async fn require_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
+    let epoch = session_epoch(&state.pool).await;
     let authenticated = session_cookie_value(req.headers())
-        .and_then(|value| verify_session(&state.session_key, &value))
+        .and_then(|value| verify_session(&state.session_key, &value, epoch))
         .is_some();
     if authenticated {
         return next.run(req).await;
@@ -477,15 +434,19 @@ pub async fn login_submit(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
-    // The empty token disables the panel entirely; never match it.
-    if !state.admin.token.is_empty() && ct_eq(&form.token, &state.admin.token) {
+    // The empty token disables the panel entirely; never match it. The
+    // token comes from the live config, so a value saved on the settings
+    // screen is enforced on the next login without a restart.
+    let admin = state.admin();
+    if !admin.token.is_empty() && ct_eq(&form.token, &admin.token) {
         let ttl = state.session_ttl();
-        let value = issue_session(&state.session_key, ttl);
+        let epoch = session_epoch(&state.pool).await;
+        let value = issue_session(&state.session_key, ttl, epoch);
         let mut cookie = format!(
             "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
             ttl.as_secs()
         );
-        if state.admin.secure_cookies {
+        if admin.secure_cookies {
             cookie.push_str("; Secure");
         }
         tracing::info!("admin logged in");
@@ -536,7 +497,16 @@ pub async fn set_lang(
         .into_response()
 }
 
-pub async fn logout() -> Response {
+/// Log out: clear the cookie *and* bump the server-side session epoch, so
+/// the exact cookie value — and every other cookie minted under the same
+/// epoch, a stolen copy included — stops verifying immediately instead of
+/// working until the TTL. The handler is mounted inside the protected
+/// nest, so only an authenticated POST carrying the CSRF token can spend a
+/// bump. One global epoch, one bump: logging out in one browser also ends
+/// any other browser's session — the accepted cost for a single-user panel
+/// whose only alternative is leaving every session irrevocable.
+pub async fn logout(State(state): State<AdminState>) -> Response {
+    revoke_all_sessions(&state.pool).await;
     let cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
     (
         StatusCode::SEE_OTHER,
@@ -580,29 +550,613 @@ fn plain(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "test-admin-token";
 
     #[test]
     fn session_round_trip_and_expiry() {
         let key = derive_key(b"test", "token");
-        let value = issue_session(&key, Duration::from_secs(3600));
-        assert!(verify_session(&key, &value).is_some());
+        let value = issue_session(&key, Duration::from_secs(3600), 0);
+        assert!(verify_session(&key, &value, 0).is_some());
 
         // Expired cookie is rejected.
         let expired = format!(
             "{}.{}",
             fumox_core::models::now_ts() - 10,
-            mac_hex(&key, &(fumox_core::models::now_ts() - 10).to_string())
+            mac_hex(
+                &epoch_session_key(&key, 0),
+                &(fumox_core::models::now_ts() - 10).to_string()
+            )
         );
-        assert!(verify_session(&key, &expired).is_none());
+        assert!(verify_session(&key, &expired, 0).is_none());
 
         // Tampered signature is rejected.
         let mut tampered = value.clone();
         tampered.pop();
-        assert!(verify_session(&key, &tampered).is_none());
+        assert!(verify_session(&key, &tampered, 0).is_none());
 
         // A different key (rotated token) revokes the session.
         let other = derive_key(b"test", "rotated");
-        assert!(verify_session(&other, &value).is_none());
+        assert!(verify_session(&other, &value, 0).is_none());
+    }
+
+    /// f18: the epoch is server-side revocation state. A bump between issue
+    /// and verify kills the cookie even though the token — and with it the
+    /// session key — is unchanged, in either direction, and a pre-epoch
+    /// cookie (MACed over the bare session key, the format before the epoch
+    /// existed) verifies under no epoch at all.
+    #[test]
+    fn epoch_bump_revokes_the_session_without_a_token_change() {
+        let key = derive_key(b"test", "token");
+        let value = issue_session(&key, Duration::from_secs(3600), 3);
+        assert!(verify_session(&key, &value, 3).is_some());
+        assert!(
+            verify_session(&key, &value, 4).is_none(),
+            "a cookie from before the bump must not verify under the new epoch"
+        );
+        assert!(
+            verify_session(&key, &value, 2).is_none(),
+            "an older epoch must not verify either"
+        );
+
+        // Pre-epoch cookie shape: HMAC over the bare session key.
+        let expires = fumox_core::models::now_ts() + 3600;
+        let legacy = format!("{expires}.{}", mac_hex(&key, &expires.to_string()));
+        assert!(
+            verify_session(&key, &legacy, 0).is_none(),
+            "pre-epoch cookies must not survive the epoch scheme"
+        );
+    }
+
+    /// f18 end to end: logout bumps the persisted epoch, so the cookie the
+    /// browser held — a stolen copy included — stops authenticating, and a
+    /// fresh login under the new epoch works again.
+    /// Build a request with the `ConnectInfo` extension the rate limiter
+    /// extracts; a real listener attaches it via
+    /// `into_make_service_with_connect_info`.
+    fn request(
+        method: &str,
+        uri: &str,
+        body: &str,
+        cookie: Option<&str>,
+    ) -> axum::extract::Request {
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .extension(ConnectInfo::<SocketAddr>(
+                "127.0.0.1:41000".parse().unwrap(),
+            ));
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        builder
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// The `name=value` pair of the session `Set-Cookie` header.
+    fn cookie_from(response: &axum::response::Response) -> String {
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The bare value of a `name=value` cookie pair.
+    fn cookie_value(pair: &str) -> &str {
+        pair.split_once('=').unwrap().1
+    }
+
+    #[tokio::test]
+    async fn logout_bumps_the_epoch_and_revokes_the_session() {
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = cookie_from(&response);
+
+        // The session authenticates.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Logout, carrying the CSRF token the login form ships.
+        let csrf = csrf_token(&state.csrf_key, cookie_value(&cookie));
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/logout",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The old cookie no longer authenticates.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/login"
+        );
+
+        // The bump is persisted, so it outlives the process that made it.
+        let stored = fumox_core::repo::meta_get(&state.pool, SESSION_EPOCH_KEY)
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("1"));
+
+        // A fresh login under the bumped epoch authenticates again.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let fresh = cookie_from(&response);
+        let response = app
+            .oneshot(request("GET", "/admin", "", Some(&fresh)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// f18 end to end, token-change path: rotating `[admin].token` through
+    /// the settings screen bumps the persisted epoch, so the cookie the
+    /// browser held — a stolen copy included — stops authenticating even
+    /// though the startup-frozen session key did not change, while a save
+    /// that leaves the token untouched neither bumps nor logs the
+    /// operator out. A fresh login under the rotated token works again.
+    #[tokio::test]
+    async fn token_rotation_through_settings_bumps_the_epoch_and_revokes_the_session() {
+        // The settings editor writes back to this scratch file, and the
+        // live config is refreshed from it after every save.
+        let config_dir = fumox_core::tempdir_lite::TempDir::new("settings-rotate");
+        let config_path = config_dir.path().join("app.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nbind = \"0.0.0.0:8080\"\n[admin]\nenabled = true\ntoken = \"test-admin-token\"\n[probe]\nfail_limit = 3\n",
+        )
+        .unwrap();
+        let (_dir, mut state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        state.config_path = fumox_core::config::ResolvedConfigPath::Loaded(config_path);
+        state.config_writable = fumox_core::config_writer::is_writable(config_dir.path());
+        let app = crate::admin::router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = cookie_from(&response);
+
+        // A save that leaves the token unchanged must neither bump the
+        // epoch nor revoke the session performing it.
+        let csrf = csrf_token(&state.csrf_key, cookie_value(&cookie));
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/settings/update",
+                &format!("admin.token={TOKEN}&_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let stored = fumox_core::repo::meta_get(&state.pool, SESSION_EPOCH_KEY)
+            .await
+            .unwrap();
+        assert_eq!(stored, None, "an unchanged token must not bump the epoch");
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Rotate the token through the settings screen.
+        const ROTATED: &str = "rotated-admin-token";
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/settings/update",
+                &format!("admin.token={ROTATED}&_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The old cookie no longer authenticates.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin", "", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/login"
+        );
+
+        // The bump is persisted, so it outlives the process that made it.
+        let stored = fumox_core::repo::meta_get(&state.pool, SESSION_EPOCH_KEY)
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("1"));
+
+        // The rotation landed in the live config: the old token is dead,
+        // the rotated one logs in and the fresh session authenticates.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={ROTATED}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let fresh = cookie_from(&response);
+        let response = app
+            .oneshot(request("GET", "/admin", "", Some(&fresh)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// f19: the cross-site verdict per header shape. Every "false" keeps
+    /// the old count-and-process behavior; every "true" rejects without
+    /// counting.
+    #[test]
+    fn cross_site_context_classification() {
+        let get = Method::GET;
+        let post = Method::POST;
+        let none = HeaderMap::new();
+
+        // No signals at all (curl, health checks): not cross-site.
+        assert!(!cross_site_context(&get, &none));
+
+        // Fetch Metadata, non-cross-site values keep counting.
+        let site = |value: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("sec-fetch-site", value.parse().unwrap());
+            h
+        };
+        assert!(!cross_site_context(&get, &site("same-origin")));
+        assert!(!cross_site_context(&get, &site("same-site")));
+        assert!(!cross_site_context(&get, &site("none")));
+        assert!(!cross_site_context(&post, &site("same-origin")));
+
+        // Cross-site fetch/XHR and subresource loads: reject.
+        let cross_fetch = |mode: &str, dest: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("sec-fetch-site", "cross-site".parse().unwrap());
+            h.insert("sec-fetch-mode", mode.parse().unwrap());
+            h.insert("sec-fetch-dest", dest.parse().unwrap());
+            h
+        };
+        assert!(cross_site_context(&get, &cross_fetch("cors", "empty")));
+        assert!(cross_site_context(&get, &cross_fetch("no-cors", "image")));
+        // An iframe navigation is not a top-level one.
+        assert!(cross_site_context(&get, &cross_fetch("navigate", "iframe")));
+        // A cross-site form POST navigation is the CSRF shape, even though
+        // it navigates a top-level document.
+        assert!(cross_site_context(
+            &post,
+            &cross_fetch("navigate", "document")
+        ));
+        // Metadata ships as a set: a cross-site claim without mode/dest is
+        // not exempted as a navigation.
+        let mut h = HeaderMap::new();
+        h.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(cross_site_context(&get, &h));
+
+        // The one exempt shape: the operator following a link from another
+        // page, a top-level GET navigation.
+        assert!(!cross_site_context(
+            &get,
+            &cross_fetch("navigate", "document")
+        ));
+
+        // Origin fallback (no Fetch Metadata, older browsers).
+        let mut h = HeaderMap::new();
+        h.insert("origin", "https://panel.example.com".parse().unwrap());
+        h.insert("host", "panel.example.com".parse().unwrap());
+        assert!(!cross_site_context(&post, &h), "matching origin counts");
+
+        // Default-port spelling differences are the same origin.
+        let mut h = HeaderMap::new();
+        h.insert("origin", "https://panel.example.com".parse().unwrap());
+        h.insert("host", "panel.example.com:443".parse().unwrap());
+        assert!(!cross_site_context(&post, &h));
+        let mut h = HeaderMap::new();
+        h.insert("origin", "http://localhost:8081".parse().unwrap());
+        h.insert("host", "localhost:8081".parse().unwrap());
+        assert!(!cross_site_context(&post, &h));
+        // Host names compare case-insensitively.
+        let mut h = HeaderMap::new();
+        h.insert("origin", "https://Panel.Example.com".parse().unwrap());
+        h.insert("host", "panel.example.com".parse().unwrap());
+        assert!(!cross_site_context(&post, &h));
+        // Bracketed IPv6 literals with ports.
+        let mut h = HeaderMap::new();
+        h.insert("origin", "http://[::1]:8081".parse().unwrap());
+        h.insert("host", "[::1]:8081".parse().unwrap());
+        assert!(!cross_site_context(&post, &h));
+
+        // A different origin (host or effective port) is cross-site.
+        let mut h = HeaderMap::new();
+        h.insert("origin", "https://evil.example".parse().unwrap());
+        h.insert("host", "panel.example.com".parse().unwrap());
+        assert!(cross_site_context(&post, &h));
+        let mut h = HeaderMap::new();
+        h.insert("origin", "https://panel.example.com:8443".parse().unwrap());
+        h.insert("host", "panel.example.com:8081".parse().unwrap());
+        assert!(cross_site_context(&post, &h));
+        // `Origin: null` (sandboxed frame) and unparsable origins.
+        let mut h = HeaderMap::new();
+        h.insert("origin", "null".parse().unwrap());
+        h.insert("host", "panel.example.com".parse().unwrap());
+        assert!(cross_site_context(&post, &h));
+        let mut h = HeaderMap::new();
+        h.insert("origin", "evil.example".parse().unwrap());
+        h.insert("host", "panel.example.com".parse().unwrap());
+        assert!(cross_site_context(&post, &h));
+        // Origin without a Host to compare against: cannot establish
+        // same-origin.
+        let mut h = HeaderMap::new();
+        h.insert("origin", "https://panel.example.com".parse().unwrap());
+        assert!(cross_site_context(&post, &h));
+    }
+
+    /// f19 end to end: cross-site requests are rejected without charging
+    /// the per-IP window, same-origin requests keep counting, and only a
+    /// top-level GET navigation from another site is processed and counted.
+    #[tokio::test]
+    async fn cross_site_requests_do_not_burn_the_rate_limit_window() {
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                rate_limit: fumox_core::config::RateLimit::new(2, Duration::from_secs(60)),
+                login_rate_limit: fumox_core::config::RateLimit::new(100, Duration::from_secs(60)),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(state);
+
+        // An attacker page hammering the panel from the operator's browser:
+        // every request is rejected and none of them touches the window.
+        let cross_fetch = || {
+            let mut req = request("GET", "/admin/login", "", None);
+            let headers = req.headers_mut();
+            headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+            headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+            headers.insert("sec-fetch-dest", "empty".parse().unwrap());
+            req
+        };
+        for _ in 0..5 {
+            let response = app.clone().oneshot(cross_fetch()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        // Same-origin-shaped requests keep counting: the window is 2.
+        let counted = || request("GET", "/admin/login", "", None);
+        assert_eq!(
+            app.clone().oneshot(counted()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone().oneshot(counted()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone().oneshot(counted()).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        // Still 403, not 429: the cross-site requests never shared the
+        // window they would have exhausted.
+        let response = app.clone().oneshot(cross_fetch()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The navigation exemption only exempts from *rejection*, not from
+        // counting: a top-level cross-site GET lands in the exhausted
+        // window like any other request.
+        let mut navigation = request("GET", "/admin/login", "", None);
+        let headers = navigation.headers_mut();
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        let response = app.clone().oneshot(navigation).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// f19 on the login window: only genuine login attempts consume it.
+    /// A cross-site POST carrying an unrelated Origin is rejected at the
+    /// rate-limit layer (the CSRF layer would reject it later, but the
+    /// window must not pay), while a same-origin POST — the form the panel
+    /// itself renders — counts and succeeds.
+    #[tokio::test]
+    async fn cross_site_login_post_does_not_consume_the_login_window() {
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(state);
+
+        let evil = || {
+            let mut req = request("POST", "/admin/login", "token=guess", None);
+            let headers = req.headers_mut();
+            headers.insert("origin", "https://evil.example".parse().unwrap());
+            headers.insert("host", "panel.example.com".parse().unwrap());
+            req
+        };
+        for _ in 0..10 {
+            let response = app.clone().oneshot(evil()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        // The genuine form: same-origin POST counts once and succeeds with
+        // the full login window behind it.
+        let mut genuine = request("POST", "/admin/login", &format!("token={TOKEN}"), None);
+        let headers = genuine.headers_mut();
+        headers.insert("origin", "https://panel.example.com".parse().unwrap());
+        headers.insert("host", "panel.example.com".parse().unwrap());
+        let response = app.oneshot(genuine).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    /// A failed login is attributed to its source: the 422 the login
+    /// handler renders is logged at warn with the per-IP key (the handler
+    /// itself never sees the client address), while a successful login
+    /// does not emit the failed-login line.
+    #[tokio::test]
+    async fn failed_login_attempt_is_logged_with_the_client_ip() {
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(state);
+
+        // A writer funneling the subscriber's output into a shared buffer
+        // (same trick as `fumox_core::logging` and the scheduler tests).
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        crate::admin::stabilize_callsite_interests();
+        // A call site whose first execution predates this test may already
+        // be cached as `never`; re-evaluate every call site against the
+        // now-multi-dispatcher registry so the lines below are observable.
+        tracing::callsite::rebuild_interest_cache();
+
+        // A wrong token renders the 422 the middleware attributes.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/login", "token=wrong-guess", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // A correct token logs in; no failed-login line for it.
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("admin logged in"),
+            "the successful login must still be logged: {logs}"
+        );
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("failed admin login attempt")
+                    && line.contains("ip=127.0.0.1")
+                    && line.contains("method=POST")
+                    && line.contains("path=/admin/login")),
+            "the failed login must be logged with the client key: {logs}"
+        );
     }
 
     #[test]
@@ -632,377 +1186,5 @@ mod tests {
         assert_eq!(form_field(body, "name").as_deref(), Some("foo bar"));
         assert_eq!(form_field(body, "empty").as_deref(), Some(""));
         assert_eq!(form_field(body, "missing"), None);
-    }
-
-    #[tokio::test]
-    async fn rate_limiter_enforces_the_limit_per_key() {
-        let limiter = RateLimiter::new(3, Duration::from_secs(60));
-        assert!(limiter.allow("ip1").await);
-        assert!(limiter.allow("ip1").await);
-        assert!(limiter.allow("ip1").await);
-        assert!(!limiter.allow("ip1").await);
-        // Other keys are independent.
-        assert!(limiter.allow("ip2").await);
-    }
-
-    /// The window *is* the reset mechanism: there is no explicit
-    /// bookkeeping, the moka TTL expiring the counter is what opens the
-    /// quota again. A real (short) sleep: the TTL runs on moka's own
-    /// clock, so a paused tokio clock would not move it.
-    #[tokio::test]
-    async fn rate_limiter_reopens_after_the_window() {
-        let limiter = RateLimiter::new(1, Duration::from_millis(50));
-        assert!(limiter.allow("ip1").await);
-        assert!(!limiter.allow("ip1").await, "window is exhausted");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(
-            limiter.allow("ip1").await,
-            "the counter must expire with its TTL and reopen the quota"
-        );
-    }
-
-    /// A refunded hit opens the window slot it consumed: a request that passed this limiter but was rejected by
-    /// a deeper one must not cost this window anything.
-    #[tokio::test]
-    async fn rate_limiter_refund_returns_the_hit_to_the_window() {
-        let limiter = RateLimiter::new(2, Duration::from_secs(60));
-        // One request counted here, rejected deeper, the refund leaves
-        // the window exactly as it was before the request arrived.
-        assert!(limiter.allow("ip1").await);
-        limiter.refund("ip1").await;
-
-        // The full quota is still available.
-        assert!(limiter.allow("ip1").await);
-        assert!(limiter.allow("ip1").await);
-        assert!(!limiter.allow("ip1").await);
-
-        // Refunding a key that was never counted is a no-op, not a credit:
-        // a below-zero wrap (fetch_sub on 0) would blacklist the key for
-        // the whole window instead.
-        limiter.refund("never-seen").await;
-        assert!(limiter.allow("never-seen").await);
-        assert!(limiter.allow("never-seen").await);
-        assert!(!limiter.allow("never-seen").await);
-    }
-
-    fn trusted_v4() -> Vec<ipnet::IpNet> {
-        vec!["2.2.2.2/32".parse().unwrap()]
-    }
-
-    fn peer() -> SocketAddr {
-        "2.2.2.2:41000".parse().unwrap()
-    }
-
-    fn xff(value: &str) -> axum::http::HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", value.parse().unwrap());
-        h
-    }
-
-    fn fwd(value: &str) -> axum::http::HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert(header::FORWARDED, value.parse().unwrap());
-        h
-    }
-
-    #[test]
-    fn empty_trusted_list_never_honors_forwarded_headers() {
-        // Even with XFF claiming 1.2.3.4, an unconfigured trust list must
-        // not let the header influence the rate-limit key, peer wins.
-        let h = xff("1.2.3.4");
-        assert_eq!(client_key(peer(), &h, &[]), peer().ip());
-        let h = fwd("for=1.2.3.4;proto=https");
-        assert_eq!(client_key(peer(), &h, &[]), peer().ip());
-    }
-
-    #[test]
-    fn trusted_peer_with_single_xff_hop_returns_that_ip() {
-        let h = xff("1.2.3.4");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn trusted_peer_with_chain_walks_past_trusted_hops_right_to_left() {
-        // Two trusted hops appended in order: the innermost observation is
-        // at the right, so the walk starts there, skips the trusted entry
-        // and lands on the client IP the first trusted proxy observed.
-        let h = xff("1.1.1.1, 2.2.2.2");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.1.1.1".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    /// The attack from security review f2: the client sends its own XFF
-    /// prefix and a trusted proxy *appends* the real client IP (nginx
-    /// `$proxy_add_x_forwarded_for`). The left-most entry is attacker text;
-    /// only the right-most non-trusted entry is what the trusted hop saw.
-    /// The old left-to-right walk returned 6.6.6.6, giving every forged IP
-    /// a fresh rate-limit window.
-    #[test]
-    fn client_supplied_xff_prefix_cannot_pick_the_rate_limit_key() {
-        let h = xff("6.6.6.6, 9.9.9.9");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "9.9.9.9".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    /// Same property on the RFC 7239 header: a client-supplied `for=` in
-    /// the left-most element is ignored when a trusted proxy appended its
-    /// own observation at the right.
-    #[test]
-    fn client_supplied_forwarded_prefix_cannot_pick_the_rate_limit_key() {
-        let h = fwd("for=6.6.6.6, for=9.9.9.9");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "9.9.9.9".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    /// A proxy configured for RFC 7239 (`Forwarded`) leaves
-    /// `X-Forwarded-For` alone, so a client-supplied XFF is the only XFF
-    /// text the request carries. The walk must not resolve on that header:
-    /// five forged XFFs must not produce five rate-limit keys on the login
-    /// brute-force cap. A second header beside the proxy's is evidence the
-    /// client wrote it, so the two disagree and the key falls back to the
-    /// trusted peer, the one bucket a client cannot pick its way out of.
-    #[test]
-    fn client_authored_xff_cannot_pick_the_key_when_the_proxy_writes_forwarded() {
-        for forged in [
-            "6.6.6.6",
-            "1.1.1.1",
-            "203.0.113.7",
-            "198.51.100.9",
-            "192.0.2.3",
-        ] {
-            let mut headers = HeaderMap::new();
-            headers.insert(header::FORWARDED, "for=9.9.9.9".parse().unwrap());
-            headers.insert("x-forwarded-for", forged.parse().unwrap());
-            assert_eq!(
-                client_key(peer(), &headers, &trusted_v4()),
-                peer().ip(),
-                "a client-authored XFF beside the proxy's Forwarded chose the key"
-            );
-        }
-    }
-
-    /// The mirror image: a proxy that writes only XFF (nginx, Caddy) and
-    /// forwards the client's `Forwarded` verbatim, the default of
-    /// `proxy_pass_request_headers on`. A single client-authored `for=` is
-    /// non-trusted, so the walk over it hands the attacker the key.
-    #[test]
-    fn client_authored_forwarded_cannot_pick_the_key_when_the_proxy_writes_xff() {
-        for forged in [
-            "for=6.6.6.6",
-            "for=1.1.1.1",
-            "for=203.0.113.7;proto=https",
-            "for=\"[2001:db8::9]\"",
-        ] {
-            let mut headers = HeaderMap::new();
-            headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
-            headers.insert(header::FORWARDED, forged.parse().unwrap());
-            assert_eq!(
-                client_key(peer(), &headers, &trusted_v4()),
-                peer().ip(),
-                "a client-authored Forwarded beside the proxy's XFF chose the key"
-            );
-        }
-    }
-
-    /// A `Forwarded` the trusted proxy wrote but that yields no address
-    /// (`for=_hidden`) is still evidence about which header the proxy
-    /// writes: falling through to the XFF the proxy never touches is the
-    /// original bypass with the sign flipped.
-    #[test]
-    fn a_hidden_forwarded_entry_never_falls_back_to_the_xff() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::FORWARDED, "for=_hidden".parse().unwrap());
-        headers.insert("x-forwarded-for", "6.6.6.6".parse().unwrap());
-        assert_eq!(client_key(peer(), &headers, &trusted_v4()), peer().ip());
-    }
-
-    /// A proxy that writes both headers (and appends to both) names the
-    /// same client in each, so the two corroborate each other and the key
-    /// is that client. This is the only case where a request carrying both
-    /// headers resolves to anything other than the peer.
-    #[test]
-    fn headers_that_agree_name_the_client() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
-        headers.insert(
-            header::FORWARDED,
-            "for=9.9.9.9;proto=https".parse().unwrap(),
-        );
-        assert_eq!(
-            client_key(peer(), &headers, &trusted_v4()),
-            "9.9.9.9".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    /// A two-proxy chain where the outer hop writes `Forwarded` and the
-    /// inner one (the peer) writes XFF: Traefik in front of nginx, both in
-    /// `trust_proxy_ips`. The XFF nginx appends is Traefik's own address,
-    /// inside the trust list, so the walk returns nothing at all and the
-    /// client address only exists in the `Forwarded` the outer hop wrote.
-    /// Treating "one header found nothing" as a forged pair collapsed this
-    /// whole deployment onto the peer's bucket, which for `/admin/login` is
-    /// one shared 5-per-minute window.
-    #[test]
-    fn a_two_proxy_chain_writing_one_header_each_keeps_the_client_key() {
-        let trusted: Vec<ipnet::IpNet> = vec![
-            "2.2.2.2/32".parse().unwrap(), // nginx, the peer
-            "10.0.0.0/8".parse().unwrap(), // Traefik, the outer hop
-        ];
-        let mut headers = HeaderMap::new();
-        // nginx appends the address it observed from Traefik.
-        headers.insert("x-forwarded-for", "10.0.0.7".parse().unwrap());
-        // Traefik writes the address it observed from the client.
-        headers.insert(
-            header::FORWARDED,
-            "for=9.9.9.9;proto=https".parse().unwrap(),
-        );
-        assert_eq!(
-            client_key(peer(), &headers, &trusted),
-            "9.9.9.9".parse::<IpAddr>().unwrap(),
-            "a trusted chain through two proxies must keep its per-client key"
-        );
-    }
-
-    /// A chain the walk can exhaust, every XFF entry inside the trust list
-    ///, beside a header that names a client is the one disagreement that
-    /// is not a forgery: an all-trusted XFF is evidence that the peer wrote
-    /// it (only a trusted hop's appending puts a trusted address there, and
-    /// the client then sits further left, in the other header). The mirror
-    /// shape is pinned too, so neither direction is accidental.
-    #[test]
-    fn an_exhausted_chain_defers_to_the_header_that_names_a_client() {
-        let trusted: Vec<ipnet::IpNet> =
-            vec!["2.2.2.2/32".parse().unwrap(), "10.0.0.0/8".parse().unwrap()];
-        // XFF exhausted on trusted entries, `Forwarded` exhausted on one.
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "10.0.0.7, 10.0.0.8".parse().unwrap());
-        headers.insert(header::FORWARDED, "for=10.0.0.9".parse().unwrap());
-        assert_eq!(client_key(peer(), &headers, &trusted), peer().ip());
-
-        // Mirror: the `Forwarded` chain is the exhausted one.
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
-        headers.insert(
-            header::FORWARDED,
-            "for=9.9.9.9, for=10.0.0.8".parse().unwrap(),
-        );
-        assert_eq!(
-            client_key(peer(), &headers, &trusted),
-            "9.9.9.9".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    /// The remaining disagreement, pinned deliberately: a client that sends
-    /// its own `Forwarded` (or arrives behind a proxy that writes only
-    /// `Forwarded`) beside an XFF-writing peer is indistinguishable from a
-    /// forgery, so the key is the peer's. That bucket is *shared*, one
-    /// window for everything that lands there, which is the documented cost
-    /// of failing closed here, never a bypass: the key is still not the
-    /// client's choice.
-    #[test]
-    fn a_disagreeing_client_forwarded_lands_in_the_shared_peer_bucket() {
-        let mut headers = HeaderMap::new();
-        // The peer (nginx) writes XFF with the address it observed.
-        headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
-        // The client, or a proxy in front of nginx, writes this one.
-        headers.insert(header::FORWARDED, "for=6.6.6.6".parse().unwrap());
-        assert_eq!(client_key(peer(), &headers, &trusted_v4()), peer().ip());
-    }
-
-    /// The same request with only the proxy's XFF and no `Forwarded` at all
-    /// still resolves through the XFF walk: a legacy proxy that writes
-    /// XFF only must keep its per-client rate-limit key.
-    #[test]
-    fn xff_is_still_honored_when_no_forwarded_is_present() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "6.6.6.6, 9.9.9.9".parse().unwrap());
-        assert_eq!(
-            client_key(peer(), &headers, &trusted_v4()),
-            "9.9.9.9".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn chain_with_all_trusted_entries_falls_back_to_peer() {
-        // Both hops are inside the trusted CIDR, walking past them all
-        // leaves nothing usable, so the peer wins.
-        let h = xff("2.2.2.2, 2.2.2.2");
-        assert_eq!(client_key(peer(), &h, &trusted_v4()), peer().ip());
-    }
-
-    #[test]
-    fn untrusted_peer_ignores_xff_and_keeps_peer() {
-        let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
-        let h = xff("1.2.3.4");
-        assert_eq!(
-            client_key(untrusted_peer, &h, &trusted_v4()),
-            untrusted_peer.ip()
-        );
-    }
-
-    #[test]
-    fn trusted_peer_with_rfc7239_forwarded_returns_first_untrusted_for() {
-        let h = fwd("for=1.2.3.4;proto=https");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn forwarded_for_hidden_falls_back_to_peer() {
-        let h = fwd("for=_hidden");
-        assert_eq!(client_key(peer(), &h, &trusted_v4()), peer().ip());
-    }
-
-    #[test]
-    fn forwarded_walks_right_to_left_past_trusted_for_entries() {
-        // The innermost trusted proxy's observation is on the right
-        // (for=2.2.2.2); the walk starts there, skips the trusted entry and
-        // returns the client IP the first trusted hop observed (1.1.1.1).
-        let h = fwd("for=1.1.1.1, for=2.2.2.2");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.1.1.1".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn forwarded_with_bracketed_ipv6_literal_is_bracket_stripped() {
-        let h = fwd("for=[2001:db8::1];proto=https");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "2001:db8::1".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    /// RFC 7239 §4 does not pin parameter ordering. A non-`for=` parameter
-    /// appearing before the `for=` must not abort the walk, only the `for=`
-    /// parameter is load-bearing for the originating-client lookup. The
-    /// audit's reported shape was `Forwarded: proto=https;for=1.2.3.4` and
-    /// the pre-fix code bailed at `proto=https` (`?` on `strip_prefix`).
-    #[test]
-    fn walk_forwarded_takes_first_for_param_regardless_of_position() {
-        let h = fwd("proto=https;for=1.2.3.4");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
-        // Also pin a chain shape with a non-`for=` parameter in the same
-        // entry to make sure the loop walks the whole `;`-separated list.
-        let h = fwd("for=1.2.3.4;by=2.2.2.2;proto=https");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
     }
 }

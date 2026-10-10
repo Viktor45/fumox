@@ -9,7 +9,10 @@
 //! preview) renders through [`WidgetFragment`] into the source/profile forms.
 
 use crate::admin::i18n::{Lang, impl_i18n};
-use crate::pipeline::{DEFAULT_GEO_TEMPLATE, DropRule, PipelineConfig, RenameRule, SortBy};
+use crate::pipeline::{
+    DEFAULT_GEO_TEMPLATE, DropRule, FilterConfig, GeoStepConfig, HealthConfig, LimitConfig,
+    PipelineConfig, RenameRule, SortBy, SortConfig,
+};
 use askama::Template;
 use fumox_core::models::{ProxyStatus, Scheme};
 
@@ -295,81 +298,88 @@ impl BuilderState {
     /// the resulting (NULL) configuration, and forcing explicit defaults is
     /// what the `*_defaults` mode is for. `None` means "nothing configured":
     /// the field stores NULL (pass-through defaults), never `{}`.
+    ///
+    /// The sections are built as a typed [`PipelineConfig`] and serialized
+    /// through its `Serialize` side, which carries the omit-defaults
+    /// policy (`skip_serializing_if` per field), so the emitted keys are
+    /// the schema's own and a new schema field cannot be missed here
+    /// without a compile error at the struct literals below.
     pub(crate) fn emit(&self) -> Option<serde_json::Value> {
-        let mut map = serde_json::Map::new();
-        map.insert("version".into(), serde_json::Value::from(1));
+        let mut config = PipelineConfig {
+            version: 1,
+            filter: None,
+            rename: None,
+            drop: None,
+            geo: None,
+            health: None,
+            dedup: None,
+            sort: None,
+            limit: None,
+        };
 
         if self.filter_defaults {
-            map.insert(
-                "filter".into(),
-                serde_json::Value::Object(Default::default()),
-            );
+            // An explicit `{}`: a profile resets the source's filter.
+            config.filter = Some(FilterConfig {
+                protocols: None,
+                exclude_protocols: None,
+                asns: None,
+                exclude_asns: None,
+                forbid_insecure: true,
+            });
         } else if self.filter_set {
-            let mut filter = serde_json::Map::new();
-            if !self.protocols.is_empty() {
-                filter.insert("protocols".into(), strings(&self.protocols));
-            }
-            if !self.exclude_protocols.is_empty() {
-                filter.insert("exclude_protocols".into(), strings(&self.exclude_protocols));
-            }
-            if let Some(asns) = split_asn_field(&self.asns) {
-                filter.insert("asns".into(), strings(&asns));
-            }
-            if let Some(exclude) = split_asn_field(&self.exclude_asns) {
-                filter.insert("exclude_asns".into(), strings(&exclude));
-            }
-            if !self.forbid_insecure {
-                filter.insert("forbid_insecure".into(), serde_json::Value::from(false));
-            }
-            if !filter.is_empty() {
-                map.insert("filter".into(), filter.into());
+            let asns = split_asn_field(&self.asns);
+            let exclude_asns = split_asn_field(&self.exclude_asns);
+            let has_values = !self.protocols.is_empty()
+                || !self.exclude_protocols.is_empty()
+                || asns.is_some()
+                || exclude_asns.is_some()
+                || !self.forbid_insecure;
+            if has_values {
+                // Empty lists are "not set" for the emit (the schema's
+                // `Option`s stay `None`), only non-empty ones are written.
+                config.filter = Some(FilterConfig {
+                    protocols: (!self.protocols.is_empty()).then(|| self.protocols.clone()),
+                    exclude_protocols: (!self.exclude_protocols.is_empty())
+                        .then(|| self.exclude_protocols.clone()),
+                    asns,
+                    exclude_asns,
+                    forbid_insecure: self.forbid_insecure,
+                });
             }
         }
 
         if self.rename_defaults {
             // An explicit `[]`: a profile resets the source's rename rules.
-            map.insert("rename".into(), serde_json::Value::Array(Vec::new()));
+            config.rename = Some(Vec::new());
         } else if !self.rename_skip {
             // Empty rows (no `match`) are work-in-progress lines of the
             // widget and never reach the JSON.
-            let rules: Vec<serde_json::Value> = self
+            let rules: Vec<RenameRule> = self
                 .rename
                 .iter()
                 .filter(|row| !row.match_pattern.is_empty())
-                .map(|row| {
-                    let mut rule = serde_json::Map::new();
-                    rule.insert(
-                        "match".into(),
-                        serde_json::Value::from(row.match_pattern.as_str()),
-                    );
-                    rule.insert(
-                        "replace".into(),
-                        serde_json::Value::from(row.replace.as_str()),
-                    );
-                    if !row.flags.is_empty() {
-                        rule.insert("flags".into(), serde_json::Value::from(row.flags.as_str()));
-                    }
-                    if let Some(target) = emit_rename_target(row) {
-                        rule.insert("target".into(), serde_json::Value::from(target));
-                    }
-                    serde_json::Value::Object(rule)
+                .map(|row| RenameRule {
+                    match_pattern: row.match_pattern.clone(),
+                    replace: row.replace.clone(),
+                    flags: row.flags.clone(),
+                    target: emit_rename_target(row),
                 })
                 .collect();
             if !rules.is_empty() {
-                map.insert("rename".into(), serde_json::Value::Array(rules));
+                config.rename = Some(rules);
             }
         }
 
         if self.drop_defaults {
             // An explicit `[]`: a profile resets the source's drop rules.
-            map.insert("drop".into(), serde_json::Value::Array(Vec::new()));
+            config.drop = Some(Vec::new());
         } else if !self.drop_skip {
             // Two flavours per row:
             //  * `target == "asn"` → ASN-list rule (no `match`).
             //  * any other target → regex rule with optional `match` /
             //    `flags`. The "work-in-progress" filter is on `match` for
             //    regex rows and on `asns` for ASN rows.
-            let rules: Vec<serde_json::Value> = self
+            let rules: Vec<DropRule> = self
                 .drop
                 .iter()
                 .filter(|row| {
@@ -381,113 +391,125 @@ impl BuilderState {
                 })
                 .map(|row| {
                     if row.target.trim() == "asn" {
-                        let asns: Vec<serde_json::Value> = row
-                            .asns
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(serde_json::Value::from)
-                            .collect();
-                        serde_json::json!({ "target": "asn", "asns": asns })
+                        DropRule {
+                            match_pattern: String::new(),
+                            flags: String::new(),
+                            target: Some("asn".to_string()),
+                            asns: Some(
+                                row.asns
+                                    .split(',')
+                                    .map(|value| value.trim().to_string())
+                                    .filter(|value| !value.is_empty())
+                                    .collect(),
+                            ),
+                        }
                     } else {
-                        let mut rule = serde_json::Map::new();
-                        rule.insert(
-                            "match".into(),
-                            serde_json::Value::from(row.match_pattern.as_str()),
-                        );
-                        if !row.flags.is_empty() {
-                            rule.insert(
-                                "flags".into(),
-                                serde_json::Value::from(row.flags.as_str()),
-                            );
+                        DropRule {
+                            match_pattern: row.match_pattern.clone(),
+                            flags: row.flags.clone(),
+                            target: row.target_value(),
+                            asns: None,
                         }
-                        if let Some(target) = row.target_value() {
-                            rule.insert("target".into(), serde_json::Value::from(target));
-                        }
-                        serde_json::Value::Object(rule)
                     }
                 })
                 .collect();
             if !rules.is_empty() {
-                map.insert("drop".into(), serde_json::Value::Array(rules));
+                config.drop = Some(rules);
             }
         }
 
         if self.geo_defaults {
-            map.insert("geo".into(), serde_json::Value::Object(Default::default()));
+            // An explicit `{}`: a profile resets the source's geo step.
+            config.geo = Some(GeoStepConfig {
+                enabled: true,
+                template: DEFAULT_GEO_TEMPLATE.to_string(),
+            });
         } else if self.geo_set {
-            let mut geo = serde_json::Map::new();
-            if !self.geo_enabled {
-                geo.insert("enabled".into(), serde_json::Value::from(false));
-            }
             let template = self.geo_template.trim();
-            if !template.is_empty() && template != DEFAULT_GEO_TEMPLATE {
-                geo.insert("template".into(), serde_json::Value::from(template));
-            }
-            if !geo.is_empty() {
-                map.insert("geo".into(), geo.into());
+            let has_values =
+                !self.geo_enabled || (!template.is_empty() && template != DEFAULT_GEO_TEMPLATE);
+            if has_values {
+                // The built-in default template is shown as the empty value:
+                // the field's placeholder carries it and the schema's
+                // serializer never writes it out.
+                config.geo = Some(GeoStepConfig {
+                    enabled: self.geo_enabled,
+                    template: if !template.is_empty() && template != DEFAULT_GEO_TEMPLATE {
+                        template.to_string()
+                    } else {
+                        DEFAULT_GEO_TEMPLATE.to_string()
+                    },
+                });
             }
         }
 
         if self.health_defaults {
-            map.insert(
-                "health".into(),
-                serde_json::Value::Object(Default::default()),
-            );
+            // An explicit `{}`: a profile resets the source's health
+            // filter, so the section is built with the default exclusion
+            // list (which the schema's serializer omits).
+            config.health = Some(HealthConfig {
+                exclude_statuses: crate::pipeline::default_exclude_statuses(),
+            });
         } else if self.health_set
             && self.exclude_statuses != crate::pipeline::default_exclude_statuses()
         {
-            map.insert(
-                "health".into(),
-                serde_json::json!({ "exclude_statuses": self.exclude_statuses }),
-            );
+            config.health = Some(HealthConfig {
+                exclude_statuses: self.exclude_statuses.clone(),
+            });
         }
 
         if self.sort_defaults {
-            map.insert("sort".into(), serde_json::Value::Object(Default::default()));
+            // An explicit `{}`: a profile resets the source's sort.
+            config.sort = Some(SortConfig {
+                by: SortBy::Source,
+                desc: false,
+            });
         } else if self.sort_set {
-            let mut sort = serde_json::Map::new();
             let by = SortBy::ALL
                 .iter()
                 .find(|sort| sort.as_str() == self.sort_by)
                 .copied();
-            if let Some(by) = by
-                && by != SortBy::Source
-            {
-                sort.insert("by".into(), serde_json::Value::from(by.as_str()));
-            }
-            if self.sort_desc {
-                sort.insert("desc".into(), serde_json::Value::from(true));
-            }
-            if !sort.is_empty() {
-                map.insert("sort".into(), sort.into());
+            if by.is_some_and(|by| by != SortBy::Source) || self.sort_desc {
+                config.sort = Some(SortConfig {
+                    by: by
+                        .filter(|by| *by != SortBy::Source)
+                        .unwrap_or(SortBy::Source),
+                    desc: self.sort_desc,
+                });
             }
         }
 
+        // The one value the typed schema cannot hold: a mistyped cap
+        // rides along as a JSON string so the validator reports it on the
+        // panel language instead of the field silently disappearing. That
+        // output is deliberately not a valid v1 config, so it cannot
+        // travel inside `LimitConfig` (whose `count` is `Option<i64>`) and
+        // is patched into the serialized document below.
+        let mut mistyped_limit: Option<String> = None;
         if self.limit_defaults {
             // An explicit `null` cap: a profile resets the source's limit
             // back to "no cap" (the same reset semantics as an empty
             // rename/drop array).
-            map.insert("limit".into(), serde_json::json!({ "count": null }));
+            config.limit = Some(LimitConfig { count: None });
         } else if self.limit_set {
             let raw = self.limit_count.trim();
             if !raw.is_empty() {
-                // A valid number is written as a number; a mistyped entry
-                // rides along as a string so the validator reports it on
-                // the panel language instead of the field silently
-                // disappearing.
-                let value = match raw.parse::<i64>() {
-                    Ok(count) => serde_json::Value::from(count),
-                    Err(_) => serde_json::Value::from(raw),
-                };
-                map.insert("limit".into(), serde_json::json!({ "count": value }));
+                match raw.parse::<i64>() {
+                    Ok(count) => config.limit = Some(LimitConfig { count: Some(count) }),
+                    Err(_) => mistyped_limit = Some(raw.to_string()),
+                }
             }
         }
 
-        if map.len() == 1 {
+        let mut value =
+            serde_json::to_value(&config).expect("pipeline v1 config always serializes");
+        if let Some(raw) = mistyped_limit {
+            value["limit"] = serde_json::json!({ "count": raw });
+        }
+        if value.as_object().is_some_and(|map| map.len() == 1) {
             None // only "version", nothing configured
         } else {
-            Some(serde_json::Value::Object(map))
+            Some(value)
         }
     }
 
@@ -882,15 +904,6 @@ impl Schema {
             "{name}",
         ]
     }
-}
-
-fn strings(values: &[String]) -> serde_json::Value {
-    serde_json::Value::Array(
-        values
-            .iter()
-            .map(|value| serde_json::Value::from(value.as_str()))
-            .collect(),
-    )
 }
 
 /// Split the comma-separated ASN text field into trimmed entries. `None`

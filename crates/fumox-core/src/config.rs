@@ -358,10 +358,15 @@ pub struct GeoConfig {
     #[serde(default = "defaults::geo_enabled")]
     pub enabled: bool,
     /// Legacy selector from the one-database era. No longer affects
-    /// resolution, every database in `db_dir` is merged, but the key is
-    /// still accepted so existing configs keep parsing.
-    #[serde(default)]
-    pub db: GeoDbKind,
+    /// resolution (every database in `db_dir` is merged) and is not read
+    /// by any code; the key is still accepted so existing config files
+    /// keep parsing, and it no longer round-trips into saved config.
+    /// `doc(hidden)`: the field is public only so struct literals with
+    /// `..Default::default()` compile outside this crate — there is
+    /// nothing to do with a value of type `()`.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing, deserialize_with = "de_ignore_legacy")]
+    pub db: (),
     /// Directory containing the `.mmdb` files (never committed).
     #[serde(default = "defaults::geo_db_dir")]
     pub db_dir: PathBuf,
@@ -379,11 +384,23 @@ pub struct GeoConfig {
     pub startup_download_budget_secs: u64,
 }
 
+/// Serde landing place for config keys the code no longer reads (the
+/// legacy `[geo].db`): any value is accepted and discarded, so old
+/// config files keep parsing and a saved file never carries the key.
+fn de_ignore_legacy<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer
+        .deserialize_any(serde::de::IgnoredAny)
+        .map(|_| ())
+}
+
 impl Default for GeoConfig {
     fn default() -> Self {
         Self {
             enabled: defaults::geo_enabled(),
-            db: GeoDbKind::default(),
+            db: (),
             db_dir: defaults::geo_db_dir(),
             cache_max_entries: defaults::geo_cache_max_entries(),
             dns_timeout_secs: defaults::dns_timeout_secs(),
@@ -1500,13 +1517,12 @@ probe_results_days = 7
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Keys the reference file deliberately does not declare: `geo.db` is
-    /// the inert one-database-era selector, kept in the struct so existing
-    /// configs keep parsing and shown in `/admin/settings` with a footnote.
-    /// Writing it into a file that promises "every available key" would
-    /// only invite an operator to set a key that does nothing. Every other
-    /// key must be there, that is the point of the guard.
-    const REFERENCE_FILE_OMISSIONS: &[&str] = &["geo.db"];
+    /// Keys the reference file deliberately does not declare. Empty since
+    /// the inert one-database-era `[geo].db` selector was dropped from the
+    /// struct (old files still parse — the key is accepted and ignored —
+    /// but it is no longer a config key, so the shipped file that promises
+    /// "every available key" must not declare it either).
+    const REFERENCE_FILE_OMISSIONS: &[&str] = &[];
 
     /// The bounds table is a lookup, so a duplicate key is not a
     /// compile error: `range_of` would silently return the first one and
@@ -1655,6 +1671,31 @@ probe_results_days = 7
             ..Default::default()
         };
         assert_eq!(cfg.dns_timeout(), std::time::Duration::from_secs(7));
+    }
+
+    /// The legacy `[geo].db` selector no longer exists as a config field:
+    /// old files that still carry the key must keep loading (any value,
+    /// even one the old enum would have refused), and a serialized
+    /// config must not re-emit the dead knob.
+    #[test]
+    fn legacy_geo_db_key_is_accepted_and_ignored() {
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-geodb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.toml");
+        // A value the old `GeoDbKind` would still have accepted…
+        std::fs::write(&file, "[geo]\ndb = \"city\"\n").unwrap();
+        assert!(load_config(Some(&file)).is_ok());
+        // …and one it would not: the key is ignored wholesale now.
+        std::fs::write(&file, "[geo]\ndb = 42\n").unwrap();
+        assert!(load_config(Some(&file)).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The key must not round-trip back into written config.
+        let json = serde_json::to_value(GeoConfig::default()).unwrap();
+        assert!(
+            json.get("db").is_none(),
+            "the dead [geo].db knob must not serialize: {json}"
+        );
     }
 
     /// The startup budget is operator-tunable, not a constant baked into

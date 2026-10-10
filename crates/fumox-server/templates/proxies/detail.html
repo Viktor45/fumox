@@ -59,7 +59,7 @@
           {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
-      <tr><th>ASN</th><td>
+      <tr><th>{{ self.t("common.asn") }}</th><td>
         {% match proxy.geo_asn %}
           {% when Some with (asn) %}{{ asn }}
           {% when None %}<span class="muted">–</span>

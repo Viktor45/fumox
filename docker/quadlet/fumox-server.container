@@ -30,7 +30,9 @@ Environment=FUMOX_GEO__DB_DIR=/shared
 #   FUMOX_CONFIG=/app/config/app.toml
 #Environment=FUMOX_CONFIG=/app/config/app.toml
 
-# Left side: a directory with app.toml (and optional GeoLite2-*.mmdb).
+# Left side: a directory with app.toml. The GeoLite2 databases do not
+# belong here: FUMOX_GEO__DB_DIR above points them at /shared (see
+# docker/README.md).
 # %h expands to your home dir; point it at the repo's config/ if you prefer.
 #
 # Writable: the admin *Edit settings* page writes /app/config/app.toml

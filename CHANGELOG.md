@@ -530,6 +530,32 @@ Changes in the working tree, not yet on a published image.
   the pin counts in either spelling; listing both keys instead would
   have split a node published as Clash YAML from the same node
   published as a URI. Guarded by `cert_pin_is_security_relevant`.
+- The dedup key ignored several more connection-defining parameters,
+  so two nodes differing only in one of them collapsed onto one row
+  and the upsert silently overwrote the first with the second. Joining
+  `SECURITY_PARAMS`: xhttp's `:authority` override, the snell
+  `version` protocol revision, `obfs-host`, hysteria2's `ports`
+  port-hopping range, tuic's `udp_relay_mode` and `disable_sni`; and
+  for vmess the cipher and the alter id as Clash spells them
+  (`cipher`/`alterId` are folded onto the URI spellings `scy`/`aid`,
+  the same per-scheme aliasing `network`→`net` already had). The one
+  toggle vocabulary shared by the fingerprint, the output writers and
+  the forbid-insecure filter also learned the `yes`/`on` spellings: a
+  Clash `allowInsecure: yes` used to contribute nothing to the
+  pre-image and merged with the verification-on variant of the same
+  node. Guarded by `newly_covered_security_params_split_nodes`,
+  `two_vmess_nodes_differing_only_in_cipher_do_not_collapse`,
+  `clash_and_uri_spellings_agree_for_vmess` and the `yes`/`on` cases
+  in `insecure_aliases_collapse` / `falsy_insecure_equals_absent`.
+  Upgrade note: every node carrying one of these parameters or
+  spellings hashes differently now, and the first re-ingest after
+  upgrading re-identifies it — reconcile matches rows by fingerprint
+  alone, so the node gets a fresh row starting at `unknown`, while its
+  status, latency and probe history stay on the old row (which then
+  retires, or lingers as a duplicate under
+  `[ingest].drop_gate = false`, through the ordinary reconcile pass).
+  Aliveness counters and the `/src` output repopulate after one probe
+  cycle; no migration can carry both the old and the new fingerprints.
 - A vless proxy that arrived from a Clash YAML source was served to
   sing-box clients as plaintext. mihomo spells the toggle `tls: true`
   and the SNI `servername`; the sing-box writer's TLS decision read
@@ -1142,6 +1168,38 @@ Changes in the working tree, not yet on a published image.
   import now enforces the profile form's unreserved-ASCII rule
   (`A-Za-z0-9-_.~`). Guarded by
   `import_rejects_tokens_outside_the_url_charset`.
+- Admin sessions are revocable now. Logging out (or rotating
+  `[admin].token` from the settings screen) cleared the browser cookie,
+  but nothing server-side could reject a copy of it: the MAC covered
+  only the expiry timestamp and the session key is frozen at startup,
+  so a stolen or copied cookie stayed valid until its TTL. A
+  revocation epoch is persisted in the `meta` table and mixed into the
+  session key (`HMAC(session_key, epoch_be)`); a bump — on logout and
+  on token rotation — invalidates every cookie minted before it at
+  once, and it survives a restart because it lives in the database.
+  This deliberately rejects pre-epoch cookies too: they MACed the bare
+  session key and match no epoch, so the first login after upgrading
+  to this build fails and costs one re-login (rolling back to the
+  previous build costs the same, symmetrically — the old binary
+  rejects the new cookie format as well).
+- The admin middleware rejects cross-site requests before auth, CSRF
+  and rate limiting, answering `403` (`err.cross_site`) without
+  charging the rate-limit window. A request is cross-site when
+  `Sec-Fetch-Site: cross-site` says so (top-level `navigate`
+  document GETs are exempt, so opening `/admin` from a link or
+  bookmark still works), or — for clients without Fetch Metadata —
+  when it carries an `Origin` that does not belong to the panel:
+  `Origin: null`, an unparsable origin, or an origin whose host:port
+  differs from the `Host` header. Requests with none of these headers
+  (curl, monitoring, health checks) are unaffected. The gate closes
+  the hole where any web page the operator visited could pin their IP
+  at the 429 ceiling with auto-issued cross-site panel requests, and
+  it inherits the panel's existing assumption that a reverse proxy
+  forwards `Host` unchanged: a proxy that rewrites `Host` away from
+  the origin the browser sees makes non-browser integrations that
+  send an `Origin` header answer `403` (they must drop the header,
+  or the proxy must pass the original `Host` through — the same
+  requirement `host_gate` already imposed).
 
 ### Docs
 

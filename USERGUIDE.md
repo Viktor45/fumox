@@ -240,6 +240,18 @@ Notes:
 > the public listener answers it `404`: it does not serve that host.
 > Either reach the panel on the same hostname the public list allows,
 > or add `127.0.0.1` to `[server].allowed_hosts` as well.
+>
+> The admin panel also answers `403` (`err.cross_site`) to requests it
+> classifies as cross-site — `Sec-Fetch-Site: cross-site` (top-level
+> navigations to `/admin` are exempt), `Origin: null`, or an `Origin`
+> whose host:port does not match the `Host` header. Browsers on the
+> panel's own origin and header-less clients (curl, monitoring) are
+> unaffected. What this adds to a reverse-proxy setup is the same
+> requirement the `Host` allowlist above already imposes: the proxy
+> must forward `Host` unchanged (the shipped `docker/nginx/` example
+> does, via `proxy_set_header Host $host`). A legitimate non-browser
+> integration that POSTs to the panel with an `Origin` header must
+> send the panel's own origin or drop the header.
 - The SQLite database lives in the `fumox-data` volume. `./config` is mounted
   into the server container **read-write** by default, so the admin *Edit
   settings* page can save `app.toml`; set `FUMOX_CONFIG_ACCESS=ro` to pin it
@@ -338,11 +350,25 @@ cargo build --release
 ./target/release/fumox-probe             # health-check daemon (separate process)
 ```
 
-Both binaries accept the same command-line options:
+The command-line options, per binary — they are not identical: only
+`fumox-server` has `--health-check`:
 
 ```
 fumox-server [OPTIONS]
-fumox-probe  [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>  Path to the TOML config file (outranks FUMOX_CONFIG)
+      --health-check     Probe the running server's /healthz and exit 0
+                         when it answers 200, 1 otherwise. The request
+                         goes to 127.0.0.1 at the configured public
+                         bind's port. Used as the container healthcheck
+                         (`docker-compose.yml` wires it as the stack's
+                         `test:`): the runtime image ships no curl or
+                         wget.
+  -h, --help             Print help
+  -V, --version          Print version
+
+fumox-probe [OPTIONS]
 
 Options:
   -c, --config <CONFIG>  Path to the TOML config file (outranks FUMOX_CONFIG)
@@ -1299,6 +1325,17 @@ stored.
       Export*, *Sources* and *Profiles* is built from the host you
       reached the panel on, and the public listener answers `404` for a
       host it does not serve. Those three screens themselves render.
+- [ ] **Behind a reverse proxy:** the proxy forwards the original `Host`
+      header unchanged (nginx: `proxy_set_header Host $host;`, which the
+      shipped `docker/nginx/` example already does). The admin panel
+      rejects requests it classifies as cross-site with `403`
+      (`err.cross_site`) before auth, CSRF and rate limiting —
+      `Sec-Fetch-Site: cross-site` (top-level navigations to `/admin`
+      are exempt), `Origin: null`, or an `Origin` whose host:port does
+      not match `Host`. Browsers on the panel's own origin and
+      header-less clients are unaffected; a proxy that rewrites `Host`,
+      or a non-browser integration that POSTs with a foreign `Origin`
+      header, gets `403` where it used to be processed.
 - [ ] `allow_private_urls` set to `false` (the built-in default, SSRF
       protection). The shipped `config/app.toml` example sets it to `true`,
       so change it unless you have a specific trusted-internal-source

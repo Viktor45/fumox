@@ -12,9 +12,11 @@ mod events;
 mod fetcher;
 mod geo_backfill;
 mod geo_download;
+mod host_gate;
 mod ingest;
 mod pipeline;
 mod scheduler;
+mod security;
 mod serve;
 
 use std::net::SocketAddr;
@@ -134,10 +136,12 @@ async fn main() -> anyhow::Result<()> {
     let caches = Caches::new();
     let geo = Arc::new(fumox_core::geo::GeoResolver::new(&config.geo));
     // Fill the geo columns of proxies ingested before a database existed
-    // (background: never blocks startup).
-    tokio::spawn(geo_backfill::backfill_missing_geo(
+    // (background: never blocks startup), bounded like the geo download
+    // above by the configured startup budget.
+    tokio::spawn(geo_backfill::backfill_missing_geo_within_budget(
         pool.clone(),
         geo.clone(),
+        config.geo.startup_download_budget(),
     ));
     // Push updates to the admin panel over SSE; the
     // scheduler publishes fetch lifecycle events onto this bus.
@@ -172,15 +176,15 @@ async fn main() -> anyhow::Result<()> {
     health_cfg.max_connections = 1;
     let health_pool = fumox_core::db::connect_pool(&health_cfg).await?;
 
-    let state = serve::AppState {
-        pool: pool.clone(),
-        caches: caches.clone(),
-        geo: geo.clone(),
-        limits: serve::PublicRateLimits::from_config(&config.server),
-        trusted_cidrs: admin::parse_trusted_cidrs(&config.server.trust_proxy_ips),
-        allowed_hosts: config.server.allowed_hosts.clone(),
-        export_max_rows: config.server.export_max_rows,
-    };
+    let state = serve::AppState::new(
+        pool.clone(),
+        caches.clone(),
+        geo.clone(),
+        serve::PublicRateLimits::from_config(&config.server),
+        admin::parse_trusted_cidrs(&config.server.trust_proxy_ips),
+        config.server.allowed_hosts.clone(),
+        config.server.export_max_rows,
+    );
     let app = serve::public_app(state, health_pool.clone());
 
     // Admin listener: a separate loopback interface. With

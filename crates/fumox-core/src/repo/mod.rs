@@ -12,6 +12,108 @@ pub mod proxies;
 pub mod sources;
 
 use crate::db::DbPool;
+use sqlx::Sqlite;
+use sqlx::sqlite::SqliteArguments;
+
+/// Dynamic WHERE-clause accumulator shared by the admin list filters of
+/// this module tree: the single copy of the "whitelist the fragment, bind
+/// the value" pattern the admin handlers used to re-implement per screen.
+///
+/// Every clause is a compile-time constant of this crate (a whitelist
+/// bucket or a fixed predicate over one table family); the only
+/// caller-controlled content is the text value each clause binds, and
+/// those travel through `.bind()`, never into the SQL text. The count and
+/// list queries of one family build their clauses through the family's
+/// own `where_filter()` method, so clause order and bind order cannot
+/// drift apart between the two statements.
+#[derive(Debug, Default)]
+pub(crate) struct WhereFilter {
+    clauses: Vec<String>,
+    values: Vec<String>,
+}
+
+impl WhereFilter {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a clause without bound values (`s.enabled = 1`, an EXISTS
+    /// fragment from a whitelist bucket).
+    pub(crate) fn clause(mut self, clause: impl Into<String>) -> Self {
+        self.clauses.push(clause.into());
+        self
+    }
+
+    /// Append a clause that binds one text value.
+    pub(crate) fn text(mut self, clause: &str, value: impl Into<String>) -> Self {
+        self.clauses.push(clause.to_string());
+        self.values.push(value.into());
+        self
+    }
+
+    /// Append one more bound text value without a clause of its own; for
+    /// predicates that repeat a value under several `?` placeholders
+    /// (`(host LIKE ? OR name LIKE ?)`).
+    pub(crate) fn text_value(mut self, value: impl Into<String>) -> Self {
+        self.values.push(value.into());
+        self
+    }
+
+    /// Append an `IN (?, ?, …)` clause over `column`, one placeholder per
+    /// element, bound in order. `values` must not be empty: an empty SQL
+    /// `IN ()` list is a syntax error, and the family builders only call
+    /// this after their own emptiness guard.
+    pub(crate) fn text_in(mut self, column: &str, values: &[String]) -> Self {
+        let placeholders = vec!["?"; values.len()].join(", ");
+        self.clauses.push(format!("{column} IN ({placeholders})"));
+        self.values.extend(values.iter().cloned());
+        self
+    }
+
+    /// The joined WHERE fragment: `""` when no clause was pushed, else
+    /// `" WHERE a AND b"`.
+    pub(crate) fn sql(&self) -> String {
+        if self.clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", self.clauses.join(" AND "))
+        }
+    }
+
+    /// The bound values in clause order; each fills the `?` placeholder
+    /// of the clause it was pushed with.
+    pub(crate) fn values(&self) -> &[String] {
+        &self.values
+    }
+}
+
+/// Apply the bound values of a [`WhereFilter`] to a sqlx query builder,
+/// in clause order. A local trait because `bind` is an inherent method
+/// returning `Self` on the sibling query constructors (`query_as`,
+/// `query_scalar`), which share no interface to call it through. The
+/// lifetime parameter ties the values slice to the query's argument
+/// lifetime: a bound value must outlive the query it feeds.
+pub(crate) trait BindWhereFilter<'a>: Sized {
+    fn bind_where_filter(self, values: &'a [String]) -> Self;
+}
+
+impl<'q, O> BindWhereFilter<'q> for sqlx::query::QueryAs<'q, Sqlite, O, SqliteArguments> {
+    fn bind_where_filter(mut self, values: &'q [String]) -> Self {
+        for value in values {
+            self = self.bind(value.as_str());
+        }
+        self
+    }
+}
+
+impl<'q, O> BindWhereFilter<'q> for sqlx::query::QueryScalar<'q, Sqlite, O, SqliteArguments> {
+    fn bind_where_filter(mut self, values: &'q [String]) -> Self {
+        for value in values {
+            self = self.bind(value.as_str());
+        }
+        self
+    }
+}
 
 /// Read a service key from `meta`.
 pub async fn meta_get(pool: &DbPool, key: &str) -> crate::Result<Option<String>> {
@@ -35,6 +137,24 @@ pub async fn meta_set(pool: &DbPool, key: &str, value: &str) -> crate::Result<()
     Ok(())
 }
 
+/// Atomically increment an integer counter key in `meta`, creating it at 1
+/// when absent, and return the new value. A single upsert, so two
+/// concurrent callers each observe their own bump — a `meta_get` +
+/// `meta_set` pair would race them onto the same value. A pre-existing
+/// non-integer value casts to 0 and self-heals from 1. Stored through the
+/// TEXT-affinity column, so `meta_get` still reads the number back as text.
+pub async fn meta_increment(pool: &DbPool, key: &str) -> crate::Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO meta (key, value) VALUES (?, '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+         RETURNING CAST(value AS INTEGER)",
+    )
+    .bind(key)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 /// Serialize a JSON column value, mapping serialization errors into the
 /// core error type (in practice unreachable for the values we store).
 pub(crate) fn json_to_text(value: &serde_json::Value) -> crate::Result<String> {
@@ -53,21 +173,23 @@ mod tests {
     use super::*;
     use crate::db;
 
-    pub(crate) async fn temp_pool() -> DbPool {
-        let dir = std::env::temp_dir().join(format!("fumox-test-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// Fresh migrated pool on a scoped temp database: keep the returned
+    /// guard in scope (`let (_dir, pool) = temp_pool().await`) and the
+    /// whole directory — database included — is removed when it drops.
+    pub(crate) async fn temp_pool() -> (crate::tempdir_lite::TempDir, DbPool) {
+        let dir = crate::tempdir_lite::TempDir::new("repo");
         let cfg = crate::config::DatabaseConfig {
-            path: dir.join("test.db"),
+            path: dir.path().join("test.db"),
             ..Default::default()
         };
         let pool = db::connect_pool(&cfg).await.unwrap();
         db::migrate(&pool).await.unwrap();
-        pool
+        (dir, pool)
     }
 
     #[tokio::test]
     async fn meta_round_trip() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
         assert_eq!(meta_get(&pool, "absent").await.unwrap(), None);
         meta_set(&pool, "k", "v1").await.unwrap();
         assert_eq!(meta_get(&pool, "k").await.unwrap().as_deref(), Some("v1"));
@@ -76,8 +198,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn meta_increment_counts_and_bootstraps() {
+        let (_dir, pool) = temp_pool().await;
+        assert_eq!(meta_increment(&pool, "counter").await.unwrap(), 1);
+        assert_eq!(meta_increment(&pool, "counter").await.unwrap(), 2);
+        // Keys are independent.
+        assert_eq!(meta_increment(&pool, "other").await.unwrap(), 1);
+        // A non-integer value casts to 0 and self-heals from 1.
+        meta_set(&pool, "corrupt", "not-a-number").await.unwrap();
+        assert_eq!(meta_increment(&pool, "corrupt").await.unwrap(), 1);
+        // Stored through the TEXT-affinity column: meta_get reads it back.
+        assert_eq!(
+            meta_get(&pool, "counter").await.unwrap().as_deref(),
+            Some("2")
+        );
+    }
+
+    #[tokio::test]
     async fn migrations_create_full_schema() {
-        let pool = temp_pool().await;
+        let (_dir, pool) = temp_pool().await;
 
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -130,9 +269,10 @@ mod tests {
             assert!(indexes.contains(&expected), "missing index {expected}");
         }
 
-        // Schema version is stamped into meta by db::migrate.
+        // Schema version is stamped into meta by db::migrate. Bumped to 9
+        // by migration 0009 (fetch_log.duration_ms).
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("8"));
+        assert_eq!(version.as_deref(), Some("9"));
 
         // WAL is active on the connection.
         let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")

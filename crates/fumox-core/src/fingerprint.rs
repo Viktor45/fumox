@@ -35,7 +35,12 @@ const SECURITY_PARAMS: &[&str] = &[
     "mode",
     "path",
     "host",
+    // xhttp `:authority` override: changes the host the client connects to
+    "authority",
     "alpn",
+    // snell protocol revision; older and newer meow builds interoperate
+    // differently across it
+    "version",
     // REALITY / TLS pinning
     "pbk",
     "publickey",
@@ -50,6 +55,7 @@ const SECURITY_PARAMS: &[&str] = &[
     "encryption",
     "scy",
     "obfs",
+    "obfs-host",
     "obfs-password",
     "congestion_control",
     "aid",
@@ -61,14 +67,18 @@ const SECURITY_PARAMS: &[&str] = &[
     "allowinsecure",
     "skip-cert-verify",
     "allow_insecure",
-    // hysteria2 / quic extras
+    // hysteria2 / tuic extras
     "servicename",
+    // hysteria2 port hopping range, tuic relay mode and SNI suppression
+    "ports",
+    "udp_relay_mode",
+    "disable_sni",
     // Clash structured blocks, stored verbatim: they have no URI spelling
     // and each one changes how the client must connect. The Clash fields
     // that *do* have a URI spelling (`servername`, `network`, `ws-path`,
-    // `client-fingerprint`, `grpc-service-name`, `fingerprint`) are folded
-    // onto it by `canonical_key` and never reach this list under their own
-    // name.
+    // `client-fingerprint`, `grpc-service-name`, `fingerprint`, and for
+    // vmess `cipher` / `alterId`) are folded onto it by `canonical_key`
+    // and never reach this list under their own name.
     "ws-headers",
     "ws-opts",
     "reality-opts",
@@ -96,6 +106,14 @@ fn canonical_key(scheme: Scheme, key: &str) -> String {
         // Clash's `fingerprint` is the certificate pin (`pinSHA256` in the
         // URI), not the uTLS client hello: that one is `client-fingerprint`.
         "fingerprint" => "pinsha256",
+        // vmess JSON spells the cipher `scy` and the alter id `aid`; Clash
+        // YAML calls them `cipher` and `alterId`. Without the folding the
+        // same node advertised as Clash YAML and as a vmess:// link lands
+        // in two rows, while two nodes differing only in the cipher
+        // collapse onto one. (Same aliasing as the URI translation in
+        // `parsers::translate_uri_param`.)
+        "cipher" if scheme == Scheme::Vmess => "scy",
+        "alterid" if scheme == Scheme::Vmess => "aid",
         other => other,
     }
     .to_string()
@@ -299,6 +317,13 @@ mod tests {
         // The underscore spelling of sing-box / tuic links dedupes with the
         // rest instead of contributing its own pre-image pair.
         assert_eq!(fingerprint(&c), fingerprint(&d));
+        // The yes/on spellings share the one toggle vocabulary too: a `yes`
+        // row must merge with the `1` row, not sit beside it waiting for a
+        // refresh to flip the stored row between insecure and secure.
+        let yes = entry("n", "h", vec![param("allowInsecure", "yes")]);
+        let on = entry("n", "h", vec![param("skip-cert-verify", "on")]);
+        assert_eq!(fingerprint(&a), fingerprint(&yes));
+        assert_eq!(fingerprint(&a), fingerprint(&on));
     }
 
     #[test]
@@ -310,6 +335,12 @@ mod tests {
         assert_eq!(fingerprint(&absent), fingerprint(&zero));
         assert_eq!(fingerprint(&absent), fingerprint(&false_));
         assert_eq!(fingerprint(&absent), fingerprint(&underscore));
+        // `no`/`off` are outside the shared truthy vocabulary: a falsy
+        // toggle means verification on, i.e. nothing in the pre-image.
+        let no = entry("n", "h", vec![param("allowInsecure", "no")]);
+        let off = entry("n", "h", vec![param("skip-cert-verify", "off")]);
+        assert_eq!(fingerprint(&absent), fingerprint(&no));
+        assert_eq!(fingerprint(&absent), fingerprint(&off));
 
         let truthy = entry("n", "h", vec![param("allowInsecure", "1")]);
         assert_ne!(fingerprint(&absent), fingerprint(&truthy));
@@ -453,23 +484,86 @@ mod tests {
     #[test]
     fn clash_and_uri_spellings_agree_for_vmess() {
         // vmess names the transport `net` in the URI JSON and sing-box native
-        // form, `network` only in Clash. Folding Clash's spelling onto `type`
-        // left the two forms as separate keys, so one vmess server published
-        // as Clash YAML and as a vmess:// link got two fingerprints, two rows
-        // and two copies in every subscription.
+        // form, `network` only in Clash; the cipher is `scy` in the JSON and
+        // `cipher` in Clash, the alter id `aid` and `alterId`. Folding the
+        // Clash spellings onto the URI ones left the two forms as separate
+        // keys, so one vmess server published as Clash YAML and as a vmess://
+        // link got two fingerprints, two rows and two copies in every
+        // subscription.
         let yaml = concat!(
             "proxies:\n",
             "  - {name: a, type: vmess, server: h.example.com, port: 443, uuid: u,",
-            "     network: ws, servername: a.example.com}\n",
+            "     network: ws, servername: a.example.com, cipher: auto, alterId: 0}\n",
         );
         let mut clash = crate::parsers::clash::parse_payload(yaml).unwrap().entries[0].clone();
         let mut uri = parse_one(concat!(
             "vmess://eyJ2IjoiMiIsInBzIjoiYSIsImFkZCI6ImguZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQz",
-            "IiwiaWQiOiJ1IiwibmV0Ijoid3MiLCJzbmkiOiJhLmV4YW1wbGUuY29tIn0="
+            "IiwiaWQiOiJ1IiwibmV0Ijoid3MiLCJzbmkiOiJhLmV4YW1wbGUuY29tIiwic2N5IjoiYXV0byIs",
+            "ImFpZCI6IjAifQ"
         ));
         clash.name = String::new();
         uri.name = String::new();
         assert_eq!(fingerprint(&clash), fingerprint(&uri));
+
+        // The same cipher also spelled the Clash way must dedup with the
+        // URI spelling, not sit beside it under its own key.
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vmess, server: h.example.com, port: 443, uuid: u,",
+            "     cipher: auto, alterId: 0}\n",
+        );
+        let mut clash = crate::parsers::clash::parse_payload(yaml).unwrap().entries[0].clone();
+        let mut uri = parse_one(concat!(
+            "vmess://eyJ2IjoiMiIsInBzIjoiYSIsImFkZCI6ImguZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQz",
+            "IiwiaWQiOiJ1Iiwic2N5IjoiYXV0byIsImFpZCI6IjAifQ"
+        ));
+        clash.name = String::new();
+        uri.name = String::new();
+        assert_eq!(fingerprint(&clash), fingerprint(&uri));
+    }
+
+    #[test]
+    fn two_vmess_nodes_differing_only_in_cipher_do_not_collapse() {
+        // Both nodes are Clash vmess items, so the cipher arrives under the
+        // Clash spelling: before it was folded onto `scy` it was dropped
+        // from the pre-image entirely, the two collapsed onto one row and
+        // reconcile_source's upsert silently overwrote one with the other.
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vmess, server: h.example.com, port: 443, uuid: u,",
+            "     cipher: auto}\n",
+            "  - {name: b, type: vmess, server: h.example.com, port: 443, uuid: u,",
+            "     cipher: aes-128-gcm}\n",
+        );
+        let parsed = crate::parsers::clash::parse_payload(yaml).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_ne!(
+            fingerprint(&parsed.entries[0]),
+            fingerprint(&parsed.entries[1])
+        );
+    }
+
+    #[test]
+    fn newly_covered_security_params_split_nodes() {
+        // Each of these changes how the client connects; left out of the
+        // pre-image two nodes differing only in it shared one row and the
+        // upsert silently overwrote one with the other.
+        for (key, first, second) in [
+            ("obfs-host", "a.example.com", "b.example.com"),
+            ("version", "3", "4"),
+            ("udp_relay_mode", "native", "quic"),
+            ("disable_sni", "1", "0"),
+            ("authority", "a.example.com", "b.example.com"),
+            ("ports", "20000-30000", "40000-50000"),
+        ] {
+            let a = entry("n", "h", vec![param(key, first)]);
+            let b = entry("n", "h", vec![param(key, second)]);
+            assert_ne!(
+                fingerprint(&a),
+                fingerprint(&b),
+                "{key}={first} vs {key}={second} must not collapse"
+            );
+        }
     }
 
     #[test]

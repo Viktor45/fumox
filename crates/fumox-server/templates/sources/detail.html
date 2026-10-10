@@ -5,9 +5,10 @@
 {% block content %}
 <div class="page-head">
   <h1>{{ source.name }}</h1>
-  <span id="enabled-badge" aria-live="polite" aria-atomic="true">
-    {% if source.enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
-  </span>
+  {#- The badge and the toggle form are the same fragment templates the
+      toggle action re-renders for its HTMX swap, so the initial markup and
+      every swap share one definition. -#}
+  {% include "sources/_enabled_badge.html" %}
   {% match source.error_class %}
     {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
     {% when None %}
@@ -16,11 +17,7 @@
   <span class="spacer"></span>
   <div class="row-actions">
     <a class="btn" href="/admin/sources/{{ source.id }}/edit">{{ self.t("common.edit") }}</a>
-    <form id="toggle-form" method="post" action="/admin/sources/{{ source.id }}/toggle"
-          hx-post="/admin/sources/{{ source.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML">
-      <input type="hidden" name="_csrf" value="{{ csrf }}">
-      <button class="btn" type="submit" aria-pressed="{% if source.enabled %}true{% else %}false{% endif %}">{% if source.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
-    </form>
+    {% include "sources/_toggle_form.html" %}
     <form method="post" action="/admin/sources/{{ source.id }}/refresh"
           hx-post="/admin/sources/{{ source.id }}/refresh" hx-target="#refresh-status" hx-swap="outerHTML">
       <input type="hidden" name="_csrf" value="{{ csrf }}">

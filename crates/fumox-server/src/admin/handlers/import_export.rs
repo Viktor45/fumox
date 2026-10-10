@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
-use super::caps;
+use super::{SLUG_RE, caps, pipeline_size};
 
 /// Body of `POST /admin/import`. A typed `Form` extractor parses only the
 /// `payload` field (the admin router's `DefaultBodyLimit::max(1 MiB)` still
@@ -49,8 +49,6 @@ pub(in crate::admin) struct ImportPayloadForm {
     payload: String,
 }
 
-/// Slug format shared with the source/profile forms.
-const SLUG_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$";
 /// Only schema version we understand today.
 const SUPPORTED_VERSION: u32 = 1;
 
@@ -432,29 +430,21 @@ pub async fn import_submit(
 pub async fn rotate_alive_token(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     match alive_export::rotate_token(&state.pool).await {
-        Ok(_) => super::flash_redirect("/admin/import", lang.t("io.alive_rotated"), "ok"),
+        Ok(_) => {
+            // Audit line for a capability change that instantly invalidates
+            // both export links (one secret, shared by /export/alive and
+            // /export/ready). The token value itself is never logged.
+            tracing::info!("alive-export capability token rotated");
+            super::flash_redirect("/admin/import", lang.t("io.alive_rotated"), "ok")
+        }
         Err(err) => super::server_error(lang, &err),
     }
-}
-
-/// Compact size of a pipeline document, the same measure the builder form
-/// applies: the stored JSON is re-rendered into every edit form and
-/// recompiled by the preview, so a file could otherwise plant a pipeline up
-/// to the 1 MiB body limit (16× the form cap).
-///
-/// The raw form measures the *pretty* JSON it renders into its textarea
-/// instead, so a document in the window between the two sizes is accepted
-/// here and then rejected by the form on every later save. The builder
-/// mode is the one this measure mirrors exactly.
-fn pipeline_size(pipeline: &serde_json::Value) -> usize {
-    serde_json::to_string(pipeline).map_or(usize::MAX, |text| text.len())
 }
 
 /// Validate every imported object with the same rules as the forms. Returns
 /// a (possibly empty) list of localized errors; any error aborts the import.
 async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
-    let slug_re = regex::Regex::new(SLUG_RE).expect("valid slug regex");
 
     // Row-count caps: one 1 MiB body could carry
     // thousands of rows, each triggering cache invalidation and (before the
@@ -520,7 +510,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             let family = s
                 .ip_family
                 .unwrap_or_else(|| state.fetcher.default_family());
-            if state.admin.allow_private_urls {
+            if state.admin().allow_private_urls {
                 // Nothing to reject at the DNS level, the fetch path still
                 // re-vets on every request.
                 if let Err(issue) = fetcher::validate_url(&s.url) {
@@ -542,7 +532,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         }
         if let Some(slug) = s.slug.as_deref()
             && !slug.is_empty()
-            && !slug_re.is_match(slug)
+            && !SLUG_RE.is_match(slug)
         {
             errors.push(format!("{ctx}: {}", lang.t("val.slug_format")));
         }
@@ -615,7 +605,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         }
         if let Some(slug) = p.slug.as_deref()
             && !slug.is_empty()
-            && !slug_re.is_match(slug)
+            && !SLUG_RE.is_match(slug)
         {
             errors.push(format!("{ctx}: {}", lang.t("val.slug_format")));
         }
@@ -752,7 +742,9 @@ async fn apply_import(
             error_class: None,
         };
         sources::create(&state.pool, &source).await?;
-        state.caches.invalidate_source(&id).await;
+        // No cache invalidation: the id is brand new, no rendered output can
+        // reference it yet, and `last_fetched_at` is NULL, so the first
+        // ingest is due immediately.
         summary.sources_created += 1;
     }
 
@@ -870,7 +862,7 @@ mod tests {
 
     /// Admin state on a throwaway database; the import path itself needs
     /// nothing but the pool, the caches and the config.
-    async fn test_state() -> AdminState {
+    async fn test_state() -> (fumox_core::tempdir_lite::TempDir, AdminState) {
         crate::admin::test_admin_state(Default::default(), Default::default()).await
     }
 
@@ -948,7 +940,8 @@ mod tests {
     /// access-token floor are hard errors, nothing is written.
     #[tokio::test]
     async fn import_rejects_row_floods_and_short_tokens() {
-        let state = crate::admin::test_admin_state(Default::default(), Default::default()).await;
+        let (_dir, state) =
+            crate::admin::test_admin_state(Default::default(), Default::default()).await;
         let lang = state.locales.default_lang();
 
         // 501 sources trip the row cap before any DNS work happens.
@@ -993,7 +986,7 @@ mod tests {
     /// validation mirrors the profile form's unreserved-ASCII rule.
     #[tokio::test]
     async fn import_rejects_tokens_outside_the_url_charset() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let lang = state.locales.default_lang();
 
         // Right length, so only the charset rule can reject these.
@@ -1038,7 +1031,7 @@ mod tests {
     /// at `/sub/{id}`.
     #[tokio::test]
     async fn a_source_and_a_profile_may_hold_the_same_slug() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let pool = state.pool.clone();
         let lang = state.locales.default_lang();
 
@@ -1104,7 +1097,7 @@ mod tests {
         // A fresh deployment importing the same file: the source and the
         // profile share a slug, and both must keep it, each in its own
         // table.
-        let fresh = test_state().await;
+        let (_dir, fresh) = test_state().await;
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
             exported_at: 1,
@@ -1129,7 +1122,7 @@ mod tests {
     /// hand-edited file the import screen accepts.
     #[tokio::test]
     async fn repeated_source_reference_stores_the_source_once() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let pool = state.pool.clone();
         let lang = state.locales.default_lang();
         let file = ConfigExport {
@@ -1157,7 +1150,7 @@ mod tests {
     /// ambiguity instead of picking a winner.
     #[tokio::test]
     async fn duplicate_source_reference_is_rejected() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let lang = state.locales.default_lang();
         let dup_text = lang.t("val.dup_ref").replace("{ref}", "srcA0000000");
 
@@ -1199,7 +1192,7 @@ mod tests {
     /// semantically valid, so only the size may reject it.
     #[tokio::test]
     async fn imported_pipelines_respect_the_form_size_cap() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let lang = state.locales.default_lang();
 
         let rules: Vec<serde_json::Value> = (0..800)
@@ -1249,5 +1242,56 @@ mod tests {
         };
         let errors = validate_import(&state, &lang, &file).await;
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// Rotating the export capability token is audited like every other
+    /// admin state change: an info line on the success path, without the
+    /// token value itself. The token is the shared secret of both export
+    /// links and rotation kills them instantly, so the log line is the
+    /// only trace an operator has when a link stops working.
+    #[tokio::test]
+    async fn rotate_alive_token_is_logged_without_the_token_value() {
+        let (_dir, state) = test_state().await;
+        let old = alive_export::ensure_token(&state.pool).await.unwrap();
+
+        // The same writer trick the scheduler tests use.
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let response = rotate_alive_token(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The rotation took effect: a fresh token replaced the old one.
+        let new = fumox_core::repo::meta_get(&state.pool, alive_export::TOKEN_KEY)
+            .await
+            .unwrap()
+            .expect("rotation must persist the fresh token");
+        assert_ne!(new, old);
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("alive-export capability token rotated"),
+            "the rotation must be audited: {logs}"
+        );
+        assert!(
+            !logs.contains(&old) && !logs.contains(&new),
+            "the token value itself must never be logged: {logs}"
+        );
     }
 }

@@ -2457,6 +2457,11 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
     assert!(html.contains("Обзор"), "{html}");
     assert!(html.contains("Прокси по источникам"), "{html}");
     assert!(html.contains("Самые готовые прокси"), "{html}");
+    // The per-source table follows the status machine (unknown first) and
+    // the oldest-ready column replaced "oldest alive"; the protocol and
+    // country columns are gone.
+    assert!(html.contains("Старейший готовый"), "{html}");
+    assert!(!html.contains("Старейший живой"), "{html}");
     // The new Top-N picker renders the default 10 selected.
     assert!(html.contains("Показать топ:"), "{html}");
     // The new Top Failure Reasons panel renders even when empty.

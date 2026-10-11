@@ -130,7 +130,9 @@
   </div>
 </div>
 
-{# Per-source health: alive / ready / quarantined / unknown / removed for every source. #}
+{# Per-source health: the columns walk the status machine in lifecycle
+   order (unknown / alive / ready / quarantine / removed) plus the
+   oldest ready proxy per source. #}
 <div class="panel">
   <h2>{{ self.t("stats.by_source") }}</h2>
   {% if sources.is_empty() %}
@@ -141,15 +143,13 @@
         <thead>
           <tr>
             <th>{{ self.t("common.source") }}</th>
+            <th class="num">{{ self.t("common.status_unknown") }}</th>
             <th class="num">{{ self.t("common.status_alive") }}</th>
             <th class="num">{{ self.t("common.status_ready") }}</th>
             <th class="num">{{ self.t("common.status_quarantine") }}</th>
-            <th class="num">{{ self.t("common.status_unknown") }}</th>
             <th class="num">{{ self.t("common.status_removed") }}</th>
             <th class="num">{{ self.t("common.total") }}</th>
-            <th class="num col-optional">{{ self.t("stats.oldest_alive") }}</th>
-            <th class="num col-optional">{{ self.t("stats.schemes_count") }}</th>
-            <th class="num col-optional">{{ self.t("stats.countries_count") }}</th>
+            <th class="num col-optional">{{ self.t("stats.oldest_ready") }}</th>
           </tr>
         </thead>
         <tbody>
@@ -159,15 +159,13 @@
               <a href="/admin/sources/{{ row.id }}">{{ row.name }}</a>
               {% if row.enabled == 0 %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
             </td>
+            <td class="num">{% if row.unknown > 0 %}<a href="/admin/proxies?status=unknown&amp;source={{ row.id }}">{{ row.unknown }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
             <td class="num">{% if row.alive > 0 %}<a href="/admin/proxies?status=alive&amp;source={{ row.id }}">{{ row.alive }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
             <td class="num">{% if row.ready > 0 %}<a href="/admin/proxies?status=ready&amp;source={{ row.id }}">{{ row.ready }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
             <td class="num">{% if row.quarantine > 0 %}<a href="/admin/proxies?status=quarantine&amp;source={{ row.id }}">{{ row.quarantine }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
-            <td class="num">{% if row.unknown > 0 %}<a href="/admin/proxies?status=unknown&amp;source={{ row.id }}">{{ row.unknown }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
             <td class="num">{% if row.removed > 0 %}<a href="/admin/proxies?status=removed&amp;source={{ row.id }}">{{ row.removed }}</a>{% else %}<span class="muted">0</span>{% endif %}</td>
             <td class="num">{{ row.total }}</td>
-            <td class="small col-optional">{{ self.opt_ts(row.oldest_alive_at) | safe }}</td>
-            <td class="num col-optional">{{ row.schemes }}</td>
-            <td class="num col-optional">{{ row.countries }}</td>
+            <td class="small col-optional">{{ self.opt_ts(row.oldest_ready_at) | safe }}</td>
           </tr>
           {% endfor %}
         </tbody>

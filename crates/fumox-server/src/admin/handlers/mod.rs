@@ -110,18 +110,14 @@ struct SourceStatRow {
     id: String,
     name: String,
     enabled: i64,
+    unknown: i64,
     alive: i64,
     ready: i64,
     quarantine: i64,
-    unknown: i64,
     removed: i64,
     total: i64,
-    /// Oldest `created_at` among this source's alive proxies.
-    oldest_alive_at: Option<i64>,
-    /// Distinct protocol schemes this source has ever yielded.
-    schemes: i64,
-    /// Number of countries among this source's alive proxies.
-    countries: i64,
+    /// Oldest `created_at` among this source's ready proxies.
+    oldest_ready_at: Option<i64>,
 }
 
 /// One row of the "longest-living alive proxies" top.
@@ -276,15 +272,13 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
     // Per-source health counters (single aggregate over the join table).
     let sources: Vec<SourceStatRow> = match sqlx::query_as(
         "SELECT s.id, s.name, s.enabled,
+                COALESCE(SUM(p.status = 'unknown'), 0)   AS unknown,
                 COALESCE(SUM(p.status = 'alive'), 0)     AS alive,
                 COALESCE(SUM(p.status = 'ready'), 0)     AS ready,
                 COALESCE(SUM(p.status = 'quarantine'), 0) AS quarantine,
-                COALESCE(SUM(p.status = 'unknown'), 0)   AS unknown,
                 COALESCE(SUM(p.status = 'removed'), 0)    AS removed,
                 COUNT(DISTINCT p.id)                      AS total,
-                MIN(CASE WHEN p.status = 'alive' THEN p.created_at END) AS oldest_alive_at,
-                COUNT(DISTINCT p.scheme)                  AS schemes,
-                COUNT(DISTINCT CASE WHEN p.status = 'alive' THEN p.geo_country END) AS countries
+                MIN(CASE WHEN p.status = 'ready' THEN p.created_at END) AS oldest_ready_at
          FROM sources s
          LEFT JOIN proxy_source_links l ON l.source_id = s.id
          LEFT JOIN proxies p ON p.id = l.proxy_id

@@ -1355,6 +1355,15 @@ Changes in the working tree, not yet on a published image.
 
 ### Changed
 
+- The dashboard's per-source table follows the status machine order:
+  unknown, alive, ready, quarantine, removed, so a fresh row starts
+  the table instead of sitting between the quarantine and removed
+  counts. "Oldest alive" became "Oldest ready" (the age of the oldest
+  tunnel-verified proxy of the source, measured from `created_at`
+  like the column it replaces), and the "Protocols" and "Countries"
+  columns are gone: a bare count of distinct values read poorly, and
+  the protocol and country split panels below already carry the
+  breakdown.
 - The pipeline builder is three tabs instead of one column of seven
   sections. The sections are grouped in the order the pipeline runs:
   *Input* (protocol filter), *Rules* (renaming and discarding, the lists

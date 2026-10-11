@@ -179,11 +179,7 @@
            operator typed on a failed-save replay. An empty submit keeps
            the current token. #}
         <input type="password" id="admin-token" name="admin.token" autocomplete="off" value="{{ self.raw_value("admin.token") }}"{{ self.fields_disabled() }}>
-        {# No catalog key carries the keep-current semantics and the
-           locale files are outside this change's boundary, so this one
-           hint sentence ships inline (English-only) rather than the
-           live token being echoed into the markup it replaces. #}
-        <div class="hint">Leave empty to keep the current token.</div>
+        <div class="hint">{{ self.t("set.token_keep_hint") }}</div>
         <div class="hint">{{ self.t("set.edit_token_warning") }}</div>
         {% match self.error_for("admin.token") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>

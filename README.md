@@ -47,16 +47,30 @@ Configuration lives in [`config/app.toml`](./config/app.toml); every key has a
 default and can be overridden through the environment: `FUMOX_SECTION__KEY`
 (e.g. `FUMOX_ADMIN__TOKEN=secret`).
 
-MaxMind GeoLite2 databases (`.mmdb`) are not part of the repository. Download
-them into `config/` separately:
+Geo enrichment uses MaxMind GeoLite2 databases (`.mmdb`, not part of the
+repository). **The server downloads them itself**: at startup it checks
+`[geo].db_dir` (default `config/`) and fetches any database that is missing,
+broken or older than a month, waiting at most
+`[geo].startup_download_budget_secs` (60 s) before it starts serving; a
+slower download continues in the background and takes effect on the next
+start. No manual step is required.
 
-1. Sign up at <https://www.maxmind.com/en/geolite2/signup> (free account).
-2. Download the databases you need via
+To ship your own files instead (e.g. with your own MaxMind license, sign up
+at <https://www.maxmind.com/en/geolite2/signup>):
+
+1. Download the databases you need via
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/):
    `GeoLite2-City.mmdb` for country flags/names and city names
    (`GeoLite2-ASN.mmdb` adds AS numbers/organizations; every database
    present is merged, so they combine in one name template).
-3. Place each file in `config/` under its canonical name.
+2. Place each file under its canonical name in `[geo].db_dir` (`config/` for
+   source runs). **The shipped Compose stack overrides the
+   directory to `/shared`** (`FUMOX_GEO__DB_DIR` in `docker-compose.yml`,
+   the volume shared with meow), and the environment outranks `app.toml`,
+   so a `.mmdb` dropped into `./config` is never read there: copy it into
+   the `meow-shared` volume
+   (`docker compose cp GeoLite2-City.mmdb server:/shared/`) or drop the
+   override and set `[geo].db_dir` instead.
 
 Without a database file, geo enrichment disables itself automatically (a
 warning is logged) and the server keeps running. MaxMind databases are updated

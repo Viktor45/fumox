@@ -240,9 +240,10 @@ impl RateLimiter {
     /// Give one hit back to `key`'s window: the outer middleware counts
     /// every request up front, but a deeper rate-limiting layer may reject
     /// the very same request too, without the refund the outer window pays
-    /// for hits the inner limiter already punished. Saturating: a refund for a key whose counter already
-    /// expired with its window (or never existed) must never wrap below
-    /// zero, the wrap would blacklist the key for the whole window.
+    /// for hits the inner limiter already punished. Saturating: a refund
+    /// for a key whose counter already expired with its window (or never
+    /// existed) must never wrap below zero, the wrap would blacklist the
+    /// key for the whole window.
     pub async fn refund(&self, key: &str) {
         let init = async { Ok::<_, std::convert::Infallible>(Arc::new(AtomicU64::new(0))) };
         if let Ok(counter) = self.counters.try_get_with(key.to_string(), init).await {
@@ -466,12 +467,13 @@ mod tests {
         );
     }
 
-    /// A chain the walk can exhaust, every XFF entry inside the trust list
-    /// , beside a header that names a client is the one disagreement that
-    /// is not a forgery: an all-trusted XFF is evidence that the peer wrote
-    /// it (only a trusted hop's appending puts a trusted address there, and
-    /// the client then sits further left, in the other header). The mirror
-    /// shape is pinned too, so neither direction is accidental.
+    /// A chain the walk can exhaust, every XFF entry inside the trust
+    /// list, beside a header that names a client is the one disagreement
+    /// that is not a forgery: an all-trusted XFF is evidence that the
+    /// peer wrote it (only a trusted hop's appending puts a trusted
+    /// address there, and the client then sits further left, in the
+    /// other header). The mirror shape is pinned too, so neither
+    /// direction is accidental.
     #[test]
     fn an_exhausted_chain_defers_to_the_header_that_names_a_client() {
         let trusted: Vec<ipnet::IpNet> =
@@ -627,8 +629,9 @@ mod tests {
         );
     }
 
-    /// A refunded hit opens the window slot it consumed: a request that passed this limiter but was rejected by
-    /// a deeper one must not cost this window anything.
+    /// A refunded hit opens the window slot it consumed: a request that
+    /// passed this limiter but was rejected by a deeper one must not cost
+    /// this window anything.
     #[tokio::test]
     async fn rate_limiter_refund_returns_the_hit_to_the_window() {
         let limiter = RateLimiter::new(2, Duration::from_secs(60));

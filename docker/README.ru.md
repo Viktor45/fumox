@@ -46,14 +46,25 @@ podman build -t localhost/fumox:local .
 podman build -t localhost/fumox-meow:local docker/meow
 ```
 
-Каталог конфигурации (app.toml + опциональные GeoLite2-*.mmdb) должен лежать
-в понятном абсолютном пути, например `~/fumox/config`:
+Каталог конфигурации (только app.toml; файлы GeoLite2-*.mmdb сюда
+**не** кладутся, см. ниже) должен лежать в понятном абсолютном пути,
+например `~/fumox/config`:
 
 ```sh
 mkdir -p ~/fumox/config
 cp config/app.toml ~/fumox/config/
-cp config/GeoLite2-*.mmdb ~/fumox/config/   # опционально: гео-обогащение
 ```
+
+Гео-обогащение смотрит в общий volume, а не в каталог конфигурации: оба
+варианта (и kube-манифест) задают `FUMOX_GEO__DB_DIR=/shared` — volume,
+общий с meow (quadlet: `fumox-shared.volume`, `VolumeName=meow-shared`;
+kube: PVC `meow-shared`), то же хранилище, где meow держит свой
+Clash-конфиг, — а окружение сильнее `[geo].db_dir`, поэтому `.mmdb`,
+положенные в каталог конфигурации, молча никогда не сканируются. Сервер
+скачивает базы GeoLite2 в `/shared` при старте, так что ручной шаг
+опционален; чтобы положить свои файлы, скопируйте их в этот volume
+(`podman volume mount meow-shared` печатает путь на хосте — тот же прием,
+что и в миграции БД ниже).
 
 ## Вариант A: `quadlet/` (рекомендуется)
 

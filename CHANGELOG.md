@@ -77,6 +77,11 @@ Changes in the working tree, not yet on a published image.
 
 ### Fixed
 
+- The *Edit settings* page carried a hardcoded English hint under the
+  admin token field ("Leave empty to keep the current token.") while
+  every other string on the panel comes from the catalog: a Russian
+  operator saw one English sentence on the most sensitive form. The
+  hint is the `set.token_keep_hint` catalog key now.
 - A quarantined hysteria2 could never come back. Its second chance and
   ladder steps were plain TCP connects, and a TCP connect to a QUIC
   port fails unconditionally, so a single T2-blip quarantine walked
@@ -549,7 +554,7 @@ Changes in the working tree, not yet on a published image.
   in `insecure_aliases_collapse` / `falsy_insecure_equals_absent`.
   Upgrade note: every node carrying one of these parameters or
   spellings hashes differently now, and the first re-ingest after
-  upgrading re-identifies it — reconcile matches rows by fingerprint
+  upgrading re-identifies it: reconcile matches rows by fingerprint
   alone, so the node gets a fresh row starting at `unknown`, while its
   status, latency and probe history stay on the old row (which then
   retires, or lingers as a duplicate under
@@ -1174,20 +1179,20 @@ Changes in the working tree, not yet on a published image.
   only the expiry timestamp and the session key is frozen at startup,
   so a stolen or copied cookie stayed valid until its TTL. A
   revocation epoch is persisted in the `meta` table and mixed into the
-  session key (`HMAC(session_key, epoch_be)`); a bump — on logout and
-  on token rotation — invalidates every cookie minted before it at
+  session key (`HMAC(session_key, epoch_be)`); a bump (on logout and
+  on token rotation) invalidates every cookie minted before it at
   once, and it survives a restart because it lives in the database.
   This deliberately rejects pre-epoch cookies too: they MACed the bare
   session key and match no epoch, so the first login after upgrading
   to this build fails and costs one re-login (rolling back to the
-  previous build costs the same, symmetrically — the old binary
+  previous build costs the same, symmetrically: the old binary
   rejects the new cookie format as well).
 - The admin middleware rejects cross-site requests before auth, CSRF
   and rate limiting, answering `403` (`err.cross_site`) without
   charging the rate-limit window. A request is cross-site when
   `Sec-Fetch-Site: cross-site` says so (top-level `navigate`
   document GETs are exempt, so opening `/admin` from a link or
-  bookmark still works), or — for clients without Fetch Metadata —
+  bookmark still works), or, for clients without Fetch Metadata,
   when it carries an `Origin` that does not belong to the panel:
   `Origin: null`, an unparsable origin, or an origin whose host:port
   differs from the `Host` header. Requests with none of these headers
@@ -1198,7 +1203,7 @@ Changes in the working tree, not yet on a published image.
   forwards `Host` unchanged: a proxy that rewrites `Host` away from
   the origin the browser sees makes non-browser integrations that
   send an `Origin` header answer `403` (they must drop the header,
-  or the proxy must pass the original `Host` through — the same
+  or the proxy must pass the original `Host` through: the same
   requirement `host_gate` already imposed).
 
 ### Docs
@@ -1318,6 +1323,35 @@ Changes in the working tree, not yet on a published image.
   comment described, and the one this batch's `limit` fix made true,
   so a multi-source profile serves each source's top up to that count,
   i.e. more than `count` in total. Both tables now say which is which.
+- The root READMEs (English and Russian) missed the geo rework entirely:
+  they still told operators to download the GeoLite2 `.mmdb` files into
+  `config/` as a required three-step ritual, the state before the
+  automatic download and the Compose `/shared` override existed: on a
+  stock `docker compose up` the manual step was not only unnecessary but
+  a no-op, because the stack pins `FUMOX_GEO__DB_DIR=/shared` and the
+  environment outranks the file. The READMEs now lead with the automatic
+  download (the `[geo].startup_download_budget_secs` wait included), keep
+  the MaxMind signup steps as the optional "ship your own files" path,
+  and say where those files have to go under Compose: into the
+  `meow-shared` volume
+  (`docker compose cp GeoLite2-City.mmdb server:/shared/`), or drop the
+  override and set `[geo].db_dir` instead. The production checklist item
+  in both guides no longer phrases the download as an operator step: the
+  check is that geo enrichment works, not that someone downloaded a file.
+- `docker/README.ru.md` was missed when the English deployment guide grew
+  the same geo correction in this batch: it still headed its preparation
+  section with "app.toml + optional GeoLite2-*.mmdb" and carried a
+  `cp config/GeoLite2-*.mmdb` line that silently did nothing on both
+  variants (both set `FUMOX_GEO__DB_DIR=/shared`). The Russian text
+  mirrors the English one now: the config directory is app.toml only,
+  geo points at the `meow-shared` volume, and the manual step is
+  optional because the server downloads the databases itself.
+- The documentation batch that landed after the last antislop audit
+  (`anti-slop/audit-005-2026-10-11.md`) carried eighteen English em
+  dashes across `CHANGELOG.md`, `USERGUIDE.md`, `README.md`,
+  `.env.example` and `docker/README.md`. All are rewritten to colons,
+  commas or parentheses; facts and anchors unchanged. Russian dash
+  usage follows the standing owner decision and was not touched.
 
 ### Changed
 

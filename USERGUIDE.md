@@ -242,7 +242,7 @@ Notes:
 > or add `127.0.0.1` to `[server].allowed_hosts` as well.
 >
 > The admin panel also answers `403` (`err.cross_site`) to requests it
-> classifies as cross-site — `Sec-Fetch-Site: cross-site` (top-level
+> classifies as cross-site: `Sec-Fetch-Site: cross-site` (top-level
 > navigations to `/admin` are exempt), `Origin: null`, or an `Origin`
 > whose host:port does not match the `Host` header. Browsers on the
 > panel's own origin and header-less clients (curl, monitoring) are
@@ -350,7 +350,7 @@ cargo build --release
 ./target/release/fumox-probe             # health-check daemon (separate process)
 ```
 
-The command-line options, per binary — they are not identical: only
+The command-line options differ per binary: only
 `fumox-server` has `--health-check`:
 
 ```
@@ -879,8 +879,8 @@ rules use the same selectors as rename (`match`, `flags`, `target`; no
 `replace`, the strict schema rejects it) and are OR-ed: a single match
 discards the proxy. The `asn` target is the exception to the regex
 selectors: it takes no `match`/`flags` (the strict schema rejects them) and
-instead requires a non-empty per-rule `asns` list — both `"24940"` and
-`"AS24940"` spellings work — discarding every proxy whose resolved AS
+instead requires a non-empty per-rule `asns` list (both `"24940"` and
+`"AS24940"` spellings work), discarding every proxy whose resolved AS
 number is in the list; a proxy whose ASN was never resolved matches
 nothing. They are applied twice, always before `rename` so both
 sides see the original values: at ingestion by the source's own pipeline
@@ -1329,7 +1329,7 @@ stored.
       header unchanged (nginx: `proxy_set_header Host $host;`, which the
       shipped `docker/nginx/` example already does). The admin panel
       rejects requests it classifies as cross-site with `403`
-      (`err.cross_site`) before auth, CSRF and rate limiting —
+      (`err.cross_site`) before auth, CSRF and rate limiting:
       `Sec-Fetch-Site: cross-site` (top-level navigations to `/admin`
       are exempt), `Origin: null`, or an `Origin` whose host:port does
       not match `Host`. Browsers on the panel's own origin and
@@ -1348,7 +1348,10 @@ stored.
       with restart policy) with its REST API at `[meow].api_addr`;
       `[meow].config_path` is readable by the meow-rs process.
 - [ ] `[meow].test_url` is reachable from your proxies' networks.
-- [ ] GeoLite2 database downloaded into `[geo].db_dir` (if you want geo names).
+- [ ] Geo enrichment works: the server downloads the GeoLite2 databases into
+      `[geo].db_dir` itself, provided the directory is writable (under Compose
+      that is `/shared`, not `./config`); check that names carry flags
+      and countries if you want geo names.
 - [ ] Regular DB backups via `sqlite3 ".backup"`.
 - [ ] Process supervision with automatic restart (`systemd`, Docker
       `restart: unless-stopped`, etc.). Both binaries shut down gracefully on

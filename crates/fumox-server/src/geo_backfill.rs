@@ -35,12 +35,14 @@ const GEO_LOOKUP_CONCURRENCY: usize = 32;
 /// this default only backs [`backfill_missing_geo`], the config-less shape
 /// the tests drive. Past the budget the pass stops issuing lookups and the
 /// rows it did not reach stay NULL for the next start.
+#[cfg(test)]
 const DEFAULT_STARTUP_BUDGET: Duration = Duration::from_secs(60);
 
 /// Fill geo facts for every proxy row that has none, bounded by
 /// [`DEFAULT_STARTUP_BUDGET`] (the tests' config-less shape; `main` calls
 /// [`backfill_missing_geo_within_budget`] with the configured budget).
 /// Never blocks startup: call sites spawn it as a background task.
+#[cfg(test)]
 pub async fn backfill_missing_geo(pool: DbPool, geo: Arc<GeoResolver>) {
     backfill_missing_geo_within_budget(pool, geo, DEFAULT_STARTUP_BUDGET).await;
 }

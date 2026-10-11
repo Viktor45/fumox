@@ -1609,6 +1609,7 @@ enum SelectorBind {
 /// visit and temp-sort every matching row before the LIMIT applies). The
 /// comparison and order fragments are fixed literals of this module
 /// (`>=`, `<`, `ASC`, `DESC`), never caller text.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_window_leg<T>(
     pool: &DbPool,
     select_list: &str,

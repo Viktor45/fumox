@@ -558,7 +558,7 @@ panel entirely: every `/admin/*` route answers 404.
 Built-in protections: CSRF tokens on every form, per-IP rate limiting
 (`120/min` general, `5/min` on login), security response headers
 (`X-Frame-Options: DENY`, `Content-Security-Policy`, `nosniff`,
-`no-referrer`), proxy credentials masked in all lists
+`Referrer-Policy: same-origin`), proxy credentials masked in all lists
 (full value only on the proxy detail page, on explicit request).
 
 ### What's inside

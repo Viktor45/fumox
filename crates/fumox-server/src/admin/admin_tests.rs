@@ -561,6 +561,16 @@ async fn login_flow_grants_access_and_wrong_token_does_not() {
             .unwrap(),
         security::CONTENT_SECURITY_POLICY
     );
+    // The referrer policy must stay off `no-referrer`: per Fetch, that
+    // policy stamps `Origin: null` on the request, which
+    // `cross_site_context` rejects, so the login form's own navigation
+    // POST could never pass the gate (`403 err.cross_site`). `same-origin`
+    // keeps the panel URL from third-party origins and lets the browser
+    // send the real Origin.
+    assert_eq!(
+        response.headers().get(header::REFERRER_POLICY).unwrap(),
+        "same-origin"
+    );
 }
 
 #[tokio::test]

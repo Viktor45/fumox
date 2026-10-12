@@ -77,6 +77,18 @@ Changes in the working tree, not yet on a published image.
 
 ### Fixed
 
+- The admin panel answered `403 err.cross_site` ("межсайтовый запрос
+  отклонён") to the login form's own submit, in every browser, so the
+  panel could not be logged into at all. The panel sets
+  `Referrer-Policy: no-referrer` on every response, and per Fetch a
+  request whose referrer policy resolves to `no-referrer` is stamped
+  with `Origin: null`, which the panel's own cross-site gate
+  (`admin::auth::cross_site_context`) rejects before authentication.
+  The token was never at fault, and neither was a proxy: the request
+  that came back was the browser's own navigation POST carrying a
+  null origin. The policy is now `same-origin`, which still keeps the
+  panel URL away from third-party origins (the leak the header exists
+  to prevent) while letting the browser send its real origin.
 - The *Edit settings* page carried a hardcoded English hint under the
   admin token field ("Leave empty to keep the current token.") while
   every other string on the panel comes from the catalog: a Russian

@@ -232,7 +232,7 @@ fn request_is_https_trusted_peer_with_explicit_http_stays_http() {
 /// `request_is_https` scheme detection key on. Its failure mode is
 /// deliberate fail-closed design: an unparsable entry is logged and
 /// dropped, never defaulted into trust. These tests pin that contract,
-/// because the failure is silent by construction — a dropped entry
+/// because the failure is silent by construction: a dropped entry
 /// degrades per-IP rate limiting to peer-IP keying and turns the
 /// X-Forwarded-Proto scheme detection off, with no error beyond a
 /// startup log line.

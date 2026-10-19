@@ -307,7 +307,7 @@ pub(crate) fn admin_next(params: &std::collections::HashMap<String, String>) -> 
 
 /// One entry of the trusted-proxy list: an explicit CIDR (`10.0.0.0/8`)
 /// or a bare address (`192.168.1.1`, read as its `/32` / `/128` host
-/// prefix — what the settings form hint advertises). `None` when the
+/// prefix, what the settings form hint advertises). `None` when the
 /// entry is unparsable; the caller decides whether to refuse it (the
 /// settings save path) or log-and-drop it (the startup load below).
 pub(crate) fn parse_trusted_cidr_entry(entry: &str) -> Option<ipnet::IpNet> {
@@ -640,8 +640,8 @@ fn request_is_https(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipne
 /// registry, for the log-capturing test modules (auth, scheduler): a call
 /// site's interest is cached against the dispatchers live at its FIRST
 /// execution, and when the registry holds fewer than two, tracing consults
-/// the *registering thread's* thread-local default — in a parallel test
-/// suite usually no subscriber at all — so call sites get cached as
+/// the *registering thread's* thread-local default (in a parallel test
+/// suite usually no subscriber at all) so call sites get cached as
 /// `Interest::never` and their events go silently nowhere for the rest of
 /// the process (an intermittent failure that depends purely on test
 /// scheduling). With the registry permanently multi-dispatcher, every
@@ -651,7 +651,7 @@ fn request_is_https(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipne
 /// to the empty global default and drop their events as before.
 ///
 /// Call once before the first capture; the two subscribers leak on
-/// purpose — the permanently-live registrars are the point.
+/// purpose: the permanently-live registrars are the point.
 #[cfg(test)]
 pub(crate) fn stabilize_callsite_interests() {
     static ONCE: std::sync::Once = std::sync::Once::new();

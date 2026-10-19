@@ -139,7 +139,7 @@ pub async fn meta_set(pool: &DbPool, key: &str, value: &str) -> crate::Result<()
 
 /// Atomically increment an integer counter key in `meta`, creating it at 1
 /// when absent, and return the new value. A single upsert, so two
-/// concurrent callers each observe their own bump — a `meta_get` +
+/// concurrent callers each observe their own bump: a `meta_get` +
 /// `meta_set` pair would race them onto the same value. A pre-existing
 /// non-integer value casts to 0 and self-heals from 1. Stored through the
 /// TEXT-affinity column, so `meta_get` still reads the number back as text.
@@ -175,7 +175,7 @@ mod tests {
 
     /// Fresh migrated pool on a scoped temp database: keep the returned
     /// guard in scope (`let (_dir, pool) = temp_pool().await`) and the
-    /// whole directory — database included — is removed when it drops.
+    /// whole directory, database included, is removed when it drops.
     pub(crate) async fn temp_pool() -> (crate::tempdir_lite::TempDir, DbPool) {
         let dir = crate::tempdir_lite::TempDir::new("repo");
         let cfg = crate::config::DatabaseConfig {

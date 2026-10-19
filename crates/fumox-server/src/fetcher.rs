@@ -380,7 +380,7 @@ fn redact_url(url: &str) -> String {
 }
 
 /// Mask the value of every credential-bearing pair of a raw query string,
-/// keeping the harmless pairs verbatim — they are the diagnostics. The
+/// keeping the harmless pairs verbatim; they are the diagnostics. The
 /// raw string is edited in place rather than round-tripped through
 /// `query_pairs_mut`, whose form-encoding would rewrite benign values
 /// (`%20` → `+`) while "fixing" them.

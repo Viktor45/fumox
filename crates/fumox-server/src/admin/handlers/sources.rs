@@ -1250,7 +1250,7 @@ pub async fn source_dry_run(
         // Plain-browser path: this fragment is the HTMX swap target inside
         // the source card, so a plain POST would land on a chrome-less
         // page. Redirect back to the card with the outcome as a flash
-        // message instead — the same plain-browser fallback as
+        // message instead, the same plain-browser fallback as
         // `source_refresh`.
         flash_redirect(
             &format!("/admin/sources/{id}"),

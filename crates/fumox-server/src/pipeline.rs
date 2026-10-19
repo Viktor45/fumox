@@ -329,7 +329,7 @@ pub(crate) struct SortConfig {
 /// fails with the field-level `pipeline.invalid_limit`
 /// error instead of an opaque serde type error; `null`/missing means "no
 /// cap", the explicit-defaults reset of the profile tri-state. Unlike the
-/// other fields, `count` serializes even when `None` — `"count": null` is
+/// other fields, `count` serializes even when `None`: `"count": null` is
 /// the explicit no-cap reset the builder emits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2376,7 +2376,7 @@ mod tests {
     #[test]
     fn typed_config_serializes_omitting_defaults() {
         // The Serialize side is the builder emit's policy. A config with
-        // every section unset serializes to bare `{"version": 1}` — the
+        // every section unset serializes to bare `{"version": 1}`: the
         // JSON that makes the builder emit collapse to NULL.
         let bare = PipelineConfig {
             version: 1,

@@ -847,7 +847,7 @@ impl RowId for fumox_core::models::Profile {
 /// built eagerly but only awaited after the format check passes, and a DB
 /// error counts as "free" (a slug that sneaks through still fails the
 /// table's UNIQUE constraint at save time, as before). A row that is not
-/// `existing_id` — the row being edited — means the slug is taken. Empty
+/// `existing_id` (the row being edited) means the slug is taken. Empty
 /// input yields `None`; problems are pushed as `slug`-field errors.
 async fn validate_slug<T, F>(
     slug_raw: &str,

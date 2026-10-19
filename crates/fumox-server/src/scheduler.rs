@@ -165,7 +165,7 @@ impl SchedulerState {
     /// including the wait for a `[fetch].max_concurrency` permit: the
     /// status fragment stops polling once this turns `false`, so a queued
     /// *Refresh now* must not look finished while its task still sits on
-    /// the semaphore. The SSE stream carries the narrower signal —
+    /// the semaphore. The SSE stream carries the narrower signal:
     /// `fetch.queued` at spawn, `fetch.started` once a request can actually
     /// go out.
     pub async fn is_in_flight(&self, source_id: &str) -> bool {
@@ -232,9 +232,9 @@ impl Drop for SweepGuard {
 /// Retention windows the scheduler enforces itself, read once at startup.
 ///
 /// The probe daemon runs the full retention loop, but the two binaries are
-/// independent and a server-only deployment — a state the architecture
+/// independent and a server-only deployment (a state the architecture
 /// explicitly allows, the panel warning about a missing daemon rather than
-/// refusing to work — writes a `fetch_log` row per fetch attempt and
+/// refusing to work) writes a `fetch_log` row per fetch attempt and
 /// enqueues `probe_requests` per refresh with nothing draining them. The
 /// scheduler therefore sweeps exactly the two tables the server itself
 /// writes with the same cutoffs the daemon's loop derives from the config
@@ -345,7 +345,7 @@ async fn retention_sweep(pool: &DbPool, retention: &ServerRetention) {
     }
     // Priority-queue housekeeping, same as the daemon: rows whose proxy no
     // longer needs the priority lane, and stale leftovers from a probe
-    // that is offline — or absent.
+    // that is offline or absent.
     match probe::purge_settled_checks(pool).await {
         Ok(0) => {}
         Ok(deleted) => {
@@ -476,7 +476,7 @@ pub async fn run(
 
 /// Handle one *Refresh now* id from the admin panel: look the row up and spawn
 /// the ingest. A stale panel id is a warning, a failed lookup an error naming
-/// the source — a broken database must not masquerade as "unknown source".
+/// the source: a broken database must not masquerade as "unknown source".
 async fn dispatch_refresh(
     env: &IngestEnv,
     state: &SchedulerState,
@@ -1307,7 +1307,7 @@ mod tests {
     /// rendered output containing the source, an ingest that changed
     /// nothing (the freshness short-circuit, all-zero stats) keeps them.
     /// The decision lives in `spawn_ingest`, so both branches of its
-    /// condition are pinned here — a regression that flips the condition
+    /// condition are pinned here: a regression that flips the condition
     /// or misreads the stats now fails instead of passing silently.
     #[tokio::test]
     async fn a_data_changing_ingest_drops_renderings_and_a_quiet_one_keeps_them() {

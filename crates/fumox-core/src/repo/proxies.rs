@@ -766,7 +766,7 @@ pub struct ProxyListRow {
     pub t2_checked: bool,
 }
 
-/// Count the rows the admin proxy browser would show for `filter` — the
+/// Count the rows the admin proxy browser would show for `filter`: the
 /// same clause set [`list_filtered`] applies.
 pub async fn count_filtered(pool: &DbPool, filter: &ProxyListFilter) -> crate::Result<i64> {
     let wf = filter.where_filter();
@@ -1612,7 +1612,7 @@ pub const T2_SCHEMES: &[&str] = &[
     "anytls",
 ];
 
-/// Schemes whose quarantined rows revive through the T2 tunnel check — a TCP
+/// Schemes whose quarantined rows revive through the T2 tunnel check: a TCP
 /// connect to a QUIC port proves nothing. Exactly hysteria2; tuic/mieru keep
 /// the T1 recheck ladder.
 pub const T2_REVIVAL_SCHEMES: &[&str] = &["hysteria2"];
@@ -1635,7 +1635,7 @@ enum SelectorBind {
 /// One leg of a bounded-window draw: up to `window` eligible rows on one
 /// side of `anchor` in id order. The id comparison rides the rowid index,
 /// so the leg stops after `window` matches without materializing the rest
-/// of the pool — the property `ORDER BY RANDOM() LIMIT ?` lacks (it must
+/// of the pool: the property `ORDER BY RANDOM() LIMIT ?` lacks (it must
 /// visit and temp-sort every matching row before the LIMIT applies). The
 /// comparison and order fragments are fixed literals of this module
 /// (`>=`, `<`, `ASC`, `DESC`), never caller text.
@@ -1870,7 +1870,7 @@ pub async fn oldest_quarantined_at(pool: &DbPool) -> crate::Result<Option<i64>> 
 /// so a single comparison suffices and the failed step travels in
 /// `ladder_step`.
 ///
-/// Rows of the [`T2_REVIVAL_SCHEMES`] schemes are not offered here — their
+/// Rows of the [`T2_REVIVAL_SCHEMES`] schemes are not offered here: their
 /// lane is [`select_due_quarantine_t2`], so a due row is never charged by
 /// both lanes in one cycle.
 ///
@@ -1907,7 +1907,7 @@ pub async fn select_due_quarantine(
 }
 
 /// The T2 counterpart of [`select_due_quarantine`]: due rows of the
-/// [`T2_REVIVAL_SCHEMES`] schemes, as full rows — the tunnel check needs the
+/// [`T2_REVIVAL_SCHEMES`] schemes, as full rows: the tunnel check needs the
 /// credentials and the ladder step that [`DueQuarantine`] omits.
 ///
 /// Drawn through [`select_window_sample`] like its T1-side sibling: a

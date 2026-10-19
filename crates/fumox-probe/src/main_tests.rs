@@ -125,7 +125,7 @@ async fn t2_vet_block_is_journaled_even_without_meow() {
     // A private host that would never pass the gate. The proxy is
     // `ready`, so the T1 sample never draws it (T1 takes
     // `unknown`/`alive`) and the vet refusal is the cycle's only
-    // verdict for it — charged exactly once to the fail ladder.
+    // verdict for it: charged exactly once to the fail ladder.
     let id = seed_proxy(&pool, "vless", "127.0.0.1", 1, "ready").await;
 
     // meow-rs is unreachable on a closed port.
@@ -856,7 +856,7 @@ async fn t1_cycle_promotes_live_proxy_and_quarantines_dead_one() {
 
     // Cycle 1: live proxy becomes alive (T1), dead one collects fail #1
     // (T1). The T2 batch skips the row the T1 sample just gave a
-    // verdict, so the promoted proxy sees no T2 check in this cycle —
+    // verdict, so the promoted proxy sees no T2 check in this cycle:
     // it is the head of the next cycle's batch.
     run_cycle(ctx.clone()).await.unwrap();
     let row = proxies::get_by_id(&pool, live).await.unwrap().unwrap();
@@ -1553,7 +1553,7 @@ async fn t1_sample_and_t2_batch_do_not_double_charge_a_cycle() {
     let (_dir, pool) = temp_pool().await;
 
     // Mock meow-rs: the engine is alive but every delay check fails,
-    // so a T2 verdict is a charged failure — exactly the second charge
+    // so a T2 verdict is a charged failure: exactly the second charge
     // the hand-off must prevent.
     let app = Router::new()
         .route(

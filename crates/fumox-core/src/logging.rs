@@ -3,7 +3,7 @@
 //! The filter defaults to the `[log]` level from the config (each binary
 //! takes its own key: `server` / `probe`) and can be overridden with the
 //! standard `RUST_LOG` environment variable (e.g.
-//! `RUST_LOG=fumox_core=debug,info`), which always wins — verbatim: the
+//! `RUST_LOG=fumox_core=debug,info`), which always wins verbatim: the
 //! sqlx silencer is added to the fallback only, never layered on `RUST_LOG`.
 
 use tracing_subscriber::EnvFilter;

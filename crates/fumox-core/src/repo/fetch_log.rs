@@ -156,7 +156,7 @@ impl FetchLogFilter {
     }
 }
 
-/// Count the journal rows the admin screen would show for `filter` — the
+/// Count the journal rows the admin screen would show for `filter`: the
 /// same clause set [`list_page`] applies.
 pub async fn count_filtered(pool: &DbPool, filter: &FetchLogFilter) -> crate::Result<i64> {
     let wf = filter.where_filter();
@@ -360,7 +360,7 @@ mod tests {
             .await
             .unwrap();
         }
-        // (fetched_at, source, ok, error_class) — four attempts.
+        // (fetched_at, source, ok, error_class): four attempts.
         let rows = [
             (1000, "srcA0000000", 1, None),
             (1001, "srcA0000000", 0, Some("network")),

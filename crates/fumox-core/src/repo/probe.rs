@@ -37,7 +37,7 @@ pub mod meta {
 
     /// `probe_heartbeat`: the daemon's liveness stamp, upserted on every
     /// beat. `interval_secs` and `cycle_interval_secs` are the beat and
-    /// cycle periods the daemon actually runs — server and probe may read
+    /// cycle periods the daemon actually runs; server and probe may read
     /// different config files, so the panel thresholds staleness against
     /// these rather than its own config copy. Both optional: stamps
     /// written before the fields existed must still parse, the reader

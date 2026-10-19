@@ -64,7 +64,7 @@ const SESSION_EPOCH_KEY: &str = "admin_session_epoch";
 /// SELECT on the tiny `meta` table is noise next to a panel request, and a
 /// per-process cache would go stale against the source of truth the moment
 /// anything but this process writes the row. A read error yields 0 without
-/// failing the request — a stricter epoch, never a looser one, so live
+/// failing the request: a stricter epoch, never a looser one, so live
 /// cookies either verify as usual or fail closed (the panel is useless
 /// with the database down anyway).
 async fn session_epoch(pool: &fumox_core::db::DbPool) -> u64 {
@@ -102,7 +102,7 @@ pub(crate) async fn revoke_all_sessions(pool: &fumox_core::db::DbPool) -> bool {
 /// Mix the revocation epoch into the effective session key with
 /// `HMAC(session_key, epoch_be_bytes)`: a bump changes the effective key,
 /// so every cookie minted before it stops verifying even though
-/// `[admin].token` — and with it the stored session key — did not change.
+/// `[admin].token`, and with it the stored session key, did not change.
 /// This also rejects pre-epoch cookies, which MACed the bare session key:
 /// they match no epoch, so upgrading costs one re-login.
 fn epoch_session_key(key: &[u8], epoch: u64) -> Vec<u8> {
@@ -124,7 +124,7 @@ pub fn issue_session(key: &[u8], ttl: Duration, epoch: u64) -> String {
 
 /// Verify a session cookie value; returns the expiry timestamp when valid.
 /// `epoch` must be the current server-side epoch: a cookie minted under an
-/// older one — before a logout bump — is rejected here.
+/// older one (before a logout bump) is rejected here.
 pub fn verify_session(key: &[u8], value: &str, epoch: u64) -> Option<i64> {
     let (expires, provided) = value.split_once('.')?;
     let expires_ts: i64 = expires.parse().ok()?;
@@ -168,7 +168,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str>
 }
 
 /// `(host, port)` of a `host[:port]` authority, IPv6-bracket aware.
-/// `None` for anything outside that grammar — unparsable means "cannot
+/// `None` for anything outside that grammar: unparsable means "cannot
 /// establish same-origin", which callers treat as the cross-site direction.
 fn authority_parts(authority: &str) -> Option<(&str, Option<u16>)> {
     let authority = authority.trim();
@@ -179,7 +179,7 @@ fn authority_parts(authority: &str) -> Option<(&str, Option<u16>)> {
         return Some((host, port));
     }
     match authority.rsplit_once(':') {
-        // host:port — the port side must be digits, else this is a bare
+        // host:port; the port side must be digits, else this is a bare
         // (unbracketed, technically illegal) IPv6 literal.
         Some((host, port))
             if !host.is_empty()
@@ -215,8 +215,8 @@ fn same_authority(a: &str, b: &str) -> bool {
     }
 }
 
-/// Positive evidence that the request was issued from a cross-site context
-/// — a web page on another origin driving the operator's browser.
+/// Positive evidence that the request was issued from a cross-site context:
+/// a web page on another origin driving the operator's browser.
 ///
 /// Primary signal: the Fetch Metadata `Sec-Fetch-Site` header, set by the
 /// browser itself and not forgeable from page scripts. Any value that is
@@ -229,13 +229,13 @@ fn same_authority(a: &str, b: &str) -> bool {
 ///
 /// Without Fetch Metadata (older browsers) the `Origin` header decides:
 /// cross-origin GET navigations carry no Origin, so an Origin here is a
-/// POST or a CORS-mode fetch — never a plain link click. `Origin: null`
+/// POST or a CORS-mode fetch, never a plain link click. `Origin: null`
 /// (sandboxed frame, opaque origin) and an unparsable mismatch count as
 /// cross-site. The comparison inherits the panel's existing assumption
 /// that any reverse proxy preserves the `Host` header (`host_gate`,
 /// `serve_base` build on it).
 ///
-/// Absence of all signals — curl, health checks, monitoring — is not
+/// Absence of all signals (curl, health checks, monitoring) is not
 /// evidence and never rejects.
 fn cross_site_context(method: &Method, headers: &HeaderMap) -> bool {
     if let Some(site) = header_str(headers, "sec-fetch-site") {
@@ -498,12 +498,12 @@ pub async fn set_lang(
 }
 
 /// Log out: clear the cookie *and* bump the server-side session epoch, so
-/// the exact cookie value — and every other cookie minted under the same
-/// epoch, a stolen copy included — stops verifying immediately instead of
+/// the exact cookie value (and every other cookie minted under the same
+/// epoch, a stolen copy included) stops verifying immediately instead of
 /// working until the TTL. The handler is mounted inside the protected
 /// nest, so only an authenticated POST carrying the CSRF token can spend a
 /// bump. One global epoch, one bump: logging out in one browser also ends
-/// any other browser's session — the accepted cost for a single-user panel
+/// any other browser's session: the accepted cost for a single-user panel
 /// whose only alternative is leaving every session irrevocable.
 pub async fn logout(State(state): State<AdminState>) -> Response {
     revoke_all_sessions(&state.pool).await;
@@ -582,8 +582,8 @@ mod tests {
     }
 
     /// f18: the epoch is server-side revocation state. A bump between issue
-    /// and verify kills the cookie even though the token — and with it the
-    /// session key — is unchanged, in either direction, and a pre-epoch
+    /// and verify kills the cookie even though the token (and with it the
+    /// session key) is unchanged, in either direction, and a pre-epoch
     /// cookie (MACed over the bare session key, the format before the epoch
     /// existed) verifies under no epoch at all.
     #[test]
@@ -610,7 +610,7 @@ mod tests {
     }
 
     /// f18 end to end: logout bumps the persisted epoch, so the cookie the
-    /// browser held — a stolen copy included — stops authenticating, and a
+    /// browser held (a stolen copy included) stops authenticating, and a
     /// fresh login under the new epoch works again.
     /// Build a request with the `ConnectInfo` extension the rate limiter
     /// extracts; a real listener attaches it via
@@ -743,7 +743,7 @@ mod tests {
 
     /// f18 end to end, token-change path: rotating `[admin].token` through
     /// the settings screen bumps the persisted epoch, so the cookie the
-    /// browser held — a stolen copy included — stops authenticating even
+    /// browser held (a stolen copy included) stops authenticating even
     /// though the startup-frozen session key did not change, while a save
     /// that leaves the token untouched neither bumps nor logs the
     /// operator out. A fresh login under the rotated token works again.
@@ -1046,8 +1046,8 @@ mod tests {
     /// f19 on the login window: only genuine login attempts consume it.
     /// A cross-site POST carrying an unrelated Origin is rejected at the
     /// rate-limit layer (the CSRF layer would reject it later, but the
-    /// window must not pay), while a same-origin POST — the form the panel
-    /// itself renders — counts and succeeds.
+    /// window must not pay), while a same-origin POST (the form the panel
+    /// itself renders) counts and succeeds.
     #[tokio::test]
     async fn cross_site_login_post_does_not_consume_the_login_window() {
         let (_dir, state) = crate::admin::test_admin_state(

@@ -81,9 +81,9 @@ pub struct AppState {
 
 impl AppState {
     /// Assemble the shared state of the public listener from its
-    /// dependencies. The single construction site for `AppState` — the
+    /// dependencies. The single construction site for `AppState` (the
     /// startup wiring in `main` and the admin panel's in-process preview
-    /// (`admin::handlers::profiles`) both go through it — so the two can
+    /// (`admin::handlers::profiles`) both go through it), so the two can
     /// never drift apart on how the listener is configured.
     pub fn new(
         pool: DbPool,
@@ -234,8 +234,8 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
     if let Some(check) = response.extensions().get::<AuthFailure>().copied() {
         // A failed secret check on a public route (profile access token,
         // export capability token): warn once per client key per window,
-        // debug after — the same coalescing the host gate's
-        // `alive_export::HostRejectLog` uses — so a token-guessing campaign
+        // debug after: the same coalescing the host gate's
+        // `alive_export::HostRejectLog` uses, so a token-guessing campaign
         // is visible without one log line per request. The client key is
         // logged, never the rejected token value.
         if should_warn_auth_failure(&ip) {
@@ -264,7 +264,7 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
 /// Response extension a handler attaches when it rejected a request on a
 /// secret check (`/sub` access token, export capability token). The public
 /// rate-limit middleware reads it to log the failure with the client key it
-/// already computed — the handlers never see the peer address, so they
+/// already computed: the handlers never see the peer address, so they
 /// cannot log one. The value names the check that failed; the checked
 /// token itself is never logged.
 #[derive(Debug, Clone, Copy)]
@@ -1517,7 +1517,7 @@ mod tests {
     }
 
     /// End-to-end check that the shared `client_key` helper plumbs through
-    /// the public router's `trusted_cidrs` — the mirror of the admin
+    /// the public router's `trusted_cidrs`: the mirror of the admin
     /// router's `rate_limit_uses_xff_ip_for_trusted_peer`, for the
     /// deployment where a reverse proxy sits in front of `/sub` exactly
     /// like in front of `/admin`. The claimed client IP a trusted proxy

@@ -225,12 +225,12 @@ async fn run(ctx: Arc<Context>) -> anyhow::Result<()> {
 /// verdict, because both sides of each overlap draw from the same
 /// population and both charge `fail_count` through `check_failed`:
 ///
-/// * The random sample skips the rows the queue lane just covered — both
+/// * The random sample skips the rows the queue lane just covered: both
 ///   draw from the same `unknown` population and claiming a request only
 ///   deletes its queue row, so without the hand-off one dead proxy in both
 ///   selections collected two `fail_count` steps from this single cycle
 ///   and quarantined in half the cycles `fail_limit` promises.
-/// * The T2 batch skips the rows the T1 sample just covered — `alive` rows
+/// * The T2 batch skips the rows the T1 sample just covered: `alive` rows
 ///   are in both selections, and a dead one drawn by both lanes quarantined
 ///   in one cycle at `fail_limit = 2`.
 ///
@@ -256,7 +256,7 @@ async fn run_cycle(ctx: Arc<Context>) -> anyhow::Result<()> {
 }
 
 /// What one lane covered: `checked` is how many verdicts it produced (for
-/// the cycle log), `claimed` the rows the lane took for itself this cycle —
+/// the cycle log), `claimed` the rows the lane took for itself this cycle:
 /// the queue lane's up-front claims (verdict or not), the random sample's
 /// verdict rows. `run_cycle` hands each lane's `claimed` to the lane that
 /// runs next, so one proxy is never judged twice in a single cycle.
@@ -323,7 +323,7 @@ async fn probe_t1_sample(
 /// Run concurrent T1 checks for the candidates and apply each outcome to
 /// the lifecycle. Returns the verdict count plus the ids of every row a
 /// verdict was produced for (vet-refused rows included, rows skipped for
-/// an unknown scheme or an out-of-range port not — they were not judged).
+/// an unknown scheme or an out-of-range port not: they were not judged).
 async fn run_t1_checks(
     ctx: Arc<Context>,
     candidates: Vec<proxies::T1Candidate>,
@@ -579,8 +579,8 @@ async fn apply_regular_failure(ctx: &Context, id: i64, now: i64) {
 /// Re-check quarantined proxies whose scheduled moment has arrived.
 ///
 /// Two lanes: [`proxies::T2_REVIVAL_SCHEMES`] rows revive via the meow-rs
-/// tunnel check ([`revive_quarantined_via_t2`]) — a T1 connect cannot succeed
-/// against a QUIC port — everything else walks the TCP/TLS ladder below.
+/// tunnel check ([`revive_quarantined_via_t2`]): a T1 connect cannot succeed
+/// against a QUIC port; everything else walks the TCP/TLS ladder below.
 async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usize> {
     let t2_due =
         proxies::select_due_quarantine_t2(&ctx.pool, now, ctx.config.probe.sample_size).await?;
@@ -651,7 +651,7 @@ async fn probe_due_quarantine(ctx: Arc<Context>, now: i64) -> anyhow::Result<usi
 /// ([`proxies::T2_REVIVAL_SCHEMES`]): their second chance is a real tunnel
 /// check through meow-rs. Success revives into the `ready` tier, an
 /// authoritative tunnel failure advances the recheck ladder, a meow-rs
-/// fault is journaled unverified and leaves the row due — an outage must
+/// fault is journaled unverified and leaves the row due: an outage must
 /// not retire a healthy proxy (see [`journal_engine_fault`]). Returns the
 /// number of rows this lane processed.
 async fn revive_quarantined_via_t2(

@@ -304,7 +304,7 @@ type ApplyField =
 /// What one editable setting does. Function pointers so the table can
 /// live in a `static`.
 struct Setting {
-    /// Dotted config key — also the form field name and the
+    /// Dotted config key, also the form field name and the
     /// error-attribution key. Written exactly once, here.
     key: &'static str,
     /// Render the current value into the edit form's raw map. A
@@ -505,7 +505,7 @@ static SETTINGS: &[Setting] = &[
         // The live token must never reach the markup (USERGUIDE: "The
         // admin token is never shown."): the field renders empty and an
         // empty submit keeps the current token (`token_field`). The key
-        // still has to be present — `the_registry_covers_every_rendered_key`
+        // still has to be present, `the_registry_covers_every_rendered_key`
         // and the edit form's input both read it.
         render: |_c, key, raw| {
             raw.insert(key.into(), String::new());
@@ -928,7 +928,7 @@ pub async fn settings_update(
     // without an epoch bump a stolen cookie keeps authenticating until
     // the next restart. The comparison runs before `refresh_live_config`
     // swaps the new token into the live config, and only on an actual
-    // change — an unconditional bump would log out the very session
+    // change: an unconditional bump would log out the very session
     // performing an unrelated save. An empty submit is NOT a change:
     // `token_field` reads it as "keep the current token", so treating
     // it as a rotation would log the operator out of every unrelated
@@ -943,7 +943,7 @@ pub async fn settings_update(
     }
 
     // Refresh the figment-merged in-memory view so the next request to
-    // /admin/settings — and every handler reading the live config —
+    // /admin/settings, and every handler reading the live config,
     // renders the values the operator just wrote, instead of the startup
     // snapshot. ENV overrides are re-applied by `config::load` itself, so
     // `FUMOX_*` env vars keep winning on top of the file.
@@ -1159,9 +1159,9 @@ fn string_field(
     set_field(cfg, field, item::string(v.to_string()), errors);
 }
 
-/// The admin token. An empty submit keeps the current token — the
+/// The admin token. An empty submit keeps the current token: the
 /// documented contract (USERGUIDE: "sending the empty string keeps the
-/// current token … so the panel never silently disables itself") — and
+/// current token … so the panel never silently disables itself"), and
 /// it is also what an untouched field submits, because the render never
 /// puts the live token into the form (see the `admin.token` render).
 /// `string_field` would refuse an empty submit with `val.required`,
@@ -1342,8 +1342,8 @@ fn string_list(
 /// `admin.trust_proxy_ips`), validated with the same parser
 /// `crate::admin::parse_trusted_cidrs` applies at startup (and which
 /// feeds both per-IP rate limiters and the X-Forwarded-Proto scheme
-/// detection). The startup parser logs and DROPS an unparsable entry —
-/// fail-closed — so an entry it would drop must be refused here behind
+/// detection). The startup parser logs and DROPS an unparsable entry,
+/// fail-closed, so an entry it would drop must be refused here behind
 /// a field error, not persisted behind a success toast and silently
 /// emptied at the next restart. Bare-IP entries are accepted, `ipnet`
 /// reads them as host prefixes, exactly what the field hint advertises.
@@ -1366,7 +1366,7 @@ fn cidr_list(
     for entry in &items {
         if crate::admin::parse_trusted_cidr_entry(entry).is_none() {
             // No catalog key names a CIDR, and the locales are not this
-            // file's to extend, so the sentence is written out here —
+            // file's to extend, so the sentence is written out here:
             // the same escape `i64_list_field` takes for the ladder
             // length and `bool_field` for an unexpected literal.
             errors.push((field.into(), format!("not a valid CIDR or IP: {entry}")));
@@ -2417,7 +2417,7 @@ mod tests {
     /// submit must keep the current token (USERGUIDE: "sending the
     /// empty string keeps the current token … so the panel never
     /// silently disables itself") instead of erroring with
-    /// `val.required` — a `""` written to the file would disable the
+    /// `val.required`: a `""` written to the file would disable the
     /// panel at the next start.
     #[test]
     fn admin_token_renders_empty_and_an_empty_submit_keeps_the_current_one() {

@@ -82,7 +82,7 @@ pub struct IngestSettings {
 ///
 /// The `caches` handle stays in the signature for its callers (the
 /// scheduler hands one in; the invalidations happen at the call sites that
-/// know the outcome) — the freshness marker this function used to maintain
+/// know the outcome), and the freshness marker this function used to maintain
 /// in it now lives on the source row alone.
 pub async fn ingest_source(
     pool: &DbPool,
@@ -144,8 +144,8 @@ pub async fn ingest_source(
     // `last_fetched_at` is a *freshness* stamp, not a download log: it
     // stands for "the database is already reconciled from this payload"
     // (the TTL short-circuit above reads it). It is therefore written only
-    // once the payload has parsed and reconciled — `journal_success` runs
-    // after the reconcile — stamping it before that made a single parse or
+    // once the payload has parsed and reconciled (`journal_success` runs
+    // after the reconcile): stamping it before that made a single parse or
     // DB failure suppress every non-forced re-fetch for a whole TTL while
     // the scheduler kept reporting successful ingests.
 
@@ -187,7 +187,7 @@ pub async fn ingest_source(
             {
                 Ok(stats) => {
                     // The database is now the content of this payload, so
-                    // `journal_success` stamps `last_fetched_at` — the
+                    // `journal_success` stamps `last_fetched_at`, the
                     // freshness marker the TTL short-circuit checks before
                     // the next re-fetch.
                     journal_success(pool, source, &payload, recognised, now, duration_ms).await;
@@ -696,7 +696,7 @@ mod tests {
                 // server. Closing a socket that still holds unread client
                 // bytes makes the kernel send RST, which can clobber the
                 // client's buffered read of the response; the fetcher then
-                // retries, opening a second connection the counter sees —
+                // retries, opening a second connection the counter sees,
                 // and the exact-fetch-count assertions below would flake.
                 let mut received = Vec::with_capacity(1024);
                 loop {
@@ -790,7 +790,7 @@ mod tests {
 
     /// The converse: a reconciled payload is what the DB now holds, so its
     /// `last_fetched_at` stamp is exactly what the freshness short-circuit
-    /// may trust — the next non-forced pass skips the HTTP fetch entirely,
+    /// may trust: the next non-forced pass skips the HTTP fetch entirely,
     /// while a forced one always hits the network.
     #[tokio::test]
     async fn a_reconciled_payload_stamps_freshness_and_skips_the_next_fetch() {
@@ -868,7 +868,7 @@ mod tests {
     /// outcome: a real fetch records `Some(ms)` in `fetch_log.duration_ms`
     /// and on the `Ok` outcome, the freshness short-circuit measures
     /// nothing (`None`) and writes no journal row at all. Without the
-    /// measurement a slow upstream — or a long retry-backoff chain — is
+    /// measurement a slow upstream (or a long retry-backoff chain) is
     /// indistinguishable from a fast one.
     #[tokio::test]
     async fn fetch_duration_is_journaled_and_carried_in_the_outcome() {

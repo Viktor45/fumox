@@ -1826,7 +1826,7 @@ async fn due_quarantine_selection_respects_schedule_and_step() {
 
 /// Quarantine dues split by revival lane: [`T2_REVIVAL_SCHEMES`] rows come
 /// back only from [`select_due_quarantine_t2`], everything else only from
-/// [`select_due_quarantine`] — a due row must not be charged by both lanes.
+/// [`select_due_quarantine`]: a due row must not be charged by both lanes.
 #[tokio::test]
 async fn quarantine_dues_split_by_revival_kind() {
     let (_dir, pool) = temp_pool().await;
@@ -2290,7 +2290,7 @@ async fn t1_windowed_sample_fills_quota_and_covers_the_pool() {
 }
 
 /// Below the window size the bounded draw fetches the whole eligible pool,
-/// which is exactly the full-pool `ORDER BY RANDOM()` it replaced — so
+/// which is exactly the full-pool `ORDER BY RANDOM()` it replaced, so
 /// eligibility semantics must match it exactly: only `unknown`/`alive`,
 /// linked, T1-probeable rows come back, however many ineligible rows
 /// surround them.
@@ -3846,7 +3846,7 @@ async fn quarantine_queue_orders_by_nearest_check() {
 
 /// The proxy card resolves source display names through the link
 /// table, newest seen first. (A link row itself cannot outlive its
-/// source — the FK cascades — but the LEFT JOIN keeps the card robust
+/// source (the FK cascades) but the LEFT JOIN keeps the card robust
 /// to a dangling name regardless.)
 #[tokio::test]
 async fn proxy_card_links_resolve_source_names() {

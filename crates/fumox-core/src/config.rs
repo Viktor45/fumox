@@ -362,7 +362,7 @@ pub struct GeoConfig {
     /// by any code; the key is still accepted so existing config files
     /// keep parsing, and it no longer round-trips into saved config.
     /// `doc(hidden)`: the field is public only so struct literals with
-    /// `..Default::default()` compile outside this crate — there is
+    /// `..Default::default()` compile outside this crate: there is
     /// nothing to do with a value of type `()`.
     #[doc(hidden)]
     #[serde(default, skip_serializing, deserialize_with = "de_ignore_legacy")]
@@ -1519,7 +1519,7 @@ probe_results_days = 7
 
     /// Keys the reference file deliberately does not declare. Empty since
     /// the inert one-database-era `[geo].db` selector was dropped from the
-    /// struct (old files still parse — the key is accepted and ignored —
+    /// struct (old files still parse: the key is accepted and ignored,
     /// but it is no longer a config key, so the shipped file that promises
     /// "every available key" must not declare it either).
     const REFERENCE_FILE_OMISSIONS: &[&str] = &[];

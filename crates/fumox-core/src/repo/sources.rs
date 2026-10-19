@@ -157,7 +157,7 @@ pub async fn create(pool: &DbPool, source: &Source) -> crate::Result<()> {
 /// fetched under these settings, so after an edit the next ingest must
 /// re-fetch instead of trusting the old stamp (the TTL short-circuit of the
 /// server's `ingest::ingest_source` reads exactly this column). Cosmetic
-/// edits — name, slug, tags — keep the stamp.
+/// edits (name, slug, tags) keep the stamp.
 fn fetch_stamp_stale(old: &Source, new: &Source) -> bool {
     old.url != new.url
         || old.enabled != new.enabled
@@ -301,7 +301,7 @@ pub async fn list(pool: &DbPool, enabled_only: bool) -> crate::Result<Vec<Source
 //
 // The dynamic list screen: filter clauses are whitelisted fragments
 // assembled through the shared [`super::WhereFilter`], every value flows
-// through a bind. The whole list is returned (no pagination — the screen
+// through a bind. The whole list is returned (no pagination; the screen
 // renders every source), so one query serves count and rows.
 
 /// One row of the admin sources list: the display columns plus the

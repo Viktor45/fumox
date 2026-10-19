@@ -35,7 +35,7 @@ const BATCH: i64 = 500;
 const GEO_LOOKUP_CONCURRENCY: usize = 32;
 
 /// Wall-clock budget for one backfill pass, mirroring the geo download
-/// startup budget (`[geo].startup_download_budget_secs`, 60 s by default —
+/// startup budget (`[geo].startup_download_budget_secs`, 60 s by default,
 /// the same bound `main` applies to `geo_download`). `main` passes the
 /// configured value straight through [`backfill_missing_geo_within_budget`];
 /// this default only backs [`backfill_missing_geo`], the config-less shape

@@ -20,7 +20,7 @@
 
 use super::BindWhereFilter;
 use crate::db::DbPool;
-use crate::geo::GeoInfo;
+use crate::geo::{GeoFactMask, GeoInfo};
 use crate::models::{Param, ProxyEntry, ProxyStatus, Scheme};
 use sqlx::FromRow;
 
@@ -407,48 +407,78 @@ pub async fn reconcile_source(
     Ok(stats)
 }
 
-/// Batch of `(id, host)` rows that carry no geo facts at all (all three
-/// `geo_*` columns NULL), ordered by id past `after_id`, keyset pagination,
-/// so rows the resolver cannot answer are skipped without reappearing.
+/// Batch of `(id, host)` rows still missing a fact the loaded databases
+/// can supply, ordered by id past `after_id`, keyset pagination.
+///
+/// Per fact, not per row: a row that resolved a country but no ASN is
+/// exactly what a later pass must retry, and the old all-NULL condition
+/// locked it out for good. A fact no database can answer (`mask`) is left
+/// out of the criterion.
 pub async fn list_missing_geo(
     pool: &DbPool,
     after_id: i64,
     limit: i64,
+    mask: GeoFactMask,
 ) -> crate::Result<Vec<(i64, String)>> {
-    let rows: Vec<(i64, String)> = sqlx::query_as(
+    let Some(criterion) = missing_geo_criterion(mask) else {
+        return Ok(Vec::new());
+    };
+    let sql = format!(
         "SELECT id, host FROM proxies
-         WHERE id > ? AND geo_country IS NULL AND geo_city IS NULL AND geo_asn IS NULL
-         ORDER BY id LIMIT ?",
-    )
-    .bind(after_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+         WHERE id > ? AND ({criterion})
+         ORDER BY id LIMIT ?"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
-/// How many rows still have every geo column NULL. The backfill summary
-/// reports this: rows the resolver cannot answer stay NULL and are retried
-/// on the next start, so the count is the honest "still missing" figure.
-pub async fn count_missing_geo(pool: &DbPool) -> crate::Result<i64> {
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM proxies
-         WHERE geo_country IS NULL AND geo_city IS NULL AND geo_asn IS NULL",
-    )
-    .fetch_one(pool)
-    .await?;
+/// The `geo_* IS NULL` predicate for the facts this installation could
+/// still fill, or `None` when it could fill none of them.
+fn missing_geo_criterion(mask: GeoFactMask) -> Option<&'static str> {
+    match (mask.country, mask.asn) {
+        (true, true) => Some("geo_country IS NULL OR geo_asn IS NULL"),
+        (true, false) => Some("geo_country IS NULL"),
+        (false, true) => Some("geo_asn IS NULL"),
+        (false, false) => None,
+    }
+}
+
+/// How many rows still miss a fact the loaded databases can supply; the
+/// backfill's "still missing" figure.
+pub async fn count_missing_geo(pool: &DbPool, mask: GeoFactMask) -> crate::Result<i64> {
+    let Some(criterion) = missing_geo_criterion(mask) else {
+        return Ok(0);
+    };
+    let sql = format!("SELECT COUNT(*) FROM proxies WHERE {criterion}");
+    let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_one(pool)
+        .await?;
     Ok(count)
 }
 
 /// Store resolved geo facts on one proxy row.
+///
+/// Only the facts the stamp carries are written: a partial stamp (ASN
+/// found, country silent) fills its gap without erasing what the row
+/// already knows, the invariant the reconcile upsert keeps too.
 pub async fn update_geo(pool: &DbPool, id: i64, geo: &GeoStamp) -> crate::Result<()> {
-    sqlx::query("UPDATE proxies SET geo_country = ?, geo_city = ?, geo_asn = ? WHERE id = ?")
-        .bind(&geo.country)
-        .bind(&geo.city)
-        .bind(&geo.asn)
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE proxies
+         SET geo_country = COALESCE(?, geo_country),
+             geo_city = COALESCE(?, geo_city),
+             geo_asn = COALESCE(?, geo_asn)
+         WHERE id = ?",
+    )
+    .bind(&geo.country)
+    .bind(&geo.city)
+    .bind(&geo.asn)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

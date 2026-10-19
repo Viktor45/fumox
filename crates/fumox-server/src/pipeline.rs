@@ -12,15 +12,17 @@
 //! the repository query (and re-applied here defensively), encode lives in
 //! the serving layer. The `drop` rules run at ingestion too (the source's
 //! own pipeline, via [`CompiledPipeline::drop_entries`]), before
-//! `rename`, so both sides see the original values. Speed-enrich is a stub
-//! until Phase 4.
+//! `rename`, so both sides see the original values. The ASN filters read a
+//! fact the row may not carry yet, so [`fill_missing_asns`] completes it
+//! before them. Speed-enrich is a stub until Phase 4.
 
-use fumox_core::geo::{GeoResolver, apply_template};
+use fumox_core::geo::{GeoInfo, GeoResolver, apply_template};
 use fumox_core::models::{ProxyEntry, ProxyStatus, Scheme};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// Default geo name template.
 pub(crate) const DEFAULT_GEO_TEMPLATE: &str = "{flag} {country} · {name}";
@@ -706,9 +708,12 @@ impl CompiledPipeline {
         if let Some(excluded) = &self.exclude_protocols {
             candidates.retain(|c| !excluded.contains(&c.entry.scheme));
         }
-        // AS-number filter: the stored `geo_asn` is a
-        // confirmed fact, resolved when the proxy was ingested, the same
-        // "only confirmed facts" contract as the profile country allowlist.
+        // Every step below reads `candidate.geo_asn`, which a row ingested
+        // without geo does not carry: complete it before they run.
+        fill_missing_asns(&mut candidates, geo).await;
+        // AS-number filter: the stored ASN, or the one the fill just
+        // resolved, is the confirmed fact, the same contract as the
+        // profile country allowlist.
         // An allowlist drops proxies without a resolved ASN; an exclude
         // list only removes the named ASNs and keeps the unresolved ones.
         if let Some(allowed) = &self.filter_asns {
@@ -838,6 +843,45 @@ impl CompiledPipeline {
                     None => (1u8, 0),
                 });
             }
+        }
+    }
+}
+
+/// The resolver call the ASN fill makes, behind a trait like ingest's
+/// `GeoLookup` so the fill is testable without a MaxMind database.
+trait HostGeo {
+    fn resolve_host(
+        &self,
+        host: &str,
+    ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send;
+}
+
+impl HostGeo for GeoResolver {
+    fn resolve_host(
+        &self,
+        host: &str,
+    ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+        self.resolve(host)
+    }
+}
+
+/// Give every candidate without a stored ASN the one the resolver can
+/// name now: an exclude list keeps what it cannot name, and the resolver
+/// caches an "unknown" verdict per host, so a row whose column stayed
+/// empty keeps reaching the output even when its host resolves fine.
+///
+/// The lookup is a cache hit (geo-enrich resolves the same hosts a few
+/// lines down), a stored ASN is never overwritten, and this runs before
+/// `rename`, so the ASN belongs to the host as stored.
+async fn fill_missing_asns<G: HostGeo + ?Sized>(candidates: &mut [Candidate], geo: &G) {
+    for candidate in candidates.iter_mut() {
+        if candidate.geo_asn.is_some() {
+            continue;
+        }
+        if let Some(info) = geo.resolve_host(&candidate.entry.host).await
+            && let Some(asn) = info.asn
+        {
+            candidate.geo_asn = Some(format!("AS{asn}"));
         }
     }
 }
@@ -1312,6 +1356,99 @@ mod tests {
         let out = compiled.apply(candidates, &inactive_geo()).await;
         let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
         assert_eq!(names, ["other", "unresolved"]);
+    }
+
+    /// Stand-in resolver for the ASN fill, answering one ASN for every host
+    /// or none at all, like ingest's `GeoLookup` seam.
+    struct FakeGeo {
+        asn: Option<u32>,
+    }
+
+    impl HostGeo for FakeGeo {
+        fn resolve_host(
+            &self,
+            _host: &str,
+        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+            let asn = self.asn;
+            async move {
+                asn.map(|asn| {
+                    Arc::new(GeoInfo {
+                        asn: Some(asn),
+                        ..Default::default()
+                    })
+                })
+            }
+        }
+    }
+
+    /// The fill writes the canonical `AS{n}` spelling the filters parse, and
+    /// only where there is nothing stored to write over.
+    #[tokio::test]
+    async fn the_fill_names_a_candidate_that_carries_no_asn() {
+        let mut candidates = vec![
+            candidate_with_asn("missing", None),
+            candidate_with_asn("stored", Some("AS24940")),
+        ];
+        fill_missing_asns(&mut candidates, &FakeGeo { asn: Some(13335) }).await;
+        assert_eq!(candidates[0].geo_asn.as_deref(), Some("AS13335"));
+    }
+
+    /// The stored ASN is the confirmed fact, never overwritten by a lookup
+    /// that would disagree.
+    #[tokio::test]
+    async fn the_fill_never_overwrites_a_stored_asn() {
+        let mut candidates = vec![candidate_with_asn("stored", Some("AS24940"))];
+        fill_missing_asns(&mut candidates, &FakeGeo { asn: Some(13335) }).await;
+        assert_eq!(candidates[0].geo_asn.as_deref(), Some("AS24940"));
+    }
+
+    /// A resolver with no ASN to give (City-only install, or a range the ASN
+    /// database does not cover) changes nothing rather than inventing one.
+    #[tokio::test]
+    async fn a_resolver_without_an_asn_changes_nothing() {
+        let mut candidates = vec![candidate_with_asn("no-asn", None)];
+        fill_missing_asns(&mut candidates, &FakeGeo { asn: None }).await;
+        assert_eq!(candidates[0].geo_asn, None);
+    }
+
+    /// The reported failure: the exclude list was honoured for every row
+    /// whose ingest stamped an ASN and silently kept the rest, while
+    /// geo-enrich printed the excluded AS in the output name.
+    #[tokio::test]
+    async fn a_proxy_without_a_stored_asn_still_honours_the_exclude_list() {
+        // GeoLite2 files are gitignored, so CI runs without them.
+        let db_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        if !db_dir.join("GeoLite2-ASN.mmdb").exists() || !db_dir.join("GeoLite2-City.mmdb").exists()
+        {
+            eprintln!("skipped: GeoLite2-ASN/City.mmdb not present");
+            return;
+        }
+        let geo = GeoResolver::new(&fumox_core::config::GeoConfig {
+            enabled: true,
+            db_dir,
+            ..Default::default()
+        });
+        assert!(geo.is_active());
+
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "exclude_asns": ["13335"] },
+            "geo": { "enabled": true, "template": "{asn} {name}" }
+        })))
+        .unwrap();
+        // Literal IPs, no DNS round-trip: 1.1.1.1 is AS13335 (excluded), 8.8.8.8
+        // is AS15169, and neither candidate carries a stored ASN.
+        let out = compiled
+            .apply(
+                vec![
+                    candidate("cloudflare", Scheme::Vless, "1.1.1.1"),
+                    candidate("google", Scheme::Vless, "8.8.8.8"),
+                ],
+                &geo,
+            )
+            .await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["AS15169 google"], "only the excluded AS is dropped");
     }
 
     #[test]

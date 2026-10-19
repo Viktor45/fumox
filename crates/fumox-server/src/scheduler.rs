@@ -34,6 +34,15 @@ use tokio::task::JoinSet;
 /// How often the scheduler looks for sources due for a refresh.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often the periodic geo backfill runs, and one pass's budget.
+///
+/// The startup pass gets one shot per boot; this is the retry for a host
+/// whose DNS came back or a half-filled stamp. It runs detached and never
+/// overlaps itself: two concurrent walks of the same rows would only
+/// duplicate the resolver's work.
+const GEO_BACKFILL_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+const GEO_BACKFILL_BUDGET: Duration = Duration::from_secs(300);
+
 /// Delay before a source whose last fetch failed is retried, doubled per
 /// consecutive failure and capped at [`FAILURE_BACKOFF_MAX_SECS`]. A dead URL
 /// (401/403/404, dead DNS, a feed that no longer parses) does not become
@@ -208,10 +217,10 @@ pub struct IngestEnv {
     pub settings: crate::ingest::IngestSettings,
 }
 
-/// Resets the sweep-overlap flag when the detached sweep task ends, on
-/// the normal path and on unwind alike. A panic inside `sweep` would
+/// Resets an overlap flag when the detached task holding it ends, on the
+/// normal path and on unwind alike. A panic inside `sweep` would
 /// otherwise strand `sweeping == true` and silently stop all future
-/// sweeps.
+/// sweeps (same for the geo backfill's own flag).
 struct SweepGuard(Arc<AtomicBool>);
 
 impl Drop for SweepGuard {
@@ -405,6 +414,12 @@ pub async fn run(
 
     let mut tick = tokio::time::interval(SWEEP_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick is immediate, repeating the startup pass `main` already
+    // spawned; consume it so the retry starts one full interval later.
+    let mut geo_backfill_tick = tokio::time::interval(GEO_BACKFILL_INTERVAL);
+    geo_backfill_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    geo_backfill_tick.tick().await;
+    let geo_backfilling = Arc::new(AtomicBool::new(false));
     // A sweep drains its whole JoinSet, so a slow source would otherwise
     // hold the loop for the length of that fetch and park a *Refresh now*
     // behind it: the refresh would not even be marked in flight, and the
@@ -430,6 +445,24 @@ pub async fn run(
             }
             _ = retention_tick.tick() => {
                 retention_sweep(&env.pool, &retention).await;
+            }
+            _ = geo_backfill_tick.tick() => {
+                if geo_backfilling.swap(true, Ordering::SeqCst) {
+                    tracing::debug!("geo backfill: previous pass still running, skipping this tick");
+                    continue;
+                }
+                let pool = env.pool.clone();
+                let geo = Arc::clone(&env.geo);
+                let guard = SweepGuard(geo_backfilling.clone());
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    crate::geo_backfill::backfill_missing_geo_within_budget(
+                        pool,
+                        geo,
+                        GEO_BACKFILL_BUDGET,
+                    )
+                    .await;
+                });
             }
             maybe_id = refresh_rx.recv() => {
                 let Some(source_id) = maybe_id else {

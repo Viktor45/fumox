@@ -2469,6 +2469,9 @@ async fn reconcile_stores_geo_and_keeps_it_when_fresh_lookup_empty() {
     assert_eq!(row.geo_asn.as_deref(), Some("AS24940"));
 }
 
+/// The listing is per fact, so a row holding a country but no ASN is
+/// walked again; `update_geo` then fills the ASN without erasing the
+/// country.
 #[tokio::test]
 async fn missing_geo_listing_and_update() {
     let (_dir, pool) = temp_pool().await;
@@ -2485,7 +2488,11 @@ async fn missing_geo_listing_and_update() {
     .await
     .unwrap();
 
-    let missing = list_missing_geo(&pool, 0, 500).await.unwrap();
+    let both = GeoFactMask {
+        country: true,
+        asn: true,
+    };
+    let missing = list_missing_geo(&pool, 0, 500, both).await.unwrap();
     let id = missing
         .iter()
         .find(|(_, host)| host == "h1.example.com")
@@ -2505,9 +2512,85 @@ async fn missing_geo_listing_and_update() {
     assert_eq!(row.geo_country.as_deref(), Some("US"));
     assert_eq!(row.geo_city, None);
 
-    // The row has country data now, so it no longer counts as missing.
-    let missing = list_missing_geo(&pool, 0, 500).await.unwrap();
-    assert!(missing.iter().all(|(known, _)| known != &id));
+    // The country landed, the ASN did not: the row stays in the listing.
+    let missing = list_missing_geo(&pool, 0, 500, both).await.unwrap();
+    assert!(
+        missing.iter().any(|(walked, _)| walked == &id),
+        "a row missing only its ASN must still be walked"
+    );
+    assert_eq!(count_missing_geo(&pool, both).await.unwrap(), 1);
+
+    // A City-only install cannot answer the ASN and must not chase it.
+    let city_only = GeoFactMask {
+        country: true,
+        asn: false,
+    };
+    assert!(
+        list_missing_geo(&pool, 0, 500, city_only)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(walked, _)| walked != &id),
+        "a fact no database can answer is not chased"
+    );
+    assert_eq!(count_missing_geo(&pool, city_only).await.unwrap(), 0);
+
+    // The ASN arrives later and the partial stamp leaves the country be.
+    update_geo(
+        &pool,
+        id,
+        &GeoStamp {
+            country: None,
+            city: None,
+            asn: Some("AS15169".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let row = get_by_fingerprint(&pool, &e.fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.geo_asn.as_deref(), Some("AS15169"));
+    assert_eq!(row.geo_country.as_deref(), Some("US"));
+    assert_eq!(count_missing_geo(&pool, both).await.unwrap(), 0);
+    assert!(
+        list_missing_geo(&pool, 0, 500, both)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// No database at all: nothing is obtainable, so nothing is walked.
+#[tokio::test]
+async fn an_empty_fact_mask_walks_nothing() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcA0000000").await;
+    let e = entry("geo-none", "h2.example.com", 443);
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        std::slice::from_ref(&e),
+        &[],
+        1000,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        list_missing_geo(&pool, 0, 500, GeoFactMask::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        count_missing_geo(&pool, GeoFactMask::default())
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 /// The admin card refresh resolves a host and writes the whole stamp

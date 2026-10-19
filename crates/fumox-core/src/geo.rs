@@ -10,7 +10,8 @@
 //!
 //! DNS and lookup results are cached per host (hosts repeat heavily in
 //! subscription feeds); negative results are cached too, so unresolvable
-//! hosts are not re-queried on every pipeline run.
+//! hosts are not re-queried on every pipeline run. Entries expire after
+//! [`CACHE_TTL`], so a host that comes back is resolved without a restart.
 //!
 //! The `.mmdb` files are never committed. When no database file can be
 //! opened the resolver degrades to a no-op with a warning, geo enrichment
@@ -151,7 +152,34 @@ impl Backends {
     fn is_empty(&self) -> bool {
         self.city.is_none() && self.asn.is_none()
     }
+
+    fn mask(&self) -> GeoFactMask {
+        GeoFactMask {
+            country: self.city.is_some(),
+            asn: self.asn.is_some(),
+        }
+    }
 }
+
+/// Which stored geo facts the loaded databases can produce at all.
+///
+/// A missing fact is only worth retrying when a database could answer it:
+/// chasing one that cannot be filled re-walks the table every pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GeoFactMask {
+    /// A City database is loaded, so `geo_country` is obtainable.
+    pub country: bool,
+    /// An ASN database is loaded, so `geo_asn` is obtainable.
+    pub asn: bool,
+}
+
+/// How long a host→geo verdict stays cached, negatives included.
+///
+/// Without a lifetime the "unknown" answer for a host whose DNS failed
+/// once survives until the process restarts, and the ASN filters keep
+/// whatever they cannot name. Six hours matches the periodic geo
+/// backfill's cadence.
+const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
 
 /// Host → geo resolver with an in-memory cache. Cheap to clone/share: the
 /// internals are `Arc`-wrapped.
@@ -171,7 +199,16 @@ impl GeoResolver {
     /// simply skipped). Returns a no-op resolver (with a warning logged)
     /// when geo is disabled or no database file could be opened.
     pub fn new(cfg: &GeoConfig) -> Self {
-        let cache = Cache::builder().max_capacity(cfg.cache_max_entries).build();
+        Self::with_cache_ttl(cfg, CACHE_TTL)
+    }
+
+    /// [`Self::new`] with an explicit cache lifetime, so a test can watch an
+    /// entry expire without waiting out the production TTL.
+    fn with_cache_ttl(cfg: &GeoConfig, ttl: Duration) -> Self {
+        let cache = Cache::builder()
+            .max_capacity(cfg.cache_max_entries)
+            .time_to_live(ttl)
+            .build();
         let dns_timeout = cfg.dns_timeout();
         if !cfg.enabled {
             return Self {
@@ -238,6 +275,12 @@ impl GeoResolver {
     /// loaded).
     pub fn is_active(&self) -> bool {
         self.backends.is_some()
+    }
+
+    /// Which stored geo facts this installation can fill in. Empty mask: no
+    /// database opened, nothing obtainable.
+    pub fn fact_mask(&self) -> GeoFactMask {
+        self.backends.as_ref().map(|b| b.mask()).unwrap_or_default()
     }
 
     /// Resolve geo information for a proxy host (domain or literal IP).
@@ -406,6 +449,43 @@ mod tests {
             ..Default::default()
         });
         resolver.is_active().then_some(resolver)
+    }
+
+    /// Positives and negatives expire alike: an "unknown" answer for a host
+    /// whose DNS was down must not outlive the process. Skipped without the
+    /// .mmdb files.
+    #[tokio::test]
+    async fn a_cached_verdict_expires_so_a_failed_host_is_retried() {
+        let Some(dir) = workspace_db_dir() else {
+            eprintln!("skipping: no GeoLite2 databases in workspace config/");
+            return;
+        };
+        let geo = GeoResolver::with_cache_ttl(
+            &GeoConfig {
+                enabled: true,
+                db_dir: dir,
+                ..Default::default()
+            },
+            Duration::from_millis(50),
+        );
+
+        geo.resolve("8.8.8.8").await.expect("8.8.8.8 is known");
+        assert!(geo.resolve("nx.invalid").await.is_none());
+        assert!(
+            geo.cache.get("nx.invalid").await.is_some(),
+            "a negative verdict is cached too"
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(geo.cache.get("8.8.8.8").await.is_none(), "positive expired");
+        assert!(
+            geo.cache.get("nx.invalid").await.is_none(),
+            "negative expired"
+        );
+        assert!(
+            geo.resolve("8.8.8.8").await.is_some(),
+            "an expired host is looked up again"
+        );
     }
 
     /// All databases found in the directory answer at once: the merged facts

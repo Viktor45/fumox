@@ -10,7 +10,7 @@ The categories follow [Keep a Changelog](https://keepachangelog.com/);
 `Docs` covers the user guide and READMEs, `Internal` (dependency bumps,
 CI plumbing) is omitted: it never changes the shipped image.
 
-## Unreleased (2026-10-05)
+## Unreleased (2026-10-19)
 
 Changes in the working tree, not yet on a published image.
 
@@ -74,6 +74,34 @@ Changes in the working tree, not yet on a published image.
   idle deployment, exactly the state an operator cannot see from
   outside. The sweep stamps `server_cycle` at its start, so a hung
   sweep ages the line instead of looking healthy.
+- The geo backfill runs on a schedule, not only at startup. A row
+  whose host lookup failed once — DNS down at ingest time, a
+  partially filled stamp, geo disabled while the row was imported —
+  kept its NULL columns until the process restarted. The scheduler
+  now repeats the pass every six hours with a five-minute budget,
+  detached and never overlapping itself (a tick that fires while the
+  previous pass still runs is skipped, under the same panic-safe
+  overlap flag the sweep uses). The startup pass takes its budget
+  from `[geo].startup_download_budget_secs`, so one configured knob
+  governs both.
+- The backfill decides per fact, not per row. A row holding a country
+  but no ASN counted as "already filled", so an installation that
+  added `GeoLite2-ASN.mmdb` later never stamped the rows that were
+  waiting for it. The missing-row query now selects either missing
+  fact, and a mask derived from the loaded databases stops the pass
+  from chasing a value no database can answer; the closing log line
+  reports how many rows remain.
+- The fetch journal records how long each attempt took
+  (`fetch_log.duration_ms`, migration 0009): from the start of the
+  fetch, retries and their backoff included, to the verdict. The
+  admin fetch log renders it beside the timestamp, so a slow
+  upstream or a long retry chain no longer looks identical to a
+  fast failure.
+- Enabling or disabling a source or profile is an in-place HTMX
+  swap: a small POST (`/admin/sources/{id}/toggle`,
+  `/admin/profiles/{id}/toggle`) re-renders the badge and the
+  button without reloading the page, with the same CSRF token and
+  the no-JavaScript form fallback the rest of the panel uses.
 
 ### Fixed
 
@@ -1147,6 +1175,23 @@ Changes in the working tree, not yet on a published image.
   orphan comma under "last seen" and a row with neither check got a
   `,` in the coverage cell. Both use the en dash the rest of the
   tables use.
+- A proxy ingested while geo was unavailable bypassed the ASN
+  filters. `exclude_asns` and the allowlist read the stored
+  `geo_asn`, and a row that never got one matched neither, so the
+  exclude list kept a proxy whose geo-enriched name printed the
+  very AS it was supposed to be dropped for. Serving now resolves
+  the missing ASN once per candidate before the filters run
+  (`fill_missing_asns`; the same host is a cache hit by the time
+  geo-enrich asks), and a stored ASN is never overwritten. Only a
+  host that genuinely cannot be resolved stays unknown: the
+  allowlist drops it, an exclude list keeps it, as documented.
+- A host whose DNS failed once was cached as "unknown" forever. The
+  resolver cached negative verdicts with no lifetime, so a transient
+  resolver outage kept the host out of every ASN filter and every
+  `{asn}`-bearing name until the process restarted. Positive and
+  negative entries now expire after six hours — the same cadence as
+  the periodic backfill — so a recovered host is picked up without a
+  restart.
 
 ### Security
 
@@ -1220,6 +1265,16 @@ Changes in the working tree, not yet on a published image.
 
 ### Docs
 
+- The guides' alive-linger rule contradicted the reconciler: they had a
+  source refresh unlink everything but `alive` rows, with `unknown`
+  said never to linger. The link actually survives for `alive`,
+  `ready`, `unknown` and `quarantine` rows, and only a source carrying
+  `drop` rules under `[ingest].drop_gate = true` retires its links on
+  the next refresh regardless of status. Both language versions state
+  the real set now.
+- `config/app.toml` described the shipped recheck ladder as
+  "10m → 15m" while shipping `recheck_delays_secs = [900]`, a single
+  15-minute step; the comment matches the list again.
 - The settings form advertised a range it never enforced. The four
   rate-limit inputs carried `min="1" max="1000000"`, but the only thing
   that ever checked them was the browser's own number validation, so a
@@ -1455,6 +1510,10 @@ Changes in the working tree, not yet on a published image.
   DESC` (the id tiebreaker is part of the index, it is part of the
   order). Without it every page of the list, and the matching
   `COUNT`, walked the whole table.
+- The minimum supported Rust toolchain is **1.98** (up from 1.94).
+  `Cargo.toml`'s `rust-version` stays a floor, not a lock: CI builds
+  on current stable, and 1.98 is the oldest toolchain the workspace
+  must keep building on.
 
 ## 2026-09-23 · sha-b72b03f
 

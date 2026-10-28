@@ -150,8 +150,8 @@ Two network listeners are involved, on purpose separated:
 | **Profile**                    | A named set of sources + processing rules + output format. Each profile has its own endpoint `/sub/{id or slug}`; this is the URL you put in your client.                  |
 | **Slug**                       | An optional human-readable identifier for a source or profile (`/sub/my-list` instead of `/sub/nNqRYHbOSqM5`).                                                              |
 | **Pipeline**                   | JSON rules describing how proxies are filtered, renamed, geo-tagged, deduplicated and sorted. A source has its own pipeline; a profile can override it.                     |
-| **Status**                     | A proxy's health state: `unknown`, `alive`, `quarantine`, `removed` (see [section 10](#10-health-checks-and-proxy-lifecycle)).                                              |
-| **Quarantine & second chance** | A proxy that keeps failing is excluded from output, then re-checked 12–16 hours later before any final decision.                                                            |
+| **Status**                     | A proxy's health state: `unknown`, `alive`, `ready`, `quarantine`, `removed` (see [section 10](#10-health-checks-and-proxy-lifecycle)).                                      |
+| **Quarantine & second chance** | A proxy that keeps failing is excluded from output, then re-checked after a configurable second-chance delay (12–16 hours by default) before any final decision.            |
 | **T1 / T2**                    | The two health-check levels: T1 = direct TCP/TLS reachability; T2 = a real tunnel request through meow-rs.                                                                  |
 
 IDs and endpoint tokens are `nanoid(12)` strings over the alphabet
@@ -425,7 +425,7 @@ A five-minute walkthrough, assuming the stack is running
    access token). Paste it into your proxy client as a subscription.
 
 5. **Watch it live.** The dashboard shows source/proxy counts and errors,
-   recent fetches, the **Top Failure Reasons** panel over a 24 h rolling
+   the **Top Failure Reasons** panel over a 24 h rolling
    window, and per-source aggregates: every top-N knob on the page
    shares one per-admin cookie `fumox_dash_top_n` (5/10/15/25/50,
    defaults to 10); the *Proxies* browser lists every node with its
@@ -565,7 +565,7 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 
 | Screen              | What you do there                                                                                                                                                                                     |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Dashboard**       | Totals: sources (enabled/errored), profiles, proxies by status, 24h fetch success rate with the age of the last scheduler sweep, probe heartbeat, recent errors and fetches                                                                    |
+| **Dashboard**       | Totals: sources (enabled/errored), profiles, proxies by status, 24h fetch success rate with the age of the last scheduler sweep, probe heartbeat, recent source errors; the per-source table lists unknown / alive / ready / quarantine / removed / total in status-machine order (the full fetch journal lives on the **Fetch log** screen) |
 | **Sources**         | Create/edit/enable/delete sources; *Refresh now*; per-source fetch log with error classes; the `/src/…` link                                                                                          |
 | **Profiles**        | Create/edit profiles: composition and order of sources, output format, pipeline overrides, access token, slug; output preview (first 50 lines)                                                        |
 | **Proxies**         | Filterable browser of all proxies (status, protocol, country, source, search by host/name); detail card with parameters, geo, lifecycle timestamps and probe history; *Reset status*; *Purge removed* |
@@ -916,8 +916,8 @@ cycle in four passes:
    config with the batch, hot-reloads meow-rs via `PUT /configs`, then
    measures delay via `GET /proxies/{name}/delay` against a randomly picked
    URL from `[meow].test_url` (the checks rotate across the configured list).
-   The sample consists of `alive` proxies plus never-checked `unknown`
-   hysteria2, which T1 cannot say anything about (see below).
+   The sample consists of `alive` and `ready` proxies plus never-checked
+   `unknown` hysteria2, which T1 cannot say anything about (see below).
    The sample order is by recency, not random: proxies without a single
    tunnel check come first, then the ones whose last check is the oldest, so
    in a large pool no proxy lingers without a tunnel verdict while its
@@ -951,10 +951,15 @@ Exclude them with `filter.protocols` if you don't want them in a profile.
 ```mermaid
 stateDiagram-v2
     [*] --> unknown : new proxy appears in a source
-    unknown --> alive : a check succeeds (T1 or T2)
+    unknown --> alive : a T1 check succeeds
+    unknown --> ready : a T2 check succeeds
+    alive --> ready : a T2 check succeeds
+    ready --> alive : a T2 check fails
     unknown --> quarantine : fail_limit consecutive failures
     alive --> quarantine : fail_limit consecutive failures
+    ready --> quarantine : fail_limit consecutive failures
     quarantine --> alive : second chance or a ladder step succeeds
+    quarantine --> ready : a hysteria2 tunnel revival succeeds
     quarantine --> removed : second chance and every ladder step fail
     note right of unknown
         hysteria2 skips T1
@@ -968,15 +973,16 @@ stateDiagram-v2
 
 The rules in plain language:
 
-- **Success makes the proxy `alive`; T2 verdicts have priority.** Any
-  successful check makes the proxy `alive` and clears schedules. A T2 success
-  and a second-chance revival also clear the failure counter; a T1 success
-  clears it only when the last failure was a T1 one. A proxy with a dead
-  tunnel (something only T2 can see) keeps accumulating failures until it
-  reaches `fail_limit`, even though every T1 check passes.
+- **Success returns the proxy to service; T2 verdicts have priority.** Any
+  successful check clears schedules: a T1 success leaves the proxy `alive`
+  (a `ready` row stays `ready`), a T2 success promotes it to `ready`. A T2
+  success and a second-chance revival also clear the failure counter; a T1
+  success clears it only when the last failure was a T1 one. A proxy with a
+  dead tunnel (something only T2 can see) keeps accumulating failures until
+  it reaches `fail_limit`, even though every T1 check passes.
 - **Quarantine.** `fail_limit` (default 3) consecutive failures move an
-  `unknown`/`alive` proxy to `quarantine`. It disappears from subscriptions
-  immediately.
+  `unknown`, `alive` or `ready` proxy to `quarantine`. It disappears from
+  subscriptions immediately.
 - **Second chance.** At a random moment of the **[12 h, 16 h)** window after
   quarantine (`quarantined_at + second_chance_min_hours +
   U(0..second_chance_spread_hours)`, UTC, drawn once and stored) the proxy is
@@ -1010,16 +1016,14 @@ The rules in plain language:
   proxy through a source (or *Purge removed* and let the next fetch carry it)
   rather than pressing the button again.
 - **Disappearing from a source does not retire a live proxy (alive-linger).**
-  While the probe keeps confirming a proxy (`alive`), a source refresh that no
-  longer sees it keeps its link: the proxy continues its check cycle and stays
-  in that source's subscriptions. The probe alone decides when it leaves:
-  once it quarantines the node, the next refresh drops the link and the proxy
-  becomes `removed` as usual. This does not apply to `unknown` proxies
-  (never verified, unlinked on the next refresh) and to sources with
-  `drop` rules **when** `[ingest].drop_gate = true` in the config (then a
-  rule added later retires the already-stored rows on the next refresh;
-  with the default `false` every source lingers; drop rules only stop
-  new matches). Deleting a source from the admin panel never lingers.
+  A source refresh that no longer sees a proxy keeps its link while the
+  proxy is `alive`, `ready`, `unknown` or `quarantine`: it continues its
+  check cycle and stays in that source's subscriptions. The probe alone
+  decides when it leaves. The exception is a source with `drop` rules
+  **when** `[ingest].drop_gate = true` in the config (then a rule added
+  later retires the already-stored rows on the next refresh; with the
+  default `false` every source lingers, and drop rules only stop new
+  matches). Deleting a source from the admin panel never lingers.
 
 **State machine configuration parameters.** All of them live in
 `config/app.toml` (or are overridden via `FUMOX_*` variables) and apply after

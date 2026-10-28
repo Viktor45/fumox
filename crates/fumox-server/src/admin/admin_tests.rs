@@ -498,6 +498,24 @@ async fn unauthenticated_browsers_are_redirected_to_login() {
 }
 
 #[tokio::test]
+async fn the_placeholder_token_never_opens_a_session() {
+    let mut admin = admin_config(10);
+    admin.token = fumox_core::config::PLACEHOLDER_ADMIN_TOKEN.to_string();
+    let (_dir, state) = test_state_with_admin(admin).await;
+    let app = router(state);
+
+    // The placeholder is not a credential: submitting it must not mint a
+    // session, exactly like a wrong token.
+    let response = app
+        .clone()
+        .oneshot(request("POST", "/admin/login", "token=change-me", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(response.headers().get(header::SET_COOKIE).is_none());
+}
+
+#[tokio::test]
 async fn unauthenticated_htmx_gets_hx_redirect() {
     let (_dir, state) = test_state(1000).await;
     let app = router(state);
@@ -1855,7 +1873,7 @@ async fn probe_screen_warns_when_drain_exceeds_target() {
     // loads the built-in default and the login below would 422.
     std::fs::write(
         &path,
-        format!("[probe]\nbacklog_target_drain_minutes = 1\n\n[admin]\ntoken = \"{TOKEN}\"\n"),
+        format!("[probe]\nbacklog_target_drain_minutes = 5\n\n[admin]\ntoken = \"{TOKEN}\"\n"),
     )
     .unwrap();
     state
@@ -1864,12 +1882,13 @@ async fn probe_screen_warns_when_drain_exceeds_target() {
     let pool = state.pool.clone();
     let now = fumox_core::models::now_ts();
 
-    // 51 rows *due*: retire = min(50, 51) = 50, lane =
+    // 151 rows *due*: retire = min(50, 151) = 50, lane =
     // ceil(50/8) x 20s = 140s > the 60s interval, so the period
-    // is 140s and 2 cycles take 5 min against the 1-min target.
-    // None of the hard heuristic thresholds fire at this size, so
-    // the banner is driven by the soft drain-vs-target check.
-    for i in 0..51 {
+    // is 140s and 4 cycles take 10 min against the 5-min target.
+    // None of the hard heuristic thresholds fire at this size (151 is
+    // below 50x20 and below 50x5), so the banner is driven by the soft
+    // drain-vs-target check.
+    for i in 0..151 {
         sqlx::query(
             "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
                                       quarantined_at, ladder_at, created_at, updated_at)
@@ -5025,5 +5044,127 @@ async fn live_config_refresh_picks_up_post_save_state() {
         state.server_bind.port(),
         8080,
         "server_bind stays startup-frozen"
+    );
+}
+
+/// A config file the panel writes to, on disk and pointed at by the
+/// admin state. The panel's editing target is the state's config path,
+/// so the test never touches the repository's own `config/app.toml`.
+async fn state_with_config_file(
+    label: &str,
+    contents: &str,
+) -> (
+    fumox_core::tempdir_lite::TempDir,
+    fumox_core::tempdir_lite::TempDir,
+    std::path::PathBuf,
+    AdminState,
+) {
+    let (_dir, mut state) = test_state(1000).await;
+    let cfg_dir = fumox_core::tempdir_lite::TempDir::new(label);
+    let path = cfg_dir.path().join("app.toml");
+    std::fs::write(&path, contents).unwrap();
+    state.config_path = ResolvedConfigPath::Loaded(path.clone());
+    state.config_writable = true;
+    (_dir, cfg_dir, path, state)
+}
+
+/// The settings form is a read-modify-write of the whole config file,
+/// and the operator can edit that file outside the panel while the form
+/// is open. The form therefore carries the fingerprint of the file it
+/// was rendered from, and a submit over a file that changed is refused
+/// rather than silently overwriting the other change.
+#[tokio::test]
+async fn a_settings_save_over_a_file_that_changed_is_refused() {
+    let (_dir, _cfg_dir, path, state) =
+        state_with_config_file("settings-conflict", "[ingest]\ndrop_gate = false\n").await;
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+
+    // The fingerprint the browser carries: the file as it is when the
+    // form is rendered.
+    let rendered = fumox_core::config_writer::fingerprint(&path);
+
+    // The operator edits the file outside the panel while the form is
+    // open.
+    std::fs::write(
+        &path,
+        "[ingest]\ndrop_gate = false\n[probe]\nfail_limit = 7\n",
+    )
+    .unwrap();
+
+    let body = format!("_csrf={csrf}&cfg_fingerprint={rendered}&ingest.drop_gate=on");
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/settings/update",
+            &body,
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "a save over a file that changed must be refused"
+    );
+    let html = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&html);
+    // The panel answers in the operator's language, so the message is
+    // looked up in the catalog rather than spelled out here.
+    let lang = state.locales.default_lang();
+    assert!(
+        html.contains(lang.t("err.config_conflict")),
+        "the conflict must be explained to the operator: {html:.400}"
+    );
+
+    // The hand edit survives, and the stale form wrote nothing.
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("fail_limit = 7"),
+        "the hand edit must survive: {on_disk}"
+    );
+    assert!(
+        on_disk.contains("drop_gate = false"),
+        "the stale form must not have been written: {on_disk}"
+    );
+}
+
+/// The refusal above must not break the ordinary save: a form whose
+/// fingerprint still matches the file writes as it always did.
+#[tokio::test]
+async fn a_settings_save_over_an_unchanged_file_still_writes() {
+    let (_dir, _cfg_dir, path, state) =
+        state_with_config_file("settings-write", "[ingest]\ndrop_gate = false\n").await;
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+    let rendered = fumox_core::config_writer::fingerprint(&path);
+
+    let body = format!("_csrf={csrf}&cfg_fingerprint={rendered}&ingest.drop_gate=on");
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/settings/update",
+            &body,
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "an ordinary save must still redirect to the overview"
+    );
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("drop_gate = true"),
+        "the setting must be written: {on_disk}"
     );
 }

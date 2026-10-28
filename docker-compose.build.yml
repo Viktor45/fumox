@@ -1,0 +1,45 @@
+# Local build overlay for docker-compose.yml.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# The base file pins the published images by digest; a digest cannot be a
+# build tag ("build tag cannot contain a digest"), so the build path lives
+# in this overlay: it replaces the pinned references with local tags and
+# adds the build sections. The two files are meant to be used together,
+# never on their own: the overlay alone has no services of its own.
+#
+# The meow wrapper pins the upstream release: MEOW_VERSION names a
+# concrete tag and the two sums are the ones the upstream release
+# publishes for its musl archives. Bumping the version means bumping the
+# sums in the same edit (the build refuses a download whose hash does not
+# match), so a new upstream release is picked up through review, not by
+# accident.
+
+services:
+  server:
+    image: localhost/fumox:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # `mounts` builds through persistent BuildKit cache mounts: rebuilds
+      # after a source change recompile only the workspace crates (~1 min
+      # instead of ~7.5). Set FUMOX_BUILD_CACHE=layers in .env on builders
+      # without cache-mount support (e.g. podman-compose), that path uses
+      # the classic cargo-chef image layers. See the Dockerfile header.
+      args:
+        BUILD_CACHE: ${FUMOX_BUILD_CACHE:-mounts}
+
+  # The probe runs the same binary as the server, so it uses the same
+  # local image; no second build section is needed.
+  probe:
+    image: localhost/fumox:local
+
+  meow:
+    image: localhost/fumox-meow:local
+    build:
+      context: ./docker/meow
+      dockerfile: Dockerfile
+      args:
+        MEOW_VERSION: ${MEOW_VERSION:-v0.27.0}
+        MEOW_SHA256_AMD64: ${MEOW_SHA256_AMD64:-38343bc0832d36d97967296a5c7d488c0ba9509186b6a7a4deef5355ff45e2d3}
+        MEOW_SHA256_ARM64: ${MEOW_SHA256_ARM64:-42f12dac9313a3c70bc4e8da7faca863a673d393d6e6f9274274a045d40f431b}

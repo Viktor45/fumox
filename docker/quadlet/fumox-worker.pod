@@ -1,0 +1,26 @@
+# Fumox worker pod, quadlet equivalent of the compose `probe` + `meow`
+# services.
+#
+# The pod holds the two components that must talk to each other and to
+# nobody else:
+#   probe → meow REST API   127.0.0.1:9090   (pod loopback, not published)
+#   probe ↔ meow            /shared/meow     (config exchange volume)
+#
+# The server is NOT in this pod: the admin panel stays unreachable from
+# the kernel (see fumox.pod). The server and the probe still share the
+# SQLite volume, so they do not need a network path to each other.
+#
+# Nothing here is published to the host: the controller answers only to a
+# caller that presents the controller secret, and even then it is
+# reachable only from inside this pod.
+
+[Unit]
+Description=Fumox worker pod (probe + meow kernel)
+After=network-online.target
+Wants=network-online.target
+
+[Pod]
+PodName=fumox-worker
+
+[Install]
+WantedBy=default.target

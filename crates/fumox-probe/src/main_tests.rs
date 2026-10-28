@@ -806,9 +806,11 @@ fn test_config(fail_limit: u32, meow_addr: &str, meow_config: PathBuf) -> AppCon
             queue_stale_days: 7,
             retention_interval_secs: 86400,
             backlog_target_drain_minutes: 60,
+            refresh_check_limit: None,
         },
         meow: fumox_core::config::MeowConfig {
             api_addr: meow_addr.into(),
+            api_token: String::new(),
             config_path: meow_config,
             test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 3,
@@ -1013,6 +1015,69 @@ async fn t2_cycle_distinguishes_bad_credential_from_live_proxy() {
     assert!(stamp.is_some());
 }
 
+/// A batch in which every tunnel failed is a verdict about the test
+/// endpoint, not about the proxies: meow-rs answers a blocked or degraded
+/// endpoint exactly like a dead tunnel. The proxies are stamped unverified
+/// and the fail ladder is not charged, so one unreachable endpoint cannot
+/// empty the pool.
+#[tokio::test]
+async fn a_batch_where_every_tunnel_failed_does_not_charge_the_proxies() {
+    let (_dir, pool) = temp_pool().await;
+
+    // The mock engine fails every delay check.
+    let app = Router::new()
+        .route(
+            "/version",
+            get(|| async { Json(serde_json::json!({"version":"mock"})) }),
+        )
+        .route("/configs", put(|| async { Json(serde_json::json!({})) }))
+        .route(
+            "/proxies/{name}/delay",
+            get(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"message":"An error occurred in the delay test"})),
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let meow_addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let first = seed_proxy(&pool, "vless", "127.0.0.1", 443, "ready").await;
+    let second = seed_proxy(&pool, "vless", "127.0.0.1", 443, "ready").await;
+
+    let config_dir = fumox_core::tempdir_lite::TempDir::new("probe-test");
+    let config_path = config_dir.path().join("probe-test.yaml");
+    let config = test_config(3, &meow_addr, config_path.clone());
+    let ctx = Arc::new(Context::new(config, pool.clone()));
+
+    probe_t2_batch(ctx.clone(), &[]).await.unwrap();
+
+    // Neither proxy was charged: the endpoint is the suspect. Both are
+    // stamped unverified instead, the way an engine outage stamps them.
+    for id in [first, second] {
+        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.fail_count, 0, "proxy {id} must not be charged");
+        assert_eq!(row.status, "alive", "proxy {id} is demoted, not retired");
+        assert!(
+            row.last_t2_failed_at.is_some(),
+            "proxy {id} must be stamped unverified"
+        );
+    }
+
+    // The attempts are journaled all the same: the recency queue keeps
+    // moving even though nobody was charged.
+    let (attempts,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE probe_kind = 't2' AND ok = 0")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(attempts, 2, "both attempts must be journaled");
+}
+
 /// The meow.yaml chmod is re-asserted on every write: a pre-existing
 /// file (older binary, hand-copied sample, restored backup) must not
 /// keep its old, possibly world-readable mode while the probe
@@ -1068,7 +1133,7 @@ async fn meow_config_permissions_are_reasserted_on_an_existing_file() {
         .mode()
         & 0o777;
     assert_eq!(
-        mode, 0o600,
+        mode, 0o640,
         "pre-existing permissions must be corrected on every write"
     );
 }

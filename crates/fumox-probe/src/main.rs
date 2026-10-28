@@ -88,6 +88,67 @@ impl BatchGuard {
     }
 }
 
+/// The T2 verdicts of one batch, collected while the checks run and
+/// settled when the batch is over.
+///
+/// The fail ladder is charged only when the batch produced at least one
+/// success. A batch in which *every* tunnel failed says more about the
+/// test endpoint than about the proxies: the proxies sit behind different
+/// exits, and an endpoint that is blocked or degraded on those exits is
+/// indistinguishable from a dead tunnel in meow-rs' answer. Charging the
+/// ladder then would empty a healthy pool because of one bad endpoint, so
+/// such a batch is stamped unverified instead, the way a meow-rs outage
+/// is.
+struct T2Verdicts {
+    successes: AtomicUsize,
+    failures: std::sync::Mutex<Vec<T2Failure>>,
+}
+
+/// One failed tunnel check, kept until the batch is over.
+struct T2Failure {
+    /// The proxy the check was about.
+    id: i64,
+    /// When the check ran; the ladder stamps its own timestamps.
+    now: i64,
+    /// The quarantine ladder step of the row, for the revival batches. The
+    /// regular T2 batch has none.
+    ladder_step: Option<i64>,
+}
+
+impl T2Verdicts {
+    fn new() -> Self {
+        Self {
+            successes: AtomicUsize::new(0),
+            failures: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record_success(&self) {
+        self.successes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self, failure: T2Failure) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(failure);
+    }
+
+    fn successes(&self) -> usize {
+        self.successes.load(Ordering::Relaxed)
+    }
+
+    /// The failures of the batch, ready to be charged (or not).
+    fn take_failures(&self) -> Vec<T2Failure> {
+        std::mem::take(
+            &mut *self
+                .failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "fumox-probe", version, about = "Fumox health-check daemon")]
 struct Cli {
@@ -95,6 +156,12 @@ struct Cli {
     /// location is config/app.toml if present).
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Print the resolved configuration as TOML and exit. The values are
+    /// the effective ones: the file merged under the environment, which
+    /// wins. The admin token is redacted.
+    #[arg(long)]
+    print_config: bool,
 }
 
 /// Shared daemon state, cheap to clone into spawned check tasks.
@@ -144,9 +211,19 @@ impl Context {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before anything builds an HTTP client: reqwest is compiled without a
+    // crypto provider, so one has to be installed first.
+    fumox_core::tls::install_crypto_provider();
+
     let cli = Cli::parse();
     let loaded = fumox_core::config::load(cli.config.as_deref())?;
     let config = loaded.config;
+
+    if cli.print_config {
+        print!("{}", fumox_core::config::dump(&config)?);
+        return Ok(());
+    }
+
     fumox_core::logging::init_tracing(config.log.probe);
 
     // The loader cannot log (its own level comes from the config); report
@@ -176,8 +253,11 @@ async fn main() -> anyhow::Result<()> {
         env_overrides,
         "database configured"
     );
-    let pool = fumox_core::db::connect_pool(&config.database).await?;
-    fumox_core::db::migrate(&pool).await?;
+    // The probe shares the database file with the server but owns only
+    // the health status of a proxy. Its connections run behind an
+    // authorizer that denies every other write, and the pool applies
+    // the schema before those connections exist.
+    let pool = fumox_core::db::connect_probe_pool(&config.database).await?;
 
     tracing::info!(
         cycle_secs = config.probe.cycle_interval_secs,
@@ -730,6 +810,10 @@ async fn revive_quarantined_via_t2(
 
     let delays = ctx.config.probe.recheck_delays_secs.clone();
     let semaphore = Arc::new(Semaphore::new(ctx.config.probe.concurrency.max(1)));
+    // One test URL for the whole batch, the same rule as the regular T2
+    // batch: every revival check asks the same endpoint.
+    let test_url = ctx.meow.cycle_test_url().to_string();
+    let verdicts = Arc::new(T2Verdicts::new());
     let mut tasks = tokio::task::JoinSet::new();
     for row in batch {
         // A recheck that cannot run (entry failed to serialize) is a failed recheck.
@@ -768,7 +852,8 @@ async fn revive_quarantined_via_t2(
             continue;
         }
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
-        let delays = delays.clone();
+        let test_url = test_url.clone();
+        let verdicts = verdicts.clone();
         tasks.spawn(async move {
             // The semaphore lives in this scope until `collect_tasks`
             // returns; a closed semaphore here is structurally impossible.
@@ -776,23 +861,74 @@ async fn revive_quarantined_via_t2(
                 Ok(permit) => permit,
                 Err(_) => return,
             };
-            perform_quarantine_t2_check(&ctx, &row, &delays).await;
+            perform_quarantine_t2_check(&ctx, &row, &test_url, &verdicts).await;
         });
     }
-    Ok(checked + collect_tasks(&mut tasks).await)
+    let done = collect_tasks(&mut tasks).await;
+    // The batch is over: advance the ladder for the failed revival checks,
+    // unless no check succeeded and more than one tunnel failed. A batch
+    // where every tunnel failed is a verdict about the test endpoint, so
+    // the rows stay where they are and are retried when the endpoint
+    // answers again.
+    let failures = verdicts.take_failures();
+    if !failures.is_empty() && verdicts.successes() == 0 && failures.len() > 1 {
+        tracing::warn!(
+            failures = failures.len(),
+            test_url = %test_url,
+            "every T2 revival check failed the tunnel: the test endpoint is suspect, \
+             the quarantine ladder was not advanced"
+        );
+    } else {
+        for failure in &failures {
+            let step = failure.ladder_step.unwrap_or(0);
+            match proxies::quarantine_check_failed(
+                &ctx.pool,
+                failure.id,
+                failure.now,
+                step,
+                &delays,
+            )
+            .await
+            {
+                Ok(proxies::Transition::Removed) => {
+                    tracing::info!(
+                        id = failure.id,
+                        "proxy removed after the final failed recheck"
+                    )
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        id = failure.id,
+                        step,
+                        "quarantine revival failed, ladder advanced"
+                    )
+                }
+                Err(error) => {
+                    tracing::warn!(id = failure.id, %error, "failed to advance quarantine ladder")
+                }
+            }
+        }
+    }
+    Ok(checked + done)
 }
 
 /// One T2 revival check for a quarantined row; the outcome contract is
 /// [`revive_quarantined_via_t2`]'s.
-async fn perform_quarantine_t2_check(ctx: &Context, row: &proxies::ProxyRow, delays: &[i64]) {
+async fn perform_quarantine_t2_check(
+    ctx: &Context,
+    row: &proxies::ProxyRow,
+    test_url: &str,
+    verdicts: &T2Verdicts,
+) {
     let name = clash::proxy_name(row.id);
     let now = now_ts();
     let outcome = ctx
         .meow
-        .check_delay_with_retry(&name, 2, Duration::from_millis(100))
+        .check_delay_with_retry(&name, test_url, 2, Duration::from_millis(100))
         .await;
     match outcome {
         DelayOutcome::Ok(delay) => {
+            verdicts.record_success();
             let latency = i64::try_from(delay).unwrap_or(i64::MAX);
             journal(
                 ctx,
@@ -838,23 +974,14 @@ async fn perform_quarantine_t2_check(ctx: &Context, row: &proxies::ProxyRow, del
                 },
             )
             .await;
-            match proxies::quarantine_check_failed(&ctx.pool, row.id, now, row.ladder_step, delays)
-                .await
-            {
-                Ok(proxies::Transition::Removed) => {
-                    tracing::info!(id = row.id, "proxy removed after the final failed recheck")
-                }
-                Ok(_) => {
-                    tracing::debug!(
-                        id = row.id,
-                        step = row.ladder_step,
-                        "quarantine revival failed, ladder advanced"
-                    )
-                }
-                Err(error) => {
-                    tracing::warn!(id = row.id, %error, "failed to advance quarantine ladder")
-                }
-            }
+            // The ladder is advanced when the batch is over, not here: a
+            // batch in which every tunnel failed is a verdict about the
+            // test endpoint, not about the quarantined rows.
+            verdicts.record_failure(T2Failure {
+                id: row.id,
+                now,
+                ladder_step: Some(row.ladder_step),
+            });
         }
         DelayOutcome::ServiceUnavailable(error) => {
             // Not a verdict: the row stays due, the ladder is untouched.
@@ -995,10 +1122,15 @@ enum T2Task {
 /// quarantine revival batch) to `meow.config_path`.
 ///
 /// The YAML carries every proxy credential in plain text, same exposure as
-/// the SQLite database, same 0600 answer (the DB chmod rationale lives in
-/// fumox-core/src/db.rs). The mode is set at creation so the file is never
+/// the SQLite database. The mode is set at creation so the file is never
 /// briefly world-readable, and re-asserted on the open fd: a pre-existing
 /// file keeps its old mode through `create` alone and must be corrected.
+///
+/// 0640, not 0600: the file lives in a volume shared with the meow-rs
+/// container, which runs under a different uid (the proxy kernel gets no
+/// access to the database) and reads the config through the shared group.
+/// The group is the only reader besides the owner, so the credentials stay
+/// out of reach of every other user on the host.
 fn write_meow_config(path: &std::path::Path, yaml: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1011,10 +1143,10 @@ fn write_meow_config(path: &std::path::Path, yaml: &str) -> std::io::Result<()> 
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
+            .mode(0o640)
             .open(path)?;
         // fchmod on the open fd, no path re-resolution between check and use.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
         file.write_all(yaml.as_bytes())?;
     }
     #[cfg(not(unix))]
@@ -1170,6 +1302,13 @@ async fn probe_t2_batch(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::R
     // still due a check in this batch then gets an aborted-failure record
     // without hammering a dying meow-rs with further requests.
     let batch_guard = Arc::new(BatchGuard::new(MEOW_ABORT_THRESHOLD));
+    // The verdicts of this batch, settled when it is over.
+    let verdicts = Arc::new(T2Verdicts::new());
+    // One test URL for the whole cycle: every check of the batch asks the
+    // same endpoint, so a cycle is internally consistent and the log line
+    // below names the endpoint the verdicts are about.
+    let test_url = ctx.meow.cycle_test_url().to_string();
+    tracing::debug!(test_url = %test_url, "T2 batch test URL");
     let mut tasks = tokio::task::JoinSet::new();
     let mut skipped = 0usize;
     for row in batch {
@@ -1189,6 +1328,8 @@ async fn probe_t2_batch(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::R
         }
         let (ctx, semaphore) = (ctx.clone(), semaphore.clone());
         let batch_guard = batch_guard.clone();
+        let verdicts = verdicts.clone();
+        let test_url = test_url.clone();
         tasks.spawn(async move {
             // The semaphore lives in this scope until `collect_tasks`
             // returns; a closed semaphore here is structurally impossible.
@@ -1217,11 +1358,12 @@ async fn probe_t2_batch(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::R
             // patterns the engine cannot recover from within the cycle.
             let outcome = ctx
                 .meow
-                .check_delay_with_retry(&name, 2, Duration::from_millis(100))
+                .check_delay_with_retry(&name, &test_url, 2, Duration::from_millis(100))
                 .await;
             match outcome {
                 DelayOutcome::Ok(delay) => {
                     batch_guard.record_recovered();
+                    verdicts.record_success();
                     let latency = i64::try_from(delay).unwrap_or(i64::MAX);
                     journal(
                         &ctx,
@@ -1268,25 +1410,15 @@ async fn probe_t2_batch(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::R
                         },
                     )
                     .await;
-                    match proxies::check_failed(
-                        &ctx.pool,
-                        row.id,
+                    // The ladder is charged when the batch is over, not
+                    // here: a batch in which every tunnel failed is a
+                    // verdict about the test endpoint, not about the
+                    // proxies.
+                    verdicts.record_failure(T2Failure {
+                        id: row.id,
                         now,
-                        fail_limit,
-                        min_secs,
-                        spread_secs,
-                        true,
-                    )
-                    .await
-                    {
-                        Ok(proxies::Transition::Quarantined) => {
-                            tracing::info!(id = row.id, "proxy quarantined after T2 failures")
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::warn!(id = row.id, %error, "failed to record T2 failure")
-                        }
-                    }
+                        ladder_step: None,
+                    });
                 }
                 DelayOutcome::ServiceUnavailable(error) => {
                     // Two paths reach here: (a) the retry budget was
@@ -1309,12 +1441,18 @@ async fn probe_t2_batch(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::R
                             %error,
                             "meow-rs answered /version after a failed delay check; treating as per-request blip"
                         );
-                        journal_and_fail(
+                        journal_failure(
                             &ctx,
                             row.id,
                             &format!("meow-rs transient error: {error}"),
+                            now,
                         )
                         .await;
+                        verdicts.record_failure(T2Failure {
+                            id: row.id,
+                            now,
+                            ladder_step: None,
+                        });
                     } else {
                         if batch_guard.record_failure() {
                             // Threshold crossed exactly once per batch;
@@ -1352,6 +1490,15 @@ async fn probe_t2_batch(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::R
             Err(error) => tracing::warn!(%error, "T2 check task panicked"),
         }
     }
+    settle_t2_failures(
+        &ctx,
+        &verdicts,
+        &test_url,
+        fail_limit,
+        min_secs,
+        spread_secs,
+    )
+    .await;
     Ok(T2Outcome {
         checked,
         aborted,
@@ -1359,16 +1506,99 @@ async fn probe_t2_batch(ctx: Arc<Context>, already_checked: &[i64]) -> anyhow::R
     })
 }
 
+/// Charge the fail ladder for the failed tunnels of a finished batch, or
+/// not, depending on what the rest of the batch did.
+///
+/// A batch in which *no* check succeeded and more than one tunnel failed is
+/// not a verdict about the proxies: it is a verdict about the test
+/// endpoint. meow-rs answers a blocked or degraded endpoint exactly like
+/// a dead tunnel, the proxies sit behind different exits, and charging
+/// the ladder then would empty a healthy pool because of one bad
+/// endpoint. Such a batch stamps the rows unverified instead, the way a
+/// meow-rs outage does.
+///
+/// A single failure is charged: one proxy that cannot reach the endpoint
+/// is a verdict about that proxy, and the ladder is the only thing that
+/// retires it.
+async fn settle_t2_failures(
+    ctx: &Context,
+    verdicts: &T2Verdicts,
+    test_url: &str,
+    fail_limit: u32,
+    min_secs: i64,
+    spread_secs: i64,
+) {
+    let failures = verdicts.take_failures();
+    if failures.is_empty() {
+        return;
+    }
+    if verdicts.successes() == 0 && failures.len() > 1 {
+        tracing::warn!(
+            failures = failures.len(),
+            test_url = %test_url,
+            "every T2 check of the batch failed the tunnel: the test endpoint is suspect, \
+             the proxies were not charged"
+        );
+        for failure in &failures {
+            if let Err(error) =
+                proxies::check_engine_unavailable(&ctx.pool, failure.id, failure.now).await
+            {
+                tracing::warn!(id = failure.id, %error, "failed to stamp the T2 engine fault");
+            }
+        }
+        return;
+    }
+    for failure in &failures {
+        match proxies::check_failed(
+            &ctx.pool,
+            failure.id,
+            failure.now,
+            fail_limit,
+            min_secs,
+            spread_secs,
+            true,
+        )
+        .await
+        {
+            Ok(proxies::Transition::Quarantined) => {
+                tracing::info!(id = failure.id, "proxy quarantined after T2 failures")
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(id = failure.id, %error, "failed to record T2 failure")
+            }
+        }
+    }
+}
+
+/// Journal one failed T2 attempt without charging the fail ladder. The
+/// ladder is charged by the caller when the batch is over (see
+/// [`settle_t2_failures`]), so that a batch in which every tunnel failed
+/// is not mistaken for a verdict about the proxies.
+async fn journal_failure(ctx: &Context, id: i64, reason: &str, now: i64) {
+    journal(
+        ctx,
+        ProbeResultEntry {
+            proxy_id: id,
+            checked_at: now,
+            ok: false,
+            latency_ms: None,
+            error: Some(reason),
+            probe_kind: T2_KIND,
+        },
+    )
+    .await;
+}
+
 /// Journal one failed T2 attempt and run the fail ladder: a proxy that got
 /// a verdict, whether the tunnel itself failed or the target was vet-refused,
 /// receives a `probe_kind='t2'` failure record, which is also what moves it
 /// forward in the recency queue.
 ///
-/// The remaining caller is the per-request blip branch, where the engine
-/// answered its liveness ping but the delay endpoint failed for this one
-/// proxy. That verdict is charged against the fail budget like any other;
-/// a meow-rs that is alive to `GET /version` but broken on every delay
-/// request is charged this way for the whole batch.
+/// The callers are the two refusals that are not about the endpoint: a
+/// target the private-address policy blocked and an entry that could not
+/// be serialized for the engine config. Both are a verdict about the
+/// proxy itself, so they are charged right away.
 async fn journal_and_fail(ctx: &Context, id: i64, reason: &str) {
     let now = now_ts();
     journal(

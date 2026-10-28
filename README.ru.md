@@ -65,10 +65,10 @@ cargo run -p fumox-probe    # демон проверки живучести п�
    объединяются и сочетаются в одном шаблоне имени).
 2. Положите файлы под каноническими именами в `[geo].db_dir` — для запуска из
    исходников это `config/`. **Поставляемый Compose-стек переопределяет каталог
-   на `/shared`** (`FUMOX_GEO__DB_DIR` в `docker-compose.yml`, volume, общий
-   с meow), а окружение сильнее `app.toml`, поэтому `.mmdb`, положенный в
-   `./config`, там просто не читается: скопируйте его в volume `meow-shared`
-   (`docker compose cp GeoLite2-City.mmdb server:/shared/`) либо уберите
+   на `/shared/geo`** (`FUMOX_GEO__DB_DIR` в `docker-compose.yml`, отдельный
+   volume для баз), а окружение сильнее `app.toml`, поэтому `.mmdb`, положенный в
+   `./config`, там просто не читается: скопируйте его в volume `fumox-geo`
+   (`docker compose cp GeoLite2-City.mmdb server:/shared/geo/`) либо уберите
    override и задайте `[geo].db_dir` в файле.
 
 Без файла гео-обогащение автоматически отключается (предупреждение в логе),

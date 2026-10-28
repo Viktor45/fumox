@@ -235,6 +235,16 @@ impl AdminState {
     /// a banner; the in-memory view is left untouched on failure.
     pub fn refresh_live_config(&self, path: &std::path::Path) -> fumox_core::Result<()> {
         let loaded = fumox_core::config::load(Some(path))?;
+        // The same warning the startup path prints: an operator who
+        // moved the panel onto a public address through the settings
+        // form has to learn that the cookie now travels in clear text.
+        if loaded.config.admin.insecure_cookies_on_a_public_bind() {
+            tracing::warn!(
+                bind = %loaded.config.admin.bind,
+                "admin session cookie is not marked Secure while the panel listens on a public \
+                 address: the session token travels in clear text"
+            );
+        }
         let mut guard = self
             .live_config
             .write()

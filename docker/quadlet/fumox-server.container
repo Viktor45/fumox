@@ -2,6 +2,9 @@
 # admin panel on :8081 (loopback-only). Default CMD of the image is already
 # fumox-server, so no Exec= override is needed.
 #
+# The unit runs in its own pod (fumox.pod): the proxy kernel lives in
+# fumox-worker.pod and cannot reach the admin panel.
+#
 # Quadlet does not build images, prepare localhost/fumox:local before the
 # first start: either pull+tag the GHCR image (see docker/README.md) or
 #   podman build -t localhost/fumox:local .
@@ -14,14 +17,40 @@ Image=localhost/fumox:local
 ContainerName=fumox-server
 Pod=fumox.pod
 
-# .env equivalent (see fumox.env.example); must exist before first start.
-# Values here CANNOT be overridden from the env file, podman gives
-# Environment= precedence over EnvironmentFile=, so only fixed wiring
-# lives in the unit; anything an operator may want to change belongs in
-# the env file.
-EnvironmentFile=%h/.config/fumox/fumox.env
+# The image already runs as this user (uid/gid 999); the explicit line
+# keeps the guarantee visible in the deployment and survives an image
+# change.
+User=999
+Group=999
+NoNewPrivileges=true
+# The root filesystem is read-only: every path the server writes to is a
+# volume, a bind mount or a tmpfs (see Tmpfs= below).
+ReadOnly=true
+# Podman's own read-only tmpfs set (/dev, /dev/shm, /run, /tmp, /var/tmp)
+# is replaced by the explicit mounts below: their mode is pinned to 1777
+# so the non-root user can write to them.
+ReadOnlyTmpfs=false
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,mode=1777,size=64m
 
-Environment=FUMOX_GEO__DB_DIR=/shared
+# Two env files, on purpose:
+#   fumox.env      shared runtime variables (config path, controller
+#                  secret, test URL, probe SSRF guard);
+#   fumox-admin.env the admin panel variables — the login token, the
+#                  cookie flag, the SSRF guard for source URLs. Only the
+#                  server reads it, so the probe and the kernel never
+#                  see the token.
+# Both must exist before the first start.
+# Values in Environment= CANNOT be overridden from the env files, podman
+# gives Environment= precedence over EnvironmentFile=, so only fixed
+# wiring lives in the unit; anything an operator may want to change
+# belongs in the env files.
+EnvironmentFile=%h/.config/fumox/fumox.env
+EnvironmentFile=%h/.config/fumox/fumox-admin.env
+
+# GeoLite2 databases live in their own volume, not in the config
+# directory: the environment outranks [geo].db_dir in the file, so
+# config/app.toml is never scanned for databases (see docker/README.md).
+Environment=FUMOX_GEO__DB_DIR=/shared/geo
 # Config file inside the container: the default below is what the image
 # uses anyway (config/app.toml relative to /app). Uncomment and adjust ONLY
 # if the file in the mounted config volume has a different name (the file
@@ -31,21 +60,29 @@ Environment=FUMOX_GEO__DB_DIR=/shared
 #Environment=FUMOX_CONFIG=/app/config/app.toml
 
 # Left side: a directory with app.toml. The GeoLite2 databases do not
-# belong here: FUMOX_GEO__DB_DIR above points them at /shared (see
-# docker/README.md).
+# belong here: FUMOX_GEO__DB_DIR above points them at the geo volume
+# (see docker/README.md).
 # %h expands to your home dir; point it at the repo's config/ if you prefer.
 #
 # Writable: the admin *Edit settings* page writes /app/config/app.toml
 # in place via the toml_edit-backed editor (see USERGUIDE §7). If you
 # want config edits off, drop the `:rw` and the editor renders disabled
-# with the `set.edit_unwritable` banner.
+# with the `set.edit_unwritable` banner. The directory must be writable
+# by the container user (uid 999), see docker/README.md.
 Volume=%h/fumox/config:/app/config:rw,Z
 Volume=fumox-data.volume:/app/data
-Volume=fumox-shared.volume:/shared
+Volume=fumox-geo.volume:/shared/geo
 
 [Service]
 # systemd equivalent of compose "restart: unless-stopped".
 Restart=on-failure
+# Resource limits: the server serves the public endpoints and the admin
+# panel, the probe and the kernel get smaller quotas (see
+# fumox-probe.container). These keys are plain systemd options, quadlet
+# passes the [Service] section through untouched.
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=256
 
 [Install]
 WantedBy=default.target

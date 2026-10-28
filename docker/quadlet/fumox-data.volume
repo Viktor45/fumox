@@ -1,9 +1,15 @@
 # SQLite database (compose named volume "fumox-data"), shared by
 # fumox-server and fumox-probe, both processes write the same WAL-mode DB.
 # Referenced from the .container units as: Volume=fumox-data.volume:/app/data
+#
+# The owner is pinned: the volume is created by this unit (before the
+# containers start), so the database files are owned by the uid the
+# binaries run under, whoever creates the volume first.
 
 [Unit]
 Description=Fumox SQLite database volume
 
 [Volume]
 VolumeName=fumox-data
+User=999
+Group=999

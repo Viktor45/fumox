@@ -1,13 +1,14 @@
-# meow-rs, mihomo-compatible kernel the probe drives for T2 checks
-# (image from docker/meow/, CMD "meow -f /etc/meow/config.yaml -d /shared"
-# is baked in). Prepare localhost/fumox-meow:local before the first start:
-# either pull+tag the GHCR image (see docker/README.md) or
+# meow-rs, mihomo-compatible kernel the probe drives for T2 checks.
+# The image renders its config from the template at startup (the
+# entrypoint), the CMD is baked in. Prepare localhost/fumox-meow:local
+# before the first start: either pull+tag the GHCR image (see
+# docker/README.md) or
 #   podman build -t localhost/fumox-meow:local docker/meow
 #
-# The bootstrap config baked into the image binds the Clash
-# external-controller to 0.0.0.0:9090 *inside the pod* and disables inbound
-# listeners (allow-lan: false). Nothing is published to the host; only the
-# probe reaches it, over pod loopback at 127.0.0.1:9090.
+# The controller answers only to a caller that presents the secret from
+# FUMOX_MEOW__API_TOKEN (the entrypoint refuses to start without one),
+# and it listens on the pod loopback (127.0.0.1:9090): no other pod, no
+# other container and nothing on the host can reach it.
 
 [Unit]
 Description=meow-rs kernel for T2 checks (REST API 9090, pod-internal)
@@ -15,11 +16,34 @@ Description=meow-rs kernel for T2 checks (REST API 9090, pod-internal)
 [Container]
 Image=localhost/fumox-meow:local
 ContainerName=fumox-meow
-Pod=fumox.pod
-Volume=fumox-shared.volume:/shared
+Pod=fumox-worker.pod
+
+# The image runs as this user (uid 998, gid 999): the kernel reads the
+# generated config through the shared group and must not be able to open
+# the SQLite database, which the probe writes under uid 999.
+User=998
+Group=999
+NoNewPrivileges=true
+ReadOnly=true
+ReadOnlyTmpfs=false
+# The rendered config (it carries the controller secret) and the kernel's
+# data directory live on RAM only.
+Tmpfs=/run/meow:rw,noexec,nosuid,nodev,mode=1777,size=16m
+
+# The controller secret and the shared runtime variables.
+EnvironmentFile=%h/.config/fumox/fumox.env
+
+# The probe shares the pod's network namespace, so the controller can
+# stay on the loopback address: nothing outside this pod reaches it.
+Environment=FUMOX_MEOW_API_BIND=127.0.0.1:9090
+
+Volume=fumox-meow.volume:/shared/meow
 
 [Service]
 Restart=on-failure
+MemoryMax=256M
+CPUQuota=75%
+TasksMax=128
 
 [Install]
 WantedBy=default.target

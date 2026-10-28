@@ -435,10 +435,15 @@ pub async fn login_submit(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     // The empty token disables the panel entirely; never match it. The
+    // historical "change-me" placeholder is not a credential either: it
+    // means "no token configured", so it must never open a session. The
     // token comes from the live config, so a value saved on the settings
     // screen is enforced on the next login without a restart.
     let admin = state.admin();
-    if !admin.token.is_empty() && ct_eq(&form.token, &admin.token) {
+    if !admin.token.is_empty()
+        && !admin.uses_placeholder_token()
+        && ct_eq(&form.token, &admin.token)
+    {
         let ttl = state.session_ttl();
         let epoch = session_epoch(&state.pool).await;
         let value = issue_session(&state.session_key, ttl, epoch);

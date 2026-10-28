@@ -28,7 +28,7 @@ your pull date against the section dates.
 """
 body = """
 {% for commit in commits %}\
-{{ commit.committer.timestamp | date(fmt="%Y-%m-%d") }}|{{ commit.id | truncate(length=7, end="") }}|{{ commit.group }}|{{ commit.message | upper_first | replace(from="\\n", to=" ") }}
+{{ commit.committer.timestamp | date(fmt="%Y-%m-%d") }}|{{ commit.id | truncate(length=7, end="") }}|{{ commit.group }}|{{ commit.message | upper_first | replace(from="\n", to=" ") }}
 {% endfor %}\
 """
 # Remove leading and trailing whitespaces from the changelog's body.

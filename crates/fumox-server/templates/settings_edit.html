@@ -15,10 +15,23 @@
   {% when None %}
 {% endmatch %}
 
+{# Form-level errors carry no field: the save was refused as a whole
+   (the file changed under the form, the document would not load, the
+   write failed). They have no input to sit under, so they are shown
+   above the form instead. #}
+{% match self.error_for("") %}
+  {% when Some with (msg) %}<div class="flash error" role="alert">{{ msg }}</div>
+  {% when None %}
+{% endmatch %}
+
 <p class="muted small">{{ self.t_named("set.edit_intro", &[("path", self.editing_path_str())][..]) }}</p>
 
 <form method="post" action="/admin/settings/update">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
+  {# Fingerprint of the file this form was rendered from: the submit is
+     refused when the file changed in the meantime, so a hand edit made
+     while the page was open is not overwritten by the stale form. #}
+  <input type="hidden" name="cfg_fingerprint" value="{{ fingerprint }}">
 
   <input type="radio" name="settings-tab" id="tab-server" class="tab-input" checked>
   <input type="radio" name="settings-tab" id="tab-probe" class="tab-input">
@@ -107,6 +120,12 @@
         <label for="server-hosts">{{ self.t("set.allowed_hosts") }}</label>
         <textarea class="mono" id="server-hosts" name="server.allowed_hosts" rows="3" placeholder="example.com&#10;localhost"{{ self.fields_disabled() }}>{{ self.raw_value("server.allowed_hosts") }}</textarea>
       </div>
+      <div class="field">
+        <label for="server-export-rows">{{ self.t("set.export_max_rows") }}</label>
+        <input type="number" id="server-export-rows" name="server.export_max_rows" min="{{ self.range_min("server.export_max_rows") }}" max="{{ self.range_max("server.export_max_rows") }}" value="{{ self.raw_value("server.export_max_rows") }}"{{ self.fields_disabled() }}>
+        {% match self.range_text("server.export_max_rows") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
+        {% match self.error_for("server.export_max_rows") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
     </div>
 
     <div class="panel">
@@ -155,6 +174,12 @@
         <input type="number" id="geo-dns" name="geo.dns_timeout_secs" min="{{ self.range_min("geo.dns_timeout_secs") }}" max="{{ self.range_max("geo.dns_timeout_secs") }}" value="{{ self.raw_value("geo.dns_timeout_secs") }}"{{ self.fields_disabled() }}>
         {% match self.range_text("geo.dns_timeout_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("geo.dns_timeout_secs") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <label for="geo-startup-budget">{{ self.t("set.geo_startup_budget") }}</label>
+        <input type="number" id="geo-startup-budget" name="geo.startup_download_budget_secs" min="{{ self.range_min("geo.startup_download_budget_secs") }}" max="{{ self.range_max("geo.startup_download_budget_secs") }}" value="{{ self.raw_value("geo.startup_download_budget_secs") }}"{{ self.fields_disabled() }}>
+        {% match self.range_text("geo.startup_download_budget_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
+        {% match self.error_for("geo.startup_download_budget_secs") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
     </div>
 

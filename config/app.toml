@@ -97,7 +97,14 @@ path = "fumox.db"
 # Range: 100..=60000 ms (form). Required: two processes write to the
 # database (server and probe); without it the second one does not wait for
 # the lock, it gets SQLITE_BUSY.
-busy_timeout_ms = 5000
+busy_timeout_ms = 30000
+# Уровень durability, без диапазона: normal | full.
+# normal = WAL переживает падение процесса, full = и потерю питания (fsync
+# на каждый коммит). Уровень задаёт развёртывание, а не код.
+# Durability level, no range: normal | full.
+# normal survives a process crash, full survives a power loss too (an fsync
+# per commit). This is a deployment decision, not a code one.
+synchronous = "normal"
 # Диапазон: 1..=1024 соединений (форма). SQLite сериализует записи, так что
 # заметный прирост на больших значениях обычно не появляется.
 # Range: 1..=1024 connections (form). SQLite serializes writes, so a
@@ -212,15 +219,16 @@ enabled = true
 # Каталог с файлами .mmdb, без диапазона: путь должен существовать.
 # «config», дефолт рядом с бинарником: удобно для dev-сборки и одиночного запуска.
 # В проде задайте абсолютный путь к read-only тому с актуальными .mmdb
-# ВНИМАНИЕ: поставляемый стек Docker Compose переопределяет это на /shared
-# (переменная FUMOX_GEO__DB_DIR), а окружение приоритетнее файла, поэтому на
-# этом стеке значение из файла не применяется: базы кладите в том meow-shared.
+# ВНИМАНИЕ: поставляемый стек Docker Compose переопределяет это на
+# /shared/geo (переменная FUMOX_GEO__DB_DIR), а окружение приоритетнее файла,
+# поэтому на этом стеке значение из файла не применяется: базы кладите в том
+# fumox-geo.
 # Directory holding the .mmdb files, no range: the path must exist.
 # "config" is the default next to the binary, convenient for dev.
 # In prod set an absolute path to a read-only volume with fresh .mmdb
-# NOTE: the shipped Docker Compose stack overrides this to /shared
+# NOTE: the shipped Docker Compose stack overrides this to /shared/geo
 # (FUMOX_GEO__DB_DIR), and the environment outranks the file, so the value
-# here does not apply on that stack: put the databases in the meow-shared
+# here does not apply on that stack: put the databases in the fumox-geo
 # volume instead.
 db_dir = "config"
 # Диапазон: 0..=10000000 записей (форма). Потолок in-memory кэша moka, уходит
@@ -258,10 +266,12 @@ startup_download_budget_secs = 60
 # Admin panel. An empty token disables the panel (it answers 404).
 enabled = true
 # Строка без диапазона: это и есть пароль, держите его секретом. Пустая
-# строка отключает админку целиком.
+# строка отключает админку целиком. Значение "change-me" считается пустым:
+# панель выключена, пока оператор не задал токен явно.
 # Free-form string, no range: this is the password itself, keep it secret.
-# An empty string disables the panel entirely.
-token = "change-me"
+# An empty string disables the panel entirely; so does the placeholder
+# "change-me". The panel stays off until an operator sets a token.
+token = ""
 # Сокет отдельного слушателя в виде host:port, без диапазона. Наружу его
 # не выставляют: reverse-proxy или SSH-туннель.
 # A separate listener's host:port socket, no range. Never exposed directly:
@@ -273,14 +283,12 @@ bind = "127.0.0.1:8081"
 # How long the admin session cookie lives.
 session_ttl_hours = 168
 # Диапазон: true | false. В сборке дефолт false.
-# В этом примере стоит true: false = отказывать RFC1918/loopback (SSRF-защита
-# активна). Поставьте обратно false, если источники не доверенные;
-# true имеет смысл только при собственной изолированной feed-инфраструктуре.
+# false = отказывать RFC1918/loopback (SSRF-защита активна). Включайте
+# true только явно и только для доверенной feed-инфраструктуры.
 # Range: true | false; the built-in default is false.
-# This example ships true: false rejects RFC1918/loopback (SSRF guard active).
-# Set it back to false for untrusted sources; true makes sense only on your
-# own isolated feed infra.
-allow_private_urls = true
+# false rejects RFC1918/loopback (SSRF guard active). Enable true only
+# explicitly, and only for your own trusted feed infrastructure.
+allow_private_urls = false
 # Диапазон: N = 1..=1000000 запросов (форма), окно = sec | min | hour | day.
 # /admin/* кроме login.
 # Range: N = 1..=1000000 requests (form), window = sec | min | hour | day.
@@ -437,41 +445,44 @@ allow_private_targets = false
 # not manage it: it only calls its REST API and reloads its config via
 # PUT /configs.
 api_addr = "127.0.0.1:9090"
+# Токен доступа к REST API meow-rs, без диапазона. Пустая строка оставляет
+# контроллер без аутентификации: он умеет переписывать конфиг ядра прокси,
+# поэтому порт 9090 не должен быть опубликован наружу. Непустое значение
+# заставляет meow-rs отвечать 401 на запрос без заголовка
+# "Authorization: Bearer <token>", и probe шлет этот заголовок при каждом
+# обращении.
+# Access token for the meow-rs REST API, no range. An empty string leaves
+# the controller unauthenticated: it can rewrite the proxy kernel's config,
+# so port 9090 must not be published. A non-empty value makes meow-rs
+# answer 401 to a request without an "Authorization: Bearer <token>"
+# header, and the probe sends that header on every call.
+api_token = ""
 # Путь к конфигу meow-rs, без диапазона: /shared/meow.yaml в типовом
 # docker-compose, подмените, когда раскладка томов иная.
 # Path to meow-rs's own config, no range: /shared/meow.yaml in the typical
 # docker-compose layout; override if your volume layout differs.
 config_path = "/shared/meow.yaml"
-# Строка, массив строк или строка с запятыми, без диапазона. Probe случайно
-# выбирает один адрес на каждую проверку, поэтому выход одного из строя не
-# ломает T2. Ниже, актуальные адреса captive-проверки Android (проверены
-# вживую 2026-08-29, все отвечают HTTP 204); уберите недоступные в вашем
-# регионе. HTTPS-варианты (www.google.com, connectivitycheck.gstatic.com,
-# play.googleapis.com) тоже живы, но дают лишний TLS-handshake внутри туннеля.
-# A string, an array of strings, or a comma-separated string, no range. The
-# probe picks one at random per check, so a dead endpoint no longer breaks T2.
-# Below are the current Android captive-portal endpoints (verified live
-# 2026-08-29, all answer HTTP 204); drop the ones unreachable in your region.
-# HTTPS variants (www.google.com, connectivitycheck.gstatic.com,
-# play.googleapis.com) are alive too but add a TLS handshake inside the tunnel.
-test_url = [
-  "https://cp.cloudflare.com/generate_204",
-  "https://connectivity-check.ubuntu.com",
-  # Android 5+ (primary since 7.1)
-  "https://www.gstatic.com/generate_204",
-  # Android 7.1+
-  "https://connectivitycheck.gstatic.com/generate_204",
-  # Android 4.2+ (fallback 9+)
-  "https://www.google.com/generate_204",
-  # Android 4.3+ (fallback)
-  "https://www.googleapis.com/generate_204",
-  # Android 9+/11 fallback
-  "https://play.googleapis.com/generate_204",
-  # legacy Android 4.x, still alive
-  "https://connectivitycheck.android.com/generate_204",
-  # legacy Android 2.3-4.x, still alive
-  "https://clients3.google.com/generate_204",
-]
+# Строка, массив строк или строка с запятыми, без диапазона. Каждый адрес —
+# абсолютный http(s)-URL: другая схема и адрес без хоста отвергаются при
+# загрузке конфига. Probe выбирает один адрес на цикл проверок, и все
+# проверки цикла бьют по нему, поэтому недоступный адрес больше не дает
+# одному прокси разные вердикты подряд. Если через туннель не прошел весь
+# батч (ни одного успеха при двух и более неудачах), адрес считается
+# подозрительным: прокси получают отметку "не проверен", а лестница отказов
+# не растет. Адрес по умолчанию — https: запрос идет через проверяемый
+# прокси, и вредоносный прокси не может подделать ответ по plain HTTP,
+# выдав ее за рабочий туннель.
+# A string, an array of strings, or a comma-separated string, no range. Every
+# entry is an absolute http(s) URL: a non-http scheme and a hostless entry
+# are refused at config load. The probe draws one URL per cycle and every
+# check of that cycle hits it, so a dead endpoint no longer gives one proxy
+# opposite verdicts in consecutive cycles. When the whole batch failed (no
+# success at all and more than one failure), the endpoint is treated as
+# suspect: the proxies are stamped unverified and the fail ladder does not
+# grow. The default endpoint is https: the request goes through the proxy
+# under test, and a hostile proxy cannot forge a plaintext answer and pass
+# it off as a working tunnel.
+test_url = ["https://www.gstatic.com/generate_204"]
 # Диапазон: 1..=600 секунд (форма). Уходит в meow-rs параметром timeout у
 # проверки задержки (это и есть бюджет туннеля) и одновременно служит
 # потолком таймаута HTTP-клиента; сам HTTP-запрос идет с запасом в 5 с.

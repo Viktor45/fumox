@@ -15,7 +15,9 @@ pub mod logging;
 pub mod models;
 pub mod parsers;
 pub mod repo;
+pub mod sqlite_guard;
 pub mod ssrf;
+pub mod tls;
 
 pub use config::{AppConfig, DEFAULT_CONFIG_PATH};
 pub use db::tempdir_lite;

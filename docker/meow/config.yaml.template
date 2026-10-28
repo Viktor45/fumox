@@ -1,0 +1,40 @@
+# meow-rs bootstrap configuration for Fumox T2 health checks.
+#
+# This is a TEMPLATE: the container renders it at startup (entrypoint.sh)
+# into a tmpfs, replacing the two placeholders below with the values of
+# FUMOX_MEOW__API_BIND and FUMOX_MEOW__API_TOKEN. The rendered copy holds
+# the controller secret, which is why it never touches a disk.
+#
+# meow-rs runs headless here: fumox-probe generates the real proxy list,
+# writes it to the shared exchange volume and hot-reloads it via
+# `PUT /configs`. This file only needs to bring up the external-controller
+# REST API that the probe talks to. No inbound listener is required for
+# delay tests (the probe measures the tunnels through the controller), and
+# the external-controller is not hot-swappable on reload, so it stays up
+# across every probe-driven config reload.
+#
+# The probe replaces this whole file on its first reload: the config it
+# renders carries the proxies and the rules, and none of the keys below.
+# That is why the controller keeps answering with the secret configured
+# here, and why the keys below only have to survive until the first
+# reload.
+
+allow-lan: false
+mode: rule
+log-level: silent
+
+# Clash external-controller REST API. fumox-probe connects to it over the
+# container network (compose) or the pod loopback (quadlet/kube) and sends
+# the secret as `Authorization: Bearer <token>`.
+#
+# The placeholder is replaced with FUMOX_MEOW__API_BIND. Bind it to
+# 127.0.0.1 when the probe shares the network namespace with the kernel
+# (the pod layouts), and to 0.0.0.0 only when the probe reaches it over a
+# container network (compose). The port is never published to the host:
+# the controller can rewrite the kernel's configuration, so it must stay
+# reachable from the probe alone.
+external-controller: __FUMOX_MEOW_API_BIND__
+secret: "__FUMOX_MEOW_API_SECRET__"
+
+proxies: []
+rules: []

@@ -20,10 +20,11 @@ axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # reqwest 0.13: rustls is the default TLS backend and `rustls-tls` became
-# `rustls`. The provider is aws-lc by default; we stay on ring to match the
-# `rustls` crate's provider above (one crypto provider in the process).
+# `rustls`. The `rustls-no-provider` feature is the one that leaves the
+# crypto provider unset, so the process installs `ring` explicitly
+# (fumox_core::tls::install_crypto_provider) instead of carrying two
+# providers. Enabling `rustls` here would pull in aws-lc-rs as well.
 reqwest = { version = "0.13", default-features = false, features = [
-    "rustls",
     "rustls-no-provider",
     "gzip",
     "brotli",
@@ -32,7 +33,14 @@ reqwest = { version = "0.13", default-features = false, features = [
     "query",
 ] }
 # T1 TLS handshakes in the probe daemon (health checks, not a trust boundary).
-tokio-rustls = "0.26"
+# default-features = false keeps tokio-rustls from re-enabling the aws-lc-rs
+# provider on the rustls crate.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+# The one crypto provider in the process.
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
@@ -58,6 +66,14 @@ toml_edit = { version = "0.25", features = ["display"] }
 # sqlx 0.9: query*() takes `impl SqlSafeStr`, `&'static str` directly,
 # dynamic SQL wrapped in `sqlx::AssertSqlSafe`.
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
+# The SQLite C API, for the authorizer that restricts the probe's
+# database connection. The version has to match the one sqlx-sqlite
+# resolves to: the authorizer is installed on the very handle sqlx
+# hands out, so both crates must link the same library. sqlx-sqlite
+# allows `>=0.30.1, <0.38.0`; 0.37 is what the lockfile pins.
+libsqlite3-sys = { version = "0.37", default-features = false, features = [
+    "pkg-config",
+] }
 
 # Observability
 tracing = "0.1"
@@ -83,6 +99,9 @@ rand = "0.10"
 time = { version = "0.3", features = ["macros", "formatting"] }
 thiserror = "2"
 anyhow = "1"
+# `O_NOFOLLOW` for the database and config file opens: the constant is
+# platform-specific, so the value is read from libc instead of hardcoded.
+libc = "0.2"
 async-stream = "0.3"
 futures-util = "0.3"
 

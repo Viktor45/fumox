@@ -20,7 +20,7 @@ mod security;
 mod serve;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,13 +43,28 @@ struct Cli {
     /// ships no curl or wget, and the binary already has an HTTP client.
     #[arg(long)]
     health_check: bool,
+
+    /// Print the resolved configuration as TOML and exit. The values are
+    /// the effective ones: the file merged under the environment, which
+    /// wins. The admin token is redacted.
+    #[arg(long)]
+    print_config: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before anything builds an HTTP client: reqwest is compiled without a
+    // crypto provider, so one has to be installed first.
+    fumox_core::tls::install_crypto_provider();
+
     let cli = Cli::parse();
     let loaded = fumox_core::config::load(cli.config.as_deref())?;
     let config = loaded.config;
+
+    if cli.print_config {
+        print!("{}", fumox_core::config::dump(&config)?);
+        return Ok(());
+    }
 
     // Before tracing, the pool and the migrations: a probe must not make
     // any of that side effect happen just to be measured. It reports the
@@ -67,12 +82,26 @@ async fn main() -> anyhow::Result<()> {
 
     fumox_core::logging::init_tracing(config.log.server);
 
-    // Security audit (2026-08-30): running the panel with the built-in
-    // default token is almost certainly a misconfiguration, say so loudly.
-    if config.admin.is_active() && config.admin.token == fumox_core::config::DEFAULT_ADMIN_TOKEN {
+    // Security audit (2026-08-30): the panel is only reachable with a
+    // token the operator set. An empty token and the historical
+    // "change-me" placeholder both mean "panel off" (see
+    // `AdminConfig::is_active`), so the listener is never started for
+    // them; say which mode this is, since "the admin URL answers 404" is
+    // otherwise indistinguishable from a routing mistake.
+    if config.admin.enabled && !config.admin.is_active() {
         tracing::warn!(
-            "admin token equals the built-in default; \
-             set [admin].token (or FUMOX_ADMIN__TOKEN) before exposing the panel"
+            bind = %config.admin.bind,
+            "admin panel is disabled: set admin.token (or FUMOX_ADMIN__TOKEN) to enable it"
+        );
+    }
+    // A panel that listens on a public address and sends its session
+    // cookie without `Secure` hands the token to everyone on the path.
+    if config.admin.insecure_cookies_on_a_public_bind() {
+        tracing::warn!(
+            bind = %config.admin.bind,
+            "admin session cookie is not marked Secure while the panel listens on a public \
+             address: the session token travels in clear text; set admin.secure_cookies = true \
+             behind an HTTPS front, or bind the panel to a loopback address"
         );
     }
 
@@ -89,6 +118,24 @@ async fn main() -> anyhow::Result<()> {
                 fumox_core::DEFAULT_CONFIG_PATH
             );
         }
+    }
+
+    // A save that died between creating its temporary file and renaming
+    // it leaves a copy of the config behind, and the config carries
+    // `[admin].token`. The leftovers of writers that are gone are
+    // removed here, on the only start that can produce them.
+    let config_dir = match &loaded.path {
+        fumox_core::config::ResolvedConfigPath::Loaded(file) => {
+            file.parent().map(Path::to_path_buf)
+        }
+        fumox_core::config::ResolvedConfigPath::Missing => {
+            Path::new(fumox_core::DEFAULT_CONFIG_PATH)
+                .parent()
+                .map(Path::to_path_buf)
+        }
+    };
+    if let Some(dir) = config_dir {
+        fumox_core::config_writer::cleanup_stale_tmp_files(&dir);
     }
 
     // figment layers `FUMOX_*` variables over the file (config.rs, `Env::
@@ -262,6 +309,9 @@ async fn main() -> anyhow::Result<()> {
 /// unauthenticated route on the public listener.
 async fn probe_healthz(port: u16) -> anyhow::Result<()> {
     let url = format!("http://127.0.0.1:{port}/healthz");
+    // reqwest is compiled without a crypto provider and panics when a
+    // client is built before one is installed.
+    fumox_core::tls::install_crypto_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()?

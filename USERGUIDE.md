@@ -199,7 +199,7 @@ Useful `.env` variables (all except the token are optional):
 | `FUMOX_ADMIN__TOKEN`              | – (**required**)                      | Admin panel login token. The panel is disabled without it.                                                                                                       |
 | `FUMOX_PUBLIC_PORT`               | `8080`                                | Host port for the public listeners; shift it to run a second, isolated stand next to the main one.                                                               |
 | `FUMOX_ADMIN_PORT`                | `8081`                                | Host port for the admin panel (always published to loopback only or `FUMOX_ADMIN_BIND`).                                                                        |
-| `FUMOX_MEOW__TEST_URL`            | `http://www.gstatic.com/generate_204` | URL used for T2 delay tests. Override if it is blocked in your region (e.g. `http://cp.cloudflare.com`).                                                         |
+| `FUMOX_MEOW__TEST_URL`            | `http://cp.cloudflare.com/generate_204` | URL used for T2 delay tests. Override if it is blocked in your region (e.g. `http://www.gstatic.com/generate_204`).                       |
 | `FUMOX_ADMIN__ALLOW_PRIVATE_URLS` | `false`                               | Allow source URLs pointing at private/loopback addresses (disables the SSRF guard). Local testing only.                                                          |
 | `FUMOX_ADMIN__SECURE_COOKIES`     | `true` (compose) / `false` (file)     | Add `; Secure` to the admin session cookie. The compose default `true` presumes an HTTPS front; set `false` in `.env` when the panel is opened over plain HTTP (`http://127.0.0.1:8081`), or every login silently fails. |
 | `FUMOX_CONFIG_ACCESS`             | `rw`                                  | Mount mode for `./config` in the **server** container. `rw` lets the admin *Edit settings* page save `app.toml`; `ro` mounts it read-only, which turns that page into a read-only view. The probe container is always `:ro`. |
@@ -286,8 +286,12 @@ Notes:
   runs basic checks (`/healthz`, the admin login page, a 404 from a wrong
   alive-export token, all three containers settling into `running` without
   restarts, a check independent of the configured log levels).
+  The generated token is written to a private `0600` file whose path the
+  script prints; pass `--show-token` to print the token itself instead. A
+  token supplied through `FUMOX_ADMIN__TOKEN` is used as it is and never
+  printed or written anywhere.
   `scripts/smoke-down.sh` tears
-  it down (volumes deleted unless `--keep-data`). The main stack is never
+  it down (the volumes are kept unless `--purge-volumes` is passed). The main stack is never
   touched; both stands share the image tags (`ghcr.io/viktor45/fumox:latest`,
   `ghcr.io/viktor45/fumox-meow:latest`), so the smoke build doubles as the
   main-stack rebuild.
@@ -736,7 +740,7 @@ tuned values that differ for some keys.
 | ------------------- | ----------- | ---------------------------------------------------------- |
 | `enabled`           | `true`      | Master switch                                              |
 | `db`                | `"country"` | Legacy key from the one-database era; kept so existing configs parse, no longer affects resolution; all databases in `db_dir` are merged |
-| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`. Under Docker Compose the shipped stack overrides this to `/shared` (the `meow-shared` volume) via `FUMOX_GEO__DB_DIR`, so `./config` on the host is **not** scanned for databases: put them in the `meow-shared` volume, or unset the override. Env outranks the file, which is why editing `db_dir` in `config/app.toml` has no effect on the Compose stack |
+| `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`. Under Docker Compose the shipped stack overrides this to `/shared/geo` (the `fumox-geo` volume) via `FUMOX_GEO__DB_DIR`, so `./config` on the host is **not** scanned for databases: put them in the `fumox-geo` volume, or unset the override. Env outranks the file, which is why editing `db_dir` in `config/app.toml` has no effect on the Compose stack |
 | `cache_max_entries` | `16384`     | Host→geo cache size; entries also expire after 6 hours, so a host whose DNS was down is retried without a restart |
 | `dns_timeout_secs`  | `5`         | DNS resolution timeout                                     |
 | `startup_download_budget_secs` | `60` | How long startup waits for the GeoLite2 download before it starts listening. Past the budget the download keeps running in the background (the file is installed by an atomic rename, so a half-written `.mmdb` is never visible) and this run serves without geo enrichment until the next start. `0` = do not wait at all |
@@ -780,7 +784,7 @@ tuned values that differ for some keys.
 | ---------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `api_addr`             | `"127.0.0.1:9090"`                                                                      | meow-rs REST API address (its external-controller)                                                                                                                                                                                                                                                                                |
 | `config_path`          | `"config/meow.yaml"`                                                                    | Where the probe writes the generated Clash config. **Must be a path meow-rs itself can read** (in Docker: the shared volume)                                                                                                                                                                                                      |
-| `test_url`             | Rotation over the Google Android `generate_204` endpoints (7 URLs, verified 2026-08-29) | URL(s) fetched through the proxy for delay tests: one URL, a TOML array, or a comma-separated string. The probe picks one at random per check, so a blocked endpoint no longer breaks T2 everywhere. iOS/Apple check URLs (`captive.apple.com/...`) answer 200, not 204 (usable, but only if your client accepts non-204 answers) |
+| `test_url`             | `"http://cp.cloudflare.com/generate_204"`                                                       | URL(s) fetched through the proxy for delay tests: one URL, a TOML array, or a comma-separated string. Every entry must be an absolute `http(s)` URL (a non-http scheme and a hostless entry are refused at config load). The probe draws one URL per cycle and every check of that cycle hits it, so a blocked endpoint no longer gives one proxy opposite verdicts in consecutive cycles; when a whole batch fails, the proxies are stamped unverified instead of being charged. iOS/Apple check URLs (`captive.apple.com/...`) answer 200, not 204 (usable, but only if your client accepts non-204 answers) |
 | `timeout_secs`         | `10`                                                                                    | Per-check timeout                                                                                                                                                                                                                                                                                                                 |
 | `backoff_initial_secs` | `60`                                                                                    | Initial T2 backoff while meow-rs is unavailable (doubles per consecutive failure)                                                                                                                                                                                                                                                 |
 | `backoff_max_secs`     | `900`                                                                                   | T2 backoff ceiling (15 min); a dead meow-rs is never mistaken for dead proxies                                                                                                                                                                                                                                                   |
@@ -914,8 +918,8 @@ cycle in four passes:
    the protocol implies TLS) checks over `unknown`/`alive` proxies;
 4. **T2**: real tunnel checks through meow-rs: the probe writes a Clash
    config with the batch, hot-reloads meow-rs via `PUT /configs`, then
-   measures delay via `GET /proxies/{name}/delay` against a randomly picked
-   URL from `[meow].test_url` (the checks rotate across the configured list).
+   measures delay via `GET /proxies/{name}/delay` against one URL drawn from
+   `[meow].test_url` (the same URL for every check of the cycle).
    The sample consists of `alive` and `ready` proxies plus never-checked
    `unknown` hysteria2, which T1 cannot say anything about (see below).
    The sample order is by recency, not random: proxies without a single
@@ -1043,7 +1047,7 @@ panel's *Settings* page.
 | `[probe].concurrency`                | `8`                 | Parallelism of checks                                                                                                                               |
 | `[probe].queue_stale_days`           | `7`                 | Lifetime of priority-queue entries (first check of new proxies)                                                                                     |
 | `[probe].allow_private_targets`      | `false`             | When `false`, the probe refuses to connect to loopback / link-local / RFC1918 / ULA addresses. This protects against SSRF if an attacker publishes a proxy list pointing at cloud metadata (`169.254.169.254`) or a private subnet. Blocked attempts are journaled as `probe_results.error = "blocked by the private-address policy: <reason>"` so the T2 recency queue advances past them |
-| `[ingest].refresh_check_limit`       | `50`                | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables)                                                       |
+| `[ingest].refresh_check_limit`       | `50`                | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables). The key used to live in `[probe]`; the old name is still accepted for one release (its value is carried over, and the startup log names the key to rename) |
 | `[ingest].drop_gate`                 | `false`             | Whether `drop` rules unlink a live "lingerer" on the very next refresh                                                                              |
 | `[ingest].removed_as_unknown`        | `false`             | Revive a `removed` proxy the feed still carries: reset to pristine `unknown` and re-check                                                           |
 | `[meow].timeout_secs`                | `10`                | Per-check T2 delay-test timeout                                                                                                                     |
@@ -1234,12 +1238,12 @@ Manual installation (e.g. with your own MaxMind license) goes like this:
 3. Place the file into `[geo].db_dir` under its canonical name:
    `GeoLite2-City.mmdb` or `GeoLite2-ASN.mmdb`. The default is `config/` next
    to the binary, which is the host's `./config` under Compose, **but the
-   shipped Compose stack overrides `[geo].db_dir` to `/shared`**, so a file
+   shipped Compose stack overrides `[geo].db_dir` to `/shared/geo`**, so a file
    dropped in `./config` is never read there. Under Compose, put the `.mmdb`
-   into the `meow-shared` volume (`/shared`), or drop the `FUMOX_GEO__DB_DIR`
+   into the `fumox-geo` volume (`/shared/geo`), or drop the `FUMOX_GEO__DB_DIR`
    override from `docker-compose.yml` and set `[geo].db_dir` in the file.
    You can skip this step entirely: Fumox downloads the databases itself
-   (see below), and under Compose that download already targets `/shared`.
+   (see below), and under Compose that download already targets `/shared/geo`.
 
 Fumox opens **every** database it finds in `[geo].db_dir` and merges their
 facts, so country, city and ASN data combine in one name template. The
@@ -1392,9 +1396,9 @@ WantedBy=multi-user.target
 | `X-Fumox-Stale: true` header                                          | Some sources are temporarily unreachable; last good data is being served. The fetch log shows which sources and why (`error_class`).               |
 | Source shows `parse_error`                                            | The source returned HTTP 200 but unparseable content (anti-bot page, CDN stub, format change). The last good snapshot is served meanwhile.         |
 | Source won't save: "private URL" error                                | The URL resolves to a loopback/private address and `allow_private_urls` is false. That's the SSRF guard working.                                   |
-| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`. Under Compose the directory is `/shared`, not `./config`, see [section 11](#11-geo-enrichment).    |
+| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`. Under Compose the directory is `/shared/geo`, not `./config`, see [section 11](#11-geo-enrichment). |
 | *Import / Export*, *Sources* or *Profiles*: export link 404s         | The link is built from the panel's host; the public listener answers `404` for a host it does not serve. Add it to `[server].allowed_hosts`.     |
-| GeoLite2 file placed in `./config` is ignored                          | The Compose stack sets `FUMOX_GEO__DB_DIR=/shared`, and the environment outranks `config/app.toml`. Use the `meow-shared` volume, or remove the override and set `[geo].db_dir`. |
+| GeoLite2 file placed in `./config` is ignored                          | The Compose stack sets `FUMOX_GEO__DB_DIR=/shared/geo`, and the environment outranks `config/app.toml`. Use the `fumox-geo` volume, or remove the override and set `[geo].db_dir`. |
 | T2 checks never run, probe logs mention meow backoff                  | meow-rs is down or `[meow].api_addr` is wrong. In Docker, it must be `meow:9090`; the config path must be the shared volume (`/shared/meow.yaml`). |
 | `SQLITE_BUSY` errors in logs                                          | `busy_timeout_ms` was removed or set too low while two processes write to the DB. Restore the default (5000).                                      |
 | Build fails: `sqlite3.h: No such file`                                | Install the system SQLite dev package (`libsqlite3-dev` on Debian/Ubuntu).                                                                         |

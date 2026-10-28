@@ -4,7 +4,7 @@
 Input:  lines `date|sha|category|message` on stdin (the flat-draft template
         in cliff.toml, see the "Flat draft" comment there).
 Output: one `## <date> · sha-<last-commit-of-the-day>` section per day,
-        Keep a Changelog categories (Added/Changed/Removed/Fixed/Docs)
+        Keep a Changelog categories (Added/Changed/Removed/Fixed/Security/Docs)
         inside, oldest first, the hand-editing pass then rewrites the
         terse commit subjects and trims whatever landed before the first
         image was ever published.
@@ -32,24 +32,48 @@ CHANGELOG.md" for the canonical rule):
   - Pre-image commits are kept (no trim); do not delete early
     sections even if they predate the first GHCR-published image.
 """
+import re
 import sys
 from collections import OrderedDict
 
 CATEGORIES = ["Added", "Changed", "Removed", "Fixed", "Security", "Docs"]
 # Internal (chore/dependabot merges) never changes the shipped image.
 DROPPED = ["Internal"]
+# The date field of a draft line: the cliff template writes %Y-%m-%d.
+# Everything else is the draft's header, not a commit.
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_draft(lines):
+    """Yield (date, sha, category, message) for every draft line.
+
+    A line is a commit only when it has all four fields and a date that
+    looks like one. The header git-cliff writes above the draft has no
+    pipes at all, but a header line that happens to carry three of them
+    must not be mistaken for a commit.
+    """
+    for line in lines:
+        line = line.rstrip("\r\n")
+        parts = line.split("|", 3)
+        if len(parts) != 4:
+            continue
+        date, sha, category, message = parts
+        if not DATE.match(date):
+            continue
+        yield date, sha, category, message
+
 
 def main() -> None:
     days: "OrderedDict[str, list[tuple[str, str, str]]]" = OrderedDict()
-    for line in sys.stdin:
-        line = line.rstrip("\n")
-        # The cliff.toml header precedes the draft; only the pipe-formatted
-        # draft lines carry four fields.
-        if not line or "|" not in line:
-            continue
-        date, sha, category, message = line.split("|", 3)
+    unknown: "OrderedDict[str, None]" = OrderedDict()
+    for date, sha, category, message in parse_draft(sys.stdin):
         if category in DROPPED:
             continue
+        if category not in CATEGORIES:
+            # A category outside the taxonomy: it keeps its own heading
+            # below, but it is worth naming, because a new category
+            # usually means a new commit-prefix convention.
+            unknown.setdefault(category, None)
         days.setdefault(date, []).append((sha, category, message))
 
     for date, commits in days.items():
@@ -61,13 +85,31 @@ def main() -> None:
         for _sha, category, message in commits:
             by_cat.setdefault(category, []).append(message)
         for category in CATEGORIES:
-            for name, messages in by_cat.items():
-                if name != category:
-                    continue
-                print(f"### {category}\n")
-                for message in messages:
-                    print(f"- {message}")
-                print()
+            if category not in by_cat:
+                continue
+            print(f"### {category}\n")
+            for message in by_cat[category]:
+                print(f"- {message}")
+            print()
+        # Categories outside the taxonomy are printed under their own
+        # heading: a commit must not disappear because its category is
+        # new.
+        for category, messages in by_cat.items():
+            if category in CATEGORIES:
+                continue
+            print(f"### {category}\n")
+            for message in messages:
+                print(f"- {message}")
+            print()
+
+    if unknown:
+        print(
+            "note: categories outside the Keep a Changelog taxonomy: "
+            + ", ".join(unknown)
+            + " (printed under their own heading)",
+            file=sys.stderr,
+        )
+
 
 if __name__ == "__main__":
     main()

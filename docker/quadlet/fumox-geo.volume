@@ -1,0 +1,14 @@
+# GeoLite2 databases (compose named volume "fumox-geo"), written by the
+# server only: the probe never opens them, and the kernel has no reason
+# to see them. They live outside the config directory on purpose — the
+# environment variable FUMOX_GEO__DB_DIR outranks [geo].db_dir in the
+# file, so the config directory is never scanned for databases.
+# Referenced from the .container units as: Volume=fumox-geo.volume:/shared/geo
+
+[Unit]
+Description=Fumox GeoLite2 database volume
+
+[Volume]
+VolumeName=fumox-geo
+User=999
+Group=999

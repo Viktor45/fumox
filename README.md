@@ -65,11 +65,11 @@ at <https://www.maxmind.com/en/geolite2/signup>):
    present is merged, so they combine in one name template).
 2. Place each file under its canonical name in `[geo].db_dir` (`config/` for
    source runs). **The shipped Compose stack overrides the
-   directory to `/shared`** (`FUMOX_GEO__DB_DIR` in `docker-compose.yml`,
-   the volume shared with meow), and the environment outranks `app.toml`,
+   directory to `/shared/geo`** (`FUMOX_GEO__DB_DIR` in `docker-compose.yml`,
+   the dedicated geo volume), and the environment outranks `app.toml`,
    so a `.mmdb` dropped into `./config` is never read there: copy it into
-   the `meow-shared` volume
-   (`docker compose cp GeoLite2-City.mmdb server:/shared/`) or drop the
+   the `fumox-geo` volume
+   (`docker compose cp GeoLite2-City.mmdb server:/shared/geo/`) or drop the
    override and set `[geo].db_dir` instead.
 
 Without a database file, geo enrichment disables itself automatically (a

@@ -15,6 +15,17 @@
 #   /app/locales : admin UI translation catalogs (<code>.toml); drop an extra
 #                  file in and restart to add a language (embedded fallbacks
 #                  keep the panel working if the directory is removed)
+#   /shared/geo  : mount point for the GeoLite2 databases (server only)
+#   /shared/meow : mount point for the config exchange with the meow kernel
+#
+# The image runs as uid 999 / gid 999 (the `fumox` user). The gid is shared
+# with the meow image, whose user has uid 998 and the same gid: the proxy
+# kernel reads the generated config through the group and never touches the
+# database, which the probe writes under the same uid as the server.
+#
+# The root filesystem is meant to be mounted read-only (the compose and kube
+# definitions do it): every path the binaries write to is a volume or a
+# bind mount, /tmp is the only writable path on the image itself.
 #
 # Configuration is resolved from built-in defaults, then a TOML file (by
 # priority: --config, the FUMOX_CONFIG environment variable, or
@@ -22,7 +33,10 @@
 # overrides. The image sets:
 #   FUMOX_DATABASE__PATH=/app/data/fumox.db
 #   FUMOX_ADMIN__BIND=0.0.0.0:8081   (upstream default is loopback-only)
-# You must additionally provide FUMOX_ADMIN__TOKEN to enable the admin panel.
+# The admin panel stays off until a token is set: FUMOX_ADMIN__TOKEN is
+# mandatory only when the mounted app.toml carries an empty [admin].token.
+# The placeholder "change-me" is not a token: the server refuses to start
+# with it on a non-loopback bind.
 #
 # Build speed (measured, amd64 dev machine, source-only change rebuild):
 #   ~7.5 min -> ~1.7 min via:
@@ -157,10 +171,28 @@ FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libsqlite3-0 tini \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system fumox \
-    && useradd --system --gid fumox --home-dir /app --shell /usr/sbin/nologin fumox \
+    # The uid and the gid are pinned, not left to the allocator: the meow
+    # image runs its user under the same gid (999) with another uid (998),
+    # and the two share a volume. A random system uid would silently break
+    # that arrangement (or collide with it). useradd fails loudly when the
+    # uid is already taken, which is the intended behaviour.
+    && groupadd --system --gid 999 fumox \
+    && useradd --system --uid 999 --gid 999 --home-dir /app --shell /usr/sbin/nologin fumox \
     && mkdir -p /app/config /app/data \
-    && chown -R fumox:fumox /app
+    && chown -R fumox:fumox /app \
+    # The shared roots, split by purpose and owner:
+    #   /shared/geo   the GeoLite2 databases, written by the server alone
+    #   /shared/meow  the config exchange with the proxy kernel
+    # Both are volume mount points, so the mode below is what a fresh volume
+    # inherits. The exchange directory is group-writable (0770): the probe
+    # writes the generated config into it and the kernel reads it, and
+    # whichever of the two creates the volume first must not lock the other
+    # out. The group is the only reader besides the owner (the files inside
+    # are 0640), so the credentials stay out of reach of anyone else.
+    && mkdir -p /shared/geo /shared/meow \
+    && chown fumox:fumox /shared/geo /shared/meow \
+    && chmod 0750 /shared/geo \
+    && chmod 0770 /shared/meow
 
 COPY --from=builder /out/fumox-server /usr/local/bin/fumox-server
 COPY --from=builder /out/fumox-probe /usr/local/bin/fumox-probe

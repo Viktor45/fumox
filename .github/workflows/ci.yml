@@ -1,10 +1,10 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
-#  push:
-#    branches: [main]
-#  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,21 +12,29 @@ env:
 permissions:
   contents: read
 
+# One run per ref: a new push supersedes the previous run on the same
+# branch, so a superseded commit does not keep a runner busy. A pull
+# request has its own ref (refs/pull/<n>/merge), so two PRs never cancel
+# each other.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # sqlx links the system SQLite (not bundled), so headers are required.
       - name: Install SQLite dev package
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
 
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # The compile/test invocations below are --locked, matching the
       # `--locked` in Dockerfile: without it a drifted Cargo.lock is silently
@@ -42,8 +50,20 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      # Ops-script coverage: `cargo test` never executes scripts/, and this
-      # one carries real write paths (revive, adopt, restore). Needs only
-      # bash and sqlite3, both present on the runner image.
-      #- name: Script tests
-      #  run: bash scripts/tests/revive-xhttp-proxies.test.sh
+      # Ops-script coverage: `cargo test` never executes scripts/, and these
+      # carry real write paths (revive, adopt, restore), the compose
+      # teardown the smoke stand depends on, and the GHCR retention
+      # rules. All are hermetic — they need only bash and the sqlite3 CLI,
+      # both present on the runner image — and none touches the network or
+      # a real container engine.
+      - name: Script tests
+        run: |
+          bash scripts/tests/cleanup-ghcr.test.sh
+          bash scripts/tests/revive-xhttp-proxies.test.sh
+          bash scripts/tests/smoke-down.test.sh
+          bash scripts/tests/smoke-up.test.sh
+
+      # The changelog generator runs on a draft git-cliff produces; it
+      # must not drop a category or crash on a malformed line.
+      - name: Changelog generator test
+        run: python3 scripts/tests/make-changelog.test.py

@@ -321,6 +321,9 @@ async fn download_body_capped(
     user_agent: &str,
     max_bytes: u64,
 ) -> Result<u64, String> {
+    // reqwest is compiled without a crypto provider and panics when a
+    // client is built before one is installed.
+    fumox_core::tls::install_crypto_provider();
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent(user_agent.to_string())
@@ -545,11 +548,18 @@ mod tests {
         const CAP: u64 = 4 * 1024;
         const SERVE: usize = 64 * 1024;
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
+                // Read the request before answering: a server that replies
+                // to a request it has not read yet sends an "early
+                // response", and hyper cancels such a connection instead
+                // of parsing it (the request is still being written when
+                // the answer arrives).
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {SERVE}\r\nconnection: close\r\n\r\n"
                 );
@@ -598,8 +608,10 @@ mod tests {
         let payload_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let payload_addr = payload_server.local_addr().unwrap();
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             while let Ok((mut sock, _)) = payload_server.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
                 let body = fake_mmdb(b"served", CITY);
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -613,8 +625,10 @@ mod tests {
         let redirector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let redirector_addr = redirector.local_addr().unwrap();
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             while let Ok((mut sock, _)) = redirector.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
                 let head = format!(
                     "HTTP/1.1 302 Found\r\nlocation: http://{payload_addr}/x.mmdb\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                 );

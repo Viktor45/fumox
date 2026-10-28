@@ -1,0 +1,17 @@
+# Clash-config exchange between fumox-probe and meow-rs (compose named
+# volume "fumox-meow"): the probe renders the T2 batch to
+# /shared/meow/meow.yaml and hot-reloads meow through its REST API.
+# Referenced from the .container units as: Volume=fumox-meow.volume:/shared/meow
+#
+# The owner is pinned to the probe's uid: the probe creates the config
+# file (0640, group 999), the kernel reads it through the same group.
+# Both containers live in the worker pod, the kernel never touches the
+# database volume.
+
+[Unit]
+Description=Fumox T2 config exchange volume (probe <-> meow)
+
+[Volume]
+VolumeName=fumox-meow
+User=999
+Group=999

@@ -11,10 +11,21 @@ use sqlx::SqlitePool;
 use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
-use crate::config::DatabaseConfig;
+use crate::config::{DatabaseConfig, SynchronousMode};
 
 /// Type alias used across repository code.
 pub type DbPool = SqlitePool;
+
+/// Which writes a pool's connections may perform.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteScope {
+    /// Every write is allowed. The server owns the subscription
+    /// content and has to be able to write all of it.
+    Full,
+    /// Only the health status of a proxy may change. See
+    /// [`crate::sqlite_guard`].
+    ProbeOnly,
+}
 
 /// Opens a connection pool configured for multi-process WAL access.
 ///
@@ -22,6 +33,53 @@ pub type DbPool = SqlitePool;
 /// holding the plain-text credentials is never briefly world-readable; on
 /// non-Unix this is a no-op and the ACL model governs.
 pub async fn connect_pool(cfg: &DatabaseConfig) -> crate::Result<SqlitePool> {
+    connect_pool_with(cfg, WriteScope::Full).await
+}
+
+/// Opens the probe daemon's connection pool.
+///
+/// The probe shares the database file with the server, but it owns only
+/// the health status of a proxy. Its connections run behind an
+/// authorizer that denies every other write, so a defect in the probe
+/// cannot rewrite the subscription content (hosts, credentials,
+/// sources) that the server maintains.
+///
+/// The schema is applied first, on an unrestricted connection: a
+/// migration rewrites the schema and may move rows between tables,
+/// which the restricted connections refuse. The probe therefore owns
+/// the schema even when it starts before the server does.
+pub async fn connect_probe_pool(cfg: &DatabaseConfig) -> crate::Result<SqlitePool> {
+    let schema_pool = connect_pool(cfg).await?;
+    // The server may be migrating the same file right now: the pod
+    // layouts start both processes at once. SQLite serializes the
+    // writers, but the loser of that race gets SQLITE_BUSY once the
+    // busy timeout is over, and a failed migration would take the probe
+    // down. Retry for a while instead — the server finishes, the write
+    // lock is free, the migration succeeds.
+    let mut attempt = 0;
+    loop {
+        match migrate(&schema_pool).await {
+            Ok(()) => break,
+            Err(error) => {
+                attempt += 1;
+                if attempt >= 10 {
+                    drop(schema_pool);
+                    return Err(error);
+                }
+                tracing::warn!(
+                    attempt,
+                    error = %error,
+                    "the schema migration failed, retrying (the server may hold the write lock)"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+    drop(schema_pool);
+    connect_pool_with(cfg, WriteScope::ProbeOnly).await
+}
+
+async fn connect_pool_with(cfg: &DatabaseConfig, scope: WriteScope) -> crate::Result<SqlitePool> {
     if cfg.max_connections == 0 {
         // sqlx accepts a zero-sized pool and then fails every acquisition
         // with `PoolTimedOut` after its 30 s acquire timeout, so the
@@ -58,24 +116,54 @@ pub async fn connect_pool(cfg: &DatabaseConfig) -> crate::Result<SqlitePool> {
         .create_if_missing(create_if_missing)
         .journal_mode(SqliteJournalMode::Wal)
         // NORMAL is the recommended synchronous mode for WAL: survives a
-        // process crash without the per-commit fsync cost of FULL.
-        .synchronous(SqliteSynchronous::Normal)
+        // process crash without the per-commit fsync cost of FULL. The
+        // level is a deployment decision, so it comes from the config.
+        .synchronous(match cfg.synchronous {
+            SynchronousMode::Normal => SqliteSynchronous::Normal,
+            SynchronousMode::Full => SqliteSynchronous::Full,
+        })
         .foreign_keys(true)
         .busy_timeout(Duration::from_millis(cfg.busy_timeout_ms.into()));
 
-    let pool = SqlitePoolOptions::new()
-        .max_connections(cfg.max_connections)
-        .connect_with(options)
-        .await?;
+    let mut pool_options = SqlitePoolOptions::new().max_connections(cfg.max_connections);
+    if scope == WriteScope::ProbeOnly {
+        // The authorizer lives on the connection, not on the pool, so it
+        // has to be installed on every connection the pool opens —
+        // including the ones it grows into later.
+        pool_options = pool_options.after_connect(|connection, _meta| {
+            Box::pin(async move {
+                crate::sqlite_guard::install(connection).await?;
+                Ok(())
+            })
+        });
+    }
+    let pool = pool_options.connect_with(options).await?;
 
     restrict_file_permissions(&cfg.path)?;
+    // WAL keeps the page cache and the write-ahead log in sidecar files
+    // next to the database. They hold the same rows as the database
+    // itself, so they get the same mode; SQLite creates them lazily, so
+    // they may not exist yet at this point.
+    restrict_sidecar_permissions(&cfg.path)?;
     Ok(pool)
 }
 
-/// On Unix only: ensure the parent directory exists (with mode `0o700` if we
-/// just created it) and pre-create the database file with mode `0o600` via
-/// `create_new(true)` so a second process racing for the same file fails
-/// with `AlreadyExists` instead of inheriting a permissive umask.
+/// On Unix only: ensure the parent directory exists and pre-create the
+/// database file with mode `0o600` via `create_new(true)` so a second
+/// process racing for the same file fails with `AlreadyExists` instead of
+/// inheriting a permissive umask.
+///
+/// A directory this function creates is tightened to `0o700`: it holds the
+/// credentials. A directory that already existed keeps its mode — a
+/// container volume or a `/var/lib` deployment owns that mode, and
+/// failing the startup over it would take the service down for a
+/// property the operator did not ask fumox to enforce. A too-permissive
+/// existing directory is reported as a warning instead.
+///
+/// The path is opened with `O_NOFOLLOW`: a symlink at the database path
+/// would otherwise redirect the whole database to a file the operator did
+/// not choose, and the `0600` mode would land on the symlink's target
+/// instead of on a file of our own.
 ///
 /// On non-Unix platforms this is a no-op; sqlx creates the file and the
 /// platform's ACL model governs.
@@ -87,6 +175,10 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         if let Some(parent) = path.parent().filter(|p| !p.exists()) {
+            // `create_dir_all` applies the process umask to every directory
+            // it creates, so the mode is set explicitly afterwards. The
+            // directory holds the credentials: nobody else needs to enter
+            // it.
             std::fs::create_dir_all(parent).map_err(|err| {
                 crate::Error::Database(format!(
                     "failed to create database parent dir {}: {err}",
@@ -109,32 +201,65 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
                     );
                 }
             }
-        }
-
-        if !path.exists() {
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(path)
-            {
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                    // Another process won the create race; the existing file
-                    // has its mode set already.
-                }
-                Err(err) => {
-                    return Err(crate::Error::Database(format!(
-                        "failed to create database file {}: {err}",
-                        path.display()
-                    )));
+        } else if let Some(parent) = path.parent() {
+            // The directory already exists. If it is group- or
+            // world-readable, the credentials file inside it is one
+            // directory traversal away from anyone on the host, so say so
+            // loudly instead of only tightening the file mode.
+            if let Ok(meta) = std::fs::metadata(parent) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    tracing::warn!(
+                        path = %parent.display(),
+                        mode = format!("{mode:04o}"),
+                        "database parent dir is readable by group or others; \
+                         chmod it to 0700 to keep the credentials private"
+                    );
                 }
             }
-        } else {
-            // File exists from a previous boot, open read-only to confirm
-            // it is accessible, no chmod here (we'd be racing the other
-            // process if any).
-            let _ = std::fs::OpenOptions::new().read(true).open(path);
+        }
+
+        // A symlink at the database path is refused: the operator asked
+        // for a database, not for whatever the link points at.
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(crate::Error::Database(format!(
+                    "database path {} is a symlink; refusing to open it",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(crate::Error::Database(format!(
+                    "failed to stat database file {}: {err}",
+                    path.display()
+                )));
+            }
+        }
+
+        // `O_NOFOLLOW` closes the race between the `symlink_metadata` check
+        // above and the open: a symlink swapped in between is rejected by
+        // the kernel instead of being followed.
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+
+        match options.open(path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                // Another process won the create race; the existing file
+                // has its mode set already.
+            }
+            Err(err) => {
+                return Err(crate::Error::Database(format!(
+                    "failed to create database file {}: {err}",
+                    path.display()
+                )));
+            }
         }
     }
     #[cfg(not(unix))]
@@ -146,6 +271,10 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
 
 /// Runs the sqlx migrations embedded in `fumox-core` and mirrors the applied
 /// schema version into the `meta` table (DATABASE, exploitation notes).
+///
+/// The pool has to be an unrestricted one: the probe's restricted
+/// connections refuse the schema changes a migration makes.
+/// [`connect_probe_pool`] applies the schema before it opens them.
 ///
 /// `sqlx` rejects startup when a previously-applied migration file has been
 /// edited in place: the SHA-384 stored in `_sqlx_migrations.checksum` no
@@ -350,6 +479,11 @@ fn chmod_test_mutex() -> &'static tokio::sync::Mutex<()> {
 /// the chmod fails so the operator notices a misconfigured database
 /// directory instead of running with a world-readable credentials file.
 ///
+/// The mode is set on the file the path resolves to, and the check that
+/// follows reads the mode back through the same inode the chmod touched:
+/// re-resolving the path would allow a symlink swapped in between to point
+/// the chmod at a different file.
+///
 /// On non-Unix platforms this is a no-op: NTFS DACLs (or whatever the host
 /// uses) govern file access, and `set_permissions` is not available.
 fn restrict_file_permissions(path: &std::path::Path) -> crate::Result<()> {
@@ -385,6 +519,57 @@ fn restrict_file_permissions(path: &std::path::Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// Give the WAL sidecars (`-wal`, `-shm`) the same mode as the database.
+///
+/// They hold the same rows as the database file, so they must not be more
+/// readable than it. SQLite creates them lazily, so a sidecar that does
+/// not exist yet is skipped instead of failing the startup; a chmod that
+/// fails on a sidecar is logged and does not abort the boot, because the
+/// database itself is already secured.
+fn restrict_sidecar_permissions(path: &std::path::Path) -> crate::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sidecar_path(path, suffix);
+            if !sidecar.exists() {
+                continue;
+            }
+            let mut perms = match std::fs::metadata(&sidecar) {
+                Ok(meta) => meta.permissions(),
+                Err(err) => {
+                    tracing::warn!(
+                        path = %sidecar.display(),
+                        error = %err,
+                        "failed to stat database sidecar"
+                    );
+                    continue;
+                }
+            };
+            perms.set_mode(0o600);
+            if let Err(err) = std::fs::set_permissions(&sidecar, perms) {
+                tracing::warn!(
+                    path = %sidecar.display(),
+                    error = %err,
+                    "failed to chmod database sidecar to 0600"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// The path of a WAL sidecar (`<db>-wal`, `<db>-shm`).
+fn sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
 #[cfg(all(test, unix))]
 mod unix_db_tests {
     use super::*;
@@ -407,6 +592,7 @@ mod unix_db_tests {
             path: path.clone(),
             busy_timeout_ms: 1000,
             max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         let meta = std::fs::metadata(&path).unwrap();
@@ -427,6 +613,7 @@ mod unix_db_tests {
             path: path.clone(),
             busy_timeout_ms: 1000,
             max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
         };
         let pool = connect_pool(&cfg).await.unwrap();
         // The file `pre_create_db_file` chmod'ed is the one the pool opened.
@@ -460,6 +647,7 @@ mod unix_db_tests {
             path: path.clone(),
             busy_timeout_ms: 1000,
             max_connections: 0,
+            synchronous: crate::config::SynchronousMode::Normal,
         };
         let err = connect_pool(&cfg).await.unwrap_err();
         assert!(
@@ -488,11 +676,104 @@ mod unix_db_tests {
             path: path.clone(),
             busy_timeout_ms: 1000,
             max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         // The chmod-confirmation step brought it back to 0600.
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// The WAL sidecars hold the same rows as the database file, so they
+    /// must not be more readable than it.
+    #[tokio::test]
+    async fn connect_pool_restores_0600_on_the_wal_sidecars() {
+        let _serial = chmod_test_mutex().lock().await;
+        let (_dir, path) = fresh_db_path("db-sidecar");
+        let cfg = DatabaseConfig {
+            path: path.clone(),
+            busy_timeout_ms: 1000,
+            max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
+        };
+        let pool = connect_pool(&cfg).await.unwrap();
+
+        // Force WAL files to exist, then widen their modes the way a
+        // stray umask would.
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let wal = sidecar_path(&path, "-wal");
+        let shm = sidecar_path(&path, "-shm");
+        for sidecar in [&wal, &shm] {
+            if !sidecar.exists() {
+                continue;
+            }
+            let mut perms = std::fs::metadata(sidecar).unwrap().permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(sidecar, perms).unwrap();
+        }
+
+        restrict_sidecar_permissions(&path).unwrap();
+
+        for sidecar in [&wal, &shm] {
+            if !sidecar.exists() {
+                continue;
+            }
+            let mode = std::fs::metadata(sidecar).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "{} must be as private as the database",
+                sidecar.display()
+            );
+        }
+    }
+
+    /// A symlink at the database path would redirect the whole database to
+    /// a file the operator did not choose, and the `0600` mode would land
+    /// on the link's target instead of on a file of our own.
+    #[tokio::test]
+    async fn a_symlinked_database_path_is_refused() {
+        let _serial = chmod_test_mutex().lock().await;
+        let dir = tempdir_lite::TempDir::new("db-symlink");
+        let target = dir.path().join("real.db");
+        let link = dir.path().join("link.db");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let cfg = DatabaseConfig {
+            path: link.clone(),
+            busy_timeout_ms: 1000,
+            max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
+        };
+        let err = connect_pool(&cfg).await.unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "the error must name the reason: {err}"
+        );
+    }
+
+    /// The durability level is a deployment decision, so it comes from the
+    /// config and reaches SQLite.
+    #[tokio::test]
+    async fn the_synchronous_mode_comes_from_the_config() {
+        let _serial = chmod_test_mutex().lock().await;
+        let (_dir, path) = fresh_db_path("db-synchronous");
+        let cfg = DatabaseConfig {
+            path: path.clone(),
+            busy_timeout_ms: 1000,
+            max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Full,
+        };
+        let pool = connect_pool(&cfg).await.unwrap();
+        let mode: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, 2, "FULL is reported as 2 by SQLite, got {mode}");
     }
 
     /// Panic-safe RAII handle for `SIMULATE_CHMOD_FAIL`. The Drop resets the
@@ -520,6 +801,7 @@ mod unix_db_tests {
             path: path.clone(),
             busy_timeout_ms: 1000,
             max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
         };
         let err = connect_pool(&cfg).await.unwrap_err();
         // The Database wrapper for the chmod path is named "set 0600" in
@@ -561,6 +843,7 @@ mod unix_db_tests {
             path: nested,
             busy_timeout_ms: 1000,
             max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         let parent = dir.path().join("a/b/c");
@@ -598,6 +881,7 @@ mod non_unix_db_tests {
             path: path.clone(),
             busy_timeout_ms: 1000,
             max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         assert!(
@@ -619,6 +903,7 @@ mod non_unix_db_tests {
             path: path.clone(),
             busy_timeout_ms: 1000,
             max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         assert!(

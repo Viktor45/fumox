@@ -2,9 +2,10 @@
 # meow) wired through shared volumes and env overrides.
 #
 # Quick start:
-#   cp .env.example .env        # then set a real FUMOX_ADMIN__TOKEN
-#   docker compose up -d        # pull the published images and start
-#   docker compose up -d --build
+#   cp .env.example .env        # then set FUMOX_ADMIN__TOKEN and
+#                               # FUMOX_MEOW__API_TOKEN
+#   docker compose up -d        # pull the pinned images and start
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 #                               # ...or build server + meow locally from source
 #   open http://127.0.0.1:8081/admin   # admin panel (login with the token)
 #
@@ -13,13 +14,21 @@
 #   probe   fumox-probe  : health-check daemon (T1 TCP/TLS + T2 tunnel checks)
 #   meow    meow-rs      : mihomo-compatible kernel the probe drives for T2
 #
+# The images are pinned by digest (see the `image:` lines): a digest names
+# one immutable manifest, so a deployment cannot change under a running
+# stack. `docker-compose.build.yml` is the overlay that replaces them with
+# local builds; the two never mix, because a build tag cannot carry a
+# digest.
+#
 # How the probe ↔ meow wiring works:
 #   - probe reaches the meow-rs REST API at meow:9090 (FUMOX_MEOW__API_ADDR);
-#   - probe renders the T2 batch to /shared/meow.yaml and calls PUT /configs
-#     with that exact path, so BOTH containers mount the meow-shared volume
-#     at the same location (FUMOX_MEOW__CONFIG_PATH=/shared/meow.yaml);
+#   - probe renders the T2 batch to /shared/meow/meow.yaml and calls PUT
+#     /configs with that exact path, so BOTH containers mount the meow
+#     volume at the same location (FUMOX_MEOW__CONFIG_PATH=/shared/meow/meow.yaml);
 #   - meow's external-controller (9090) is only reachable from the probe over
-#     the internal network; it is deliberately not published to the host.
+#     the dedicated `meow` network; it is deliberately not published to the
+#     host and it answers only to a caller that presents the controller
+#     secret (FUMOX_MEOW__API_TOKEN).
 #
 # Config file location: the services point the loader at the mounted
 # ./config volume explicitly (FUMOX_CONFIG=/app/config/app.toml, the default
@@ -29,39 +38,47 @@
 #
 # Volumes:
 #   fumox-data   SQLite database, shared by server and probe -> /app/data
-#   meow-shared  generated Clash config exchange             -> /shared
-#   ./config     app.toml                                   -> /app/config
+#   fumox-geo    GeoLite2 .mmdb files, written by the server   -> /shared/geo
+#   fumox-meow   generated Clash config exchange                -> /shared/meow
+#   ./config     app.toml                                      -> /app/config
 #                (probe always :ro; the server :rw so the admin
 #                *Edit settings* page can save, or :ro with
 #                FUMOX_CONFIG_ACCESS=ro)
 #
-# GeoLite2 .mmdb files do NOT go into ./config: both services set
-# FUMOX_GEO__DB_DIR=/shared (the meow-shared volume, the same place
-# /shared/meow.yaml goes), and the environment outranks config/app.toml,
-# so ./config is never scanned for databases. The server downloads them
-# into /shared at startup, which is why the manual step below is optional
-# and needs no action on a stock `docker compose up`. To supply your own
-# MaxMind files, copy them into that volume:
-#   docker compose cp GeoLite2-City.mmdb server:/shared/
+# Each container runs as a non-root user with no capabilities and a
+# read-only root filesystem; every path a binary writes to is a volume, a
+# bind mount or a tmpfs (/tmp for the SQLite scratch files, /run/meow for
+# the rendered kernel config).
+#
+# GeoLite2 .mmdb files do NOT go into ./config: the server sets
+# FUMOX_GEO__DB_DIR=/shared/geo (the geo volume), and the environment
+# outranks config/app.toml, so ./config is never scanned for databases. The
+# server downloads them into /shared/geo at startup, which is why the manual
+# step below is optional and needs no action on a stock `docker compose up`.
+# To supply your own MaxMind files, copy them into that volume:
+#   docker compose cp GeoLite2-City.mmdb server:/shared/geo/
 # or drop the FUMOX_GEO__DB_DIR override and set [geo].db_dir instead.
 
 services:
   server:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      # `mounts` builds through persistent BuildKit cache mounts: rebuilds
-      # after a source change recompile only the workspace crates (~1 min
-      # instead of ~7.5). Set FUMOX_BUILD_CACHE=layers in .env on builders
-      # without cache-mount support (e.g. podman-compose), that path uses
-      # the classic cargo-chef image layers. See the Dockerfile header.
-      args:
-        BUILD_CACHE: ${FUMOX_BUILD_CACHE:-mounts}
-    image: ghcr.io/viktor45/fumox:latest
+    image: ${FUMOX_IMAGE:-ghcr.io/viktor45/fumox@sha256:6490bda1a14b3ce12b5192121cfb92ffca220761a732661f4bd2a79d8373f466}
     command: ["fumox-server"]
+    # Least privilege: the image already runs as this user (uid/gid 999),
+    # the explicit line keeps the guarantee visible in the deployment and
+    # survives an image change.
+    user: "999:999"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      # SQLite needs a scratch directory; nothing else on the image is
+      # writable.
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
     environment:
       FUMOX_CONFIG: ${FUMOX_CONFIG:-/app/config/app.toml}
-      FUMOX_ADMIN__TOKEN: ${FUMOX_ADMIN__TOKEN:?set FUMOX_ADMIN__TOKEN in .env}
+      # The panel is off without a token. "change-me" is not a token: the
+      # server refuses to start with it on a non-loopback bind.
+      FUMOX_ADMIN__TOKEN: ${FUMOX_ADMIN__TOKEN:?set FUMOX_ADMIN__TOKEN in .env (a random value, not "change-me")}
       # Add `; Secure` to the admin session cookie. Set true when the panel is
       # reached through an HTTPS front (reverse proxy with TLS); leave false
       # for plain-HTTP localhost access (browsers drop Secure cookies on
@@ -69,11 +86,11 @@ services:
       # true (ready for an HTTPS front), so a plain-HTTP stand must pin
       # FUMOX_ADMIN__SECURE_COOKIES=false in .env.
       FUMOX_ADMIN__SECURE_COOKIES: ${FUMOX_ADMIN__SECURE_COOKIES:-true}
-      FUMOX_GEO__DB_DIR: /shared
+      FUMOX_GEO__DB_DIR: /shared/geo
       # SSRF guard: set true in .env only for trusted local test setups
       # (source URLs may then point at private/loopback addresses).
       FUMOX_ADMIN__ALLOW_PRIVATE_URLS: ${FUMOX_ADMIN__ALLOW_PRIVATE_URLS:-false}
-      # GeoLite2 databases live in the meow-shared volume, not in ./config:
+      # GeoLite2 databases live in the geo volume, not in ./config:
       # the env layer outranks config/app.toml, so [geo].db_dir = "config"
       # from the file is ignored by this stack. See the Volumes header.
     volumes:
@@ -87,7 +104,7 @@ services:
       # admin panel overwrite the main stack's app.toml.
       - ./config:/app/config:${FUMOX_CONFIG_ACCESS:-rw},z
       - fumox-data:/app/data
-      - meow-shared:/shared
+      - fumox-geo:/shared/geo
     ports:
       # Host ports are parameterized so a second, isolated stand (the smoke
       # scripts in scripts/) can run alongside the main one:
@@ -122,25 +139,38 @@ services:
       # behind the front). The server ports above can then be unpublished
       # entirely, nginx reaches both listeners over the compose network.
     restart: unless-stopped
+    networks:
+      - default
 
   probe:
-    image: ghcr.io/viktor45/fumox:latest         # same image as server, different command
+    image: ${FUMOX_IMAGE:-ghcr.io/viktor45/fumox@sha256:6490bda1a14b3ce12b5192121cfb92ffca220761a732661f4bd2a79d8373f466}
     command: ["fumox-probe"]
+    user: "999:999"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
     depends_on:
       # service_healthy, not a bare list entry: `depends_on` without a
       # condition only waits for the container to start, which said nothing
       # about whether the server had finished migrating the shared volume.
       server:
         condition: service_healthy
-      meow:                    # probe seeds /shared through the meow image
+      meow:                    # probe seeds the exchange volume
         condition: service_started
     environment:
       FUMOX_CONFIG: ${FUMOX_CONFIG:-/app/config/app.toml}
-      FUMOX_GEO__DB_DIR: /shared
       FUMOX_MEOW__API_ADDR: meow:9090
-      FUMOX_MEOW__CONFIG_PATH: /shared/meow.yaml
+      FUMOX_MEOW__CONFIG_PATH: /shared/meow/meow.yaml
+      # The controller secret: the probe presents it as
+      # `Authorization: Bearer <token>`, and the kernel refuses everything
+      # else. The probe never sees the admin token.
+      FUMOX_MEOW__API_TOKEN: ${FUMOX_MEOW__API_TOKEN:?set FUMOX_MEOW__API_TOKEN in .env (openssl rand -hex 32)}
       # Override in .env if the default test URL is blocked in your region.
-      FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-http://www.gstatic.com/generate_204}
+      # HTTPS only: a plain-HTTP answer would not prove that a tunnel is
+      # up, it would only prove that something answered.
+      FUMOX_MEOW__TEST_URL: ${FUMOX_MEOW__TEST_URL:-https://www.gstatic.com/generate_204}
       # SSRF guard for dial targets, mirroring the server's
       # ALLOW_PRIVATE_URLS handling: feeds are untrusted, so the probe must
       # not dial loopback/RFC1918/link-local/CGNAT addresses they carry.
@@ -152,27 +182,50 @@ services:
       # editing.
       - ./config:/app/config:ro,z
       - fumox-data:/app/data
-      - meow-shared:/shared
+      - fumox-meow:/shared/meow
     restart: unless-stopped
+    networks:
+      # The default network carries the outbound traffic; the `meow` network
+      # is the only path to the kernel's controller.
+      - default
+      - meow
 
   meow:
-    # Same pattern as server: `up` pulls the published image, `up --build`
-    # rebuilds it locally and retags. The GHCR image is published manually
-    # via .github/workflows/docker-meow.yml; MEOW_VERSION below only affects
-    # local builds.
-    build:
-      context: ./docker/meow
-      dockerfile: Dockerfile
-      args:
-        # "latest" (default) resolves the newest meow-rs release at build
-        # time via the GitHub API. Set MEOW_VERSION in .env to a tag
-        # (e.g. v0.22.0) to pin a specific release instead.
-        MEOW_VERSION: ${MEOW_VERSION:-latest}
-    image: ghcr.io/viktor45/fumox-meow:latest
+    # The wrapper image is pinned by digest like the fumox one. The
+    # GHCR image is published manually via .github/workflows/docker-meow.yml.
+    image: ${FUMOX_MEOW_IMAGE:-ghcr.io/viktor45/fumox-meow@sha256:49e91fa751672db22916982ed4cb97423d7aaaa667cf4984e973f613f2406e7b}
+    user: "998:999"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      # The rendered kernel config (it carries the controller secret) and
+      # the kernel's own data directory live on RAM only.
+      - /run/meow:rw,noexec,nosuid,nodev,mode=1777,size=16m
+    environment:
+      # The controller secret. The kernel refuses to start without one: an
+      # unauthenticated controller can rewrite the proxy configuration.
+      FUMOX_MEOW__API_TOKEN: ${FUMOX_MEOW__API_TOKEN:?set FUMOX_MEOW__API_TOKEN in .env (openssl rand -hex 32)}
+      # The probe reaches the controller over the compose network, so the
+      # controller listens on the container's address. In the pod layouts
+      # (quadlet/kube) the probe shares the network namespace and the
+      # address is 127.0.0.1 instead.
+      FUMOX_MEOW_API_BIND: 0.0.0.0:9090
     volumes:
-      - meow-shared:/shared
+      - fumox-meow:/shared/meow
     restart: unless-stopped
+    networks:
+      # The kernel dials the proxies under test, so it needs the outbound
+      # path the default network provides; the controller stays unpublished.
+      - default
+      - meow
 
 volumes:
   fumox-data:
-  meow-shared:
+  fumox-geo:
+  fumox-meow:
+
+networks:
+  # The `meow` network carries the probe ↔ kernel traffic only. The server
+  # is not on it, so it cannot reach the controller at all.
+  meow:

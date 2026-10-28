@@ -1,24 +1,25 @@
-# Fumox pod, quadlet equivalent of docker-compose.yml.
+# Fumox server pod, quadlet equivalent of the compose `server` service.
 #
-# One systemd-managed pod ("fumox") holding all three compose services in a
-# single network namespace: fumox-server, fumox-probe and the meow-rs kernel.
-# Starting the generated pod service brings up every .container unit that
-# references this file:
+# The pod holds the public listener (:8080) and the admin panel (:8081)
+# and NOTHING ELSE: the probe and the proxy kernel live in a second pod
+# (fumox-worker.pod). The split is the point — the kernel handles
+# untrusted proxy traffic and its configuration is writable by the probe,
+# so it must not be able to reach the admin panel even inside a shared
+# network namespace. The two pods exchange nothing over the network:
+# the server and the probe talk through the shared SQLite volume, and
+# the probe and the kernel through the shared config volume.
 #
+# Start:
 #   systemctl --user daemon-reload
-#   systemctl --user start fumox-pod.service
+#   systemctl --user start fumox-pod.service        # server
+#   systemctl --user start fumox-worker-pod.service  # probe + kernel
 #
-# Pod-internal wiring (containers in one pod share loopback, there is no
-# per-container DNS like in compose):
-#   probe -> meow REST API   127.0.0.1:9090   (see fumox-probe.container)
-#   server + probe -> SQLite /app/data        (fumox-data volume)
-#   probe + meow    -> config exchange /shared (fumox-shared volume)
-#
-# Only the two ports below are published; meow's external-controller (9090)
-# and everything else stays pod-internal, exactly like in compose.
+# Only the two ports below are published. The kernel's controller (9090)
+# stays inside the worker pod and is never published, exactly like in
+# compose.
 
 [Unit]
-Description=Fumox pod (server + probe + meow)
+Description=Fumox server pod (public endpoints + admin panel)
 After=network-online.target
 Wants=network-online.target
 

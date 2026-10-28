@@ -17,3 +17,6 @@ A description of any alternative solutions or workarounds you've already tried o
 
 **Additional context**  
 Any additional context: use cases, links to similar projects, screenshots, etc.
+
+**Do not paste secrets**  
+This is a public issue tracker. Replace every token, key, password and subscription URL with a placeholder (`<token>`, `https://example.com/sub/…`), and remove the `Authorization` header and the `[admin].token` value. Never post a live subscription URL or a config file with a real secret in it.

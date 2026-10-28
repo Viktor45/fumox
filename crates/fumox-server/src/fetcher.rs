@@ -144,6 +144,9 @@ impl Fetcher {
         host: &str,
         addr: SocketAddr,
     ) -> Result<reqwest::Client, reqwest::Error> {
+        // reqwest is compiled without a crypto provider and panics when a
+        // client is built before one is installed.
+        fumox_core::tls::install_crypto_provider();
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(self.config.connect_timeout_secs))
             .timeout(Duration::from_secs(self.config.read_timeout_secs))

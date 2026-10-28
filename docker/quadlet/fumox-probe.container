@@ -1,19 +1,34 @@
 # fumox-probe, health-check daemon (T1 TCP/TLS sample + T2 tunnel checks
 # driven through the meow-rs REST API). Overrides the image CMD the same way
 # compose `command: ["fumox-probe"]` does; tini stays as the entrypoint.
+#
+# The unit runs in the worker pod (fumox-worker.pod), next to the kernel
+# it drives and away from the admin panel.
 
 [Unit]
 Description=Fumox probe (health checks: T1 TCP/TLS + T2 via meow)
-# compose depends_on: the server creates/migrates the DB first.
+# The server creates/migrates the DB first. The probe does not depend on
+# it: both apply the schema on startup, SQLite serializes the two
+# writers and the loser retries until the lock is free (see
+# connect_probe_pool in crates/fumox-core/src/db.rs).
 Wants=fumox-server.service
 After=fumox-server.service
 
 [Container]
 Image=localhost/fumox:local
 ContainerName=fumox-probe
-Pod=fumox.pod
+Pod=fumox-worker.pod
 Exec=fumox-probe
 
+User=999
+Group=999
+NoNewPrivileges=true
+ReadOnly=true
+ReadOnlyTmpfs=false
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,mode=1777,size=64m
+
+# The shared runtime variables only: the admin login token lives in
+# fumox-admin.env, which the probe never reads.
 EnvironmentFile=%h/.config/fumox/fumox.env
 
 # One network namespace inside the pod: meow is reached on loopback, not by
@@ -23,18 +38,21 @@ EnvironmentFile=%h/.config/fumox/fumox.env
 # at a differently named file in the mounted config volume, see
 # fumox.env.example. The image default (config/app.toml under /app) applies
 # when the variable is unset.
-Environment=FUMOX_GEO__DB_DIR=/shared
 Environment=FUMOX_MEOW__API_ADDR=127.0.0.1:9090
-Environment=FUMOX_MEOW__CONFIG_PATH=/shared/meow.yaml
+Environment=FUMOX_MEOW__CONFIG_PATH=/shared/meow/meow.yaml
 
 # Probe only reads app.toml at startup, never writes. Read-only mount means
 # a buggy probe can never mangle the config the server is also editing.
 Volume=%h/fumox/config:/app/config:ro,Z
 Volume=fumox-data.volume:/app/data
-Volume=fumox-shared.volume:/shared
+Volume=fumox-meow.volume:/shared/meow
 
 [Service]
 Restart=on-failure
+# Smaller quota than the server: the probe only samples the proxy list.
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=128
 
 [Install]
 WantedBy=default.target

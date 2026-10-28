@@ -25,12 +25,14 @@ pub fn init_tracing(level: LogLevel) {
 /// `EnvFilter::add_directive` replaces a same-target directive and would
 /// silently undo an operator's `RUST_LOG=sqlx::query=debug`.
 ///
-/// `None`, or a value that does not parse, falls back to the `[log]`
-/// level from the config (plus the silencer), so one malformed directive
-/// never blinds the whole process.
+/// `None`, an empty/whitespace-only value, or a value that does not parse,
+/// falls back to the `[log]` level from the config (plus the silencer), so
+/// one malformed directive never blinds the whole process.
 fn build_filter(rust_log: Option<&str>, level: LogLevel) -> EnvFilter {
     rust_log
-        .and_then(|rust_log| EnvFilter::try_new(rust_log).ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| EnvFilter::try_new(value).ok())
         .unwrap_or_else(|| fallback_filter(level))
 }
 
@@ -121,5 +123,21 @@ mod tests {
 
         assert!(event_passes(filter(), event_core_info));
         assert!(!event_passes(filter(), event_sqlx_query_debug));
+    }
+
+    /// An empty `RUST_LOG` is an absent one, not a directive set that
+    /// switches everything off: a deployment that exports `RUST_LOG=` (or
+    /// exports it with an empty value) must still get the configured level.
+    #[test]
+    fn an_empty_rust_log_falls_back_to_config_level() {
+        for value in ["", " ", "\t\n "] {
+            let filter = || build_filter(Some(value), LogLevel::Info);
+
+            assert!(
+                event_passes(filter(), event_core_info),
+                "RUST_LOG={value:?} must not switch the process off"
+            );
+            assert!(!event_passes(filter(), event_sqlx_query_debug));
+        }
     }
 }

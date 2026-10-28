@@ -4,10 +4,10 @@
 #
 # The script must keep running on the stock macOS bash 3.2, where an
 # unquoted empty-array expansion is fatal under `set -u`, exactly the
-# state --keep-data puts VOLUME_FLAGS in. This test drives it through a
-# stubbed `docker` and asserts on the compose command it builds, under the
-# oldest bash on the machine so the guard stays load-bearing where it
-# matters. Needs nothing but bash.
+# state the default (volumes kept) puts VOLUME_FLAGS in. This test drives
+# it through a stubbed `docker` and asserts on the compose command it
+# builds, under the oldest bash on the machine so the guard stays
+# load-bearing where it matters. Needs nothing but bash.
 #
 # Run directly:  bash scripts/tests/smoke-down.test.sh
 
@@ -53,12 +53,16 @@ else
     note "bash ${BASH_MAJOR} trips set -u on empty arrays; the guard is load-bearing here"
 fi
 
-# docker stub: claims compose capability, records every other command line.
+# docker stub: claims compose capability and a working daemon, records
+# every other command line.
 STUB="$WORK/bin"
 mkdir -p "$STUB"
 cat >"$STUB/docker" <<STUB
 #!/bin/sh
 if [ "\$1" = compose ] && [ "\$2" = version ]; then
+    exit 0
+fi
+if [ "\$1" = info ]; then
     exit 0
 fi
 printf '%s\n' "\$*" >> "$WORK/compose.args"
@@ -77,10 +81,11 @@ run_down() { # expected compose command line, then script args
     note "compose ran: $got"
 }
 
-# Default: the stand's volumes go with it.
-run_down "compose -p fumox-smoke down --remove-orphans -v"
-# --keep-data: volumes preserved, and nothing else about the command moves.
-run_down "compose -p fumox-smoke down --remove-orphans" --keep-data
+# Default: the stand's volumes are kept -- deleting them is opt-in.
+run_down "compose -p fumox-smoke down --remove-orphans"
+# --purge-volumes: the volumes go with it, and nothing else about the
+# command moves.
+run_down "compose -p fumox-smoke down --remove-orphans -v" --purge-volumes
 
 set +e
 OUT="$(PATH="$STUB:$PATH" "$BASH_BIN" "$SCRIPT" --bogus 2>&1)"
@@ -88,6 +93,17 @@ CODE=$?
 set -e
 [[ "$CODE" -eq 64 ]] || fail "unknown flag: expected exit 64, got $CODE"
 note "unknown flag exits 64"
+
+# A project name outside the smoke stand's own naming scheme is refused
+# before anything is torn down: this script can delete volumes.
+: >"$WORK/compose.args"
+set +e
+OUT="$(PATH="$STUB:$PATH" SMOKE_PROJECT=fumox "$BASH_BIN" "$SCRIPT" 2>&1)"
+CODE=$?
+set -e
+[[ "$CODE" -eq 64 ]] || fail "foreign project name: expected exit 64, got $CODE"
+[[ ! -s "$WORK/compose.args" ]] || fail "a refused project name still ran compose"
+note "a project name outside the allow-list is refused"
 
 echo
 echo "smoke-down.sh: all checks passed"

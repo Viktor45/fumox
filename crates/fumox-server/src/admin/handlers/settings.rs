@@ -27,7 +27,7 @@ use fumox_core::config::{
     IngestConfig, LogConfig, MeowConfig, ProbeConfig, RateLimit, ResolvedConfigPath,
     RetentionConfig, ServerConfig, bounds,
 };
-use fumox_core::config_writer::{ConfigItem, EditableConfig, item};
+use fumox_core::config_writer::{ConfigItem, ConfigWriteError, EditableConfig, fingerprint, item};
 use fumox_core::models::IpFamily;
 
 /// Read-only config view the *Settings* overview renders: the same
@@ -191,6 +191,10 @@ struct SettingsEditTemplate {
     errors: Vec<(String, String)>,
     /// Top-level banner (no config file, file not writable, …).
     banner: Option<Banner>,
+    /// Fingerprint of the file the form was rendered from. The submit
+    /// carries it back, and a file that changed in the meantime is
+    /// refused instead of being overwritten by the stale form.
+    fingerprint: String,
 }
 
 #[derive(Clone)]
@@ -216,7 +220,8 @@ impl SettingsEditTemplate {
         bounds::min_attr(field)
     }
 
-    /// `max` for a number input, empty when the setting is unbounded.
+    /// `max` for a number input, empty when the setting has no range
+    /// entry (the field is not a bounded number).
     fn range_max(&self, field: &str) -> String {
         bounds::max_attr(field)
     }
@@ -225,7 +230,7 @@ impl SettingsEditTemplate {
     /// the same value the save handler enforces, so the number in the
     /// hint and the number in the error cannot drift apart.
     fn range_text(&self, field: &str) -> Option<String> {
-        bounds::display(field, self.lang.t("set.range_open_ended"))
+        bounds::display(field)
     }
 
     /// Longest recheck ladder the config accepts, in steps. The ladder
@@ -355,6 +360,13 @@ static SETTINGS: &[Setting] = &[
         render: |c, key, raw| rate_into(raw, key, &c.server.auth_fail_rate_limit),
         apply: |raw, key, cfg, lang, errors| rate_limit(raw, key, cfg, lang, errors),
     },
+    Setting {
+        key: "server.export_max_rows",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.server.export_max_rows.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
     // --- database ---
     Setting {
         key: "database.path",
@@ -482,6 +494,13 @@ static SETTINGS: &[Setting] = &[
         key: "geo.dns_timeout_secs",
         render: |c, key, raw| {
             raw.insert(key.into(), c.geo.dns_timeout_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "geo.startup_download_budget_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.geo.startup_download_budget_secs.to_string());
         },
         apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
     },
@@ -702,7 +721,7 @@ static SETTINGS: &[Setting] = &[
         render: |c, key, raw| {
             raw.insert(key.into(), c.meow.test_url.join("\n"));
         },
-        apply: |raw, key, cfg, lang, errors| string_list(raw, key, cfg, lang, errors),
+        apply: |raw, key, cfg, lang, errors| url_list(raw, key, cfg, lang, errors),
     },
     Setting {
         key: "meow.timeout_secs",
@@ -843,6 +862,7 @@ pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) 
         raw,
         errors: Vec::new(),
         banner,
+        fingerprint: fingerprint(&target),
     };
     render_html(template.lang.clone(), &template, StatusCode::OK)
 }
@@ -859,13 +879,30 @@ pub async fn settings_update(
     let lang = state.locales.lang_from_headers(&headers);
     let raw: HashMap<String, String> = form.into_iter().collect();
 
+    // Optimistic concurrency: the form carries the fingerprint of the
+    // file it was rendered from. A file that changed since (a hand edit
+    // in a shell, another panel instance, a deployment that rewrote
+    // it) is refused instead of being overwritten by a form that never
+    // saw the newer content. The operator reloads and re-applies.
+    let target = editing_target(&state);
+    if let Some(submitted) = raw.get("cfg_fingerprint").map(String::as_str)
+        && !submitted.is_empty()
+        && submitted != fingerprint(&target)
+    {
+        tracing::warn!(
+            path = %target.display(),
+            "settings save refused: the config file changed since the form was rendered"
+        );
+        return settings_edit_conflict(&state, &headers);
+    }
+
     // Build a fresh `EditableConfig` so we can fail-and-replay the form
     // before touching disk. The validator only reads `raw` and the
     // language catalog, no side effects. The editor holds the
     // process-wide config lock, so it is confined to this block: its
     // guard must not ride across the awaits below.
     let path = {
-        let mut cfg = match EditableConfig::load(&editing_target(&state)) {
+        let mut cfg = match EditableConfig::load(&target) {
             Ok(c) => c,
             Err(err) => return settings_edit_load_error(&state, &headers, err.to_string()),
         };
@@ -884,6 +921,7 @@ pub async fn settings_update(
                 raw,
                 errors,
                 banner: None,
+                fingerprint: fingerprint(&target),
             };
             return render_html(
                 template.lang.clone(),
@@ -895,6 +933,17 @@ pub async fn settings_update(
         // Persist atomically. On a backend that rejects `rename` (NFS / SMB),
         // `save()` falls back to a direct write with a tracing warning.
         if let Err(err) = cfg.save() {
+            // The file changed between the load above and the write: the
+            // document in hand is a snapshot of a file that no longer
+            // exists. Refuse it like the stale-form case, so the other
+            // change survives.
+            if matches!(err, ConfigWriteError::Conflict { .. }) {
+                tracing::warn!(
+                    path = %cfg.path().display(),
+                    "settings save refused: the config file changed during the save"
+                );
+                return settings_edit_conflict(&state, &headers);
+            }
             tracing::error!(error = %err, path = %cfg.path().display(), "failed to save settings");
             let template = SettingsEditTemplate {
                 langs: state.locales.choices().to_vec(),
@@ -909,6 +958,7 @@ pub async fn settings_update(
                     lang.t_args("err.internal", &[format!("save: {err}")]),
                 )],
                 banner: None,
+                fingerprint: fingerprint(&target),
             };
             return render_html(
                 template.lang.clone(),
@@ -949,16 +999,38 @@ pub async fn settings_update(
     // `FUMOX_*` env vars keep winning on top of the file.
     if let Err(err) = state.refresh_live_config(Path::new(&path)) {
         tracing::warn!(error = %err, path = %path, "live config refresh skipped");
+        return settings_refresh_failed(&lang, &headers, &path, &err);
     }
 
     let toast = lang.t_named("set.edit_saved_toast", &[("path", path)]);
     if headers.get("HX-Request").is_some() {
-        return htmx_redirect_with_toast("/admin/settings", &toast);
+        return htmx_redirect_with_toast("/admin/settings", &toast, "ok");
     }
     super::flash_redirect("/admin/settings", &toast, "ok")
 }
 
-fn htmx_redirect_with_toast(redirect_to: &str, toast: &str) -> Response {
+/// The save reached the disk, but the running view could not be
+/// refreshed: the file on disk carries the operator's new configuration,
+/// the process keeps the old one until the next restart. The operator is
+/// told with an error-level toast, because a green "saved" toast would
+/// claim the new values are live while the server runs on the old ones.
+fn settings_refresh_failed(
+    lang: &Lang,
+    headers: &HeaderMap,
+    path: &str,
+    err: &fumox_core::Error,
+) -> Response {
+    let message = lang.t_named(
+        "err.config_not_reloaded",
+        &[("path", path.to_string()), ("error", err.to_string())],
+    );
+    if headers.get("HX-Request").is_some() {
+        return htmx_redirect_with_toast("/admin/settings", &message, "error");
+    }
+    super::flash_redirect("/admin/settings", &message, "error")
+}
+
+fn htmx_redirect_with_toast(redirect_to: &str, toast: &str, level: &str) -> Response {
     (
         StatusCode::SEE_OTHER,
         [
@@ -968,11 +1040,38 @@ fn htmx_redirect_with_toast(redirect_to: &str, toast: &str) -> Response {
             ),
             (
                 HeaderName::from_static("hx-trigger"),
-                super::toast_trigger("ok", toast),
+                super::toast_trigger(level, toast),
             ),
         ],
     )
         .into_response()
+}
+
+/// The config file changed under the open form, so the submit is
+/// refused. The page comes back with the values that are on disk *now*
+/// and the current fingerprint, so the operator reviews them and
+/// re-applies their change; a stale form carrying the old values would
+/// overwrite the change that beat it.
+fn settings_edit_conflict(state: &AdminState, headers: &HeaderMap) -> Response {
+    let lang = state.locales.lang_from_headers(headers);
+    let target = editing_target(state);
+    let raw = match fumox_core::config::load(Some(&target)) {
+        Ok(loaded) => raw_from_config(&loaded.config),
+        Err(_) => raw_from_config(&state.live()),
+    };
+    let template = SettingsEditTemplate {
+        langs: state.locales.choices().to_vec(),
+        theme: theme::from_headers(headers),
+        lang: lang.clone(),
+        active: "settings",
+        csrf: state.csrf_for(headers),
+        state: state.clone(),
+        raw,
+        errors: vec![("".into(), lang.t("err.config_conflict").to_string())],
+        banner: None,
+        fingerprint: fingerprint(&target),
+    };
+    render_html(template.lang.clone(), &template, StatusCode::CONFLICT)
 }
 
 fn settings_edit_unwritable(state: &AdminState, headers: &HeaderMap) -> Response {
@@ -989,6 +1088,7 @@ fn settings_edit_unwritable(state: &AdminState, headers: &HeaderMap) -> Response
         banner: Some(Banner::Unwritable(
             editing_target(state).display().to_string(),
         )),
+        fingerprint: fingerprint(&editing_target(state)),
     };
     render_html(
         template.lang.clone(),
@@ -1010,6 +1110,7 @@ fn settings_edit_load_error(state: &AdminState, headers: &HeaderMap, message: St
         raw: raw_from_config(&state.live()),
         errors: vec![("".into(), format!("{internal}: {message}"))],
         banner: None,
+        fingerprint: fingerprint(&editing_target(state)),
     };
     render_html(
         template.lang.clone(),
@@ -1033,7 +1134,10 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
         return settings_edit_unwritable(&state, &headers);
     }
 
-    if let Err(err) = std::fs::write(&target, fumox_core::config_writer::REFERENCE_CONFIG) {
+    if let Err(err) = fumox_core::config_writer::create_private_file(
+        &target,
+        fumox_core::config_writer::REFERENCE_CONFIG,
+    ) {
         tracing::error!(error = %err, path = %target.display(), "failed to write reference config");
         return settings_edit_load_error(&state, &headers, err.to_string());
     }
@@ -1044,8 +1148,15 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
     // every default rather than the empty startup snapshot.
     if let Err(err) = state.refresh_live_config(&target) {
         tracing::warn!(error = %err, path = %target.display(), "live config refresh after create skipped");
+        let message = lang.t_named(
+            "err.config_not_reloaded",
+            &[
+                ("path", target.display().to_string()),
+                ("error", err.to_string()),
+            ],
+        );
+        return super::flash_redirect("/admin/settings/edit", &message, "error");
     }
-
     let path = target.display().to_string();
     let msg = lang.t_named("set.file_created_toast", &[("path", path)]);
     redirect_after_create(msg)
@@ -1171,7 +1282,7 @@ fn token_field(
     raw: &HashMap<String, String>,
     field: &str,
     cfg: &mut EditableConfig,
-    _lang: &Lang,
+    lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) {
     let Some(v) = raw_get(raw, field) else { return };
@@ -1181,22 +1292,40 @@ fn token_field(
         // token it loaded from disk.
         return;
     }
+    if v == fumox_core::config::PLACEHOLDER_ADMIN_TOKEN {
+        // The placeholder is not a credential: writing it would leave the
+        // server unable to start on a non-loopback bind, and it would
+        // never open a session. Reject it here, where the operator can
+        // still fix it.
+        errors.push((
+            field.to_string(),
+            lang.t("val.token_placeholder").to_string(),
+        ));
+        return;
+    }
     set_field(cfg, field, item::string(v.to_string()), errors);
 }
 
 /// The error text for a value outside its setting's range. Reads the
 /// bound from [`bounds`] by the field name, so a numeric setting cannot
 /// be enforced against one range and advertised with another.
-fn out_of_range(field: &str, value: u64, lang: &Lang) -> String {
+fn out_of_range(field: &str, lang: &Lang) -> String {
     let Some(range) = bounds::range_of(field) else {
         // A numeric field with no entry in the table is a wiring bug,
         // not a user error. Say so instead of blaming the input.
         return format!("{field} has no configured range");
     };
-    match range.max {
-        Some(max) => lang.t_args("val.in_range", &[range.min.to_string(), max.to_string()]),
-        None => lang.t_args("val.at_least", &[range.min.to_string(), value.to_string()]),
-    }
+    lang.t_args(
+        "val.in_range",
+        &[range.min.to_string(), range.max.to_string()],
+    )
+}
+
+/// Whether a number survives the round trip through the TOML document,
+/// which stores integers as `i64`. A larger value wraps negative on the
+/// write and the saved config fails to load at the next start.
+fn fits_document_i64(value: u64) -> bool {
+    value <= i64::MAX as u64
 }
 
 fn u64_field(
@@ -1216,12 +1345,12 @@ fn u64_field(
         }
     };
     if !bounds::range_of(field).is_some_and(|r| r.contains(parsed)) {
-        errors.push((field.into(), out_of_range(field, parsed, lang)));
+        errors.push((field.into(), out_of_range(field, lang)));
         return;
     }
     // `item::integer` stores an `i64`, so a larger `u64` wraps negative
     // on the write and the saved config fails to load at the next start.
-    if parsed > i64::MAX as u64 {
+    if !fits_document_i64(parsed) {
         errors.push((field.into(), format!("must be at most {}", i64::MAX)));
         return;
     }
@@ -1245,7 +1374,7 @@ fn u32_field(
         }
     };
     if !bounds::range_of(field).is_some_and(|r| r.contains(u64::from(parsed))) {
-        errors.push((field.into(), out_of_range(field, u64::from(parsed), lang)));
+        errors.push((field.into(), out_of_range(field, lang)));
         return;
     }
     set_field(cfg, field, item::integer(i64::from(parsed)), errors);
@@ -1268,7 +1397,7 @@ fn usize_field(
         }
     };
     if !bounds::range_of(field).is_some_and(|r| r.contains(parsed as u64)) {
-        errors.push((field.into(), out_of_range(field, parsed as u64, lang)));
+        errors.push((field.into(), out_of_range(field, lang)));
         return;
     }
     set_field(cfg, field, item::integer(parsed as i64), errors);
@@ -1335,6 +1464,78 @@ fn string_list(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    set_field(cfg, field, item::string_array(items), errors);
+}
+
+/// The T2 test URLs. Three rules the canonical loader enforces and the
+/// panel must not write past: the list must not be empty, every entry
+/// must be an absolute `http(s)` URL, and an entry must not point at a
+/// private address while the probe's SSRF guard is on. The panel writes
+/// the file verbatim and the next start of both binaries aborts on
+/// anything the loader refuses, so an entry refused here would have
+/// turned a green toast into a dead server.
+fn url_list(
+    raw: &HashMap<String, String>,
+    field: &str,
+    cfg: &mut EditableConfig,
+    lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+) {
+    let Some(v) = raw_get(raw, field) else { return };
+    let items: Vec<String> = v
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.is_empty() {
+        errors.push((field.into(), lang.t("val.empty_list").into()));
+        return;
+    }
+    // The guard lives in the `[probe]` section, which the editor applies
+    // before this one, so the flag in hand is the one the operator just
+    // saved, not the one on disk.
+    let allow_private = cfg
+        .get("probe.allow_private_targets")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    for entry in &items {
+        let parsed = match url::Url::parse(entry) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                errors.push((
+                    field.into(),
+                    lang.t_args("val.url_invalid", &[err.to_string()]),
+                ));
+                return;
+            }
+        };
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                errors.push((
+                    field.into(),
+                    lang.t_args("val.url_scheme", &[other.to_string()]),
+                ));
+                return;
+            }
+        }
+        if parsed.host_str().is_none_or(str::is_empty) {
+            errors.push((field.into(), lang.t("val.url_no_host").into()));
+            return;
+        }
+        if allow_private {
+            continue;
+        }
+        let ip = match parsed.host() {
+            Some(url::Host::Ipv4(addr)) => std::net::IpAddr::V4(addr),
+            Some(url::Host::Ipv6(addr)) => std::net::IpAddr::V6(addr),
+            Some(url::Host::Domain(_)) | None => continue,
+        };
+        if let Err(reason) = fumox_core::ssrf::check_ip(ip, false) {
+            errors.push((field.into(), lang.t_args("val.url_ssrf", &[reason])));
+            return;
+        }
+    }
     set_field(cfg, field, item::string_array(items), errors);
 }
 
@@ -1478,7 +1679,7 @@ fn rate_limit(
     // having one.
     let field = format!("{prefix}.limit");
     if !bounds::range_of(&field).is_some_and(|r| r.contains(u64::from(limit))) {
-        let msg = out_of_range(&field, u64::from(limit), lang);
+        let msg = out_of_range(&field, lang);
         errors.push((field, msg));
         return;
     }
@@ -1994,7 +2195,8 @@ mod tests {
                 rest = &rest[end..];
             }
         }
-        posted.retain(|name| name != "_csrf" && name != "settings-tab");
+        posted
+            .retain(|name| name != "_csrf" && name != "settings-tab" && name != "cfg_fingerprint");
 
         let keys: Vec<&str> = SETTINGS.iter().map(|s| s.key).collect();
 
@@ -2157,22 +2359,24 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// An unbounded setting says so in words and leaves `max` empty.
-    /// Printing `u64::MAX / 2` would be a true number nobody can type,
-    /// and printing `0` would be a lie the browser reads as "max zero".
+    /// Every bounded setting says so in words. The number in the hint
+    /// is the number the save handler enforces.
     #[test]
-    fn an_unbounded_setting_renders_an_empty_max() {
-        assert_eq!(bounds::max_attr("fetch.max_response_bytes"), "");
+    fn a_bounded_setting_renders_its_range() {
+        assert_eq!(bounds::max_attr("fetch.max_response_bytes"), "268435456");
         assert_eq!(bounds::min_attr("fetch.max_response_bytes"), "1024");
         assert_eq!(
-            bounds::display("fetch.max_response_bytes", "and up").as_deref(),
-            Some("1024 and up")
+            bounds::display("fetch.max_response_bytes").as_deref(),
+            Some("1024..=268435456")
         );
         assert_eq!(bounds::max_attr("probe.sample_size"), "100000");
         assert_eq!(
-            bounds::display("probe.sample_size", "and up").as_deref(),
-            Some("0..=100000")
+            bounds::display("probe.sample_size").as_deref(),
+            Some("1..=100000")
         );
+        // A key that is not a bounded number has no range to render.
+        assert_eq!(bounds::max_attr("server.bind"), "");
+        assert_eq!(bounds::display("server.bind"), None);
     }
 
     /// Regression: the replay rendered every hidden `value="off"` input
@@ -2294,8 +2498,8 @@ mod tests {
 
         for (value, accepted) in [
             ("1024".to_string(), true),
-            (i64::MAX.to_string(), true),
-            ((i64::MAX as u64 + 1).to_string(), false),
+            ("268435456".to_string(), true),
+            (i64::MAX.to_string(), false),
             (u64::MAX.to_string(), false),
         ] {
             let mut raw = HashMap::new();
@@ -2322,6 +2526,13 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&dir).ok();
+
+        // The document stores integers as `i64`. A larger value would
+        // wrap negative on the write and the saved config would fail to
+        // load at the next start.
+        assert!(fits_document_i64(i64::MAX as u64));
+        assert!(!fits_document_i64(i64::MAX as u64 + 1));
+        assert!(!fits_document_i64(u64::MAX));
     }
 
     /// The trust lists feed `crate::admin::parse_trusted_cidrs`, which
@@ -2420,6 +2631,42 @@ mod tests {
     /// `val.required`: a `""` written to the file would disable the
     /// panel at the next start.
     #[test]
+    fn the_placeholder_token_is_rejected_by_the_edit_form() {
+        use fumox_core::config::load_config;
+
+        let dir = temp_dir("token-placeholder");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[admin]\ntoken = \"live-secret\"\n").unwrap();
+        let lang = test_lang();
+
+        let mut raw = HashMap::new();
+        raw.insert("admin.token".into(), "change-me".into());
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "the placeholder must be refused: {errors:?}"
+        );
+        assert_eq!(errors[0].0, "admin.token");
+        assert!(
+            errors[0].1.contains("change-me"),
+            "the error must name the placeholder: {}",
+            errors[0].1
+        );
+
+        // The document keeps the token it had: the placeholder never
+        // reaches the file.
+        cfg.save().unwrap();
+        let loaded = load_config(Some(&path)).expect("the kept token must load");
+        assert_eq!(loaded.admin.token, "live-secret");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn admin_token_renders_empty_and_an_empty_submit_keeps_the_current_one() {
         use fumox_core::config::load_config;
 
@@ -2478,8 +2725,12 @@ mod tests {
     /// disabled") on top of the banner the page already showed.
     #[tokio::test]
     async fn settings_edit_renders_without_the_token_and_disables_fields_when_unwritable() {
+        let admin = AdminConfig {
+            token: "live-secret".into(),
+            ..AdminConfig::default()
+        };
         let (_dir, mut state) =
-            crate::admin::test_admin_state(AdminConfig::default(), ServerConfig::default()).await;
+            crate::admin::test_admin_state(admin, ServerConfig::default()).await;
         let token = state.admin().token;
         assert!(!token.is_empty(), "the fixture needs a non-empty token");
 
@@ -2495,6 +2746,7 @@ mod tests {
             raw: raw_from_config(&state.live()),
             errors: Vec::new(),
             banner: Some(Banner::Unwritable("/unwritable/app.toml".into())),
+            fingerprint: String::new(),
         };
         let html = template.render().unwrap();
         assert!(
@@ -2519,6 +2771,7 @@ mod tests {
             raw: raw_from_config(&state.live()),
             errors: Vec::new(),
             banner: None,
+            fingerprint: String::new(),
         };
         let html = template.render().unwrap();
         assert!(
@@ -2573,5 +2826,198 @@ mod tests {
                 if want_banner { "" } else { "not " }
             );
         }
+    }
+
+    /// An empty test-URL list leaves the probe without an endpoint, and
+    /// the file is written verbatim: the next start of both binaries
+    /// would abort on it. The editor refuses it behind a field error
+    /// instead of writing an empty array behind a success toast.
+    #[test]
+    fn apply_all_refuses_an_empty_test_url_list() {
+        let dir = temp_dir("empty-test-url");
+        let path = write_minimal_config(&dir);
+
+        let mut raw = HashMap::new();
+        raw.insert("meow.test_url".into(), "  \n \n".into());
+
+        let lang = test_lang();
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+        assert_eq!(
+            collect_field(&errors, "meow.test_url"),
+            Some("must not be empty"),
+            "actual: {errors:?}"
+        );
+        assert!(
+            !cfg.doc().to_string().contains("test_url"),
+            "the empty list must not reach the document: {}",
+            cfg.doc()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The loader refuses an entry that is not an absolute http(s) URL,
+    /// and the panel writes the file verbatim: an entry the loader would
+    /// refuse would abort the next start of both binaries.
+    #[test]
+    fn apply_all_refuses_a_test_url_the_loader_would_reject() {
+        for (entry, expected) in [
+            (
+                "ftp://example.com/generate_204",
+                "only http/https URLs are supported, got 'ftp'",
+            ),
+            (
+                "file:///etc/passwd",
+                "only http/https URLs are supported, got 'file'",
+            ),
+            ("not a url", "invalid URL: "),
+            ("http://", "invalid URL: "),
+        ] {
+            let dir = temp_dir("bad-test-url");
+            let path = write_minimal_config(&dir);
+
+            let mut raw = HashMap::new();
+            raw.insert("meow.test_url".into(), entry.into());
+
+            let lang = test_lang();
+            let mut errors = Vec::new();
+            let mut cfg = EditableConfig::load(&path).unwrap();
+            apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+            let message = collect_field(&errors, "meow.test_url").unwrap_or_default();
+            assert!(
+                message.starts_with(expected),
+                "entry {entry}: unexpected message {message:?}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The probe dials the test URL through the tunnel, so a private
+    /// address is refused by the same SSRF policy that guards the feed
+    /// targets — unless the operator turned that guard off.
+    #[test]
+    fn apply_all_refuses_a_private_test_url_while_the_probe_guard_is_on() {
+        let dir = temp_dir("private-test-url");
+        let path = write_minimal_config(&dir);
+
+        let mut raw = HashMap::new();
+        raw.insert(
+            "meow.test_url".into(),
+            "http://127.0.0.1/generate_204".into(),
+        );
+
+        let lang = test_lang();
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+        let message = collect_field(&errors, "meow.test_url").unwrap_or_default();
+        assert!(
+            message.starts_with("SSRF protection: "),
+            "unexpected message {message:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_all_accepts_a_private_test_url_when_the_probe_guard_is_off() {
+        let dir = temp_dir("private-test-url-off");
+        let path = write_minimal_config(&dir);
+
+        let mut raw = HashMap::new();
+        raw.insert("probe.allow_private_targets".into(), "on".into());
+        raw.insert(
+            "meow.test_url".into(),
+            "http://127.0.0.1/generate_204".into(),
+        );
+
+        let lang = test_lang();
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(
+            cfg.doc()
+                .to_string()
+                .contains("http://127.0.0.1/generate_204"),
+            "the entry must reach the document"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_all_writes_the_test_urls_verbatim() {
+        let dir = temp_dir("test-url-write");
+        let path = write_minimal_config(&dir);
+
+        let mut raw = HashMap::new();
+        raw.insert(
+            "meow.test_url".into(),
+            "http://cp.cloudflare.com/generate_204\nhttps://www.gstatic.com/generate_204".into(),
+        );
+
+        let lang = test_lang();
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors);
+
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let serialized = cfg.doc().to_string();
+        assert!(
+            serialized.contains("http://cp.cloudflare.com/generate_204"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("https://www.gstatic.com/generate_204"),
+            "{serialized}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A save whose live refresh failed must reach the operator: the file
+    /// on disk carries the new configuration, the running process keeps
+    /// the old one until the next restart. A green "saved" toast would
+    /// hide that.
+    #[test]
+    fn a_failed_live_refresh_is_reported_with_an_error() {
+        let lang = test_lang();
+        let err = fumox_core::Error::Config("meow.test_url entry 'x' is not a valid URL".into());
+
+        let response =
+            settings_refresh_failed(&lang, &HeaderMap::new(), "/etc/fumox/app.toml", &err);
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("a redirect")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.contains("flash_level=error"),
+            "the toast must be an error: {location}"
+        );
+        let flash = location
+            .split("flash=")
+            .nth(1)
+            .expect("a flash message")
+            .split('&')
+            .next()
+            .unwrap();
+        let message = percent_encoding::percent_decode_str(flash)
+            .decode_utf8_lossy()
+            .to_string();
+        assert!(
+            message.contains("/etc/fumox/app.toml"),
+            "the message must name the file: {message}"
+        );
+        assert!(
+            message.contains("is not a valid URL"),
+            "the message must carry the reason: {message}"
+        );
     }
 }

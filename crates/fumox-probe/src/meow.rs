@@ -15,6 +15,9 @@ pub struct MeowClient {
     base_url: String,
     test_urls: Vec<String>,
     timeout: Duration,
+    /// Bearer token for the external-controller, empty when the
+    /// controller is unauthenticated.
+    api_token: String,
 }
 
 /// One sample of the proxy kernel's memory use.
@@ -44,6 +47,9 @@ pub enum DelayOutcome {
 
 impl MeowClient {
     pub fn new(config: &MeowConfig) -> Self {
+        // reqwest is compiled without a crypto provider and panics when a
+        // client is built before one is installed.
+        fumox_core::tls::install_crypto_provider();
         let timeout = Duration::from_secs(config.timeout_secs.max(1));
         Self {
             // Client-level timeouts as a floor: every call below also sets a
@@ -67,7 +73,22 @@ impl MeowClient {
             base_url: format!("http://{}", config.api_addr),
             test_urls: config.test_url.clone(),
             timeout,
+            api_token: config.api_token.trim().to_string(),
         }
+    }
+
+    /// The `Authorization` header of every controller request.
+    ///
+    /// The controller can rewrite the proxy kernel's configuration, so a
+    /// deployment that publishes it needs it to answer only to the
+    /// probe. An empty token means the controller is unauthenticated:
+    /// the header is left off entirely rather than sent empty, which
+    /// some controllers answer differently from a missing one.
+    fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_token.is_empty() {
+            return request;
+        }
+        request.bearer_auth(&self.api_token)
     }
 
     /// Random test URL for one delay check: with several configured, the
@@ -79,11 +100,23 @@ impl MeowClient {
             .expect("meow.test_url is never empty (guaranteed by the config deserializer)")
     }
 
+    /// The test URL of one cycle: one draw from the configured list,
+    /// shared by every check of the cycle.
+    ///
+    /// A per-check draw gives the same proxy opposite verdicts in
+    /// consecutive cycles, which reads as "the proxy dies on its own", and
+    /// a cycle whose draws all land on an unreachable endpoint fails every
+    /// proxy at once. One draw per cycle keeps a cycle internally
+    /// consistent and makes the endpoint a property of the cycle, visible
+    /// in its log line.
+    pub fn cycle_test_url(&self) -> &str {
+        self.pick_test_url(&mut rand::rng())
+    }
+
     /// `GET /version`, cheap liveness probe of the REST API.
     pub async fn ping(&self) -> Result<String, String> {
         let response = self
-            .http
-            .get(format!("{}/version", self.base_url))
+            .auth(self.http.get(format!("{}/version", self.base_url)))
             .timeout(Duration::from_secs(3))
             .send()
             .await
@@ -109,8 +142,7 @@ impl MeowClient {
     /// frame later, so the first is dropped rather than shown as "0 bytes".
     pub async fn memory(&self) -> Result<MeowMemory, String> {
         let mut response = self
-            .http
-            .get(format!("{}/memory", self.base_url))
+            .auth(self.http.get(format!("{}/memory", self.base_url)))
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -153,8 +185,7 @@ impl MeowClient {
     /// restarting the meow-rs process.
     pub async fn reload_config(&self, path: &std::path::Path) -> Result<(), String> {
         let response = self
-            .http
-            .put(format!("{}/configs", self.base_url))
+            .auth(self.http.put(format!("{}/configs", self.base_url)))
             .json(&serde_json::json!({ "path": path.to_string_lossy() }))
             .timeout(Duration::from_secs(10))
             .send()
@@ -170,6 +201,9 @@ impl MeowClient {
 
     /// `GET /proxies/{name}/delay`, run one real tunnel check.
     ///
+    /// `test_url` is the endpoint of the current cycle (see
+    /// [`cycle_test_url`]): the same one for every check of the cycle.
+    ///
     /// Distinguishes "the proxy is dead" (meow answered with a failure)
     /// from "meow itself is down" (transport error / 5xx). Both are
     /// *failures* for the proxy as far as the ladder is concerned (owner
@@ -179,13 +213,11 @@ impl MeowClient {
     /// `ProxyFailed` lets the batch continue.
     /// Success is strict: 2xx **with** a numeric `delay` field; a 2xx
     /// without one is an engine malfunction, not a pass.
-    pub async fn check_delay(&self, name: &str) -> DelayOutcome {
+    pub async fn check_delay(&self, name: &str, test_url: &str) -> DelayOutcome {
         let url = format!("{}/proxies/{name}/delay", self.base_url);
         let timeout_ms = self.timeout.as_millis().to_string();
-        let test_url = self.pick_test_url(&mut rand::rng());
         let response = match self
-            .http
-            .get(&url)
+            .auth(self.http.get(&url))
             .query(&[("url", test_url), ("timeout", timeout_ms.as_str())])
             .timeout(self.timeout + Duration::from_secs(5))
             .send()
@@ -232,13 +264,14 @@ impl MeowClient {
     pub async fn check_delay_with_retry(
         &self,
         name: &str,
+        test_url: &str,
         attempts: u8,
         backoff: Duration,
     ) -> DelayOutcome {
         debug_assert!(attempts >= 1, "attempts must be at least 1");
         let mut last_error = String::new();
         for attempt in 0..attempts {
-            match self.check_delay(name).await {
+            match self.check_delay(name, test_url).await {
                 ok @ DelayOutcome::Ok(_) => return ok,
                 pf @ DelayOutcome::ProxyFailed(_) => return pf,
                 DelayOutcome::ServiceUnavailable(err) => {
@@ -340,6 +373,7 @@ mod tests {
 
         let config = MeowConfig {
             api_addr: addr.to_string(),
+            api_token: String::new(),
             config_path: std::env::temp_dir().join("fumox-meow-test.yaml"),
             test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 5,
@@ -361,18 +395,134 @@ mod tests {
         client.reload_config(&config.config_path).await.unwrap();
         assert_eq!(reloads.load(Ordering::SeqCst), 1);
 
-        match client.check_delay("fumox-1").await {
+        match client
+            .check_delay("fumox-1", "http://cp.cloudflare.com")
+            .await
+        {
             DelayOutcome::Ok(delay) => assert_eq!(delay, 42),
             other => panic!("expected Ok, got {other:?}"),
         }
-        match client.check_delay("fumox-2").await {
+        match client
+            .check_delay("fumox-2", "http://cp.cloudflare.com")
+            .await
+        {
             DelayOutcome::ProxyFailed(msg) => assert!(msg.contains("timeout")),
             other => panic!("expected ProxyFailed, got {other:?}"),
         }
-        match client.check_delay("fumox-99").await {
+        match client
+            .check_delay("fumox-99", "http://cp.cloudflare.com")
+            .await
+        {
             DelayOutcome::ServiceUnavailable(_) => {}
             other => panic!("expected ServiceUnavailable, got {other:?}"),
         }
+    }
+
+    /// The `Authorization` header of a request, as the controller sees it.
+    fn auth_header(headers: &axum::http::HeaderMap) -> Option<String> {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// The controller can reconfigure the proxy kernel, so a deployment
+    /// that publishes it needs it to answer only to the probe. Every
+    /// request therefore carries the configured bearer token, and a
+    /// client without a token sends no header at all.
+    #[tokio::test]
+    async fn the_bearer_token_is_sent_on_every_request() {
+        let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+
+        let capture = seen.clone();
+        let version_capture = capture.clone();
+        let configs_capture = capture.clone();
+        let app = Router::new()
+            .route(
+                "/version",
+                get(move |headers: axum::http::HeaderMap| {
+                    let capture = version_capture.clone();
+                    async move {
+                        capture.lock().unwrap().push(auth_header(&headers));
+                        Json(serde_json::json!({"version": "mock"}))
+                    }
+                }),
+            )
+            .route(
+                "/configs",
+                put(move |headers: axum::http::HeaderMap| {
+                    let capture = configs_capture.clone();
+                    async move {
+                        capture.lock().unwrap().push(auth_header(&headers));
+                        Json(serde_json::json!({}))
+                    }
+                }),
+            )
+            .route(
+                "/proxies/{name}/delay",
+                get(move |_name: Path<String>, headers: axum::http::HeaderMap| {
+                    let capture = capture.clone();
+                    async move {
+                        capture.lock().unwrap().push(auth_header(&headers));
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({"delay": 42})),
+                        )
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = MeowConfig {
+            api_addr: addr.to_string(),
+            api_token: "s3cr3t".to_string(),
+            config_path: std::env::temp_dir().join("fumox-meow-auth.yaml"),
+            test_url: vec!["https://www.gstatic.com/generate_204".to_string()],
+            timeout_secs: 5,
+            backoff_initial_secs: 60,
+            backoff_max_secs: 900,
+            ipv6: false,
+        };
+
+        let client = MeowClient::new(&config);
+        client.ping().await.unwrap();
+        client.reload_config(&config.config_path).await.unwrap();
+        assert!(matches!(
+            client
+                .check_delay("fumox-1", "https://www.gstatic.com/generate_204")
+                .await,
+            DelayOutcome::Ok(42)
+        ));
+
+        let headers = seen.lock().unwrap().clone();
+        assert_eq!(headers.len(), 3, "every call must reach the controller");
+        for header in &headers {
+            assert_eq!(
+                header.as_deref(),
+                Some("Bearer s3cr3t"),
+                "the controller must see the bearer token"
+            );
+        }
+
+        // Without a token the header is absent, not empty: a controller
+        // that treats "no header" and "empty header" differently has to
+        // see the former.
+        let plain = MeowClient::new(&MeowConfig {
+            api_token: String::new(),
+            ..config.clone()
+        });
+        plain.ping().await.unwrap();
+        let headers = seen.lock().unwrap().clone();
+        assert_eq!(
+            headers.last().and_then(|header| header.as_deref()),
+            None,
+            "an unauthenticated client must not send an Authorization header"
+        );
     }
 
     #[tokio::test]
@@ -380,6 +530,7 @@ mod tests {
         let config = MeowConfig {
             // Nothing listens here.
             api_addr: "127.0.0.1:1".into(),
+            api_token: String::new(),
             config_path: std::env::temp_dir().join("fumox-meow-test.yaml"),
             test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 2,
@@ -391,32 +542,32 @@ mod tests {
         assert!(client.ping().await.is_err());
         assert!(client.reload_config(&config.config_path).await.is_err());
         assert!(matches!(
-            client.check_delay("fumox-1").await,
+            client
+                .check_delay("fumox-1", "http://cp.cloudflare.com")
+                .await,
             DelayOutcome::ServiceUnavailable(_)
         ));
     }
 
+    /// The URL of the cycle is the URL every check of the cycle uses: the
+    /// probe draws it once, the checks do not pick their own.
     #[tokio::test]
-    async fn delay_requests_rotate_the_configured_test_urls() {
+    async fn delay_requests_use_the_url_of_the_cycle() {
         let reloads = Arc::new(AtomicUsize::new(0));
         let (_addr, mut config, seen) = mock_api(reloads.clone()).await;
         config.test_url = vec!["http://a.example/204".into(), "http://b.example/204".into()];
         let client = MeowClient::new(&config);
 
-        // 40 draws over two URLs: the odds of never seeing one are ~10^-12.
-        for _ in 0..40 {
-            assert!(matches!(
-                client.check_delay("fumox-1").await,
-                DelayOutcome::Ok(_)
-            ));
-        }
-        assert_eq!(
-            *seen.lock().unwrap(),
-            HashSet::from([
-                "http://a.example/204".to_string(),
-                "http://b.example/204".to_string(),
-            ])
+        let cycle_url = client.cycle_test_url().to_string();
+        assert!(
+            cycle_url == "http://a.example/204" || cycle_url == "http://b.example/204",
+            "{cycle_url}"
         );
+        assert!(matches!(
+            client.check_delay("fumox-1", &cycle_url).await,
+            DelayOutcome::Ok(_)
+        ));
+        assert_eq!(*seen.lock().unwrap(), HashSet::from([cycle_url]));
     }
 
     #[test]
@@ -476,6 +627,7 @@ mod tests {
         });
         let config = MeowConfig {
             api_addr: addr,
+            api_token: String::new(),
             config_path: std::env::temp_dir().join("fumox-meow-retry.yaml"),
             test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 5,
@@ -486,7 +638,12 @@ mod tests {
         let client = MeowClient::new(&config);
         // Two attempts, 50ms between, first fails, second succeeds.
         match client
-            .check_delay_with_retry("fumox-flaky", 2, Duration::from_millis(50))
+            .check_delay_with_retry(
+                "fumox-flaky",
+                "http://cp.cloudflare.com",
+                2,
+                Duration::from_millis(50),
+            )
             .await
         {
             DelayOutcome::Ok(delay) => assert_eq!(delay, 17),
@@ -528,6 +685,7 @@ mod tests {
         });
         let config = MeowConfig {
             api_addr: addr,
+            api_token: String::new(),
             config_path: std::env::temp_dir().join("fumox-meow-retry.yaml"),
             test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 5,
@@ -537,7 +695,12 @@ mod tests {
         };
         let client = MeowClient::new(&config);
         match client
-            .check_delay_with_retry("fumox-dead", 3, Duration::from_millis(10))
+            .check_delay_with_retry(
+                "fumox-dead",
+                "http://cp.cloudflare.com",
+                3,
+                Duration::from_millis(10),
+            )
             .await
         {
             DelayOutcome::ProxyFailed(msg) => assert!(msg.contains("timeout"), "{msg}"),
@@ -601,6 +764,7 @@ mod tests {
             });
             let config = MeowConfig {
                 api_addr: addr,
+                api_token: String::new(),
                 config_path: std::env::temp_dir().join("fumox-meow-probefail.yaml"),
                 test_url: vec!["http://cp.cloudflare.com".to_string()],
                 timeout_secs: 5,
@@ -611,7 +775,12 @@ mod tests {
             let client = MeowClient::new(&config);
 
             match client
-                .check_delay_with_retry("fumox-dead", 3, Duration::from_millis(10))
+                .check_delay_with_retry(
+                    "fumox-dead",
+                    "http://cp.cloudflare.com",
+                    3,
+                    Duration::from_millis(10),
+                )
                 .await
             {
                 DelayOutcome::ProxyFailed(msg) => {
@@ -653,6 +822,7 @@ mod tests {
         });
         let config = MeowConfig {
             api_addr: addr,
+            api_token: String::new(),
             config_path: std::env::temp_dir().join("fumox-meow-boom.yaml"),
             test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 5,
@@ -661,7 +831,10 @@ mod tests {
             ipv6: false,
         };
         let client = MeowClient::new(&config);
-        match client.check_delay("fumox-x").await {
+        match client
+            .check_delay("fumox-x", "http://cp.cloudflare.com")
+            .await
+        {
             DelayOutcome::ServiceUnavailable(err) => assert!(err.contains("boom"), "{err}"),
             other => panic!("500 must stay ServiceUnavailable, got {other:?}"),
         }

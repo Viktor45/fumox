@@ -25,3 +25,9 @@ If applicable, add screenshots to help explain your problem.
 
 **Additional context**  
 Any other context: software version, operating system, logs, network conditions, etc.
+
+**Logs**  
+Paste the relevant log lines here, or point at where they can be found. Raise the log level for the run that misbehaves — `[log].server` / `[log].probe` (or `RUST_LOG`) — and quote only the lines around the failure.
+
+**Do not paste secrets**  
+This is a public issue tracker. Replace every token, key, password and subscription URL with a placeholder (`<token>`, `https://example.com/sub/…`), and remove the `Authorization` header and the `[admin].token` value. Never post a live subscription URL or a config file with a real secret in it.

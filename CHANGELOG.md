@@ -102,6 +102,95 @@ Changes in the working tree, not yet on a published image.
   `/admin/profiles/{id}/toggle`) re-renders the badge and the
   button without reloading the page, with the same CSRF token and
   the no-JavaScript form fallback the rest of the panel uses.
+- A container smoke test for the runtime image
+  (`scripts/container-smoke.sh`): it starts the server with the bind
+  mounts a deployment uses (`/app/data` owned by the fumox uid 999,
+  `/app/config` read-only), waits for `/healthz` to answer 200, asserts
+  that the SQLite file was created inside the data mount, and then
+  starts the image once more with a read-only data mount and asserts
+  that the container exits with a non-zero code — a misconfigured mount
+  must surface as a failed start, not as a container that looks alive.
+  The CI runs it on both architectures against the image it just
+  published, so the artefact the release ships is the artefact the
+  test proves.
+- A cold-start e2e test for the kube layout
+  (`scripts/kube-coldstart-smoke.sh`): `podman kube play` on an empty
+  volume, then wait for the server to answer `/healthz` and for the
+  probe to reach the running state, and assert that no container
+  restarted. It is what proves that the two pods can start at the same
+  time without the probe dying on the schema lock.
+- A controller smoke test for the meow image
+  (`scripts/meow-controller-smoke.sh`): the kernel must refuse to start
+  without a controller secret, the controller must reject a request
+  that carries no `Authorization` header (or a wrong one), and it must
+  answer the request that presents the secret.
+
+### Changed
+
+- `[probe].refresh_check_limit` moved to `[ingest].refresh_check_limit`:
+  the priority queue belongs to the scheduler, the probe only drains it.
+  The old key is still accepted for one release — its value is carried
+  over to the new key and a warning names the key to rename — so an
+  upgrade from a config that still carries the old spelling does not
+  turn into a refusal to start. `FUMOX_PROBE__REFRESH_CHECK_LIMIT` is
+  accepted the same way. The old key goes away in the next release.
+- The T2 test URL is drawn once per probe cycle instead of once per
+  check: every check of a cycle hits the same endpoint, so a proxy no
+  longer gets opposite verdicts in two consecutive cycles because the
+  draw landed on a different address. A batch in which every tunnel
+  failed (no success at all and more than one failure) is read as a
+  suspect endpoint rather than a dead fleet: the proxies are stamped
+  unverified and the fail ladder does not grow. The shipped default is
+  one neutral endpoint instead of seven addresses of one vendor, and
+  every `[meow].test_url` entry has to be an absolute `http(s)` URL: a
+  private address needs `[probe].allow_private_targets = true`.
+- The configuration is checked at startup instead of at first use. Every
+  numeric setting has an explicit range now, and a value outside it
+  aborts the boot with the key and the bound in the message; a
+  `trust_proxy_ips` entry that trusts every peer (`0.0.0.0/0`, `::/0`) is
+  a config error, and a panel on a public address that sends its
+  session cookie without `Secure` warns at startup.
+- A `FUMOX_*` variable that names no configuration key is refused
+  instead of being ignored: the mistake was invisible, the setting kept
+  the value the file gave it, and the operator never learned why. The
+  message names the variable and the closest key.
+- The *Edit settings* page refuses a `[meow].test_url` the loader would
+  reject (an empty list, a non-`http(s)` URL, a private address while
+  the probe's guard is on) instead of writing a file that stops both
+  binaries at the next start, and a save whose live reload failed tells
+  the operator instead of only logging it.
+- The shared volume was split by purpose and owner. The one `meow-shared`
+  volume (which held the GeoLite2 databases *and* the kernel's
+  configuration exchange) became two: `fumox-geo` for the databases,
+  written by the server alone, and `fumox-meow` for the exchange
+  directory, written by the probe and read by the kernel. The compose
+  stack mounts them at `/shared/geo` and `/shared/meow`, and
+  `FUMOX_GEO__DB_DIR` follows the databases into their own volume
+  (`/shared/geo`, the quadlet units and the manifest declare the same).
+  A deployment that keeps its own `.mmdb` files has to move them to the
+  new volume; the guide and the compose header say where.
+- The nginx example serves every layout now. The server blocks moved
+  into a template that the image's entrypoint renders, so the upstream
+  addresses are a runtime choice
+  (`FUMOX_UPSTREAM_PUBLIC`, `FUMOX_UPSTREAM_ADMIN`, `FUMOX_SERVER_NAME`),
+  and the resolver belongs to the flavour: the compose flavour resolves
+  the service names through Docker's embedded DNS (`127.0.0.11`), the
+  podman flavour needs none, because there the upstream is the pod
+  loopback (`127.0.0.1:8080` / `127.0.0.1:8081`). The `Host` header is
+  normalised before it is forwarded (the default ports are dropped, a
+  non-default port is kept, a Host that is not a plain hostname is
+  replaced by the canonical name), the SSE stream at `/admin/events` has
+  its own location with the buffering off and a long read timeout, and
+  the remaining `/admin` locations answer in seconds. The redirect from
+  `:80` goes to the normalised host, never to the raw client header.
+- The quadlet units and the kube manifest declare resource limits: the
+  server gets `MemoryMax=512M`, `CPUQuota=100%`, `TasksMax=256`, the
+  probe and the kernel smaller quotas (in the `[Service]` section of
+  the units, which systemd reads as its own options).
+- The quadlet units run with a read-only root filesystem and explicit
+  tmpfs mounts instead of podman's default set, so the non-root users
+  can write to `/tmp` and the kernel can render its config in
+  `/run/meow` without the whole filesystem becoming writable.
 
 ### Fixed
 
@@ -1262,9 +1351,86 @@ Changes in the working tree, not yet on a published image.
   send an `Origin` header answer `403` (they must drop the header,
   or the proxy must pass the original `Host` through: the same
   requirement `host_gate` already imposed).
+- The container stack runs with the least privilege it can run with.
+  Every service declares `user: "999:999"` (the kernel: `998:999`),
+  `cap_drop: ["ALL"]`, `security_opt: ["no-new-privileges:true"]` and
+  `read_only: true`, and the paths that must be writable are tmpfs
+  mounts (`/tmp` for the SQLite scratch files, `/run/meow` for the
+  rendered kernel config) or volumes. The quadlet units say the same
+  in their own dialect (`User=`, `Group=`, `NoNewPrivileges=true`,
+  `ReadOnly=true`, explicit `Tmpfs=`), and the kube manifest carries a
+  `securityContext` with `runAsNonRoot`, `allowPrivilegeEscalation:
+  false`, `readOnlyRootFilesystem: true` and `capabilities: drop:
+  ["ALL"]`.
+- The admin token no longer reaches the probe. The quadlet stack splits
+  the environment in two: `fumox.env` holds the shared runtime
+  variables, `fumox-admin.env` holds the panel's login token and is
+  read by the server alone; the kube manifest does the same with the
+  `fumox-env` and `fumox-admin` secrets. The probe and the kernel
+  therefore cannot reach the admin panel even if one of them is
+  compromised.
+- The admin panel moved into its own network namespace. The compose
+  stack kept one stack with two networks; the quadlet and kube layouts
+  became two pods — `fumox` (the server alone) and `fumox-worker` (the
+  probe and the proxy kernel). The kernel handles untrusted proxy
+  traffic and its configuration is writable by the probe, so it must not
+  be able to reach the panel; the two pods need no network path to each
+  other, the server and the probe exchange everything through the shared
+  SQLite volume. The port publishing changed with it: the public
+  listener stays on 8080 and the admin panel stays on 127.0.0.1:8081.
+- The meow-rs external-controller is authenticated and unreachable from
+  outside its pod. The kernel refuses to start without a controller
+  secret (`FUMOX_MEOW__API_TOKEN`, generated at random and checked
+  against `[A-Za-z0-9._-]`), the probe presents it as
+  `Authorization: Bearer <token>`, and the controller is bound to the
+  pod loopback (`127.0.0.1:9090`) in the pod layouts. The port is
+  published nowhere: it is not in the compose file, not in the pod
+  units and not in the manifest. The bootstrap config lost its
+  `mixed-port: 7890` — the delay checks go through the controller and
+  need no inbound listener.
+- The exchange directory is not world-writable any more. The old
+  layout gave `/shared` mode 1777, so every user on the host could
+  write into the kernel's configuration. The directories are split by
+  purpose and owner now (`/shared/geo` for the GeoLite2 databases, the
+  server's; `/shared/meow` for the config exchange, the probe's), the
+  exchange directory is group-writable for the shared gid (0770) and
+  the files inside it are 0640.
+- The images are pinned to immutable identifiers: the compose file
+  names them by digest (`image: …@sha256:…`), so a deployment cannot
+  change under a running stack, and the meow wrapper pins its upstream
+  release to a concrete version whose SHA256 sums the build verifies
+  against a file in this repository — a tampered asset or a tampered
+  checksum file cannot pass. The release workflow takes the version and
+  the sums as inputs, so a new upstream release is picked up through
+  review and not by resolving "latest" at build time.
+- The example secrets in the documentation are generated, not literal.
+  The quadlet examples ship an empty `FUMOX_ADMIN__TOKEN=` (an empty
+  token disables the panel) next to the `openssl rand -hex 32` step
+  that fills it, the kube instructions create the secrets from a random
+  value instead of the `change-me` placeholder, and the env files are
+  installed with mode 600 so the secret is never briefly readable by
+  another user.
 
 ### Docs
 
+- The podman guide describes the deployment as it is now. The quadlet
+  variant installs two environment files (the shared one and the
+  admin-only one) instead of one, the kube variant creates two
+  `podman secret`s from random values instead of a literal `change-me`,
+  the cookie note moved out of the variant-A subsection into the shared
+  preparation part (both variants publish the panel over plain HTTP and
+  both need the same answer), and the upgrade section grew the case of
+  units that name the GHCR image directly (`podman pull … && systemctl
+  --user restart …`, without the `podman tag` step) together with the
+  warning to back up the database first: the server migrates the schema
+  at startup. A new section explains how to put the nginx TLS front in
+  front of the pod layouts, with the upstream names each variant needs
+  (`127.0.0.1:8080` / `127.0.0.1:8081` inside the server pod, `server:
+  8080` / `server:8081` for compose) and the ready-made start command.
+  The guide also spells out what the two pods do at start: they come up
+  at the same time, the server applies the schema and the probe waits
+  for the database with its own backoff, so a `database is locked` error
+  never takes the probe down.
 - The guides' alive-linger rule contradicted the reconciler: they had a
   source refresh unlink everything but `alive` rows, with `unknown`
   said never to linger. The link actually survives for `alive`,

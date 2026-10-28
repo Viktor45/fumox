@@ -25,7 +25,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::config::{
     AdminConfig, DatabaseConfig, FetchConfig, GeoConfig, IngestConfig, LogConfig, MeowConfig,
-    ProbeConfig, ResolvedConfigPath, RetentionConfig, ServerConfig,
+    NetworkConfig, ProbeConfig, ResolvedConfigPath, RetentionConfig, ServerConfig,
 };
 use fumox_core::config_writer::is_writable;
 use fumox_core::db::DbPool;
@@ -224,6 +224,12 @@ impl AdminState {
     /// The live `[log]` block (console log levels).
     pub fn log(&self) -> LogConfig {
         self.live().log
+    }
+
+    /// The live `[network]` block (the DNS resolution timeout of the
+    /// source fetcher).
+    pub fn network(&self) -> NetworkConfig {
+        self.live().network
     }
 
     /// Reload the on-disk config via the figment merge
@@ -711,7 +717,7 @@ pub(crate) async fn test_admin_state(
     let fetcher = Fetcher::new(
         config.fetch.clone(),
         config.admin.allow_private_urls,
-        config.geo.dns_timeout(),
+        config.ssrf_dns_timeout(),
     );
     (
         dir,

@@ -114,6 +114,11 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, String> {
             ));
         }
     }
+    // The host, the credential and the name are persisted verbatim, so they
+    // are capped like the parameters.
+    super::check_field_size("vmess: add", &host)?;
+    super::check_field_size("vmess: id", &credential)?;
+    super::check_field_size("vmess: ps", &name)?;
 
     Ok(ProxyEntry {
         scheme: Scheme::Vmess,

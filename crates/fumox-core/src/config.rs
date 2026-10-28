@@ -69,6 +69,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub geo: GeoConfig,
     #[serde(default)]
+    pub network: NetworkConfig,
+    #[serde(default)]
     pub admin: AdminConfig,
     #[serde(default)]
     pub probe: ProbeConfig,
@@ -165,6 +167,22 @@ impl AppConfig {
             "probe.refresh_check_limit moved to ingest.refresh_check_limit: \
              rename the key in your config file"
         );
+    }
+
+    /// The DNS timeout of the SSRF pipeline: the dedicated
+    /// `[network].dns_timeout_secs` when it is set, `[geo].dns_timeout_secs`
+    /// otherwise, never below one second.
+    ///
+    /// The two consumers of the address policy (the probe's dial gate and
+    /// the server's fetcher) read the bound from here, so a change to it
+    /// reaches both.
+    pub fn ssrf_dns_timeout(&self) -> std::time::Duration {
+        let secs = if self.network.dns_timeout_secs > 0 {
+            self.network.dns_timeout_secs
+        } else {
+            self.geo.dns_timeout_secs
+        };
+        std::time::Duration::from_secs(secs.max(1))
     }
 
     /// Cross-field checks serde cannot express on individual fields.
@@ -299,6 +317,7 @@ impl AppConfig {
                 "geo.startup_download_budget_secs",
                 self.geo.startup_download_budget_secs,
             ),
+            ("network.dns_timeout_secs", self.network.dns_timeout_secs),
             (
                 "admin.session_ttl_hours",
                 u64::from(self.admin.session_ttl_hours),
@@ -896,6 +915,33 @@ impl GeoConfig {
     /// listeners bind without geo enrichment.
     pub fn startup_download_budget(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.startup_download_budget_secs)
+    }
+}
+
+/// Settings of the address policy, the gate every untrusted host passes
+/// before it may be dialed.
+///
+/// The section exists because the SSRF pipeline resolves a feed-supplied
+/// host before the probe or the fetcher may connect to it, and that
+/// resolution belongs to the address policy, not to the geo enrichment
+/// (which resolves the same names for a different reason: to label them).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
+    /// Upper bound for the DNS resolution step of the SSRF pipeline.
+    ///
+    /// `0` = follow `[geo].dns_timeout_secs`. The effective bound is never
+    /// below one second: a zero timeout would fail every resolution
+    /// instantly, which is a misconfiguration, not a policy.
+    #[serde(default = "defaults::network_dns_timeout_secs")]
+    pub dns_timeout_secs: u64,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            dns_timeout_secs: defaults::network_dns_timeout_secs(),
+        }
     }
 }
 
@@ -1545,6 +1591,8 @@ pub mod bounds {
         ("geo.cache_max_entries", Range::new(0, 10_000_000)),
         ("geo.dns_timeout_secs", Range::new(1, 60)),
         ("geo.startup_download_budget_secs", Range::new(0, 3600)),
+        // 0 = follow [geo].dns_timeout_secs.
+        ("network.dns_timeout_secs", Range::new(0, 60)),
         ("admin.session_ttl_hours", Range::new(1, 24 * 365)),
         ("admin.rate_limit.limit", Range::new(1, 1_000_000)),
         ("admin.login_rate_limit.limit", Range::new(1, 1_000_000)),
@@ -1665,6 +1713,11 @@ mod defaults {
     }
     pub const fn dns_timeout_secs() -> u64 {
         5
+    }
+    /// The SSRF pipeline follows the geo timeout until an operator gives it
+    /// its own bound.
+    pub const fn network_dns_timeout_secs() -> u64 {
+        0
     }
     pub const fn geo_startup_download_budget_secs() -> u64 {
         60
@@ -2575,6 +2628,30 @@ probe_results_days = 7
             ..Default::default()
         };
         assert_eq!(cfg.dns_timeout(), std::time::Duration::from_secs(7));
+    }
+
+    /// The SSRF pipeline has its own DNS bound: the dedicated
+    /// `[network].dns_timeout_secs` when it is set, the geo key otherwise,
+    /// and never below one second (a zero timeout would fail every
+    /// resolution instantly).
+    #[test]
+    fn the_ssrf_dns_timeout_follows_the_geo_key_until_it_is_set() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.geo.dns_timeout_secs, 5);
+        assert_eq!(cfg.ssrf_dns_timeout(), std::time::Duration::from_secs(5));
+
+        cfg.network.dns_timeout_secs = 9;
+        assert_eq!(cfg.ssrf_dns_timeout(), std::time::Duration::from_secs(9));
+
+        // The geo key stays the geo enrichment's own bound.
+        cfg.geo.dns_timeout_secs = 3;
+        assert_eq!(cfg.ssrf_dns_timeout(), std::time::Duration::from_secs(9));
+        assert_eq!(cfg.geo.dns_timeout(), std::time::Duration::from_secs(3));
+
+        // A zero bound is clamped to one second, never to "no wait".
+        cfg.network.dns_timeout_secs = 0;
+        cfg.geo.dns_timeout_secs = 0;
+        assert_eq!(cfg.ssrf_dns_timeout(), std::time::Duration::from_secs(1));
     }
 
     /// A `FUMOX_*` variable that names no configuration key is a

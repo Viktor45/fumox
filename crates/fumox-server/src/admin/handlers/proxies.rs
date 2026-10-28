@@ -945,6 +945,7 @@ mod tests {
             params: None,
             unknown_params: None,
             raw_line: None,
+            raw_path: None,
             geo_country: country.map(str::to_string),
             geo_city: city.map(str::to_string),
             geo_asn: asn.map(str::to_string),
@@ -1047,7 +1048,7 @@ mod tests {
         std::mem::forget(refresh_rx); // keep the channel open for sends
         let config = fumox_core::AppConfig::default();
         let fetcher =
-            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.geo.dns_timeout());
+            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.ssrf_dns_timeout());
         let mut state = AdminState::new(
             pool,
             crate::cache::Caches::new(),
@@ -1142,7 +1143,7 @@ mod tests {
         let fetcher = crate::fetcher::Fetcher::new(
             config.fetch.clone(),
             config.admin.allow_private_urls,
-            config.geo.dns_timeout(),
+            config.ssrf_dns_timeout(),
         );
         AdminState::new(
             pool,

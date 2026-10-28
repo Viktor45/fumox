@@ -158,6 +158,8 @@ pub struct ClashParseResult {
     pub unsupported: usize,
     /// Items missing required fields (server/port/type).
     pub invalid: usize,
+    /// Items left out because the payload reached the entry cap.
+    pub skipped: usize,
 }
 
 /// Parse a full Clash YAML subscription payload.
@@ -178,8 +180,15 @@ pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
         entries: Vec::new(),
         unsupported: 0,
         invalid: 0,
+        skipped: 0,
     };
     for item in proxies {
+        if result.entries.len() >= super::MAX_ENTRIES {
+            // The cap is reached: the rest of the payload is counted instead
+            // of parsed, so the load stays bounded and the truncation shows.
+            result.skipped += 1;
+            continue;
+        }
         match parse_item(item) {
             Ok(Some(entry)) => result.entries.push(entry),
             Ok(None) => result.unsupported += 1,
@@ -214,9 +223,14 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     let name = map
         .get("name")
         .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
         .unwrap_or_default()
         .to_string();
     let host = string_field(map, "server")?;
+    if host.is_empty() {
+        return Err("clash: empty server".to_string());
+    }
+    let host = super::normalize_host(&host);
     let port = numeric_field(map, "port")?;
 
     // The credential fields are joined in their declared order, which is
@@ -234,10 +248,19 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     //     ss item with only `password` stores `pw`;
     //   - with nothing present the credential stays empty, so a
     //     single-field scheme without its secret emits no userinfo.
+    //
+    // A field that is present but empty (`null` or an empty scalar) counts as
+    // absent: it says nothing about the secret, and treating it as present
+    // would keep an empty leading slot (`":pw"`, an empty cipher).
     let fields: Vec<Option<String>> = spec
         .credential_fields
         .iter()
-        .map(|field| map.get(field).map(yaml_to_string))
+        .map(|field| {
+            map.get(field)
+                .filter(|value| !matches!(value, Value::Null))
+                .map(yaml_to_string)
+                .filter(|value| !value.is_empty())
+        })
         .collect();
     let first = if spec.optional_credential_fields {
         0
@@ -301,6 +324,11 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
             ));
         }
     }
+    // The host, the credential and the name are persisted verbatim, so they
+    // are capped like the parameters.
+    super::check_field_size("clash: server", &host)?;
+    super::check_field_size("clash: credential", &credential)?;
+    super::check_field_size("clash: name", &name)?;
 
     Ok(Some(ProxyEntry {
         scheme: spec.scheme,
@@ -565,11 +593,84 @@ proxy-groups:
         );
     }
 
+    /// The stored host must have one shape whatever the source spelled it:
+    /// the URI parser stores the bare literal, so a Clash server written
+    /// the URI way (`[2001:db8::1]`) is stored bare too. The fingerprint,
+    /// the SSRF vetting and the serializer all read the stored host as an
+    /// address.
+    #[test]
+    fn a_bracketed_ipv6_server_is_stored_bare() {
+        let yaml = "proxies:\n  - {name: v6, type: trojan, server: '[2001:db8::1]', port: 443, password: p}\n";
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].host, "2001:db8::1");
+    }
+
     #[test]
     fn malformed_items_are_counted_not_fatal() {
         let yaml = "proxies:\n  - name: broken\n    type: ss\n    server: h\n  - {type: trojan, server: h, port: 443, password: p}\n";
         let result = parse_payload(yaml).unwrap();
         assert_eq!(result.invalid, 1); // first item: no port
         assert_eq!(result.entries.len(), 1);
+    }
+
+    /// An empty server is not a proxy: it must be counted as invalid instead
+    /// of stored as a row whose host is the empty string.
+    #[test]
+    fn an_empty_server_is_invalid() {
+        let yaml = "proxies:\n  - {name: a, type: trojan, server: '', port: 443, password: p}\n";
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.invalid, 1);
+        assert!(result.entries.is_empty());
+    }
+
+    /// The host, the credential and the name are stored verbatim on every
+    /// row, so they are capped like the parameters.
+    #[test]
+    fn oversized_fields_are_invalid() {
+        let long = "h".repeat(crate::parsers::uri::MAX_PARAM_BYTES + 1);
+        for yaml in [
+            format!(
+                "proxies:\n  - {{name: a, type: trojan, server: {long}, port: 443, password: p}}\n"
+            ),
+            format!(
+                "proxies:\n  - {{name: a, type: trojan, server: h, port: 443, password: {long}}}\n"
+            ),
+            format!(
+                "proxies:\n  - {{name: {long}, type: trojan, server: h, port: 443, password: p}}\n"
+            ),
+        ] {
+            let result = parse_payload(&yaml).unwrap();
+            assert_eq!(result.invalid, 1, "{yaml}");
+            assert!(result.entries.is_empty());
+        }
+    }
+
+    /// A credential field that is present but empty says nothing about the
+    /// secret: it must count as absent, or it keeps an empty leading slot and
+    /// the writers read `":pw"` as an empty cipher.
+    #[test]
+    fn an_empty_credential_field_counts_as_absent() {
+        for yaml in [
+            "proxies:\n  - {name: a, type: ss, server: h, port: 8388, cipher: '', password: pw}\n",
+            "proxies:\n  - {name: a, type: ss, server: h, port: 8388, cipher: null, password: pw}\n",
+        ] {
+            let result = parse_payload(yaml).unwrap();
+            assert_eq!(result.entries[0].credential, "pw", "{yaml}");
+        }
+    }
+
+    /// A payload with a pathological number of items stops at the cap, and
+    /// the remainder is counted as skipped.
+    #[test]
+    fn a_payload_with_too_many_items_is_capped() {
+        let items: String = (0..crate::parsers::MAX_ENTRIES + 5)
+            .map(|i| {
+                format!("  - {{name: n{i}, type: trojan, server: h{i}.example.com, port: 443, password: p}}\n")
+            })
+            .collect();
+        let result = parse_payload(&format!("proxies:\n{items}")).unwrap();
+        assert_eq!(result.entries.len(), crate::parsers::MAX_ENTRIES);
+        assert_eq!(result.skipped, 5);
     }
 }

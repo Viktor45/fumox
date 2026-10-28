@@ -259,6 +259,19 @@ dns_timeout_secs = 5
 # atomic rename, so no partial .mmdb is ever visible).
 startup_download_budget_secs = 60
 
+[network]
+# Диапазон: 0..=60 секунд (форма). 0 = брать значение из [geo].dns_timeout_secs.
+# Таймаут DNS-резолва на шаге SSRF-проверки адреса: и фетчер источников, и
+# пробник сначала резолвят имя фида и только потом решают, можно ли туда
+# стучаться. Это отдельная настройка, потому что резолв здесь — часть
+# политики адресов, а не обогащения гео-данными.
+# Range: 0..=60 seconds (form). 0 = follow [geo].dns_timeout_secs.
+# DNS timeout of the SSRF pipeline: the source fetcher and the probe both
+# resolve a feed-supplied name before they may dial it. The bound lives
+# here because the resolution belongs to the address policy, not to the geo
+# enrichment.
+dns_timeout_secs = 0
+
 [admin]
 # Диапазон: true | false.
 # Админка. Пустой token = админка отключена (отдает 404).

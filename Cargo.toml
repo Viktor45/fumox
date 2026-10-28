@@ -104,6 +104,12 @@ anyhow = "1"
 libc = "0.2"
 async-stream = "0.3"
 futures-util = "0.3"
+# Test-only: the self-signed certificate the T1 handshake tests serve.
+rcgen = { version = "0.14", default-features = false, features = [
+    "crypto",
+    "pem",
+    "ring",
+] }
 
 # Admin UI (SSR templates)
 askama = "0.16"

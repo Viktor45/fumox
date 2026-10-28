@@ -13,11 +13,13 @@ pub mod formats;
 pub mod geo;
 pub mod logging;
 pub mod models;
+pub mod params;
 pub mod parsers;
 pub mod repo;
 pub mod sqlite_guard;
 pub mod ssrf;
 pub mod tls;
+pub mod token;
 
 pub use config::{AppConfig, DEFAULT_CONFIG_PATH};
 pub use db::tempdir_lite;

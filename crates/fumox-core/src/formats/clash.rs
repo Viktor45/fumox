@@ -17,22 +17,32 @@
 //! overrides the name and its always-on `skip-cert-verify`.
 
 use crate::models::{ProxyEntry, Scheme};
+use crate::params::Blocks;
 use serde_norway::{Mapping, Value};
 
 /// Schemes with a mihomo counterpart; everything else is skipped in output
 /// (log-and-skip principle, never fatal).
+///
+/// The mapping below is the authority: this asks it instead of keeping a
+/// second list of schemes, so the query and the mapping cannot drift
+/// apart. A caller that already holds an entry can simply ask the mapping
+/// itself — a `None` means "no mihomo counterpart".
 pub fn is_supported(scheme: Scheme) -> bool {
-    matches!(
+    entry_to_clash_named(&bare_entry(scheme), "").is_some()
+}
+
+/// An entry that carries nothing but a scheme, for the support question.
+fn bare_entry(scheme: Scheme) -> ProxyEntry {
+    ProxyEntry {
         scheme,
-        Scheme::Vless
-            | Scheme::Vmess
-            | Scheme::Trojan
-            | Scheme::Ss
-            | Scheme::Hysteria2
-            | Scheme::Socks5
-            | Scheme::Snell
-            | Scheme::AnyTls
-    )
+        name: String::new(),
+        host: String::new(),
+        port: 0,
+        credential: String::new(),
+        params: Vec::new(),
+        raw_path: String::new(),
+        raw_line: String::new(),
+    }
 }
 
 /// Map one entry onto a Clash proxy definition using its own name.
@@ -48,6 +58,10 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
     let mut put = |key: &str, value: Value| {
         m.insert(Value::String(key.into()), value);
     };
+    // The structured blocks are parsed once for the whole entry and handed
+    // to the writers below: every one of them used to re-parse the same
+    // feed-controlled YAML text.
+    let blocks = Blocks::of(entry);
 
     put("name", Value::String(name.to_string()));
     put("server", Value::String(entry.host.clone()));
@@ -58,16 +72,18 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
             put("type", Value::String("vless".into()));
             put("uuid", Value::String(entry.credential.clone()));
             copy_param(entry, "flow", "flow", &mut put);
-            let reality = security_is(entry, "reality");
-            if security_is(entry, "tls") || reality || super::param_truthy(entry, "tls") {
+            // One shared decision on whether the proxy is wrapped; the
+            // sing-box writer asks the same question.
+            if crate::params::wants_tls(entry, &blocks) {
                 put("tls", Value::Bool(true));
                 copy_param(entry, "sni", "servername", &mut put);
                 copy_param(entry, "servername", "servername", &mut put);
             }
             copy_param(entry, "fp", "client-fingerprint", &mut put);
-            put_reality_opts(entry, &mut put);
+            copy_param(entry, "client-fingerprint", "client-fingerprint", &mut put);
+            put_reality_opts(entry, &blocks, &mut put);
             put_alpn(entry, &mut put);
-            put_transport(entry, "type", &mut put);
+            put_transport(entry, "type", &blocks, &mut put);
         }
         Scheme::Vmess => {
             put("type", Value::String("vmess".into()));
@@ -83,11 +99,7 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
             put("cipher", Value::String(cipher));
             // vmess JSON carries TLS in `tls: "tls"`; Clash input uses the
             // boolean `tls: true`; some feeds spell it `security=tls`.
-            let tls = super::param_value(entry, "tls")
-                .is_some_and(|v| v.eq_ignore_ascii_case("tls"))
-                || super::param_truthy(entry, "tls")
-                || security_is(entry, "tls");
-            if tls {
+            if crate::params::wants_tls(entry, &blocks) {
                 put("tls", Value::Bool(true));
                 copy_param(entry, "sni", "servername", &mut put);
                 copy_param(entry, "servername", "servername", &mut put);
@@ -95,7 +107,7 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
             copy_param(entry, "fp", "client-fingerprint", &mut put);
             copy_param(entry, "client-fingerprint", "client-fingerprint", &mut put);
             put_alpn(entry, &mut put);
-            put_transport(entry, "net", &mut put);
+            put_transport(entry, "net", &blocks, &mut put);
         }
         Scheme::Trojan => {
             put("type", Value::String("trojan".into()));
@@ -103,9 +115,10 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
             copy_param(entry, "sni", "sni", &mut put);
             copy_param(entry, "flow", "flow", &mut put);
             copy_param(entry, "fp", "client-fingerprint", &mut put);
-            put_reality_opts(entry, &mut put);
+            copy_param(entry, "client-fingerprint", "client-fingerprint", &mut put);
+            put_reality_opts(entry, &blocks, &mut put);
             put_alpn(entry, &mut put);
-            put_transport(entry, "type", &mut put);
+            put_transport(entry, "type", &blocks, &mut put);
         }
         Scheme::Ss => {
             put("type", Value::String("ss".into()));
@@ -174,11 +187,10 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
             }
             // A Clash feed keeps the nested `obfs-opts` block, a URI feed the
             // flat `obfs` / `obfs-host` pair. The flat form wins, as in put_ws_opts.
-            let obfs_yaml = super::param_map(entry, "obfs-opts");
             let obfs =
-                super::param_value(entry, "obfs").or_else(|| super::map_str(&obfs_yaml, "mode"));
+                super::param_value(entry, "obfs").or_else(|| super::map_str(&blocks.obfs, "mode"));
             let obfs_host = super::param_value(entry, "obfs-host")
-                .or_else(|| super::map_str(&obfs_yaml, "host"));
+                .or_else(|| super::map_str(&blocks.obfs, "host"));
             if obfs.is_some() || obfs_host.is_some() {
                 let mut opts = Mapping::new();
                 // meow treats an absent obfs as off, and so do we: only a
@@ -204,7 +216,7 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
         Scheme::Naive | Scheme::Tuic | Scheme::Mieru => return None,
     }
 
-    if super::is_insecure(&entry.params) {
+    if super::is_insecure(entry) {
         put("skip-cert-verify", Value::Bool(true));
     }
     // Clash-input entries keep their `udp` toggle; URI feeds don't carry one.
@@ -215,28 +227,22 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
     Some(Value::Mapping(m))
 }
 
-/// Whether the URI `security` parameter equals `want` (vless/trojan).
-fn security_is(entry: &ProxyEntry, want: &str) -> bool {
-    super::param_value(entry, "security").is_some_and(|v| v.eq_ignore_ascii_case(want))
-}
-
 /// `reality-opts: {public-key, short-id}` from URI `pbk`/`sid` params or a
 /// Clash-input `reality-opts` block. Emitted only when at least one key is
 /// present, an empty block would make mihomo reject the proxy.
-fn put_reality_opts(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
-    let pbk = super::reality_public_key(entry);
-    let sid = super::reality_short_id(entry);
-    if pbk.is_none() && sid.is_none() {
+fn put_reality_opts(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Value)) {
+    let reality = crate::params::reality(entry, blocks);
+    if reality.is_empty() {
         return;
     }
-    let mut reality = Mapping::new();
-    if let Some(pbk) = pbk {
-        reality.insert(Value::String("public-key".into()), Value::String(pbk));
+    let mut opts = Mapping::new();
+    if let Some(pbk) = reality.public_key {
+        opts.insert(Value::String("public-key".into()), Value::String(pbk));
     }
-    if let Some(sid) = sid {
-        reality.insert(Value::String("short-id".into()), Value::String(sid));
+    if let Some(sid) = reality.short_id {
+        opts.insert(Value::String("short-id".into()), Value::String(sid));
     }
-    put("reality-opts", Value::Mapping(reality));
+    put("reality-opts", Value::Mapping(opts));
 }
 
 /// `alpn` as a YAML list (mihomo requires a sequence there).
@@ -259,12 +265,16 @@ fn put_alpn(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
 /// `network: http` directly. `type=httpupgrade` becomes mihomo's
 /// `network: ws` + `ws-opts.v2ray-http-upgrade` (there is no dedicated
 /// httpupgrade transport).
-fn put_transport(entry: &ProxyEntry, uri_key: &str, put: &mut impl FnMut(&str, Value)) {
-    let network =
-        match super::param_value(entry, uri_key).or_else(|| super::param_value(entry, "network")) {
-            Some(n) => n.to_ascii_lowercase(),
-            None => return,
-        };
+fn put_transport(
+    entry: &ProxyEntry,
+    uri_key: &str,
+    blocks: &Blocks,
+    put: &mut impl FnMut(&str, Value),
+) {
+    let network = match super::network_of(entry, uri_key) {
+        Some(n) => n,
+        None => return,
+    };
     match network.as_str() {
         "" | "tcp" => {
             // Plain-HTTP header obfuscation: `type=tcp&headerType=http` in
@@ -273,28 +283,28 @@ fn put_transport(entry: &ProxyEntry, uri_key: &str, put: &mut impl FnMut(&str, V
                 || (entry.scheme == Scheme::Vmess && param_value_is(entry, "type", "http"))
             {
                 put("network", Value::String("http".into()));
-                put_http_opts(entry, put);
+                put_http_opts(entry, blocks, put);
             }
         }
         "ws" | "httpupgrade" => {
             put("network", Value::String("ws".into()));
-            put_ws_opts(entry, network == "httpupgrade", put);
+            put_ws_opts(entry, blocks, network == "httpupgrade", put);
         }
         "grpc" => {
             put("network", Value::String("grpc".into()));
-            put_grpc_opts(entry, put);
+            put_grpc_opts(entry, blocks, put);
         }
         "h2" => {
             put("network", Value::String("h2".into()));
-            put_h2_opts(entry, put);
+            put_h2_opts(entry, blocks, put);
         }
         "http" => {
             if entry.scheme == Scheme::Vmess || param_value_is(entry, "headerType", "http") {
                 put("network", Value::String("http".into()));
-                put_http_opts(entry, put);
+                put_http_opts(entry, blocks, put);
             } else {
                 put("network", Value::String("h2".into()));
-                put_h2_opts(entry, put);
+                put_h2_opts(entry, blocks, put);
             }
         }
         // Unknown network spelling (xhttp, kcp, …): pass it through so a
@@ -308,13 +318,16 @@ fn param_value_is(entry: &ProxyEntry, key: &str, want: &str) -> bool {
 }
 
 /// `ws-opts: {path, headers: {Host}}` (plus the httpupgrade toggle).
-fn put_ws_opts(entry: &ProxyEntry, http_upgrade: bool, put: &mut impl FnMut(&str, Value)) {
-    let ws_yaml = super::param_map(entry, "ws-opts");
-    let headers_yaml = super::param_map(entry, "ws-headers");
-    let path = super::param_value(entry, "path").or_else(|| super::map_str(&ws_yaml, "path"));
+fn put_ws_opts(
+    entry: &ProxyEntry,
+    blocks: &Blocks,
+    http_upgrade: bool,
+    put: &mut impl FnMut(&str, Value),
+) {
+    let path = super::param_value(entry, "path").or_else(|| super::map_str(&blocks.ws, "path"));
     let host = super::param_value(entry, "host")
-        .or_else(|| super::map_str(&headers_yaml, "host"))
-        .or_else(|| nested_host(&ws_yaml));
+        .or_else(|| super::map_str(&blocks.ws_headers, "host"))
+        .or_else(|| nested_host(&blocks.ws));
     if path.is_none() && host.is_none() && !http_upgrade {
         return;
     }
@@ -337,27 +350,18 @@ fn put_ws_opts(entry: &ProxyEntry, http_upgrade: bool, put: &mut impl FnMut(&str
 }
 
 /// `Host` header inside a parsed Clash-input `ws-opts.headers` block.
+///
+/// mihomo's `ws-opts.headers` maps a name to one value, so only the first
+/// host of a multi-host header survives.
 fn nested_host(ws_yaml: &Option<Mapping>) -> Option<String> {
-    let headers = ws_yaml
-        .as_ref()?
-        .get("headers")
-        .and_then(Value::as_mapping)?;
-    for key in ["Host", "host"] {
-        if let Some(host) = headers.get(key).and_then(Value::as_str)
-            && !host.trim().is_empty()
-        {
-            return Some(host.trim().to_string());
-        }
-    }
-    None
+    super::map_header(ws_yaml).and_then(|hosts| hosts.into_iter().next())
 }
 
 /// `grpc-opts: {grpc-service-name}`. vmess JSON carries the gRPC service
 /// name in its `path` field, so that is the vmess fallback.
-fn put_grpc_opts(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
-    let yaml = super::param_map(entry, "grpc-opts");
+fn put_grpc_opts(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Value)) {
     let mut service = super::param_value(entry, "serviceName")
-        .or_else(|| super::map_str(&yaml, "grpc-service-name"))
+        .or_else(|| super::map_str(&blocks.grpc, "grpc-service-name"))
         .or_else(|| super::param_value(entry, "grpc-service-name"));
     if entry.scheme == Scheme::Vmess {
         service = service.or_else(|| super::param_value(entry, "path"));
@@ -373,11 +377,10 @@ fn put_grpc_opts(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
 }
 
 /// `h2-opts: {host: [...], path}`; the URI `host` value may list several.
-fn put_h2_opts(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
-    let yaml = super::param_map(entry, "h2-opts");
-    let path = super::param_value(entry, "path").or_else(|| super::map_str(&yaml, "path"));
+fn put_h2_opts(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Value)) {
+    let path = super::param_value(entry, "path").or_else(|| super::map_str(&blocks.h2, "path"));
     let hosts = super::param_value(entry, "host")
-        .or_else(|| super::map_str(&yaml, "host"))
+        .or_else(|| super::map_str(&blocks.h2, "host"))
         .map(|h| {
             h.split(',')
                 .map(str::trim)
@@ -385,7 +388,7 @@ fn put_h2_opts(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         })
-        .or_else(|| yaml_list(&yaml, "host"));
+        .or_else(|| super::map_list(&blocks.h2, "host"));
     if path.is_none() && hosts.is_none() {
         return;
     }
@@ -403,9 +406,10 @@ fn put_h2_opts(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
 }
 
 /// `http-opts: {path: [...], headers: {Host: [...]}}`.
-fn put_http_opts(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
-    let path = super::param_value(entry, "path");
-    let host = super::param_value(entry, "host");
+fn put_http_opts(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Value)) {
+    let path = super::param_value(entry, "path").or_else(|| super::map_first(&blocks.http, "path"));
+    let host = super::param_value(entry, "host")
+        .or_else(|| super::map_header(&blocks.http).and_then(|h| h.into_iter().next()));
     if path.is_none() && host.is_none() {
         return;
     }
@@ -529,18 +533,6 @@ fn put_plugin_opts(opts: Mapping, put: &mut impl FnMut(&str, Value)) {
     if !opts.is_empty() {
         put("plugin-opts", Value::Mapping(opts));
     }
-}
-
-/// List lookup inside an optional parsed YAML mapping.
-fn yaml_list(map: &Option<Mapping>, key: &str) -> Option<Vec<String>> {
-    let seq = map.as_ref()?.get(key).and_then(Value::as_sequence)?;
-    let list: Vec<String> = seq
-        .iter()
-        .filter_map(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_string())
-        .collect();
-    (!list.is_empty()).then_some(list)
 }
 
 /// Encode the final candidate list as a Clash YAML document. Duplicate

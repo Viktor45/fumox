@@ -16,6 +16,11 @@ Changes in the working tree, not yet on a published image.
 
 ### Added
 
+- The probe cycle summary reports the wall-clock cost of the cycle and
+  of every stage, the depth of the priority queue before and after the
+  cycle, how many checks each group of lanes may still run, and how
+  many rows the spent budget deferred. A cycle that overran its period
+  says so instead of ending quietly.
 - An integration test for `scripts/smoke-down.sh`
   (`scripts/tests/smoke-down.test.sh`): it drives the teardown through
   a stubbed `docker` and asserts on the compose command the script
@@ -127,6 +132,83 @@ Changes in the working tree, not yet on a published image.
 
 ### Changed
 
+- A probe cycle is bounded now. It carries a wall-clock budget (three
+  quarters of the period), and a lane that starts after the budget is
+  spent issues no check: the row is deferred, not charged and not
+  journaled, and the next cycle picks it up. A cycle that outlives the
+  whole period is aborted. The lanes also share one check quota per
+  group of work (the quarantine drain, the coverage lanes, the tunnel
+  lanes) instead of applying `probe.sample_size` each on its own, so a
+  cycle runs the number of checks the setting names instead of up to
+  five times as many. Guarded by
+  `a_spent_budget_defers_the_rows_of_the_lane`.
+- The hosts of a cycle are resolved once. The rows of a feed often
+  share their host, and every row spent a DNS lookup of its own; the
+  tunnel lanes then resolved the same hosts a second time. The tunnel
+  lanes reuse the addresses the coverage lanes of the same cycle
+  already vetted. Guarded by `the_hosts_of_a_cycle_are_resolved_once`.
+- The engine's backoff says how long it is and when the lanes run
+  again, and a recovery is logged as well: until now the refusal said
+  only that meow-rs was unavailable, and the return to service was
+  silent.
+- The controller of the proxy kernel is vetted before the first probe
+  cycle now. It carries a bearer token on every request and can rewrite
+  the kernel's configuration, so it has to stay where nobody else
+  reaches it: a public address (a literal, or a name that resolves into
+  one) aborts the start, and a controller that is not on loopback must
+  have a token. A redirect is not followed any more, so the token cannot
+  be carried to whoever the controller points at. The path the probe
+  writes the kernel's configuration to is checked too: it has to be
+  absolute (the kernel resolves it in its own filesystem, not in the
+  probe's) and its directory is created, so an unusable location is a
+  startup message instead of a write error on every cycle.
+  **Migration:** a deployment that reaches the controller over a
+  network (the compose stack does: `meow:9090`) has to set
+  `FUMOX_MEOW__API_TOKEN`; a loopback controller keeps working without
+  one. Guarded by `a_public_controller_address_is_refused`,
+  `a_network_controller_without_a_token_is_refused`,
+  `a_loopback_controller_may_run_without_a_token`,
+  `a_malformed_controller_address_is_refused` and
+  `a_relative_meow_config_path_is_refused_at_startup`.
+- An attempt the engine never judged is journaled under a kind of its
+  own now (`t2_unverified`) instead of `t2`. A `t2` row is a verdict, a
+  `t2_unverified` row is the record of an attempt the engine could not
+  complete (an outage, a refused request, a run of blips), and the two
+  are told apart by the panel and by the log. Both count as an attempt
+  for the T2 recency queue, so a dead engine cannot pin the head of it
+  forever. Migration `0011` carries the matching index.
+- The list of the protocols meow-rs can tunnel lives in one place. The
+  probe carried its own copy of the list beside the mapping that
+  decides the same question, so the two could drift apart and a
+  protocol would be offered to the engine and dropped again. The
+  mapping is the authority now: a protocol it cannot express has no
+  Clash definition, and the probe reads that as "not tunnelable".
+- The dedup key now carries a version and is computed from one
+  canonical form of a node instead of a fixed list of parameter names.
+  Every parameter that changes how a client connects counts — including
+  the ones the list never named: the `h2-opts`, `http-opts`, `grpc-opts`
+  and `obfs-opts` blocks, xhttp's mode/path/extra, the snell protocol
+  revision, hysteria2's port hopping, tuic's relay mode — while the
+  cosmetic ones (the display name, the advertising tags, the bandwidth
+  caps) stay out. The structured blocks are expanded into the scalars
+  they carry, so a node published as a `reality-opts` block and the
+  same node published as the flat `pbk`/`sid` parameters hash alike,
+  and the spellings of one parameter (`servername`/`sni`,
+  `network`/`net`, `cipher`/`scy`) count once. The version is part of
+  the pre-image, so a change of the canonical form changes every key:
+  the stored rows are recomputed on the first start after the upgrade,
+  before the first ingest. A row that describes a node another row
+  already describes is merged into the one with the better lifecycle
+  status, its source links move over and the merged row is deleted, so
+  the node keeps its status, its latency and its probe history instead
+  of starting over at `unknown`. The server logs the version it stores
+  at startup, with the number of rows it rewrote and merged. A
+  downgrade to a build without the recompute leaves the rows under keys
+  that build no longer produces, and the nodes are re-identified on the
+  next ingest, so downgrading is not recommended. Guarded by
+  `two_rows_that_describe_the_same_node_are_merged`,
+  `the_recompute_is_idempotent` and
+  `the_version_marker_gates_the_recompute`.
 - `[probe].refresh_check_limit` moved to `[ingest].refresh_check_limit`:
   the priority queue belongs to the scheduler, the probe only drains it.
   The old key is still accepted for one release — its value is carried
@@ -194,6 +276,118 @@ Changes in the working tree, not yet on a published image.
 
 ### Fixed
 
+- One failing lane cancelled the whole cycle. A lane that raised an
+  error ended the cycle, so a single failing write left the fleet
+  unprobed until the next cycle. The lanes are isolated now: the
+  failing lane is logged with its whole error chain and the name of
+  the lane, and the other lanes of the cycle still run. A T2 config
+  that cannot be written is handled like a rejected reload now: the
+  rows are journaled unverified, the engine is put into backoff, and
+  the lane returns cleanly instead of failing the cycle. Guarded by
+  `a_failing_lane_does_not_cancel_the_cycle`.
+- The config the probe hands to the engine was written in place: a
+  crash or a full disk left a half-written config in front of the
+  engine, and a name planted in the directory could be written through.
+  The config is written into a temporary file in the target directory
+  now (created exclusively, without following a symlink, mode 0640 so
+  the kernel's shared group can read it and nobody else can), flushed
+  to disk and renamed onto the target: the engine reads either the old
+  or the new file and never a half-written one. A directory every local
+  user may write to is refused. The file itself stays where it is (the
+  kernel resolves it by path, and the exchange volume is shared with
+  the kernel's container, so it cannot be a tmpfs), but the temporary
+  file of the write never stays behind. Guarded by
+  `the_meow_config_is_renamed_into_place_inside_its_directory` and
+  `the_meow_config_write_does_not_follow_a_planted_symlink`.
+- The fail ladder of a batch was applied one row at a time, two awaits
+  per row: an outage that touched a hundred rows cost two hundred
+  round trips and held the write lock for all of them. The ladder of a
+  batch now moves in one transaction, and the journal rows of the
+  batch are inserted in one statement.
+- An outage of the proxy kernel was charged to the proxies under test.
+  Every answer meow-rs gave was read as a verdict about the proxy: a
+  tunnel that failed, a request it refused, a transport error, a
+  configuration reload it rejected. A dead kernel therefore walked a
+  healthy pool down the fail ladder and into quarantine, and the pool
+  was retired by an infrastructure failure. The engine's answers are
+  split now: a *tunnel verdict* (503, 504, and a 400 whose message
+  names a fault of the proxy) is the only outcome that spends a
+  proxy's fail budget; everything else — a 404, a 405, a 401, a 429, an
+  unreadable body, a refused request — is an engine fault, journaled
+  unverified and never charged. The status code is kept in the journal
+  and in the log, so a 503/504 stays distinguishable from a 400.
+  Guarded by `only_a_tunnel_verdict_is_charged_to_the_proxy` and
+  `a_delay_response_without_a_numeric_delay_is_not_a_pass`.
+- A run of transient engine errors was charged to the proxies as well. A
+  single failed delay check with a live engine was logged and forgotten,
+  but three of them in a row are no longer a per-request hiccup: the
+  run is escalated to an engine fault now — the row is journaled
+  unverified, no proxy is charged, and the engine is put into backoff.
+  Guarded by `a_run_of_blips_escalates_to_an_engine_fault` and
+  `t2_per_request_blip_with_alive_engine_does_not_abort`.
+- The probe cycle summary could not tell a refused target from a failed
+  one, and an engine fault from either. The private-address refusals
+  are counted apart from the verdicts, and the engine faults apart from
+  both: the summary reports `blocked` and `engine_faults` per lane, and
+  a batch whose targets were refused logs one aggregated warning with
+  the count and the reasons instead of one warning per row. Guarded by
+  `a_refused_target_is_counted_as_a_refusal_not_an_engine_fault`.
+- The T1 connectivity check presented the wrong name to the server. The
+  handshake used the stored host as the TLS server name and ignored the
+  name the node itself carries, so a node reached through a CDN (which
+  publishes its own name in `sni`/`servername`) and a node whose host is
+  an IP literal (whose certificate was issued for a name the row also
+  carries) failed the handshake against a server that only accepts its
+  own name, and were quarantined as dead. The node's own name is
+  presented now, and an IP-literal host without a name of its own
+  presents none instead of failing because of it. Guarded by
+  `tls_check_presents_the_nodes_own_sni`,
+  `tls_check_accepts_an_ip_literal_host` and
+  `tls_check_keeps_the_sni_of_an_ip_literal_host`.
+- The check and the writers disagreed about whether a node speaks TLS.
+  The probe answered the question from its own table of parameter
+  spellings, and the writers answered it from another one: a node
+  carrying an SNI was written as a TLS node and probed as plaintext, so
+  a broken TLS node passed the pre-check and was served; `security=xtls`
+  and any other unknown, non-empty `security` value were read as
+  plaintext for the same reason. One shared decision now answers the
+  question for the check and for both writers, and a `security` value
+  this build does not know is treated as TLS: a node whose transport
+  cannot be identified is not probed as plaintext. Guarded by
+  `kind_decision_table` and `clash_and_uri_spellings_agree_on_tls`.
+- A T1 check gave up on a node after its first address. Only the first
+  vetted address was dialed, and a TLS failure on it ended the check
+  even when the other addresses of the same node were reachable — a
+  node whose first address is broken was quarantined although it works.
+  Every vetted address is dialed at once now, the first one that
+  completes the check wins, and a failure on one of them no longer
+  stops the others; the check fails only when the whole list has, and
+  the error it reports is the one of the last attempt. Guarded by
+  `every_vetted_address_is_tried`.
+- A TLS check against a server that does not speak TLS reported the
+  failure as a generic connect error, so the journal could not tell a
+  broken handshake from an unreachable host. The handshake failure is
+  now named as such. Guarded by
+  `tls_check_against_a_plain_listener_fails_with_a_tls_error` and
+  `tls_check_completes_the_handshake`.
+- The Clash and the sing-box writer could disagree about the same node:
+  both questions — does the node need TLS, and which transport does it
+  speak — were answered twice, from two vocabularies. A `tls: true` in
+  a Clash YAML source reached the Clash writer and not the sing-box
+  one; a `security: none` node carrying an SNI was written as TLS in
+  one format and as plaintext in the other; a REALITY node without a
+  `security` parameter was written as plaintext; and a node whose
+  transport only the Clash spelling named (`ws-opts`, `ws-headers`,
+  `grpc-opts`, `h2-opts`) lost its path and its host in the sing-box
+  output, because that writer read the flat parameters only. One
+  shared decision now answers both questions — an explicit toggle
+  first, then `security`, then the REALITY keys, then the SNI — and
+  each writer only projects the result onto its own format. The
+  transport is normalised to one spelling before it is written, so
+  `type=http` over TCP, Xray's `httpupgrade` and the Clash `network`
+  name the same transport in both outputs. Guarded by
+  `both_encoders_agree_on_tls`, `both_encoders_agree_on_the_transport`
+  and `both_encoders_agree_on_the_transport_settings`.
 - The admin panel answered `403 err.cross_site` ("межсайтовый запрос
   отклонён") to the login form's own submit, in every browser, so the
   panel could not be logged into at all. The panel sets
@@ -474,16 +668,15 @@ Changes in the working tree, not yet on a published image.
   invalid instead of vanishing. Guarded by
   `every_user_of_an_xray_endpoint_becomes_an_entry`.
 - Two Clash-advertised nodes differing only in a connection-defining
-  field deduplicated into one row. The fingerprint's
-  `SECURITY_PARAMS` list held the URI spellings only, so the Clash
-  ones (`servername`, `network`, `ws-path`, `client-fingerprint`,
-  `grpc-service-name`, plus the URI-less `ws-headers`, `ws-opts` and
-  `reality-opts` blocks, stored verbatim) were invisible to the
-  dedup key and the upsert overwrote one node with the other. The
-  spellings that do have a URI form are now canonicalized onto it
-  (`canonical_key`), so the same node advertised as Clash YAML and as
-  a URI still deduplicates together. Guarded by
-  `clash_spellings_are_security_relevant`,
+  field deduplicated into one row. The dedup key counted the URI
+  spellings of a parameter only, so the Clash ones (`servername`,
+  `network`, `ws-path`, `client-fingerprint`, `grpc-service-name`,
+  plus the URI-less `ws-headers`, `ws-opts` and `reality-opts`
+  blocks, stored verbatim) were invisible to the dedup key and the
+  upsert overwrote one node with the other. The spellings that do
+  have a URI form are now canonicalized onto it, so the same node
+  advertised as Clash YAML and as a URI still deduplicates together.
+  Guarded by `clash_spellings_are_security_relevant`,
   `clash_structured_fields_are_security_relevant` and
   `clash_and_uri_spellings_agree`.
 - Fingerprint pre-images could be forged from inside a value. The
@@ -659,37 +852,34 @@ Changes in the working tree, not yet on a published image.
 - The dedup key ignored TLS certificate pinning, so two nodes
   differing only in the certificate they pin shared one key and the
   second was overwritten by reconcile's `ON CONFLICT`, vanishing
-  from the database and from every subscription. `pinSHA256` is now in
-  `SECURITY_PARAMS`, and Clash's `fingerprint` is folded onto it so
-  the pin counts in either spelling; listing both keys instead would
+  from the database and from every subscription. The pin counts in the
+  dedup key in either spelling now (`pinSHA256`, with Clash's
+  `fingerprint` folded onto it); listing both keys instead would
   have split a node published as Clash YAML from the same node
   published as a URI. Guarded by `cert_pin_is_security_relevant`.
 - The dedup key ignored several more connection-defining parameters,
   so two nodes differing only in one of them collapsed onto one row
-  and the upsert silently overwrote the first with the second. Joining
-  `SECURITY_PARAMS`: xhttp's `:authority` override, the snell
-  `version` protocol revision, `obfs-host`, hysteria2's `ports`
-  port-hopping range, tuic's `udp_relay_mode` and `disable_sni`; and
-  for vmess the cipher and the alter id as Clash spells them
-  (`cipher`/`alterId` are folded onto the URI spellings `scy`/`aid`,
-  the same per-scheme aliasing `network`→`net` already had). The one
-  toggle vocabulary shared by the fingerprint, the output writers and
-  the forbid-insecure filter also learned the `yes`/`on` spellings: a
-  Clash `allowInsecure: yes` used to contribute nothing to the
-  pre-image and merged with the verification-on variant of the same
-  node. Guarded by `newly_covered_security_params_split_nodes`,
+  and the upsert silently overwrote the first with the second. The
+  dedup key now counts every connection-defining parameter: xhttp's
+  `:authority` override, the snell `version` protocol revision,
+  `obfs-host`, hysteria2's `ports` port-hopping range, tuic's
+  `udp_relay_mode` and `disable_sni`; and for vmess the cipher and
+  the alter id as Clash spells them (`cipher`/`alterId` are folded
+  onto the URI spellings `scy`/`aid`, the same per-scheme aliasing
+  `network`→`net` already had). The one toggle vocabulary shared by
+  the dedup key, the output writers and the forbid-insecure filter
+  also learned the `yes`/`on` spellings: a Clash `allowInsecure: yes`
+  used to contribute nothing to the pre-image and merged with the
+  verification-on variant of the same node. Guarded by
+  `newly_covered_security_params_split_nodes`,
   `two_vmess_nodes_differing_only_in_cipher_do_not_collapse`,
   `clash_and_uri_spellings_agree_for_vmess` and the `yes`/`on` cases
   in `insecure_aliases_collapse` / `falsy_insecure_equals_absent`.
   Upgrade note: every node carrying one of these parameters or
-  spellings hashes differently now, and the first re-ingest after
-  upgrading re-identifies it: reconcile matches rows by fingerprint
-  alone, so the node gets a fresh row starting at `unknown`, while its
-  status, latency and probe history stay on the old row (which then
-  retires, or lingers as a duplicate under
-  `[ingest].drop_gate = false`, through the ordinary reconcile pass).
-  Aliveness counters and the `/src` output repopulate after one probe
-  cycle; no migration can carry both the old and the new fingerprints.
+  spellings hashes differently now. The stored rows are recomputed on
+  the first start after the upgrade (see the *dedup key version* entry
+  below), so the node keeps its row, its status and its probe history
+  under the new key.
 - A vless proxy that arrived from a Clash YAML source was served to
   sing-box clients as plaintext. mihomo spells the toggle `tls: true`
   and the SNI `servername`; the sing-box writer's TLS decision read
@@ -778,12 +968,11 @@ Changes in the working tree, not yet on a published image.
   `overlapping_edits_do_not_lose_the_first_change`.
 - The same vmess node advertised as Clash YAML and as a `vmess://`
   link got two fingerprints, two rows and two entries in every
-  subscription. `canonical_key` folds Clash's `network` onto `type`
-  to stop exactly that, but vmess's other spellings call the same
-  field `net`, a separate entry in `SECURITY_PARAMS`; the fold is
-  per-scheme now, onto `net` for vmess and `type` for the rest. The
-  alias test beside it only ever covered vless, whose URI spelling
-  really is `type`. Guarded by
+  subscription. Clash's `network` is folded onto the URI spelling of
+  the same field to stop exactly that, but vmess's other spellings call
+  the same field `net`; the fold is per-scheme now, onto `net` for
+  vmess and `type` for the rest. The alias test beside it only ever
+  covered vless, whose URI spelling really is `type`. Guarded by
   `clash_and_uri_spellings_agree_for_vmess`.
 - A Clash socks5 entry carrying only `username` was stored as
   `onlyuser` rather than `onlyuser:`, and both output writers guard

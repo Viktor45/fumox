@@ -642,6 +642,34 @@ pub fn server_error(lang: Lang, err: &impl std::fmt::Display) -> Response {
         .into_response()
 }
 
+/// Why a submitted form could not be turned into a model.
+#[derive(Debug)]
+pub(super) enum FormError {
+    /// Per-field errors, shown next to the fields.
+    Validation(Vec<(String, String)>),
+    /// The row behind the form could not be read: a missing entity or a
+    /// database failure. Neither is a form error, so neither is rendered
+    /// as one.
+    Server(fumox_core::Error),
+}
+
+/// The response for a form whose row could not be read: a missing entity
+/// is a 404, a database failure is a 500.
+///
+/// The two used to travel as one (`Option::None` for both), so a broken
+/// database answered "not found" and a client could not tell a deleted
+/// row from a failed query.
+pub(super) fn row_error_response(
+    lang: Lang,
+    err: &fumox_core::Error,
+    not_found_key: &str,
+) -> Response {
+    match err {
+        fumox_core::Error::NotFound(_) => not_found(lang, not_found_key),
+        other => server_error(lang, other),
+    }
+}
+
 /// 404 page for unknown entities; `what_key` selects the translated noun.
 pub fn not_found(lang: Lang, what_key: &str) -> Response {
     (

@@ -269,10 +269,10 @@ mod tests {
             assert!(indexes.contains(&expected), "missing index {expected}");
         }
 
-        // Schema version is stamped into meta by db::migrate. Bumped to 9
-        // by migration 0009 (fetch_log.duration_ms).
+        // Schema version is stamped into meta by db::migrate. Bumped to 11
+        // by migration 0011 (the t2_unverified probe kind).
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("9"));
+        assert_eq!(version.as_deref(), Some("11"));
 
         // WAL is active on the connection.
         let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")

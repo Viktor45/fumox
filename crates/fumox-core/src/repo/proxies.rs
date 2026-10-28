@@ -82,6 +82,8 @@ pub struct ProxyRow {
     pub params: Option<String>,
     pub unknown_params: Option<String>,
     pub raw_line: Option<String>,
+    /// The path segment of the parsed URI, preserved verbatim.
+    pub raw_path: Option<String>,
     pub geo_country: Option<String>,
     pub geo_city: Option<String>,
     pub geo_asn: Option<String>,
@@ -113,21 +115,12 @@ impl ProxyRow {
     ///
     /// The database stores parameters as two JSON objects (recognized /
     /// unknown), so the original on-the-wire order is not recoverable; the
-    /// entry is still fully serializable. `raw_path` is not persisted (no
-    /// schema column) and resets to empty.
+    /// entry is still fully serializable.
     pub fn to_entry(&self) -> crate::Result<ProxyEntry> {
         let mut params: Vec<Param> = Vec::new();
         for (column, known) in [(&self.params, true), (&self.unknown_params, false)] {
             if let Some(text) = column {
-                let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)
-                    .map_err(|e| crate::Error::Parse(format!("corrupt proxy params JSON: {e}")))?;
-                for (key, value) in map {
-                    params.push(Param {
-                        key,
-                        value: value.as_str().unwrap_or_default().to_string(),
-                        known,
-                    });
-                }
+                params.extend(stored_params(text, known)?);
             }
         }
         Ok(ProxyEntry {
@@ -138,7 +131,7 @@ impl ProxyRow {
                 .map_err(|_| crate::Error::Parse(format!("port out of range: {}", self.port)))?,
             credential: self.credential.clone(),
             params,
-            raw_path: String::new(),
+            raw_path: self.raw_path.clone().unwrap_or_default(),
             raw_line: self.raw_line.clone().unwrap_or_default(),
         })
     }
@@ -234,7 +227,7 @@ pub async fn reconcile_source(
     // daemon's `busy_timeout` and drop its journals.
     //
     // Two ceilings bound this, both of which "optimizing" it upward would
-    // hit: 250 * 14 columns = 3500 binds, against SQLite's 32766-variable
+    // hit: 250 * 15 columns = 3750 binds, against SQLite's 32766-variable
     // limit, and a multi-row VALUES is a compound SELECT, against
     // SQLITE_MAX_COMPOUND_SELECT (500 in the bundled build, 256 in some
     // others). The link stamp below uses 500, which is at that ceiling.
@@ -249,11 +242,11 @@ pub async fn reconcile_source(
     for (chunk_idx, chunk) in entries.chunks(UPSERT_CHUNK).enumerate() {
         let base = chunk_idx * UPSERT_CHUNK;
         let placeholders =
-            vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+            vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
         let sql = format!(
             "INSERT INTO proxies
                 (fingerprint, scheme, name, host, port, credential,
-                 params, unknown_params, raw_line,
+                 params, unknown_params, raw_line, raw_path,
                  geo_country, geo_city, geo_asn, created_at, updated_at)
              VALUES {placeholders}
              ON CONFLICT(fingerprint) DO UPDATE SET
@@ -261,6 +254,7 @@ pub async fn reconcile_source(
                 params = excluded.params,
                 unknown_params = excluded.unknown_params,
                 raw_line = excluded.raw_line,
+                raw_path = excluded.raw_path,
                 geo_country = COALESCE(excluded.geo_country, proxies.geo_country),
                 geo_city = COALESCE(excluded.geo_city, proxies.geo_city),
                 geo_asn = COALESCE(excluded.geo_asn, proxies.geo_asn),
@@ -290,6 +284,7 @@ pub async fn reconcile_source(
                 .bind(params_json)
                 .bind(unknown_json)
                 .bind(&entry.raw_line)
+                .bind(&entry.raw_path)
                 .bind(geostamp.country)
                 .bind(geostamp.city)
                 .bind(geostamp.asn)
@@ -548,7 +543,9 @@ pub async fn count_by_status(pool: &DbPool) -> crate::Result<Vec<(String, i64)>>
 /// Check-coverage buckets of the whole population (probe overview panel):
 /// `none`, no journaled attempt at all, `t1_only` / `t2_only`, exactly one
 /// of the check tiers has history, `both`, T1 and T2 both do. T1 is
-/// `probe_kind IN ('tcp', 'tls')`, T2 is `probe_kind = 't2'`.
+/// `probe_kind IN ('tcp', 'tls')`, T2 is any of the T2 kinds
+/// ([`crate::repo::probe::T2_KINDS_SQL`]), so an attempt the engine
+/// never verified still counts as a T2 attempt.
 ///
 /// The buckets cover *preserved* history only: `probe_results` rotates after
 /// `[retention].probe_results_days`, so a long-unseen proxy may look
@@ -557,7 +554,7 @@ pub async fn count_by_status(pool: &DbPool) -> crate::Result<Vec<(String, i64)>>
 /// The order is fixed and missing buckets are zero-filled, so the panel
 /// never reshuffles when counts change.
 pub async fn count_by_check_coverage(pool: &DbPool) -> crate::Result<Vec<(String, i64)>> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
+    let sql = format!(
         "SELECT bucket, COUNT(*) FROM (
              SELECT CASE
                  WHEN t1.e IS NOT NULL AND t2.e IS NOT NULL THEN 'both'
@@ -569,11 +566,13 @@ pub async fn count_by_check_coverage(pool: &DbPool) -> crate::Result<Vec<(String
              LEFT JOIN (SELECT DISTINCT proxy_id, 1 AS e FROM probe_results
                         WHERE probe_kind IN ('tcp', 'tls')) t1 ON t1.proxy_id = p.id
              LEFT JOIN (SELECT DISTINCT proxy_id, 1 AS e FROM probe_results
-                        WHERE probe_kind = 't2') t2 ON t2.proxy_id = p.id
+                        WHERE probe_kind IN ({})) t2 ON t2.proxy_id = p.id
          ) GROUP BY bucket",
-    )
-    .fetch_all(pool)
-    .await?;
+        crate::repo::probe::T2_KINDS_SQL
+    );
+    let rows: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await?;
     let mut out: Vec<(String, i64)> = ["none", "t1_only", "t2_only", "both"]
         .iter()
         .map(|bucket| (bucket.to_string(), 0))
@@ -595,7 +594,8 @@ pub async fn count_by_check_coverage(pool: &DbPool) -> crate::Result<Vec<(String
 
 /// Which check tiers have preserved history for a proxy, the coverage
 /// buckets of the admin proxy browser and the probe overview. T1 is
-/// `probe_kind IN ('tcp', 'tls')`, T2 is `probe_kind = 't2'`.
+/// `probe_kind IN ('tcp', 'tls')`, T2 is any of the T2 kinds (an attempt
+/// the engine never verified still counts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckCoverage {
     /// No journaled attempt at all.
@@ -634,27 +634,30 @@ impl CheckCoverage {
 
     /// The EXISTS-based WHERE fragment of the bucket over `proxies p`.
     /// A fixed literal per variant: caller text never reaches the SQL.
-    fn exists_clause(self) -> &'static str {
+    fn exists_clause(self) -> String {
+        let t2 = crate::repo::probe::T2_KINDS_SQL;
         match self {
-            Self::None => "NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id)",
-            Self::T1Only => {
+            Self::None => {
+                "NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id)".to_string()
+            }
+            Self::T1Only => format!(
                 "EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
                  AND r.probe_kind IN ('tcp', 'tls')) \
                  AND NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
-                 AND r.probe_kind = 't2')"
-            }
-            Self::T2Only => {
+                 AND r.probe_kind IN ({t2}))"
+            ),
+            Self::T2Only => format!(
                 "EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
-                 AND r.probe_kind = 't2') \
+                 AND r.probe_kind IN ({t2})) \
                  AND NOT EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
                  AND r.probe_kind IN ('tcp', 'tls'))"
-            }
-            Self::Both => {
+            ),
+            Self::Both => format!(
                 "EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
                  AND r.probe_kind IN ('tcp', 'tls')) \
                  AND EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id \
-                 AND r.probe_kind = 't2')"
-            }
+                 AND r.probe_kind IN ({t2}))"
+            ),
         }
     }
 }
@@ -794,10 +797,11 @@ pub async fn list_filtered(
                 EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id
                         AND r.probe_kind IN ('tcp', 'tls')) AS t1_checked,
                 EXISTS (SELECT 1 FROM probe_results r WHERE r.proxy_id = p.id
-                        AND r.probe_kind = 't2') AS t2_checked
+                        AND r.probe_kind IN ({})) AS t2_checked
          FROM proxies p{}
          ORDER BY {}
          LIMIT ? OFFSET ?",
+        crate::repo::probe::T2_KINDS_SQL,
         wf.sql(),
         order.order_sql(),
     );
@@ -1564,6 +1568,18 @@ pub struct T1Candidate {
     pub params: Option<String>,
 }
 
+impl T1Candidate {
+    /// The entry the stored columns describe.
+    ///
+    /// The probe needs the parameters to answer two questions about the
+    /// node — does it speak TLS, and which name does its handshake present
+    /// — and both are answered from the same parameter set the ingest
+    /// parsed and the output writers read.
+    pub fn to_entry(&self) -> crate::Result<ProxyEntry> {
+        stored_entry(&self.scheme, &self.host, self.port, self.params.as_deref())
+    }
+}
+
 /// Quarantined proxy whose next scheduled check has come due.
 #[derive(Debug, Clone, FromRow)]
 pub struct DueQuarantine {
@@ -1574,6 +1590,59 @@ pub struct DueQuarantine {
     pub params: Option<String>,
     /// The ladder step this row is waiting on (0 = second chance).
     pub ladder_step: i64,
+}
+
+impl DueQuarantine {
+    /// The entry the stored columns describe; see [`T1Candidate::to_entry`].
+    pub fn to_entry(&self) -> crate::Result<ProxyEntry> {
+        stored_entry(&self.scheme, &self.host, self.port, self.params.as_deref())
+    }
+}
+
+/// The entry a stored proxy row describes, rebuilt from the columns a
+/// probe candidate carries.
+///
+/// The parameters come back from their JSON projection, the same text the
+/// ingest wrote; the credential and the raw line are not part of a
+/// connectivity check and stay empty.
+fn stored_entry(
+    scheme: &str,
+    host: &str,
+    port: i64,
+    params: Option<&str>,
+) -> crate::Result<ProxyEntry> {
+    let list = match params {
+        Some(text) => stored_params(text, true)?,
+        None => Vec::new(),
+    };
+    Ok(ProxyEntry {
+        scheme: scheme.parse::<Scheme>()?,
+        name: String::new(),
+        host: host.to_string(),
+        port: u16::try_from(port)
+            .map_err(|_| crate::Error::Parse(format!("port out of range: {port}")))?,
+        credential: String::new(),
+        params: list,
+        raw_path: String::new(),
+        raw_line: String::new(),
+    })
+}
+
+/// The parameters a stored params column holds, as an ordered list.
+///
+/// The column is a JSON object, so the order is the one the object has;
+/// a non-string value is stored as its textual form.
+fn stored_params(text: &str, known: bool) -> crate::Result<Vec<Param>> {
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)
+        .map_err(|e| crate::Error::Parse(format!("corrupt proxy params JSON: {e}")))?;
+    Ok(map
+        .into_iter()
+        .map(|(key, value)| Param {
+            key,
+            value: value.as_str().unwrap_or_default().to_string(),
+            known,
+        })
+        .collect())
 }
 
 /// Result of applying a check outcome to the lifecycle.
@@ -1597,7 +1666,8 @@ pub enum Transition {
 pub const T1_EXCLUDED_SCHEMES: &[&str] = &["hysteria2", "tuic", "mieru"];
 
 /// Schemes meow-rs can actually tunnel (the T2 allowlist). Mirrors
-/// `fumox_probe::clash::is_supported`, probe filters the batch by it after
+/// `fumox_core::formats::clash::is_supported`, the probe filters the
+/// batch by it after
 /// the SQL, so the selector must not offer rows that would only be dropped
 /// again: under the recency-priority order a perpetually uncheckable row
 /// would otherwise sit at the head of the sample forever (starvation).
@@ -1824,9 +1894,10 @@ pub async fn select_t2_candidates(pool: &DbPool, limit: u32) -> crate::Result<Ve
            AND p.scheme IN ({supported})
            AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
          ORDER BY (SELECT MAX(r.checked_at) FROM probe_results r
-                   WHERE r.proxy_id = p.id AND r.probe_kind = 't2') ASC,
+                   WHERE r.proxy_id = p.id AND r.probe_kind IN ({})) ASC,
                   p.id ASC
-         LIMIT ?"
+         LIMIT ?",
+        crate::repo::probe::T2_KINDS_SQL
     );
     let mut query = sqlx::query_as::<_, ProxyRow>(sqlx::AssertSqlSafe(sql.as_str()));
     for scheme in T2_SCHEMES {
@@ -2024,6 +2095,47 @@ pub async fn check_failed(
     second_chance_spread_secs: i64,
     mark_t2_failed: bool,
 ) -> crate::Result<Transition> {
+    let mut transitions = check_failed_batch(
+        pool,
+        &[id],
+        now,
+        fail_limit,
+        second_chance_min_secs,
+        second_chance_spread_secs,
+        mark_t2_failed,
+    )
+    .await?;
+    Ok(transitions
+        .pop()
+        .map(|(_, transition)| transition)
+        .unwrap_or(Transition::Unchanged))
+}
+
+/// Apply the fail ladder to a batch of rows in one transaction.
+///
+/// The per-row version opens a transaction per row, and a batch of failed
+/// tunnels meant a hundred transactions in a row: every one of them took
+/// the write lock, read a counter and wrote it back. This version reads
+/// the counters of the whole batch once and writes every row inside the
+/// same transaction, so the batch costs one lock and one commit.
+///
+/// The per-row semantics are unchanged: the counter is read inside the
+/// write transaction, the jitter is drawn per row, and the write repeats
+/// the `status IN ('unknown', 'alive', 'ready')` guard of the read. The
+/// returned transitions report what was actually written; a row that
+/// vanished or left the eligible statuses is not in the list.
+pub async fn check_failed_batch(
+    pool: &DbPool,
+    ids: &[i64],
+    now: i64,
+    fail_limit: u32,
+    second_chance_min_secs: i64,
+    second_chance_spread_secs: i64,
+    mark_t2_failed: bool,
+) -> crate::Result<Vec<(i64, Transition)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
     // rand 0.10: `random_range` moved from `Rng` to `RngExt`.
     use rand::RngExt;
 
@@ -2033,80 +2145,96 @@ pub async fn check_failed(
     // `reconcile_source`).
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT fail_count FROM proxies WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((fail_count,)) = row else {
-        // Row vanished or left the regular-check states concurrently
+    // The counters of the batch, read once.
+    let mut counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for chunk in ids.chunks(100) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT id, fail_count FROM proxies
+             WHERE id IN ({placeholders}) AND status IN ('unknown', 'alive', 'ready')"
+        );
+        let mut query = sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
+        for id in chunk {
+            query = query.bind(id);
+        }
+        for (id, fail_count) in query.fetch_all(&mut *tx).await? {
+            counts.insert(id, fail_count);
+        }
+    }
+
+    let mut transitions = Vec::new();
+    for id in ids {
+        // The row vanished or left the regular-check states concurrently
         // (quarantined by another worker, removed by reconciliation).
-        return Ok(Transition::Unchanged);
-    };
-
-    let new_count = fail_count + 1;
-    let (transition, written) = if new_count >= i64::from(fail_limit) {
-        let jitter = if second_chance_spread_secs > 0 {
-            rand::rng().random_range(0..second_chance_spread_secs)
-        } else {
-            0
+        let Some(fail_count) = counts.get(id).copied() else {
+            continue;
         };
-        let second_chance_at = now + second_chance_min_secs + jitter;
-        let written = sqlx::query(
-            "UPDATE proxies SET
-                 status = 'quarantine',
-                 fail_count = ?,
-                 last_checked_at = ?,
-                 quarantined_at = ?,
-                 ladder_at = ?,
-                 ladder_step = 0,
-                 last_t2_failed_at = CASE WHEN ? THEN ? ELSE last_t2_failed_at END,
-                 updated_at = ?
-             WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
-        )
-        .bind(new_count)
-        .bind(now)
-        .bind(now)
-        .bind(second_chance_at)
-        .bind(mark_t2_failed)
-        .bind(now)
-        .bind(now)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        (Transition::Quarantined, written)
-    } else {
-        let written = sqlx::query(
-            "UPDATE proxies SET
-                 status = CASE WHEN status = 'ready' THEN 'alive' ELSE status END,
-                 fail_count = ?,
-                 last_checked_at = ?,
-                 last_t2_failed_at = CASE WHEN ? THEN ? ELSE last_t2_failed_at END,
-                 updated_at = ?
-             WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
-        )
-        .bind(new_count)
-        .bind(now)
-        .bind(mark_t2_failed)
-        .bind(now)
-        .bind(now)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        (Transition::Unchanged, written)
-    };
+        let new_count = fail_count + 1;
+        let (transition, written) = if new_count >= i64::from(fail_limit) {
+            let jitter = if second_chance_spread_secs > 0 {
+                rand::rng().random_range(0..second_chance_spread_secs)
+            } else {
+                0
+            };
+            let second_chance_at = now + second_chance_min_secs + jitter;
+            let written = sqlx::query(
+                "UPDATE proxies SET
+                     status = 'quarantine',
+                     fail_count = ?,
+                     last_checked_at = ?,
+                     quarantined_at = ?,
+                     ladder_at = ?,
+                     ladder_step = 0,
+                     last_t2_failed_at = CASE WHEN ? THEN ? ELSE last_t2_failed_at END,
+                     updated_at = ?
+                 WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
+            )
+            .bind(new_count)
+            .bind(now)
+            .bind(now)
+            .bind(second_chance_at)
+            .bind(mark_t2_failed)
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            (Transition::Quarantined, written)
+        } else {
+            let written = sqlx::query(
+                "UPDATE proxies SET
+                     status = CASE WHEN status = 'ready' THEN 'alive' ELSE status END,
+                     fail_count = ?,
+                     last_checked_at = ?,
+                     last_t2_failed_at = CASE WHEN ? THEN ? ELSE last_t2_failed_at END,
+                     updated_at = ?
+                 WHERE id = ? AND status IN ('unknown', 'alive', 'ready')",
+            )
+            .bind(new_count)
+            .bind(now)
+            .bind(mark_t2_failed)
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            (Transition::Unchanged, written)
+        };
+        // The guard refused the write (the row left the eligible statuses
+        // after all): report what happened, not what was attempted.
+        transitions.push((
+            *id,
+            if written > 0 {
+                transition
+            } else {
+                Transition::Unchanged
+            },
+        ));
+    }
     tx.commit().await?;
-
-    // The guard refused the write (the row left the eligible statuses
-    // after all): report what happened, not what was attempted.
-    Ok(if written > 0 {
-        transition
-    } else {
-        Transition::Unchanged
-    })
+    Ok(transitions)
 }
 
 /// Record a T2 attempt that never happened because the tunnel engine
@@ -2153,6 +2281,44 @@ pub async fn check_engine_unavailable(pool: &DbPool, id: i64, now: i64) -> crate
     Ok(written > 0)
 }
 
+/// Stamp a batch of rows as unverified by the engine, in one transaction.
+///
+/// The per-row version is one statement per row, and an engine outage
+/// stamps every due row of the batch: a hundred rows meant a hundred
+/// round trips before the cycle could move on.
+pub async fn check_engine_unavailable_batch(
+    pool: &DbPool,
+    ids: &[i64],
+    now: i64,
+) -> crate::Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut written = 0u64;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for chunk in ids.chunks(100) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "UPDATE proxies SET
+                 status = CASE WHEN status = 'ready' THEN 'alive' ELSE status END,
+                 last_checked_at = ?,
+                 last_t2_failed_at = ?,
+                 updated_at = ?
+             WHERE id IN ({placeholders}) AND status IN ('unknown', 'alive', 'ready')"
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(now)
+            .bind(now)
+            .bind(now);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        written += query.execute(&mut *tx).await?.rows_affected();
+    }
+    tx.commit().await?;
+    Ok(written)
+}
+
 /// Apply a failed quarantine check (second chance or a recheck ladder step).
 ///
 /// The ladder is always scheduled relative to the moment of the failure that
@@ -2169,48 +2335,298 @@ pub async fn quarantine_check_failed(
     step: i64,
     delays: &[i64],
 ) -> crate::Result<Transition> {
-    let next_delay = delays.get(step.max(0) as usize).copied();
-    let (transition, next_at) = match next_delay {
-        Some(delay) => (Transition::Unchanged, now + delay.max(0)),
-        None => (Transition::Removed, 0),
-    };
+    let mut transitions = quarantine_check_failed_batch(pool, &[(id, now, step)], delays).await?;
+    Ok(transitions
+        .pop()
+        .map(|(_, transition)| transition)
+        .unwrap_or(Transition::Unchanged))
+}
 
-    if transition == Transition::Removed {
+/// Advance the quarantine ladder of a batch of rows in one transaction.
+///
+/// Each entry is `(id, now, step)`: the row, the moment of the failure and
+/// the ladder step it failed at. The per-row version is one statement per
+/// row, and a batch of failed revival checks settled them one after the
+/// other.
+pub async fn quarantine_check_failed_batch(
+    pool: &DbPool,
+    rows: &[(i64, i64, i64)],
+    delays: &[i64],
+) -> crate::Result<Vec<(i64, Transition)>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut transitions = Vec::with_capacity(rows.len());
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (id, now, step) in rows {
+        let next_delay = delays.get((*step).max(0) as usize).copied();
+        let (transition, next_at) = match next_delay {
+            Some(delay) => (Transition::Unchanged, now + delay.max(0)),
+            None => (Transition::Removed, 0),
+        };
+
+        if transition == Transition::Removed {
+            sqlx::query(
+                "UPDATE proxies SET
+                     status = 'removed',
+                     last_checked_at = ?,
+                     removed_at = ?,
+                     ladder_at = NULL,
+                     ladder_step = 0,
+                     updated_at = ?
+                 WHERE id = ? AND status = 'quarantine'",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            transitions.push((*id, transition));
+            continue;
+        }
+
         sqlx::query(
             "UPDATE proxies SET
-                 status = 'removed',
                  last_checked_at = ?,
-                 removed_at = ?,
-                 ladder_at = NULL,
-                 ladder_step = 0,
+                 ladder_at = ?,
+                 ladder_step = ?,
                  updated_at = ?
              WHERE id = ? AND status = 'quarantine'",
         )
         .bind(now)
-        .bind(now)
+        .bind(next_at)
+        .bind(step + 1)
         .bind(now)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-        return Ok(Transition::Removed);
+        transitions.push((*id, transition));
     }
+    tx.commit().await?;
+    Ok(transitions)
+}
 
-    sqlx::query(
-        "UPDATE proxies SET
-             last_checked_at = ?,
-             ladder_at = ?,
-             ladder_step = ?,
-             updated_at = ?
-         WHERE id = ? AND status = 'quarantine'",
+/// What a fingerprint recompute changed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RefingerprintStats {
+    /// Rows whose key was rewritten.
+    pub rewritten: usize,
+    /// Rows that described a node another row already described and were
+    /// merged into it.
+    pub merged: usize,
+}
+
+/// The `meta` key that records which fingerprint version the stored rows
+/// carry. The recompute runs when it differs from the current one.
+pub const FINGERPRINT_VERSION_KEY: &str = "fingerprint_version";
+
+/// How many rows one recompute batch pulls and rewrites.
+const REFINGERPRINT_BATCH: i64 = 500;
+
+/// Recompute the stored fingerprints after a change of the canonical form.
+///
+/// The fingerprint version is part of the pre-image, so a change of the
+/// canonical form changes every key: the rows written before the change
+/// keep keys the ingest no longer produces, and the same node can live in
+/// two rows — the old one and the new one the ingest created.
+///
+/// Every row is recomputed from its stored fields, so its key is the key
+/// the ingest computes for the same node. Two rows that now describe the
+/// same node are merged: the one with the better lifecycle status
+/// survives, takes over the links of the other and the other is deleted.
+///
+/// The rows are walked in bounded batches, each in its own short
+/// transaction, so the write lock is never held over the whole table and
+/// the probe daemon keeps working while the pass runs.
+///
+/// The pass is idempotent: a row whose key already matches its recomputed
+/// one is left alone, so a second run costs a read and nothing else.
+pub async fn refingerprint(pool: &DbPool) -> crate::Result<RefingerprintStats> {
+    let mut stats = RefingerprintStats::default();
+    let mut cursor = 0i64;
+    loop {
+        let rows = list_for_refingerprint(pool, cursor, REFINGERPRINT_BATCH).await?;
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows.last().map(|row| row.id).unwrap_or(cursor);
+        recompute_batch(pool, &rows, &mut stats).await?;
+        if (rows.len() as i64) < REFINGERPRINT_BATCH {
+            break;
+        }
+    }
+    Ok(stats)
+}
+
+/// Bring the stored fingerprints up to the current version.
+///
+/// The version is part of the pre-image, so a change of the canonical form
+/// changes every key: the rows written before the change keep keys the
+/// ingest no longer produces, and the same node can live in two rows — the
+/// old one and the new one the ingest created.
+///
+/// The recompute runs only when the stored rows carry another version. The
+/// marker in `meta` names the version the rows were written with, so the
+/// pass runs once per version change and not on every start. The pass is
+/// idempotent, so a start that dies in the middle of it runs it again on
+/// the next start.
+pub async fn ensure_fingerprint_version(
+    pool: &DbPool,
+) -> crate::Result<Option<RefingerprintStats>> {
+    let stored = crate::repo::meta_get(pool, FINGERPRINT_VERSION_KEY).await?;
+    if stored.as_deref() == Some(crate::fingerprint::FINGERPRINT_VERSION) {
+        return Ok(None);
+    }
+    let stats = refingerprint(pool).await?;
+    crate::repo::meta_set(
+        pool,
+        FINGERPRINT_VERSION_KEY,
+        crate::fingerprint::FINGERPRINT_VERSION,
     )
-    .bind(now)
-    .bind(next_at)
-    .bind(step + 1)
-    .bind(now)
-    .bind(id)
-    .execute(pool)
     .await?;
-    Ok(transition)
+    Ok(Some(stats))
+}
+
+/// The rows a recompute pass still has to walk, oldest id first.
+async fn list_for_refingerprint(
+    pool: &DbPool,
+    after_id: i64,
+    limit: i64,
+) -> crate::Result<Vec<ProxyRow>> {
+    let sql = "SELECT * FROM proxies WHERE id > ? ORDER BY id LIMIT ?";
+    let rows = sqlx::query_as::<_, ProxyRow>(sql)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// Recompute one batch of rows and write the new keys.
+async fn recompute_batch(
+    pool: &DbPool,
+    rows: &[ProxyRow],
+    stats: &mut RefingerprintStats,
+) -> crate::Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for row in rows {
+        let entry = match row.to_entry() {
+            Ok(entry) => entry,
+            Err(err) => {
+                // A row whose stored fields do not parse cannot be
+                // recomputed; its key stays as it is.
+                tracing::warn!(
+                    proxy = row.id,
+                    error = %err,
+                    "fingerprint recompute: skipping a row that does not parse"
+                );
+                continue;
+            }
+        };
+        let fingerprint = entry.fingerprint();
+        if fingerprint == row.fingerprint {
+            continue;
+        }
+        // The row that already carries the new key, if any: the ingest
+        // may have created it after the upgrade.
+        let clash: Option<(i64, String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, status, last_alive_at FROM proxies WHERE fingerprint = ? AND id <> ?",
+        )
+        .bind(&fingerprint)
+        .bind(row.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match clash {
+            None => {
+                sqlx::query("UPDATE proxies SET fingerprint = ? WHERE id = ?")
+                    .bind(&fingerprint)
+                    .bind(row.id)
+                    .execute(&mut *tx)
+                    .await?;
+                stats.rewritten += 1;
+            }
+            Some((other_id, other_status, other_alive)) => {
+                // The better row survives; the other one is merged into it.
+                let keep = if status_rank(&other_status, other_alive)
+                    > status_rank(&row.status, row.last_alive_at)
+                {
+                    other_id
+                } else {
+                    row.id
+                };
+                let drop = if keep == other_id { row.id } else { other_id };
+                merge_rows(&mut tx, keep, drop).await?;
+                if keep == row.id {
+                    // The survivor was the old row: it takes the new key
+                    // now that the row that held it is gone.
+                    sqlx::query("UPDATE proxies SET fingerprint = ? WHERE id = ?")
+                        .bind(&fingerprint)
+                        .bind(keep)
+                        .execute(&mut *tx)
+                        .await?;
+                    stats.rewritten += 1;
+                }
+                stats.merged += 1;
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Merge the `drop` row into the `keep` row: the dropped row's source
+/// links move over, the dropped row goes away.
+async fn merge_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    keep: i64,
+    drop: i64,
+) -> crate::Result<()> {
+    // The links move first: the surviving row takes over the sources the
+    // dropped row was seen in, and keeps the most recent sighting of each.
+    sqlx::query(
+        "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
+         SELECT ?, l.source_id, MAX(l.seen_at)
+         FROM proxy_source_links l
+         WHERE l.proxy_id IN (?, ?)
+         GROUP BY l.source_id
+         ON CONFLICT(proxy_id, source_id) DO UPDATE SET
+            seen_at = MAX(seen_at, excluded.seen_at)",
+    )
+    .bind(keep)
+    .bind(keep)
+    .bind(drop)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM proxy_source_links WHERE proxy_id = ?")
+        .bind(drop)
+        .execute(&mut **tx)
+        .await?;
+    // The row itself: its history goes with it.
+    sqlx::query("DELETE FROM proxies WHERE id = ?")
+        .bind(drop)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// The lifecycle rank of a status: the row with the higher rank survives a
+/// merge of two rows that describe the same node.
+///
+/// A node that was verified alive is worth more than one that never got a
+/// verdict, and one that never got a verdict is worth more than one the
+/// probe retired. The most recently alive row wins a tie, and the older
+/// row wins a tie beyond that, so the survivor keeps the history.
+fn status_rank(status: &str, last_alive_at: Option<i64>) -> (i32, i64) {
+    let rank = match status {
+        "alive" => 5,
+        "ready" => 4,
+        "unknown" => 3,
+        "quarantine" => 2,
+        "removed" => 1,
+        _ => 0,
+    };
+    (rank, last_alive_at.unwrap_or(i64::MIN))
 }
 
 #[cfg(test)]

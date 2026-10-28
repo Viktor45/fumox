@@ -10,22 +10,6 @@ use fumox_core::models::{Param, ProxyEntry, Scheme};
 use fumox_core::repo::proxies::ProxyRow;
 use serde_norway::Value;
 
-/// Schemes meow-rs can actually tunnel. naive has no mihomo counterpart and
-/// tuic/mieru are unsupported, so they never enter a T2 batch.
-pub fn is_supported(scheme: Scheme) -> bool {
-    matches!(
-        scheme,
-        Scheme::Vless
-            | Scheme::Vmess
-            | Scheme::Trojan
-            | Scheme::Ss
-            | Scheme::Hysteria2
-            | Scheme::Socks5
-            | Scheme::Snell
-            | Scheme::AnyTls
-    )
-}
-
 /// Deterministic name of a proxy inside the generated config.
 pub fn proxy_name(proxy_id: i64) -> String {
     format!("fumox-{proxy_id}")
@@ -74,7 +58,12 @@ pub fn generate(
 }
 
 /// Map one DB row onto a Clash proxy definition; returns `None` for
-/// unsupported schemes (they are skipped, never fatal, log+skip policy).
+/// entries the core mapping cannot express (they are skipped, never
+/// fatal, log+skip policy).
+///
+/// The core mapping is the single source of truth for what meow-rs can
+/// tunnel: a scheme it does not know has no mihomo counterpart, and the
+/// mapping says so by returning `None`. The probe keeps no second list.
 ///
 /// When `pins` contains an entry for the row's host, the entry is cloned with
 /// `host` replaced by the pinned IP literal before being serialized. This
@@ -91,11 +80,7 @@ fn proxy_to_value(
     row: &ProxyRow,
     pins: &std::collections::HashMap<String, std::net::IpAddr>,
 ) -> Option<Value> {
-    let entry = row.to_entry().ok()?;
-    if !is_supported(entry.scheme) {
-        return None;
-    }
-    let mut entry = entry;
+    let mut entry = row.to_entry().ok()?;
     if let Some(ip) = pins.get(&row.host) {
         carry_server_name(&mut entry, &row.host);
         entry.host = ip.to_string();
@@ -169,7 +154,7 @@ fn carry_server_name(entry: &mut ProxyEntry, pre_pin_host: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fumox_core::models::{Param, ProxyEntry};
+    use fumox_core::models::{Param, ProxyEntry, Scheme};
 
     fn row_from_entry(id: i64, entry: ProxyEntry) -> ProxyRow {
         let known = serde_json::to_string(&entry.known_params_json()).unwrap();
@@ -184,6 +169,7 @@ mod tests {
             params: Some(known),
             unknown_params: None,
             raw_line: None,
+            raw_path: None,
             last_t2_failed_at: None,
             geo_country: None,
             geo_city: None,
@@ -313,16 +299,22 @@ mod tests {
 
     #[test]
     fn unsupported_schemes_are_skipped() {
-        assert!(is_supported(Scheme::Vless));
-        assert!(is_supported(Scheme::Hysteria2));
-        assert!(!is_supported(Scheme::Tuic));
-        assert!(!is_supported(Scheme::Mieru));
-        assert!(!is_supported(Scheme::Naive));
+        // The probe keeps no list of its own: the core mapping decides,
+        // and a scheme it cannot express yields no proxy definition.
+        assert!(fumox_core::formats::clash::is_supported(Scheme::Vless));
+        assert!(fumox_core::formats::clash::is_supported(Scheme::Hysteria2));
+        assert!(!fumox_core::formats::clash::is_supported(Scheme::Tuic));
+        assert!(!fumox_core::formats::clash::is_supported(Scheme::Mieru));
+        assert!(!fumox_core::formats::clash::is_supported(Scheme::Naive));
 
         let rows = vec![row_from_entry(9, entry(Scheme::Tuic, "c", &[]))];
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
+        let (yaml, included) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert!(parsed["proxies"].as_sequence().unwrap().is_empty());
+        assert!(
+            included.is_empty(),
+            "a skipped row must not be reported as included"
+        );
     }
 
     /// T2 tunnels carry the proxy credential, so certificate verification

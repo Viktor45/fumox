@@ -24,7 +24,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use fumox_core::config::{
     AdminConfig, AppConfig, DEFAULT_CONFIG_PATH, DatabaseConfig, FetchConfig, GeoConfig,
-    IngestConfig, LogConfig, MeowConfig, ProbeConfig, RateLimit, ResolvedConfigPath,
+    IngestConfig, LogConfig, MeowConfig, NetworkConfig, ProbeConfig, RateLimit, ResolvedConfigPath,
     RetentionConfig, ServerConfig, bounds,
 };
 use fumox_core::config_writer::{ConfigItem, ConfigWriteError, EditableConfig, fingerprint, item};
@@ -44,6 +44,7 @@ struct SettingsView {
     fetch: FetchConfig,
     ingest: IngestConfig,
     geo_config: GeoConfig,
+    network: NetworkConfig,
     admin: AdminConfig,
     probe: ProbeConfig,
     meow: MeowConfig,
@@ -61,6 +62,7 @@ impl SettingsView {
             fetch: state.fetch(),
             ingest: state.ingest(),
             geo_config: state.geo_config(),
+            network: state.network(),
             admin: state.admin(),
             probe: state.probe(),
             meow: state.meow(),
@@ -68,6 +70,16 @@ impl SettingsView {
             log: state.log(),
             config_path: state.config_path.clone(),
             config_writable: state.config_writable,
+        }
+    }
+
+    /// The DNS resolution timeout in force: the dedicated `[network]` key
+    /// when it is set, otherwise the `[geo]` one it follows.
+    fn network_dns_timeout(&self) -> u64 {
+        if self.network.dns_timeout_secs > 0 {
+            self.network.dns_timeout_secs
+        } else {
+            self.geo_config.dns_timeout_secs
         }
     }
 }
@@ -501,6 +513,14 @@ static SETTINGS: &[Setting] = &[
         key: "geo.startup_download_budget_secs",
         render: |c, key, raw| {
             raw.insert(key.into(), c.geo.startup_download_budget_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    // --- network ---
+    Setting {
+        key: "network.dns_timeout_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.network.dns_timeout_secs.to_string());
         },
         apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
     },
@@ -2809,6 +2829,7 @@ mod tests {
                     fetch: cfg.fetch.clone(),
                     ingest: cfg.ingest.clone(),
                     geo_config: cfg.geo.clone(),
+                    network: cfg.network.clone(),
                     admin: cfg.admin.clone(),
                     probe: cfg.probe.clone(),
                     meow: cfg.meow.clone(),

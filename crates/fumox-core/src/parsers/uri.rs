@@ -167,10 +167,19 @@ pub static ANYTLS_SPEC: UriSchemeSpec = UriSchemeSpec {
     credential_required: true,
 };
 
+/// The synthetic parameter that carries the naive transport (`https` / `quic`).
+///
+/// The transport is part of the scheme identity (`naive+https://` vs
+/// `naive+quic://`), not a client-facing query key: the parser attaches it,
+/// the serializer consumes it to rebuild the prefix, and it never appears in
+/// an emitted URI. The key lives here so the parser, the serializer and the
+/// fingerprint all read the same spelling.
+pub const NAIVE_TRANSPORT_PARAM: &str = "naive_transport";
+
 pub static NAIVE_SPEC: UriSchemeSpec = UriSchemeSpec {
     scheme: Scheme::Naive,
     prefix: "naive+https://",
-    known_keys: &["sni", "naive_transport"],
+    known_keys: &["sni", NAIVE_TRANSPORT_PARAM],
     credential_required: true,
 };
 
@@ -260,6 +269,12 @@ pub fn parse_hostport(s: &str) -> Result<(String, u16), String> {
         let (host, port) = s
             .rsplit_once(':')
             .ok_or_else(|| "missing port in host:port".to_string())?;
+        if host.contains(':') {
+            // An unbracketed IPv6 literal: `2001:db8::1:443` would be split
+            // into the host `2001:db8::1` and the port 443, and the client
+            // would dial the wrong address.
+            return Err("IPv6 host must be bracketed".to_string());
+        }
         (host.to_string(), port)
     };
     if host.is_empty() {
@@ -489,20 +504,78 @@ pub fn parse_with_spec(
     })
 }
 
+/// Percent-encode the structural characters of a field that is emitted
+/// verbatim into a URI.
+///
+/// `%` is left alone on purpose: the URI parsers store the userinfo and the
+/// host still percent-encoded, so re-encoding `%` would turn every `%2F` into
+/// `%252F` and break the byte-exact round-trip.
+fn encode_structural<'a>(raw: &'a str, chars: &[char]) -> Cow<'a, str> {
+    if !raw.chars().any(|ch| chars.contains(&ch)) {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = String::with_capacity(raw.len() * 3);
+    for ch in raw.chars() {
+        if chars.contains(&ch) {
+            let mut buf = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buf).as_bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// The userinfo to emit for `entry`.
+///
+/// A URI-sourced entry keeps its userinfo byte-for-byte (`raw_line` is set),
+/// and it cannot contain a structural character anyway: the parser splits the
+/// fragment and the query off before the userinfo. An entry from a structured
+/// format carries *decoded* text, where a raw `#` or `?` would truncate the
+/// emitted line and swallow the host.
+pub fn credential_for_output(entry: &ProxyEntry) -> Cow<'_, str> {
+    if !entry.raw_line.is_empty() {
+        return Cow::Borrowed(entry.credential.as_str());
+    }
+    encode_structural(&entry.credential, &['#', '?'])
+}
+
+/// The host to emit for `entry`.
+///
+/// A URI-sourced entry keeps its host byte-for-byte (`raw_line` is set); the
+/// parser splits the userinfo, the path and the query apart, so such a host
+/// never carries a structural character. An entry from a structured format
+/// carries *decoded* text, where a raw `#` or `?` truncates the line, an `@`
+/// moves the userinfo boundary and a `/` starts the path.
+pub fn host_for_output(entry: &ProxyEntry) -> Cow<'_, str> {
+    if !entry.raw_line.is_empty() {
+        return Cow::Owned(host_for_uri(&entry.host));
+    }
+    let encoded = encode_structural(&entry.host, &['#', '?', '@', '/']);
+    if encoded.contains(':') && !encoded.starts_with('[') {
+        Cow::Owned(format!("[{encoded}]"))
+    } else {
+        Cow::Owned(encoded.into_owned())
+    }
+}
+
 /// Generic serializer for the `userinfo@host:port[?query][#name]` family.
 ///
-/// The credential is emitted exactly as stored and parameter values keep
-/// their percent-encoding (only the characters that would break the query
-/// are escaped, see `encode_query_delimiters`); the name is re-encoded
-/// with [`encode_fragment`].
+/// The credential is emitted as stored (percent-encoded when the entry did
+/// not come from a URI, see [`credential_for_output`]) and parameter values
+/// keep their percent-encoding (only the characters that would break the
+/// query are escaped, see `encode_query_delimiters`); the name is
+/// re-encoded with [`encode_fragment`].
 pub fn serialize_with_spec(spec: &UriSchemeSpec, entry: &ProxyEntry) -> String {
     let mut out = String::with_capacity(128);
     out.push_str(spec.prefix);
     if !entry.credential.is_empty() {
-        out.push_str(&entry.credential);
+        out.push_str(&credential_for_output(entry));
         out.push('@');
     }
-    out.push_str(&host_for_uri(&entry.host));
+    out.push_str(&host_for_output(entry));
     out.push(':');
     out.push_str(&entry.port.to_string());
     out.push_str(&entry.raw_path);
@@ -584,6 +657,52 @@ mod tests {
         assert_eq!(parsed.port, 8443);
         assert_eq!(parsed.credential, "uuid");
         assert_eq!(parsed.name, "v6");
+    }
+
+    /// A structured source (Clash YAML, sing-box JSON) carries *decoded*
+    /// text: a raw `#`, `?`, `@` or `/` in the host or the credential would
+    /// truncate the emitted line or move the userinfo boundary, and the
+    /// client would dial the wrong host.
+    #[test]
+    fn structural_characters_are_encoded_for_a_structured_entry() {
+        let entry = ProxyEntry {
+            scheme: Scheme::Vless,
+            name: "node".into(),
+            host: "ho#st?x@y/z".into(),
+            port: 443,
+            credential: "pa#ss?word".into(),
+            params: vec![Param {
+                key: "security".into(),
+                value: "tls".into(),
+                known: true,
+            }],
+            raw_path: String::new(),
+            raw_line: String::new(),
+        };
+        let out = serialize_with_spec(&VLESS_SPEC, &entry);
+        assert_eq!(
+            out,
+            "vless://pa%23ss%3Fword@ho%23st%3Fx%40y%2Fz:443?security=tls#node"
+        );
+        // The emitted line stays parseable: the boundaries survive.
+        let parsed =
+            parse_with_spec(&VLESS_SPEC, out.strip_prefix("vless://").unwrap(), &out).unwrap();
+        assert_eq!(parsed.port, 443);
+        assert_eq!(parsed.name, "node");
+        assert_eq!(parsed.params.len(), 1);
+        assert_eq!(parsed.credential, "pa%23ss%3Fword");
+        assert_eq!(parsed.host, "ho%23st%3Fx%40y%2Fz");
+    }
+
+    /// A URI-sourced entry is emitted byte-for-byte: the parser had already
+    /// split the structural characters apart, so there is nothing to encode
+    /// and the round-trip stays exact.
+    #[test]
+    fn a_uri_sourced_entry_is_emitted_verbatim() {
+        let line = "vless://uuid@h.example.com:443?security=tls#name";
+        let parsed =
+            parse_with_spec(&VLESS_SPEC, line.strip_prefix("vless://").unwrap(), line).unwrap();
+        assert_eq!(serialize_with_spec(&VLESS_SPEC, &parsed), line);
     }
 
     #[test]

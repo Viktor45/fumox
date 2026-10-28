@@ -101,6 +101,10 @@ struct ExportSource {
 struct ExportProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slug: Option<String>,
+    /// The profile's access token **as stored**: a hash, never the secret.
+    /// The export therefore cannot leak a working token, and the import
+    /// keeps the endpoint usable on the target deployment (the same secret
+    /// still opens it) without ever handling the plaintext.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     access_token: Option<String>,
     name: String,
@@ -162,6 +166,10 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
         ordered.sort_by_key(|(_, position)| *position);
         export_profiles.push(ExportProfile {
             slug: p.slug.clone(),
+            // The stored token is a hash, so the file carries the hash: no
+            // working secret ever leaves the deployment, and the import
+            // stores the same hash, which keeps the endpoint usable for
+            // the clients that already know the token.
             access_token: p.access_token.clone(),
             name: p.name.clone(),
             output_format: p.output_format,
@@ -613,30 +621,32 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         // must not plant a guessable secret on a public endpoint. Tokens
         // shorter than the floor are hard errors, silently regenerating
         // them would change what the operator expects the file to contain.
+        //
+        // A token that is already a hash is not a secret the file chooses:
+        // it is what this deployment stored (the export of a hashed row),
+        // and the plaintext rules below do not apply to it.
         if let Some(token) = p.access_token.as_deref()
             && !token.is_empty()
-            && token.chars().count() < caps::IMPORT_TOKEN_MIN
+            && !fumox_core::token::is_hashed(token)
         {
-            errors.push(format!("{ctx}: {}", lang.t("val.token_too_short_import")));
-        }
-        if let Some(token) = p.access_token.as_deref()
-            && token.len() > caps::ACCESS_TOKEN
-        {
-            errors.push(format!(
-                "{ctx}: {}",
-                lang.t("val.field_too_long")
-                    .replace("{}", &caps::ACCESS_TOKEN.to_string())
-            ));
-        }
-        // The serve link embeds the token unescaped in `?token=…`, so
-        // only unreserved ASCII (the profile form's charset) round-trips.
-        if let Some(token) = p.access_token.as_deref()
-            && !token.is_empty()
-            && !token
+            if token.chars().count() < caps::IMPORT_TOKEN_MIN {
+                errors.push(format!("{ctx}: {}", lang.t("val.token_too_short_import")));
+            }
+            if token.len() > caps::ACCESS_TOKEN {
+                errors.push(format!(
+                    "{ctx}: {}",
+                    lang.t("val.field_too_long")
+                        .replace("{}", &caps::ACCESS_TOKEN.to_string())
+                ));
+            }
+            // The serve link embeds the token unescaped in `?token=…`, so
+            // only unreserved ASCII (the profile form's charset) round-trips.
+            if !token
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
-        {
-            errors.push(format!("{ctx}: {}", lang.t("val.token_format")));
+            {
+                errors.push(format!("{ctx}: {}", lang.t("val.token_format")));
+            }
         }
         if let Some(pipeline) = p.pipeline.as_ref() {
             if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
@@ -729,7 +739,9 @@ async fn apply_import(
             enabled: s.enabled,
             encoding: s.encoding,
             input_format: s.input_format,
-            protocols: s.protocols,
+            // An empty allowlist means "no filter", never "nothing passes":
+            // the list is normalised before the source is written.
+            protocols: models::normalize_protocols(s.protocols),
             cache_ttl_seconds: s.cache_ttl_seconds,
             tags: s.tags,
             pipeline: s.pipeline,
@@ -786,6 +798,8 @@ async fn apply_import(
         let profile = models::Profile {
             id: id.clone(),
             slug,
+            // A plaintext token from a hand-written file is hashed by the
+            // repository; a hash from an export is stored as it is.
             access_token: p.access_token,
             name: p.name,
             output_format: p.output_format,

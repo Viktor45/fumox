@@ -21,6 +21,10 @@ reqwest = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rand = { workspace = true }
+futures-util = { workspace = true }
+# `O_NOFOLLOW` for the meow config file: the constant is platform-specific.
+libc = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+rcgen = { workspace = true }

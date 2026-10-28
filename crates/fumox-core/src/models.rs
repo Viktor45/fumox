@@ -13,8 +13,7 @@ use std::str::FromStr;
 ///
 /// Serialized as the lower-case wire name used in subscription URIs and in
 /// the database. `naive` covers both `naive+https` and `naive+quic` origins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scheme {
     Vless,
     Vmess,
@@ -48,6 +47,29 @@ impl Scheme {
             Scheme::Naive => "naive",
             Scheme::Snell => "snell",
             Scheme::AnyTls => "anytls",
+        }
+    }
+
+    /// Every accepted spelling of this scheme, the canonical wire name
+    /// first.
+    ///
+    /// The table is the single source of truth: [`FromStr`] and the
+    /// `Deserialize` impl both read it, so a spelling one of them accepts
+    /// the other accepts too. `hy2` is the spelling subscription feeds
+    /// actually use for `hysteria2`.
+    pub const fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Scheme::Vless => &["vless"],
+            Scheme::Vmess => &["vmess"],
+            Scheme::Trojan => &["trojan"],
+            Scheme::Ss => &["ss"],
+            Scheme::Hysteria2 => &["hysteria2", "hy2"],
+            Scheme::Tuic => &["tuic"],
+            Scheme::Mieru => &["mieru"],
+            Scheme::Socks5 => &["socks5"],
+            Scheme::Naive => &["naive"],
+            Scheme::Snell => &["snell"],
+            Scheme::AnyTls => &["anytls"],
         }
     }
 
@@ -87,23 +109,36 @@ impl FromStr for Scheme {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let scheme = match s {
-            "vless" => Scheme::Vless,
-            "vmess" => Scheme::Vmess,
-            "trojan" => Scheme::Trojan,
-            "ss" => Scheme::Ss,
-            "hysteria2" | "hy2" => Scheme::Hysteria2,
-            "tuic" => Scheme::Tuic,
-            "mieru" => Scheme::Mieru,
-            "socks5" => Scheme::Socks5,
-            "naive" => Scheme::Naive,
-            "snell" => Scheme::Snell,
-            "anytls" => Scheme::AnyTls,
-            other => {
-                return Err(crate::Error::Parse(format!("unknown scheme: {other:?}")));
+        for scheme in Scheme::all() {
+            if scheme.aliases().contains(&s) {
+                return Ok(*scheme);
             }
-        };
-        Ok(scheme)
+        }
+        Err(crate::Error::Parse(format!("unknown scheme: {s:?}")))
+    }
+}
+
+/// The wire format reads the same alias table as [`FromStr`]: a config or
+/// an import file that spells a scheme `hy2` parses exactly like the string
+/// `"hy2"` does.
+impl<'de> Deserialize<'de> for Scheme {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse::<Scheme>().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The wire name of a scheme is its canonical alias, the spelling the
+/// database and the subscription URIs use.
+impl Serialize for Scheme {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -265,6 +300,19 @@ pub(crate) fn is_truthy_toggle(value: &str) -> bool {
     )
 }
 
+/// Whether `value` spells a falsy toggle (`0` / `false` / `no` / `off`,
+/// trimmed and case-insensitive).
+///
+/// The counterpart of [`is_truthy_toggle`]: an explicit switch that says
+/// "off" has to be honoured, otherwise a stated `tls: false` would be
+/// overruled by the SNI-implies-TLS rule.
+pub(crate) fn is_falsy_toggle(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 /// Whether the parameter switches certificate verification off: one of the
 /// [`INSECURE_ALIASES`] spellings carrying a truthy value.
 pub fn is_insecure_param(param: &Param) -> bool {
@@ -283,6 +331,9 @@ pub struct ProxyEntry {
     pub host: String,
     pub port: u16,
     /// uuid / password / `method:pass` / `user:pass`, scheme-dependent.
+    ///
+    /// A secret: it never leaves the server in a serialised form.
+    #[serde(skip_serializing)]
     pub credential: String,
     /// All parameters in original order (query pairs for URI schemes, JSON
     /// fields for vmess).
@@ -291,7 +342,9 @@ pub struct ProxyEntry {
     /// preserved verbatim for round-trip fidelity.
     pub raw_path: String,
     /// The exact source line this entry was parsed from (debugging and
-    /// recovery; `proxies.raw_line`).
+    /// recovery; `proxies.raw_line`). It carries the credential, so it is
+    /// a secret too.
+    #[serde(skip_serializing)]
     pub raw_line: String,
 }
 
@@ -349,6 +402,18 @@ impl ProxyEntry {
     }
 }
 
+/// Normalise a protocol allowlist: an empty list means "accept every
+/// scheme", the same as `None`.
+///
+/// The two spellings used to mean different things — `None` accepts every
+/// scheme, an empty list accepts none — but nothing checked the difference:
+/// a source with an empty allowlist dropped every entry at ingest and
+/// then failed every fetch with "no proxies left after the protocol
+/// allowlist", looking configured while loading nothing.
+pub fn normalize_protocols(protocols: Option<Vec<Scheme>>) -> Option<Vec<Scheme>> {
+    protocols.filter(|list| !list.is_empty())
+}
+
 /// Subscription source (`sources` table).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
@@ -371,7 +436,10 @@ pub struct Source {
     /// Processing rules, pipeline JSON v1. Validated by the
     /// pipeline module before storage.
     pub pipeline: Option<serde_json::Value>,
-    /// Extra HTTP headers sent with the fetch request.
+    /// Extra HTTP headers sent with the fetch request. They usually carry
+    /// an `Authorization`, so the map is a secret and never leaves the
+    /// server in a serialised form.
+    #[serde(default, skip_serializing)]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Preferred IP protocol family for fetching the URL.
     /// `None` inherits the deployment default (`[fetch] ip_family`); a set
@@ -432,7 +500,10 @@ pub struct Profile {
     /// `nanoid(12)`; doubles as the `/sub/{id}` token when `slug` is unset.
     pub id: String,
     pub slug: Option<String>,
-    /// Optional access token for `/sub`; `None` = public.
+    /// Optional access token for `/sub`; `None` = public. The token is a
+    /// secret (the database keeps its hash), so it never leaves the server
+    /// in a serialised form.
+    #[serde(default, skip_serializing)]
     pub access_token: Option<String>,
     pub name: String,
     pub output_format: OutputFormat,
@@ -609,12 +680,109 @@ mod tests {
                 serde_json::to_string(scheme).unwrap(),
                 format!("\"{}\"", scheme.as_str())
             );
+            let from_json: Scheme = serde_json::from_str(&format!("\"{}\"", scheme.as_str()))
+                .expect("the canonical wire name must parse");
+            assert_eq!(from_json, *scheme);
+        }
+    }
+
+    /// One alias table, two entry points: every spelling a scheme accepts
+    /// is accepted by `FromStr` *and* by the serde deserializer, so a
+    /// config or an import file that spells a scheme `hy2` is not rejected
+    /// while the same word parses as a string.
+    #[test]
+    fn every_scheme_alias_parses_on_both_paths() {
+        for scheme in Scheme::all() {
+            for alias in scheme.aliases() {
+                assert_eq!(
+                    alias.parse::<Scheme>().unwrap(),
+                    *scheme,
+                    "FromStr must accept {alias}"
+                );
+                let from_json: Scheme = serde_json::from_str(&format!("\"{alias}\""))
+                    .unwrap_or_else(|err| {
+                        panic!("serde must accept {alias}: {err}");
+                    });
+                assert_eq!(from_json, *scheme, "serde must accept {alias}");
+            }
+        }
+    }
+
+    /// The alias table is the single source of truth: the canonical wire
+    /// name is the first alias of its scheme.
+    #[test]
+    fn the_canonical_wire_name_is_the_first_alias() {
+        for scheme in Scheme::all() {
+            assert_eq!(scheme.aliases().first(), Some(&scheme.as_str()));
         }
     }
 
     #[test]
     fn scheme_hy2_alias_parses() {
         assert_eq!("hy2".parse::<Scheme>().unwrap(), Scheme::Hysteria2);
+    }
+
+    /// A serialised model carries no secret: the proxy credential, the
+    /// source headers and the profile access token never reach a JSON dump.
+    #[test]
+    fn serialised_models_carry_no_secret() {
+        let entry = ProxyEntry {
+            scheme: Scheme::Vless,
+            name: "n".into(),
+            host: "h".into(),
+            port: 443,
+            credential: "super-secret-uuid".into(),
+            params: Vec::new(),
+            raw_path: "/ws".into(),
+            raw_line: "vless://super-secret-uuid@h:443".into(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("super-secret-uuid"), "{json}");
+
+        let source = Source {
+            id: "s".into(),
+            slug: None,
+            name: "n".into(),
+            url: "https://example.com".into(),
+            enabled: true,
+            encoding: Encoding::Auto,
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 60,
+            tags: None,
+            pipeline: None,
+            headers: Some(std::collections::BTreeMap::from([(
+                "Authorization".into(),
+                "Bearer super-secret-header".into(),
+            )])),
+            ip_family: None,
+            created_at: 0,
+            updated_at: 0,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        assert!(!json.contains("super-secret-header"), "{json}");
+        // The field is gone entirely, not emptied: there is no key to fill
+        // with a secret later.
+        assert!(!json.contains("headers"), "{json}");
+
+        let profile = Profile {
+            id: "p".into(),
+            slug: None,
+            access_token: Some("super-secret-token".into()),
+            name: "n".into(),
+            output_format: OutputFormat::UriList,
+            pipeline: None,
+            countries: Vec::new(),
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(!json.contains("super-secret-token"), "{json}");
+        assert!(!json.contains("access_token"), "{json}");
     }
 
     #[test]

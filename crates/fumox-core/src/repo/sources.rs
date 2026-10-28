@@ -51,7 +51,8 @@ impl TryFrom<SourceRow> for Source {
                         .map(|name| name.parse::<Scheme>())
                         .collect::<Result<Vec<_>, _>>()
                 })
-                .transpose()?,
+                .transpose()?
+                .filter(|list| !list.is_empty()),
             cache_ttl_seconds: row.cache_ttl_seconds,
             tags: row
                 .tags
@@ -86,14 +87,15 @@ impl TryFrom<SourceRow> for Source {
     }
 }
 
+/// The protocol allowlist as stored. An empty list means "no filter", the
+/// same as `None`, so it is stored as NULL: a source with an empty
+/// allowlist would drop every entry at ingest and fail every fetch.
 fn protocols_json(protocols: &Option<Vec<Scheme>>) -> crate::Result<Option<String>> {
-    protocols
-        .as_ref()
-        .map(|list| {
-            let names: Vec<&str> = list.iter().map(|scheme| scheme.as_str()).collect();
-            super::json_to_text(&serde_json::to_value(names).expect("scheme list serializes"))
-        })
-        .transpose()
+    let Some(list) = crate::models::normalize_protocols(protocols.clone()) else {
+        return Ok(None);
+    };
+    let names: Vec<&str> = list.iter().map(|scheme| scheme.as_str()).collect();
+    super::json_to_text(&serde_json::to_value(names).expect("scheme list serializes")).map(Some)
 }
 
 fn headers_json(
@@ -222,7 +224,9 @@ pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
     .await?
     .rows_affected();
     if affected == 0 {
-        return Err(crate::Error::Database(sqlx::Error::RowNotFound.to_string()));
+        // The row is gone, not the database: the caller can answer "not
+        // found" instead of "the write failed".
+        return Err(crate::Error::NotFound(format!("source {}", source.id)));
     }
     Ok(())
 }
@@ -599,6 +603,37 @@ mod tests {
             loaded.last_fetched_at.is_none(),
             "a fetch-relevant edit must reset the freshness stamp"
         );
+    }
+
+    /// An empty protocol allowlist means "no filter", the same as `None`:
+    /// a source that stored one dropped every entry at ingest and failed
+    /// every fetch, so the empty list is normalised away on the way in
+    /// and on the way out.
+    #[tokio::test]
+    async fn an_empty_protocol_allowlist_is_stored_as_no_filter() {
+        let (_dir, pool) = temp_pool().await;
+        let mut source = sample_source("src8hhhhhhhh");
+        source.protocols = Some(Vec::new());
+        create(&pool, &source).await.unwrap();
+
+        let stored: (Option<String>,) =
+            sqlx::query_as("SELECT protocols FROM sources WHERE id = 'src8hhhhhhhh'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0, None, "an empty allowlist is stored as NULL");
+
+        let loaded = get(&pool, "src8hhhhhhhh").await.unwrap().unwrap();
+        assert_eq!(loaded.protocols, None);
+
+        // A row that still carries an empty list reads back as "no filter"
+        // too.
+        sqlx::query("UPDATE sources SET protocols = '[]' WHERE id = 'src8hhhhhhhh'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let loaded = get(&pool, "src8hhhhhhhh").await.unwrap().unwrap();
+        assert_eq!(loaded.protocols, None);
     }
 
     #[tokio::test]

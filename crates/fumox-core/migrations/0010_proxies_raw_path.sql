@@ -1,0 +1,12 @@
+-- The path segment of the parsed URI (`/ws`, `/path?query` without the
+-- query), preserved verbatim for the round trip.
+--
+-- The model carries `raw_path`, but the table had no column for it, so
+-- every stored proxy came back with an empty path: a subscription rebuilt
+-- from the database dropped the path segment of a node (a `trojan://…/ws`
+-- line was served as `trojan://…`), and a client that reads the path from
+-- the URI segment connected to the wrong endpoint.
+--
+-- NULL for rows written before the column existed; an empty string is the
+-- path of a URI without one.
+ALTER TABLE proxies ADD COLUMN raw_path TEXT;

@@ -45,6 +45,14 @@ const NON_PROXY_TYPES: &[&str] = &[
     "loopback",
 ];
 
+/// Upper bound on the users processed per Xray endpoint.
+///
+/// Every user is a separate credential and therefore a separate entry with
+/// its own parameter set, so an endpoint carrying a million users turns a
+/// small payload into a million rows. The cap bounds the work per endpoint;
+/// the dropped users are counted as invalid.
+const MAX_USERS_PER_ENDPOINT: usize = 16;
+
 /// Result of parsing a sing-box / Xray JSON payload.
 #[derive(Debug, Default)]
 pub struct SingBoxParseResult {
@@ -53,6 +61,8 @@ pub struct SingBoxParseResult {
     pub unsupported: usize,
     /// Outbound objects missing required fields or over the parameter cap.
     pub invalid: usize,
+    /// Outbounds left out because the payload reached the entry cap.
+    pub skipped: usize,
 }
 
 /// Parse a full sing-box / Xray JSON payload: a root object with an
@@ -133,7 +143,18 @@ fn parse_outbound(outbound: &Value, result: &mut SingBoxParseResult) {
         }
     };
     match built {
-        Ok(entries) => result.entries.extend(entries),
+        Ok(built) => {
+            for entry in built.entries {
+                if result.entries.len() >= super::MAX_ENTRIES {
+                    result.skipped += 1;
+                    continue;
+                }
+                result.entries.push(entry);
+            }
+            // The users dropped by the per-endpoint cap are counted as
+            // invalid: they were recognized but not stored.
+            result.invalid += built.dropped;
+        }
         Err(message) => {
             tracing::debug!(error = %message, "skipping malformed sing-box outbound");
             result.invalid += 1;
@@ -141,8 +162,18 @@ fn parse_outbound(outbound: &Value, result: &mut SingBoxParseResult) {
     }
 }
 
-fn vec1(entry: ProxyEntry) -> Vec<ProxyEntry> {
-    vec![entry]
+/// What one outbound produced: its entries plus the users dropped by the
+/// per-endpoint cap.
+struct XrayOutbound {
+    entries: Vec<ProxyEntry>,
+    dropped: usize,
+}
+
+fn vec1(entry: ProxyEntry) -> XrayOutbound {
+    XrayOutbound {
+        entries: vec![entry],
+        dropped: 0,
+    }
 }
 
 // sing-box native dialect
@@ -367,9 +398,13 @@ fn native_tls_params(
 ) {
     let enabled = tls.get("enabled").and_then(Value::as_bool).unwrap_or(false);
     let reality = tls.get("reality").and_then(Value::as_object);
-    let reality_key = reality.and_then(|r| str_field(r, "public_key")).is_some();
-    let reality_on = reality_key
-        || reality.is_some_and(|r| r.get("enabled").and_then(Value::as_bool) == Some(true));
+    // An explicit `enabled: false` switches REALITY off, public key or not.
+    // Without the switch the legacy lenient mode applies: a public key means
+    // REALITY.
+    let reality_on = reality.is_some_and(|r| match r.get("enabled").and_then(Value::as_bool) {
+        Some(enabled) => enabled,
+        None => str_field(r, "public_key").is_some(),
+    });
     if !enabled && !reality_on {
         return;
     }
@@ -464,8 +499,9 @@ fn native_transport_params(
 
 // Xray/v2ray-core ("vnext") dialect
 
-fn xray_vless(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
+fn xray_vless(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, String> {
     let mut entries = Vec::new();
+    let mut dropped = 0usize;
     let mut endpoints = 0usize;
     for vnext in xray_settings_list(map, "vnext")? {
         endpoints += 1;
@@ -474,7 +510,9 @@ fn xray_vless(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, S
             continue;
         };
         let mut built = 0usize;
-        for user in xray_users(vnext) {
+        let (users, endpoint_dropped) = xray_users(vnext);
+        dropped += endpoint_dropped;
+        for user in users {
             let Some(id) = str_field(user, "id") else {
                 tracing::debug!("sing-box: xray vless user without id, skipped");
                 continue;
@@ -523,11 +561,12 @@ fn xray_vless(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, S
     if endpoints > 0 && entries.is_empty() {
         return Err("xray: vless vnext without a usable user".to_string());
     }
-    Ok(entries)
+    Ok(XrayOutbound { entries, dropped })
 }
 
-fn xray_vmess(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
+fn xray_vmess(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, String> {
     let mut entries = Vec::new();
+    let mut dropped = 0usize;
     let mut endpoints = 0usize;
     for vnext in xray_settings_list(map, "vnext")? {
         endpoints += 1;
@@ -536,7 +575,9 @@ fn xray_vmess(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, S
             continue;
         };
         let mut built = 0usize;
-        for user in xray_users(vnext) {
+        let (users, endpoint_dropped) = xray_users(vnext);
+        dropped += endpoint_dropped;
+        for user in users {
             let Some(id) = str_field(user, "id") else {
                 tracing::debug!("sing-box: xray vmess user without id, skipped");
                 continue;
@@ -582,10 +623,10 @@ fn xray_vmess(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, S
     if endpoints > 0 && entries.is_empty() {
         return Err("xray: vmess vnext without a usable user".to_string());
     }
-    Ok(entries)
+    Ok(XrayOutbound { entries, dropped })
 }
 
-fn xray_trojan(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
+fn xray_trojan(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, String> {
     let mut entries = Vec::new();
     let mut servers = 0usize;
     for server in xray_settings_list(map, "servers")? {
@@ -626,10 +667,13 @@ fn xray_trojan(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, 
     if servers > 0 && entries.is_empty() {
         return Err("xray: trojan server without a usable endpoint".to_string());
     }
-    Ok(entries)
+    Ok(XrayOutbound {
+        entries,
+        dropped: 0,
+    })
 }
 
-fn xray_ss(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
+fn xray_ss(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, String> {
     let settings = map.get("settings").and_then(Value::as_object);
     let plugin = settings
         .and_then(|s| s.get("plugin"))
@@ -681,11 +725,15 @@ fn xray_ss(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, Stri
     if servers > 0 && entries.is_empty() {
         return Err("xray: shadowsocks server without a usable endpoint".to_string());
     }
-    Ok(entries)
+    Ok(XrayOutbound {
+        entries,
+        dropped: 0,
+    })
 }
 
-fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, String> {
+fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<XrayOutbound, String> {
     let mut entries = Vec::new();
+    let mut dropped = 0usize;
     let mut servers = 0usize;
     for server in xray_settings_list(map, "servers")? {
         servers += 1;
@@ -699,7 +747,10 @@ fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, S
         };
         // A socks server without a `users` list is a no-auth proxy and still
         // yields one entry; with a list, every user is a separate proxy.
-        let users: Vec<(String, String)> = xray_users(server)
+        let (users, endpoint_dropped) = xray_users(server);
+        dropped += endpoint_dropped;
+        let users: Vec<(String, String)> = users
+            .into_iter()
             .map(|user| {
                 (
                     str_field(user, "user").unwrap_or_default().to_string(),
@@ -734,7 +785,7 @@ fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, S
     if servers > 0 && entries.is_empty() {
         return Err("xray: socks server without a usable endpoint".to_string());
     }
-    Ok(entries)
+    Ok(XrayOutbound { entries, dropped })
 }
 
 /// The `users` array of one Xray endpoint (`vnext[i].users`,
@@ -745,12 +796,29 @@ fn xray_socks(map: &Map<String, Value>, name: &str) -> Result<Vec<ProxyEntry>, S
 /// `vnext`/`servers` arrays already get, and the reason a multi-user
 /// outbound must not be collapsed to its first element. A junk element
 /// costs only itself (log-and-skip), not the credentials around it.
-fn xray_users(map: &Map<String, Value>) -> impl Iterator<Item = &Map<String, Value>> {
-    map.get("users")
+///
+/// At most [`MAX_USERS_PER_ENDPOINT`] users are processed; the rest are
+/// counted as invalid, so one endpoint cannot turn a small payload into an
+/// unbounded number of rows.
+fn xray_users(map: &Map<String, Value>) -> (Vec<&Map<String, Value>>, usize) {
+    let users: Vec<&Map<String, Value>> = map
+        .get("users")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_object)
+        .collect();
+    if users.len() > MAX_USERS_PER_ENDPOINT {
+        let dropped = users.len() - MAX_USERS_PER_ENDPOINT;
+        tracing::warn!(
+            users = users.len(),
+            cap = MAX_USERS_PER_ENDPOINT,
+            dropped,
+            "sing-box: endpoint carries more users than the cap, the rest are dropped"
+        );
+        return (users[..MAX_USERS_PER_ENDPOINT].to_vec(), dropped);
+    }
+    (users, 0)
 }
 
 /// Outbound keys consumed structurally by every Xray builder; `mux` is a
@@ -791,7 +859,8 @@ fn xray_stream_params(
     let network = str_field(stream, "network").unwrap_or("tcp");
     // TCP is the implicit transport in every dialect; `type=tcp` is stored
     // only when it carries HTTP obfuscation (see the `tcp` arm below).
-    if network != "tcp" {
+    // Xray renamed `tcp` to `raw` in 1.8.24; it is the same transport.
+    if network != "tcp" && network != "raw" {
         push_param(params, true, network_key, network);
     }
     match str_field(stream, "security") {
@@ -857,13 +926,15 @@ fn xray_stream_params(
                 {
                     push_param(params, true, "host", host);
                 }
+                passthrough_settings(params, ws, &["path", "headers"]);
             }
         }
         "grpc" => {
-            if let Some(grpc) = stream.get("grpcSettings").and_then(Value::as_object)
-                && let Some(service) = str_field(grpc, "serviceName")
-            {
-                push_param(params, true, "serviceName", service);
+            if let Some(grpc) = stream.get("grpcSettings").and_then(Value::as_object) {
+                if let Some(service) = str_field(grpc, "serviceName") {
+                    push_param(params, true, "serviceName", service);
+                }
+                passthrough_settings(params, grpc, &["serviceName"]);
             }
         }
         "http" | "h2" => {
@@ -874,6 +945,7 @@ fn xray_stream_params(
                 if let Some(path) = str_field(http, "path") {
                     push_param(params, true, "path", path);
                 }
+                passthrough_settings(params, http, &["host", "path"]);
             }
         }
         "httpupgrade" => {
@@ -884,6 +956,7 @@ fn xray_stream_params(
                 if let Some(host) = str_field(upgrade, "host") {
                     push_param(params, true, "host", host);
                 }
+                passthrough_settings(params, upgrade, &["path", "host"]);
             }
         }
         "xhttp" | "splithttp" => {
@@ -900,32 +973,48 @@ fn xray_stream_params(
                 if let Some(extra) = xhttp.get("extra") {
                     push_param(params, false, "extra", json_to_param_value(extra));
                 }
+                passthrough_settings(params, xhttp, &["host", "path", "mode", "extra"]);
+            }
+        }
+        // The mKCP and QUIC transports have no URI spelling the clients
+        // understand, so their whole settings block passes through as one
+        // unknown parameter: nothing is lost, and a client that knows the
+        // transport can still read it.
+        "kcp" | "quic" => {
+            let key = format!("{network}Settings");
+            if let Some(settings) = stream.get(&key) {
+                push_param(params, false, &key, json_to_param_value(settings));
             }
         }
         // TCP with HTTP obfuscation (`header.type: "http"`); plain TCP
-        // (`type: "none"` or absent) maps to no parameters at all.
-        "tcp" => {
-            if let Some(header) = stream
-                .get("tcpSettings")
-                .and_then(Value::as_object)
-                .and_then(|tcp| tcp.get("header"))
-                .and_then(Value::as_object)
-                && str_field(header, "type") == Some("http")
-            {
-                push_param(params, true, network_key, "tcp");
-                push_param(params, true, "headertype", "http");
-                if let Some(request) = header.get("request").and_then(Value::as_object) {
-                    if let Some(path) = string_or_joined_array(request.get("path")) {
-                        push_param(params, true, "path", path);
-                    }
-                    if let Some(host) = request
-                        .get("headers")
-                        .and_then(Value::as_object)
-                        .and_then(|headers| string_or_joined_array(headers.get("Host")))
-                    {
-                        push_param(params, true, "host", host);
+        // (`type: "none"` or absent) maps to no parameters at all. Xray's
+        // `raw` is the renamed TCP transport and carries the same block.
+        "tcp" | "raw" => {
+            let key = if network == "raw" {
+                "rawSettings"
+            } else {
+                "tcpSettings"
+            };
+            if let Some(settings) = stream.get(key).and_then(Value::as_object) {
+                if let Some(header) = settings.get("header").and_then(Value::as_object)
+                    && str_field(header, "type") == Some("http")
+                {
+                    push_param(params, true, network_key, "tcp");
+                    push_param(params, true, "headertype", "http");
+                    if let Some(request) = header.get("request").and_then(Value::as_object) {
+                        if let Some(path) = string_or_joined_array(request.get("path")) {
+                            push_param(params, true, "path", path);
+                        }
+                        if let Some(host) = request
+                            .get("headers")
+                            .and_then(Value::as_object)
+                            .and_then(|headers| string_or_joined_array(headers.get("Host")))
+                        {
+                            push_param(params, true, "host", host);
+                        }
                     }
                 }
+                passthrough_settings(params, settings, &["header"]);
             }
         }
         _ => {}
@@ -950,6 +1039,21 @@ fn passthrough(map: &Map<String, Value>, consumed: &[&str], params: &mut Vec<Par
     }
 }
 
+/// Keep the keys of a transport settings object the mapping did not consume.
+///
+/// A settings block carries transport identity (`maxEarlyData`,
+/// `earlyDataHeaderName`, `seed`, …); dropping the unused ones loses
+/// information, so they pass through under their original names as unknown
+/// parameters.
+fn passthrough_settings(params: &mut Vec<Param>, settings: &Map<String, Value>, consumed: &[&str]) {
+    for (key, value) in settings {
+        if consumed.contains(&key.as_str()) || value.is_null() {
+            continue;
+        }
+        push_param(params, false, key, json_to_param_value(value));
+    }
+}
+
 /// Assemble the final entry: reject line breaks (the URI serializers emit
 /// these fields verbatim) and enforce the parameter cap.
 fn finish(
@@ -960,8 +1064,18 @@ fn finish(
     credential: String,
     params: Vec<Param>,
 ) -> Result<ProxyEntry, String> {
+    let host = super::normalize_host(&host);
+    if host.is_empty() {
+        return Err("sing-box: empty server".to_string());
+    }
     super::reject_line_breaks("sing-box: server", &host)?;
     super::reject_line_breaks("sing-box: credential", &credential)?;
+    // The host, the credential and the name are stored verbatim on every
+    // row, so an oversized one is a storage bomb (the vector formats are
+    // not bounded as a whole the way a URI list is).
+    super::check_field_size("sing-box: server", &host)?;
+    super::check_field_size("sing-box: credential", &credential)?;
+    super::check_field_size("sing-box: name", name)?;
     // JSON strings may contain `\n`, and the URI serializers emit these
     // fields verbatim (see `parsers::reject_line_breaks`).
     for param in &params {
@@ -1402,6 +1516,40 @@ mod tests {
         assert_eq!(result.invalid, 4);
     }
 
+    /// An empty server is not a proxy: it must be counted as invalid instead
+    /// of stored as a row whose host is the empty string. An oversized host
+    /// or credential is a storage bomb the same way (the vector formats are
+    /// not bounded as a whole the way a URI list is).
+    #[test]
+    fn an_empty_or_oversized_server_is_invalid() {
+        let long = "h".repeat(crate::parsers::uri::MAX_PARAM_BYTES + 1);
+        let payload = format!(
+            r#"{{"outbounds":[
+                {{"type":"vless","tag":"empty","server":"","server_port":443,"uuid":"u"}},
+                {{"type":"vless","tag":"huge","server":"{long}","server_port":443,"uuid":"u"}},
+                {{"type":"trojan","tag":"ok","server":"h.example.com","server_port":443,
+                 "password":"p"}}]}}"#
+        );
+        let result = parse_payload(&payload).unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.invalid, 2);
+    }
+
+    /// The stored host must have one shape whatever the source spelled it:
+    /// the URI parser stores the bare literal, so a server written the URI
+    /// way (`[2001:db8::1]`) is stored bare too.
+    #[test]
+    fn a_bracketed_ipv6_server_is_stored_bare() {
+        let result = parse_payload(
+            r#"{"outbounds":[
+                {"type":"trojan","tag":"v6","server":"[2001:db8::1]","server_port":443,
+                 "password":"p"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].host, "2001:db8::1");
+    }
+
     /// An Xray endpoint may carry several credentials in `users`; each is a
     /// distinct proxy. Truncating to the first entry silently dropped the
     /// rest, with no log line and no invalid counter to show for it.
@@ -1657,10 +1805,113 @@ mod tests {
         assert_eq!(result.invalid, 1);
     }
 
+    /// An explicit `reality.enabled: false` switches REALITY off, public key
+    /// or not: the node is a plain TLS node then.
+    #[test]
+    fn an_explicitly_disabled_reality_is_off() {
+        let entry = parse_one(
+            r#"{"outbounds":[{"type":"vless","tag":"r","server":"h.example.com","server_port":443,
+                "uuid":"u1",
+                "tls":{"enabled":true,"server_name":"s.example.com",
+                       "reality":{"enabled":false,"public_key":"PBK"}}}]}"#,
+        );
+        assert_eq!(entry.param("security"), Some("tls"));
+        assert_eq!(entry.param("pbk"), None);
+    }
+
+    /// The mKCP and QUIC transports have no URI spelling the clients
+    /// understand: their settings block must pass through as one unknown
+    /// parameter instead of being dropped.
+    #[test]
+    fn the_kcp_and_quic_settings_pass_through() {
+        let kcp = parse_one(
+            r#"{"outbounds":[{"protocol":"vless","tag":"k",
+                "settings":{"vnext":[{"address":"h.example.com","port":443,
+                    "users":[{"id":"u1","encryption":"none"}]}]},
+                "streamSettings":{"network":"kcp","security":"none",
+                    "kcpSettings":{"seed":"s0ed","header":{"type":"srtp"}}}}]}"#,
+        );
+        assert_eq!(kcp.param("type"), Some("kcp"));
+        let settings = kcp
+            .param("kcpSettings")
+            .expect("the kcp settings must survive");
+        assert!(settings.contains("s0ed"), "{settings}");
+
+        let quic = parse_one(
+            r#"{"outbounds":[{"protocol":"vless","tag":"q",
+                "settings":{"vnext":[{"address":"h.example.com","port":443,
+                    "users":[{"id":"u1","encryption":"none"}]}]},
+                "streamSettings":{"network":"quic","security":"none",
+                    "quicSettings":{"security":"aes-128-gcm","key":"k"}}}]}"#,
+        );
+        assert_eq!(quic.param("type"), Some("quic"));
+        let settings = quic
+            .param("quicSettings")
+            .expect("the quic settings must survive");
+        assert!(settings.contains("aes-128-gcm"), "{settings}");
+    }
+
+    /// The keys of a transport settings block the mapping does not consume
+    /// describe the transport and must not be dropped.
+    #[test]
+    fn unused_transport_settings_keys_survive() {
+        let entry = parse_one(
+            r#"{"outbounds":[{"protocol":"vless","tag":"w",
+                "settings":{"vnext":[{"address":"h.example.com","port":443,
+                    "users":[{"id":"u1","encryption":"none"}]}]},
+                "streamSettings":{"network":"ws","security":"none",
+                    "wsSettings":{"path":"/ws","maxEarlyData":2048,
+                        "earlyDataHeaderName":"Sec-WebSocket-Protocol"}}}]}"#,
+        );
+        assert_eq!(entry.param("path"), Some("/ws"));
+        assert_eq!(entry.param("maxEarlyData"), Some("2048"));
+        assert_eq!(
+            entry.param("earlyDataHeaderName"),
+            Some("Sec-WebSocket-Protocol")
+        );
+    }
+
+    /// Xray renamed the TCP transport to `raw`; it is the same transport and
+    /// carries the same settings block.
+    #[test]
+    fn the_raw_transport_is_the_tcp_one() {
+        let entry = parse_one(
+            r#"{"outbounds":[{"protocol":"vless","tag":"r",
+                "settings":{"vnext":[{"address":"h.example.com","port":443,
+                    "users":[{"id":"u1","encryption":"none"}]}]},
+                "streamSettings":{"network":"raw","security":"none",
+                    "rawSettings":{"header":{"type":"http",
+                        "request":{"path":["/raw"],"headers":{"Host":["raw.example.net"]}}}}}}]}"#,
+        );
+        assert_eq!(entry.param("type"), Some("tcp"));
+        assert_eq!(entry.param("headertype"), Some("http"));
+        assert_eq!(entry.param("path"), Some("/raw"));
+        assert_eq!(entry.param("host"), Some("raw.example.net"));
+    }
+
+    /// An endpoint with more users than the cap yields only the first ones;
+    /// the rest are counted as invalid.
+    #[test]
+    fn the_users_of_an_endpoint_are_capped() {
+        let users: Vec<String> = (0..40)
+            .map(|i| format!(r#"{{"id":"u{i}","encryption":"none"}}"#))
+            .collect();
+        let payload = format!(
+            r#"{{"outbounds":[{{"protocol":"vless","tag":"m",
+                "settings":{{"vnext":[{{"address":"h.example.com","port":443,
+                    "users":[{}]}}]}}}}]}}"#,
+            users.join(",")
+        );
+        let result = parse_payload(&payload).unwrap();
+        assert_eq!(result.entries.len(), MAX_USERS_PER_ENDPOINT);
+        assert_eq!(result.invalid, 40 - MAX_USERS_PER_ENDPOINT);
+    }
+
     // Fixture tests against the real sing-box/Xray samples `test-sing.txt`
     // (single Xray config) and `test-sing2.txt` (v2rayN share array). The
-    // fixtures are gitignored (real credentials) and never committed;
-    // these tests skip themselves when the files are absent.
+    // fixtures are gitignored (real credentials) and never committed, so
+    // these tests are ignored by default: the committed synthetic fixtures
+    // below carry the mandatory coverage.
 
     fn fixture_payload(name: &str) -> Option<String> {
         std::fs::read_to_string(
@@ -1669,12 +1920,82 @@ mod tests {
         .ok()
     }
 
+    /// The committed synthetic fixture: generated outbounds without real
+    /// credentials, committed so the fixture tests always run.
+    fn synthetic_fixture(name: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("fixture {} unreadable: {e}", path.display()))
+    }
+
+    /// The transports and TLS modes the synthetic fixture must cover, so a
+    /// shrunken fixture cannot silently reduce the coverage.
+    fn assert_variety(entries: &[ProxyEntry]) {
+        let mut transports: Vec<&str> = entries.iter().filter_map(|e| e.param("type")).collect();
+        transports.sort_unstable();
+        transports.dedup();
+        assert!(transports.contains(&"ws"), "{transports:?}");
+        assert!(transports.contains(&"grpc"), "{transports:?}");
+        assert!(transports.contains(&"http"), "{transports:?}");
+        let reality = entries
+            .iter()
+            .filter(|e| e.param("security") == Some("reality"))
+            .count();
+        assert!(reality > 0, "no REALITY node in the fixture");
+        let tls = entries
+            .iter()
+            .filter(|e| e.param("security") == Some("tls"))
+            .count();
+        assert!(tls > 0, "no TLS node in the fixture");
+    }
+
     #[test]
+    fn synthetic_fixture_single_config_parses_and_round_trips() {
+        let payload = synthetic_fixture("singbox-config.json");
+        let result = parse_payload(&payload).unwrap();
+        // The whole-pipeline path must auto-detect the format too.
+        let via_auto =
+            crate::parsers::parse_subscription(&payload, crate::models::Encoding::Auto, None)
+                .unwrap();
+        assert_eq!(via_auto.format, crate::models::InputFormat::SingBoxJson);
+        assert_eq!(via_auto.entries.len(), result.entries.len());
+        assert_eq!(via_auto.clash_skipped, 0);
+        assert_eq!(result.invalid, 0, "no outbound should be malformed");
+        assert_eq!(result.unsupported, 0);
+        assert_eq!(result.entries.len(), 32);
+        assert!(result.entries.iter().all(|e| e.scheme == Scheme::Vless));
+        assert_variety(&result.entries);
+        for entry in &result.entries {
+            assert_output_round_trip(entry);
+        }
+    }
+
+    #[test]
+    fn synthetic_fixture_share_array_parses_and_round_trips() {
+        let payload = synthetic_fixture("singbox-share.json");
+        let result = parse_payload(&payload).unwrap();
+        let via_auto =
+            crate::parsers::parse_subscription(&payload, crate::models::Encoding::Auto, None)
+                .unwrap();
+        assert_eq!(via_auto.format, crate::models::InputFormat::SingBoxJson);
+        assert_eq!(via_auto.entries.len(), result.entries.len());
+        assert_eq!(via_auto.clash_skipped, 0);
+        assert_eq!(result.invalid, 0, "no outbound should be malformed");
+        assert_eq!(result.unsupported, 0);
+        assert_eq!(result.entries.len(), 72);
+        assert_variety(&result.entries);
+        for entry in &result.entries {
+            assert_output_round_trip(entry);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local gitignored fixture test-sing.txt"]
     fn fixture_single_config_parses_and_round_trips() {
-        let Some(payload) = fixture_payload("test-sing.txt") else {
-            eprintln!("skipped: test-sing.txt fixture is absent (gitignored debug file)");
-            return;
-        };
+        let payload = fixture_payload("test-sing.txt")
+            .expect("the local gitignored fixture test-sing.txt is required for this test");
         let result = parse_payload(&payload).unwrap();
         // The whole-pipeline path must auto-detect the format too.
         let via_auto =
@@ -1697,11 +2018,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the local gitignored fixture test-sing2.txt"]
     fn fixture_share_array_parses_and_round_trips() {
-        let Some(payload) = fixture_payload("test-sing2.txt") else {
-            eprintln!("skipped: test-sing2.txt fixture is absent (gitignored debug file)");
-            return;
-        };
+        let payload = fixture_payload("test-sing2.txt")
+            .expect("the local gitignored fixture test-sing2.txt is required for this test");
         let result = parse_payload(&payload).unwrap();
         let via_auto =
             crate::parsers::parse_subscription(&payload, crate::models::Encoding::Auto, None)

@@ -9,6 +9,35 @@ use crate::db::DbPool;
 use crate::repo::proxies::{T1_EXCLUDED_SCHEMES, T1Candidate};
 use sqlx::FromRow;
 
+/// `probe_results.probe_kind` of a tunnel check that produced a verdict:
+/// the engine answered and the tunnel either came up or died.
+pub const T2_KIND: &str = "t2";
+
+/// `probe_results.probe_kind` of a tunnel attempt that produced *no*
+/// verdict because the tunnel engine was down (a ping, config-reload or
+/// mid-batch failure).
+///
+/// The separate label is what tells a log consumer and the admin panel
+/// "the engine failed" apart from "the proxy failed": an unverified
+/// attempt says nothing about the proxy and never charges its fail
+/// budget.
+pub const T2_UNVERIFIED_KIND: &str = "t2_unverified";
+
+/// The T2 kinds as a SQL literal list. Every query that asks "did this
+/// proxy get a tunnel attempt?" uses it, so an unverified attempt still
+/// counts as an attempt: the recency queue has to advance past a row
+/// whose check never ran.
+pub const T2_KINDS_SQL: &str = "'t2', 't2_unverified'";
+
+/// Whether a `probe_kind` belongs to the T2 tier.
+///
+/// The fail ladder follows it: a T1 success must not wipe the counter a
+/// T2 failure accumulated, and an unverified T2 attempt is still a T2
+/// attempt, so it keeps the counter too.
+pub fn is_t2_kind(kind: &str) -> bool {
+    matches!(kind, T2_KIND | T2_UNVERIFIED_KIND)
+}
+
 // Cross-process `meta` payloads (probe daemon <-> admin panel)
 
 /// Wire contracts of the `meta` stamps the probe daemon and the admin
@@ -189,6 +218,40 @@ pub async fn insert(pool: &DbPool, entry: &ProbeResultEntry<'_>) -> crate::Resul
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// How many rows one journal statement carries. Six binds per row, so a
+/// chunk of 100 stays well below the variable limit of every SQLite build
+/// the project supports.
+const JOURNAL_CHUNK: usize = 100;
+
+/// Insert a batch of journal rows in one statement per chunk.
+///
+/// A batch of failures used to write its rows one by one, and every row
+/// was its own round trip to the database. The batch is one statement
+/// now: the rows land together or not at all.
+pub async fn insert_many(pool: &DbPool, entries: &[ProbeResultEntry<'_>]) -> crate::Result<u64> {
+    let mut written = 0u64;
+    for chunk in entries.chunks(JOURNAL_CHUNK) {
+        let placeholders = vec!["(?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+        let sql = format!(
+            "INSERT INTO probe_results
+                (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
+             VALUES {placeholders}"
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        for entry in chunk {
+            query = query
+                .bind(entry.proxy_id)
+                .bind(entry.checked_at)
+                .bind(entry.ok)
+                .bind(entry.latency_ms)
+                .bind(entry.error)
+                .bind(entry.probe_kind);
+        }
+        written += query.execute(pool).await?.rows_affected();
+    }
+    Ok(written)
 }
 
 /// Delete probe history older than the cutoff (retention).
@@ -400,6 +463,18 @@ pub async fn claim_checks(pool: &DbPool, proxy_ids: &[i64]) -> crate::Result<u64
     Ok(claimed)
 }
 
+/// How many entries are still waiting for their first check.
+///
+/// The cycle log compares this before and after a cycle: a queue that
+/// does not drain is invisible in the check counters (the cycle checked
+/// its quota, the queue grew anyway).
+pub async fn queue_depth(pool: &DbPool) -> crate::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_requests")
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
 /// Drop requests for proxies that no longer need the priority lane (already
 /// checked by the random path, quarantined or removed). Deleted proxies are
 /// removed by the FK cascade.
@@ -433,6 +508,23 @@ pub async fn purge_requests_before(pool: &DbPool, cutoff: i64) -> crate::Result<
 mod tests {
     use super::*;
     use crate::repo::tests::temp_pool;
+
+    /// The SQL literal list and the predicate must name the same kinds:
+    /// a kind added to one of them and forgotten in the other would
+    /// leave a query that counts the wrong attempts.
+    #[test]
+    fn the_t2_kind_list_and_the_predicate_agree() {
+        let listed: Vec<&str> = T2_KINDS_SQL
+            .split(',')
+            .map(|kind| kind.trim().trim_matches('\''))
+            .collect();
+        assert_eq!(listed, vec![T2_KIND, T2_UNVERIFIED_KIND]);
+        for kind in listed {
+            assert!(is_t2_kind(kind), "{kind} must be a T2 kind");
+        }
+        assert!(!is_t2_kind("tcp"));
+        assert!(!is_t2_kind("tls"));
+    }
 
     #[tokio::test]
     async fn insert_and_purge_history() {

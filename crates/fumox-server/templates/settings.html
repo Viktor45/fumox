@@ -125,6 +125,15 @@
   </div>
 
   <div class="panel">
+    <h2>{{ self.t("set.network_panel") }}</h2>
+    <table class="kv">
+      <tbody>
+        <tr><th>{{ self.t("set.network_dns_timeout") }}</th><td>{{ state.network_dns_timeout() }} {{ self.t("common.sec") }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
     <h2>{{ self.t("set.admin_panel") }}</h2>
     <table class="kv">
       <tbody>

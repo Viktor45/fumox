@@ -75,6 +75,10 @@ fn countries_to_text(list: &[String]) -> crate::Result<Option<String>> {
 const COLUMNS: &str = "id, slug, access_token, name, output_format, pipeline, countries, enabled, created_at, updated_at";
 
 /// Insert a new profile. The caller assigns `id` (see [`crate::models::new_id`]).
+///
+/// The access token is stored as a hash: the repository is the only place
+/// that writes the column, so the secret never reaches the database in
+/// plain text, whichever caller filled the model.
 pub async fn create(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
     // sqlx 0.9 SqlSafeStr: {COLUMNS} is a compile-time constant; all data
     // flows through .bind().
@@ -83,7 +87,7 @@ pub async fn create(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
     )))
     .bind(&profile.id)
     .bind(&profile.slug)
-    .bind(&profile.access_token)
+    .bind(crate::token::stored(profile.access_token.clone()))
     .bind(&profile.name)
     .bind(profile.output_format.as_str())
     .bind(
@@ -103,6 +107,8 @@ pub async fn create(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
 }
 
 /// Update mutable profile fields. `id` and `created_at` are immutable.
+///
+/// The access token is stored as a hash, like [`create`].
 pub async fn update(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
     let affected = sqlx::query(
         "UPDATE profiles SET
@@ -111,7 +117,7 @@ pub async fn update(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
          WHERE id = ?",
     )
     .bind(&profile.slug)
-    .bind(&profile.access_token)
+    .bind(crate::token::stored(profile.access_token.clone()))
     .bind(&profile.name)
     .bind(profile.output_format.as_str())
     .bind(
@@ -129,7 +135,9 @@ pub async fn update(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
     .await?
     .rows_affected();
     if affected == 0 {
-        return Err(crate::Error::Database(sqlx::Error::RowNotFound.to_string()));
+        // The row is gone, not the database: the caller can answer "not
+        // found" instead of "the write failed".
+        return Err(crate::Error::NotFound(format!("profile {}", profile.id)));
     }
     Ok(())
 }
@@ -185,6 +193,33 @@ pub async fn delete(pool: &DbPool, id: &str) -> crate::Result<bool> {
         .await?
         .rows_affected();
     Ok(affected > 0)
+}
+
+/// Rewrite the access tokens of the rows written before hashing into
+/// their stored form.
+///
+/// A deployment whose rows still hold the token in plain text keeps
+/// serving its subscribers either way (see [`crate::token::verify`]), but
+/// the secret sits on disk until this runs. Returns the number of rows it
+/// rewrote.
+pub async fn hash_legacy_tokens(pool: &DbPool) -> crate::Result<usize> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, access_token FROM profiles WHERE access_token IS NOT NULL")
+            .fetch_all(pool)
+            .await?;
+    let mut rewritten = 0;
+    for (id, token) in rows {
+        if crate::token::is_hashed(&token) {
+            continue;
+        }
+        sqlx::query("UPDATE profiles SET access_token = ? WHERE id = ?")
+            .bind(crate::token::hash(&token))
+            .bind(&id)
+            .execute(pool)
+            .await?;
+        rewritten += 1;
+    }
+    Ok(rewritten)
 }
 
 /// Replace the full source composition of a profile in one transaction.
@@ -376,7 +411,15 @@ mod tests {
         let (_dir, pool) = temp_pool().await;
         let mut profile = sample_profile("prf1aaaaaaa");
         create(&pool, &profile).await.unwrap();
-        assert_eq!(get(&pool, "prf1aaaaaaa").await.unwrap().unwrap(), profile);
+        let loaded = get(&pool, "prf1aaaaaaa").await.unwrap().unwrap();
+        // The token comes back hashed: the column never holds the secret.
+        assert_eq!(
+            loaded.access_token.as_deref(),
+            Some(crate::token::hash("secret-token").as_str())
+        );
+        assert!(loaded.access_token.as_deref().unwrap() != "secret-token");
+        profile.access_token = loaded.access_token.clone();
+        assert_eq!(loaded, profile);
         assert_eq!(
             resolve_token(&pool, "slug-prf1aaaaaaa")
                 .await
@@ -406,6 +449,30 @@ mod tests {
 
         assert!(delete(&pool, "prf1aaaaaaa").await.unwrap());
         assert!(get(&pool, "prf1aaaaaaa").await.unwrap().is_none());
+    }
+
+    /// A row written by an older release holds the token in plain text.
+    /// The backfill rewrites it in place, and the token keeps verifying
+    /// against its new form.
+    #[tokio::test]
+    async fn legacy_plaintext_tokens_are_hashed_in_place() {
+        let (_dir, pool) = temp_pool().await;
+        let profile = sample_profile("prf4ddddddd");
+        create(&pool, &profile).await.unwrap();
+        sqlx::query("UPDATE profiles SET access_token = 'legacy-secret' WHERE id = ?")
+            .bind(&profile.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(hash_legacy_tokens(&pool).await.unwrap(), 1);
+        let stored = get(&pool, &profile.id).await.unwrap().unwrap();
+        let token = stored.access_token.expect("the token must still be there");
+        assert!(crate::token::is_hashed(&token));
+        assert!(crate::token::verify("legacy-secret", &token));
+
+        // A second run has nothing left to do.
+        assert_eq!(hash_legacy_tokens(&pool).await.unwrap(), 0);
     }
 
     #[tokio::test]

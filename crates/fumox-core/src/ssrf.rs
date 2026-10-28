@@ -8,6 +8,21 @@
 //! `vless://uuid@169.254.169.254:80#x` turned the daemon into an internal
 //! port scanner. Both call sites now run every candidate through
 //! [`check_ip`] with the same blocklist.
+//!
+//! # The DNS resolution step
+//!
+//! A hostname has to be resolved before it can be vetted, and that step is
+//! bounded by `[network].dns_timeout_secs`: `0` means "follow
+//! `[geo].dns_timeout_secs`", and the effective bound is never below one
+//! second. The two consumers read it through
+//! `AppConfig::ssrf_dns_timeout`, so one setting governs both.
+//!
+//! That bound is the *caller's* wait, not the resolver's:
+//! `tokio::net::lookup_host` hands the name to the OS resolver, which keeps
+//! running after the caller gave up, so the timeout does not interrupt the
+//! system resolution. The pipeline therefore admits a bounded number of
+//! resolutions at a time ([`MAX_CONCURRENT_RESOLUTIONS`]) instead of
+//! trusting the timeout to stop them.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -32,6 +47,20 @@ pub fn pick_vetted(addrs: &[IpAddr], family: IpFamily) -> Option<IpAddr> {
     }
 }
 
+/// Upper bound on the resolutions running at the same time.
+///
+/// The timeout of [`lookup_with_timeout`] bounds how long the caller waits,
+/// it does not cancel the lookup: the OS resolver keeps working on the name
+/// after the caller gave up. A feed full of dead names would otherwise
+/// start one unbounded resolution per host, each of them holding a runtime
+/// worker and a resolver thread until the OS gives up on its own.
+const MAX_CONCURRENT_RESOLUTIONS: usize = 16;
+
+/// The resolution slots. A static semaphore, so the cap holds across every
+/// consumer of the policy in the process.
+static RESOLUTION_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_RESOLUTIONS);
+
 /// Async DNS resolution with an operator-supplied timeout. Async DNS has no
 /// built-in timeout, a hostile authoritative resolver can pin the runtime
 /// worker for the OS resolver's default (~30 s+). The single
@@ -44,8 +73,37 @@ pub fn pick_vetted(addrs: &[IpAddr], family: IpFamily) -> Option<IpAddr> {
 /// successful combined response. On glibc, both run in parallel and the
 /// timeout fires only when both have stalled. This is the documented cost
 /// of avoiding the doubled wire DNS count.
+///
+/// The resolution runs under one of the [`MAX_CONCURRENT_RESOLUTIONS`]
+/// slots, and the timeout covers the wait for a slot as well: the caller
+/// stops waiting after `dns_timeout` either way.
 pub async fn lookup_with_timeout(host: &str, dns_timeout: Duration) -> Result<Vec<IpAddr>, String> {
-    timeout_lookup(host, dns_timeout, tokio::net::lookup_host((host, 0))).await
+    timeout_lookup(host, dns_timeout, async {
+        match with_resolution_slot(async {
+            tokio::net::lookup_host((host, 0))
+                .await
+                .map(|addrs| addrs.collect::<Vec<_>>())
+        })
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(err) => Err(err),
+        }
+    })
+    .await
+}
+
+/// Run `fut` while holding one of the [`MAX_CONCURRENT_RESOLUTIONS`]
+/// slots.
+async fn with_resolution_slot<F, T>(fut: F) -> Result<T, std::io::Error>
+where
+    F: std::future::Future<Output = T>,
+{
+    let _permit = RESOLUTION_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| std::io::Error::other("the DNS resolution semaphore is closed"))?;
+    Ok(fut.await)
 }
 
 /// Inner wrapper of [`lookup_with_timeout`] generic over the resolver future
@@ -70,6 +128,43 @@ where
     }
 }
 
+/// Strip the URI decorations from a host: the square brackets of an IPv6
+/// literal and the `%zone` scope id.
+///
+/// A feed may spell an IPv6 address the URI way (`[2606:4700:4700::1111]`)
+/// or with a zone (`fe80::1%eth0`); neither parses as an IP literal, so the
+/// host would be taken for a name and sent to the resolver, which is exactly
+/// the gap the literal check exists to close.
+pub fn strip_host_decorations(host: &str) -> &str {
+    let trimmed = host.trim();
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    match unbracketed.split_once('%') {
+        Some((literal, _zone)) => literal,
+        None => unbracketed,
+    }
+}
+
+/// Parse a host as an IP literal, tolerating the bracketed URI form and a
+/// `%zone` scope id. `None` = not a literal, the host must be resolved.
+pub fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    strip_host_decorations(host).parse::<IpAddr>().ok()
+}
+
+/// Whether the address is a globally routable public address, i.e. one
+/// that must not be handed a secret.
+///
+/// The inverse of the private-address policy: [`check_ip`] rejects the
+/// non-public ranges, this reports the addresses it lets through. It
+/// exists for the *other* direction of the same policy: a service the
+/// probe authenticates against (the tunnel engine's controller) must not
+/// live in public space, where the credential it carries would leak.
+pub fn is_public(ip: IpAddr) -> bool {
+    check_ip(ip, false).is_ok()
+}
+
 /// Vet a single IP address against the shared SSRF policy.
 ///
 /// With `allow_private = false` the following are rejected: loopback,
@@ -77,16 +172,15 @@ where
 /// metadata endpoint), CGNAT, unspecified, broadcast, multicast and
 /// benchmark ranges, TEST-NET documentation space, plus their IPv6
 /// equivalents (incl. the deprecated `fec0::/10` site-local block), the
-/// IPv4-mapped `::ffff:0:0/96` and IPv4-compatible `::/96` forms, and the
-/// NAT64 `64:ff9b::/96` and 6to4 `2002::/16` transition ranges.
+/// IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96` and IPv4-translated
+/// `::ffff:0:0:0/96` forms, the NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`
+/// prefixes, the Teredo `2001:0000::/32` range and the 6to4 `2002::/16`
+/// transition range.
 ///
-/// That list is the enforced set, not "every spelling of an IPv4 address":
-/// the IPv4-translated prefix `::ffff:0:0:0/96` is neither
-/// `to_ipv4_mapped()` nor `to_ipv4()`, and Teredo `2001:0000::/32` is not
-/// matched either, so an address in either of them passes this gate.
-/// Neither is routable on a default host (Teredo needs its own interface),
-/// which is why neither is a hole an attacker can dial today, but a
-/// caller must not read this function as covering them.
+/// Every IPv6 form of a blocked IPv4 address is vetted on its embedded
+/// payload, so a feed line writing the metadata endpoint as
+/// `::ffff:0:a9fe:a9fe` or as a Teredo address is refused like the plain
+/// `169.254.169.254` is.
 pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
     if allow_private {
         return Ok(());
@@ -130,6 +224,19 @@ pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
             if segments[0] & 0xffc0 == 0xfec0 {
                 return Err("site-local address (deprecated fec0::/10)".into());
             }
+            // IPv4-translated ::ffff:0:0:0/96 (RFC 2765): neither
+            // `to_ipv4_mapped()` (the `ffff` sits one segment earlier) nor
+            // `to_ipv4()` matches it, so the embedded IPv4 was never vetted.
+            // The low 32 bits are a plain IPv4 address.
+            if segments[0] == 0
+                && segments[1] == 0
+                && segments[2] == 0
+                && segments[3] == 0
+                && segments[4] == 0xffff
+                && segments[5] == 0
+            {
+                return check_ipv4(embedded_v4(segments[6], segments[7]));
+            }
             // NAT64 well-known prefix 64:ff9b::/96: the low 32 bits are an
             // IPv4 address, vet the embedded address, not the wrapper
             // (2001:db8::/32-only U64 prefix 64:ff9b:1::/48 is public space
@@ -142,6 +249,24 @@ pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
                 && segments[5] == 0
             {
                 return check_ipv4(embedded_v4(segments[6], segments[7]));
+            }
+            // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215): the whole
+            // prefix is refused. The embedded IPv4 sits in octets 10 and 11
+            // (RFC 6052 §2.2), and the well-known /96 form of the same
+            // prefix is already vetted on its payload, so a payload rule
+            // here would need the byte order right to close the hole.
+            if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+                return Err("64:ff9b:1::/48 local-use NAT64 prefix".into());
+            }
+            // Teredo 2001:0000::/32 (RFC 4380): the address carries two
+            // IPv4 addresses, the Teredo server (segments 2-3) and the
+            // client (segments 6-7, every bit inverted). Both are vetted:
+            // either side of the tunnel is a dial target of its own.
+            if segments[0] == 0x2001 && segments[1] == 0 {
+                check_ipv4(embedded_v4(segments[2], segments[3]))
+                    .map_err(|reason| format!("Teredo server address: {reason}"))?;
+                return check_ipv4(inverted_v4(segments[6], segments[7]))
+                    .map_err(|reason| format!("Teredo client address: {reason}"));
             }
             // 6to4 2002::/16: the next 32 bits are the encapsulated IPv4.
             if segments[0] == 0x2002 {
@@ -159,6 +284,14 @@ fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
         (low >> 8) as u8,
         (low & 0xff) as u8,
     )
+}
+
+/// The IPv4 address embedded in the last 32 bits of an IPv6 address, with
+/// every bit inverted. Teredo stores the client address that way (RFC 4380
+/// §6.1), so the embedded value must be inverted before it is vetted.
+fn inverted_v4(high: u16, low: u16) -> Ipv4Addr {
+    let [a, b, c, d] = embedded_v4(high, low).octets();
+    Ipv4Addr::new(!a, !b, !c, !d)
 }
 
 /// Whether a proxy host may be dialed by the probe: IP literals are vetted
@@ -179,7 +312,7 @@ pub async fn vet_probe_host_addrs(
     allow_private: bool,
     dns_timeout: Duration,
 ) -> Result<Vec<IpAddr>, String> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    if let Some(ip) = parse_ip_literal(host) {
         check_ip(ip, allow_private)?;
         return Ok(vec![ip]);
     }
@@ -315,8 +448,11 @@ fn check_ipv4(v4: Ipv4Addr) -> Result<(), String> {
         0 => Err("0.0.0.0/8".into()),
         100 if (b & 0xc0) == 64 => Err("100.64.0.0/10 CGNAT".into()),
         198 if b == 18 || b == 19 => Err("198.18.0.0/15 benchmarking".into()),
-        192 if b == 0 => Err("192.0.0.0/24 IETF".into()),
-        192 if b == 2 => Err("192.0.2.0/24 TEST-NET-1".into()),
+        // 192.0.0.0/24 (IETF protocol assignments) and 192.0.2.0/24
+        // (TEST-NET-1). Only the two /24s are special space, the rest of
+        // 192.0.0.0/16 is ordinary public address space.
+        192 if b == 0 && c == 0 => Err("192.0.0.0/24 IETF protocol assignments".into()),
+        192 if b == 0 && c == 2 => Err("192.0.2.0/24 TEST-NET-1".into()),
         198 if b == 51 && c == 100 => Err("198.51.100.0/24 TEST-NET-2".into()),
         203 if b == 0 && c == 113 => Err("203.0.113.0/24 TEST-NET-3".into()),
         _ => Ok(()),
@@ -372,14 +508,74 @@ mod tests {
             "ff02::1",
             "::ffff:127.0.0.1",
             "::ffff:192.168.0.1",
+            // IPv4-translated ::ffff:0:0:0/96 embedding 169.254.169.254.
+            "::ffff:0:a9fe:a9fe",
             // NAT64 64:ff9b::/96 embedding 192.0.2.1.
             "64:ff9b::192.0.2.1",
             "64:ff9b::c000:201",
+            // NAT64 local-use prefix 64:ff9b:1::/48.
+            "64:ff9b:1:a9fe:a9fe::",
+            "64:ff9b:1::1",
+            // Teredo 2001:0000::/32 with 169.254.169.254 as the client
+            // address (the last 32 bits are the inverted client IPv4).
+            "2001:0:808:808::5601:5601",
             // 6to4 2002::/16 embedding 127.0.0.1.
             "2002:7f00:1::",
         ] {
             assert!(check_ip(ip(addr), false).is_err(), "{addr} must be blocked");
         }
+    }
+
+    /// The IPv4-translated prefix `::ffff:0:0:0/96` is neither
+    /// `to_ipv4_mapped()` nor `to_ipv4()`, so the embedded address was never
+    /// vetted: the same metadata endpoint spelled that way walked past the
+    /// policy.
+    #[test]
+    fn ipv4_translated_addresses_are_vetted_on_their_payload() {
+        assert!(check_ip(ip("::ffff:0:a9fe:a9fe"), false).is_err());
+        assert!(check_ip(ip("::ffff:0:7f00:1"), false).is_err());
+        // A public payload stays reachable.
+        assert!(check_ip(ip("::ffff:0:0808:0808"), false).is_ok());
+    }
+
+    /// Teredo `2001:0000::/32` carries the Teredo server (segments 2-3) and
+    /// the client (segments 6-7, inverted) as plain IPv4 addresses. Both are
+    /// vetted, either side of the tunnel is a dial target of its own.
+    #[test]
+    fn teredo_addresses_are_vetted_on_both_payloads() {
+        // Client 169.254.169.254 (inverted: 86.1.86.1) behind a public
+        // Teredo server.
+        assert!(check_ip(ip("2001:0:808:808::5601:5601"), false).is_err());
+        // Client 127.0.0.1 (inverted: 128.0.0.128).
+        assert!(check_ip(ip("2001:0:808:808::8000:80"), false).is_err());
+        // A private Teredo server is blocked on its own side.
+        assert!(check_ip(ip("2001:0:a9fe:a9fe::f7f7:f7f7"), false).is_err());
+        // A public server with a public client stays reachable.
+        assert!(check_ip(ip("2001:0:808:808::f7f7:f7f7"), false).is_ok());
+    }
+
+    /// The NAT64 local-use prefix `64:ff9b:1::/48` (RFC 8215) is refused
+    /// as a whole: the embedded IPv4 sits in octets 10 and 11 (RFC 6052
+    /// §2.2), so a payload rule would depend on the byte order being right.
+    #[test]
+    fn the_local_use_nat64_prefix_is_refused() {
+        assert!(check_ip(ip("64:ff9b:1:a9fe:a9fe::"), false).is_err());
+        assert!(check_ip(ip("64:ff9b:1::1"), false).is_err());
+        // The well-known /96 prefix of the same block stays payload-vetted.
+        assert!(check_ip(ip("64:ff9b::c000:201"), false).is_err());
+        assert!(check_ip(ip("64:ff9b::808:808"), false).is_ok());
+    }
+
+    /// Only `192.0.0.0/24` and `192.0.2.0/24` are special space; the rest
+    /// of `192.0.0.0/16` is ordinary public address space and must stay
+    /// reachable.
+    #[test]
+    fn the_special_192_blocks_are_narrow() {
+        assert!(check_ip(ip("192.0.0.1"), false).is_err());
+        assert!(check_ip(ip("192.0.2.1"), false).is_err());
+        assert!(check_ip(ip("192.0.1.1"), false).is_ok());
+        assert!(check_ip(ip("192.2.0.1"), false).is_ok());
+        assert!(check_ip(ip("192.1.2.3"), false).is_ok());
     }
 
     /// Every IPv6 spelling of a blocked IPv4 address must be blocked, not
@@ -412,9 +608,7 @@ mod tests {
 
     #[test]
     fn transition_prefixes_with_public_payloads_pass() {
-        // The local-use U64 prefix 64:ff9b:1::/48 is public space (RFC 8215),
-        // and the 6to4 relay anycast payload is vetted on its own merits.
-        assert!(check_ip(ip("64:ff9b:1::c000:201"), false).is_ok());
+        // The 6to4 relay anycast payload is vetted on its own merits.
         assert!(check_ip(ip("2002:0808:0808::"), false).is_ok()); // 8.8.8.8
     }
 
@@ -481,6 +675,36 @@ mod tests {
         );
     }
 
+    /// A feed may spell an IPv6 address the URI way (`[2606:4700:4700::1111]`)
+    /// or with a `%zone` scope id. Neither parses as an IP literal, so the
+    /// host used to be taken for a name and sent to the resolver, and a
+    /// bracketed loopback (`[::1]`) slipped past the literal gate.
+    #[tokio::test]
+    async fn probe_host_addrs_vetting_accepts_the_decorated_literal_forms() {
+        let addrs = vet_probe_host_addrs("[2606:4700:4700::1111]", false, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            addrs,
+            vec!["2606:4700:4700::1111".parse::<IpAddr>().unwrap()]
+        );
+        // The zone id is dropped, the address is still the literal.
+        let addrs =
+            vet_probe_host_addrs("[2606:4700:4700::1111%eth0]", false, Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert_eq!(
+            addrs,
+            vec!["2606:4700:4700::1111".parse::<IpAddr>().unwrap()]
+        );
+        // A decorated loopback is still blocked.
+        assert!(
+            vet_probe_host_addrs("[::1]", false, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn probe_host_vetting_unresolvable_name_fails_closed() {
         let err = vet_probe_host(
@@ -503,6 +727,42 @@ mod tests {
             vet_probe_host("localhost", false, Duration::from_secs(5))
                 .await
                 .is_err()
+        );
+    }
+
+    /// The resolution timeout does not cancel the OS resolver, so the
+    /// pipeline admits a bounded number of resolutions at a time instead of
+    /// trusting the timeout to stop them.
+    #[tokio::test]
+    async fn concurrent_resolutions_are_capped() {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..(MAX_CONCURRENT_RESOLUTIONS * 2) {
+            let running = running.clone();
+            let peak = peak.clone();
+            tasks.push(tokio::spawn(async move {
+                with_resolution_slot(async {
+                    let now = running.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let seen = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            seen <= MAX_CONCURRENT_RESOLUTIONS,
+            "{seen} resolutions ran at once, the cap is {MAX_CONCURRENT_RESOLUTIONS}"
+        );
+        assert!(
+            seen > 1,
+            "the cap serialized every resolution ({seen} at once)"
         );
     }
 

@@ -530,6 +530,47 @@ async fn unauthenticated_htmx_gets_hx_redirect() {
     );
 }
 
+/// A row that is not there and a database that failed must not answer
+/// alike: the first is a 404, the second a 500.
+///
+/// The two used to travel as one (`Option::None` for both), so a broken
+/// database answered "not found" and a client could not tell a deleted
+/// row from a failed query.
+#[tokio::test]
+async fn a_missing_row_and_a_broken_database_answer_differently() {
+    let (_dir, state) = test_state(1000).await;
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+
+    // The row does not exist: the row is missing, the database is fine.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/admin/sources/srcMissing00",
+            "",
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // The database is gone: the same request cannot be answered with a
+    // "not found", the failure is on this side.
+    state.pool.close().await;
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/admin/sources/srcMissing00",
+            "",
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
 #[tokio::test]
 async fn login_flow_grants_access_and_wrong_token_does_not() {
     let (_dir, state) = test_state(1000).await;
@@ -1082,6 +1123,51 @@ async fn source_form_validation_rejects_bad_input() {
     );
 }
 
+/// L-098: the SSRF guard on the source form must refuse the cloud
+/// metadata endpoint and the loopback, not only the RFC1918 space. The
+/// default test config switches the guard off (no DNS in tests), so the
+/// check was never exercised end to end.
+#[tokio::test]
+async fn private_source_urls_are_rejected_when_the_ssrf_guard_is_on() {
+    let mut admin = admin_config(1000);
+    admin.allow_private_urls = false;
+    let (_dir, state) = test_admin_state(admin, Default::default()).await;
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+
+    for url in [
+        // The metadata endpoint of every cloud provider.
+        "http://169.254.169.254/latest/meta-data/",
+        // The host's own services.
+        "http://127.0.0.1:8080/",
+    ] {
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", "Private"),
+            ("url", url),
+            ("cache_ttl_seconds", "3600"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/sources/new", &body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{url} must be refused"
+        );
+        assert!(
+            fumox_core::repo::sources::list(&state.pool, false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{url} must not create a source"
+        );
+    }
+}
+
 /// F7: unbounded form fields used to be
 /// stored verbatim, a megabyte pipeline or a hundred tags degraded
 /// every later render. The caps reject the submission.
@@ -1209,6 +1295,97 @@ async fn profile_token_validation_caps_and_charset() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
+}
+
+/// A profile's access token is stored as a hash, so the panel can never
+/// show it again. The whole round trip through the admin form: the secret
+/// is written, the row keeps only its hash, the edit form hands out a
+/// placeholder, and posting that placeholder back keeps the token.
+#[tokio::test]
+async fn a_profile_token_is_stored_hashed_and_survives_the_placeholder() {
+    let (_dir, state) = test_state(1000).await;
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+    let secret = "super-secret-token";
+
+    let body = urlencoded(&[
+        ("_csrf", &csrf),
+        ("name", "Protected"),
+        ("output_format", "uri_list"),
+        ("access_token", secret),
+        ("enabled", "1"),
+    ]);
+    let response = app
+        .clone()
+        .oneshot(request("POST", "/admin/profiles/new", &body, Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    // The row holds the hash, never the secret.
+    let stored = fumox_core::repo::profiles::list(&state.pool, false)
+        .await
+        .unwrap()
+        .pop()
+        .expect("the profile was created");
+    let stored_token = stored.access_token.clone().expect("the token is stored");
+    assert_ne!(stored_token, secret, "the secret must not be at rest");
+    assert!(fumox_core::token::is_hashed(&stored_token));
+    assert!(fumox_core::token::verify(secret, &stored_token));
+
+    // The edit form hands out a placeholder, never the secret.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/admin/profiles/{}/edit", stored.id),
+            "",
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&html);
+    assert!(!html.contains(secret), "the form must not carry the secret");
+    assert!(html.contains("••••••"), "{html}");
+
+    // Posting the form back unchanged keeps the token: the placeholder
+    // is not a token, and the stored one stays.
+    let body = urlencoded(&[
+        ("_csrf", &csrf),
+        ("name", "Protected"),
+        ("slug", "protected"),
+        ("output_format", "uri_list"),
+        ("access_token", "••••••"),
+        ("enabled", "1"),
+    ]);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("/admin/profiles/{}/edit", stored.id),
+            &body,
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let stored = fumox_core::repo::profiles::get(&state.pool, &stored.id)
+        .await
+        .unwrap()
+        .expect("the profile is still there");
+    assert_eq!(
+        stored.access_token.as_deref(),
+        Some(stored_token.as_str()),
+        "the unchanged placeholder must keep the token"
+    );
+    assert!(fumox_core::token::verify(
+        secret,
+        stored.access_token.as_deref().unwrap()
+    ));
 }
 
 #[tokio::test]
@@ -2553,7 +2730,7 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
     let fetcher = Fetcher::new(
         config.fetch.clone(),
         config.admin.allow_private_urls,
-        config.geo.dns_timeout(),
+        config.ssrf_dns_timeout(),
     );
     let state = AdminState::new(
         pool.clone(),
@@ -3898,9 +4075,14 @@ async fn export_downloads_configuration_as_attachment() {
     assert_eq!(parsed["sources"][0]["slug"], "exp-src");
     assert_eq!(parsed["profiles"][0]["slug"], "exp-prof");
     assert_eq!(parsed["profiles"][0]["output_format"], "clash");
-    assert_eq!(
-        parsed["profiles"][0]["access_token"],
-        "tok-0123456789abcdef"
+    // The export carries the stored hash, never the secret itself.
+    let exported_token = parsed["profiles"][0]["access_token"]
+        .as_str()
+        .expect("the token is exported");
+    assert_ne!(exported_token, "tok-0123456789abcdef");
+    assert!(
+        fumox_core::token::is_hashed(exported_token),
+        "the export must carry the hash: {exported_token}"
     );
     assert_eq!(
         parsed["profiles"][0]["sources"],
@@ -3948,9 +4130,19 @@ async fn import_creates_new_objects_and_remaps_composition() {
     let new_profile = &profiles[0];
     assert_ne!(new_profile.id, "profX0000000");
     assert_eq!(new_profile.slug.as_deref(), Some("exp-prof"));
-    assert_eq!(
-        new_profile.access_token.as_deref(),
-        Some("tok-0123456789abcdef")
+    // The imported profile keeps the hash the export carried, so the same
+    // secret still opens the endpoint on the target deployment.
+    let imported_token = new_profile
+        .access_token
+        .as_deref()
+        .expect("the token is imported");
+    assert!(
+        fumox_core::token::is_hashed(imported_token),
+        "the imported token must stay a hash: {imported_token}"
+    );
+    assert!(
+        fumox_core::token::verify("tok-0123456789abcdef", imported_token),
+        "the original secret must still open the imported endpoint"
     );
     let composition = fumox_core::repo::profiles::get_sources(&pool, &new_profile.id)
         .await

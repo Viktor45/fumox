@@ -2,8 +2,8 @@
 //!
 //! ```text
 //! fingerprint = sha256(
-//!     scheme "|" escape(normalize(host)) "|" port "|" escape(credential)
-//!     "|" canonical(security_params)
+//!     version "|" scheme "|" escape(normalize(host)) "|" port "|"
+//!     escape(credential) "|" canonical(params)
 //! )
 //! ```
 //!
@@ -12,112 +12,29 @@
 //! cannot move a field boundary inside the pre-image. The scheme and the port
 //! are written as they are: a fixed enum literal and a number.
 //!
-//! The display name and cosmetic parameters (advertising tags, bandwidth
-//! caps, timestamps) are deliberately excluded, so the same server advertised
-//! under different names collapses into a single row. `fingerprint` is UNIQUE
-//! in the schema, which makes reconciliation a natural upsert.
+//! The parameters enter the pre-image in their canonical form
+//! ([`crate::params::canonical`]): one value per canonical key, the
+//! structured blocks expanded into the scalars they carry, the cosmetic
+//! names dropped. The display name and the cosmetic parameters
+//! (advertising tags, bandwidth caps, timestamps) are deliberately
+//! excluded, so the same server advertised under different names collapses
+//! into a single row. `fingerprint` is UNIQUE in the schema, which makes
+//! reconciliation a natural upsert.
+//!
+//! The version is part of the pre-image: a change of the canonical form
+//! changes every key, so the stored rows are recomputed on the first start
+//! after the upgrade (see [`crate::repo::proxies::refingerprint`]).
 
-use crate::models::{ProxyEntry, Scheme};
+use crate::models::ProxyEntry;
 use sha2::{Digest, Sha256};
 
-/// Lower-cased parameter keys that change how a client must connect or
-/// authenticate. Only these take part in the fingerprint; everything else is
-/// cosmetic. The list covers the MVP schemes (vless, vmess, trojan, ss,
-/// hysteria2, tuic, mieru, socks5, naive) and is checked case-insensitively
-/// because real feeds mix spellings (`headerType` / `headertype`).
-const SECURITY_PARAMS: &[&str] = &[
-    // transport / TLS layer
-    "security",
-    "tls",
-    "type",
-    "net",
-    "headertype",
-    "mode",
-    "path",
-    "host",
-    // xhttp `:authority` override: changes the host the client connects to
-    "authority",
-    "alpn",
-    // snell protocol revision; older and newer meow builds interoperate
-    // differently across it
-    "version",
-    // REALITY / TLS pinning
-    "pbk",
-    "publickey",
-    "sid",
-    "shortid",
-    "fp",
-    "utls",
-    "sni",
-    "flow",
-    "pinsha256",
-    // cipher / credentials extras
-    "encryption",
-    "scy",
-    "obfs",
-    "obfs-host",
-    "obfs-password",
-    "congestion_control",
-    "aid",
-    // wire encoding
-    "packetencoding",
-    // cert-verification toggles (aliases, normalized below; the canonical
-    // alias list lives in `models::INSECURE_ALIASES`)
-    "insecure",
-    "allowinsecure",
-    "skip-cert-verify",
-    "allow_insecure",
-    // hysteria2 / tuic extras
-    "servicename",
-    // hysteria2 port hopping range, tuic relay mode and SNI suppression
-    "ports",
-    "udp_relay_mode",
-    "disable_sni",
-    // Clash structured blocks, stored verbatim: they have no URI spelling
-    // and each one changes how the client must connect. The Clash fields
-    // that *do* have a URI spelling (`servername`, `network`, `ws-path`,
-    // `client-fingerprint`, `grpc-service-name`, `fingerprint`, and for
-    // vmess `cipher` / `alterId`) are folded onto it by `canonical_key`
-    // and never reach this list under their own name.
-    "ws-headers",
-    "ws-opts",
-    "reality-opts",
-];
-
-/// Map a parameter key onto the spelling the fingerprint is keyed by.
+/// The version of the fingerprint pre-image.
 ///
-/// Clash carries its own field names for fields every URI format spells the
-/// same way. Left alone, the same node advertised as Clash YAML and as a URI
-/// would get two different fingerprints and land in two rows, so the Clash
-/// spelling is rewritten to the URI one before the security filter runs.
-///
-/// The transport is spelled per scheme: the vmess JSON and the sing-box native
-/// form both call it `net`, while vless, trojan and the rest call it `type`.
-/// Folding it onto one spelling for every scheme would split the vmess forms
-/// from each other, so the target key depends on the scheme.
-fn canonical_key(scheme: Scheme, key: &str) -> String {
-    match key {
-        "servername" => "sni",
-        "network" if scheme == Scheme::Vmess => "net",
-        "network" => "type",
-        "ws-path" => "path",
-        "client-fingerprint" => "fp",
-        "grpc-service-name" => "servicename",
-        // Clash's `fingerprint` is the certificate pin (`pinSHA256` in the
-        // URI), not the uTLS client hello: that one is `client-fingerprint`.
-        "fingerprint" => "pinsha256",
-        // vmess JSON spells the cipher `scy` and the alter id `aid`; Clash
-        // YAML calls them `cipher` and `alterId`. Without the folding the
-        // same node advertised as Clash YAML and as a vmess:// link lands
-        // in two rows, while two nodes differing only in the cipher
-        // collapse onto one. (Same aliasing as the URI translation in
-        // `parsers::translate_uri_param`.)
-        "cipher" if scheme == Scheme::Vmess => "scy",
-        "alterid" if scheme == Scheme::Vmess => "aid",
-        other => other,
-    }
-    .to_string()
-}
+/// It is hashed into the key, so the keys of two versions never collide and
+/// a change of the canonical form is visible as a new set of keys rather
+/// than as a silent re-mapping of the old ones. Bump it whenever the
+/// pre-image changes, and recompute the stored keys.
+pub const FINGERPRINT_VERSION: &str = "fp2";
 
 /// Compute the stable deduplication fingerprint of a proxy entry.
 ///
@@ -128,6 +45,8 @@ fn canonical_key(scheme: Scheme, key: &str) -> String {
 /// literal, the port a number by type.
 pub fn fingerprint(entry: &ProxyEntry) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(FINGERPRINT_VERSION.as_bytes());
+    hasher.update(b"|");
     hasher.update(entry.scheme.as_str().as_bytes());
     hasher.update(b"|");
     hasher.update(escape(&normalize_host(&entry.host)).as_bytes());
@@ -136,7 +55,7 @@ pub fn fingerprint(entry: &ProxyEntry) -> String {
     hasher.update(b"|");
     hasher.update(escape(&entry.credential).as_bytes());
     hasher.update(b"|");
-    hasher.update(canonical_security_params(entry).as_bytes());
+    hasher.update(canonical_params(entry).as_bytes());
     to_hex(&hasher.finalize())
 }
 
@@ -148,23 +67,14 @@ pub fn normalize_host(host: &str) -> String {
     host.to_ascii_lowercase().trim_end_matches('.').to_string()
 }
 
-/// Canonical form of the security-relevant parameters: keys lower-cased and
-/// alias-mapped, insecure-aliases merged, pairs escaped, sorted and joined
-/// with `&`.
-fn canonical_security_params(entry: &ProxyEntry) -> String {
-    let mut pairs: Vec<(String, String)> = entry
-        .params
-        .iter()
-        .filter_map(|param| {
-            let key = canonical_key(entry.scheme, &param.key.to_ascii_lowercase());
-            if !SECURITY_PARAMS.contains(&key.as_str()) {
-                return None;
-            }
-            normalize_insecure_alias(&key, &param.value)
-        })
-        .collect();
-    pairs.sort();
-    pairs
+/// Canonical form of the connection parameters: keys and values escaped,
+/// sorted and joined with `&`.
+///
+/// The canonical form holds one value per key already, so the pairs are
+/// unique; the sort makes the order independent of the order the
+/// parameters were parsed in.
+fn canonical_params(entry: &ProxyEntry) -> String {
+    crate::params::canonical(entry)
         .iter()
         .map(|(k, v)| format!("{}={}", escape(k), escape(v)))
         .collect::<Vec<_>>()
@@ -196,24 +106,6 @@ fn escape(value: &str) -> String {
     out
 }
 
-/// Merge the certificate-verification spellings (`insecure`, `allowInsecure`,
-/// `skip-cert-verify`, `allow_insecure`) into a single canonical `insecure`
-/// flag.
-///
-/// A falsy or absent toggle means the same thing (verification on), so falsy
-/// values are dropped entirely, `allowInsecure=0`, `insecure=false` and no
-/// toggle at all produce identical fingerprints. Folding every spelling onto
-/// one flag also lets the same server advertised with different toggle
-/// spellings (say a tuic link's `allow_insecure` and a Clash document's
-/// `skip-cert-verify`) land on one row.
-fn normalize_insecure_alias(key: &str, value: &str) -> Option<(String, String)> {
-    if crate::models::INSECURE_ALIASES.contains(&key) {
-        return crate::models::is_truthy_toggle(value)
-            .then(|| ("insecure".to_string(), "1".to_string()));
-    }
-    Some((key.to_string(), value.to_string()))
-}
-
 fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -226,7 +118,6 @@ fn to_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::models::{Param, Scheme};
-    use sha2::{Digest, Sha256};
 
     fn entry(name: &str, host: &str, params: Vec<Param>) -> ProxyEntry {
         ProxyEntry {
@@ -378,6 +269,29 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicated_parameter_keeps_its_first_value() {
+        // The stored parameters keep the first occurrence of a key, so the
+        // fingerprint has to as well: a row recomputed from the database
+        // must land on the key the ingest computed.
+        let a = entry(
+            "n",
+            "h",
+            vec![param("sni", "first"), param("sni", "second")],
+        );
+        let b = entry("n", "h", vec![param("sni", "first")]);
+        assert_eq!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn the_parameter_values_are_decoded() {
+        // A percent-encoded path and a plain one describe the same
+        // transport, so they must not land in two rows.
+        let a = entry("n", "h", vec![param("path", "%2Fws%3Fed%3D2560")]);
+        let b = entry("n", "h", vec![param("path", "/ws?ed=2560")]);
+        assert_eq!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
     fn clash_spellings_are_security_relevant() {
         // Clash keeps its own field names; parsed verbatim they must still
         // reach the dedup key, or two nodes differing only in `servername`
@@ -452,6 +366,20 @@ mod tests {
     }
 
     #[test]
+    fn a_structured_block_and_its_flat_spelling_agree() {
+        // The same node published as a `reality-opts` block and as the flat
+        // `pbk`/`sid` parameters is one node, not two.
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     reality-opts: {public-key: key, short-id: short}}\n",
+        );
+        let clash = crate::parsers::clash::parse_payload(yaml).unwrap().entries[0].clone();
+        let uri = parse_one("vless://u@h.example.com:443?pbk=key&sid=short#a");
+        assert_eq!(fingerprint(&clash), fingerprint(&uri));
+    }
+
+    #[test]
     fn cert_pin_is_security_relevant() {
         // The pinned certificate decides which servers the client accepts, so
         // two hysteria2 nodes pinning different certificates are different
@@ -479,6 +407,18 @@ mod tests {
         );
         assert_eq!(fingerprint(&parsed.entries[0]), fingerprint(&uri_a));
         assert_eq!(fingerprint(&parsed.entries[1]), fingerprint(&uri_b));
+    }
+
+    #[test]
+    fn the_version_is_part_of_the_key() {
+        // A change of the canonical form changes every key, so the version
+        // is hashed into the pre-image.
+        let e = entry("n", "h", vec![]);
+        let mut hasher = Sha256::new();
+        hasher.update(FINGERPRINT_VERSION.as_bytes());
+        hasher.update(b"|");
+        hasher.update(b"vless|h|443|3e4d70e5-7ec9-48f9-a4e0-48c44c6063fd|");
+        assert_eq!(fingerprint(&e), to_hex(&hasher.finalize()));
     }
 
     #[test]
@@ -555,6 +495,8 @@ mod tests {
             ("disable_sni", "1", "0"),
             ("authority", "a.example.com", "b.example.com"),
             ("ports", "20000-30000", "40000-50000"),
+            ("grpc-mode", "gun", "multi"),
+            ("seed", "seed-a", "seed-b"),
         ] {
             let a = entry("n", "h", vec![param(key, first)]);
             let b = entry("n", "h", vec![param(key, second)]);
@@ -589,8 +531,8 @@ mod tests {
 
     #[test]
     fn pipe_in_a_field_cannot_shift_the_pre_image_boundary() {
-        // The pre-image is `scheme|host|port|credential|params`, and the host
-        // and the credential reach it verbatim (parse_hostport and
+        // The pre-image is `version|scheme|host|port|credential|params`, and
+        // the host and the credential reach it verbatim (parse_hostport and
         // split_userinfo keep them as written). A `|` inside either one moved
         // a field boundary, so two unrelated malformed lines hashed to the
         // same fingerprint and the upsert kept only the last of them.
@@ -626,7 +568,7 @@ mod tests {
             ],
         );
         let mut hasher = Sha256::new();
-        hasher.update(b"vless|example.com|443|3e4d70e5-7ec9-48f9-a4e0-48c44c6063fd|pbk=SbVKqWj1&security=reality");
+        hasher.update(b"fp2|vless|example.com|443|3e4d70e5-7ec9-48f9-a4e0-48c44c6063fd|pbk=SbVKqWj1&security=reality");
         let expected = to_hex(&hasher.finalize());
         assert_eq!(fingerprint(&e), expected);
         assert_eq!(fingerprint(&e).len(), 64);

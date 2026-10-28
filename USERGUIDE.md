@@ -425,8 +425,10 @@ A five-minute walkthrough, assuming the stack is running
    countries (see [Country filter](#country-filter)).
 
 4. **Copy the URL.** The profile card shows the subscription URL, e.g.
-   `http://<host>:8080/sub/nNqRYHbOSqM5` (or with `?token=…` if you set an
-   access token). Paste it into your proxy client as a subscription.
+   `http://<host>:8080/sub/nNqRYHbOSqM5`. If the profile has an access token,
+   the card says so and the link stays without it — append `?token=…` (or send
+   an `Authorization: Bearer …` header) in your proxy client. Paste the
+   result into the client as a subscription.
 
 5. **Watch it live.** The dashboard shows source/proxy counts and errors,
    the **Top Failure Reasons** panel over a 24 h rolling
@@ -472,6 +474,19 @@ limited per IP: after too many failures within a minute
 (`auth_fail_rate_limit`, default `30/min`) the endpoint answers
 `429 Too Many Requests` for a while. All public requests are also subject to
 a generous per-IP ceiling (`rate_limit`, default `300/min`) against scraping.
+
+The token is stored **as a hash** (SHA-256), never in plain text: the
+database file, the backups and the exported configuration hold the hash, not
+the secret. Consequences worth knowing:
+
+- the admin panel cannot show the token again — the edit form carries a
+  placeholder, and an unchanged placeholder keeps the stored token while an
+  empty field clears it;
+- the subscription link on the profile card therefore carries no token;
+  append the one you set yourself;
+- a profile that was protected before the upgrade keeps working: rows still
+  holding a plain token are re-hashed on the next start, and the clients
+  that already know the token are unaffected.
 
 ### Output formats
 
@@ -590,7 +605,10 @@ and server logs always remain UTC.
 ### Import and export
 
 *Export* downloads all sources and profiles (with profile composition, headers
-and access tokens) as a versioned JSON file. *Import* recreates them with
+and access tokens) as a versioned JSON file. A profile's access token is
+exported **as its hash**, so the file never contains a working secret; the
+import stores the same hash, which keeps the endpoint usable for the clients
+that already know the token. *Import* recreates the objects with
 **create-new-only** semantics:
 
 - imported objects always get fresh ids; existing rows are never overwritten;
@@ -744,6 +762,12 @@ tuned values that differ for some keys.
 | `cache_max_entries` | `16384`     | Host→geo cache size; entries also expire after 6 hours, so a host whose DNS was down is retried without a restart |
 | `dns_timeout_secs`  | `5`         | DNS resolution timeout                                     |
 | `startup_download_budget_secs` | `60` | How long startup waits for the GeoLite2 download before it starts listening. Past the budget the download keeps running in the background (the file is installed by an atomic rename, so a half-written `.mmdb` is never visible) and this run serves without geo enrichment until the next start. `0` = do not wait at all |
+
+### `[network]` – name resolution
+
+| Key                | Default | Meaning                                                                                                                                                       |
+| ------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dns_timeout_secs` | `0`     | How long a source hostname may take to resolve. `0` = follow `[geo].dns_timeout_secs`. The wait covers the DNS lookup *and* the SSRF vetting of the resolved addresses, so a slow resolver cannot hang a fetch |
 
 ### `[admin]` – admin panel
 

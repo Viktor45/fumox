@@ -3,8 +3,8 @@
 //! preview, toggle / delete actions.
 
 use super::{
-    action_response, caps, is_htmx, mask_secret, not_found, pipeline_from_form, server_error,
-    validate_slug,
+    FormError, action_response, caps, is_htmx, mask_secret, not_found, pipeline_from_form,
+    row_error_response, server_error, validate_slug,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -22,6 +22,62 @@ use std::str::FromStr;
 
 /// Preview length on the profile card.
 const PREVIEW_LINES: usize = 50;
+
+/// The placeholder the token field shows for a stored token.
+///
+/// The token is stored as a hash, so there is nothing to mask: the field
+/// shows a fixed stand-in, and an unchanged stand-in means "keep the
+/// stored token". A row written before hashing still holds the token in
+/// plain text, and its mask is what the form shows.
+const TOKEN_PLACEHOLDER: &str = "••••••";
+
+/// The profile fields the admin card renders.
+///
+/// The card never receives the model: the model's access token is a
+/// secret (the database keeps its hash), and a template must not be able
+/// to reach it.
+#[derive(Debug, Clone)]
+struct ProfileCard {
+    id: String,
+    slug: Option<String>,
+    name: String,
+    output_format: OutputFormat,
+    created_at: i64,
+    updated_at: i64,
+    enabled: bool,
+}
+
+impl ProfileCard {
+    fn from_profile(profile: &Profile) -> Self {
+        Self {
+            id: profile.id.clone(),
+            slug: profile.slug.clone(),
+            name: profile.name.clone(),
+            output_format: profile.output_format,
+            created_at: profile.created_at,
+            updated_at: profile.updated_at,
+            enabled: profile.enabled,
+        }
+    }
+}
+
+/// The value the token field of the form carries: a stand-in for a
+/// stored token, empty when the profile has none.
+fn token_placeholder(stored: Option<&str>) -> String {
+    match stored {
+        None => String::new(),
+        Some(value) if fumox_core::token::is_hashed(value) => TOKEN_PLACEHOLDER.to_string(),
+        Some(value) => mask_secret(value),
+    }
+}
+
+/// Whether the token field carries a placeholder rather than a value the
+/// operator typed: the fixed stand-in of a hashed token, or the mask of a
+/// legacy plain-text one. A typed token never contains a mask character
+/// (the charset check refuses them), so the two cannot be confused.
+fn is_token_placeholder(value: &str) -> bool {
+    value == TOKEN_PLACEHOLDER || value == "••••" || value.ends_with("…••••")
+}
 
 // List
 
@@ -244,11 +300,7 @@ pub async fn profile_edit_form(
     let values = ProfileFormValues {
         name: profile.name.clone(),
         slug: profile.slug.clone().unwrap_or_default(),
-        access_token: profile
-            .access_token
-            .as_deref()
-            .map(mask_secret)
-            .unwrap_or_default(),
+        access_token: token_placeholder(profile.access_token.as_deref()),
         output_format: format.clone(),
         countries: profile.countries.join(", "),
         enabled: profile.enabled,
@@ -310,13 +362,14 @@ fn composition_from_form(form: &[(String, String)]) -> Vec<(String, i64)> {
 }
 
 /// Validate + assemble a `Profile` from form fields. Returns the model or
-/// per-field errors (localized, shown next to fields).
+/// the reason it could not be built: per-field errors (localized, shown
+/// next to fields) or a row that could not be read.
 async fn build_profile_from_form(
     state: &AdminState,
     lang: &Lang,
     form: &[(String, String)],
     existing_id: Option<&str>,
-) -> Result<Profile, Vec<(String, String)>> {
+) -> Result<Profile, FormError> {
     let get = |key: &str| -> String {
         form.iter()
             .rev()
@@ -344,25 +397,36 @@ async fn build_profile_from_form(
     )
     .await;
 
-    // The mask is resolved before validation: `…`/`•` are outside the token
-    // charset, so an unchanged placeholder must never be checked as typed.
+    // The placeholder is resolved before validation: `…`/`•` are outside
+    // the token charset, so an unchanged placeholder must never be
+    // checked as typed.
     let token_raw = get("access_token");
     let stored = match existing_id {
-        Some(id) => profiles::get(&state.pool, id).await.ok().flatten(),
+        Some(id) => match profiles::get(&state.pool, id).await {
+            Ok(Some(profile)) => Some(profile),
+            Ok(None) => {
+                return Err(FormError::Server(fumox_core::Error::NotFound(format!(
+                    "profile {id}"
+                ))));
+            }
+            Err(err) => return Err(FormError::Server(err)),
+        },
         None => None,
     };
-    let stored_token = stored
-        .as_ref()
-        .and_then(|p| p.access_token.as_deref())
-        .filter(|secret| token_raw == mask_secret(secret));
-    let access_token = match stored_token {
-        Some(secret) => Some(secret.to_string()),
-        None if token_raw.is_empty() => None,
-        None => Some(token_raw.clone()),
+    let stored_token = stored.as_ref().and_then(|p| p.access_token.as_deref());
+    // An unchanged placeholder keeps the stored token; anything else is a
+    // token the operator typed.
+    let unchanged = stored_token.is_some() && token_raw == token_placeholder(stored_token);
+    let access_token = if unchanged {
+        stored_token.map(str::to_string)
+    } else if token_raw.is_empty() {
+        None
+    } else {
+        Some(token_raw.clone())
     };
     // Token format cap: the token guards a public
     // endpoint, so it is URL-safe and bounded like every other field.
-    if stored_token.is_none()
+    if !unchanged
         && let Some(token) = access_token.as_ref()
         && token.len() > caps::ACCESS_TOKEN
     {
@@ -371,7 +435,7 @@ async fn build_profile_from_form(
             lang.t("val.field_too_long")
                 .replace("{}", &caps::ACCESS_TOKEN.to_string()),
         ));
-    } else if stored_token.is_none()
+    } else if !unchanged
         && let Some(token) = access_token.as_ref()
         && !token
             .chars()
@@ -433,12 +497,15 @@ async fn build_profile_from_form(
                 "sources".into(),
                 lang.t("val.source_missing").replace("{}", source_id),
             )),
-            Err(err) => errors.push(("sources".into(), err.to_string())),
+            // A failed query is not a bad choice of sources: it is a
+            // broken database, and it must not be rendered as a field
+            // error the operator can "fix".
+            Err(err) => return Err(FormError::Server(err)),
         }
     }
 
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(FormError::Validation(errors));
     }
 
     let now = now_ts();
@@ -514,7 +581,7 @@ async fn form_error_response(
                 None => "/admin/profiles/new".into(),
             },
             formats,
-            token_masked_note: values.access_token.contains('•'),
+            token_masked_note: is_token_placeholder(&values.access_token),
             form_id,
             values,
             errors,
@@ -534,8 +601,11 @@ pub async fn profile_create(
     let composition = composition_from_form(&form);
     let profile = match build_profile_from_form(&state, &lang, &form, None).await {
         Ok(profile) => profile,
-        Err(errors) => {
+        Err(FormError::Validation(errors)) => {
             return form_error_response(&state, lang, &headers, &form, None, errors).await;
+        }
+        Err(FormError::Server(err)) => {
+            return row_error_response(lang, &err, "err.profile_not_found");
         }
     };
     if let Err(err) = profiles::create(&state.pool, &profile).await {
@@ -558,12 +628,15 @@ pub async fn profile_update(
     let composition = composition_from_form(&form);
     let profile = match build_profile_from_form(&state, &lang, &form, Some(&id)).await {
         Ok(profile) => profile,
-        Err(errors) => {
+        Err(FormError::Validation(errors)) => {
             return form_error_response(&state, lang, &headers, &form, Some(id), errors).await;
+        }
+        Err(FormError::Server(err)) => {
+            return row_error_response(lang, &err, "err.profile_not_found");
         }
     };
     if let Err(err) = profiles::update(&state.pool, &profile).await {
-        return server_error(lang, &err);
+        return row_error_response(lang, &err, "err.profile_not_found");
     }
     if let Err(err) = profiles::set_sources(&state.pool, &profile.id, &composition).await {
         return server_error(lang, &err);
@@ -584,10 +657,13 @@ struct ProfileDetailTemplate {
     theme: Theme,
     active: &'static str,
     csrf: String,
-    profile: Profile,
+    profile: ProfileCard,
     serve_path: String,
     serve_url: String,
     token_display: String,
+    /// Whether the endpoint is protected by an access token; the card
+    /// says so next to the link, which can no longer carry the token.
+    token_required: bool,
     countries_display: String,
     pipeline_display: String,
     composition: Vec<profiles::CompositionRow>,
@@ -660,29 +736,22 @@ pub async fn profile_detail(
         "/sub/{}",
         profile.slug.clone().unwrap_or_else(|| profile.id.clone())
     );
-    // A token-protected profile answers 403 without its token, and the
-    // token row below is masked, so the copyable endpoint link has to
-    // carry the secret in the query string or it could never be used.
-    // The token charset is unreserved ASCII only (`is_ascii_alphanumeric`
-    // plus `-_.~`), so it needs no escaping.
-    let serve_query = profile
-        .access_token
-        .as_deref()
-        .map(|token| format!("?token={token}"))
-        .unwrap_or_default();
-    // Absolute serve link: the host the admin panel was opened on with the
-    // public port from [server].bind.
+    // The token is stored as a hash: the panel cannot show it and the
+    // copyable link cannot carry it, so the endpoint answers only with
+    // `?token=…` (or a Bearer header). The operator appends the token
+    // they set.
     let base = match state.serve_base(peer, &headers) {
         Ok(b) => b,
         Err(err) => return super::server_error(lang, &fumox_core::Error::Config(err.to_string())),
     };
-    let serve_url = format!("{base}{serve_path}{serve_query}");
+    let serve_url = format!("{base}{serve_path}");
 
-    let token_display = profile
-        .access_token
-        .as_deref()
-        .map(mask_secret)
-        .unwrap_or_else(|| lang.t("prof.token_public").to_string());
+    let token_required = profile.access_token.is_some();
+    let token_display = if token_required {
+        token_placeholder(profile.access_token.as_deref())
+    } else {
+        lang.t("prof.token_public").to_string()
+    };
     let countries_display = if profile.countries.is_empty() {
         lang.t("prof.countries_none").to_string()
     } else {
@@ -699,6 +768,7 @@ pub async fn profile_detail(
             serve_path,
             serve_url,
             token_display,
+            token_required,
             countries_display,
             pipeline_display: profile
                 .pipeline
@@ -706,7 +776,7 @@ pub async fn profile_detail(
                 .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
                 .unwrap_or_default(),
             stats_dupes: stats_total - stats_unique,
-            profile,
+            profile: ProfileCard::from_profile(&profile),
             composition,
             stats_total,
             stats_unique,
@@ -727,7 +797,7 @@ pub async fn profile_detail(
 #[template(path = "profiles/_enabled_badge.html")]
 struct EnabledBadgeFragment {
     lang: Lang,
-    profile: Profile,
+    profile: ProfileCard,
 }
 
 impl_i18n!(EnabledBadgeFragment);
@@ -740,7 +810,7 @@ impl_i18n!(EnabledBadgeFragment);
 #[template(path = "profiles/_toggle_form.html")]
 struct ToggleFormFragment {
     lang: Lang,
-    profile: Profile,
+    profile: ProfileCard,
     csrf: String,
     swap_oob: bool,
 }
@@ -752,15 +822,16 @@ impl_i18n!(ToggleFormFragment);
 /// fragment templates the detail page includes, so the ids, aria
 /// attributes and the hx-* contract cannot drift from the initial render.
 fn toggle_swap_fragment(lang: &Lang, profile: &Profile, csrf: &str) -> String {
+    let card = ProfileCard::from_profile(profile);
     let badge = EnabledBadgeFragment {
         lang: lang.clone(),
-        profile: profile.clone(),
+        profile: card.clone(),
     }
     .render()
     .expect("badge fragment renders");
     let form = ToggleFormFragment {
         lang: lang.clone(),
-        profile: profile.clone(),
+        profile: card,
         csrf: csrf.to_string(),
         swap_oob: true,
     }
@@ -783,7 +854,7 @@ pub async fn profile_toggle(
     profile.enabled = !profile.enabled;
     profile.updated_at = now_ts();
     if let Err(err) = profiles::update(&state.pool, &profile).await {
-        return server_error(lang, &err);
+        return row_error_response(lang, &err, "err.profile_not_found");
     }
     state.caches.invalidate_profile(&id).await;
     let message = if profile.enabled {
@@ -853,11 +924,21 @@ mod tests {
         }
     }
 
-    /// The edit form re-renders the stored secret as `mask_secret`
-    /// (`abc…••••`) and posts it back verbatim on any save. That mask is
-    /// not a token, so the charset check used to reject it and the whole
-    /// save came back 422: a profile with an access token could never be
-    /// renamed, re-slugged or re-pointed at other sources.
+    /// The per-field errors of a refused form. A server-side failure is
+    /// not a form error, so it fails the test instead of hiding behind
+    /// an empty error list.
+    fn field_errors(err: FormError) -> Vec<(String, String)> {
+        match err {
+            FormError::Validation(errors) => errors,
+            FormError::Server(err) => panic!("the form failed on the server: {err}"),
+        }
+    }
+
+    /// The edit form re-renders the stored secret as a fixed placeholder
+    /// (`••••••`) and posts it back verbatim on any save. The placeholder
+    /// is not a token, so the charset check used to reject it and the
+    /// whole save came back 422: a profile with an access token could
+    /// never be renamed, re-slugged or re-pointed at other sources.
     #[tokio::test]
     async fn unchanged_masked_token_keeps_the_stored_secret() {
         let (_dir, state) = test_state().await;
@@ -866,13 +947,25 @@ mod tests {
         let stored = stored_profile(Some(secret));
         profiles::create(&state.pool, &stored).await.unwrap();
 
+        // The row holds the hash, never the secret.
+        let stored_row = profiles::get(&state.pool, &stored.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_hash = stored_row
+            .access_token
+            .clone()
+            .expect("the token is stored");
+        assert_ne!(stored_hash, secret, "the secret must not be at rest");
+        assert!(fumox_core::token::is_hashed(&stored_hash));
+
         // Exactly what GET /admin/profiles/{id}/edit hands the browser.
-        let masked = mask_secret(secret);
-        assert!(masked.contains('•'), "the form value is the mask {masked}");
+        let placeholder = token_placeholder(Some(&stored_hash));
+        assert_eq!(placeholder, TOKEN_PLACEHOLDER);
         let form: Vec<(String, String)> = vec![
             ("name".into(), "renamed".into()),
             ("slug".into(), "p1".into()),
-            ("access_token".into(), masked),
+            ("access_token".into(), placeholder),
             ("output_format".into(), "uri_list".into()),
             ("enabled".into(), "on".into()),
         ];
@@ -882,8 +975,8 @@ mod tests {
             .expect("posting the form back unchanged must save");
         assert_eq!(
             built.access_token.as_deref(),
-            Some(secret),
-            "the masked placeholder must keep the stored secret"
+            Some(stored_hash.as_str()),
+            "the unchanged placeholder must keep the stored token"
         );
         // The other fields of the same save did change.
         assert_eq!(built.name, "renamed");
@@ -919,18 +1012,22 @@ mod tests {
             ]
         };
 
-        let errors = build_profile_from_form(&state, &lang, &with_token("bad token!"), None)
-            .await
-            .expect_err("a token outside the charset must be refused");
+        let errors = field_errors(
+            build_profile_from_form(&state, &lang, &with_token("bad token!"), None)
+                .await
+                .expect_err("a token outside the charset must be refused"),
+        );
         assert!(
             errors.iter().any(|(field, _)| field == "access_token"),
             "the format check must still fire: {errors:?}"
         );
 
         let over = "a".repeat(caps::ACCESS_TOKEN + 1);
-        let errors = build_profile_from_form(&state, &lang, &with_token(&over), None)
-            .await
-            .expect_err("an over-long token must be refused");
+        let errors = field_errors(
+            build_profile_from_form(&state, &lang, &with_token(&over), None)
+                .await
+                .expect_err("an over-long token must be refused"),
+        );
         assert!(
             errors.iter().any(|(field, _)| field == "access_token"),
             "the cap must still fire: {errors:?}"
@@ -942,13 +1039,22 @@ mod tests {
         assert_eq!(built.access_token.as_deref(), Some("good-token_1"));
     }
 
-    /// Only the mask itself restores the stored secret; anything else typed is validated as typed.
+    /// Only the placeholder itself restores the stored token; anything
+    /// else typed is validated as typed.
     #[tokio::test]
     async fn a_typed_bullet_is_not_mistaken_for_the_mask() {
         let (_dir, state) = test_state().await;
         let lang = state.locales.default_lang();
         let stored = stored_profile(Some("supersecretvalue"));
         profiles::create(&state.pool, &stored).await.unwrap();
+        let stored_row = profiles::get(&state.pool, &stored.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_hash = stored_row
+            .access_token
+            .clone()
+            .expect("the token is stored");
 
         let with_token = |token: &str| -> Vec<(String, String)> {
             vec![
@@ -959,21 +1065,23 @@ mod tests {
             ]
         };
 
-        // The mask itself still restores the stored secret.
-        let mask = mask_secret("supersecretvalue");
-        let built = build_profile_from_form(&state, &lang, &with_token(&mask), Some(&stored.id))
-            .await
-            .expect("the unchanged mask must save");
-        assert_eq!(built.access_token.as_deref(), Some("supersecretvalue"));
+        // The placeholder itself still restores the stored token.
+        let placeholder = token_placeholder(Some(&stored_hash));
+        let built =
+            build_profile_from_form(&state, &lang, &with_token(&placeholder), Some(&stored.id))
+                .await
+                .expect("the unchanged placeholder must save");
+        assert_eq!(built.access_token.as_deref(), Some(stored_hash.as_str()));
 
-        // A typed value that merely contains a bullet is not the mask, so
-        // it is validated like any other typed value: '•' is outside the
-        // token charset and the save is refused rather than silently
-        // keeping the old secret.
-        let errors =
+        // A typed value that merely contains a bullet is not the
+        // placeholder, so it is validated like any other typed value:
+        // '•' is outside the token charset and the save is refused rather
+        // than silently keeping the old token.
+        let errors = field_errors(
             build_profile_from_form(&state, &lang, &with_token("tok•en"), Some(&stored.id))
                 .await
-                .expect_err("a typed bullet must not resolve to the stored secret");
+                .expect_err("a typed bullet must not resolve to the stored token"),
+        );
         assert!(
             errors.iter().any(|(field, _)| field == "access_token"),
             "the format check must fire on a typed bullet: {errors:?}"
@@ -1011,18 +1119,22 @@ mod tests {
         };
 
         // Bad format: outside the shared slug charset/length rules.
-        let errors = build_profile_from_form(&state, &lang, &with_slug("no spaces"), None)
-            .await
-            .expect_err("an invalid slug format must be refused");
+        let errors = field_errors(
+            build_profile_from_form(&state, &lang, &with_slug("no spaces"), None)
+                .await
+                .expect_err("an invalid slug format must be refused"),
+        );
         assert!(
             errors.iter().any(|(field, _)| field == "slug"),
             "the format check must fire on the slug field: {errors:?}"
         );
 
         // Taken: a new profile may not claim the stored row's slug.
-        let errors = build_profile_from_form(&state, &lang, &with_slug("p1"), None)
-            .await
-            .expect_err("a slug held by another profile must be refused");
+        let errors = field_errors(
+            build_profile_from_form(&state, &lang, &with_slug("p1"), None)
+                .await
+                .expect_err("a slug held by another profile must be refused"),
+        );
         assert!(
             errors.iter().any(|(field, _)| field == "slug"),
             "the uniqueness check must fire on the slug field: {errors:?}"
@@ -1124,7 +1236,7 @@ mod tests {
         let profile = sample_profile(true);
         let page_form = ToggleFormFragment {
             lang: lang.clone(),
-            profile: profile.clone(),
+            profile: ProfileCard::from_profile(&profile),
             csrf: "csrf-token".into(),
             swap_oob: false,
         }
@@ -1132,7 +1244,7 @@ mod tests {
         .unwrap();
         let swap_form = ToggleFormFragment {
             lang: lang.clone(),
-            profile,
+            profile: ProfileCard::from_profile(&profile),
             csrf: "csrf-token".into(),
             swap_oob: true,
         }

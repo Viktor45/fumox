@@ -139,6 +139,106 @@ async fn coverage_buckets_partition_the_population() {
     );
 }
 
+/// An attempt the tunnel engine never verified is still a T2 attempt:
+/// the row exists, so the coverage buckets and the admin browser count
+/// it, and the recency queue moves past the proxy instead of serving it
+/// again and again.
+#[tokio::test]
+async fn an_unverified_t2_attempt_counts_as_a_t2_attempt() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcA0000000").await;
+    let unverified = entry("unverified", "h9.example.com", 443);
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        std::slice::from_ref(&unverified),
+        &[],
+        1000,
+        false,
+    )
+    .await
+    .unwrap();
+
+    // No attempt at all: the proxy is in the `none` bucket.
+    assert_eq!(coverage_of(&pool).await, ("none".to_string(), 1));
+
+    // An attempt the engine never verified: still a T2 attempt.
+    let row = get_by_fingerprint(&pool, &unverified.fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
+         VALUES (?, 1000, 0, NULL, 'meow-rs unavailable', ?)",
+    )
+    .bind(row.id)
+    .bind(crate::repo::probe::T2_UNVERIFIED_KIND)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(coverage_of(&pool).await, ("t2_only".to_string(), 1));
+
+    // The admin browser flags the proxy as T2-checked as well.
+    let (t2_checked,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM probe_results r
+         WHERE r.proxy_id = ? AND r.probe_kind IN ('t2', 't2_unverified')",
+    )
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(t2_checked, 1, "the unverified attempt is a T2 attempt");
+}
+
+/// The bucket of the only proxy of the pool, as (bucket, count).
+async fn coverage_of(pool: &DbPool) -> (String, i64) {
+    let buckets = count_by_check_coverage(pool).await.unwrap();
+    let (name, count) = buckets
+        .into_iter()
+        .find(|(_, count)| *count > 0)
+        .expect("a bucket");
+    (name, count)
+}
+
+/// The recency queue must move past a proxy whose T2 attempt never ran:
+/// an unverified attempt is still an attempt, so the proxy is not
+/// served again in the very next cycle.
+#[tokio::test]
+async fn an_unverified_attempt_advances_the_t2_recency_queue() {
+    let (_dir, pool) = temp_pool().await;
+    let a = seed_proxy(&pool, "vless", "rec-a.example.com").await;
+    let b = seed_proxy(&pool, "trojan", "rec-b.example.com").await;
+    sqlx::query("UPDATE proxies SET status = 'alive'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Without any attempt the queue is served by id.
+    let rows = select_t2_candidates(&pool, 10).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![a, b]
+    );
+
+    // An unverified attempt is an attempt: the proxy moves to the back
+    // of the queue.
+    sqlx::query(
+        "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
+         VALUES (?, 1000, 0, NULL, 'meow-rs unavailable', ?)",
+    )
+    .bind(a)
+    .bind(crate::repo::probe::T2_UNVERIFIED_KIND)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rows = select_t2_candidates(&pool, 10).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![b, a]
+    );
+}
+
 #[tokio::test]
 async fn inserts_new_proxies_as_unknown() {
     let (_dir, pool) = temp_pool().await;
@@ -287,6 +387,28 @@ async fn reconcile_stamps_each_entry_with_its_own_geo() {
         assert_eq!(c.as_deref(), Some(country), "country for {}", e.host);
         assert_eq!(a.as_deref(), Some(asn), "asn for {}", e.host);
     }
+}
+
+/// The path segment of a parsed URI survives the round trip through the
+/// database: a node served from the store keeps the path it was parsed
+/// with, so a client that reads the path from the URI segment connects to
+/// the endpoint the feed named.
+#[tokio::test]
+async fn reconcile_keeps_the_raw_path_of_an_entry() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcA0000000").await;
+    let mut with_path = entry("one", "h1.example.com", 443);
+    with_path.raw_path = "/ws".to_string();
+    reconcile_source(&pool, "srcA0000000", &[with_path.clone()], &[], 1000, false)
+        .await
+        .unwrap();
+
+    let row = get_by_fingerprint(&pool, &with_path.fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.raw_path.as_deref(), Some("/ws"));
+    assert_eq!(row.to_entry().unwrap().raw_path, "/ws");
 }
 
 #[tokio::test]
@@ -2202,15 +2324,16 @@ async fn t2_sample_prioritizes_never_checked_then_oldest_last_check() {
 }
 
 /// The SQL allowlist must mirror what meow-rs can actually tunnel
-/// (fumox-probe filters the batch through `clash::is_supported`). A
+/// (`fumox_core::formats::clash::is_supported`, the mapping the probe
+/// builds its T2 batch with). A
 /// divergence would either drop rows the SQL offered, under the
 /// recency order a perpetually uncheckable row (e.g. naive) would
 /// starve the whole batch, or skip schemes meow-rs handles fine.
 #[tokio::test]
 async fn t2_scheme_allowlist_mirrors_meow_support() {
     use crate::models::Scheme;
-    // The mirror lives in fumox-probe::clash::is_supported; the core
-    // crate cannot depend on it, so assert the exact expected set
+    // The mapping lives in fumox-core::formats::clash; the SQL allowlist
+    // cannot depend on the mapping, so assert the exact expected set
     // instead: adding a scheme there (or removing one) must update
     // T2_SCHEMES in the same change.
     let meow_supported: Vec<&str> = Scheme::all()
@@ -3869,4 +3992,230 @@ async fn proxy_card_links_resolve_source_names() {
     assert_eq!(rows[0].seen_at, 2);
     assert_eq!(rows[1].source_id, "srcA0000000");
     assert_eq!(rows[1].name.as_deref(), Some("srcA0000000"));
+}
+
+/// Insert a proxy row with a hand-made fingerprint, the shape a row
+/// written before the canonical form changed has: a key the ingest no
+/// longer produces and the fields the recompute reads.
+async fn insert_legacy_row(
+    pool: &DbPool,
+    fingerprint: &str,
+    params: &str,
+    status: &str,
+    source_id: &str,
+) -> i64 {
+    let now = crate::models::now_ts();
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
+                              params, unknown_params, status, created_at, updated_at)
+         VALUES (?, 'vless', 'n', 'h.example.com', 443, 'uuid-1', ?, NULL, ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(fingerprint)
+    .bind(params)
+    .bind(status)
+    .bind(now)
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, ?, ?)")
+        .bind(id)
+        .bind(source_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    id
+}
+
+/// The key the canonical form gives a vless node with that SNI.
+fn canonical_key_of(sni: &str) -> String {
+    let entry = ProxyEntry {
+        scheme: Scheme::Vless,
+        name: "n".into(),
+        host: "h.example.com".into(),
+        port: 443,
+        credential: "uuid-1".into(),
+        params: vec![Param {
+            key: "sni".into(),
+            value: sni.into(),
+            known: true,
+        }],
+        raw_path: String::new(),
+        raw_line: String::new(),
+    };
+    entry.fingerprint()
+}
+
+#[tokio::test]
+async fn two_rows_that_describe_the_same_node_are_merged() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcMergeA").await;
+    make_source(&pool, "srcMergeB").await;
+
+    // Two keys under the old canonical form, one node under the new one:
+    // the Clash spelling `servername` and the URI spelling `sni`.
+    let alive = insert_legacy_row(
+        &pool,
+        "old-alive",
+        r#"{"sni":"a.example.com"}"#,
+        "alive",
+        "srcMergeA",
+    )
+    .await;
+    insert_legacy_row(
+        &pool,
+        "old-other",
+        r#"{"servername":"a.example.com"}"#,
+        "unknown",
+        "srcMergeB",
+    )
+    .await;
+
+    let stats = refingerprint(&pool).await.unwrap();
+    assert_eq!(stats.merged, 1);
+    assert_eq!(stats.rewritten, 1);
+
+    // One row is left, and it is the one the probe had verified.
+    let rows: Vec<ProxyRow> = sqlx::query_as("SELECT * FROM proxies")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, alive);
+    assert_eq!(rows[0].status, "alive");
+    assert_eq!(rows[0].fingerprint, canonical_key_of("a.example.com"));
+
+    // Both sources are still linked to the surviving row.
+    let links: Vec<(String,)> = sqlx::query_as(
+        "SELECT source_id FROM proxy_source_links WHERE proxy_id = ? ORDER BY source_id",
+    )
+    .bind(alive)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        links,
+        vec![("srcMergeA".to_string(),), ("srcMergeB".to_string(),)]
+    );
+}
+
+#[tokio::test]
+async fn a_row_that_already_carries_the_key_is_left_alone() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcUnchanged").await;
+    let id = insert_legacy_row(
+        &pool,
+        &canonical_key_of("a.example.com"),
+        r#"{"sni":"a.example.com"}"#,
+        "unknown",
+        "srcUnchanged",
+    )
+    .await;
+
+    let stats = refingerprint(&pool).await.unwrap();
+    assert_eq!(stats.rewritten, 0);
+    assert_eq!(stats.merged, 0);
+    let row: ProxyRow = sqlx::query_as("SELECT * FROM proxies WHERE id = ?")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.fingerprint, canonical_key_of("a.example.com"));
+}
+
+#[tokio::test]
+async fn the_recompute_is_idempotent() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcIdempotent").await;
+    insert_legacy_row(
+        &pool,
+        "old-one",
+        r#"{"sni":"a.example.com"}"#,
+        "unknown",
+        "srcIdempotent",
+    )
+    .await;
+
+    let first = refingerprint(&pool).await.unwrap();
+    assert_eq!(first.rewritten, 1);
+    // A second pass finds every key already computed and changes nothing.
+    let second = refingerprint(&pool).await.unwrap();
+    assert_eq!(second.rewritten, 0);
+    assert_eq!(second.merged, 0);
+}
+
+#[tokio::test]
+async fn a_row_the_ingest_already_recomputed_is_not_duplicated() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcIngest").await;
+    // The old row, still under its old key.
+    let legacy = insert_legacy_row(
+        &pool,
+        "old-row",
+        r#"{"sni":"a.example.com"}"#,
+        "unknown",
+        "srcIngest",
+    )
+    .await;
+    // The row the ingest created after the upgrade, already under the new
+    // key: the same node, twice.
+    let fresh = insert_legacy_row(
+        &pool,
+        &canonical_key_of("a.example.com"),
+        r#"{"sni":"a.example.com"}"#,
+        "alive",
+        "srcIngest",
+    )
+    .await;
+
+    let stats = refingerprint(&pool).await.unwrap();
+    assert_eq!(stats.merged, 1);
+    let rows: Vec<ProxyRow> = sqlx::query_as("SELECT * FROM proxies")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // The verified row survives: the old row had no verdict of its own.
+    assert_eq!(rows[0].id, fresh);
+    assert_ne!(rows[0].id, legacy);
+    assert_eq!(rows[0].status, "alive");
+}
+
+#[tokio::test]
+async fn the_version_marker_gates_the_recompute() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcMarker").await;
+    insert_legacy_row(
+        &pool,
+        "old-row",
+        r#"{"sni":"a.example.com"}"#,
+        "unknown",
+        "srcMarker",
+    )
+    .await;
+
+    // The rows carry no version yet: the recompute runs and the marker
+    // names the version they now carry.
+    let stats = ensure_fingerprint_version(&pool).await.unwrap().unwrap();
+    assert_eq!(stats.rewritten, 1);
+    assert_eq!(
+        crate::repo::meta_get(&pool, FINGERPRINT_VERSION_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(crate::fingerprint::FINGERPRINT_VERSION)
+    );
+
+    // The rows carry the current version now: the next start does no work.
+    assert!(ensure_fingerprint_version(&pool).await.unwrap().is_none());
+
+    // Another version: the recompute runs again.
+    crate::repo::meta_set(&pool, FINGERPRINT_VERSION_KEY, "fp1")
+        .await
+        .unwrap();
+    let stats = ensure_fingerprint_version(&pool).await.unwrap().unwrap();
+    assert_eq!(stats.rewritten, 0);
+    assert_eq!(stats.merged, 0);
 }

@@ -7,6 +7,7 @@
 //! suffixes as Clash output.
 
 use crate::models::{ProxyEntry, Scheme};
+use crate::params::Blocks;
 use serde_json::{Map, Value};
 
 /// Schemes with a sing-box counterpart used by Fumox; everything else is
@@ -34,6 +35,10 @@ pub fn entry_to_outbound(entry: &ProxyEntry) -> Option<Value> {
 pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
     let mut m = Map::new();
     m.insert("tag".into(), Value::String(tag.to_string()));
+    // The structured blocks are parsed once for the whole entry and handed
+    // to the writers below: every one of them used to re-parse the same
+    // feed-controlled YAML text.
+    let blocks = Blocks::of(entry);
 
     match entry.scheme {
         Scheme::Vless => {
@@ -41,15 +46,15 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
             m.insert("server".into(), Value::String(entry.host.clone()));
             m.insert("server_port".into(), num(entry.port));
             m.insert("uuid".into(), Value::String(entry.credential.clone()));
-            if let Some(flow) = non_empty_param(entry, "flow") {
+            if let Some(flow) = super::param_value(entry, "flow") {
                 m.insert("flow".into(), Value::String(flow.to_string()));
             }
-            let reality =
-                security_is(entry, "reality") || super::reality_public_key(entry).is_some();
-            if let Some(tls) = tls_object(entry, reality || wants_tls(entry), reality) {
+            let reality = crate::params::is_reality(entry, &blocks);
+            let tls = crate::params::wants_tls(entry, &blocks);
+            if let Some(tls) = tls_object(entry, &blocks, tls, reality) {
                 m.insert("tls".into(), tls);
             }
-            if let Some(transport) = transport_object(entry, "type") {
+            if let Some(transport) = transport_object(entry, "type", &blocks) {
                 m.insert("transport".into(), transport);
             }
         }
@@ -74,14 +79,12 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
             m.insert("alter_id".into(), unsigned(alter_id));
             // vmess JSON spells TLS as `tls: "tls"`; Clash input uses the
             // boolean `tls: true`; some feeds spell it `security=tls`.
-            let tls = super::param_value(entry, "tls")
-                .is_some_and(|v| v.eq_ignore_ascii_case("tls"))
-                || super::param_truthy(entry, "tls")
-                || security_is(entry, "tls");
-            if tls && let Some(tls) = tls_object(entry, true, false) {
+            if crate::params::wants_tls(entry, &blocks)
+                && let Some(tls) = tls_object(entry, &blocks, true, false)
+            {
                 m.insert("tls".into(), tls);
             }
-            if let Some(transport) = transport_object(entry, "net") {
+            if let Some(transport) = transport_object(entry, "net", &blocks) {
                 m.insert("transport".into(), transport);
             }
         }
@@ -90,12 +93,15 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
             m.insert("server".into(), Value::String(entry.host.clone()));
             m.insert("server_port".into(), num(entry.port));
             m.insert("password".into(), Value::String(entry.credential.clone()));
-            let reality =
-                security_is(entry, "reality") || super::reality_public_key(entry).is_some();
-            if let Some(tls) = tls_object(entry, true, reality) {
+            let reality = crate::params::is_reality(entry, &blocks);
+            // Trojan is TLS by definition: the shared decision says so, and
+            // the Clash writer leaves the key out for the same reason.
+            if crate::params::wants_tls(entry, &blocks)
+                && let Some(tls) = tls_object(entry, &blocks, true, reality)
+            {
                 m.insert("tls".into(), tls);
             }
-            if let Some(transport) = transport_object(entry, "type") {
+            if let Some(transport) = transport_object(entry, "type", &blocks) {
                 m.insert("transport".into(), transport);
             }
         }
@@ -132,13 +138,13 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
             m.insert("server".into(), Value::String(entry.host.clone()));
             m.insert("server_port".into(), num(entry.port));
             m.insert("password".into(), Value::String(entry.credential.clone()));
-            if let Some(tls) = tls_object(entry, true, false) {
+            if let Some(tls) = tls_object(entry, &blocks, true, false) {
                 m.insert("tls".into(), tls);
             }
-            if let Some(obfs) = non_empty_param(entry, "obfs") {
+            if let Some(obfs) = super::param_value(entry, "obfs") {
                 let mut o = Map::new();
                 o.insert("type".into(), Value::String(obfs.to_string()));
-                if let Some(pass) = non_empty_param(entry, "obfs-password") {
+                if let Some(pass) = super::param_value(entry, "obfs-password") {
                     o.insert("password".into(), Value::String(pass.to_string()));
                 }
                 m.insert("obfs".into(), Value::Object(o));
@@ -211,50 +217,14 @@ pub fn encode_singbox(entries: &[ProxyEntry]) -> String {
     }
 }
 
-/// vless/trojan/hysteria2-style entries want a TLS block when the entry
-/// advertises TLS or carries SNI/insecure markers. Clash YAML spells the
-/// toggle `tls: true` and the SNI `servername`, so both spellings count.
-fn wants_tls(entry: &ProxyEntry) -> bool {
-    // An explicit `tls` toggle is authoritative wherever it appears: the
-    // mihomo boolean (`tls: false`) and the vmess string (`tls=tls`) both
-    // mean "this proxy is/is not wrapped". Deciding from the SNI instead
-    // would override a stated `tls: false` and emit a TLS outbound the
-    // Clash writer of the same entry never emits. A value that is
-    // neither truthy nor falsy is not a toggle at all, so the rules
-    // below still decide; `param_value` already drops an empty one.
-    if let Some(tls) = super::param_value(entry, "tls") {
-        match tls.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" | "tls" => return true,
-            "0" | "false" | "no" | "off" => return false,
-            _ => {}
-        }
-    }
-    matches!(entry.param("security").unwrap_or_default(), "tls")
-        || sni_of(entry).is_some()
-        || super::is_insecure(&entry.params)
-}
-
-/// SNI under either spelling: the URI family's `sni` and the mihomo
-/// `servername` that Clash YAML carries. Reading only the first dropped
-/// the SNI of every Clash-sourced proxy.
-fn sni_of(entry: &ProxyEntry) -> Option<String> {
-    non_empty_param(entry, "sni")
-        .map(str::to_string)
-        .or_else(|| super::param_value(entry, "servername"))
-}
-
-fn security_is(entry: &ProxyEntry, want: &str) -> bool {
-    super::param_value(entry, "security").is_some_and(|v| v.eq_ignore_ascii_case(want))
-}
-
 /// Bare TLS object for schemes without the full options (socks5-over-TLS).
 fn minimal_tls(entry: &ProxyEntry) -> Value {
     let mut tls = Map::new();
     tls.insert("enabled".into(), Value::Bool(true));
-    if let Some(sni) = sni_of(entry) {
+    if let Some(sni) = crate::params::sni(entry) {
         tls.insert("server_name".into(), Value::String(sni));
     }
-    if super::is_insecure(&entry.params) {
+    if crate::params::is_insecure(entry) {
         tls.insert("insecure".into(), Value::Bool(true));
     }
     Value::Object(tls)
@@ -263,16 +233,16 @@ fn minimal_tls(entry: &ProxyEntry) -> Value {
 /// Build the sing-box `tls` object; `enabled` is always true once emitted.
 /// `reality` adds the REALITY sub-object with the entry's pbk/sid (URI
 /// params or a Clash-input `reality-opts` block).
-fn tls_object(entry: &ProxyEntry, enabled: bool, reality: bool) -> Option<Value> {
+fn tls_object(entry: &ProxyEntry, blocks: &Blocks, enabled: bool, reality: bool) -> Option<Value> {
     if !enabled {
         return None;
     }
     let mut tls = Map::new();
     tls.insert("enabled".into(), Value::Bool(true));
-    if let Some(sni) = sni_of(entry) {
+    if let Some(sni) = crate::params::sni(entry) {
         tls.insert("server_name".into(), Value::String(sni));
     }
-    if super::is_insecure(&entry.params) {
+    if crate::params::is_insecure(entry) {
         tls.insert("insecure".into(), Value::Bool(true));
     }
     if let Some(list) = super::param_list(entry, "alpn") {
@@ -281,22 +251,23 @@ fn tls_object(entry: &ProxyEntry, enabled: bool, reality: bool) -> Option<Value>
             Value::Array(list.into_iter().map(Value::String).collect()),
         );
     }
-    if let Some(fp) = non_empty_param(entry, "fp") {
+    // The uTLS client hello under either spelling: the URI family's `fp`
+    // and the mihomo `client-fingerprint`.
+    if let Some(fp) = crate::params::fingerprint_hint(entry) {
         let mut utls = Map::new();
         utls.insert("enabled".into(), Value::Bool(true));
-        utls.insert("fingerprint".into(), Value::String(fp.to_string()));
+        utls.insert("fingerprint".into(), Value::String(fp));
         tls.insert("utls".into(), Value::Object(utls));
     }
     if reality {
-        let pbk = super::reality_public_key(entry);
-        let sid = super::reality_short_id(entry);
-        if pbk.is_some() || sid.is_some() {
+        let reality = crate::params::reality(entry, blocks);
+        if !reality.is_empty() {
             let mut r = Map::new();
             r.insert("enabled".into(), Value::Bool(true));
-            if let Some(pbk) = pbk {
+            if let Some(pbk) = reality.public_key {
                 r.insert("public_key".into(), Value::String(pbk));
             }
-            if let Some(sid) = sid {
+            if let Some(sid) = reality.short_id {
                 r.insert("short_id".into(), Value::String(sid));
             }
             tls.insert("reality".into(), Value::Object(r));
@@ -308,17 +279,28 @@ fn tls_object(entry: &ProxyEntry, enabled: bool, reality: bool) -> Option<Value>
 /// Transport block resolved from the entry's native network key (`uri_key`:
 /// `type` for vless/trojan URIs, `net` for vmess JSON; the mihomo spelling
 /// `network` is accepted as a fallback). sing-box spells both HTTP/2 and
-/// HTTP-header transports `http`; `httpupgrade` has its own transport type.
-fn transport_object(entry: &ProxyEntry, uri_key: &str) -> Option<Value> {
+/// the plain-HTTP header transport `http`; `httpupgrade` has its own
+/// transport type.
+///
+/// The blocks of a Clash-input entry are read as well: the same node
+/// published as YAML carries its transport in `ws-opts`/`grpc-opts`/
+/// `h2-opts` instead of in the flat parameters, and the writer has to
+/// describe the same node either way.
+fn transport_object(entry: &ProxyEntry, uri_key: &str, blocks: &Blocks) -> Option<Value> {
     let network = super::network_of(entry, uri_key)?;
     let mut t = Map::new();
     match network.as_str() {
         "ws" | "httpupgrade" => {
             t.insert("type".into(), Value::String(network.clone()));
-            if let Some(path) = super::param_value(entry, "path") {
+            let path =
+                super::param_value(entry, "path").or_else(|| super::map_str(&blocks.ws, "path"));
+            if let Some(path) = path {
                 t.insert("path".into(), Value::String(path));
             }
-            if let Some(host) = super::param_value(entry, "host") {
+            let host = super::param_value(entry, "host")
+                .or_else(|| super::map_str(&blocks.ws_headers, "host"))
+                .or_else(|| ws_nested_host(blocks));
+            if let Some(host) = host {
                 if network == "ws" {
                     let mut headers = Map::new();
                     headers.insert("Host".into(), Value::String(host));
@@ -330,7 +312,9 @@ fn transport_object(entry: &ProxyEntry, uri_key: &str) -> Option<Value> {
         }
         "grpc" => {
             t.insert("type".into(), Value::String("grpc".into()));
-            let mut service = super::param_value(entry, "serviceName");
+            let mut service = super::param_value(entry, "serviceName")
+                .or_else(|| super::map_str(&blocks.grpc, "grpc-service-name"))
+                .or_else(|| super::param_value(entry, "grpc-service-name"));
             if entry.scheme == Scheme::Vmess {
                 service = service.or_else(|| super::param_value(entry, "path"));
             }
@@ -340,26 +324,75 @@ fn transport_object(entry: &ProxyEntry, uri_key: &str) -> Option<Value> {
         }
         "h2" | "http" => {
             t.insert("type".into(), Value::String("http".into()));
-            if let Some(host) = super::param_value(entry, "host") {
-                let hosts: Vec<Value> = host
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| Value::String(s.to_string()))
-                    .collect();
-                t.insert("host".into(), Value::Array(hosts));
-            }
-            if let Some(path) = super::param_value(entry, "path") {
-                t.insert("path".into(), Value::String(path));
-            }
+            put_http_transport(entry, blocks, &mut t);
         }
+        // Plain-HTTP header obfuscation: `type=tcp&headerType=http` in
+        // URIs, `net: tcp, type: http` in vmess JSON. The Clash writer
+        // reduces it to its `http` transport, and the two writers have
+        // to describe the same node.
+        "tcp" if header_is_http(entry) => {
+            t.insert("type".into(), Value::String("http".into()));
+            put_http_transport(entry, blocks, &mut t);
+        }
+        // Plain TCP is sing-box's default: no transport block.
+        "tcp" => return None,
+        // Unknown network spelling (xhttp, kcp, …): sing-box has a closed
+        // set of transport types, so there is nothing to emit and the
+        // transport is left out. The Clash writer passes the name through
+        // for a capable mihomo instead; the two differ on purpose, a
+        // transport sing-box does not know makes the whole config fail to
+        // start, while mihomo may still understand the name.
         _ => return None,
     }
     Some(Value::Object(t))
 }
 
-fn non_empty_param<'a>(entry: &'a ProxyEntry, key: &str) -> Option<&'a str> {
-    entry.param(key).filter(|v| !v.is_empty())
+/// The host list and the path of the HTTP transports (HTTP/2 and the
+/// plain-HTTP header obfuscation).
+///
+/// The structured blocks are read as well: a Clash-input node carries its
+/// HTTP/2 settings in `h2-opts` and its plain-HTTP ones in `http-opts`,
+/// and the writer has to describe the same node either way.
+fn put_http_transport(entry: &ProxyEntry, blocks: &Blocks, t: &mut Map<String, Value>) {
+    let mut hosts: Vec<String> = super::param_value(entry, "host")
+        .map(|host| {
+            host.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if hosts.is_empty() {
+        hosts = super::map_list(&blocks.h2, "host")
+            .or_else(|| super::map_header(&blocks.http))
+            .unwrap_or_default();
+    }
+    if !hosts.is_empty() {
+        t.insert(
+            "host".into(),
+            Value::Array(hosts.into_iter().map(Value::String).collect()),
+        );
+    }
+    let path = super::param_value(entry, "path")
+        .or_else(|| super::map_first(&blocks.h2, "path"))
+        .or_else(|| super::map_first(&blocks.http, "path"));
+    if let Some(path) = path {
+        t.insert("path".into(), Value::String(path));
+    }
+}
+
+/// Whether the entry asks for the plain-HTTP header obfuscation.
+fn header_is_http(entry: &ProxyEntry) -> bool {
+    super::param_value(entry, "headertype").is_some_and(|v| v.eq_ignore_ascii_case("http"))
+        || (entry.scheme == Scheme::Vmess
+            && super::param_value(entry, "type").is_some_and(|v| v.eq_ignore_ascii_case("http")))
+}
+
+/// The `Host` header inside a parsed `ws-opts.headers` block.
+fn ws_nested_host(blocks: &Blocks) -> Option<String> {
+    let hosts = super::map_header(&blocks.ws)?;
+    (!hosts.is_empty()).then(|| hosts.join(","))
 }
 
 fn num(value: u16) -> Value {

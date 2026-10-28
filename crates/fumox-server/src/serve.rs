@@ -15,7 +15,7 @@
 
 use crate::cache::{Caches, InlineClaim, InlineOutcome, Rendered};
 use crate::pipeline::{self, Candidate, CompiledPipeline, PipelineIssue};
-use crate::security::{RateLimiter, client_key, ct_eq, fmt_rfc3339_utc};
+use crate::security::{RateLimiter, client_key, fmt_rfc3339_utc};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -456,17 +456,17 @@ async fn serve_sub(
         return error_response(StatusCode::NOT_FOUND, "profile not found");
     }
     // Optional per-profile access token: query parameter or
-    // Authorization: Bearer. NULL means the endpoint is public.
+    // Authorization: Bearer. NULL means the endpoint is public. The row
+    // holds the token's hash, so the presented token is hashed and
+    // compared in constant time.
     if let Some(required) = &profile.access_token {
         let provided = params
             .get("token")
             .cloned()
             .or_else(|| bearer_token(&headers));
-        // Constant-time comparison: the token is a secret checked on the
-        // public listener.
         let ok = provided
             .as_deref()
-            .is_some_and(|provided| ct_eq(provided, required));
+            .is_some_and(|provided| fumox_core::token::verify(provided, required));
         if !ok {
             let mut response =
                 error_response(StatusCode::FORBIDDEN, "access token is missing or invalid");

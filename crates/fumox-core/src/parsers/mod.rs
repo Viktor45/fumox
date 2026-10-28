@@ -41,6 +41,16 @@ pub enum LineOutcome {
     Unrecognized,
 }
 
+/// Upper bound on the entries one payload may produce.
+///
+/// Every entry costs a row, a fingerprint and a parameter set, and a payload
+/// is attacker-controlled feed content bounded only by the fetch cap: a feed
+/// with a million lines would otherwise load the database with a million
+/// rows in one refresh. The cap stops the parse; the remainder is counted
+/// (unrecognized for a URI list, skipped for the structured formats) so the
+/// truncation stays visible.
+pub const MAX_ENTRIES: usize = 4096;
+
 /// Parse one subscription line. Comments and blank lines must be filtered
 /// out by the caller ([`parse_subscription`] does this).
 pub fn parse_line(line: &str) -> LineOutcome {
@@ -94,6 +104,17 @@ fn parsed(result: Result<ProxyEntry, String>) -> LineOutcome {
     }
 }
 
+/// Normalize a host to the shape the URI parser produces: the bare address.
+///
+/// The URI parser stores the literal without its brackets (`[2001:db8::1]`
+/// becomes `2001:db8::1`), a structured source may spell it the URI way or
+/// with a `%zone` scope id. The stored host must have one shape, the
+/// fingerprint, the SSRF vetting and the serializer all read it as an
+/// address.
+pub(crate) fn normalize_host(host: &str) -> String {
+    crate::ssrf::strip_host_decorations(host).to_string()
+}
+
 /// Reject a field value that would break the one-proxy-per-line contract.
 ///
 /// The URI serializers emit `host` and `credential` verbatim and parameter
@@ -111,6 +132,25 @@ fn parsed(result: Result<ProxyEntry, String>) -> LineOutcome {
 pub(crate) fn reject_line_breaks(field: &str, value: &str) -> Result<(), String> {
     if value.contains(['\n', '\r']) {
         return Err(format!("{field} contains a line break"));
+    }
+    Ok(())
+}
+
+/// Reject a persisted field that is over the byte cap.
+///
+/// The host, the credential and the name are stored verbatim on every row
+/// (`proxies.host`, `proxies.credential`, `proxies.name`), so an oversized one
+/// is a storage bomb exactly like an oversized parameter. URI-list input is
+/// bounded as a whole by [`uri::MAX_LINE_BYTES`]; the vector formats (Clash
+/// YAML, vmess JSON, the base64 blob of a legacy `ss` line) are not, so their
+/// fields are capped one by one.
+pub(crate) fn check_field_size(field: &str, value: &str) -> Result<(), String> {
+    if value.len() > uri::MAX_PARAM_BYTES {
+        return Err(format!(
+            "{field} over the {}-byte cap ({} bytes)",
+            uri::MAX_PARAM_BYTES,
+            value.len()
+        ));
     }
     Ok(())
 }
@@ -210,9 +250,9 @@ fn scan_yaml_line(
             } else if b == b'\'' {
                 *in_single = false;
             }
-        } else if b == b'"' && boundary {
+        } else if b == b'"' && at_value_position(&line[..i]) {
             *in_double = true;
-        } else if b == b'\'' && boundary {
+        } else if b == b'\'' && at_value_position(&line[..i]) {
             *in_single = true;
         } else if b == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
             // Comment to end of line.
@@ -230,6 +270,28 @@ fn scan_yaml_line(
         i += 1;
     }
     false
+}
+
+/// Is the text before `prefix` a value position — the place where a
+/// quoted scalar may start? The last non-whitespace character before the
+/// quote must be a structural one (`:`, `,`, `[`, `{`, `-`, `?`), or the
+/// quote must be the first thing on its line.
+///
+/// A quote that is *not* in a value position belongs to a plain scalar
+/// (`name: foo "bar`) and is an ordinary character. Treating it as a
+/// quoting delimiter switched the scanner into quoted mode and kept it
+/// there for the rest of the payload, which blinded it to every alias
+/// reference behind it — the exact hole the alias scan exists to close.
+fn at_value_position(prefix: &str) -> bool {
+    for byte in prefix.bytes().rev() {
+        match byte {
+            b' ' | b'\t' => continue,
+            b':' | b',' | b'[' | b'{' | b'-' | b'?' => return true,
+            _ => return false,
+        }
+    }
+    // Only whitespace before the quote: it opens the line's value.
+    true
 }
 
 /// Does the `|`/`>` starting at `header` begin a block scalar? The header
@@ -287,12 +349,25 @@ fn parse_naive(transport: &str, rest: &str, line: &str) -> LineOutcome {
     entry.params.insert(
         0,
         crate::models::Param {
-            key: "naive_transport".to_string(),
+            key: uri::NAIVE_TRANSPORT_PARAM.to_string(),
             value: transport.to_string(),
             known: true,
         },
     );
     LineOutcome::Parsed(entry)
+}
+
+impl ProxyEntry {
+    /// The transport of a `naive+…` entry (`https` / `quic`).
+    ///
+    /// The transport rides in a synthetic parameter the parser attaches and
+    /// the serializer consumes; it is never a client-facing query key. The
+    /// parameter survives the database round-trip (the serializer needs it
+    /// to rebuild the prefix), so the accessor reads it from the stored
+    /// parameter list.
+    pub fn naive_transport(&self) -> Option<&str> {
+        self.param(uri::NAIVE_TRANSPORT_PARAM)
+    }
 }
 
 /// Serialize an entry back into a subscription line.
@@ -362,7 +437,9 @@ fn canonical_uri_entry(entry: &ProxyEntry) -> ProxyEntry {
     // Force the one key the translation cannot know about: a public key
     // makes this a REALITY node whatever `security` says (or omits).
     if matches!(entry.scheme, Scheme::Vless | Scheme::Trojan)
-        && crate::formats::reality_public_key(entry).is_some()
+        && crate::params::reality(entry, &crate::params::Blocks::of(entry))
+            .public_key
+            .is_some()
     {
         match out
             .params
@@ -616,12 +693,14 @@ fn sanitize_for_output(entry: &ProxyEntry) -> Option<ProxyEntry> {
 }
 
 fn serialize_naive(entry: &ProxyEntry) -> String {
-    let transport = entry.param("naive_transport").unwrap_or("https");
+    let transport = entry.naive_transport().unwrap_or("https");
     let prefix = format!("naive+{transport}://");
     // Serialize through the generic machinery, then swap the prefix; the
     // synthetic parameter itself must not leak into the query string.
     let mut stripped = entry.clone();
-    stripped.params.retain(|p| p.key != "naive_transport");
+    stripped
+        .params
+        .retain(|p| p.key != uri::NAIVE_TRANSPORT_PARAM);
     let spec_prefix = uri::NAIVE_SPEC.prefix;
     let generic = uri::serialize_with_spec(&uri::NAIVE_SPEC, &stripped);
     format!("{prefix}{}", &generic[spec_prefix.len()..])
@@ -732,6 +811,12 @@ fn parse_uri_list(text: &str, format: InputFormat) -> crate::Result<ParsedSubscr
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        if result.entries.len() >= MAX_ENTRIES {
+            // The cap is reached: the rest of the payload is counted instead
+            // of parsed, so the load stays bounded and the truncation shows.
+            result.unrecognized += 1;
+            continue;
+        }
         match parse_line(line) {
             LineOutcome::Parsed(entry) => result.entries.push(entry),
             LineOutcome::Discarded => result.discarded += 1,
@@ -745,7 +830,7 @@ fn parse_clash_payload(text: &str) -> crate::Result<ParsedSubscription> {
     let clash_result = clash::parse_payload(text).map_err(crate::Error::Parse)?;
     Ok(ParsedSubscription {
         entries: clash_result.entries,
-        clash_skipped: clash_result.unsupported + clash_result.invalid,
+        clash_skipped: clash_result.unsupported + clash_result.invalid + clash_result.skipped,
         format: InputFormat::ClashYaml,
         ..Default::default()
     })
@@ -755,7 +840,7 @@ fn parse_singbox_payload(text: &str) -> crate::Result<ParsedSubscription> {
     let result = singbox::parse_payload(text).map_err(crate::Error::Parse)?;
     Ok(ParsedSubscription {
         entries: result.entries,
-        clash_skipped: result.unsupported + result.invalid,
+        clash_skipped: result.unsupported + result.invalid + result.skipped,
         format: InputFormat::SingBoxJson,
         ..Default::default()
     })
@@ -790,8 +875,41 @@ mod tests {
             "naive+https://User:d75ca9b2@grape.example.net:5443?sni=grape.example.net#Unknown";
         let entry = entry_for(line);
         assert_eq!(entry.scheme, Scheme::Naive);
-        assert_eq!(entry.param("naive_transport"), Some("https"));
+        assert_eq!(entry.naive_transport(), Some("https"));
         assert_eq!(serialize(&entry), line);
+    }
+
+    /// A payload with a pathological number of entries stops at the cap,
+    /// and the remainder is reported instead of parsed.
+    #[test]
+    fn a_payload_with_too_many_entries_is_capped() {
+        let payload = (0..MAX_ENTRIES + 10)
+            .map(|i| format!("vless://u{i}@h{i}.example.com:443#n{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = parse_subscription(&payload, Encoding::Plain, None).unwrap();
+        assert_eq!(result.entries.len(), MAX_ENTRIES);
+        assert_eq!(result.unrecognized, 10);
+    }
+
+    /// The naive transport rides in a synthetic parameter, so it must never
+    /// reach a client: the emitted URI carries the transport in the scheme
+    /// prefix and nothing else.
+    #[test]
+    fn the_naive_transport_parameter_never_leaves_the_module() {
+        let line =
+            "naive+quic://User:d75ca9b2@grape.example.net:5443?sni=grape.example.net#Unknown";
+        let mut entry = entry_for(line);
+        assert_eq!(entry.naive_transport(), Some("quic"));
+        assert_eq!(serialize(&entry), line);
+
+        // The stored shape (no source line): the serializer rebuilds the
+        // prefix from the synthetic parameter and drops the parameter itself.
+        entry.raw_line.clear();
+        let out = serialize(&entry);
+        assert!(out.starts_with("naive+quic://"), "{out}");
+        assert!(!out.contains("naive_transport"), "{out}");
+        assert_eq!(out.matches('?').count(), 1, "{out}");
     }
 
     fn clash_entries(yaml: &str) -> Vec<ProxyEntry> {
@@ -1100,6 +1218,24 @@ mod tests {
             assert!(
                 reject_yaml_aliases(payload).is_ok(),
                 "must accept: {payload:?}"
+            );
+        }
+    }
+
+    /// A quote inside a plain scalar is an ordinary character, not a
+    /// quoting delimiter. Treating it as one switched the scanner into
+    /// quoted mode and kept it there for the rest of the payload, so
+    /// every alias behind the quote went unseen.
+    #[test]
+    fn a_quote_inside_a_plain_scalar_does_not_hide_an_alias() {
+        for payload in [
+            "name: foo \" *a\n",
+            "name: foo ' *a\n",
+            "name: foo \" *a\nother: 1\n",
+        ] {
+            assert!(
+                reject_yaml_aliases(payload).is_err(),
+                "must reject: {payload:?}"
             );
         }
     }

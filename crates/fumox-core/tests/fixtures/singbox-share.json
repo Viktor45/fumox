@@ -1,0 +1,2121 @@
+[
+  {
+    "remarks": "fumox-fixture-share-a",
+    "log": {
+      "loglevel": "warning"
+    },
+    "inbounds": [
+      {
+        "tag": "socks",
+        "port": 1080,
+        "listen": "127.0.0.1",
+        "protocol": "socks",
+        "settings": {
+          "auth": "noauth",
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "fumox-fixture-share-a-node-00",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-00.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000000",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-00.example.net",
+            "fingerprint": "chrome"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-01",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-01.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000001",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-01.example.net",
+            "publicKey": "PBK0001",
+            "shortId": "0001"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-02",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-02.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000002",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-02.example.net",
+            "fingerprint": "safari"
+          },
+          "wsSettings": {
+            "path": "/ws2",
+            "headers": {
+              "Host": "ws-2.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-03",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-03.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000003",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "grpc",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-03.example.net",
+            "publicKey": "PBK0003",
+            "shortId": "0003"
+          },
+          "grpcSettings": {
+            "serviceName": "svc3"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-04",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-04.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000004",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "http",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-04.example.net",
+            "fingerprint": "firefox"
+          },
+          "httpSettings": {
+            "host": [
+              "h4.example.net"
+            ],
+            "path": "/api/4"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-05",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-05.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000005",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp"
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-06",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-06.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000006",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-06.example.net",
+            "fingerprint": "chrome"
+          },
+          "wsSettings": {
+            "path": "/ws6",
+            "headers": {
+              "Host": "ws-6.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-07",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-07.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000007",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-07.example.net"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-08",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-08.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000008",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-08.example.net",
+            "fingerprint": "safari"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-09",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-09.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000009",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-09.example.net",
+            "publicKey": "PBK0009",
+            "shortId": "0009"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-10",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-10.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000000a",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-10.example.net",
+            "fingerprint": "firefox",
+            "allowInsecure": true
+          },
+          "wsSettings": {
+            "path": "/ws10",
+            "headers": {
+              "Host": "ws-10.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-11",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-11.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000000b",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "grpc",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-11.example.net",
+            "publicKey": "PBK0011",
+            "shortId": "000b"
+          },
+          "grpcSettings": {
+            "serviceName": "svc11"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-12",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-12.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000000c",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "http",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-12.example.net",
+            "fingerprint": "chrome"
+          },
+          "httpSettings": {
+            "host": [
+              "h12.example.net"
+            ],
+            "path": "/api/12"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-13",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-13.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000000d",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp"
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-14",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-14.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000000e",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-14.example.net",
+            "fingerprint": "safari"
+          },
+          "wsSettings": {
+            "path": "/ws14",
+            "headers": {
+              "Host": "ws-14.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-15",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-15.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000000f",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-15.example.net"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-16",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-16.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000010",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-16.example.net",
+            "fingerprint": "firefox"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-17",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-17.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000011",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-17.example.net",
+            "publicKey": "PBK0017",
+            "shortId": "0011",
+            "fingerprint": "firefox"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-18",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-18.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000012",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-18.example.net",
+            "fingerprint": "chrome"
+          },
+          "wsSettings": {
+            "path": "/ws18",
+            "headers": {
+              "Host": "ws-18.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-19",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-19.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000013",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "grpc",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-19.example.net",
+            "publicKey": "PBK0019",
+            "shortId": "0013"
+          },
+          "grpcSettings": {
+            "serviceName": "svc19"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-20",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-20.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000014",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "http",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-20.example.net",
+            "fingerprint": "safari"
+          },
+          "httpSettings": {
+            "host": [
+              "h20.example.net"
+            ],
+            "path": "/api/20"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-21",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-21.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000015",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp"
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-22",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-22.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000016",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-22.example.net",
+            "fingerprint": "firefox"
+          },
+          "wsSettings": {
+            "path": "/ws22",
+            "headers": {
+              "Host": "ws-22.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-a-node-23",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-23.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000017",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-23.example.net"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "fumox-fixture-share-b",
+    "log": {
+      "loglevel": "warning"
+    },
+    "inbounds": [
+      {
+        "tag": "socks",
+        "port": 1080,
+        "listen": "127.0.0.1",
+        "protocol": "socks",
+        "settings": {
+          "auth": "noauth",
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "fumox-fixture-share-b-node-24",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-24.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000018",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-24.example.net",
+            "fingerprint": "chrome",
+            "allowInsecure": true
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-25",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-25.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000019",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-25.example.net",
+            "publicKey": "PBK0025",
+            "shortId": "0019"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-26",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-26.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000001a",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-26.example.net",
+            "fingerprint": "safari"
+          },
+          "wsSettings": {
+            "path": "/ws26",
+            "headers": {
+              "Host": "ws-26.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-27",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-27.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000001b",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "grpc",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-27.example.net",
+            "publicKey": "PBK0027",
+            "shortId": "001b",
+            "fingerprint": "firefox"
+          },
+          "grpcSettings": {
+            "serviceName": "svc27"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-28",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-28.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000001c",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "http",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-28.example.net",
+            "fingerprint": "firefox"
+          },
+          "httpSettings": {
+            "host": [
+              "h28.example.net"
+            ],
+            "path": "/api/28"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-29",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-29.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000001d",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp"
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-30",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-30.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000001e",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-30.example.net",
+            "fingerprint": "chrome"
+          },
+          "wsSettings": {
+            "path": "/ws30",
+            "headers": {
+              "Host": "ws-30.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-31",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-31.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000001f",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-31.example.net",
+            "allowInsecure": true
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-32",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-32.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000020",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-32.example.net",
+            "fingerprint": "safari"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-33",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-33.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000021",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-33.example.net",
+            "publicKey": "PBK0033",
+            "shortId": "0021"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-34",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-34.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000022",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-34.example.net",
+            "fingerprint": "firefox"
+          },
+          "wsSettings": {
+            "path": "/ws34",
+            "headers": {
+              "Host": "ws-34.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-35",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-35.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000023",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "grpc",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-35.example.net",
+            "publicKey": "PBK0035",
+            "shortId": "0023"
+          },
+          "grpcSettings": {
+            "serviceName": "svc35"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-36",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-36.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000024",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "http",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-36.example.net",
+            "fingerprint": "chrome"
+          },
+          "httpSettings": {
+            "host": [
+              "h36.example.net"
+            ],
+            "path": "/api/36"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-37",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-37.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000025",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp"
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-38",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-38.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000026",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-38.example.net",
+            "fingerprint": "safari",
+            "allowInsecure": true
+          },
+          "wsSettings": {
+            "path": "/ws38",
+            "headers": {
+              "Host": "ws-38.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-39",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-39.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000027",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-39.example.net"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-40",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-40.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000028",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-40.example.net",
+            "fingerprint": "firefox"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-41",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-41.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000029",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-41.example.net",
+            "publicKey": "PBK0041",
+            "shortId": "0029"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-42",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-42.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000002a",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-42.example.net",
+            "fingerprint": "chrome"
+          },
+          "wsSettings": {
+            "path": "/ws42",
+            "headers": {
+              "Host": "ws-42.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-43",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-43.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000002b",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "grpc",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-43.example.net",
+            "publicKey": "PBK0043",
+            "shortId": "002b"
+          },
+          "grpcSettings": {
+            "serviceName": "svc43"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-44",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-44.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000002c",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "http",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-44.example.net",
+            "fingerprint": "safari"
+          },
+          "httpSettings": {
+            "host": [
+              "h44.example.net"
+            ],
+            "path": "/api/44"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-45",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-45.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000002d",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp"
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-46",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-46.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000002e",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-46.example.net",
+            "fingerprint": "firefox"
+          },
+          "wsSettings": {
+            "path": "/ws46",
+            "headers": {
+              "Host": "ws-46.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-b-node-47",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-47.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000002f",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-47.example.net"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "fumox-fixture-share-c",
+    "log": {
+      "loglevel": "warning"
+    },
+    "inbounds": [
+      {
+        "tag": "socks",
+        "port": 1080,
+        "listen": "127.0.0.1",
+        "protocol": "socks",
+        "settings": {
+          "auth": "noauth",
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "fumox-fixture-share-c-node-48",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-48.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000030",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-48.example.net",
+            "fingerprint": "chrome"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-49",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-49.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000031",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-49.example.net",
+            "publicKey": "PBK0049",
+            "shortId": "0031"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-50",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-50.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000032",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-50.example.net",
+            "fingerprint": "safari"
+          },
+          "wsSettings": {
+            "path": "/ws50",
+            "headers": {
+              "Host": "ws-50.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-51",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-51.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000033",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "grpc",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-51.example.net",
+            "publicKey": "PBK0051",
+            "shortId": "0033"
+          },
+          "grpcSettings": {
+            "serviceName": "svc51"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-52",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-52.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000034",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "http",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-52.example.net",
+            "fingerprint": "firefox",
+            "allowInsecure": true
+          },
+          "httpSettings": {
+            "host": [
+              "h52.example.net"
+            ],
+            "path": "/api/52"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-53",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-53.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000035",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp"
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-54",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-54.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000036",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-54.example.net",
+            "fingerprint": "chrome"
+          },
+          "wsSettings": {
+            "path": "/ws54",
+            "headers": {
+              "Host": "ws-54.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-55",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-55.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000037",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-55.example.net"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-56",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-56.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000038",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-56.example.net",
+            "fingerprint": "safari"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-57",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-57.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000039",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-57.example.net",
+            "publicKey": "PBK0057",
+            "shortId": "0039",
+            "fingerprint": "firefox"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-58",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-58.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000003a",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-58.example.net",
+            "fingerprint": "firefox"
+          },
+          "wsSettings": {
+            "path": "/ws58",
+            "headers": {
+              "Host": "ws-58.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-59",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-59.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000003b",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "grpc",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-59.example.net",
+            "publicKey": "PBK0059",
+            "shortId": "003b"
+          },
+          "grpcSettings": {
+            "serviceName": "svc59"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-60",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-60.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000003c",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "http",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-60.example.net",
+            "fingerprint": "chrome"
+          },
+          "httpSettings": {
+            "host": [
+              "h60.example.net"
+            ],
+            "path": "/api/60"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-61",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-61.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000003d",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp"
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-62",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-62.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000003e",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-62.example.net",
+            "fingerprint": "safari"
+          },
+          "wsSettings": {
+            "path": "/ws62",
+            "headers": {
+              "Host": "ws-62.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-63",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-63.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-00000000003f",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-63.example.net"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-64",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-64.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000040",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-64.example.net",
+            "fingerprint": "firefox"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-65",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-65.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000041",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-65.example.net",
+            "publicKey": "PBK0065",
+            "shortId": "0041"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-66",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-66.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000042",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-66.example.net",
+            "fingerprint": "chrome",
+            "allowInsecure": true
+          },
+          "wsSettings": {
+            "path": "/ws66",
+            "headers": {
+              "Host": "ws-66.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-67",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-67.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000043",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "grpc",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "node-67.example.net",
+            "publicKey": "PBK0067",
+            "shortId": "0043",
+            "fingerprint": "firefox"
+          },
+          "grpcSettings": {
+            "serviceName": "svc67"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-68",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-68.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000044",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "http",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-68.example.net",
+            "fingerprint": "safari"
+          },
+          "httpSettings": {
+            "host": [
+              "h68.example.net"
+            ],
+            "path": "/api/68"
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-69",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-69.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000045",
+                  "encryption": "none",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp"
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-70",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-70.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000046",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-70.example.net",
+            "fingerprint": "firefox"
+          },
+          "wsSettings": {
+            "path": "/ws70",
+            "headers": {
+              "Host": "ws-70.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "fumox-fixture-share-c-node-71",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node-71.example.net",
+              "port": 8443,
+              "users": [
+                {
+                  "id": "00000000-0000-0000-0000-000000000047",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node-71.example.net"
+          }
+        }
+      }
+    ]
+  }
+]

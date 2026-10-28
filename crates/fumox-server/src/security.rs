@@ -19,16 +19,12 @@ use std::time::Duration;
 /// Constant-time string equality (cookie/CSRF comparison). Also used for
 /// the public capability-token checks (`/sub` access token, alive-export
 /// link) so every secret comparison goes through one implementation.
+///
+/// The implementation lives in `fumox-core`, next to the token hashing it
+/// has to stay consistent with: the profile access token is verified
+/// against its stored hash there.
 pub fn ct_eq(a: &str, b: &str) -> bool {
-    let (ab, bb) = (a.as_bytes(), b.as_bytes());
-    if ab.len() != bb.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in ab.iter().zip(bb) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    fumox_core::token::ct_eq(a, b)
 }
 
 /// What one forwarded header says about the request it arrived on.

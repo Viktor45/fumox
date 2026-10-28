@@ -3,8 +3,9 @@
 //! toggle / *Refresh now* / delete actions.
 
 use super::{
-    FormMap, action_response, caps, flash_redirect, fmt_bytes, is_htmx, mask_secret, not_found,
-    page_offset, pagination_pages, pipeline_from_form, server_error, validate_slug,
+    FormError, FormMap, action_response, caps, flash_redirect, fmt_bytes, is_htmx, mask_secret,
+    not_found, page_offset, pagination_pages, pipeline_from_form, row_error_response, server_error,
+    validate_slug,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -16,7 +17,9 @@ use askama::Template;
 use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use fumox_core::models::{Encoding, InputFormat, IpFamily, Scheme, Source, new_id, now_ts};
+use fumox_core::models::{
+    Encoding, ErrorClass, InputFormat, IpFamily, Scheme, Source, new_id, now_ts,
+};
 use fumox_core::repo::{fetch_log, proxies, sources};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -25,6 +28,51 @@ use std::str::FromStr;
 /// `sources/_log.html` fragment: one fixed page size, no query parameter
 /// (the log is a card detail, not a browsable list screen).
 const LOG_PAGE_SIZE: i64 = 20;
+
+/// The source fields the admin card renders.
+///
+/// The card never receives the model: the model's headers carry the
+/// source's `Authorization` and the like, so they must stay out of a
+/// template's reach. The masked pairs the card shows are a separate
+/// field.
+#[derive(Debug, Clone)]
+struct SourceCard {
+    id: String,
+    slug: Option<String>,
+    name: String,
+    encoding: Encoding,
+    input_format: Option<InputFormat>,
+    ip_family: Option<IpFamily>,
+    tags: Option<Vec<String>>,
+    cache_ttl_seconds: i64,
+    created_at: i64,
+    updated_at: i64,
+    last_fetched_at: Option<i64>,
+    last_error: Option<String>,
+    error_class: Option<ErrorClass>,
+    enabled: bool,
+}
+
+impl SourceCard {
+    fn from_source(source: &Source) -> Self {
+        Self {
+            id: source.id.clone(),
+            slug: source.slug.clone(),
+            name: source.name.clone(),
+            encoding: source.encoding,
+            input_format: source.input_format,
+            ip_family: source.ip_family,
+            tags: source.tags.clone(),
+            cache_ttl_seconds: source.cache_ttl_seconds,
+            created_at: source.created_at,
+            updated_at: source.updated_at,
+            last_fetched_at: source.last_fetched_at,
+            last_error: source.last_error.clone(),
+            error_class: source.error_class,
+            enabled: source.enabled,
+        }
+    }
+}
 
 // List
 
@@ -280,13 +328,14 @@ fn values_for_select(source: &Source) -> Vec<String> {
 }
 
 /// Validate + assemble a `Source` from form fields. Returns the model or
-/// per-field errors (translated, shown next to fields).
+/// the reason it could not be built: per-field errors (translated, shown
+/// next to fields) or a row that could not be read.
 async fn build_source_from_form(
     state: &AdminState,
     lang: &Lang,
     form: &[(String, String)],
     existing_id: Option<&str>,
-) -> Result<Source, Vec<(String, String)>> {
+) -> Result<Source, FormError> {
     let get = |key: &str| -> String {
         form.iter()
             .rev()
@@ -500,22 +549,31 @@ async fn build_source_from_form(
     let pipeline = pipeline_from_form(form, lang, &mut errors);
 
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(FormError::Validation(errors));
     }
 
-    // Restore unchanged masked header secrets from the stored row.
-    if let Some(id) = existing_id
-        && let Ok(Some(stored)) = sources::get(&state.pool, id).await
-        && let Some(stored_headers) = stored.headers
-    {
-        restore_masked_headers(&mut headers_map, &stored_headers);
+    // The stored row: its masked header secrets go back where the form
+    // still carries the mask, and its creation stamp and last fetch
+    // state carry over into the updated row. A failed read is a broken
+    // database, not a missing row: the two must not answer alike.
+    let existing = match existing_id {
+        Some(id) => match sources::get(&state.pool, id).await {
+            Ok(Some(stored)) => Some(stored),
+            // The row is gone: the save has nothing to update.
+            Ok(None) => {
+                return Err(FormError::Server(fumox_core::Error::NotFound(format!(
+                    "source {id}"
+                ))));
+            }
+            Err(err) => return Err(FormError::Server(err)),
+        },
+        None => None,
+    };
+    if let Some(stored_headers) = existing.as_ref().and_then(|s| s.headers.as_ref()) {
+        restore_masked_headers(&mut headers_map, stored_headers);
     }
 
     let now = now_ts();
-    let existing = match existing_id {
-        Some(id) => sources::get(&state.pool, id).await.ok().flatten(),
-        None => None,
-    };
 
     Ok(Source {
         id: existing_id.map(str::to_string).unwrap_or_else(new_id),
@@ -637,7 +695,7 @@ pub async fn source_create(
     let theme = theme::from_headers(&headers);
     let source = match build_source_from_form(&state, &lang, &form, None).await {
         Ok(source) => source,
-        Err(errors) => {
+        Err(FormError::Validation(errors)) => {
             let pipeline_error = errors
                 .iter()
                 .find(|(field, _)| field == "pipeline")
@@ -668,6 +726,9 @@ pub async fn source_create(
                 StatusCode::UNPROCESSABLE_ENTITY,
             );
         }
+        Err(FormError::Server(err)) => {
+            return row_error_response(lang, &err, "err.source_not_found");
+        }
     };
     if let Err(err) = sources::create(&state.pool, &source).await {
         return server_error(lang, &err);
@@ -686,7 +747,7 @@ pub async fn source_update(
     let theme = theme::from_headers(&headers);
     let source = match build_source_from_form(&state, &lang, &form, Some(&id)).await {
         Ok(source) => source,
-        Err(errors) => {
+        Err(FormError::Validation(errors)) => {
             let action = format!("/admin/sources/{id}/edit");
             let pipeline_error = errors
                 .iter()
@@ -718,9 +779,12 @@ pub async fn source_update(
                 StatusCode::UNPROCESSABLE_ENTITY,
             );
         }
+        Err(FormError::Server(err)) => {
+            return row_error_response(lang, &err, "err.source_not_found");
+        }
     };
     if let Err(err) = sources::update(&state.pool, &source).await {
-        return server_error(lang, &err);
+        return row_error_response(lang, &err, "err.source_not_found");
     }
     // Saved → effective immediately. The freshness stamp lives on the
     // source row (`sources::update` resets it when a fetch-relevant field
@@ -752,7 +816,7 @@ struct SourceDetailTemplate {
     theme: Theme,
     active: &'static str,
     csrf: String,
-    source: Source,
+    source: SourceCard,
     url_display: String,
     headers_display: Vec<(String, String)>,
     pipeline_display: String,
@@ -871,7 +935,7 @@ fn render_source_detail(
             active: "sources",
             csrf: state.csrf_for(headers),
             url_display: source.url.clone(),
-            source,
+            source: SourceCard::from_source(&source),
             headers_display,
             pipeline_display,
             protocols_display,
@@ -922,7 +986,7 @@ pub async fn source_log(
 #[template(path = "sources/_enabled_badge.html")]
 struct EnabledBadgeFragment {
     lang: Lang,
-    source: Source,
+    source: SourceCard,
 }
 
 impl_i18n!(EnabledBadgeFragment);
@@ -935,7 +999,7 @@ impl_i18n!(EnabledBadgeFragment);
 #[template(path = "sources/_toggle_form.html")]
 struct ToggleFormFragment {
     lang: Lang,
-    source: Source,
+    source: SourceCard,
     csrf: String,
     swap_oob: bool,
 }
@@ -947,15 +1011,16 @@ impl_i18n!(ToggleFormFragment);
 /// fragment templates the detail page includes, so the ids, aria
 /// attributes and the hx-* contract cannot drift from the initial render.
 fn toggle_swap_fragment(lang: &Lang, source: &Source, csrf: &str) -> String {
+    let card = SourceCard::from_source(source);
     let badge = EnabledBadgeFragment {
         lang: lang.clone(),
-        source: source.clone(),
+        source: card.clone(),
     }
     .render()
     .expect("badge fragment renders");
     let form = ToggleFormFragment {
         lang: lang.clone(),
-        source: source.clone(),
+        source: card,
         csrf: csrf.to_string(),
         swap_oob: true,
     }
@@ -978,7 +1043,7 @@ pub async fn source_toggle(
     source.enabled = !source.enabled;
     source.updated_at = now_ts();
     if let Err(err) = sources::update(&state.pool, &source).await {
-        return server_error(lang, &err);
+        return row_error_response(lang, &err, "err.source_not_found");
     }
     // The enabled flip reset the row's freshness stamp (a fetch-relevant
     // change, see `sources::update`); the rendered outputs go here.
@@ -1011,13 +1076,10 @@ pub async fn source_refresh(
     headers: HeaderMap,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
-    if sources::get(&state.pool, &id)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return not_found(lang, "err.source_not_found");
+    match sources::get(&state.pool, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found(lang, "err.source_not_found"),
+        Err(err) => return server_error(lang, &err),
     }
     if state.refresh_tx.send(id.clone()).is_err() {
         return action_response(
@@ -1077,7 +1139,10 @@ pub async fn source_refresh_status(
     let (done_at, error_message, ok) = if busy {
         (None, None, true)
     } else {
-        let source = sources::get(&state.pool, &id).await.ok().flatten();
+        let source = match sources::get(&state.pool, &id).await {
+            Ok(source) => source,
+            Err(err) => return server_error(lang, &err),
+        };
         match source {
             Some(s) if s.error_class.is_none() && s.last_fetched_at.is_some() => {
                 (s.last_fetched_at, None, true)
@@ -1474,7 +1539,7 @@ mod tests {
         let source = sample_source(true);
         let page_form = ToggleFormFragment {
             lang: lang.clone(),
-            source: source.clone(),
+            source: SourceCard::from_source(&source),
             csrf: "csrf-token".into(),
             swap_oob: false,
         }
@@ -1482,7 +1547,7 @@ mod tests {
         .unwrap();
         let swap_form = ToggleFormFragment {
             lang: lang.clone(),
-            source,
+            source: SourceCard::from_source(&source),
             csrf: "csrf-token".into(),
             swap_oob: true,
         }

@@ -21,7 +21,7 @@ use crate::models::{ProxyEntry, Scheme};
 use base64::Engine;
 
 use super::uri::{
-    encode_fragment, host_for_uri, parse_hostport, parse_query, percent_decode, serialize_query,
+    encode_fragment, host_for_output, parse_hostport, parse_query, percent_decode, serialize_query,
     split_fragment, split_path, split_query,
 };
 
@@ -39,9 +39,12 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, String> {
     let mut params = query.map(parse_query).transpose()?.unwrap_or_default();
     super::uri::mark_known(&mut params, &[]);
 
+    let name = fragment.map(percent_decode).unwrap_or_default();
+    super::check_field_size("ss: name", &name)?;
+
     Ok(ProxyEntry {
         scheme: Scheme::Ss,
-        name: fragment.map(percent_decode).unwrap_or_default(),
+        name,
         host,
         port,
         credential,
@@ -57,18 +60,36 @@ fn parse_sip002(before_query: &str) -> Result<(String, String, u16, String), Str
         Some(i) => (&before_query[..i], &before_query[i + 1..]),
         None => return Err("ss: missing @".to_string()),
     };
-    let decoded = decode_b64_lenient(userinfo).ok_or("ss: invalid base64 userinfo")?;
-    let credential =
-        String::from_utf8(decoded).map_err(|_| "ss: non-UTF-8 userinfo".to_string())?;
+    let credential = decode_userinfo(userinfo)?;
     if !credential.contains(':') {
         return Err("ss: userinfo is not method:password".to_string());
     }
     // The blob is arbitrary bytes, so it can carry a line break that the
     // serializer would emit verbatim (see `parsers::reject_line_breaks`).
     super::reject_line_breaks("ss: credential", &credential)?;
+    super::check_field_size("ss: credential", &credential)?;
     let (hostport, raw_path) = split_path(hostport_path);
     let (host, port) = parse_hostport(hostport)?;
+    super::check_field_size("ss: host", &host)?;
     Ok((credential, host, port, raw_path.to_string()))
+}
+
+/// Decode the SIP002 userinfo into `method:password`.
+///
+/// The specification says the userinfo is the base64 of `method:password`, but
+/// a fair number of producers emit it percent-encoded in the clear. Base64 is
+/// tried first; a userinfo that is not valid base64 is decoded as plaintext
+/// and accepted when it carries the `method:password` separator. The two
+/// readings cannot collide: a base64 blob never contains a `:`.
+fn decode_userinfo(userinfo: &str) -> Result<String, String> {
+    if let Some(decoded) = decode_b64_lenient(userinfo) {
+        return String::from_utf8(decoded).map_err(|_| "ss: non-UTF-8 userinfo".to_string());
+    }
+    let plaintext = super::uri::percent_decode(userinfo);
+    if plaintext.contains(':') {
+        return Ok(plaintext);
+    }
+    Err("ss: invalid base64 userinfo".to_string())
 }
 
 /// Legacy: the whole `method:password@host:port` is base64-encoded.
@@ -84,8 +105,10 @@ fn parse_legacy(before_query: &str) -> Result<(String, String, u16, String), Str
         return Err("ss: legacy payload is not method:password@host:port".to_string());
     }
     super::reject_line_breaks("ss: credential", credential)?;
+    super::check_field_size("ss: credential", credential)?;
     let (host, port) = parse_hostport(hostport)?;
     super::reject_line_breaks("ss: host", &host)?;
+    super::check_field_size("ss: host", &host)?;
     Ok((credential.to_string(), host, port, String::new()))
 }
 
@@ -103,7 +126,7 @@ pub fn serialize(entry: &ProxyEntry) -> String {
     out.push_str("ss://");
     out.push_str(&blob);
     out.push('@');
-    out.push_str(&host_for_uri(&entry.host));
+    out.push_str(&host_for_output(entry));
     out.push(':');
     out.push_str(&entry.port.to_string());
     out.push_str(&entry.raw_path);
@@ -172,6 +195,17 @@ mod tests {
         let line = format!("ss://{blob}@1.2.3.4:8388#x");
         let entry = parse(&line[5..], &line).unwrap();
         assert_eq!(entry.credential, "aes-256-gcm:pass123");
+    }
+
+    /// The specification says the SIP002 userinfo is base64, but producers
+    /// emit it percent-encoded in the clear as well.
+    #[test]
+    fn parses_a_plaintext_sip002_userinfo() {
+        let line = "ss://aes-256-gcm%3Apass123@1.2.3.4:8388#x";
+        let entry = parse(&line[5..], line).unwrap();
+        assert_eq!(entry.credential, "aes-256-gcm:pass123");
+        assert_eq!(entry.host, "1.2.3.4");
+        assert_eq!(entry.port, 8388);
     }
 
     #[test]

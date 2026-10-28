@@ -158,6 +158,36 @@ async fn main() -> anyhow::Result<()> {
     // link is stable across restarts until rotated from the admin panel.
     alive_export::ensure_token(&pool).await?;
 
+    // Profile access tokens are stored as hashes. A row written before
+    // that still holds the token in plain text, so it is rewritten in
+    // place on the first start after the upgrade.
+    let hashed = fumox_core::repo::profiles::hash_legacy_tokens(&pool).await?;
+    if hashed > 0 {
+        tracing::info!(count = hashed, "profile access tokens hashed");
+    }
+
+    // The fingerprint version is part of the pre-image, so a change of the
+    // canonical form changes every key: the rows written before the change
+    // keep keys the ingest no longer produces. They are recomputed once,
+    // on the first start after the upgrade, before the first ingest — the
+    // rows that describe the same node twice are merged into one.
+    match fumox_core::repo::proxies::ensure_fingerprint_version(&pool).await? {
+        Some(stats) => {
+            tracing::info!(
+                version = fumox_core::fingerprint::FINGERPRINT_VERSION,
+                rewritten = stats.rewritten,
+                merged = stats.merged,
+                "stored fingerprints recomputed"
+            );
+        }
+        None => {
+            tracing::info!(
+                version = fumox_core::fingerprint::FINGERPRINT_VERSION,
+                "stored fingerprints are current"
+            );
+        }
+    }
+
     // Best-effort GeoLite2 database download into [geo].db_dir: fetch what
     // is missing, broken or older than a month. It runs before the geo
     // resolver opens the files, but only for `[geo].startup_download_budget_secs`:
@@ -177,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
     let fetcher = Fetcher::new(
         config.fetch.clone(),
         config.admin.allow_private_urls,
-        config.geo.dns_timeout(),
+        config.ssrf_dns_timeout(),
     );
     let scheduler_state = SchedulerState::new(config.fetch.max_concurrency);
     let caches = Caches::new();

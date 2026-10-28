@@ -184,6 +184,17 @@
     </div>
 
     <div class="panel">
+      <h2>{{ self.t("set.network_panel") }} <span class="badge neutral">server</span></h2>
+      <div class="field">
+        <label for="network-dns">{{ self.t("set.network_dns_timeout") }}</label>
+        <input type="number" id="network-dns" name="network.dns_timeout_secs" min="{{ self.range_min("network.dns_timeout_secs") }}" max="{{ self.range_max("network.dns_timeout_secs") }}" value="{{ self.raw_value("network.dns_timeout_secs") }}"{{ self.fields_disabled() }}>
+        {% match self.range_text("network.dns_timeout_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
+        {% match self.error_for("network.dns_timeout_secs") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
+        <div class="hint">{{ self.t("set.network_dns_timeout_hint") }}</div>
+      </div>
+    </div>
+
+    <div class="panel">
       <h2>{{ self.t("set.admin_panel") }} <span class="badge neutral">server</span></h2>
       <div class="field">
         <span class="check-row">

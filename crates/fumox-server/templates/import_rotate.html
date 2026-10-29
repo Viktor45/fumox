@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block title %}{{ self.t("io.alive_rotate_title") }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ self.t("io.alive_rotate_title") }}</h1>
+</div>
+
+{#- The rotation revokes a capability the clients hold, so the
+    confirmation is a page of its own: it states what is lost, and the
+    second click performs the rotation. A `data-confirm` dialog would
+    have been one click less, but it depends on JavaScript and says
+    nothing about the consequences. -#}
+<div class="panel">
+  <p>{{ self.t("io.alive_rotate_consequences") }}</p>
+  <form method="post" action="/admin/import/alive-token" class="form-actions">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <button class="btn danger" type="submit">{{ self.t("io.alive_rotate_confirm") }}</button>
+    <a class="btn" href="/admin/import">{{ self.t("io.alive_rotate_back") }}</a>
+  </form>
+</div>
+
+{% endblock %}

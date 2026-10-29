@@ -38,3 +38,5 @@ ipnet = { workspace = true }
 
 [dev-dependencies]
 serde_norway = { workspace = true }
+# `test-util` drives the paused clock the timeout tests need.
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,11 +1,16 @@
 {#- Fragment: the toggle form of the profile card, included by the detail
     page for the initial render and re-rendered by the toggle action. In
     the swap response `swap_oob` adds the hx-swap-oob attribute so the
-    form replaces itself out-of-band; the page renders it plain. The
-    aria-pressed state and the button label flip with `profile.enabled`,
-    exactly like the badge. -#}
-<form id="toggle-form" method="post" action="/admin/profiles/{{ profile.id }}/toggle"
-      hx-post="/admin/profiles/{{ profile.id }}/toggle" hx-target="#enabled-badge" hx-swap="outerHTML"{% if swap_oob %} hx-swap-oob="outerHTML:#toggle-form"{% endif %}>
+    form replaces itself out-of-band; the page renders it plain.
+
+    The button carries the action, not the state ("Disable" on an
+    enabled profile), and the state lives in the badge next to it, so the
+    button has no aria-pressed. The button is disabled while the request
+    runs, so a second click cannot flip the flag twice, and the response
+    error is printed into the slot the page keeps next to the badge. -#}
+<form id="toggle-form" method="post" action="/admin/profiles/{{ profile_id }}/toggle"
+      hx-post="/admin/profiles/{{ profile_id }}/toggle" hx-target="#enabled-badge" hx-swap="innerHTML"
+      hx-disabled-elt="find button" data-error-target="toggle-error"{% if swap_oob %} hx-swap-oob="outerHTML:#toggle-form"{% endif %}>
   <input type="hidden" name="_csrf" value="{{ csrf }}">
-  <button class="btn" type="submit" aria-pressed="{% if profile.enabled %}true{% else %}false{% endif %}">{% if profile.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}</button>
+  <button class="btn" type="submit">{% if enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}<span class="htmx-indicator">&nbsp;…</span></button>
 </form>

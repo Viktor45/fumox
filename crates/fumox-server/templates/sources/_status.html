@@ -1,13 +1,26 @@
 {#- Fragment: the "Refresh now" status. While the job is in flight the
     fragment polls itself every 2 seconds (no-JS/SSE fallback) and also
     listens for the fumox:refresh event re-broadcast by the SSE handler in
-    base.html on fetch.done/fetch.failed; when finished it shows the result. -#}
+    base.html on fetch.done/fetch.failed; when finished it shows the result.
+
+    The polled element is swapped whole (`hx-swap="outerHTML"`), so
+    everything the busy state shows lives inside it: a sibling would
+    survive the swap and pile up on every poll. -#}
 {% if busy %}
 <span id="refresh-status" data-busy="1"
       aria-live="polite" aria-atomic="true"
       hx-get="/admin/sources/{{ source_id }}/refresh-status"
       hx-trigger="every 2s, fumox:refresh" hx-swap="outerHTML">
   <span class="badge neutral">{{ self.t("common.refreshing") }}</span>
+  {% match elapsed_seconds %}
+    {% when Some with (seconds) %}
+      <span class="small">{{ self.t_named("src.refresh_elapsed", &[("seconds", seconds.to_string())][..]) }}</span>
+    {% when None %}
+  {% endmatch %}
+  {#- The budget is stated next to the spinner: a refresh may take up to
+      that many seconds, and a stalled one is dropped and can be started
+      again. -#}
+  <span class="hint">{{ budget_hint }}</span>
 </span>
 {% else %}
 <span id="refresh-status" aria-live="polite" aria-atomic="true">

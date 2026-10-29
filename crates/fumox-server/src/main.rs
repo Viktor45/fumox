@@ -15,11 +15,12 @@ mod geo_download;
 mod host_gate;
 mod ingest;
 mod pipeline;
+mod redact;
 mod scheduler;
 mod security;
 mod serve;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,15 @@ use clap::Parser;
 use crate::cache::Caches;
 use crate::fetcher::Fetcher;
 use crate::scheduler::SchedulerState;
+
+/// How long the listeners may take to drain after a shutdown signal.
+///
+/// The graceful shutdown waits for the open connections, and some of them
+/// never end on their own: the admin panel holds an SSE stream, and a
+/// client may be downloading a large export. Without a deadline the
+/// process waits forever and the orchestrator kills it, which skips the
+/// drain and the shutdown log below.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "fumox-server", version, about = "Fumox subscription server")]
@@ -71,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
     // server's readiness, and migrations complete before the listeners
     // bind, so a 200 here means the schema is current.
     if cli.health_check {
-        return match probe_healthz(config.server.bind.port()).await {
+        return match probe_healthz(config.server.bind).await {
             Ok(()) => Ok(()),
             Err(error) => {
                 eprintln!("/healthz did not answer 200: {error}");
@@ -249,10 +259,15 @@ async fn main() -> anyhow::Result<()> {
                 drop_gate: config.ingest.drop_gate,
                 removed_as_unknown: config.ingest.removed_as_unknown,
             },
+            budget: scheduler::ingest_budget(&config.fetch),
         },
         scheduler_state.clone(),
         events.clone(),
         refresh_rx,
+        // The retention windows come from the config this process booted
+        // with: the entry point is the only place that knows which file
+        // that was.
+        scheduler::ServerRetention::from_config(&config),
     ));
 
     // Public listener: /sub/{id}, /src/{id} and /export/alive/{token}.
@@ -329,21 +344,51 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // The public rate limiter also keys requests by peer address.
-    let public_server = axum::serve(
+    //
+    // The graceful shutdown waits for the open connections to finish, and
+    // the admin panel holds an SSE stream that never ends on its own. The
+    // wait therefore has a deadline — and the deadline starts when the
+    // signal arrives, not when the listeners start.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut public_server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal());
-    let admin_server = axum::serve(
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
+    .into_future();
+    let mut admin_server = axum::serve(
         admin_listener,
         admin_router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal());
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
+    .into_future();
 
     // Drain the background scheduler even when a listener failed: the
     // `?` used to return here first, so a bind error skipped the drain and
     // the process exited with the scheduler's in-flight fetches unnamed.
-    let serving = tokio::try_join!(public_server, admin_server);
+    let serving = tokio::select! {
+        // A listener that fails ends the wait right away.
+        result = async {
+            tokio::try_join!(&mut public_server, &mut admin_server).map(|_| ())
+        } => result,
+        () = shutdown_signal() => {
+            // The listeners stop accepting and drain what they have.
+            // The drain is bounded: an SSE stream or a slow download
+            // never ends on its own, and an orchestrator kills the
+            // process at its own grace period anyway — with the drain
+            // below skipped, since it sits behind the wait.
+            let _ = shutdown_tx.send(true);
+            drain_listeners(SHUTDOWN_DRAIN_TIMEOUT, async {
+                tokio::try_join!(&mut public_server, &mut admin_server).map(|_| ())
+            })
+            .await
+        }
+    };
+    // The listeners are done: their sockets close here rather than at the
+    // end of the process, so nothing new arrives during the scheduler
+    // drain below.
+    drop(public_server);
+    drop(admin_server);
 
     // Dropping `refresh_tx` (the admin router's clone went with its
     // server) closes the channel, and the loop treats that as its
@@ -375,8 +420,8 @@ async fn main() -> anyhow::Result<()> {
 /// GET the local public listener's `/healthz` and accept only 200. The
 /// probe carries no token, which is the point: the endpoint is the one
 /// unauthenticated route on the public listener.
-async fn probe_healthz(port: u16) -> anyhow::Result<()> {
-    let url = format!("http://127.0.0.1:{port}/healthz");
+async fn probe_healthz(bind: SocketAddr) -> anyhow::Result<()> {
+    let url = health_probe_url(bind);
     // reqwest is compiled without a crypto provider and panics when a
     // client is built before one is installed.
     fumox_core::tls::install_crypto_provider();
@@ -388,6 +433,70 @@ async fn probe_healthz(port: u16) -> anyhow::Result<()> {
         .await?
         .error_for_status()?;
     Ok(())
+}
+
+/// The address the health probe must use for a listener bound to `bind`.
+///
+/// A bind that names an address is the one the operator chose, and it is
+/// reachable from the machine itself, so the probe uses exactly that
+/// address. A wildcard is not a usable destination, so the loopback
+/// stands in for it — the IPv6 loopback for an IPv6 wildcard, the IPv4
+/// one for an IPv4 wildcard, because the two wildcards are different
+/// sockets.
+fn health_probe_addr(bind: SocketAddr) -> SocketAddr {
+    let ip = match bind.ip() {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, bind.port())
+}
+
+/// The URL of the local public listener's `/healthz`, derived from the
+/// bind address. The address is rendered by `SocketAddr`, so an IPv6
+/// address keeps its square brackets.
+fn health_probe_url(bind: SocketAddr) -> String {
+    format!("http://{}/healthz", health_probe_addr(bind))
+}
+
+/// Wait for the listeners to drain, but no longer than `deadline`.
+///
+/// A graceful shutdown waits for the open connections, and some of them
+/// never end on their own: the admin panel holds an SSE stream, and a
+/// client may be downloading a large export. The wait is therefore
+/// bounded; a drain that runs over its deadline is abandoned with a
+/// warning, and the connections are dropped with the listeners.
+async fn drain_listeners<F>(deadline: Duration, drain: F) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    match tokio::time::timeout(deadline, drain).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                deadline_secs = deadline.as_secs(),
+                "listeners did not finish draining within the deadline; \
+                 the open connections are dropped"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Resolve when the shared shutdown flag flips to true.
+///
+/// The flag is a watch channel rather than a signal handler of its own:
+/// both listeners wait on it, and the flag keeps its value, so a
+/// listener that starts polling late still sees the shutdown.
+async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow_and_update() {
+            return;
+        }
+    }
 }
 
 /// Wait for the GeoLite2 download task, but no longer than `budget`. On
@@ -447,8 +556,16 @@ fn startup_warnings(config: &fumox_core::AppConfig) -> Vec<String> {
         ));
     }
     for (section, cidrs, header) in [
-        ("server", &config.server.trust_proxy_ips, config.server.trust_proxy_header),
-        ("admin", &config.admin.trust_proxy_ips, config.admin.trust_proxy_header),
+        (
+            "server",
+            &config.server.trust_proxy_ips,
+            config.server.trust_proxy_header,
+        ),
+        (
+            "admin",
+            &config.admin.trust_proxy_ips,
+            config.admin.trust_proxy_header,
+        ),
     ] {
         if !cidrs.is_empty() && header == fumox_core::config::TrustedHeader::None {
             warnings.push(format!(
@@ -597,6 +714,98 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The drain after a shutdown signal must have a deadline: an SSE
+    /// stream never ends on its own, and a wait without a bound keeps
+    /// the process alive until the orchestrator kills it — which skips
+    /// the drain and the shutdown log that sit behind the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_drain_is_abandoned_at_the_deadline() {
+        let began = tokio::time::Instant::now();
+        let result = drain_listeners(
+            Duration::from_secs(10),
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await;
+        assert!(result.is_ok(), "an abandoned drain is not a failure");
+        assert_eq!(began.elapsed(), Duration::from_secs(10));
+    }
+
+    /// The health probe must reach the listener the operator configured.
+    /// A bind that names an address is probed at exactly that address; a
+    /// wildcard is not a destination, so the loopback stands in for it —
+    /// the IPv6 loopback for an IPv6 wildcard, the IPv4 one for an IPv4
+    /// wildcard.
+    #[test]
+    fn the_health_probe_follows_the_bind_address() {
+        let cases = [
+            (
+                SocketAddr::from(([0, 0, 0, 0], 8080)),
+                SocketAddr::from(([127, 0, 0, 1], 8080)),
+            ),
+            (
+                SocketAddr::from(([10, 1, 2, 3], 9000)),
+                SocketAddr::from(([10, 1, 2, 3], 9000)),
+            ),
+            (
+                SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 8080)),
+                SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 8080)),
+            ),
+            (
+                SocketAddr::from(([0xfd00, 0, 0, 0, 0, 0, 0, 1], 8080)),
+                SocketAddr::from(([0xfd00, 0, 0, 0, 0, 0, 0, 1], 8080)),
+            ),
+        ];
+        for (bind, expected) in cases {
+            assert_eq!(health_probe_addr(bind), expected, "bind {bind}");
+        }
+
+        // An IPv6 address keeps its square brackets in the URL.
+        let v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 8080));
+        assert_eq!(health_probe_url(v6), "http://[::1]:8080/healthz");
+        let v4 = SocketAddr::from(([127, 0, 0, 1], 8080));
+        assert_eq!(health_probe_url(v4), "http://127.0.0.1:8080/healthz");
+    }
+
+    /// The probe accepts only 200: a listener that answers something else
+    /// is not ready, and the healthcheck must fail rather than pass on a
+    /// redirect or an error page.
+    #[tokio::test]
+    async fn the_health_probe_accepts_only_200() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        probe_healthz(addr)
+            .await
+            .expect("a 200 is a healthy answer");
+        server.abort();
+    }
+
+    /// A listener that answers 404 is not healthy: the probe must fail
+    /// instead of accepting the answer.
+    #[tokio::test]
+    async fn the_health_probe_rejects_a_non_200() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/other", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        assert!(
+            probe_healthz(addr).await.is_err(),
+            "a 404 must fail the healthcheck"
+        );
+        server.abort();
     }
 
     /// A non-empty allowlist is a gate the operator cannot see from the

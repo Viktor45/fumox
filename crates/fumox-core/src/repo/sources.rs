@@ -180,23 +180,32 @@ fn fetch_stamp_stale(old: &Source, new: &Source) -> bool {
         || old.ip_family != new.ip_family
 }
 
-/// Update mutable source fields. `id` and `created_at` are immutable;
-/// `updated_at` must be set by the caller.
+/// Update the admin-owned columns of a source row. `id` and `created_at`
+/// are immutable; `updated_at` must be set by the caller.
+///
+/// The admin write path owns the settings columns only. The fetcher's
+/// columns (`last_error`, `error_class`) are never written from here: a
+/// fetch outcome that lands while an operator saves the form must not be
+/// clobbered by the save. The freshness stamp is not written either, it
+/// is only reset (see below).
 ///
 /// A change to a fetch-relevant field (see [`fetch_stamp_stale`]) resets
 /// `last_fetched_at`, so the next ingest re-fetches under the new settings
 /// instead of riding out the TTL window on a payload reconciled under the
 /// old ones.
-pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
-    let last_fetched_at = match get(pool, &source.id).await? {
-        Some(existing) if fetch_stamp_stale(&existing, source) => None,
-        _ => source.last_fetched_at,
+pub async fn update_settings(pool: &DbPool, source: &Source) -> crate::Result<()> {
+    let stale = match get(pool, &source.id).await? {
+        Some(existing) => fetch_stamp_stale(&existing, source),
+        // The row is gone: the write below affects nothing and the
+        // caller answers "not found".
+        None => true,
     };
     let affected = sqlx::query(
         "UPDATE sources SET
             slug = ?, name = ?, url = ?, enabled = ?, encoding = ?, input_format = ?,
             protocols = ?, cache_ttl_seconds = ?, tags = ?, pipeline = ?, headers = ?,
-            ip_family = ?, updated_at = ?, last_fetched_at = ?, last_error = ?, error_class = ?
+            ip_family = ?, updated_at = ?,
+            last_fetched_at = CASE WHEN ? THEN NULL ELSE last_fetched_at END
          WHERE id = ?",
     )
     .bind(&source.slug)
@@ -224,9 +233,7 @@ pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
     .bind(headers_json(&source.headers)?)
     .bind(source.ip_family.map(IpFamily::as_str))
     .bind(source.updated_at)
-    .bind(last_fetched_at)
-    .bind(&source.last_error)
-    .bind(source.error_class.map(ErrorClass::as_str))
+    .bind(stale as i64)
     .bind(&source.id)
     .execute(pool)
     .await?
@@ -237,6 +244,32 @@ pub async fn update(pool: &DbPool, source: &Source) -> crate::Result<()> {
         return Err(crate::Error::NotFound(format!("source {}", source.id)));
     }
     Ok(())
+}
+
+/// Flip the enabled flag of a source row.
+///
+/// The toggle is the one admin action that does not go through the
+/// settings form, so it gets its own targeted write: the settings
+/// columns keep the values they have, and the fetcher's columns are not
+/// touched at all.
+///
+/// The flip is a fetch-relevant change, so the freshness stamp is reset:
+/// the next ingest must fetch under the new state instead of riding out
+/// the TTL window on a payload reconciled under the old one.
+///
+/// Returns whether the row was there.
+pub async fn set_enabled(pool: &DbPool, id: &str, enabled: bool) -> crate::Result<bool> {
+    let now = crate::models::now_ts();
+    let affected = sqlx::query(
+        "UPDATE sources SET enabled = ?, updated_at = ?, last_fetched_at = NULL WHERE id = ?",
+    )
+    .bind(enabled)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
 }
 
 pub async fn get(pool: &DbPool, id: &str) -> crate::Result<Option<Source>> {
@@ -532,14 +565,14 @@ mod tests {
         // NULL (inherit) → explicit family → back to NULL round trip.
         source.ip_family = Some(IpFamily::Ipv6);
         source.updated_at += 10;
-        update(&pool, &source).await.unwrap();
+        update_settings(&pool, &source).await.unwrap();
         let loaded = get(&pool, "src1aaaaaaaa").await.unwrap().unwrap();
         assert_eq!(loaded.name, "Renamed");
         assert_eq!(loaded.cache_ttl_seconds, 600);
         assert_eq!(loaded.ip_family, Some(IpFamily::Ipv6));
 
         source.ip_family = None;
-        update(&pool, &source).await.unwrap();
+        update_settings(&pool, &source).await.unwrap();
         let loaded = get(&pool, "src1aaaaaaaa").await.unwrap().unwrap();
         assert_eq!(loaded.ip_family, None);
 
@@ -588,7 +621,7 @@ mod tests {
     /// next ingest re-fetches under the new settings; a cosmetic edit keeps
     /// the stamp.
     #[tokio::test]
-    async fn update_resets_the_freshness_stamp_on_a_fetch_relevant_change() {
+    async fn update_settings_resets_the_freshness_stamp_on_a_fetch_relevant_change() {
         let (_dir, pool) = temp_pool().await;
         let mut source = sample_source("src5eeeeeeee");
         source.last_fetched_at = Some(crate::models::now_ts());
@@ -599,7 +632,7 @@ mod tests {
         source.slug = Some("renamed-slug".into());
         source.tags = Some(vec!["misc".into()]);
         source.updated_at += 5;
-        update(&pool, &source).await.unwrap();
+        update_settings(&pool, &source).await.unwrap();
         let loaded = get(&pool, "src5eeeeeeee").await.unwrap().unwrap();
         assert!(
             loaded.last_fetched_at.is_some(),
@@ -609,7 +642,7 @@ mod tests {
         // A fetch-relevant edit resets the stamp; the rest of the row is
         // written exactly as given.
         source.url = "https://example.com/other".into();
-        update(&pool, &source).await.unwrap();
+        update_settings(&pool, &source).await.unwrap();
         let loaded = get(&pool, "src5eeeeeeee").await.unwrap().unwrap();
         assert_eq!(loaded.url, "https://example.com/other");
         assert_eq!(loaded.name, "Renamed");
@@ -617,6 +650,63 @@ mod tests {
             loaded.last_fetched_at.is_none(),
             "a fetch-relevant edit must reset the freshness stamp"
         );
+    }
+
+    /// The admin write path owns the settings columns only: the fetcher's
+    /// columns survive a save, so a fetch outcome that landed while the
+    /// operator was editing the form is not clobbered by it.
+    #[tokio::test]
+    async fn update_settings_leaves_the_fetcher_columns_alone() {
+        let (_dir, pool) = temp_pool().await;
+        let mut source = sample_source("src9iiiiiiii");
+        create(&pool, &source).await.unwrap();
+        record_fetch_outcome(
+            &pool,
+            "src9iiiiiiii",
+            &FetchOutcome::Failure {
+                at: crate::models::now_ts(),
+                error: "connection reset",
+                class: ErrorClass::Network,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The save carries no error state of its own.
+        source.name = "Renamed".into();
+        source.last_error = None;
+        source.error_class = None;
+        update_settings(&pool, &source).await.unwrap();
+
+        let loaded = get(&pool, "src9iiiiiiii").await.unwrap().unwrap();
+        assert_eq!(loaded.name, "Renamed");
+        assert_eq!(loaded.last_error.as_deref(), Some("connection reset"));
+        assert_eq!(loaded.error_class, Some(ErrorClass::Network));
+    }
+
+    /// The toggle is a targeted write: it flips the flag, resets the
+    /// freshness stamp (the flip is a fetch-relevant change) and leaves
+    /// the settings columns exactly as they are.
+    #[tokio::test]
+    async fn set_enabled_flips_the_flag_without_rewriting_the_row() {
+        let (_dir, pool) = temp_pool().await;
+        let mut source = sample_source("src7jjjjjjjj");
+        source.enabled = true;
+        source.last_fetched_at = Some(crate::models::now_ts());
+        create(&pool, &source).await.unwrap();
+
+        assert!(set_enabled(&pool, "src7jjjjjjjj", false).await.unwrap());
+        let loaded = get(&pool, "src7jjjjjjjj").await.unwrap().unwrap();
+        assert!(!loaded.enabled);
+        assert!(
+            loaded.last_fetched_at.is_none(),
+            "the flip resets the freshness stamp"
+        );
+        assert_eq!(loaded.url, source.url);
+        assert_eq!(loaded.name, source.name);
+
+        // A vanished row is reported, not written.
+        assert!(!set_enabled(&pool, "nope", true).await.unwrap());
     }
 
     /// An empty protocol allowlist means "no filter", the same as `None`:

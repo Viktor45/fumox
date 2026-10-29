@@ -160,15 +160,18 @@ pub enum ProxyStatus {
 }
 
 impl ProxyStatus {
-    /// Every status in schema order, the source for admin UI option lists
-    /// (pipeline editor health filter).
-    pub const ALL: [ProxyStatus; 5] = [
-        ProxyStatus::Unknown,
-        ProxyStatus::Alive,
-        ProxyStatus::Ready,
-        ProxyStatus::Quarantine,
-        ProxyStatus::Removed,
-    ];
+    /// Every status in schema order, the source for the admin UI option
+    /// lists (pipeline editor health filter), the proxy filter whitelist
+    /// and the status badge map.
+    pub const fn all() -> &'static [ProxyStatus] {
+        &[
+            ProxyStatus::Unknown,
+            ProxyStatus::Alive,
+            ProxyStatus::Ready,
+            ProxyStatus::Quarantine,
+            ProxyStatus::Removed,
+        ]
+    }
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -814,7 +817,7 @@ mod tests {
         }
         // ALL carries every wire name exactly once (admin option lists
         // derive from it).
-        let names: Vec<&str> = ProxyStatus::ALL.iter().map(|s| s.as_str()).collect();
+        let names: Vec<&str> = ProxyStatus::all().iter().map(|s| s.as_str()).collect();
         for (_, name) in [
             (ProxyStatus::Unknown, "unknown"),
             (ProxyStatus::Alive, "alive"),

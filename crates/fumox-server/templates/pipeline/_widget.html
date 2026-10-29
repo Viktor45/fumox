@@ -38,24 +38,31 @@
   {% endmatch %}
 </div>
 {% else %}
+{#- A preset replaces the rules the user has built, so it asks before it
+    does: the rest of the form is untouched, only the builder state
+    changes. -#}
 <div class="ped-presets" role="group" aria-labelledby="ped-presets-label">
   <span id="ped-presets-label" class="hint">{{ self.t("ped.presets") }}</span>
   <button type="button" class="btn small"
           hx-post="/admin/pipeline/preset?name=workers{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
-          hx-include="[name='_csrf']">{{ self.t("ped.preset_workers") }}</button>
+          hx-include="[name='_csrf']"
+          hx-confirm="{{ self.t("ped.preset_confirm").replace("{name}", self.t("ped.preset_workers")) }}">{{ self.t("ped.preset_workers") }}</button>
   <button type="button" class="btn small"
           hx-post="/admin/pipeline/preset?name=country{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
-          hx-include="[name='_csrf']">{{ self.t("ped.preset_country") }}</button>
+          hx-include="[name='_csrf']"
+          hx-confirm="{{ self.t("ped.preset_confirm").replace("{name}", self.t("ped.preset_country")) }}">{{ self.t("ped.preset_country") }}</button>
   <button type="button" class="btn small"
           hx-post="/admin/pipeline/preset?name=clean{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
-          hx-include="[name='_csrf']">{{ self.t("ped.preset_clean") }}</button>
+          hx-include="[name='_csrf']"
+          hx-confirm="{{ self.t("ped.preset_confirm").replace("{name}", self.t("ped.preset_clean")) }}">{{ self.t("ped.preset_clean") }}</button>
   <button type="button" class="btn small"
           hx-post="/admin/pipeline/preset?name=blank{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
-          hx-include="[name='_csrf']">{{ self.t("ped.preset_blank") }}</button>
+          hx-include="[name='_csrf']"
+          hx-confirm="{{ self.t("ped.preset_confirm").replace("{name}", self.t("ped.preset_blank")) }}">{{ self.t("ped.preset_blank") }}</button>
 </div>
 {% if profile %}
 {# The tri-state hint (ped.tri_state_hint) explains section override
@@ -145,6 +152,10 @@
         </div>
         <div class="field">
           <span class="check-row">
+            {# The hidden companion makes the checkbox tri-state: an
+               unchecked box submits "0", a checked one "1" (the last
+               value of the name wins). #}
+            <input type="hidden" name="ped_forbid_insecure" value="0">
             <input type="checkbox" name="ped_forbid_insecure" value="1" id="ped-forbid-insecure" {% if builder.state.forbid_insecure %}checked{% endif %}>
             <label for="ped-forbid-insecure">{{ self.t("ped.forbid_insecure") }}</label>
           </span>
@@ -268,6 +279,10 @@
         </div>
         <div class="ped-inner" data-ped-inner="geo"{% if !builder.geo_section_active() %} hidden{% endif %}>
           <span class="check-row">
+            {# The hidden companion makes the checkbox tri-state: an
+               unchecked box submits "0", a checked one "1" (the last
+               value of the name wins). #}
+            <input type="hidden" name="ped_geo_enabled" value="0">
             <input type="checkbox" name="ped_geo_enabled" value="1" id="ped-geo-enabled" {% if builder.state.geo_enabled %}checked{% endif %}>
             <label for="ped-geo-enabled">{{ self.t("ped.geo_disable_label") }}</label>
           </span>
@@ -335,6 +350,10 @@
     </div>
   </section>
 
-  <div id="ped-preview">{{ preview_html | safe }}</div>
+  {#- The preview is a live region: the verdict and the errors it lists
+      are announced when the builder changes. The JSON block opts out
+      (aria-live="off"), it is re-rendered on every keystroke and would
+      drown the verdict. -#}
+  <div id="ped-preview" role="status" aria-live="polite">{{ preview_html | safe }}</div>
 </div>
 {% endif %}

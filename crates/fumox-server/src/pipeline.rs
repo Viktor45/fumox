@@ -217,6 +217,18 @@ pub(crate) enum RenameTarget {
     Param(String),
 }
 
+impl RenameTarget {
+    /// The field the rule rewrites, for the logs.
+    fn label(&self) -> String {
+        match self {
+            RenameTarget::Name => "name".to_string(),
+            RenameTarget::Host => "host".to_string(),
+            RenameTarget::Port => "port".to_string(),
+            RenameTarget::Param(key) => format!("param:{key}"),
+        }
+    }
+}
+
 /// A discard rule: a proxy matching any rule is thrown away entirely. The
 /// mirror of [`RenameRule`] minus `replace`, the field is absent on purpose
 /// (`deny_unknown_fields` rejects a copy-pasted rewrite rule), a drop rule
@@ -419,7 +431,7 @@ impl Default for CompiledPipeline {
 /// `{1}`… arguments. The admin layer renders it with `Lang::t_args` in the
 /// panel language (form errors, import validation); the serving layer only
 /// logs issues in their debug form.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineIssue {
     /// Catalog key (`pipeline.*` section of `locales/*.toml`).
     pub key: &'static str,
@@ -704,10 +716,10 @@ impl CompiledPipeline {
     /// geo-enrich → health-filter. `/sub` runs this for every source with
     /// the merged (source + profile) pipeline, then calls [`Self::finalize`]
     /// once on the merged result.
-    pub async fn apply_per_source(
+    pub async fn apply_per_source<G: HostGeo + ?Sized>(
         &self,
         mut candidates: Vec<Candidate>,
-        geo: &GeoResolver,
+        geo: &G,
     ) -> Vec<Candidate> {
         // filter
         if let Some(allowed) = &self.filter_protocols {
@@ -717,8 +729,18 @@ impl CompiledPipeline {
             candidates.retain(|c| !excluded.contains(&c.entry.scheme));
         }
         // Every step below reads `candidate.geo_asn`, which a row ingested
-        // without geo does not carry: complete it before they run.
-        fill_missing_asns(&mut candidates, geo).await;
+        // without geo does not carry: complete it before they run. Only the
+        // ASN rules need it, so a pipeline without them pays no geo lookup
+        // per request; the missing ASNs are filled on the ingest side.
+        let needs_asn = self.filter_asns.is_some()
+            || self.exclude_asns.is_some()
+            || self
+                .drop
+                .iter()
+                .any(|rule| matches!(rule, CompiledDrop::Asn { .. }));
+        if needs_asn {
+            fill_missing_asns(&mut candidates, geo).await;
+        }
         // AS-number filter: the stored ASN, or the one the fill just
         // resolved, is the confirmed fact, the same contract as the
         // profile country allowlist.
@@ -745,12 +767,7 @@ impl CompiledPipeline {
         // any spelling. Falsy toggles (`insecure=0`) and
         // alias-free entries survive; the DB row is never touched.
         if self.forbid_insecure {
-            candidates.retain(|c| {
-                !c.entry
-                    .params
-                    .iter()
-                    .any(fumox_core::models::is_insecure_param)
-            });
+            Self::retain_secure(&mut candidates);
         }
 
         // drop, discard rules. Deliberately before
@@ -782,17 +799,41 @@ impl CompiledPipeline {
         // out-of-range port, URI delimiters in the host) is skipped with a
         // WARN, leaving the original intact, a broken rule must not
         // produce a broken subscription line for every proxy at once.
+        //
+        // The skips are counted per rule and reported once per rule: the
+        // per-entry event stays at TRACE, a broken rule would otherwise
+        // write a WARN line per proxy.
+        let mut skips: Vec<SkippedRewrites> = vec![SkippedRewrites::default(); self.rename.len()];
         for candidate in &mut candidates {
-            for rule in &self.rename {
-                apply_rename_rule(&mut candidate.entry, rule);
+            for (idx, rule) in self.rename.iter().enumerate() {
+                if let Rewrite::Rejected(value) = apply_rename_rule(&mut candidate.entry, rule) {
+                    skips[idx].record(value);
+                }
             }
+        }
+        for (idx, (rule, skip)) in self.rename.iter().zip(&skips).enumerate() {
+            if skip.count > 0 {
+                tracing::warn!(
+                    rule = idx,
+                    target = %rule.target.label(),
+                    skipped = skip.count,
+                    value = %skip.example,
+                    "rename rule produced an invalid value, the original is kept"
+                );
+            }
+        }
+
+        // filter.forbid_insecure, again: the filter must see the final
+        // parameters, a rename rule can introduce an insecure switch.
+        if self.forbid_insecure {
+            Self::retain_secure(&mut candidates);
         }
 
         // geo-enrich, rewrite the display name from the template and keep
         // the country code for sorting. No-op when the resolver is inactive.
         if self.geo_enabled && geo.is_active() {
             for candidate in &mut candidates {
-                if let Some(info) = geo.resolve(&candidate.entry.host).await {
+                if let Some(info) = geo.resolve_host(&candidate.entry.host).await {
                     let renamed = apply_template(&self.geo_template, &info, &candidate.entry.name);
                     candidate.entry.name = renamed;
                     candidate.geo_country = info.country_code.clone();
@@ -806,6 +847,18 @@ impl CompiledPipeline {
         candidates.retain(|c| !excluded.contains(&c.status));
 
         candidates
+    }
+
+    /// Drop the candidates that allow insecure TLS in any spelling: a
+    /// truthy certificate-verification alias. Falsy toggles (`insecure=0`)
+    /// and alias-free entries survive.
+    fn retain_secure(candidates: &mut Vec<Candidate>) {
+        candidates.retain(|c| {
+            !c.entry
+                .params
+                .iter()
+                .any(fumox_core::models::is_insecure_param)
+        });
     }
 
     /// Post-merge steps: dedup by fingerprint, the first
@@ -857,11 +910,14 @@ impl CompiledPipeline {
 
 /// The resolver call the ASN fill makes, behind a trait like ingest's
 /// `GeoLookup` so the fill is testable without a MaxMind database.
-trait HostGeo {
+pub(crate) trait HostGeo {
     fn resolve_host(
         &self,
         host: &str,
     ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send;
+
+    /// Whether the resolver can answer at all.
+    fn is_active(&self) -> bool;
 }
 
 impl HostGeo for GeoResolver {
@@ -870,6 +926,10 @@ impl HostGeo for GeoResolver {
         host: &str,
     ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
         self.resolve(host)
+    }
+
+    fn is_active(&self) -> bool {
+        GeoResolver::is_active(self)
     }
 }
 
@@ -904,6 +964,12 @@ pub fn merge_configs(
         (None, None) => None,
         (Some(s), None) | (None, Some(s)) => Some(s.clone()),
         (Some(s), Some(p)) => {
+            // A `NULL` profile pipeline overrides nothing: the source's
+            // sections stay in place. Without this the profile's `null`
+            // would replace every section with "nothing configured".
+            if *p == serde_json::Value::Null {
+                return Some(s.clone());
+            }
             let (Some(s_map), Some(p_map)) = (s.as_object(), p.as_object()) else {
                 // Non-object configs are invalid; the profile side wins so
                 // the error surfaces against the profile form.
@@ -916,6 +982,43 @@ pub fn merge_configs(
             Some(serde_json::Value::Object(merged))
         }
     }
+}
+
+/// The outcome of one rewrite: the value was applied, or it was rejected
+/// and the original stayed. The rejected value travels back to the caller,
+/// which counts the skips per rule instead of logging one line per entry.
+enum Rewrite {
+    Applied,
+    Rejected(String),
+}
+
+/// The rejected rewrites of one rule: how many entries kept their original
+/// and one example of the rejected value, truncated for the log.
+#[derive(Clone, Default)]
+struct SkippedRewrites {
+    count: usize,
+    example: String,
+}
+
+impl SkippedRewrites {
+    fn record(&mut self, value: String) {
+        self.count += 1;
+        if self.example.is_empty() {
+            self.example = truncate_for_log(&value);
+        }
+    }
+}
+
+/// A log value is truncated: a rejected rewrite can be a whole proxy name,
+/// not a field the log has to carry in full.
+fn truncate_for_log(value: &str) -> String {
+    const LIMIT: usize = 128;
+    if value.chars().count() <= LIMIT {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(LIMIT).collect();
+    out.push('…');
+    out
 }
 
 /// Whether a drop rule's regex matches its target on the entry. The same
@@ -941,14 +1044,17 @@ fn matches_target(entry: &ProxyEntry, regex: &Regex, target: &RenameTarget) -> b
 /// the admin sees in the URI, and the replacement is stored raw as well.
 /// This keeps `path=%2Fws` rewritable through its encoded spelling only,
 /// which is the honest, predictable contract (documented in USERGUIDE).
-fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) {
+fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) -> Rewrite {
     let rewritten = |value: &str| -> String {
         rule.regex
             .replace_all(value, rule.replace.as_str())
             .into_owned()
     };
     match &rule.target {
-        RenameTarget::Name => entry.name = rewritten(&entry.name),
+        RenameTarget::Name => {
+            entry.name = rewritten(&entry.name);
+            Rewrite::Applied
+        }
         RenameTarget::Host => {
             let host = rewritten(&entry.host);
             // The host is embedded verbatim into the output URI, so it
@@ -956,23 +1062,31 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) {
             // stay bracket-free in storage (parse_hostport strips them).
             if valid_rewritten_host(&host) {
                 entry.host = host;
+                Rewrite::Applied
             } else {
-                tracing::warn!(
+                tracing::trace!(
                     host = %host,
                     fingerprint = entry.fingerprint(),
                     "rename rule produced an invalid host, keeping the original"
                 );
+                Rewrite::Rejected(host)
             }
         }
         RenameTarget::Port => {
             let port = rewritten(&entry.port.to_string());
             match port.parse::<u16>() {
-                Ok(parsed) => entry.port = parsed,
-                Err(_) => tracing::warn!(
-                    port = %port,
-                    fingerprint = entry.fingerprint(),
-                    "rename rule produced an invalid port, keeping the original"
-                ),
+                Ok(parsed) => {
+                    entry.port = parsed;
+                    Rewrite::Applied
+                }
+                Err(_) => {
+                    tracing::trace!(
+                        port = %port,
+                        fingerprint = entry.fingerprint(),
+                        "rename rule produced an invalid port, keeping the original"
+                    );
+                    Rewrite::Rejected(port)
+                }
             }
         }
         RenameTarget::Param(key) => {
@@ -985,9 +1099,10 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) {
                 .iter_mut()
                 .find(|p| p.key.eq_ignore_ascii_case(key))
             else {
-                return;
+                return Rewrite::Applied;
             };
             param.value = rewritten(&param.value);
+            Rewrite::Applied
         }
     }
 }
@@ -1412,6 +1527,43 @@ mod tests {
                     })
                 })
             }
+        }
+
+        fn is_active(&self) -> bool {
+            true
+        }
+    }
+
+    /// A resolver that counts its lookups, so a test can see that a
+    /// pipeline without an ASN rule resolves nothing at all.
+    struct CountingGeo {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingGeo {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl HostGeo for CountingGeo {
+        fn resolve_host(
+            &self,
+            _host: &str,
+        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { None }
+        }
+
+        fn is_active(&self) -> bool {
+            false
         }
     }
 
@@ -2306,6 +2458,137 @@ mod tests {
         // Profile replaced sort; source filter survived.
         assert_eq!(merged["sort"]["by"], "latency");
         assert_eq!(merged["filter"]["protocols"][0], "vless");
+    }
+
+    /// A `NULL` profile pipeline overrides nothing: the source's sections
+    /// stay in place. The profile's `null` is "no override", not "every
+    /// section reset to nothing configured".
+    #[test]
+    fn a_null_profile_pipeline_overrides_nothing() {
+        let source = json!({
+            "version": 1,
+            "filter": { "protocols": ["vless"] },
+            "sort": { "by": "name" }
+        });
+        let merged = merge_configs(Some(&source), Some(&serde_json::Value::Null)).unwrap();
+        assert_eq!(merged, source);
+    }
+
+    /// The ASN fill is a geo lookup per candidate: only the ASN rules need
+    /// it, a pipeline without one resolves nothing.
+    #[tokio::test]
+    async fn a_pipeline_without_an_asn_rule_resolves_no_asn() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "protocols": ["vless"] }
+        })))
+        .unwrap();
+        let geo = CountingGeo::new();
+        let candidates = vec![candidate_with_asn("n", None)];
+        let out = compiled.apply_per_source(candidates, &geo).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(geo.calls(), 0);
+
+        // With an ASN rule the fill runs.
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "asns": ["13335"] }
+        })))
+        .unwrap();
+        let geo = CountingGeo::new();
+        let candidates = vec![candidate_with_asn("n", None)];
+        let _ = compiled.apply_per_source(candidates, &geo).await;
+        assert_eq!(geo.calls(), 1);
+    }
+
+    /// The insecure filter sees the final parameters: a rename rule that
+    /// introduces an insecure switch drops the proxy.
+    #[tokio::test]
+    async fn the_insecure_filter_sees_the_renamed_parameters() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "rename": [{ "match": ".*", "replace": "1", "target": "param:insecure" }]
+        })))
+        .unwrap();
+        let mut c = candidate("n", Scheme::Vless, "h.example.com");
+        c.entry.params.push(Param {
+            key: "insecure".into(),
+            value: "0".into(),
+            known: true,
+        });
+        let out = compiled.apply(vec![c], &inactive_geo()).await;
+        assert!(
+            out.is_empty(),
+            "the renamed proxy allows insecure TLS and must be dropped"
+        );
+    }
+
+    /// A stored insecure proxy stays dropped even when a rename rule would
+    /// rewrite the switch away: the stored row is the fact, the rewrite
+    /// only changes the output text.
+    #[tokio::test]
+    async fn a_stored_insecure_proxy_is_dropped_even_when_a_rename_rewrites_it() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "rename": [{ "match": ".*", "replace": "0", "target": "param:insecure" }]
+        })))
+        .unwrap();
+        let mut c = candidate("n", Scheme::Vless, "h.example.com");
+        c.entry.params.push(Param {
+            key: "insecure".into(),
+            value: "1".into(),
+            known: true,
+        });
+        let out = compiled.apply(vec![c], &inactive_geo()).await;
+        assert!(out.is_empty(), "the stored row allows insecure TLS");
+    }
+
+    /// A broken rename rule warns once per rule, not once per proxy: a
+    /// thousand proxies must not write a thousand WARN lines.
+    #[tokio::test]
+    async fn a_broken_rename_rule_warns_once_per_rule() {
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "rename": [{ "match": ".*", "replace": "evil.tr/../../x", "target": "host" }]
+        })))
+        .unwrap();
+        let candidates: Vec<Candidate> = (0..5)
+            .map(|idx| {
+                candidate(
+                    &format!("n{idx}"),
+                    Scheme::Vless,
+                    &format!("h{idx}.example.com"),
+                )
+            })
+            .collect();
+        let out = compiled.apply(candidates, &inactive_geo()).await;
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0].entry.host, "h0.example.com");
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let warnings = logs.lines().filter(|line| line.contains("WARN")).count();
+        assert_eq!(warnings, 1, "one WARN per rule, not per entry: {logs}");
+        assert!(logs.contains("skipped=5"), "{logs}");
+        assert!(logs.contains("target=host"), "{logs}");
     }
 
     #[tokio::test]

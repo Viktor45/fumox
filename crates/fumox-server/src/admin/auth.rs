@@ -623,10 +623,7 @@ pub async fn logout(State(state): State<AdminState>) -> Response {
     };
     (
         StatusCode::SEE_OTHER,
-        [
-            (header::SET_COOKIE, cookie),
-            (header::LOCATION, location),
-        ],
+        [(header::SET_COOKIE, cookie), (header::LOCATION, location)],
     )
         .into_response()
 }
@@ -864,10 +861,7 @@ mod tests {
             fumox_core::config::AdminConfig {
                 enabled: true,
                 token: TOKEN.to_string(),
-                login_rate_limit: fumox_core::config::RateLimit::new(
-                    1,
-                    Duration::from_secs(60),
-                ),
+                login_rate_limit: fumox_core::config::RateLimit::new(1, Duration::from_secs(60)),
                 ..Default::default()
             },
             Default::default(),
@@ -900,10 +894,7 @@ mod tests {
             fumox_core::config::AdminConfig {
                 enabled: true,
                 token: TOKEN.to_string(),
-                login_rate_limit: fumox_core::config::RateLimit::new(
-                    2,
-                    Duration::from_secs(60),
-                ),
+                login_rate_limit: fumox_core::config::RateLimit::new(2, Duration::from_secs(60)),
                 ..Default::default()
             },
             Default::default(),

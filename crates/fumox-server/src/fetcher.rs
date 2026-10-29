@@ -26,6 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
+use crate::redact::redact_url;
+
 /// Maximum accepted URL length.
 const MAX_URL_LEN: usize = 2048;
 /// Upper bound on followed redirects.
@@ -38,7 +40,7 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 /// form bounds the field, but the config file and the `FUMOX_*` env layer
 /// do not, and each retry costs up to [`MAX_RETRY_BACKOFF`] while holding
 /// the source's in-flight mark and one concurrency permit.
-const MAX_RETRIES: u32 = 16;
+pub(crate) const MAX_RETRIES: u32 = 16;
 /// Wall-clock ceiling for one fetch: the initial attempt, every retry and
 /// every backoff sleep together.
 ///
@@ -48,7 +50,20 @@ const MAX_RETRIES: u32 = 16;
 /// the sum of every backoff (16 retries from the shipped 500 ms base
 /// already reach ~33 s of pure sleep, and every attempt adds up to a
 /// connect plus a read timeout on top).
-const MAX_FETCH_BUDGET: Duration = Duration::from_secs(180);
+pub(crate) const MAX_FETCH_BUDGET: Duration = Duration::from_secs(180);
+
+/// The wall-clock ceiling of one fetch, in seconds. The admin panel
+/// quotes it next to the running refresh, so the operator knows how long
+/// a slow source may take before it is dropped.
+pub(crate) fn budget_seconds() -> u64 {
+    MAX_FETCH_BUDGET.as_secs()
+}
+
+/// The number of requests one fetch may make: the first attempt plus
+/// every retry it is allowed.
+pub(crate) fn max_requests() -> u32 {
+    MAX_RETRIES + 1
+}
 
 /// A successfully downloaded payload.
 #[derive(Debug, Clone)]
@@ -410,10 +425,13 @@ impl Fetcher {
         let mut withheld: Option<&'static str> = None;
         for _hop in 0..=MAX_REDIRECTS {
             if tokio::time::Instant::now() >= deadline {
-                return Err(budget_exhausted(self.budget, &FetchFailure::Network {
-                    message: "no time left in the fetch budget".to_string(),
-                    permanent: false,
-                }));
+                return Err(budget_exhausted(
+                    self.budget,
+                    &FetchFailure::Network {
+                        message: "no time left in the fetch budget".to_string(),
+                        permanent: false,
+                    },
+                ));
             }
             if current.len() > MAX_URL_LEN {
                 return Err(FetchFailure::http_client(414));
@@ -547,75 +565,6 @@ fn format_budget(budget: Duration) -> String {
     } else {
         format!("{}ms", budget.as_millis())
     }
-}
-
-/// Query-parameter names whose values count as credentials. Matched as
-/// case-insensitive substrings, so `token`, `Token`, `api_key`,
-/// `AUTH_TOKEN`… all hit; a false positive merely masks a harmless value,
-/// a false negative would leak one. Subscription URLs carry their secret
-/// as a query parameter (`?token=…`) exactly the way source headers may
-/// carry one, and unlike the panel (which shows the source URL to the
-/// authenticated admin) tracing output and persisted error text land in
-/// stdout/journald and any log shipper.
-///
-/// The stems cover the shapes the feeds in the wild use: a bearer token,
-/// an API key, an authorization header, a client secret, a password, a
-/// signature (`sig`, `X-Amz-Signature`), a session id (`session`,
-/// `jsessionid`) and a credential carried as a parameter of its own.
-const SENSITIVE_QUERY_PARAMS: [&str; 8] = [
-    "token",
-    "key",
-    "auth",
-    "secret",
-    "pass",
-    "sig",
-    "session",
-    "credential",
-];
-
-/// Whether a query-parameter name looks credential-bearing (see
-/// [`SENSITIVE_QUERY_PARAMS`]).
-fn is_sensitive_param(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    SENSITIVE_QUERY_PARAMS
-        .iter()
-        .any(|stem| lower.contains(stem))
-}
-
-/// Strip userinfo (`user:pass@`) and mask the value of every
-/// credential-bearing query pair from a URL string. Applied on every path
-/// where a URL, or an error text embedding one, reaches the tracing log,
-/// `fetch_log` or `sources.last_error`.
-fn redact_url(url: &str) -> String {
-    match Url::parse(url) {
-        Ok(mut parsed) => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            if let Some(query) = parsed.query() {
-                parsed.set_query(Some(&redact_query(query)));
-            }
-            parsed.to_string()
-        }
-        // Not a URL (the error text embedded something else), nothing to leak.
-        Err(_) => url.to_string(),
-    }
-}
-
-/// Mask the value of every credential-bearing pair of a raw query string,
-/// keeping the harmless pairs verbatim; they are the diagnostics. The
-/// raw string is edited in place rather than round-tripped through
-/// `query_pairs_mut`, whose form-encoding would rewrite benign values
-/// (`%20` → `+`) while "fixing" them.
-fn redact_query(query: &str) -> String {
-    query
-        .split('&')
-        .map(|pair| match pair.split_once('=') {
-            // A bare name (`?token` without `=`) carries no value to leak.
-            Some((name, _)) if is_sensitive_param(name) => format!("{name}=[redacted]"),
-            _ => pair.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("&")
 }
 
 /// Scheme + host + effective port, the scope source headers are confined to.
@@ -881,39 +830,6 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
-    }
-
-    #[test]
-    fn redact_url_strips_userinfo_and_secret_query_values() {
-        assert_eq!(
-            redact_url("https://user:pass@example.com/sub?a=1"),
-            "https://example.com/sub?a=1"
-        );
-        assert_eq!(
-            redact_url("http://user@example.com/"),
-            "http://example.com/"
-        );
-        // Without userinfo the URL is untouched; non-URLs pass through.
-        assert_eq!(redact_url("https://example.com/"), "https://example.com/");
-        assert_eq!(redact_url("not a url"), "not a url");
-
-        // Credential-bearing query pairs are masked, benign pairs survive:
-        // the query is where a subscription token travels, and the
-        // redacted URL reaches tracing output and fetch_log verbatim.
-        assert_eq!(
-            redact_url("https://example.com/sub?token=SECRET&page=2"),
-            "https://example.com/sub?token=[redacted]&page=2"
-        );
-        // Case-insensitive, and the stem match covers compound names.
-        assert_eq!(
-            redact_url("https://example.com/sub?API_KEY=x&ok=1"),
-            "https://example.com/sub?API_KEY=[redacted]&ok=1"
-        );
-        // A bare name carries no value, so it survives untouched.
-        assert_eq!(
-            redact_url("https://example.com/sub?token&ok=1"),
-            "https://example.com/sub?token&ok=1"
-        );
     }
 
     #[test]
@@ -1506,12 +1422,12 @@ mod tests {
     /// to 131072 bytes of body. The compressed size is what the wire
     /// carries, the expanded size is what the cap has to count.
     const GZIP_128K_ZEROS: [u8; 161] = [
-        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 237, 193, 49, 1, 0, 0, 0, 194, 160, 245, 79, 237,
-        97, 13, 160, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 110, 205, 205, 232, 126, 0, 0, 2, 0
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 237, 193, 49, 1, 0, 0, 0, 194, 160, 245, 79, 237, 97,
+        13, 160, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 110, 205, 205, 232, 126, 0, 0, 2, 0,
     ];
 
     /// Responder serving a gzip-compressed body with the matching

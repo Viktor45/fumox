@@ -15,7 +15,7 @@
 //!    left without any link by that deletion is marked `removed`. Only
 //!    the proxies this pass unlinked: a row that was already link-less
 //!    (the admin source-delete path deliberately leaves the statuses it
-//!    protects behind, see [`mark_orphans_removed`]) is none of this
+//!    protects behind, see [`mark_source_orphans_removed`]) is none of this
 //!    source's business and stays as it is.
 
 use super::BindWhereFilter;
@@ -184,7 +184,7 @@ const FOREIGN_SOURCE_LINK: &str = "EXISTS (SELECT 1 FROM proxy_source_links l
 /// refresh. With the strict policy and a source that has `drop` rules,
 /// the sweep and the unlink run unrestricted: a rule added later has to
 /// reach the rows already stored, which is the whole point of the gate.
-/// The admin's source deletion path (`mark_orphans_removed`) honours the
+/// The admin's source deletion path (`mark_source_orphans_removed`) honours the
 /// same policy, when the gate is closed, `ready` and `unknown` rows are
 /// left alone (`ready` is tunnel-verified, `unknown` has not yet had its
 /// first verdict; the click that deleted the source should not retire
@@ -400,7 +400,7 @@ pub async fn reconcile_source(
     // per-proxy answer about this source, not a global one. The
     // unscoped `NOT EXISTS (link)` version swept up every link-less row
     // in the table, including the deliberate residue of the admin
-    // source-delete path: `mark_orphans_removed` protects `ready` and
+    // source-delete path: `mark_source_orphans_removed` protects `ready` and
     // `unknown` rows under `drop_gate = false` and leaves them link-less
     // on purpose, and the very next reconcile of any *other* source
     // retired them, undoing the operator's choice. The protected rows
@@ -626,6 +626,150 @@ pub async fn count_by_status(pool: &DbPool) -> crate::Result<Vec<(String, i64)>>
             .fetch_all(pool)
             .await?;
     Ok(rows)
+}
+
+/// One row of the dashboard's aggregate over the proxy table: the status
+/// it groups by and the counters that used to come from four separate
+/// scans of the same table.
+#[derive(Debug, Clone, FromRow)]
+pub struct StatusAggregateRow {
+    /// The status this row groups (`unknown`, `alive`, …).
+    pub status: String,
+    /// Rows of this status.
+    pub count: i64,
+    /// Rows of this status that were never checked.
+    pub never_checked: i64,
+    /// Quarantine rows waiting for their second chance.
+    pub second_chance: i64,
+    /// Rows of an unprobeable scheme (they stay `unknown` forever).
+    pub unprobeable: i64,
+    /// Fastest measured latency of this status (`NULL` without one).
+    pub latency_min: Option<i64>,
+    /// Sum and count of the measured latencies of this status; the mean
+    /// is their quotient, kept split so the integers do not overflow.
+    pub latency_sum: Option<i64>,
+    pub latency_count: Option<i64>,
+}
+
+/// The dashboard's counters over the whole proxy table, read in one
+/// grouped pass.
+///
+/// The breakdown by status and the scalar counters (quarantine, second
+/// chance, never checked, unprobeable, latency) come from the same rows,
+/// so the numbers on the dashboard cannot contradict each other the way
+/// four independent scans of the same table could.
+#[derive(Debug, Clone, Default)]
+pub struct StatusAggregates {
+    /// The breakdown by status, ordered by status.
+    pub counts: Vec<(String, i64)>,
+    /// Rows in the table.
+    pub total: i64,
+    /// Rows in quarantine.
+    pub in_quarantine: i64,
+    /// Quarantine rows waiting for their second chance.
+    pub quarantine_second_chance: i64,
+    /// Rows that were never checked (removed rows excluded).
+    pub never_checked: i64,
+    /// Rows of an unprobeable scheme (removed rows excluded).
+    pub unprobeable: i64,
+    /// Fastest measured latency of a live proxy (`alive` or `ready`).
+    pub latency_min: Option<i64>,
+    /// Mean measured latency of a live proxy.
+    pub latency_avg: Option<i64>,
+}
+
+/// The schemes the probe daemon cannot check: their proxies stay
+/// `unknown` for good, and the dashboard counts them apart.
+fn unprobeable_schemes() -> Vec<&'static str> {
+    Scheme::all()
+        .iter()
+        .filter(|scheme| !scheme.is_probeable())
+        .map(|scheme| scheme.as_str())
+        .collect()
+}
+
+/// Read the dashboard's proxy counters in one grouped pass.
+///
+/// The query groups the table by status and carries the scalar counters
+/// as per-group sums, so the whole dashboard reads the table once
+/// instead of once per counter. The latency figures cover the same live
+/// pool (`alive` and `ready`) the dashboard's other widgets show.
+pub async fn status_aggregates<'e, E>(executor: E) -> crate::Result<StatusAggregates>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let schemes = unprobeable_schemes();
+    let placeholders = vec!["?"; schemes.len()].join(", ");
+    let sql = format!(
+        "SELECT status,
+                COUNT(*) AS count,
+                COALESCE(SUM(status != 'removed' AND last_checked_at IS NULL), 0) AS never_checked,
+                COALESCE(SUM(status = 'quarantine' AND ladder_step = 0), 0) AS second_chance,
+                COALESCE(SUM(status != 'removed' AND scheme IN ({placeholders})), 0) AS unprobeable,
+                MIN(CASE WHEN status IN ('alive', 'ready') AND latency_ms IS NOT NULL
+                         THEN latency_ms END) AS latency_min,
+                SUM(CASE WHEN status IN ('alive', 'ready') AND latency_ms IS NOT NULL
+                         THEN latency_ms ELSE 0 END) AS latency_sum,
+                SUM(CASE WHEN status IN ('alive', 'ready') AND latency_ms IS NOT NULL
+                         THEN 1 ELSE 0 END) AS latency_count
+         FROM proxies
+         GROUP BY status
+         ORDER BY status"
+    );
+    // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
+    let mut query = sqlx::query_as::<_, StatusAggregateRow>(sqlx::AssertSqlSafe(sql));
+    for scheme in &schemes {
+        query = query.bind(scheme);
+    }
+    let rows = query.fetch_all(executor).await?;
+
+    let mut out = StatusAggregates::default();
+    let mut latency_sum = 0i64;
+    let mut latency_count = 0i64;
+    for row in rows {
+        out.counts.push((row.status.clone(), row.count));
+        out.total += row.count;
+        out.never_checked += row.never_checked;
+        out.unprobeable += row.unprobeable;
+        if row.status == ProxyStatus::Quarantine.as_str() {
+            out.in_quarantine += row.count;
+            out.quarantine_second_chance += row.second_chance;
+        }
+        if let Some(min) = row.latency_min {
+            out.latency_min = Some(out.latency_min.map_or(min, |current: i64| current.min(min)));
+        }
+        latency_sum += row.latency_sum.unwrap_or(0);
+        latency_count += row.latency_count.unwrap_or(0);
+    }
+    if latency_count > 0 {
+        out.latency_avg = Some(latency_sum / latency_count);
+    }
+    Ok(out)
+}
+
+/// The median measured latency of the live proxies (`alive` and
+/// `ready`).
+///
+/// SQLite has no median builtin: the middle element(s) are picked with a
+/// window function over the measured rows and averaged (odd count: one
+/// element, even count: the mean of the two middle).
+pub async fn latency_median<'e, E>(executor: E) -> crate::Result<Option<i64>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let median: Option<i64> = sqlx::query_scalar(
+        "WITH ordered AS (
+             SELECT latency_ms, ROW_NUMBER() OVER (ORDER BY latency_ms) AS rn,
+                    COUNT(*) OVER () AS n
+             FROM proxies
+             WHERE status IN ('alive', 'ready') AND latency_ms IS NOT NULL
+         )
+         SELECT CAST(AVG(latency_ms) AS INTEGER) FROM ordered
+         WHERE rn IN ((n + 1) / 2, (n + 2) / 2)",
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok(median)
 }
 
 /// The coverage aggregate of the preserved probe history: one row per
@@ -1792,13 +1936,22 @@ pub struct OrphanSweep {
     pub protected: u64,
 }
 
-/// Mark proxies that lost their last source link as `removed`
-/// (deleting a source is soft, orphaned
+/// Mark the proxies of one source that lost their last link as
+/// `removed` (deleting a source is soft, orphaned
 /// proxies are not physically deleted, they transition to `removed`.
 /// `removed` is terminal for reconciliation: a proxy that reappears in a
 /// fetch keeps its state, the ways back are the admin "reset status"
 /// action or purge removed followed by a re-insert). Returns how many
 /// proxies were retired and how many were left alone.
+///
+/// The sweep is restricted to the proxies the source was linked to: it
+/// picks them through the link table, so deleting one source does not
+/// walk the whole table. A proxy that is still linked to another source
+/// keeps its link and stays untouched.
+///
+/// The rows are selected while the source still exists, because deleting
+/// it cascades its links away: the caller runs this first and deletes the
+/// source afterwards.
 ///
 /// `protected_statuses` lists the lifecycle states the caller does not
 /// want to retire just because their last source link vanished: a row in
@@ -1809,8 +1962,9 @@ pub struct OrphanSweep {
 /// its first verdict, so retiring either from a single click would be too
 /// aggressive. Pass an empty slice to retire every orphan (the strict
 /// policy).
-pub async fn mark_orphans_removed(
+pub async fn mark_source_orphans_removed(
     pool: &DbPool,
+    source_id: &str,
     protected_statuses: &[&str],
 ) -> crate::Result<OrphanSweep> {
     // sqlx's `query` with no bound values still uses a fixed query, the
@@ -1826,11 +1980,17 @@ pub async fn mark_orphans_removed(
     // carries no live recheck schedule any more, and a stale
     // `ladder_at` on a `removed` row describes a ladder that does not
     // exist.
+    //
+    // The link subquery names the source's own proxies and the NOT EXISTS
+    // excludes the source's own link, so a proxy that another source
+    // still feeds is not an orphan.
     let mut sql = String::from(
         "UPDATE proxies SET status = 'removed', quarantined_at = NULL, ladder_at = NULL,
                 ladder_step = 0, removed_at = ?, updated_at = ?
          WHERE status != 'removed'
-           AND id NOT IN (SELECT proxy_id FROM proxy_source_links)",
+           AND id IN (SELECT proxy_id FROM proxy_source_links WHERE source_id = ?)
+           AND NOT EXISTS (SELECT 1 FROM proxy_source_links l
+                           WHERE l.proxy_id = proxies.id AND l.source_id != ?)",
     );
     if !protected_statuses.is_empty() {
         let placeholders = vec!["?"; protected_statuses.len()].join(", ");
@@ -1839,7 +1999,9 @@ pub async fn mark_orphans_removed(
     let now = crate::models::now_ts();
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(now)
-        .bind(now);
+        .bind(now)
+        .bind(source_id)
+        .bind(source_id);
     for status in protected_statuses {
         query = query.bind(*status);
     }
@@ -1852,13 +2014,17 @@ pub async fn mark_orphans_removed(
     let mut protected_sql = String::from(
         "SELECT COUNT(*) FROM proxies
          WHERE status != 'removed'
-           AND id NOT IN (SELECT proxy_id FROM proxy_source_links)",
+           AND id IN (SELECT proxy_id FROM proxy_source_links WHERE source_id = ?)
+           AND NOT EXISTS (SELECT 1 FROM proxy_source_links l
+                           WHERE l.proxy_id = proxies.id AND l.source_id != ?)",
     );
     if !protected_statuses.is_empty() {
         let placeholders = vec!["?"; protected_statuses.len()].join(", ");
         protected_sql.push_str(&format!(" AND status IN ({placeholders})"));
     }
-    let mut count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(protected_sql.as_str()));
+    let mut count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(protected_sql.as_str()))
+        .bind(source_id)
+        .bind(source_id);
     for status in protected_statuses {
         count_query = count_query.bind(*status);
     }

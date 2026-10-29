@@ -43,8 +43,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
 use super::{
-    caps, pipeline_size, validate_countries, validate_header_map, validate_name, validate_slug_format,
-    validate_tags, validate_token, validate_ttl,
+    caps, pipeline_size, validate_countries, validate_header_map, validate_name,
+    validate_slug_format, validate_tags, validate_token, validate_ttl,
 };
 
 /// Body of `POST /admin/import`. A typed `Form` extractor parses only the
@@ -160,7 +160,9 @@ struct ImportLimit {
 /// document of at most [`caps::IMPORT_BODY_BYTES`] bytes. A bigger
 /// deployment exports a file the import refuses, so the file says so
 /// instead of the operator finding out at the import step.
-fn serialize_export(file: &ConfigExport) -> Result<(String, Option<ImportLimit>), serde_json::Error> {
+fn serialize_export(
+    file: &ConfigExport,
+) -> Result<(String, Option<ImportLimit>), serde_json::Error> {
     let plain = serde_json::to_string_pretty(file)?;
     let limit = if file.sources.len() > caps::IMPORT_ROWS {
         Some(ImportLimit {
@@ -576,6 +578,47 @@ pub async fn import_submit(
     }
 }
 
+/// `GET /admin/import/alive-token`, the confirmation page of the token
+/// rotation.
+///
+/// The rotation revokes a capability the clients hold: both export links
+/// stop working the moment it happens, and the old token is gone. The
+/// confirmation is therefore a page of its own — it states the
+/// consequences and the second click performs the rotation. A
+/// `data-confirm` dialog would have been one click less, but it depends
+/// on JavaScript and the browser's own question says nothing about what
+/// is lost.
+#[derive(Template)]
+#[template(path = "import_rotate.html")]
+struct RotateTokenTemplate {
+    lang: Lang,
+    langs: Vec<(String, String)>,
+    theme: Theme,
+    active: &'static str,
+    csrf: String,
+}
+
+impl_i18n!(RotateTokenTemplate);
+
+pub async fn rotate_alive_token_form(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Response {
+    let lang = state.locales.lang_from_headers(&headers);
+    let theme = theme::from_headers(&headers);
+    render_html(
+        lang.clone(),
+        &RotateTokenTemplate {
+            lang,
+            langs: state.locales.choices().to_vec(),
+            theme,
+            active: "import",
+            csrf: state.csrf_for(&headers),
+        },
+        StatusCode::OK,
+    )
+}
+
 /// `POST /admin/import/alive-token`, issue a fresh token for the «all
 /// alive» export link; the previous link stops working immediately.
 pub async fn rotate_alive_token(State(state): State<AdminState>, headers: HeaderMap) -> Response {
@@ -609,11 +652,7 @@ struct ImportValidation {
 /// timeout, a SERVFAIL) is a warning, not an error: the fetch path
 /// re-vets every request anyway, so the row is imported and checked
 /// again later. Only a policy violation (a private address) is fatal.
-async fn validate_import(
-    state: &AdminState,
-    lang: &Lang,
-    file: &ConfigExport,
-) -> ImportValidation {
+async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -> ImportValidation {
     let mut validation = ImportValidation::default();
 
     // Row-count caps: one 1 MiB body could carry
@@ -672,7 +711,8 @@ async fn validate_import(
         } else if s.url.len() > caps::URL {
             validation.errors.push(format!(
                 "{ctx}: {}",
-                lang.t("val.field_too_long").replace("{}", &caps::URL.to_string())
+                lang.t("val.field_too_long")
+                    .replace("{}", &caps::URL.to_string())
             ));
             url_ok = false;
         } else if let Err(issue) = fetcher::validate_url(&s.url) {
@@ -747,11 +787,10 @@ async fn validate_import(
             && !token.is_empty()
             && !fumox_core::token::is_hashed(token)
         {
-            if token.chars().count() < caps::IMPORT_TOKEN_MIN {
-                validation.errors.push(format!(
-                    "{ctx}: {}",
-                    lang.t("val.token_too_short_import")
-                ));
+            if token.chars().count() < caps::TOKEN_MIN {
+                validation
+                    .errors
+                    .push(format!("{ctx}: {}", lang.t("val.token_too_short_import")));
             }
             if let Err(message) = validate_token(token, lang) {
                 validation.errors.push(format!("{ctx}: {message}"));
@@ -802,7 +841,9 @@ async fn validate_import(
             break;
         }
         vetted += 1;
-        let family = s.ip_family.unwrap_or_else(|| state.fetcher.default_family());
+        let family = s
+            .ip_family
+            .unwrap_or_else(|| state.fetcher.default_family());
         let outcome = tokio::time::timeout(
             remaining,
             fetcher::vet_url_with_policy(
@@ -1189,8 +1230,8 @@ mod tests {
 
         // Right length, so only the charset rule can reject these.
         for token in [
-            format!("{} ", "a".repeat(caps::IMPORT_TOKEN_MIN)),
-            "ё".repeat(caps::IMPORT_TOKEN_MIN),
+            format!("{} ", "a".repeat(caps::TOKEN_MIN)),
+            "ё".repeat(caps::TOKEN_MIN),
         ] {
             let mut planted = profile("p", None, &[]);
             planted.access_token = Some(token.clone());
@@ -1208,7 +1249,7 @@ mod tests {
         }
 
         let mut ok = profile("p", None, &[]);
-        ok.access_token = Some(format!("{}-_.~", "a".repeat(caps::IMPORT_TOKEN_MIN)));
+        ok.access_token = Some(format!("{}-_.~", "a".repeat(caps::TOKEN_MIN)));
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
             exported_at: 1,

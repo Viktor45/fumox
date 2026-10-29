@@ -3,9 +3,9 @@
 //! preview, toggle / delete actions.
 
 use super::{
-    FormError, action_response, is_htmx, mask_secret, not_found, pipeline_from_form,
-    row_error_response, server_error, validate_countries, validate_name, validate_slug,
-    validate_token,
+    FormError, action_response, caps, flash_redirect, is_htmx, mask_secret, not_found,
+    pipeline_from_form, row_error_response, server_error, validate_countries, validate_name,
+    validate_slug, validate_token,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -32,36 +32,6 @@ const PREVIEW_LINES: usize = 50;
 /// plain text, and its mask is what the form shows.
 const TOKEN_PLACEHOLDER: &str = "••••••";
 
-/// The profile fields the admin card renders.
-///
-/// The card never receives the model: the model's access token is a
-/// secret (the database keeps its hash), and a template must not be able
-/// to reach it.
-#[derive(Debug, Clone)]
-struct ProfileCard {
-    id: String,
-    slug: Option<String>,
-    name: String,
-    output_format: OutputFormat,
-    created_at: i64,
-    updated_at: i64,
-    enabled: bool,
-}
-
-impl ProfileCard {
-    fn from_profile(profile: &Profile) -> Self {
-        Self {
-            id: profile.id.clone(),
-            slug: profile.slug.clone(),
-            name: profile.name.clone(),
-            output_format: profile.output_format,
-            created_at: profile.created_at,
-            updated_at: profile.updated_at,
-            enabled: profile.enabled,
-        }
-    }
-}
-
 /// The value the token field of the form carries: a stand-in for a
 /// stored token, empty when the profile has none.
 fn token_placeholder(stored: Option<&str>) -> String {
@@ -71,7 +41,6 @@ fn token_placeholder(stored: Option<&str>) -> String {
         Some(value) => mask_secret(value),
     }
 }
-
 /// Whether the token field carries a placeholder rather than a value the
 /// operator typed: the fixed stand-in of a hashed token, or the mask of a
 /// legacy plain-text one. A typed token never contains a mask character
@@ -164,6 +133,9 @@ struct ProfileFormTemplate {
     formats: Vec<FormatOption>,
     source_picks: Vec<SourcePick>,
     token_masked_note: bool,
+    /// The edited row already carries a slug: the slug is part of the
+    /// public link, so the form says what a change costs.
+    slug_warning: bool,
     /// Pipeline widget HTML (builder ⇄ raw): the profile
     /// flavor with tri-state section controls (inherit / defaults / set).
     widget_html: String,
@@ -252,6 +224,8 @@ pub async fn profile_form(State(state): State<AdminState>, headers: HeaderMap) -
             formats,
             source_picks: picks,
             token_masked_note: false,
+            // New profile: nothing stored yet, so no slug can be broken.
+            slug_warning: false,
             // New profile: nothing stored yet, an empty builder widget.
             widget_html: widget_from_stored(
                 lang,
@@ -322,6 +296,10 @@ pub async fn profile_edit_form(
             formats,
             source_picks: picks,
             token_masked_note: profile.access_token.is_some(),
+            // The stored slug is part of the public link: a change breaks
+            // the links the subscribers hold, so the form says so before
+            // the operator types.
+            slug_warning: profile.slug.is_some(),
             widget_html,
         },
         StatusCode::OK,
@@ -362,6 +340,37 @@ fn composition_from_form(form: &[(String, String)]) -> Vec<(String, i64)> {
         .collect()
 }
 
+/// The profile assembled from the form, plus the slug the row carried
+/// before the save.
+///
+/// The saved slug is what makes a slug change visible: a non-empty slug
+/// that the form replaces breaks the `/sub/{slug}` link the subscribers
+/// hold, so the operator has to be warned about it.
+#[derive(Debug)]
+struct BuiltProfile {
+    profile: Profile,
+    saved_slug: Option<String>,
+}
+
+impl std::ops::Deref for BuiltProfile {
+    type Target = Profile;
+
+    fn deref(&self) -> &Profile {
+        &self.profile
+    }
+}
+
+/// Whether the save replaces a non-empty slug with a different one.
+///
+/// A profile without a slug has no link to break, and a slug that stays
+/// the same breaks nothing.
+fn slug_changed(saved: Option<&str>, submitted: Option<&str>) -> bool {
+    match saved {
+        Some(old) if !old.is_empty() => Some(old) != submitted,
+        _ => false,
+    }
+}
+
 /// Validate + assemble a `Profile` from form fields. Returns the model or
 /// the reason it could not be built: per-field errors (localized, shown
 /// next to fields) or a row that could not be read.
@@ -370,7 +379,7 @@ async fn build_profile_from_form(
     lang: &Lang,
     form: &[(String, String)],
     existing_id: Option<&str>,
-) -> Result<Profile, FormError> {
+) -> Result<BuiltProfile, FormError> {
     let get = |key: &str| -> String {
         form.iter()
             .rev()
@@ -425,11 +434,20 @@ async fn build_profile_from_form(
     };
     // Token format cap: the token guards a public
     // endpoint, so it is URL-safe and bounded like every other field.
-    if !unchanged
-        && let Some(token) = access_token.as_ref()
-        && let Err(message) = validate_token(token, lang)
-    {
-        errors.push(("access_token".into(), message));
+    if !unchanged && let Some(token) = access_token.as_ref() {
+        // The same floor the import path applies (L-194): a token that
+        // guards a public endpoint must not be guessable, so the form
+        // does not accept a shorter one either.
+        if token.chars().count() < caps::TOKEN_MIN {
+            errors.push((
+                "access_token".into(),
+                lang.t("val.token_too_short")
+                    .replace("{}", &caps::TOKEN_MIN.to_string()),
+            ));
+        }
+        if let Err(message) = validate_token(token, lang) {
+            errors.push(("access_token".into(), message));
+        }
     }
 
     let format_raw = get("output_format");
@@ -486,19 +504,22 @@ async fn build_profile_from_form(
 
     let now = now_ts();
 
-    Ok(Profile {
-        id: existing_id.map(str::to_string).unwrap_or_else(new_id),
-        slug,
-        access_token,
-        name,
-        output_format,
-        pipeline,
-        countries,
-        enabled: form.iter().any(|(k, _)| k == "enabled"),
-        // `stored` is the row read above for the mask, so `created_at`
-        // carries over without a second query.
-        created_at: stored.as_ref().map(|p| p.created_at).unwrap_or(now),
-        updated_at: now,
+    Ok(BuiltProfile {
+        saved_slug: stored.as_ref().and_then(|p| p.slug.clone()),
+        profile: Profile {
+            id: existing_id.map(str::to_string).unwrap_or_else(new_id),
+            slug,
+            access_token,
+            name,
+            output_format,
+            pipeline,
+            countries,
+            enabled: form.iter().any(|(k, _)| k == "enabled"),
+            // `stored` is the row read above for the mask, so `created_at`
+            // carries over without a second query.
+            created_at: stored.as_ref().map(|p| p.created_at).unwrap_or(now),
+            updated_at: now,
+        },
     })
 }
 
@@ -531,7 +552,23 @@ async fn form_error_response(
 ) -> Response {
     let values = form_values_from(form);
     let composition = composition_from_form(form);
-    let picks = source_picks(state, &composition).await.unwrap_or_default();
+    // A failed read is not an empty checklist: an operator who sees no
+    // source would read it as "the profile has no sources" and save the
+    // wrong composition.
+    let picks = match source_picks(state, &composition).await {
+        Ok(picks) => picks,
+        Err(err) => return server_error(lang, &err),
+    };
+    // The edited row's slug decides whether the form has to warn about a
+    // broken link. The row is read again here (the error path only).
+    let slug_warning = match &form_id {
+        Some(id) => match profiles::get(&state.pool, id).await {
+            Ok(Some(profile)) => profile.slug.is_some(),
+            Ok(None) => false,
+            Err(err) => return server_error(lang, &err),
+        },
+        None => false,
+    };
     let formats = format_options(&values.output_format, &lang);
     let pipeline_error = errors
         .iter()
@@ -558,6 +595,7 @@ async fn form_error_response(
             },
             formats,
             token_masked_note: is_token_placeholder(&values.access_token),
+            slug_warning,
             form_id,
             values,
             errors,
@@ -584,10 +622,12 @@ pub async fn profile_create(
             return row_error_response(lang, &err, "err.profile_not_found");
         }
     };
-    if let Err(err) = profiles::create(&state.pool, &profile).await {
-        return server_error(lang, &err);
-    }
-    if let Err(err) = profiles::replace_sources(&state.pool, &profile.id, &composition).await {
+    // The profile row and its composition are one object: they are
+    // written in one transaction, so a failed composition cannot leave a
+    // profile without its sources behind.
+    if let Err(err) =
+        profiles::upsert_with_sources(&state.pool, &profile.profile, &composition, true).await
+    {
         return server_error(lang, &err);
     }
     tracing::info!(profile = %profile.id, "profile created");
@@ -611,14 +651,47 @@ pub async fn profile_update(
             return row_error_response(lang, &err, "err.profile_not_found");
         }
     };
-    if let Err(err) = profiles::update(&state.pool, &profile).await {
+    // The row and the composition are written together; the cached
+    // rendering of the old composition is dropped right after, so the
+    // next public request already serves the saved profile.
+    if let Err(err) =
+        profiles::upsert_with_sources(&state.pool, &profile.profile, &composition, false).await
+    {
         return row_error_response(lang, &err, "err.profile_not_found");
     }
-    if let Err(err) = profiles::replace_sources(&state.pool, &profile.id, &composition).await {
-        return server_error(lang, &err);
-    }
-    // Saved means immediately effective.
     state.caches.invalidate_profile(&profile.id).await;
+    // A changed slug breaks the links the subscribers hold: the old
+    // /sub/{slug} stops answering at once, so the outcome says so.
+    if slug_changed(
+        profile.saved_slug.as_deref(),
+        profile.profile.slug.as_deref(),
+    ) {
+        tracing::warn!(
+            profile = %profile.id,
+            old_slug = ?profile.saved_slug,
+            new_slug = ?profile.profile.slug,
+            "profile slug changed: the previous link stops working"
+        );
+        let message = lang.t_named(
+            "prof.slug_changed_toast",
+            &[
+                ("old", profile.saved_slug.clone().unwrap_or_default()),
+                (
+                    "new",
+                    profile
+                        .profile
+                        .slug
+                        .clone()
+                        .unwrap_or_else(|| profile.id.clone()),
+                ),
+            ],
+        );
+        return flash_redirect(
+            &format!("/admin/profiles/{}", profile.id),
+            &message,
+            "warning",
+        );
+    }
     tracing::info!(profile = %profile.id, "profile updated");
     Redirect::to(&format!("/admin/profiles/{}", profile.id)).into_response()
 }
@@ -633,7 +706,16 @@ struct ProfileDetailTemplate {
     theme: Theme,
     active: &'static str,
     csrf: String,
-    profile: ProfileCard,
+    /// The card's own fields. The card never receives the model: the
+    /// model's access token is a secret (the database keeps its hash),
+    /// and a template must not be able to reach it.
+    profile_id: String,
+    name: String,
+    slug: Option<String>,
+    output_format: OutputFormat,
+    created_at: i64,
+    updated_at: i64,
+    enabled: bool,
     serve_path: String,
     serve_url: String,
     token_display: String,
@@ -754,7 +836,13 @@ pub async fn profile_detail(
                 .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
                 .unwrap_or_default(),
             stats_dupes: stats_total - stats_unique,
-            profile: ProfileCard::from_profile(&profile),
+            profile_id: profile.id.clone(),
+            name: profile.name.clone(),
+            slug: profile.slug.clone(),
+            output_format: profile.output_format,
+            created_at: profile.created_at,
+            updated_at: profile.updated_at,
+            enabled: profile.enabled,
             composition,
             stats_total,
             stats_unique,
@@ -775,7 +863,7 @@ pub async fn profile_detail(
 #[template(path = "profiles/_enabled_badge.html")]
 struct EnabledBadgeFragment {
     lang: Lang,
-    profile: ProfileCard,
+    enabled: bool,
 }
 
 impl_i18n!(EnabledBadgeFragment);
@@ -788,7 +876,8 @@ impl_i18n!(EnabledBadgeFragment);
 #[template(path = "profiles/_toggle_form.html")]
 struct ToggleFormFragment {
     lang: Lang,
-    profile: ProfileCard,
+    profile_id: String,
+    enabled: bool,
     csrf: String,
     swap_oob: bool,
 }
@@ -799,17 +888,21 @@ impl_i18n!(ToggleFormFragment);
 /// normally plus the form marked out-of-band. Both halves come from the
 /// fragment templates the detail page includes, so the ids, aria
 /// attributes and the hx-* contract cannot drift from the initial render.
-fn toggle_swap_fragment(lang: &Lang, profile: &Profile, csrf: &str) -> String {
-    let card = ProfileCard::from_profile(profile);
+///
+/// The fragments read the id and the new state only, so the response is
+/// rendered from the row the targeted UPDATE returned — the toggle never
+/// rewrites the fields it did not look at.
+fn toggle_swap_fragment(lang: &Lang, profile_id: &str, enabled: bool, csrf: &str) -> String {
     let badge = EnabledBadgeFragment {
         lang: lang.clone(),
-        profile: card.clone(),
+        enabled,
     }
     .render()
     .expect("badge fragment renders");
     let form = ToggleFormFragment {
         lang: lang.clone(),
-        profile: card,
+        profile_id: profile_id.to_string(),
+        enabled,
         csrf: csrf.to_string(),
         swap_oob: true,
     }
@@ -824,23 +917,21 @@ pub async fn profile_toggle(
     headers: HeaderMap,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
-    let mut profile = match profiles::get(&state.pool, &id).await {
-        Ok(Some(profile)) => profile,
-        Ok(None) => return not_found(lang, "err.profile_not_found"),
+    // A targeted UPDATE: the flip does not depend on the row the caller
+    // read a moment earlier and does not write back fields it never
+    // looked at.
+    let enabled = match profiles::toggle_enabled(&state.pool, &id).await {
+        Ok((enabled, _)) => enabled,
+        Err(fumox_core::Error::NotFound(_)) => return not_found(lang, "err.profile_not_found"),
         Err(err) => return server_error(lang, &err),
     };
-    profile.enabled = !profile.enabled;
-    profile.updated_at = now_ts();
-    if let Err(err) = profiles::update(&state.pool, &profile).await {
-        return row_error_response(lang, &err, "err.profile_not_found");
-    }
     state.caches.invalidate_profile(&id).await;
-    let message = if profile.enabled {
+    let message = if enabled {
         lang.t("prof.enabled_toast")
     } else {
         lang.t("prof.disabled_toast")
     };
-    tracing::info!(profile = %id, enabled = profile.enabled, "profile toggled");
+    tracing::info!(profile = %id, enabled, "profile toggled");
     action_response(
         is_htmx(&headers),
         &format!("/admin/profiles/{id}"),
@@ -850,7 +941,7 @@ pub async fn profile_toggle(
         // Both elements are rendered from the same fragment templates the
         // detail page includes, so the swap cannot drop the aria attributes
         // or drift from the initial markup.
-        toggle_swap_fragment(&lang, &profile, &state.csrf_for(&headers)),
+        toggle_swap_fragment(&lang, &id, enabled, &state.csrf_for(&headers)),
         message,
     )
 }
@@ -1012,10 +1103,65 @@ mod tests {
             "the cap must still fire: {errors:?}"
         );
 
-        let built = build_profile_from_form(&state, &lang, &with_token("good-token_1"), None)
+        let built =
+            build_profile_from_form(&state, &lang, &with_token("good-token_0123456789"), None)
+                .await
+                .expect("a well-formed token must save");
+        assert_eq!(built.access_token.as_deref(), Some("good-token_0123456789"));
+    }
+
+    /// The profile form and the import path apply the same floor to the
+    /// token: a token that guards a public endpoint must not be
+    /// guessable. A token shorter than the floor is refused, the stored
+    /// one is untouched (the placeholder keeps it).
+    #[tokio::test]
+    async fn a_short_typed_token_is_refused_like_in_the_import_path() {
+        let (_dir, state) = test_state().await;
+        let lang = state.locales.default_lang();
+        let stored = stored_profile(Some("supersecretvalue"));
+        profiles::create(&state.pool, &stored).await.unwrap();
+        let stored_row = profiles::get(&state.pool, &stored.id)
             .await
-            .expect("a well-formed token must save");
-        assert_eq!(built.access_token.as_deref(), Some("good-token_1"));
+            .unwrap()
+            .unwrap();
+        let stored_hash = stored_row
+            .access_token
+            .clone()
+            .expect("the token is stored");
+
+        let with_token = |token: &str| -> Vec<(String, String)> {
+            vec![
+                ("name".into(), "p1".into()),
+                ("slug".into(), "p1".into()),
+                ("access_token".into(), token.to_string()),
+                ("output_format".into(), "uri_list".into()),
+            ]
+        };
+
+        let short = "a".repeat(caps::TOKEN_MIN - 1);
+        let errors = field_errors(
+            build_profile_from_form(&state, &lang, &with_token(&short), Some(&stored.id))
+                .await
+                .expect_err("a token below the floor must be refused"),
+        );
+        assert!(
+            errors.iter().any(|(field, _)| field == "access_token"),
+            "the floor must fire on the token field: {errors:?}"
+        );
+
+        // The stored secret survives the refusal: nothing was written.
+        let after = profiles::get(&state.pool, &stored.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.access_token.as_deref(), Some(stored_hash.as_str()));
+
+        // Exactly at the floor the token is accepted.
+        let exact = "a".repeat(caps::TOKEN_MIN);
+        let built = build_profile_from_form(&state, &lang, &with_token(&exact), Some(&stored.id))
+            .await
+            .expect("a token at the floor must save");
+        assert_eq!(built.access_token.as_deref(), Some(exact.as_str()));
     }
 
     /// Only the placeholder itself restores the stored token; anything
@@ -1070,12 +1216,15 @@ mod tests {
         let built = build_profile_from_form(
             &state,
             &lang,
-            &with_token("rotated-token"),
+            &with_token("rotated-token-0123456789"),
             Some(&stored.id),
         )
         .await
         .expect("a typed token must replace the stored one");
-        assert_eq!(built.access_token.as_deref(), Some("rotated-token"));
+        assert_eq!(
+            built.access_token.as_deref(),
+            Some("rotated-token-0123456789")
+        );
     }
 
     /// The shared slug validation: a bad format and a slug held by another
@@ -1132,22 +1281,22 @@ mod tests {
         assert_eq!(built.slug, None);
     }
 
-    /// A profile row for the swap-fragment tests (id and enabled flag are
-    /// all the templates read).
-    fn sample_profile(enabled: bool) -> Profile {
-        let now = now_ts();
-        Profile {
-            id: new_id(),
-            slug: Some("p1".into()),
-            access_token: None,
-            name: "p1".into(),
-            output_format: OutputFormat::UriList,
-            pipeline: None,
-            countries: Vec::new(),
-            enabled,
-            created_at: now,
-            updated_at: now,
-        }
+    /// A profile id for the swap-fragment tests (the fragments read the
+    /// id and the enabled flag only).
+    fn sample_id() -> String {
+        new_id()
+    }
+
+    /// A slug is part of the public link: replacing a non-empty one
+    /// breaks the links the subscribers hold, and the form has to say
+    /// so. A profile without a slug has no link to break.
+    #[test]
+    fn only_a_replaced_non_empty_slug_counts_as_a_change() {
+        assert!(slug_changed(Some("p1"), Some("p2")));
+        assert!(slug_changed(Some("p1"), None));
+        assert!(!slug_changed(Some("p1"), Some("p1")));
+        assert!(!slug_changed(None, Some("p2")));
+        assert!(!slug_changed(None, None));
     }
 
     fn test_lang() -> Lang {
@@ -1156,24 +1305,24 @@ mod tests {
 
     /// The toggle swap is rendered from the fragment templates the detail
     /// page includes, so the ids, aria attributes and the hx-* contract
-    /// cannot drift apart.
+    /// cannot drift apart: the badge half must be the plain badge the
+    /// page wraps in a live region (a live region that is recreated with
+    /// every swap is never announced), and the form half must fill that
+    /// region, replace itself out-of-band and flip its action label.
     #[test]
     fn toggle_swap_fragment_carries_the_page_contract() {
         let lang = test_lang();
-        let profile = sample_profile(true);
-        let swap = toggle_swap_fragment(&lang, &profile, "csrf-token");
+        let id = sample_id();
+        let swap = toggle_swap_fragment(&lang, &id, true, "csrf-token");
 
         assert!(
-            swap.contains(r#"<span id="enabled-badge" aria-live="polite" aria-atomic="true">"#),
-            "the badge half lost the live-region contract: {swap}"
+            !swap.contains(r#"id="enabled-badge""#),
+            "the badge half must not carry the live region, the page owns it: {swap}"
         );
         assert!(swap.contains(r#"<span class="badge on">"#), "{swap}");
         assert!(swap.contains(r#"id="toggle-form""#), "{swap}");
         assert!(
-            swap.contains(&format!(
-                r#"hx-post="/admin/profiles/{}/toggle""#,
-                profile.id
-            )),
+            swap.contains(&format!(r#"hx-post="/admin/profiles/{}/toggle""#, id)),
             "{swap}"
         );
         assert!(
@@ -1181,28 +1330,39 @@ mod tests {
             "the form must keep targeting the badge: {swap}"
         );
         assert!(
+            swap.contains(r##"hx-swap="innerHTML""##),
+            "the form must fill the badge, not replace the live region: {swap}"
+        );
+        assert!(
             swap.contains(r#"hx-swap-oob="outerHTML:#toggle-form""#),
             "the form must travel as an out-of-band swap: {swap}"
         );
         assert!(
-            swap.contains(r#"aria-pressed="true""#),
-            "the pressed state must flip with the badge: {swap}"
+            swap.contains(r#"hx-disabled-elt="find button""#),
+            "the button must be locked while the request runs: {swap}"
+        );
+        assert!(
+            swap.contains(r#"data-error-target="toggle-error""#),
+            "a failed toggle needs a slot to write into: {swap}"
+        );
+        assert!(
+            !swap.contains(r#"aria-pressed"#),
+            "the button carries the action, the badge carries the state: {swap}"
         );
         assert!(swap.contains(r#"value="csrf-token""#), "{swap}");
         assert!(swap.contains(lang.t("common.disable")), "{swap}");
         assert!(swap.contains(lang.t("common.on")), "{swap}");
     }
 
-    /// The disabled flip: badge class, pressed state and button label all
-    /// follow the stored state.
+    /// The disabled flip: the badge class and the button label follow the
+    /// stored state.
     #[test]
     fn toggle_swap_fragment_flips_with_the_disabled_state() {
         let lang = test_lang();
-        let swap = toggle_swap_fragment(&lang, &sample_profile(false), "csrf-token");
+        let swap = toggle_swap_fragment(&lang, &sample_id(), false, "csrf-token");
 
         assert!(swap.contains(r#"<span class="badge off">"#), "{swap}");
         assert!(!swap.contains(r#"<span class="badge on">"#), "{swap}");
-        assert!(swap.contains(r#"aria-pressed="false""#), "{swap}");
         assert!(swap.contains(lang.t("common.enable")), "{swap}");
     }
 
@@ -1212,10 +1372,11 @@ mod tests {
     #[test]
     fn the_oob_marker_is_the_only_difference_from_the_page_render() {
         let lang = test_lang();
-        let profile = sample_profile(true);
+        let id = sample_id();
         let page_form = ToggleFormFragment {
             lang: lang.clone(),
-            profile: ProfileCard::from_profile(&profile),
+            profile_id: id.clone(),
+            enabled: true,
             csrf: "csrf-token".into(),
             swap_oob: false,
         }
@@ -1223,7 +1384,8 @@ mod tests {
         .unwrap();
         let swap_form = ToggleFormFragment {
             lang: lang.clone(),
-            profile: ProfileCard::from_profile(&profile),
+            profile_id: id,
+            enabled: true,
             csrf: "csrf-token".into(),
             swap_oob: true,
         }
@@ -1235,6 +1397,205 @@ mod tests {
             swap_form.replace(r#" hx-swap-oob="outerHTML:#toggle-form""#, ""),
             page_form,
             "the swap render must be the page render plus the oob marker"
+        );
+    }
+
+    /// A ready proxy linked to a source: the served tier the public
+    /// output carries.
+    async fn seed_ready_proxy(
+        pool: &fumox_core::db::DbPool,
+        fingerprint: &str,
+        host: &str,
+        source_id: &str,
+    ) {
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies
+                 (fingerprint, scheme, name, host, port, credential, params,
+                  unknown_params, raw_line, status, fail_count, ladder_step,
+                  created_at, updated_at)
+             VALUES (?, 'vless', ?, ?, 443, 'uuid', '{}', '{}', '', 'ready', 0, 0, 1, 1)
+             RETURNING id",
+        )
+        .bind(fingerprint)
+        .bind(fingerprint)
+        .bind(host)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, ?, ?)",
+        )
+        .bind(id)
+        .bind(source_id)
+        .bind(now_ts())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A member source of the profile under test.
+    async fn seed_member_source(pool: &fumox_core::db::DbPool, id: &str, name: &str) {
+        let now = now_ts();
+        let source = fumox_core::models::Source {
+            id: id.into(),
+            slug: None,
+            name: name.into(),
+            url: "https://example.com/sub".into(),
+            enabled: true,
+            encoding: Default::default(),
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 3600,
+            tags: None,
+            pipeline: None,
+            headers: None,
+            ip_family: None,
+            created_at: now,
+            updated_at: now,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        };
+        sources::create(pool, &source).await.unwrap();
+    }
+
+    /// The status and the body of a public subscription request.
+    async fn sub_body(public: &axum::Router, id: &str) -> (StatusCode, String) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let response = public
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/sub/{id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// L-128: the panel and the public listener share one cache, so a
+    /// profile write has to reach the subscribers at once. A saved
+    /// composition reorders the output, a disabled profile stops serving
+    /// it, and a deleted profile is gone — a cached rendering of the old
+    /// profile would keep serving the previous composition to every
+    /// subscriber.
+    #[tokio::test]
+    async fn the_public_output_follows_the_profile_writes() {
+        let (_dir, state) = test_state().await;
+        let pool = state.pool.clone();
+        seed_member_source(&pool, "srcL128000A", "first").await;
+        seed_member_source(&pool, "srcL128000B", "second").await;
+        seed_ready_proxy(&pool, "fp-l128-a", "a.example.com", "srcL128000A").await;
+        seed_ready_proxy(&pool, "fp-l128-b", "b.example.com", "srcL128000B").await;
+
+        let now = now_ts();
+        let profile = Profile {
+            id: "profL1280000".into(),
+            slug: None,
+            access_token: None,
+            name: "l128".into(),
+            output_format: OutputFormat::UriList,
+            pipeline: None,
+            countries: Vec::new(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        profiles::create(&pool, &profile).await.unwrap();
+        profiles::replace_sources(
+            &pool,
+            &profile.id,
+            &[("srcL128000A".into(), 0), ("srcL128000B".into(), 1)],
+        )
+        .await
+        .unwrap();
+
+        // The public listener shares the cache instance with the panel.
+        let public_state = crate::serve::AppState::new(
+            pool.clone(),
+            state.caches.clone(),
+            state.geo.clone(),
+            crate::serve::PublicRateLimits::unlimited(),
+            Vec::new(),
+            fumox_core::config::TrustedHeader::None,
+            Vec::new(),
+            state.server().export_max_rows,
+            state.export_token.clone(),
+        );
+        let public = crate::serve::public_app(public_state, pool.clone());
+
+        // The first request renders the subscription and caches it: the
+        // sources of the composition decide the order of the output.
+        let (status, body) = sub_body(&public, &profile.id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let a = body.find("a.example.com").expect("the first source");
+        let b = body.find("b.example.com").expect("the second source");
+        assert!(a < b, "the composition order must reach the output: {body}");
+
+        // The panel saves the same profile with the sources swapped.
+        let form: Vec<(String, String)> = vec![
+            ("name".into(), "l128".into()),
+            ("output_format".into(), "uri_list".into()),
+            ("sources".into(), "srcL128000B".into()),
+            ("sources".into(), "srcL128000A".into()),
+            ("enabled".into(), "on".into()),
+        ];
+        let response = profile_update(
+            State(state.clone()),
+            Path(profile.id.clone()),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let (status, body) = sub_body(&public, &profile.id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let a = body.find("a.example.com").expect("the first source");
+        let b = body.find("b.example.com").expect("the second source");
+        assert!(b < a, "the saved order must reach the output: {body}");
+
+        // A disabled profile stops answering.
+        let response = profile_toggle(
+            State(state.clone()),
+            Path(profile.id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        // The plain-browser path answers with a redirect carrying the toast.
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let (status, _) = sub_body(&public, &profile.id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Switching it back on serves the saved composition again.
+        profile_toggle(
+            State(state.clone()),
+            Path(profile.id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let (status, body) = sub_body(&public, &profile.id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("a.example.com") && body.contains("b.example.com"));
+
+        // A deleted profile is gone for good.
+        let response = profile_delete(
+            State(state.clone()),
+            Path(profile.id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let (status, _) = sub_body(&public, &profile.id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            profiles::get(&pool, &profile.id).await.unwrap().is_none(),
+            "the deleted profile must be gone from the database too"
         );
     }
 }

@@ -6,9 +6,11 @@
 
 pub mod auth;
 mod dash_top_n;
+mod flash;
 mod handlers;
 pub mod i18n;
 pub(crate) mod pipeline_editor;
+pub(crate) mod presentation;
 pub mod security;
 pub mod theme;
 
@@ -33,6 +35,15 @@ use fumox_core::geo::GeoResolver;
 use i18n::Lang;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+/// Ceiling of the admin panel's rate-limit counters, in keys.
+///
+/// The panel's keys are compact addresses and its client set is small
+/// (the operator, a reverse proxy, the occasional scanner), so a ceiling
+/// above the public listener's default costs little memory and keeps the
+/// counters of the real operators from being evicted by a flood of
+/// distinct addresses.
+const ADMIN_LIMITER_MAX_KEYS: u64 = 250_000;
 
 /// Shared state for every admin handler.
 #[derive(Clone)]
@@ -96,6 +107,13 @@ pub struct AdminState {
     /// public listener holds: a rotation from this panel has to reach the
     /// public endpoint in the same breath.
     pub export_token: crate::alive_export::TokenCache,
+    /// Row counts of the two journals, cached for a minute: the
+    /// retention card reads them on every render, and two COUNT scans
+    /// of a growing table do not have to run that often.
+    pub journal_counts: crate::cache::JournalCounts,
+    /// Pending one-shot toast messages of the plain-browser path, keyed
+    /// by the session. The message never travels through the URL.
+    pub flashes: flash::FlashStore,
 }
 
 impl AdminState {
@@ -114,13 +132,15 @@ impl AdminState {
         config_path: ResolvedConfigPath,
         export_token: crate::alive_export::TokenCache,
     ) -> Self {
-        let login_limiter = Arc::new(RateLimiter::new(
+        let login_limiter = Arc::new(RateLimiter::with_capacity(
             u64::from(config.admin.login_rate_limit.limit),
             config.admin.login_rate_limit.window,
+            ADMIN_LIMITER_MAX_KEYS,
         ));
-        let admin_limiter = Arc::new(RateLimiter::new(
+        let admin_limiter = Arc::new(RateLimiter::with_capacity(
             u64::from(config.admin.rate_limit.limit),
             config.admin.rate_limit.window,
+            ADMIN_LIMITER_MAX_KEYS,
         ));
         let locales = Arc::new(i18n::Locales::load(std::path::Path::new(
             &config.admin.locales_dir,
@@ -157,6 +177,8 @@ impl AdminState {
             config_writable,
             live_config: Arc::new(std::sync::RwLock::new(config)),
             export_token,
+            journal_counts: crate::cache::JournalCounts::new(std::time::Duration::from_secs(60)),
+            flashes: flash::FlashStore::new(),
         }
     }
 
@@ -424,7 +446,10 @@ async fn enforce_allowed_hosts(
             .get::<axum::extract::ConnectInfo<SocketAddr>>()
             .map(|info| info.0);
         let trusted_peer = peer.is_some_and(|peer| {
-            state.trusted_cidrs.iter().any(|net| net.contains(&peer.ip()))
+            state
+                .trusted_cidrs
+                .iter()
+                .any(|net| net.contains(&peer.ip()))
         });
         let forwarded_ok = trusted_peer
             && host_gate::validate_forwarded_host(req.headers(), &allowed, state.trusted_header)
@@ -442,6 +467,49 @@ async fn enforce_allowed_hosts(
         }
     }
     next.run(req).await
+}
+
+/// Park the toast of a plain-browser action in the session's slot.
+///
+/// The handler attaches the message to its redirect as a response header
+/// (it cannot reach the store: the redirect carries no session state).
+/// This middleware moves the message into the store of the session that
+/// made the request and strips the header, so the text never reaches the
+/// browser and never ends up in the URL.
+async fn capture_flash(State(state): State<AdminState>, req: Request, next: Next) -> Response {
+    let session = auth::session_cookie_value(req.headers()).unwrap_or_default();
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    let message = headers.remove(flash::FLASH_HEADER);
+    let level = headers.remove(flash::FLASH_LEVEL_HEADER);
+    if let Some(message) = message {
+        let message = message.to_str().unwrap_or_default().to_string();
+        let level = level
+            .and_then(|value| value.to_str().ok().map(str::to_string))
+            .unwrap_or_else(|| "ok".to_string());
+        state.flashes.put(&session, message, level);
+    }
+    response
+}
+
+/// The pending toast of the session, handed out once.
+///
+/// The plain-browser path has no `HX-Trigger` header to carry the message
+/// across the redirect, so the page asks for it here. The answer is the
+/// message and its level; the second request finds nothing.
+async fn take_flash(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let session = auth::session_cookie_value(&headers).unwrap_or_default();
+    match state.flashes.take(&session) {
+        Some((message, level)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            // The message is percent-encoded (see `header_safe`), so it
+            // carries no quote or backslash that would break the JSON.
+            format!("{{\"message\": \"{message}\", \"level\": \"{level}\"}}"),
+        )
+            .into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 
 /// Build the admin router. Mounted only when the panel is active
@@ -556,8 +624,16 @@ pub fn router(state: AdminState) -> axum::Router {
             "/import",
             get(handlers::import_form).post(handlers::import_submit),
         )
-        .route("/import/alive-token", post(handlers::rotate_alive_token))
+        // The token rotation is confirmed on a page of its own: it
+        // states the consequences before the capability is revoked.
+        .route(
+            "/import/alive-token",
+            get(handlers::rotate_alive_token_form).post(handlers::rotate_alive_token),
+        )
         .route("/events", get(handlers::events_stream))
+        // The pending toast of the plain-browser path: the page asks for
+        // it after the redirect, the answer is handed out once.
+        .route("/flash", get(take_flash))
         // Logout is a state-changing POST like every other one: the session
         // it clears is the panel's only authentication, and an attacker
         // page that can auto-submit a cross-site form to `/admin/logout`
@@ -587,6 +663,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/admin/set-theme", get(theme::set_theme))
         .route("/admin/set-dash-top-n", get(dash_top_n::set_top_n))
         .route("/admin/static/app.css", get(static_css))
+        .route("/admin/static/app.js", get(static_app_js))
         .route("/admin/static/htmx.min.js", get(static_htmx))
         // Router-wide request-body cap:
         // the CSRF layer already buffers POSTs at 1 MiB; this gives every
@@ -594,6 +671,10 @@ pub fn router(state: AdminState) -> axum::Router {
         // coincidence.
         .layer(axum::extract::DefaultBodyLimit::max(1 << 20))
         .layer(axum::middleware::from_fn(security::headers))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            capture_flash,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::rate_limit,
@@ -635,6 +716,18 @@ async fn static_css() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../../static/app.css"),
+    )
+}
+
+/// The panel's script, served as a file so the content-security policy
+/// does not have to allow inline scripts.
+async fn static_app_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../../static/app.js"),
     )
 }
 

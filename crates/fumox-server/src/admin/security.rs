@@ -1,20 +1,23 @@
 //! Response-hardening middleware for the admin listener:
 //! clickjacking, MIME sniffing and referrer leakage protection, plus a
-//! Content-Security-Policy. The panel renders
-//! with server-side askama escaping and ships its script (htmx) and the
-//! inline bootstrap scripts/styles from itself, so `'unsafe-inline'` for
-//! script/style is the current floor, no external origins are allowed.
+//! Content-Security-Policy. The panel renders with server-side askama
+//! escaping and ships its script (`/admin/static/app.js`) as a file, so
+//! the policy allows scripts from the origin only: no inline script and
+//! no inline event handler. Inline styles stay allowed, the templates
+//! still carry a `<noscript>` block and a few style attributes.
 
 use axum::extract::Request;
 use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::Response;
 
-/// CSP for the admin panel: everything comes from itself; inline script and
-/// style blocks (the base.html bootstrap, import page helper, theme
-/// attributes) keep `unsafe-inline` until the templates are refactored.
+/// CSP for the admin panel: everything comes from itself. The panel's
+/// script is a file (`/admin/static/app.js`) and every handler is
+/// delegated from it, so no inline script and no inline event handler
+/// has to be allowed. Inline styles stay for now: the templates still
+/// carry a `<noscript>` block and a few style attributes.
 pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
-     script-src 'self' 'unsafe-inline'; \
+     script-src 'self'; \
      style-src 'self' 'unsafe-inline'; \
      img-src 'self' data:; \
      connect-src 'self'; \
@@ -55,4 +58,67 @@ pub async fn headers(req: Request, next: Next) -> Response {
     // intermediary cache.
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Every header the panel sets, on every response.
+    ///
+    /// The middleware is the only place that hardens the responses, so a
+    /// route that bypasses it (or a refactor that drops a header) would
+    /// leave the panel unprotected. The assertions name the exact values:
+    /// `same-origin` and `no-store` are the two that are easy to get
+    /// wrong (a `no-referrer` policy locks the operator out of the login
+    /// form, see the comment in `headers`).
+    #[tokio::test]
+    async fn every_response_carries_the_security_headers() {
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(headers));
+
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .expect("the router answers");
+
+        assert_eq!(
+            response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get(header::REFERRER_POLICY).unwrap(),
+            "same-origin"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("the policy must be set")
+            .to_str()
+            .expect("the policy is ASCII");
+        assert_eq!(csp, CONTENT_SECURITY_POLICY);
+        // Inline scripts are not allowed: the panel's script is a file and
+        // every handler is delegated from it. Inline styles still are.
+        let script_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|directive| directive.starts_with("script-src"))
+            .expect("the policy names script-src");
+        assert_eq!(script_src, "script-src 'self'");
+    }
 }

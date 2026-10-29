@@ -16,6 +16,7 @@ pub mod logging;
 pub mod models;
 pub mod params;
 pub mod parsers;
+pub mod probe_backlog;
 pub mod repo;
 pub mod sqlite_guard;
 pub mod ssrf;

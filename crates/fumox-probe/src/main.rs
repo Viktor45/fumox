@@ -31,7 +31,7 @@ use fumox_core::AppConfig;
 use fumox_core::db::DbPool;
 use fumox_core::models::{Scheme, now_ts};
 use fumox_core::repo::probe::{ProbeResultEntry, T2_KIND, T2_UNVERIFIED_KIND};
-use fumox_core::repo::{fetch_log, meta_set, probe as probe_repo, proxies};
+use fumox_core::repo::{meta_set, probe as probe_repo, proxies, retention};
 use meow::{DelayOutcome, MeowClient};
 use tokio::sync::Semaphore;
 
@@ -2551,12 +2551,6 @@ async fn journal_engine_failure(ctx: &Context, batch: &[proxies::ProxyRow], reas
     tracing::warn!(proxies = batch.len(), "T2 batch failed by engine outage");
 }
 
-/// Cutoff timestamp for a retention window of `days`. A zero window would
-/// wipe the whole history on every cycle, so it is clamped to one day.
-fn retention_cutoff(now: i64, days: u32) -> i64 {
-    now - i64::from(days.max(1)) * 86_400
-}
-
 /// Publish the proxy kernel's RSS for the admin panel.
 ///
 /// Purely observational: failures touch neither the fail ladder nor the
@@ -2644,13 +2638,16 @@ async fn retention_loop(ctx: Arc<Context>) {
 
 async fn run_retention(ctx: &Context) {
     let now = now_ts();
-    let probe_cutoff = retention_cutoff(now, ctx.config.retention.probe_results_days);
-    let fetch_cutoff = retention_cutoff(now, ctx.config.retention.fetch_log_days);
 
+    // The daemon's own table first: `probe_results` is the daemon's
+    // alone, the server never writes it.
     let mut deleted_probe = 0u64;
-    let mut deleted_fetch = 0u64;
-    let mut deleted_requests = 0u64;
-    match probe_repo::purge_before(&ctx.pool, probe_cutoff).await {
+    match probe_repo::purge_before(
+        &ctx.pool,
+        retention::cutoff(now, u64::from(ctx.config.retention.probe_results_days)),
+    )
+    .await
+    {
         Ok(0) => {}
         Ok(deleted) => {
             deleted_probe = deleted;
@@ -2658,31 +2655,15 @@ async fn run_retention(ctx: &Context) {
         }
         Err(error) => tracing::warn!(%error, "probe_results rotation failed"),
     }
-    match fetch_log::purge_before(&ctx.pool, fetch_cutoff).await {
-        Ok(0) => {}
-        Ok(deleted) => {
-            deleted_fetch = deleted;
-            tracing::info!(deleted, "rotated fetch_log");
-        }
-        Err(error) => tracing::warn!(%error, "fetch_log rotation failed"),
-    }
-    // Priority queue housekeeping: requests whose proxy already
-    // left `unknown`, and stale leftovers from an offline probe.
-    match probe_repo::purge_settled_checks(&ctx.pool).await {
-        Ok(0) => {}
-        Ok(deleted) => tracing::debug!(deleted, "dropped settled probe_requests"),
-        Err(error) => tracing::warn!(%error, "probe_requests cleanup failed"),
-    }
-    let stale_days = ctx.config.probe.queue_stale_days.max(1) as i64;
-    let queue_cutoff = now - stale_days * 86_400;
-    match probe_repo::purge_requests_before(&ctx.pool, queue_cutoff).await {
-        Ok(0) => {}
-        Ok(deleted) => {
-            deleted_requests = deleted;
-            tracing::info!(deleted, "rotated stale probe_requests");
-        }
-        Err(error) => tracing::warn!(%error, "probe_requests rotation failed"),
-    }
+
+    // The journals both binaries write, with the windows and the clamp
+    // of the shared sweep: a server-only deployment runs the same one.
+    let windows = retention::RetentionWindows {
+        fetch_log_days: ctx.config.retention.fetch_log_days,
+        queue_stale_days: ctx.config.probe.queue_stale_days,
+    };
+    let outcome = retention::sweep_shared_journals(&ctx.pool, &windows, now).await;
+
     // Stamp the run so /admin/probe can surface it: the info lines above
     // are not a surface an operator looks at, and a probe daemon that
     // stopped rotating would otherwise grow both journals with nothing
@@ -2690,8 +2671,8 @@ async fn run_retention(ctx: &Context) {
     let stamp = probe_repo::meta::LastRotation {
         ts: now_ts(),
         probe_results: deleted_probe,
-        fetch_log: deleted_fetch,
-        probe_requests: deleted_requests,
+        fetch_log: outcome.fetch_log,
+        probe_requests: outcome.probe_requests,
     };
     if let Err(error) = meta_set(
         &ctx.pool,

@@ -323,6 +323,52 @@ impl SettingsEditTemplate {
             &[("fields", self.env_locked.join(", "))],
         ))
     }
+
+    /// The pane that holds the first validation error, if any.
+    ///
+    /// A refused save re-renders the form, and the error has to be on
+    /// screen: the pane that owns the offending field opens, so the
+    /// operator reads the message instead of hunting for the tab.
+    /// A form-level error (no field) belongs to no pane and is shown
+    /// above the form.
+    fn error_tab(&self) -> Option<&'static str> {
+        self.errors
+            .iter()
+            .find(|(field, _)| !field.is_empty())
+            .map(|(field, _)| settings_tab_of(field))
+    }
+
+    /// Whether the tab is the one the page opens on: the pane that
+    /// holds the first error, or the first tab when the form is clean.
+    fn tab_checked(&self, tab: &str) -> bool {
+        match self.error_tab() {
+            Some(owner) => owner == tab,
+            None => tab == "server",
+        }
+    }
+
+    /// Whether the pane holds a validation error: the tab carries a
+    /// marker, so a tab the operator did not open still says that
+    /// something in it is broken.
+    fn tab_has_error(&self, tab: &str) -> bool {
+        self.errors
+            .iter()
+            .any(|(field, _)| !field.is_empty() && settings_tab_of(field) == tab)
+    }
+}
+
+/// The pane that owns a config path.
+///
+/// The editor groups the fields by the process that reads them, so a
+/// validation error has to name the pane the operator has to open. The
+/// mapping mirrors the panes of `settings_edit.html`.
+fn settings_tab_of(field: &str) -> &'static str {
+    let section = field.split('.').next().unwrap_or_default();
+    match section {
+        "ingest" | "server" | "database" | "geo" | "network" | "admin" => "server",
+        "probe" | "meow" | "retention" => "probe",
+        _ => "shared",
+    }
 }
 
 /// Whether the environment overrides `field`.
@@ -1249,7 +1295,9 @@ pub async fn settings_update(
     if !token_locked && !new_token.is_empty() && new_token != previous_token {
         tracing::info!("admin token rotated; all admin sessions revoked");
         if !crate::admin::auth::revoke_all_sessions(&state.pool).await {
-            tracing::warn!("the session revocation did not persist; cookies minted under the old token stay valid");
+            tracing::warn!(
+                "the session revocation did not persist; cookies minted under the old token stay valid"
+            );
         }
     }
 
@@ -2625,6 +2673,32 @@ mod tests {
         }
     }
 
+    /// Every field the form can carry has a place to show what the
+    /// server refused. The registry decides which fields exist, and the
+    /// server reports its errors under those field names, so a field
+    /// without an error block would swallow the message: the page comes
+    /// back with a 422 and nothing on it.
+    #[test]
+    fn the_form_carries_an_error_block_for_every_field() {
+        let raw = raw_from_config(&AppConfig::default());
+        let template = include_str!("../../../templates/settings_edit.html");
+
+        for key in raw.keys() {
+            assert!(
+                template.contains(&format!("error_for(\"{key}\")")),
+                "the form has no error block for {key}"
+            );
+            assert!(
+                template.contains(&format!("error_attrs(\"{key}\")")),
+                "the form does not mark the control of {key} as invalid"
+            );
+            assert!(
+                template.contains(&format!("id=\"err-{key}\"")),
+                "the error block of {key} has no id the control can point at"
+            );
+        }
+    }
+
     /// Regression for the *Edit settings* bug where the page re-rendered
     /// stale `state.config` instead of reading the file the editor just
     /// wrote to. After `EditableConfig::save()`, a subsequent reload
@@ -3405,26 +3479,36 @@ mod tests {
             settings_refresh_failed(&lang, &HeaderMap::new(), "/etc/fumox/app.toml", &err);
 
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        let location = response
-            .headers()
-            .get(axum::http::header::LOCATION)
-            .expect("a redirect")
-            .to_str()
-            .unwrap();
-        assert!(
-            location.contains("flash_level=error"),
-            "the toast must be an error: {location}"
+        // The message rides in a header, the redirect target stays clean.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .expect("a redirect")
+                .to_str()
+                .unwrap(),
+            "/admin/settings"
         );
-        let flash = location
-            .split("flash=")
-            .nth(1)
-            .expect("a flash message")
-            .split('&')
-            .next()
-            .unwrap();
-        let message = percent_encoding::percent_decode_str(flash)
-            .decode_utf8_lossy()
-            .to_string();
+        assert_eq!(
+            response
+                .headers()
+                .get(crate::admin::flash::FLASH_LEVEL_HEADER)
+                .expect("the toast must carry a level")
+                .to_str()
+                .unwrap(),
+            "error",
+            "the toast must be an error"
+        );
+        let message = percent_encoding::percent_decode_str(
+            response
+                .headers()
+                .get(crate::admin::flash::FLASH_HEADER)
+                .expect("the toast must carry a message")
+                .to_str()
+                .unwrap(),
+        )
+        .decode_utf8_lossy()
+        .to_string();
         assert!(
             message.contains("/etc/fumox/app.toml"),
             "the message must name the file: {message}"
@@ -3456,7 +3540,10 @@ mod tests {
             &["ingest.drop_gate".to_string()],
         );
 
-        assert!(errors.is_empty(), "a locked field is not an error: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "a locked field is not an error: {errors:?}"
+        );
         assert!(
             cfg.doc().to_string().contains("drop_gate = false"),
             "the locked field must keep the file's value"
@@ -3489,16 +3576,8 @@ mod tests {
         std::fs::write(&path, "[server]\nrate_limit = \"120/min\"\n").unwrap();
         let before = std::fs::read(&path).unwrap();
 
-        let raw = HashMap::from([(
-            "server.rate_limit.limit".to_string(),
-            "60".to_string(),
-        )]);
-        let outcome = save_settings(
-            path.clone(),
-            raw,
-            test_lang(),
-            Vec::new(),
-        );
+        let raw = HashMap::from([("server.rate_limit.limit".to_string(), "60".to_string())]);
+        let outcome = save_settings(path.clone(), raw, test_lang(), Vec::new());
 
         let SaveOutcome::Invalid(errors) = outcome else {
             panic!("a half-filled pair must be refused");
@@ -3524,10 +3603,7 @@ mod tests {
         std::fs::write(&path, "[server]\nrate_limit = \"120/min\"\n").unwrap();
         let before = std::fs::read(&path).unwrap();
 
-        let raw = HashMap::from([(
-            "server.rate_limit.unit".to_string(),
-            "min".to_string(),
-        )]);
+        let raw = HashMap::from([("server.rate_limit.unit".to_string(), "min".to_string())]);
         let outcome = save_settings(path.clone(), raw, test_lang(), Vec::new());
 
         let SaveOutcome::Invalid(errors) = outcome else {
@@ -3554,10 +3630,7 @@ mod tests {
         let path = dir.join("app.toml");
         std::fs::write(&path, "[ingest]\ndrop_gate = true\n").unwrap();
 
-        let raw = HashMap::from([(
-            "probe.fail_limit".to_string(),
-            "5".to_string(),
-        )]);
+        let raw = HashMap::from([("probe.fail_limit".to_string(), "5".to_string())]);
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
@@ -3635,11 +3708,8 @@ mod tests {
         // The token is the sharpest case: the panel runs under the
         // environment's token whatever the file says, so a green toast
         // would claim a rotation that did not happen.
-        let (message, level) = save_toast(
-            &lang,
-            "/etc/fumox/app.toml",
-            &["admin.token".to_string()],
-        );
+        let (message, level) =
+            save_toast(&lang, "/etc/fumox/app.toml", &["admin.token".to_string()]);
         assert_eq!(level, "error");
         assert!(
             message.contains("admin.token") || message.contains("FUMOX_ADMIN__TOKEN"),

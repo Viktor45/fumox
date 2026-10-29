@@ -4,7 +4,7 @@
 {% match json %}
   {% when Some with (value) %}
   <label>{{ self.t("ped.preview_title") }}</label>
-  <pre class="mono ped-preview-json">{{ value }}</pre>
+  <pre class="mono ped-preview-json" aria-live="off">{{ value }}</pre>
   {% if valid %}
     <span class="badge on">{{ self.t("ped.preview_ok") }}</span>
   {% else %}

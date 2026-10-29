@@ -11,7 +11,11 @@
 //! - `parse_error` → stale snapshot or empty output + `X-Fumox-Warning:
 //!   parse-error`;
 //! - every proxy quarantined/removed → empty valid output +
-//!   `X-Fumox-Warning: all-proxies-quarantined`.
+//!   `X-Fumox-Warning: all-proxies-quarantined`;
+//! - entries the output format cannot express (a scheme without a
+//!   counterpart in the target format) → the output plus
+//!   `X-Fumox-Warning: incompatible-entries-skipped` and the count in
+//!   `X-Fumox-Skipped`.
 
 use crate::cache::{Caches, InlineClaim, InlineOutcome, Rendered};
 use crate::pipeline::{self, Candidate, CompiledPipeline, PipelineIssue};
@@ -377,16 +381,19 @@ impl AuthFailLog {
     /// into the log, and the summary is what stops the campaign from going
     /// unseen: even as the hundred-and-first client of a busy hour it is
     /// named once at the rollover.
+    ///
+    /// The budget covers every warning of the window, not only the ones
+    /// issued to a client seen for the first time: a client that comes back
+    /// after its own window elapsed spends the same budget as a new one, so
+    /// a campaign that rotates through a small set of clients cannot
+    /// out-warn the budget by waiting.
     fn should_warn(&mut self, client: &str, now: Instant) -> (bool, Option<String>) {
         let summary = self.roll_window(now);
         if let Some(first) = self.seen.get(client) {
             if now.duration_since(*first) < AUTH_FAIL_WARN_WINDOW {
                 return (false, summary);
             }
-            self.seen.insert(client.to_string(), now);
-            return (true, summary);
-        }
-        if self.seen.len() >= AUTH_FAIL_MAX_TRACKED {
+        } else if self.seen.len() >= AUTH_FAIL_MAX_TRACKED {
             // Bound the map, not the warnings: drop the oldest entry.
             if let Some(oldest) = self
                 .seen
@@ -630,8 +637,11 @@ where
             tokio::spawn(async move {
                 // The claim is released when `claim` drops, panic included.
                 let _claim = claim;
-                match make_render().await {
-                    Ok(rendered) => {
+                // The same deadline the leader of an inline render gets: a
+                // background re-render that wedges must not hold the claim
+                // forever, or the key would never be revalidated again.
+                match tokio::time::timeout(WAIT_FOR_LEADER, make_render()).await {
+                    Ok(Ok(rendered)) => {
                         // An invalidation that landed while this render ran
                         // supersedes it: storing pre-change data with a full
                         // TTL would resurrect the very staleness the
@@ -648,7 +658,7 @@ where
                             );
                         }
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         // An unrecoverable upstream answer is the endpoint's
                         // answer now: drop the snapshot so the next request
                         // re-renders and returns the upstream status instead
@@ -657,6 +667,15 @@ where
                             state.caches.processed_invalidate(&key).await;
                         }
                         tracing::warn!(key = %key, status = %err.status, "revalidation failed");
+                    }
+                    Err(_) => {
+                        // The claim drops with the task, so the next request
+                        // can start a revalidation again.
+                        tracing::warn!(
+                            key = %key,
+                            deadline_secs = WAIT_FOR_LEADER.as_secs(),
+                            "revalidation timed out; the cached snapshot stays until the next attempt"
+                        );
                     }
                 }
             });
@@ -685,6 +704,14 @@ where
             .await
         {
             InlineClaim::Leader(claim) => break claim,
+            // A render of this key failed a moment ago: its verdict is the
+            // answer, a second render would fail the same way.
+            InlineClaim::Failed { status, message } => {
+                return error_response(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    &message,
+                );
+            }
             InlineClaim::Wait(mut ended) => {
                 // The leader's guard drop is the wake-up. The channel then
                 // carries what the leader did, and keeps it after the
@@ -797,15 +824,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     // the upstream status code, not cached.
     for (source, _) in &members {
         if source.error_class == Some(ErrorClass::HttpClient) {
-            let upstream = last_http_status(state, &source.id).await.unwrap_or(502);
-            return Err(ErrorReply::upstream_unavailable(
-                StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY),
-                format!(
-                    "source \"{}\" unavailable: {}",
-                    source.name,
-                    source.last_error.as_deref().unwrap_or("HTTP client error")
-                ),
-            ));
+            return Err(upstream_unavailable_reply(state, source).await);
         }
     }
 
@@ -848,6 +867,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     let mut loaded_statuses: Vec<ProxyStatus> = Vec::new();
     let mut any_stale = false;
     let mut any_parse_error = false;
+    let mut skipped = SkippedRows::default();
 
     for (position, (source, compiled)) in members.iter().enumerate() {
         match source.error_class {
@@ -860,7 +880,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
             Some(ErrorClass::HttpClient) => unreachable!("handled above"),
         }
         let rows = by_source.remove(&source.id).unwrap_or_default();
-        let mut candidates = rows_to_candidates(rows, position as i64);
+        let mut candidates = rows_to_candidates(rows, position as i64, &mut skipped);
         if let Some(allowed) = &allowed_countries {
             candidates.retain(|c| {
                 c.geo_country
@@ -916,7 +936,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     // must stay decodable to a bare list (the block would double-encode as
     // base64 text), and structured formats have their own document shape.
     let interval_hours: u64 = update_interval_hours(&members).parse().unwrap_or(1);
-    let (body, content_type) = encode(&all, profile.output_format, || {
+    let (body, content_type, skipped_entries) = encode(&all, profile.output_format, || {
         url_list_header_block(&profile.name, interval_hours, all.len())
     });
 
@@ -930,14 +950,22 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     if any_stale {
         extra_headers.push(("X-Fumox-Stale".to_string(), "true".to_string()));
     }
+    let mut warnings: Vec<&str> = Vec::new();
     if any_parse_error {
-        extra_headers.push(("X-Fumox-Warning".to_string(), "parse-error".to_string()));
+        warnings.push("parse-error");
     } else if all_quarantined {
-        extra_headers.push((
-            "X-Fumox-Warning".to_string(),
-            "all-proxies-quarantined".to_string(),
-        ));
+        warnings.push("all-proxies-quarantined");
     }
+    if skipped_entries > 0 {
+        warnings.push("incompatible-entries-skipped");
+    }
+    if !warnings.is_empty() {
+        extra_headers.push(("X-Fumox-Warning".to_string(), warnings.join(", ")));
+    }
+    if skipped_entries > 0 {
+        extra_headers.push(("X-Fumox-Skipped".to_string(), skipped_entries.to_string()));
+    }
+    skipped.log();
 
     // The shortest member TTL bounds how long a cached render stays
     // fresh; the freshness cap is smaller than every fallback in
@@ -958,15 +986,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
 /// always the plain URI-list format.
 async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, ErrorReply> {
     if source.error_class == Some(ErrorClass::HttpClient) {
-        let upstream = last_http_status(state, &source.id).await.unwrap_or(502);
-        return Err(ErrorReply::upstream_unavailable(
-            StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY),
-            format!(
-                "source \"{}\" unavailable: {}",
-                source.name,
-                source.last_error.as_deref().unwrap_or("HTTP client error")
-            ),
-        ));
+        return Err(upstream_unavailable_reply(state, source).await);
     }
 
     let compiled = CompiledPipeline::from_json(source.pipeline.as_ref())
@@ -975,8 +995,16 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
     let rows = proxies::list_with_source(&state.pool, std::slice::from_ref(&source.id))
         .await
         .map_err(ErrorReply::internal)?;
-    let mut candidates =
-        rows_to_candidates(rows.into_iter().map(|linked| linked.proxy).collect(), 0);
+    let mut skipped = SkippedRows::default();
+    let mut candidates = rows_to_candidates(
+        rows.into_iter().map(|linked| linked.proxy).collect(),
+        0,
+        &mut skipped,
+    );
+    // The tiers the source holds before the live-tier filter: the
+    // "everything is hidden" verdict is about the source's health, not
+    // about what a filter removed.
+    let loaded_statuses: Vec<ProxyStatus> = candidates.iter().map(|c| c.status).collect();
     // /src serves only health-checked, currently-live proxies: rows that
     // were never probed (unknown), quarantined or removed stay out even
     // when the pipeline's health filter would let them through. `ready`
@@ -986,14 +1014,23 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
     candidates.retain(|c| matches!(c.status, ProxyStatus::Alive | ProxyStatus::Ready));
     let out = compiled.apply(candidates, &state.geo).await;
 
+    // The same verdict /sub reports: the source holds proxies, but every
+    // one of them is out of the live tiers.
+    let all_quarantined = !loaded_statuses.is_empty()
+        && out.is_empty()
+        && loaded_statuses
+            .iter()
+            .all(|status| matches!(status, ProxyStatus::Quarantine | ProxyStatus::Removed));
+
     // Same ttl-derived interval rule as the sub profile: whole hours
     // rounded up from the source TTL, at least 1.
     let interval_hours = whole_hours(source.cache_ttl_seconds);
-    let (body, content_type) = encode(&out, OutputFormat::UriList, || {
+    let (body, content_type, skipped_entries) = encode(&out, OutputFormat::UriList, || {
         url_list_header_block(&source.name, interval_hours as u64, out.len())
     });
 
     let mut extra_headers: Vec<(String, String)> = Vec::new();
+    let mut warnings: Vec<&str> = Vec::new();
     match source.error_class {
         None => {}
         Some(ErrorClass::Network) | Some(ErrorClass::HttpServer) => {
@@ -1005,10 +1042,23 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
             extra_headers.push(("X-Fumox-Stale".to_string(), "true".to_string()));
         }
         Some(ErrorClass::ParseError) => {
-            extra_headers.push(("X-Fumox-Warning".to_string(), "parse-error".to_string()));
+            warnings.push("parse-error");
         }
         Some(ErrorClass::HttpClient) => unreachable!("handled above"),
     }
+    if all_quarantined {
+        warnings.push("all-proxies-quarantined");
+    }
+    if skipped_entries > 0 {
+        warnings.push("incompatible-entries-skipped");
+    }
+    if !warnings.is_empty() {
+        extra_headers.push(("X-Fumox-Warning".to_string(), warnings.join(", ")));
+    }
+    if skipped_entries > 0 {
+        extra_headers.push(("X-Fumox-Skipped".to_string(), skipped_entries.to_string()));
+    }
+    skipped.log();
 
     Ok(Rendered {
         status: 200,
@@ -1042,22 +1092,62 @@ pub(crate) async fn preview_sub(
     Ok(text.lines().take(max_lines).map(str::to_string).collect())
 }
 
-/// Map DB rows to pipeline candidates; corrupt rows are logged and skipped
-/// (errors never abort a rendering).
-fn rows_to_candidates(rows: Vec<proxies::ProxyRow>, source_position: i64) -> Vec<Candidate> {
+/// Proxy rows that could not be turned into a candidate.
+///
+/// A corrupt row is skipped instead of failing the whole render, but a
+/// skipped row is a row the subscriber does not get. The count and the
+/// first reason are summarized in one line per render: a feed full of
+/// broken rows must not produce one log line per row.
+#[derive(Default)]
+struct SkippedRows {
+    count: u64,
+    first_id: Option<i64>,
+    first_error: Option<String>,
+}
+
+impl SkippedRows {
+    fn note(&mut self, proxy_id: i64, error: &str) {
+        self.count += 1;
+        if self.first_id.is_none() {
+            self.first_id = Some(proxy_id);
+            self.first_error = Some(error.to_string());
+        }
+    }
+
+    /// One summary line for the whole render.
+    fn log(&self) {
+        if self.count == 0 {
+            return;
+        }
+        tracing::warn!(
+            skipped = self.count,
+            first_proxy_id = self.first_id.unwrap_or_default(),
+            first_error = self.first_error.as_deref().unwrap_or_default(),
+            "proxy rows skipped during rendering"
+        );
+    }
+}
+
+/// Map DB rows to pipeline candidates; corrupt rows are counted and
+/// skipped (errors never abort a rendering).
+fn rows_to_candidates(
+    rows: Vec<proxies::ProxyRow>,
+    source_position: i64,
+    skipped: &mut SkippedRows,
+) -> Vec<Candidate> {
     let mut candidates = Vec::with_capacity(rows.len());
     for row in rows {
         let entry = match row.to_entry() {
             Ok(entry) => entry,
             Err(err) => {
-                tracing::warn!(proxy_id = row.id, error = %err, "skipping corrupt proxy row");
+                skipped.note(row.id, &err.to_string());
                 continue;
             }
         };
         let status = match row.status.parse::<ProxyStatus>() {
             Ok(status) => status,
             Err(err) => {
-                tracing::warn!(proxy_id = row.id, error = %err, "skipping proxy with unknown status");
+                skipped.note(row.id, &err.to_string());
                 continue;
             }
         };
@@ -1076,11 +1166,19 @@ fn rows_to_candidates(rows: Vec<proxies::ProxyRow>, source_position: i64) -> Vec
 /// Serialize candidates into the profile's output format. The
 /// `header_block` closure supplies the url_list metadata comments; it is
 /// only invoked (and only prepended) for the plain uri_list format.
+///
+/// The third value is the number of entries the format cannot express
+/// (see [`fumox_core::formats::skipped_count`]). The response says so
+/// instead of quietly serving a shorter list than the pipeline
+/// produced.
 fn encode(
     candidates: &[Candidate],
     format: OutputFormat,
     mut header_block: impl FnMut() -> String,
-) -> (Vec<u8>, String) {
+) -> (Vec<u8>, String, usize) {
+    let entries: Vec<fumox_core::models::ProxyEntry> =
+        candidates.iter().map(|c| c.entry.clone()).collect();
+    let skipped = fumox_core::formats::skipped_count(format, &entries);
     match format {
         OutputFormat::UriList => {
             // The block already ends with a newline; empty candidate lists
@@ -1089,30 +1187,40 @@ fn encode(
                 block if block.is_empty() => uri_lines(candidates),
                 block => format!("{block}{}", uri_lines(candidates)),
             };
-            (body.into_bytes(), "text/plain; charset=utf-8".to_string())
+            (
+                body.into_bytes(),
+                "text/plain; charset=utf-8".to_string(),
+                skipped,
+            )
         }
         OutputFormat::Base64 => (
             base64::engine::general_purpose::STANDARD
                 .encode(uri_lines(candidates).as_bytes())
                 .into_bytes(),
             "text/plain; charset=utf-8".to_string(),
+            skipped,
         ),
         OutputFormat::Clash => {
-            let entries: Vec<fumox_core::models::ProxyEntry> =
-                candidates.iter().map(|c| c.entry.clone()).collect();
+            let body = fumox_core::formats::clash::encode_clash(&entries);
+            // The count inside the document too: a YAML comment is inert
+            // for the parsers and survives a copy-pasted file, where the
+            // response headers are long gone.
+            let body = if skipped > 0 {
+                format!("# skipped: {skipped} (unsupported scheme)\n{body}")
+            } else {
+                body
+            };
             (
-                fumox_core::formats::clash::encode_clash(&entries).into_bytes(),
+                body.into_bytes(),
                 "text/yaml; charset=utf-8".to_string(),
+                skipped,
             )
         }
-        OutputFormat::SingBox => {
-            let entries: Vec<fumox_core::models::ProxyEntry> =
-                candidates.iter().map(|c| c.entry.clone()).collect();
-            (
-                fumox_core::formats::singbox::encode_singbox(&entries).into_bytes(),
-                "application/json; charset=utf-8".to_string(),
-            )
-        }
+        OutputFormat::SingBox => (
+            fumox_core::formats::singbox::encode_singbox(&entries).into_bytes(),
+            "application/json; charset=utf-8".to_string(),
+            skipped,
+        ),
     }
 }
 
@@ -1201,17 +1309,64 @@ fn update_interval_hours(members: &[(Source, CompiledPipeline)]) -> String {
 
 /// The upstream HTTP status of the source's latest fetch attempt, for the
 /// "return the original code" policy.
+///
+/// `None` means the real status is unknown (the fetch log could not be
+/// read, or the last attempt recorded no HTTP status); the caller then
+/// substitutes 502. That substitution is a guess, so it is logged: an
+/// operator reading the log sees why the answer is 502 and not 404.
 async fn last_http_status(state: &AppState, source_id: &str) -> Option<u16> {
-    let rows = fetch_log::recent_for_source(&state.pool, source_id, 1)
-        .await
-        .ok()?;
-    let status = rows.first()?.http_status?;
+    let rows = match fetch_log::recent_for_source(&state.pool, source_id, 1).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                source_id,
+                error = %err,
+                "the upstream status is unknown: the fetch log could not be read"
+            );
+            return None;
+        }
+    };
+    let Some(status) = rows.first().and_then(|row| row.http_status) else {
+        tracing::warn!(
+            source_id,
+            "the upstream status is unknown: the last fetch attempt recorded no HTTP status"
+        );
+        return None;
+    };
     u16::try_from(status).ok()
 }
 
+/// The reply for a source whose last fetch failed with an unrecoverable
+/// client error: the upstream status is the answer, and a cached snapshot
+/// must not keep masking it.
+///
+/// Shared by `/sub` and `/src` so both classify the failure the same way.
+async fn upstream_unavailable_reply(state: &AppState, source: &Source) -> ErrorReply {
+    let upstream = last_http_status(state, &source.id).await.unwrap_or(502);
+    ErrorReply::upstream_unavailable(
+        StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY),
+        format!(
+            "source \"{}\" unavailable: {}",
+            source.name,
+            source.last_error.as_deref().unwrap_or("HTTP client error")
+        ),
+    )
+}
+
+/// The token of an `Authorization: Bearer <token>` header.
+///
+/// The scheme is compared case-insensitively (RFC 7235 makes the scheme
+/// case-insensitive, and clients spell it `bearer` as often as `Bearer`);
+/// the token itself is taken as is, since it is compared verbatim against
+/// the stored hash.
 fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    value.strip_prefix("Bearer ").map(str::to_string)
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 pub(crate) fn to_response(rendered: &Rendered) -> Response {
@@ -1782,6 +1937,37 @@ mod tests {
         assert!(summary.contains("10.0.64.1"), "summary: {summary}");
     }
 
+    /// The per-window budget covers the aged branch too: a client that
+    /// comes back after its own window elapsed spends the same budget as
+    /// a new one, so a campaign that rotates through a small set of
+    /// clients cannot out-warn the budget by waiting.
+    #[test]
+    fn auth_fail_log_budget_covers_the_aged_branch() {
+        let mut log = AuthFailLog::default();
+        let t0 = Instant::now();
+        // The first failure opens the window.
+        assert!(log.should_warn("10.0.0.1", t0).0);
+        // A second client, seen inside the same window.
+        assert!(log.should_warn("10.0.0.2", t0 + Duration::from_secs(60)).0);
+
+        // The next window opens: the client above is aged now.
+        let t1 = t0 + Duration::from_secs(AUTH_FAIL_WARN_WINDOW.as_secs() + 1);
+        assert!(log.should_warn("10.0.0.1", t1).0);
+        // Spend the budget of the new window.
+        for i in 0..(AUTH_FAIL_MAX_WARNS - 1) {
+            assert!(log.should_warn(&format!("10.1.{i}.1"), t1).0);
+        }
+        assert_eq!(log.warns_emitted, AUTH_FAIL_MAX_WARNS);
+
+        // The aged client comes back while that window still holds: the
+        // aged branch must respect the budget like every other branch.
+        let t2 = t0 + Duration::from_secs(60 + AUTH_FAIL_WARN_WINDOW.as_secs() + 1);
+        assert!(
+            !log.should_warn("10.0.0.2", t2).0,
+            "the aged branch must respect the warn budget"
+        );
+    }
+
     fn entry(name: &str, host: &str, port: u16) -> ProxyEntry {
         ProxyEntry {
             scheme: Scheme::Vless,
@@ -1797,6 +1983,14 @@ mod tests {
             raw_path: String::new(),
             raw_line: String::new(),
         }
+    }
+
+    /// The same entry under a scheme the structured formats cannot
+    /// express.
+    fn entry_with_scheme(scheme: Scheme, name: &str, host: &str, port: u16) -> ProxyEntry {
+        let mut entry = entry(name, host, port);
+        entry.scheme = scheme;
+        entry
     }
 
     async fn make_source(state: &AppState, id: &str) -> Source {
@@ -2121,8 +2315,26 @@ mod tests {
             .header("Authorization", "Bearer secret-token")
             .body(Body::empty())
             .unwrap();
-        let response = router(state).oneshot(request).await.unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        // The scheme is case-insensitive: the token itself is not.
+        let request = Request::builder()
+            .uri("/sub/profA0000000")
+            .header("Authorization", "bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Another scheme is not a bearer token at all.
+        let request = Request::builder()
+            .uri("/sub/profA0000000")
+            .header("Authorization", "Basic secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -2386,7 +2598,9 @@ mod tests {
                 pipeline["sort"] = sort;
             }
             source.pipeline = Some(pipeline);
-            sources::update(&state.pool, &source).await.unwrap();
+            sources::update_settings(&state.pool, &source)
+                .await
+                .unwrap();
             make_profile(&state, "profA0000000", &["srcA0000000"]).await;
             ingest(
                 &state,
@@ -2424,7 +2638,9 @@ mod tests {
         let state = test_state().await;
         let mut source = make_source(&state, "srcA0000000").await;
         source.pipeline = Some(serde_json::json!({ "version": 1 }));
-        sources::update(&state.pool, &source).await.unwrap();
+        sources::update_settings(&state.pool, &source)
+            .await
+            .unwrap();
         let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         profile.pipeline = Some(serde_json::json!({
             "version": 1,
@@ -2462,11 +2678,11 @@ mod tests {
             "sort": { "by": "name" },
             "limit": { "count": 2 }
         }));
-        sources::update(&state.pool, &a).await.unwrap();
+        sources::update_settings(&state.pool, &a).await.unwrap();
         // Source B: no cap of its own.
         let mut b = make_source(&state, "srcB0000000").await;
         b.pipeline = Some(serde_json::json!({ "version": 1 }));
-        sources::update(&state.pool, &b).await.unwrap();
+        sources::update_settings(&state.pool, &b).await.unwrap();
         make_profile(&state, "profA0000000", &["srcA0000000", "srcB0000000"]).await;
         ingest(
             &state,
@@ -2515,7 +2731,9 @@ mod tests {
         let state = test_state().await;
         let mut source = make_source(&state, "srcA0000000").await;
         source.cache_ttl_seconds = 86_400;
-        sources::update(&state.pool, &source).await.unwrap();
+        sources::update_settings(&state.pool, &source)
+            .await
+            .unwrap();
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
         sqlx::query("UPDATE proxies SET status = 'alive'")
@@ -2598,6 +2816,7 @@ mod tests {
     async fn src_endpoint_serves_single_source() {
         let state = test_state().await;
         make_source(&state, "srcA0000000").await;
+        make_source(&state, "srcB0000000").await;
         ingest(
             &state,
             "srcA0000000",
@@ -2607,9 +2826,16 @@ mod tests {
             ],
         )
         .await;
+        // A second source: its proxy belongs to another feed and must not
+        // leak into this source's output.
+        ingest(&state, "srcB0000000", &[entry("b", "h3.example.com", 443)]).await;
         // Only the first proxy passed the health check; the second stays
         // unknown (never probed).
         sqlx::query("UPDATE proxies SET status = 'alive' WHERE host = 'h1.example.com'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET status = 'alive' WHERE host = 'h3.example.com'")
             .execute(&state.pool)
             .await
             .unwrap();
@@ -2619,9 +2845,38 @@ mod tests {
         assert!(body.contains("h1.example.com"));
         // alive-only endpoint: untested proxies are not served.
         assert!(!body.contains("h2.example.com"));
+        // Another source's proxy is not this source's output.
+        assert!(!body.contains("h3.example.com"), "{body:?}");
+
+        let (status, _, body) = get(router(state.clone()), "/src/srcB0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("h3.example.com"), "{body:?}");
+        assert!(!body.contains("h1.example.com"), "{body:?}");
 
         let (status, _, _) = get(router(state), "/src/missing00000").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The single-source endpoint reports the same verdict as the profile
+    /// one: a source whose proxies are all out of the live tiers is a
+    /// health fact, not an empty feed.
+    #[tokio::test]
+    async fn an_all_quarantined_source_warns_on_the_src_endpoint() {
+        let state = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+        sqlx::query("UPDATE proxies SET status = 'quarantine'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, headers, body) = get(router(state), "/src/srcA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            header_str(&headers, "x-fumox-warning"),
+            Some("all-proxies-quarantined")
+        );
+        assert_eq!(proxy_lines(&body), 0, "{body:?}");
     }
 
     #[tokio::test]
@@ -2817,7 +3072,9 @@ mod tests {
         let mut source = make_source(&state, "srcA0000000").await;
         // 90 minutes → 2 hours (rounded up, never 0).
         source.cache_ttl_seconds = 5400;
-        sources::update(&state.pool, &source).await.unwrap();
+        sources::update_settings(&state.pool, &source)
+            .await
+            .unwrap();
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
         sqlx::query("UPDATE proxies SET status = 'alive'")
             .execute(&state.pool)
@@ -2858,7 +3115,9 @@ mod tests {
             "version": 1,
             "filter": { "protocols": ["trojan"] }
         }));
-        sources::update(&state.pool, &source).await.unwrap();
+        sources::update_settings(&state.pool, &source)
+            .await
+            .unwrap();
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         let mut trojan = entry("t", "h2.example.com", 443);
         trojan.scheme = Scheme::Trojan;
@@ -2995,5 +3254,339 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A format that cannot express an entry must say so: the response
+    /// names the warning and the count, and the document carries the
+    /// count as a comment for a file that was copied out of the browser.
+    #[tokio::test]
+    async fn a_clash_profile_reports_the_entries_it_cannot_express() {
+        let state = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        profile.output_format = OutputFormat::Clash;
+        profiles::update(&state.pool, &profile).await.unwrap();
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("a", "h1.example.com", 443),
+                entry_with_scheme(Scheme::Naive, "n", "h2.example.com", 443),
+            ],
+        )
+        .await;
+
+        let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            header_str(&headers, "x-fumox-warning"),
+            Some("incompatible-entries-skipped")
+        );
+        assert_eq!(header_str(&headers, "x-fumox-skipped"), Some("1"));
+        assert!(
+            body.starts_with("# skipped: 1 (unsupported scheme)"),
+            "{body:?}"
+        );
+        // The entry the format can express is still served.
+        assert!(body.contains("h1.example.com"), "{body:?}");
+    }
+
+    /// The stale verdict and the upstream status code are the same on both
+    /// public endpoints: a source that is down is reported the same way
+    /// whether the subscriber reads the profile or the source.
+    #[tokio::test]
+    async fn a_recoverable_error_serves_stale_on_both_endpoints() {
+        for uri in ["/sub/profA0000000", "/src/srcA0000000"] {
+            let state = test_state().await;
+            make_source(&state, "srcA0000000").await;
+            make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+            ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+            // The live tiers are what the endpoints serve.
+            sqlx::query("UPDATE proxies SET status = 'alive'")
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            sources::record_fetch_outcome(
+                &state.pool,
+                "srcA0000000",
+                &FetchOutcome::Failure {
+                    at: fumox_core::models::now_ts(),
+                    error: "connection timed out",
+                    class: ErrorClass::Network,
+                },
+            )
+            .await
+            .unwrap();
+
+            let (status, headers, body) = get(router(state), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(body.contains("h1.example.com"), "{uri}: {body:?}");
+            assert_eq!(header_str(&headers, "x-fumox-stale"), Some("true"), "{uri}");
+        }
+    }
+
+    /// The unrecoverable verdict is the upstream's status code on both
+    /// endpoints: a subscriber that reads the source directly must not be
+    /// served a snapshot the profile endpoint has already given up on.
+    #[tokio::test]
+    async fn an_unrecoverable_error_answers_the_upstream_code_on_both_endpoints() {
+        for uri in ["/sub/profA0000000", "/src/srcA0000000"] {
+            let state = test_state().await;
+            make_source(&state, "srcA0000000").await;
+            make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+            ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+            fetch_log::insert(
+                &state.pool,
+                &fetch_log::FetchLogEntry {
+                    source_id: "srcA0000000",
+                    fetched_at: fumox_core::models::now_ts(),
+                    ok: false,
+                    http_status: Some(404),
+                    bytes: None,
+                    proxies_found: None,
+                    error: Some("Not Found"),
+                    error_class: Some(ErrorClass::HttpClient),
+                },
+            )
+            .await
+            .unwrap();
+            sources::record_fetch_outcome(
+                &state.pool,
+                "srcA0000000",
+                &FetchOutcome::Failure {
+                    at: fumox_core::models::now_ts(),
+                    error: "HTTP 404",
+                    class: ErrorClass::HttpClient,
+                },
+            )
+            .await
+            .unwrap();
+
+            let (status, _, _) = get(router(state), uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    /// A successful revalidation replaces the cached snapshot: the stale
+    /// body is served while the background render runs, and the entry
+    /// holds the new content afterwards.
+    #[tokio::test]
+    async fn a_successful_revalidation_replaces_the_cached_snapshot() {
+        let state = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+
+        // Cold render: a 200 with a full TTL is cached.
+        let (status, _, body) = get(router(state.clone()), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("h1.example.com"), "{body:?}");
+
+        // Age the entry so the next request takes the stale-while-revalidate
+        // path and spawns a background re-render.
+        let cached = state
+            .caches
+            .processed_get("sub:profA0000000")
+            .await
+            .expect("the cold render is cached");
+        state
+            .caches
+            .processed_put(
+                "sub:profA0000000",
+                Rendered {
+                    status: cached.status,
+                    body: cached.body.clone(),
+                    content_type: cached.content_type.clone(),
+                    extra_headers: cached.extra_headers.clone(),
+                    fresh_until: 0,
+                    source_ids: cached.source_ids.clone(),
+                },
+            )
+            .await;
+
+        // A new proxy arrives while the snapshot is stale.
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("a", "h1.example.com", 443),
+                entry("b", "h2.example.com", 443),
+            ],
+        )
+        .await;
+
+        // The stale snapshot is served immediately; the revalidation runs
+        // in the background.
+        let (status, _, body) = get(router(state.clone()), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("h1.example.com"), "{body:?}");
+        assert!(
+            !body.contains("h2.example.com"),
+            "the stale body is served: {body:?}"
+        );
+
+        // The background render replaces the entry with the new content.
+        let mut refreshed = None;
+        for _ in 0..200 {
+            let entry = state.caches.processed_get("sub:profA0000000").await;
+            if let Some(entry) = entry
+                && String::from_utf8_lossy(&entry.body).contains("h2.example.com")
+            {
+                refreshed = Some(entry);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refreshed = refreshed.expect("the revalidation must replace the snapshot");
+        assert!(
+            String::from_utf8_lossy(&refreshed.body).contains("h2.example.com"),
+            "{:?}",
+            String::from_utf8_lossy(&refreshed.body)
+        );
+    }
+
+    /// A leader that never finishes must not park the waiters behind it:
+    /// the waiter answers "render in progress" when its own deadline
+    /// passes, and the client retries.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_render_leader_answers_render_in_progress() {
+        let state = state_without_a_database();
+        // A claim that is taken and never released: the leader is stuck.
+        let claim = state
+            .caches
+            .begin_inline_render("sub:profA0000000", Vec::new())
+            .await;
+        assert!(matches!(claim, InlineClaim::Leader(_)));
+        let _claim = claim;
+
+        let response = serve_cached(
+            &state,
+            "sub:profA0000000".to_string(),
+            || async { Vec::new() },
+            || async { unreachable!("the waiter must not render") },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_of(response).await;
+        assert!(body.contains("render in progress"), "{body:?}");
+    }
+
+    /// A leader whose render outruns the deadline answers "render timed
+    /// out" and lets the next request render again; the verdict is
+    /// remembered for a moment, so a burst behind a broken upstream costs
+    /// one render rather than one per waiter.
+    #[tokio::test(start_paused = true)]
+    async fn an_overrunning_render_answers_render_timed_out() {
+        let state = state_without_a_database();
+        let key = "sub:profA0000000";
+        let renders = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+
+        let leader_state = state.clone();
+        let leader_renders = renders.clone();
+        let leader_started = started.clone();
+        let leader = tokio::spawn(async move {
+            serve_cached(
+                &leader_state,
+                key.to_string(),
+                || async { Vec::new() },
+                move || {
+                    let renders = leader_renders.clone();
+                    let started = leader_started.clone();
+                    async move {
+                        renders.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        started.notify_one();
+                        tokio::time::sleep(Duration::from_secs(WAIT_FOR_LEADER.as_secs() * 2))
+                            .await;
+                        Ok(Rendered {
+                            status: 200,
+                            body: Bytes::new(),
+                            content_type: "text/plain; charset=utf-8".to_string(),
+                            extra_headers: Vec::new(),
+                            fresh_until: 0,
+                            source_ids: Vec::new(),
+                        })
+                    }
+                },
+            )
+            .await
+        });
+        started.notified().await;
+
+        // The next request is the leader's waiter: it must not render on
+        // its own, and it must not hang past the leader's verdict.
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            serve_cached(
+                &waiter_state,
+                key.to_string(),
+                || async { Vec::new() },
+                || async { unreachable!("the waiter must not render") },
+            )
+            .await
+        });
+
+        let leader_response = leader.await.unwrap();
+        assert_eq!(leader_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let leader_body = body_of(leader_response).await;
+        assert!(leader_body.contains("render timed out"), "{leader_body:?}");
+
+        let waiter_response = waiter.await.unwrap();
+        assert_eq!(waiter_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let waiter_body = body_of(waiter_response).await;
+        assert!(waiter_body.contains("render timed out"), "{waiter_body:?}");
+
+        // The failed render's verdict is repeated instead of the same
+        // failing render running again.
+        let next_state = state.clone();
+        let next = tokio::spawn(async move {
+            serve_cached(
+                &next_state,
+                key.to_string(),
+                || async { Vec::new() },
+                || async { unreachable!("the failed verdict must be repeated") },
+            )
+            .await
+        });
+        let next_response = next.await.unwrap();
+        assert_eq!(next_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let next_body = body_of(next_response).await;
+        assert!(next_body.contains("render timed out"), "{next_body:?}");
+        assert_eq!(
+            renders.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one render, not one per waiter"
+        );
+    }
+
+    /// A state without a database. The paused clock of the timeout tests
+    /// breaks the pool's acquire timeout: the timer fires in virtual time
+    /// while the real I/O is still in flight. The tests that use it never
+    /// query the database.
+    fn state_without_a_database() -> AppState {
+        let pool = fumox_core::db::DbPool::connect_lazy("sqlite::memory:").unwrap();
+        let geo_cfg = fumox_core::config::GeoConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        AppState::new(
+            pool,
+            Caches::new(),
+            Arc::new(GeoResolver::new(&geo_cfg)),
+            PublicRateLimits::unlimited(),
+            Vec::new(),
+            fumox_core::config::TrustedHeader::None,
+            Vec::new(),
+            fumox_core::config::ServerConfig::default().export_max_rows,
+            crate::alive_export::TokenCache::new(),
+        )
+    }
+
+    /// The body of a response, as text.
+    async fn body_of(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 }

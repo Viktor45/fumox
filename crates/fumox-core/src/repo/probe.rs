@@ -386,11 +386,14 @@ pub async fn last_failed_kind(pool: &DbPool, proxy_id: i64) -> crate::Result<Opt
 /// `limit` caps the returned rows. Errors with `NULL` reason text are
 /// excluded, they are uninformative aggregates of successful probes that
 /// stored no diagnostic.
-pub async fn top_failure_reasons(
-    pool: &DbPool,
+pub async fn top_failure_reasons<'e, E>(
+    executor: E,
     since_ts: i64,
     limit: i64,
-) -> crate::Result<Vec<(String, i64)>> {
+) -> crate::Result<Vec<(String, i64)>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT error, COUNT(*) AS hits FROM probe_results
          WHERE ok = 0 AND error IS NOT NULL AND checked_at >= ?
@@ -400,7 +403,7 @@ pub async fn top_failure_reasons(
     )
     .bind(since_ts)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows)
 }

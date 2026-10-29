@@ -30,6 +30,8 @@ If you only have five minutes, read sections [1](#1-what-is-fumox),
     - [Signing in](#signing-in)
     - [What's inside](#whats-inside)
     - [Times and timezones](#times-and-timezones)
+    - [Keyboard and screen reader](#keyboard-and-screen-reader)
+    - [Deleting a source](#deleting-a-source)
     - [Import and export](#import-and-export)
     - [Languages and themes](#languages-and-themes)
   - [8. Configuration reference](#8-configuration-reference)
@@ -133,6 +135,22 @@ proxy stays linked while the probe confirms it (see alive-linger in
 identity fields only), and journals every fetch. Meanwhile `fumox-probe`
 samples proxies and updates their health status, which the health filter
 then uses.
+
+Two rules keep that loop from hammering a broken source. A source whose last
+attempt failed is held back by a growing backoff — two minutes after the
+first failure, twice that after the next one, up to an hour — so a dead URL
+is not asked again on every tick; a source that recovers is picked up as soon
+as its backoff expires. And every fetch runs under a budget derived from the
+fetch timeouts (`[fetch].connect_timeout_secs`, `[fetch].read_timeout_secs`
+and the retry count): an attempt that exceeds it is abandoned, its slot is
+released and the failure is reported to the admin panel instead of blocking
+the loop.
+
+The server owns the journal retention on its own as well: the `fetch_log`
+and the `probe_requests` are swept on the `[probe].retention_interval_secs`
+cadence, with the same windows the probe daemon uses (`[retention]`). A
+deployment that runs the daemon and one that does not stay bounded the same
+way.
 
 Two network listeners are involved, on purpose separated:
 
@@ -382,11 +400,13 @@ Options:
   -c, --config <CONFIG>  Path to the TOML config file (outranks FUMOX_CONFIG)
       --health-check     Probe the running server's /healthz and exit 0
                          when it answers 200, 1 otherwise. The request
-                         goes to 127.0.0.1 at the configured public
-                         bind's port. Used as the container healthcheck
-                         (`docker-compose.yml` wires it as the stack's
-                         `test:`): the runtime image ships no curl or
-                         wget.
+                         goes to the configured public bind's address
+                         (the loopback of that family for a wildcard
+                         bind: 127.0.0.1 for 0.0.0.0, ::1 for ::) at
+                         the bind's port. Used as the container
+                         healthcheck (`docker-compose.yml` wires it as
+                         the stack's `test:`): the runtime image ships
+                         no curl or wget.
   -h, --help             Print help
   -V, --version          Print version
 
@@ -404,7 +424,11 @@ without the flag or the variable, `config/app.toml` is used if present;
 the full layering is described in [section 8](#how-configuration-is-resolved)).
 The server creates
 the database and runs migrations on startup, then serves until SIGINT/SIGTERM
-(graceful shutdown). The probe opens no listening sockets at all.
+(graceful shutdown). The drain after the signal is bounded: the listeners stop
+accepting and finish the open requests for at most 10 seconds, then the
+remaining connections are dropped. Without the bound a single SSE stream in the
+admin panel or a slow export download could keep the process alive until the
+supervisor killed it. The probe opens no listening sockets at all.
 
 For a quick dev run without installing anything:
 
@@ -546,6 +570,15 @@ out of a sing-box export. Proxies of the remaining protocols (tuic, mieru,
 naive) are skipped with a log entry, not an error. Duplicate display names get automatic
 suffixes: `Name`, `Name (2)`, `Name (3)`…
 
+A format that cannot express an entry says so instead of quietly serving a
+shorter list: the response carries `X-Fumox-Warning: incompatible-entries-skipped`
+and the number of the skipped entries in `X-Fumox-Skipped`, and a Clash
+document carries the same count as a `# skipped: N (unsupported scheme)`
+comment (a YAML comment is inert for the parsers and survives a file that was
+copied out of the browser, where the headers are long gone). The warning
+header may carry several values at once, comma-separated
+(`parse-error, incompatible-entries-skipped`).
+
 ### Country filter
 
 A profile can restrict its output to specific countries: list ISO 3166-1
@@ -567,7 +600,8 @@ selection.
 | Everything is fine                                                                                   | `200` + fresh data                                                                                                                                                                                                            |
 | Some sources are temporarily down (`network`, `http_server` errors)                                  | `200` + last good data for the failed sources, fresh data for the rest; header `X-Fumox-Stale: true`. Stale data is served as long as needed; the health filter keeps cleaning dead proxies out, so the output self-heals. |
 | A source returned HTTP 200 but the content doesn't parse (`parse_error`: anti-bot pages, CDN stubs) | `200` + last good snapshot if one exists, otherwise an empty valid config; header `X-Fumox-Warning: parse-error`                                                                                                              |
-| All proxies of the profile are quarantined/removed                                                   | `200` + a valid **empty** config + header `X-Fumox-Warning: all-proxies-quarantined`                                                                                                                                          |
+| All proxies of the profile are quarantined/removed (on `/src`: all proxies of the source)              | `200` + a valid **empty** config + header `X-Fumox-Warning: all-proxies-quarantined`                                                                                                                                          |
+| The output format cannot express some of the entries (a protocol with no counterpart in that format)  | `200` + the entries the format can express + header `X-Fumox-Warning: incompatible-entries-skipped` and the number of the skipped ones in `X-Fumox-Skipped`                                                                                       |
 | A source is permanently broken (`http_client`: 400/403/404/410)                                      | The upstream status code is passed through; not cached                                                                                                                                                                        |
 | Profile doesn't exist / disabled                                                                     | `404`                                                                                                                                                                                                                         |
 | Too many requests from one IP (rate limit or exhausted failure window)                               | `429 Too Many Requests`, slow down                                                                                                                                                                                           |
@@ -595,17 +629,42 @@ panel entirely: every `/admin/*` route answers 404.
 Built-in protections: CSRF tokens on every form, per-IP rate limiting
 (`120/min` general, `5/min` on login), security response headers
 (`X-Frame-Options: DENY`, `Content-Security-Policy`, `nosniff`,
-`Referrer-Policy: same-origin`), proxy credentials masked in all lists
-(full value only on the proxy detail page, on explicit request).
+`Referrer-Policy: same-origin`), and secrets masked on every screen.
+
+The content-security policy allows scripts from the panel's own origin
+only (`script-src 'self'`): the panel ships its script as a file
+(`/admin/static/app.js`) and every handler is delegated from there, so
+no inline script and no inline event handler runs in the panel. Inline
+styles are still allowed; the templates carry a `<noscript>` block and a
+few style attributes.
+
+A secret is masked wherever the panel shows it. A proxy's credential
+is shown as `user:sec…••••`, the password in its proxy line is masked
+the same way, and the value of a credential-bearing parameter (a
+`password`, an `api_key`, a `token`) is shown as `[redacted]`. The
+card says that the value is a secret and never reaches the log.
+
+A secret inside a URL is treated the same way: a source whose address
+carries a password (`https://user:pass@host/sub`) or a secret query
+value (`?token=…`) shows it masked on the list, on the card and in the
+edit form, while the stored address keeps it — the fetcher needs the
+password, and saving the form without touching the field keeps it. The
+mask is put back under the key it replaced, so a source whose token
+sits in a renamed parameter keeps its token too. A profile's access
+token is stored as a hash, so the panel cannot show it: the
+subscription link carries the path alone, and the operator appends the
+token they set. The token field is a password field that never renders
+the stored value, and the panel refuses a token shorter than 16
+characters.
 
 ### What's inside
 
 | Screen              | What you do there                                                                                                                                                                                     |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Dashboard**       | Totals: sources (enabled/errored), profiles, proxies by status, 24h fetch success rate with the age of the last scheduler sweep, probe heartbeat, recent source errors; the per-source table lists unknown / alive / ready / quarantine / removed / total in status-machine order (the full fetch journal lives on the **Fetch log** screen) |
-| **Sources**         | Create/edit/enable/delete sources; *Refresh now*; per-source fetch log with error classes; the `/src/…` link                                                                                          |
-| **Profiles**        | Create/edit profiles: composition and order of sources, output format, pipeline overrides, access token, slug; output preview (first 50 lines)                                                        |
-| **Proxies**         | Filterable browser of all proxies (status, protocol, country, source, search by host/name); the list pages with *First* / *Previous* / *Next*, so a deep page costs one seek instead of a walk over every row before it; detail card with parameters, geo, lifecycle timestamps and probe history; *Reset status*; *Purge removed* |
+| **Dashboard**       | Totals: sources (enabled/errored), profiles, proxies by status, 24h fetch success rate with the age of the last scheduler sweep, probe heartbeat, recent source errors; the per-source table lists unknown / alive / ready / quarantine / removed / total in status-machine order, and the panel below it lists the top failure reasons of the last 24 h with their hit counts (the full fetch journal lives on the **Fetch log** screen) |
+| **Sources**         | Create/edit/enable/delete sources; *Refresh now*; per-source fetch log with error classes; the `/src/…` link; the password and the secret query values of a URL are masked on every screen; a running refresh shows how long it has been running and what it may cost (the wall-clock budget and the number of attempts) |
+| **Profiles**        | Create/edit profiles: composition and order of sources, output format, pipeline overrides, access token (a password field with a 16-character floor; the panel shows a placeholder, never the secret), slug; output preview (first 50 lines)                                                        |
+| **Proxies**         | Filterable browser of all proxies (status, protocol, country, source, search by host/name); the list pages with *First* / *Previous* / *Next*, so a deep page costs one seek instead of a walk over every row before it; detail card with parameters, geo (the facts are refreshed in the background, so the new ones show up on the next open of the card), lifecycle timestamps and probe history; the credential, the proxy line and the credential-bearing parameters are masked; *Reset status*; *Purge removed* (batched, so a big tier does not block the panel) |
 | **Fetch log**       | Journal of every source fetch: time, status, bytes, proxies found, error class                                                                                                                        |
 | **Probe**           | Health-check daemon status: heartbeat, meow-rs status with the kernel's live RSS (from meow-rs `GET /memory`, refreshed whenever a T2 batch reloads the engine), quarantine queue with scheduled second chances, and the history rotation panel (when the last retention run happened, what it deleted, journal size now)                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
@@ -619,6 +678,53 @@ formatted according to the interface language. Hover over a timestamp to see
 the original UTC instant and the timezone name. With JavaScript disabled the
 UTC text (`YYYY-MM-DD HH:MM:SS`) is displayed instead. Stored data, exports
 and server logs always remain UTC.
+
+### Keyboard and screen reader
+
+The panel is built to be usable without a mouse and to say what it is doing
+to a screen reader:
+
+- every page works with JavaScript disabled; the script that is loaded when
+  it is available only adds the live updates and the local conveniences;
+- a form the server refuses shows the message **on the field it belongs to**:
+  the message sits under the control, the control points at it
+  (`aria-describedby`), it is marked invalid (`aria-invalid`) and the
+  message is announced (`role="alert"`);
+- the settings editor is split into three tabs. A refused save opens the
+  pane that holds the first error, and every pane with an error is marked
+  with a red `!` in the tab strip, so a broken pane is never silently
+  wrong;
+- a confirmation dialog puts the focus on the **cancel** button, not on the
+  button that removes the rows;
+- the toggles (enable / disable) and the live badges announce their new
+  state, and the containers that carry the announcements are not re-created
+  on every update, so a screen reader is not sent the whole table again on
+  every poll;
+- the buttons that need a second look (a destructive action, a preset that
+  replaces the current rules) say what they do in their caption or in the
+  confirmation they ask for.
+
+### Deleting a source
+
+Deleting a source also disconnects the proxies it fed: they lose the link
+to it, and the sweep that follows touches **only** the proxies of that
+source — the proxies another source still feeds keep their links and their
+state.
+
+What the sweep does with the disconnected proxies depends on
+`[ingest].drop_gate`:
+
+- `false` (the conservative policy): nothing is retired. A `ready` proxy is
+  tunnel-verified and an `unknown` proxy has not had its first verdict yet;
+  the probe is the only authority on the lifecycle of a verified proxy, and
+  the priority queue the only authority on a not-yet-checked one. The rows
+  stay where they are, without a source.
+- `true` (the strict policy): every orphan of that source is marked
+  `removed`.
+
+If the sweep itself fails, the source is still deleted and the panel says
+so in a warning toast: the proxies that could not be flagged are named in
+the log.
 
 ### Import and export
 
@@ -706,7 +812,9 @@ Because the two tiers do not overlap, a `ready` proxy appears only in
 
 `Download url_list` saves the body as a file; *Regenerate link*
 replaces the token if the link leaks (the old link stops working
-immediately, both endpoints rotate together). The token is held in the
+immediately, both endpoints rotate together). The rotation asks for
+confirmation on a page of its own, so a misclick cannot break the links
+your clients already use. The token is held in the
 process memory of the running server and shared by the panel and the
 public listener, so a download costs no database read; the stored copy is
 the fallback that survives a restart.
@@ -932,7 +1040,7 @@ deduplicate by fingerprint". `"version": 1` is required.
 
 | Section  | What it does                                                 | Fields and defaults                                                                                                                |
 | -------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `filter` | Keep/drop protocols and AS numbers; drop proxies allowing insecure TLS | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null, matched against the stored `geo_asn`; a row that carries none is resolved once at serving time (the lookup is cached, and geo-enrich asks for the same host moments later), so only a host that genuinely cannot be resolved stays unknown: the allowlist drops it, an exclude list keeps it (both `"24940"` and `"AS24940"` spellings work); `forbid_insecure`: default `true`, drops any proxy with a truthy `insecure`/`allowInsecure`/`skip-cert-verify`/`allow_insecure` toggle (the old `normalize_params` name is still accepted) |
+| `filter` | Keep/drop protocols and AS numbers; drop proxies allowing insecure TLS | `protocols` / `exclude_protocols`: lists or null (= all); `asns` / `exclude_asns`: AS-number lists or null, matched against the stored `geo_asn`; a row that carries none is resolved once at serving time, but only when an ASN rule is actually in play (an ASN filter or an ASN drop rule) — the lookup is cached, and geo-enrich asks for the same host moments later — so only a host that genuinely cannot be resolved stays unknown: the allowlist drops it, an exclude list keeps it (both `"24940"` and `"AS24940"` spellings work). A pipeline without an ASN rule resolves nothing at serving time: the ingest and the geo backfill fill the number in; `forbid_insecure`: default `true`, drops any proxy with a truthy `insecure`/`allowInsecure`/`skip-cert-verify`/`allow_insecure` toggle (the old `normalize_params` name is still accepted). The insecure check runs after the rename rules, so it judges the parameters the pipeline ends up with — a rename that rewrites an insecure switch is caught |
 | `drop`   | Discard matching proxies whole (never stored)                | `match` (regex), `flags`, `target` (optional: `name` default, `host`, `port`, `param:KEY`, `asn`); an `asn` rule takes no `match`/`flags` and instead requires a non-empty per-rule `asns` list (`"24940"` and `"AS24940"` both work) matched against the proxy's resolved AS number; rules are OR-ed; default `[]` |
 | `rename` | Regex-based rewriting, rules applied in order                | `match` (regex), `replace`, `flags` (e.g. `"i"`), `target` (optional: `name` default, `host`, `port`, `param:KEY`); default `[]` |
 | `geo`    | Rewrite display names with geo data                          | `enabled` (default `true`), `template` (default `"{flag} {country} · {name}"`; placeholders in [section 11](#11-geo-enrichment))   |
@@ -946,6 +1054,22 @@ value are rejected with a field error in the admin form; nothing is saved.
 This strictness is deliberate, so a future schema v2 can add fields without
 ambiguity.
 
+The admin panel edits a pipeline through a form. Every section can be set to
+"keep the built-in default", to "use an explicit value" or to "drop the
+section", and the switches inside a section (the insecure check, the geo
+rewrite) work the same way: an untouched switch keeps the default, an
+unchecked one sends its own "off". A rule's text — the regex, the
+replacement, the flags, the ASNs — is taken verbatim, spaces included: a
+pattern that starts or ends with a space is a different pattern, and trimming
+it would silently change what the rule does.
+
+The form is not the only way in. A pipeline the form cannot represent (a
+section the builder does not know, a rule it cannot express) is edited as raw
+JSON instead of being rewritten into something else. A value the form does not
+understand — a sort key that does not exist, a cap that is not a number — is
+kept in the document and reported against the field it came from, so the panel
+names the mistake instead of quietly falling back to a default.
+
 A rule's optional `target` picks what its regex rewrites; the display name is
 only the default target: `name` (also omitted in the JSON) is the classic renaming;
 `host` and `port` rewrite the proxy address, and `param:KEY` rewrites the
@@ -954,8 +1078,11 @@ first parameter with that key (case-insensitive: feeds mix `headerType` and
 percent-encoded form, exactly as they appear in the URI, so `path=%2Fws` is
 rewritten through its encoded spelling. Host and port results are guarded on
 serving: an empty host, a host containing URI delimiters or a port outside
-0–65535 is skipped with a WARN log entry and the original value kept, so one
-broken rule cannot corrupt every line of the subscription. Note that
+0–65535 is skipped and the original value kept, so one broken rule cannot
+corrupt every line of the subscription. The skips are counted per rule and
+reported in one WARN line per rule — the rule index, its target, the number of
+skipped entries and one sample value — instead of one line per proxy, so a
+feed full of broken entries cannot flood the log. Note that
 rewriting `host`/`port`/`param` changes the proxy fingerprint at serving time:
 two nodes rewritten to the same address merge at the dedup step (which runs
 after renaming, first occurrence wins).
@@ -986,6 +1113,11 @@ filters discarded, so rules can be tuned before the first real fetch.
 
 The pipeline runs in a fixed order:
 **parse → filter → drop → rename → geo → health-filter → merge + dedup → sort → encode.**
+
+One filter runs twice: the insecure check (`filter.forbid_insecure`) is applied
+with the other filters and again after the rename rules, because a rename can
+introduce an insecure switch — the second pass sees the parameters the
+pipeline ends up with.
 
 ## 10. Health checks and proxy lifecycle
 
@@ -1273,11 +1405,13 @@ takes a `max` because the daemon's ticker skips missed ticks: a lane
 longer than the interval pushes the next start out by the work.
 
 When `retire_per_cycle` is 0, usually because the second-chance window
-has not elapsed yet or because `sample_size` is 0, the cycle picks up
-nothing and there is no drain to estimate. The banner then reports what
-the cycle took and how much is due, instead of a figure it does not
-have. At `sample_size = 0` the two sample-proportional triggers stay off
-entirely: a ratio of the queue against a zero sample says nothing.
+has not elapsed yet, the cycle picks up nothing and there is no drain to
+estimate. The banner then reports what the cycle took and how much is due,
+instead of a figure it does not have. A sample of 0 is not a state the
+config accepts (`probe.sample_size` starts at 1 and the file is refused at
+startup otherwise), but the model guards it anyway: a ratio of the queue
+against a zero sample says nothing, so the two sample-proportional triggers
+stay off entirely.
 
 Two assumptions the figure rests on:
 
@@ -1443,8 +1577,11 @@ tried.
 
 - **Growth control.** The probe purges history automatically:
   `probe_results` older than 14 days and `fetch_log` older than 30 days by
-  default (`[retention]`). Removed proxies accumulate until you press *Purge
-  removed* in the admin panel.
+  default (`[retention]`). The server sweeps the shared journals on its own
+  as well — `fetch_log` and `probe_requests` on the
+  `[probe].retention_interval_secs` cadence — so a deployment that runs no
+  probe daemon stays bounded too. Removed proxies accumulate until you press
+  *Purge removed* in the admin panel.
 - **Configuration backup.** Use the admin panel's *Export*: it captures all
   sources and profiles in a JSON file you can import on another instance.
 - **Timestamps** everywhere are Unix epoch seconds, UTC; the admin panel

@@ -1247,7 +1247,7 @@ async fn shared_proxy_survives_until_last_source_lets_go() {
 /// link-less before the pass started is none of this source's
 /// business, and that is exactly the residue the admin source
 /// delete leaves behind under `drop_gate = false`, where
-/// `mark_orphans_removed` protects `ready` and `unknown` rows on
+/// `mark_source_orphans_removed` protects `ready` and `unknown` rows on
 /// purpose. Reconciling an unrelated source afterwards must not
 /// retire them.
 #[tokio::test]
@@ -1273,15 +1273,13 @@ async fn reconcile_of_another_source_leaves_protected_orphans_alone() {
         .unwrap();
 
     // The source is deleted: the click protects the verified and the
-    // not-yet-checked row, both stay behind without a link.
+    // not-yet-checked row, both stay behind without a link. The sweep
+    // runs while the links still name the source.
+    let sweep = mark_source_orphans_removed(&pool, "srcD0000000", &["ready", "unknown"])
+        .await
+        .unwrap();
+    assert_eq!(sweep.retired, 0);
     assert!(sources_repo::delete(&pool, "srcD0000000").await.unwrap());
-    assert_eq!(
-        mark_orphans_removed(&pool, &["ready", "unknown"])
-            .await
-            .unwrap()
-            .retired,
-        0
-    );
 
     // An unrelated source is reconciled. Its own pass must not touch
     // the two rows the delete left behind.
@@ -3655,11 +3653,11 @@ async fn remove_unprobeable_unknown_retires_only_tuic_and_mieru() {
     assert_eq!(bulk_status_of(&pool, tuic_alive).await.0, "alive");
 }
 
-/// `mark_orphans_removed` with no protected statuses is the strict
+/// `mark_source_orphans_removed` with no protected statuses is the strict
 /// policy: every link-less proxy retires, no matter the tier, this is
 /// what `drop_gate = true` asks for from the admin source-delete path.
 #[tokio::test]
-async fn mark_orphans_removed_retires_every_status_by_default() {
+async fn mark_source_orphans_removed_retires_every_status_by_default() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcO0000000").await;
 
@@ -3675,16 +3673,11 @@ async fn mark_orphans_removed_retires_every_status_by_default() {
         None,
     )
     .await;
-    // The rows start linked and lose the link, exactly what happens
-    // after a source delete: the sweep only acts on rows with no
-    // remaining links.
+    // The rows start linked to the source that goes away: the sweep
+    // only acts on rows with no remaining link.
     for id in [ready, alive, unknown, quarantined] {
         link_row(&pool, id, "srcO0000000").await;
     }
-    sqlx::query("DELETE FROM proxy_source_links")
-        .execute(&pool)
-        .await
-        .unwrap();
 
     // The fixtures carry a live ladder: a retired row must not keep a
     // recheck schedule that describes a ladder nobody walks any more.
@@ -3702,7 +3695,9 @@ async fn mark_orphans_removed_retires_every_status_by_default() {
         .unwrap();
     }
 
-    let sweep = mark_orphans_removed(&pool, &[]).await.unwrap();
+    let sweep = mark_source_orphans_removed(&pool, "srcO0000000", &[])
+        .await
+        .unwrap();
     assert_eq!(
         sweep.retired, 4,
         "every orphan must retire under strict policy"
@@ -3744,7 +3739,7 @@ async fn mark_orphans_removed_retires_every_status_by_default() {
 /// authority on a not-yet-verified row. Already-`removed` rows stay
 /// untouched regardless of the protected list (idempotency).
 #[tokio::test]
-async fn mark_orphans_removed_protects_listed_statuses() {
+async fn mark_source_orphans_removed_protects_listed_statuses() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcO0000001").await;
 
@@ -3759,10 +3754,6 @@ async fn mark_orphans_removed_protects_listed_statuses() {
     for id in [ready, alive, unknown, already] {
         link_row(&pool, id, "srcO0000001").await;
     }
-    sqlx::query("DELETE FROM proxy_source_links")
-        .execute(&pool)
-        .await
-        .unwrap();
     sqlx::query("UPDATE proxies SET removed_at = 1234 WHERE id = ?")
         .bind(already)
         .execute(&pool)
@@ -3773,7 +3764,7 @@ async fn mark_orphans_removed_protects_listed_statuses() {
     // `ready` (tunnel-verified, the probe is its only authority) and
     // `unknown` (not yet checked, the priority queue is its only
     // authority). Both must survive the click.
-    let sweep = mark_orphans_removed(&pool, &["ready", "unknown"])
+    let sweep = mark_source_orphans_removed(&pool, "srcO0000001", &["ready", "unknown"])
         .await
         .unwrap();
     assert_eq!(
@@ -3807,7 +3798,7 @@ async fn mark_orphans_removed_protects_listed_statuses() {
 /// Empty protected-status slice is the strict path; a non-empty slice
 /// with multiple statuses protects every row in any of them.
 #[tokio::test]
-async fn mark_orphans_removed_accepts_multiple_protected_statuses() {
+async fn mark_source_orphans_removed_accepts_multiple_protected_statuses() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcO0000002").await;
 
@@ -3819,12 +3810,8 @@ async fn mark_orphans_removed_accepts_multiple_protected_statuses() {
     for id in [ready, alive, unknown] {
         link_row(&pool, id, "srcO0000002").await;
     }
-    sqlx::query("DELETE FROM proxy_source_links")
-        .execute(&pool)
-        .await
-        .unwrap();
 
-    let sweep = mark_orphans_removed(&pool, &["ready", "alive"])
+    let sweep = mark_source_orphans_removed(&pool, "srcO0000002", &["ready", "alive"])
         .await
         .unwrap();
     assert_eq!(sweep.retired, 1, "only the non-protected orphan retires");
@@ -4387,6 +4374,48 @@ async fn oldest_quarantined_at_returns_min() {
 
     let v = oldest_quarantined_at(&pool).await.unwrap();
     assert_eq!(v, Some(now - 30 * 86_400));
+}
+
+/// The physical cleanup of the removed tier runs in batches: a tier
+/// too big for one statement is deleted piece by piece, so the panel
+/// does not hold a write lock for the whole delete.
+#[tokio::test]
+async fn purge_removed_deletes_a_tier_bigger_than_one_batch() {
+    let (_dir, pool) = temp_pool().await;
+    let rows = PURGE_BATCH_SIZE + 5;
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (
+             SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?
+         )
+         INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
+                              status, created_at, updated_at)
+         SELECT 'purge-fp-' || n, 'vless', 'n' || n, 'h' || n || '.example.com',
+                443, '', 'removed', 1, 1
+         FROM seq",
+    )
+    .bind(rows)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let alive = bulk_test_row(&pool, "purge-alive", "vless", "alive", None, None).await;
+
+    let deleted = purge_removed(&pool).await.unwrap();
+    assert_eq!(deleted, rows as u64);
+
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM proxies WHERE status = 'removed'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    // The purge touches the removed tier only.
+    assert!(
+        sqlx::query("SELECT 1 FROM proxies WHERE id = ?")
+            .bind(alive)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 // Admin proxy browser
@@ -5111,4 +5140,77 @@ async fn the_version_marker_gates_the_recompute() {
     let stats = ensure_fingerprint_version(&pool).await.unwrap().unwrap();
     assert_eq!(stats.rewritten, 0);
     assert_eq!(stats.merged, 0);
+}
+
+/// The geo stamp merges into the stored facts: a field the lookup did
+/// not resolve keeps its stored value, a field it did resolve replaces
+/// it. The admin card renders the row, so a partial stamp (an ASN-only
+/// hit, as for the Cloudflare `104.16.0.0/12` block, whose City record
+/// decodes with an empty country) must not blank out a stored country.
+#[tokio::test]
+async fn a_partial_geo_stamp_keeps_the_stored_fields() {
+    let (_dir, pool) = temp_pool().await;
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
+                              geo_country, geo_city, geo_asn, created_at, updated_at)
+         VALUES ('fp-geo', 'vless', 'n', 'h.example.com', 443, 'uuid', 'unknown',
+                 'US', 'New York', NULL, 1, 1)
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    update_geo_full(
+        &pool,
+        id,
+        &GeoStamp {
+            country: None,
+            city: None,
+            asn: Some("AS13335".to_string()),
+        },
+        "104.16.0.1",
+    )
+    .await
+    .unwrap();
+
+    let row = get_by_id(&pool, id).await.unwrap().unwrap();
+    assert_eq!(row.geo_country.as_deref(), Some("US"));
+    assert_eq!(row.geo_city.as_deref(), Some("New York"));
+    assert_eq!(row.geo_asn.as_deref(), Some("AS13335"));
+    assert_eq!(row.resolved_ip.as_deref(), Some("104.16.0.1"));
+}
+
+/// A stamp that carries the fields refreshes them.
+#[tokio::test]
+async fn a_full_geo_stamp_refreshes_the_stored_fields() {
+    let (_dir, pool) = temp_pool().await;
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
+                              geo_country, geo_city, geo_asn, created_at, updated_at)
+         VALUES ('fp-geo-full', 'vless', 'n', 'h.example.com', 443, 'uuid', 'unknown',
+                 'US', 'New York', 'AS13335', 1, 1)
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    update_geo_full(
+        &pool,
+        id,
+        &GeoStamp {
+            country: Some("DE".to_string()),
+            city: Some("Frankfurt".to_string()),
+            asn: Some("AS24940".to_string()),
+        },
+        "1.2.3.4",
+    )
+    .await
+    .unwrap();
+
+    let row = get_by_id(&pool, id).await.unwrap().unwrap();
+    assert_eq!(row.geo_country.as_deref(), Some("DE"));
+    assert_eq!(row.geo_city.as_deref(), Some("Frankfurt"));
+    assert_eq!(row.geo_asn.as_deref(), Some("AS24940"));
 }

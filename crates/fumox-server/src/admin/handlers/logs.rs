@@ -44,27 +44,37 @@ impl FetchLogsTemplate {
 
     /// Preserve the current filters in pagination links.
     fn query_suffix(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if !self.f_result.is_empty() {
-            parts.push(format!("result={}", self.f_result));
-        }
-        if !self.f_class.is_empty() {
-            parts.push(format!("class={}", self.f_class));
-        }
-        if !self.f_source.is_empty() {
-            parts.push(format!(
-                "source={}",
-                percent_encoding::utf8_percent_encode(
-                    &self.f_source,
-                    percent_encoding::NON_ALPHANUMERIC
-                )
-            ));
-        }
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!("&{}", parts.join("&"))
-        }
+        filter_query_suffix(&self.f_result, &self.f_class, &self.f_source)
+    }
+}
+
+/// Add one filter to a query string: the value is percent-encoded, so a
+/// filter with a special character travels through the link without
+/// changing the meaning of the rest of it.
+fn push_param(parts: &mut Vec<String>, key: &str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    parts.push(format!(
+        "{key}={}",
+        percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC)
+    ));
+}
+
+/// The query that carries the current filters into the next page.
+///
+/// Every filter goes through [`push_param`]: the values come from the
+/// query string, so an unencoded one would let a crafted filter value
+/// change the pagination link's own parameters.
+fn filter_query_suffix(result: &str, class: &str, source: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    push_param(&mut parts, "result", result);
+    push_param(&mut parts, "class", class);
+    push_param(&mut parts, "source", source);
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("&{}", parts.join("&"))
     }
 }
 
@@ -137,4 +147,31 @@ pub async fn fetch_logs(
         },
         StatusCode::OK,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_query_suffix;
+
+    /// Every filter of the pagination link is percent-encoded: a value
+    /// with a special character cannot change the parameters of the link
+    /// it travels in.
+    #[test]
+    fn the_pagination_link_encodes_every_filter() {
+        // No filter: no suffix at all.
+        assert_eq!(filter_query_suffix("", "", ""), "");
+        // The ordinary case: the filters travel as they are.
+        assert_eq!(
+            filter_query_suffix("ok", "network", "src1"),
+            "&result=ok&class=network&source=src1"
+        );
+        // A value with a special character is encoded, not dropped and
+        // not pasted in raw.
+        assert_eq!(
+            filter_query_suffix("ok", "a&b=c", "src 1"),
+            "&result=ok&class=a%26b%3Dc&source=src%201"
+        );
+        // An empty filter is left out, the others still travel.
+        assert_eq!(filter_query_suffix("", "network", ""), "&class=network");
+    }
 }

@@ -1,19 +1,22 @@
 {% extends "base.html" %}
 
-{% block title %}{{ profile.name }}{% endblock %}
+{% block title %}{{ name }}{% endblock %}
 
 {% block content %}
 <div class="page-head">
-  <h1>{{ profile.name }}</h1>
+  <h1>{{ name }}</h1>
   {#- The badge and the toggle form are the same fragment templates the
       toggle action re-renders for its HTMX swap, so the initial markup and
-      every swap share one definition. -#}
-  {% include "profiles/_enabled_badge.html" %}
+      every swap share one definition. The badge sits in a wrapper that
+      the swap does not touch: a live region that is recreated with every
+      swap is never announced. -#}
+  <span id="enabled-badge" aria-live="polite" aria-atomic="true">{% include "profiles/_enabled_badge.html" %}</span>
+  <span id="toggle-error" class="error-text" role="alert" data-error-fallback="{{ self.t("common.action_failed") }}"></span>
   <span class="spacer"></span>
   <div class="row-actions">
-    <a class="btn" href="/admin/profiles/{{ profile.id }}/edit">{{ self.t("common.edit") }}</a>
+    <a class="btn" href="/admin/profiles/{{ profile_id }}/edit">{{ self.t("common.edit") }}</a>
     {% include "profiles/_toggle_form.html" %}
-    <button class="btn danger" type="button" aria-haspopup="dialog" aria-controls="delete-dialog" onclick="document.getElementById('delete-dialog').showModal()">{{ self.t("common.delete") }}</button>
+    <button class="btn danger" type="button" aria-haspopup="dialog" aria-controls="delete-dialog" data-dialog-open="delete-dialog">{{ self.t("common.delete") }}</button>
   </div>
 </div>
 
@@ -22,21 +25,21 @@
     <h2>{{ self.t("src.params_title") }}</h2>
     <table class="kv">
       <tr><th>Slug</th><td class="mono">
-        {% match profile.slug %}
+        {% match slug %}
           {% when Some with (slug) %}{{ slug }}
           {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
-      <tr><th>{{ self.t("prof.endpoint") }}</th><td class="mono small"><a href="{{ serve_url }}">{{ serve_url }}</a>
+      <tr><th>{{ self.t("prof.endpoint") }}</th><td class="mono small"><a href="{{ serve_url }}" rel="noreferrer noopener">{{ serve_url }}</a>
         {% if token_required %}
           <p class="muted small">{{ self.t("prof.token_required_note") }}</p>
         {% endif %}
       </td></tr>
       <tr><th>{{ self.t("prof.token_label") }}</th><td class="mono small">{{ token_display }}</td></tr>
-      <tr><th>{{ self.t("prof.output_format") }}</th><td class="mono small">{{ profile.output_format.as_str() }}</td></tr>
+      <tr><th>{{ self.t("prof.output_format") }}</th><td class="mono small">{{ output_format.as_str() }}</td></tr>
       <tr><th>{{ self.t("prof.countries_label") }}</th><td class="mono small">{{ countries_display }}</td></tr>
-      <tr><th>{{ self.t("common.created") }}</th><td class="small">{{ self.ts(profile.created_at) | safe }}</td></tr>
-      <tr><th>{{ self.t("common.updated") }}</th><td class="small">{{ self.ts(profile.updated_at) | safe }}</td></tr>
+      <tr><th>{{ self.t("common.created") }}</th><td class="small">{{ self.ts(created_at) | safe }}</td></tr>
+      <tr><th>{{ self.t("common.updated") }}</th><td class="small">{{ self.ts(updated_at) | safe }}</td></tr>
     </table>
 
     {% if !pipeline_display.is_empty() %}
@@ -100,14 +103,14 @@
 </div>
 
 <dialog id="delete-dialog" aria-labelledby="delete-dialog-title">
-  <h2 id="delete-dialog-title" class="visually-hidden">{{ self.t("prof.delete_confirm") }}</h2>
-  <form method="post" action="/admin/profiles/{{ profile.id }}/delete">
+  <h2 id="delete-dialog-title" class="visually-hidden" tabindex="-1">{{ self.t("prof.delete_confirm") }}</h2>
+  <form method="post" action="/admin/profiles/{{ profile_id }}/delete">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
-    <p>{{ self.t("prof.delete_confirm") }} <b>{{ profile.name }}</b>?</p>
+    <p>{{ self.t("prof.delete_confirm") }} <b>{{ name }}</b>?</p>
     <p class="muted small">{{ self.t("prof.delete_note_prefix") }} <span class="mono">{{ serve_path }}</span> {{ self.t("prof.delete_note_suffix") }}</p>
     <div class="form-actions">
       <button class="btn danger" type="submit">{{ self.t("common.delete") }}</button>
-      <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
+      <button class="btn" type="button" data-dialog-close>{{ self.t("common.cancel") }}</button>
     </div>
   </form>
 </dialog>

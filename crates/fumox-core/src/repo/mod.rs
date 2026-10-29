@@ -9,11 +9,13 @@ pub mod fetch_log;
 pub mod probe;
 pub mod profiles;
 pub mod proxies;
+pub mod retention;
 pub mod sources;
 
 use crate::db::DbPool;
 use sqlx::Sqlite;
 use sqlx::sqlite::SqliteArguments;
+use std::collections::HashMap;
 
 /// Dynamic WHERE-clause accumulator shared by the admin list filters of
 /// this module tree: the single copy of the "whitelist the fragment, bind
@@ -116,12 +118,48 @@ impl<'q, O> BindWhereFilter<'q> for sqlx::query::QueryScalar<'q, Sqlite, O, Sqli
 }
 
 /// Read a service key from `meta`.
-pub async fn meta_get(pool: &DbPool, key: &str) -> crate::Result<Option<String>> {
+///
+/// The executor is generic so the read can join a caller's transaction
+/// (the admin dashboard reads every key inside one snapshot) or run on
+/// the pool on its own.
+pub async fn meta_get<'e, E>(executor: E, key: &str) -> crate::Result<Option<String>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let row: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = ?")
         .bind(key)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
     Ok(row.map(|(value,)| value))
+}
+
+/// Read several service keys from `meta` in one query.
+///
+/// The admin panel reads the four probe stamps on every render; four
+/// round trips are four chances to queue behind a write, and none of
+/// them depends on another. A key without a row is simply absent from
+/// the map, so the caller tells "no record" from "no value" the same
+/// way it does with [`meta_get`].
+pub async fn meta_get_many<'e, E>(
+    executor: E,
+    keys: &[&str],
+) -> crate::Result<HashMap<String, String>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new("SELECT key, value FROM meta WHERE key IN (");
+    {
+        let mut separated = query.separated(", ");
+        for key in keys {
+            separated.push_bind(*key);
+        }
+        separated.push_unseparated(")");
+    }
+    let rows: Vec<(String, String)> = query.build_query_as().fetch_all(executor).await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Upsert a service key in `meta`.

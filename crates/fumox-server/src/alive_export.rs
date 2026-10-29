@@ -445,6 +445,14 @@ async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fu
             let rendered = render_tier(&state.pool, tier, state.export_max_rows).await?;
             Ok(state.caches.processed_put(&key, rendered).await)
         }
+        InlineClaim::Failed { .. } => {
+            // The export render never publishes a verdict (a failing
+            // export fails its own request instead), so this branch is
+            // unreachable today. It renders independently rather than
+            // answering with a verdict that belongs to another endpoint.
+            let rendered = render_tier(&state.pool, tier, state.export_max_rows).await?;
+            Ok(state.caches.processed_put(&key, rendered).await)
+        }
     }
 }
 
@@ -523,7 +531,9 @@ fn warn_truncation(tier: &str, cap: u32, total: i64) {
     static LAST_WARNING: LazyLock<Mutex<HashMap<String, Instant>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     let now = Instant::now();
-    let mut last = LAST_WARNING.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut last = LAST_WARNING
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     if let Some(previous) = last.get(tier)
         && now.duration_since(*previous) < Duration::from_secs(EXPORT_TTL_SECS as u64)
     {
@@ -909,7 +919,10 @@ mod tests {
     async fn a_truncated_export_states_what_it_left_out() {
         let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
             path: std::env::temp_dir()
-                .join(format!("fumox-alive-trunc-{}", fumox_core::models::new_id()))
+                .join(format!(
+                    "fumox-alive-trunc-{}",
+                    fumox_core::models::new_id()
+                ))
                 .join("test.db"),
             ..Default::default()
         })
@@ -945,7 +958,10 @@ mod tests {
     async fn corrupt_rows_are_skipped_and_reported_once() {
         let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
             path: std::env::temp_dir()
-                .join(format!("fumox-alive-corrupt-{}", fumox_core::models::new_id()))
+                .join(format!(
+                    "fumox-alive-corrupt-{}",
+                    fumox_core::models::new_id()
+                ))
                 .join("test.db"),
             ..Default::default()
         })
@@ -955,7 +971,10 @@ mod tests {
         seed_alive_tier(&pool, "srcG0000000", 2).await;
         // Two rows that cannot be turned into an entry: an unknown scheme
         // and a port that does not fit.
-        for (fingerprint, scheme, port) in [("fp-bad-1", "nosuchscheme", 443i64), ("fp-bad-2", "vless", 70000)] {
+        for (fingerprint, scheme, port) in [
+            ("fp-bad-1", "nosuchscheme", 443i64),
+            ("fp-bad-2", "vless", 70000),
+        ] {
             sqlx::query(
                 "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
                  VALUES (?1, ?2, 'n', 'bad.example.com', ?3, 'c', 'alive', 1, 1)",
@@ -1204,9 +1223,6 @@ mod tests {
         // The host that warned before comes back after its own quiet
         // window: it must not warn past the budget.
         let (warn, _) = log.should_warn("repeat.example", t1 + Duration::from_secs(1));
-        assert!(
-            !warn,
-            "a returning host must not spend the window's warns"
-        );
+        assert!(!warn, "a returning host must not spend the window's warns");
     }
 }

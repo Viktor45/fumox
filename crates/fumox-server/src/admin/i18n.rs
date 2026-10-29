@@ -8,15 +8,19 @@
 //!
 //! The shipped `ru`/`en` catalogs are also compiled into the binary as a
 //! fallback, so a bare binary without a locales directory still renders the
-//! panel. Files on disk override the embedded copy of the same language.
+//! panel. A file on disk overrides the embedded copy of the same language
+//! **key by key**: the embedded catalog is the base, the disk file wins for
+//! the keys it defines, and the keys it leaves out keep the embedded text.
+//! A partial file therefore translates only what it names instead of
+//! emptying the whole language.
 //!
 //! The UI language is stored in the plain `fumox_lang` cookie; the login
 //! screen (`?lang=` query parameter) and the topbar switcher
 //! (`/admin/set-lang`) set it. The default language is Russian when its
 //! catalog is loaded, otherwise the first available one.
 //!
-//! Templates access messages through `t("key")` and `lang_code()` helpers
-//! that the [`impl_i18n`] macro adds to every template struct carrying a
+//! Templates access messages through the `t` helper and `lang_code()` that
+//! the [`impl_i18n`] macro adds to every template struct carrying a
 //! `lang: Lang` field. Messages injected from Rust (toasts, validation,
 //! badges) are translated with [`Lang::t`] at the call site.
 
@@ -46,8 +50,9 @@ const LANG_NAME_KEY: &str = "lang.name";
 const PREFERRED_DEFAULT: &str = "ru";
 
 /// Every message catalog known to the server. Built once at startup from
-/// the embedded catalogs plus the `*.toml` files of the locales directory
-/// (disk wins over embedded for the same language code).
+/// the embedded catalogs plus the `*.toml` files of the locales directory.
+/// A disk file overlays the embedded catalog of the same language key by
+/// key (the disk text wins, the keys it omits keep the embedded text).
 pub struct Locales {
     catalogs: BTreeMap<String, Arc<HashMap<String, String>>>,
     default_code: String,
@@ -59,6 +64,13 @@ pub struct Locales {
 impl Locales {
     /// Load catalogs: embedded first, then every `<code>.toml` in `dir`.
     /// Unreadable or malformed files are logged and skipped.
+    ///
+    /// A disk file is merged **per key** onto the embedded catalog of the
+    /// same language: the file's text wins for the keys it defines, the
+    /// embedded text survives for the keys it omits. Before the merge a
+    /// file replaced the whole language, so a partial file (a single
+    /// translated phrase) emptied every other key of that language and
+    /// the panel fell back to echoing the raw keys.
     pub fn load(dir: &Path) -> Self {
         let mut catalogs: BTreeMap<String, Arc<HashMap<String, String>>> = BTreeMap::new();
         for (code, text) in EMBEDDED_LOCALES {
@@ -92,7 +104,8 @@ impl Locales {
                     {
                         Ok(messages) => {
                             tracing::info!(code = %code, path = %path.display(), "locale loaded");
-                            catalogs.insert(code, Arc::new(messages));
+                            let merged = merge_into_base(catalogs.get(&code), messages);
+                            catalogs.insert(code, Arc::new(merged));
                         }
                         Err(err) => {
                             tracing::error!(path = %path.display(), error = %err, "locale file skipped");
@@ -192,6 +205,25 @@ impl Locales {
     }
 }
 
+/// Overlay a disk catalog onto the built-in one of the same language.
+///
+/// The disk file wins per key; the keys it does not define keep the
+/// built-in text. `base` is `None` for a language the binary does not ship
+/// (a file that adds one): the file is then the whole catalog.
+fn merge_into_base(
+    base: Option<&Arc<HashMap<String, String>>>,
+    overlay: HashMap<String, String>,
+) -> HashMap<String, String> {
+    match base {
+        Some(base) => {
+            let mut merged = (**base).clone();
+            merged.extend(overlay);
+            merged
+        }
+        None => overlay,
+    }
+}
+
 /// Parse one TOML catalog document: flat `"domain.name" = "text"` pairs.
 fn parse_catalog(text: &str) -> Result<HashMap<String, String>, String> {
     let table: toml::Table = toml::from_str(text).map_err(|err| err.to_string())?;
@@ -270,9 +302,16 @@ pub fn lang_cookie(code: &str) -> String {
 /// warnings: which helpers a template actually calls is only known to
 /// askama.
 ///
+/// The macro covers the translation helpers only. The presentation helpers
+/// (status labels, proxy names, timestamps) live in
+/// [`crate::admin::presentation`] and are wired into the same structs by
+/// [`crate::admin::presentation::impl_presentation`], which this macro
+/// invokes.
+///
 /// Form templates that additionally carry an `errors: Vec<(String, String)>`
 /// field use the `impl_i18n!(Type, errors)` form, which adds `error_for`
-/// for the per-field validation messages.
+/// for the per-field validation messages and the ARIA attributes that
+/// bind a message to its control.
 macro_rules! impl_i18n {
     ($ty:ty, errors) => {
         impl_i18n!($ty);
@@ -284,6 +323,35 @@ macro_rules! impl_i18n {
                     .iter()
                     .find(|(f, _)| f == field)
                     .map(|(_, m)| m.as_str())
+            }
+
+            /// The ARIA attributes of a control whose field carries a
+            /// validation error: the message is referenced by id and the
+            /// control is marked invalid. Empty for a field without an
+            /// error, so a form that validated carries no ARIA noise.
+            ///
+            /// The field name is a literal of the template, never user
+            /// input, so the result is safe to render as raw markup.
+            #[allow(dead_code)]
+            fn error_attrs(&self, field: &str) -> String {
+                if self.error_for(field).is_some() {
+                    format!(" aria-describedby=\"err-{field}\" aria-invalid=\"true\"")
+                } else {
+                    String::new()
+                }
+            }
+
+            /// The ARIA attributes of a group of controls (a fieldset of
+            /// checkboxes): the message is referenced by id, but the group
+            /// as a whole is not marked invalid, since the offending
+            /// control inside it is not known.
+            #[allow(dead_code)]
+            fn describedby(&self, field: &str) -> String {
+                if self.error_for(field).is_some() {
+                    format!(" aria-describedby=\"err-{field}\"")
+                } else {
+                    String::new()
+                }
             }
         }
     };
@@ -305,47 +373,8 @@ macro_rules! impl_i18n {
             fn lang_code(&self) -> &str {
                 self.lang.code()
             }
-            /// Localized display label for a proxy status (e.g. *alive*),
-            /// so every status badge renders in the page language,
-            /// including htmx-swapped fragments. Unknown values fall
-            /// through to *unknown*, mirroring the template chains.
-            #[allow(dead_code)]
-            fn status_label(&self, status: &str) -> String {
-                let key = match status {
-                    "alive" => "common.status_alive",
-                    "ready" => "common.status_ready",
-                    "quarantine" => "common.status_quarantine",
-                    "removed" => "common.status_removed",
-                    _ => "common.status_unknown",
-                };
-                self.lang.t(key).to_string()
-            }
-            /// Display name of a proxy: the source-provided name, or the
-            /// server address when the source sent none, an empty name
-            /// would render an empty, unclickable-looking link. Whitespace
-            /// only counts as empty: it displays as nothing.
-            #[allow(dead_code)]
-            fn display_name(&self, name: &str, host: &str, port: &i64) -> String {
-                if name.trim().is_empty() {
-                    format!("{host}:{port}")
-                } else {
-                    name.to_string()
-                }
-            }
-            /// Render a Unix timestamp as a `<time class="ts">` element
-            /// (see [`crate::admin::handlers::fmt_ts_element`]); the
-            /// template emits it through `| safe`.
-            #[allow(dead_code)]
-            fn ts(&self, ts: &i64) -> String {
-                crate::admin::handlers::fmt_ts_element(*ts)
-            }
-            /// [`Self::ts`] for optional timestamps; `None` renders the en
-            /// dash used across the admin tables (plain text, no element).
-            #[allow(dead_code)]
-            fn opt_ts(&self, ts: &Option<i64>) -> String {
-                crate::admin::handlers::fmt_opt_ts_element(*ts)
-            }
         }
+        crate::admin::presentation::impl_presentation!($ty);
     };
 }
 pub(crate) use impl_i18n;
@@ -402,6 +431,16 @@ mod tests {
             "probe.rec_concurrency",
             "probe.factor_all_idle",
         ] {
+            for (code, catalog) in &catalogs {
+                let text = catalog
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{key} missing in {code}"));
+                assert_ne!(text, key, "{key} is untranslated in {code}");
+            }
+        }
+        // The same for the keys the Rust side looks up by value: a status
+        // badge renders through them.
+        for key in rust_side_keys() {
             for (code, catalog) in &catalogs {
                 let text = catalog
                     .get(key)
@@ -510,10 +549,13 @@ mod tests {
         assert!(locales.contains("en"));
         assert!(!locales.contains("broken"));
         assert_eq!(locales.resolve("de").t("nav.dashboard"), "Armaturenbrett");
-        // The disk file replaced the embedded English catalog entirely…
+        // The disk file wins for the key it defines…
         assert_eq!(locales.resolve("en").t("nav.dashboard"), "Dashboard!");
-        // …so keys it does not define echo themselves.
-        assert_eq!(locales.resolve("en").t("nav.logout"), "nav.logout");
+        // …and the keys it leaves out keep the embedded text: the merge is
+        // per key, so a partial file does not empty the language.
+        assert_eq!(locales.resolve("en").t("nav.logout"), "Log out");
+        // A language the binary does not ship is the file alone.
+        assert_eq!(locales.resolve("de").t("nav.logout"), "nav.logout");
         // Switcher labels come from each catalog's lang.name.
         let choices = locales.choices();
         assert!(choices.contains(&("de".to_string(), "Deutsch".to_string())));
@@ -538,15 +580,60 @@ mod tests {
 
     /// Every key referenced by a template must exist in every embedded
     /// catalog, so a typo surfaces in CI instead of rendering as a raw key.
+    ///
+    /// The keys the Rust side assembles at runtime (a status label built
+    /// from a value) are invisible to the template scan: they are listed
+    /// in [`crate::admin::presentation::STATUS_KEYS`] and checked here.
     #[test]
     fn every_template_key_exists_in_the_catalog() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
         let catalogs = embedded_catalogs();
         let mut missing: Vec<String> = Vec::new();
         visit_templates(&dir, &catalogs, &mut missing);
+        for key in rust_side_keys() {
+            for (code, catalog) in &catalogs {
+                if !catalog.contains_key(key) {
+                    missing.push(format!("{key} ({code})"));
+                }
+            }
+        }
         assert!(
             missing.is_empty(),
             "unknown i18n keys in templates: {missing:?}"
+        );
+    }
+
+    /// The keys the Rust code looks up by value rather than by a literal
+    /// argument: the status labels of the proxy badges.
+    fn rust_side_keys() -> Vec<&'static str> {
+        crate::admin::presentation::STATUS_KEYS
+            .iter()
+            .map(|(_, key)| *key)
+            .chain(std::iter::once(
+                crate::admin::presentation::UNKNOWN_STATUS_KEY,
+            ))
+            .collect()
+    }
+
+    /// The same check for the keys the Rust code resolves itself
+    /// (`lang.t("…")`): a typo in a toast or a validation message is
+    /// invisible to the template scan, and the key echoes itself on the
+    /// screen.
+    #[test]
+    fn every_rust_side_key_exists_in_the_catalog() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let catalogs = embedded_catalogs();
+        let mut missing: Vec<String> = Vec::new();
+        let found = visit_rust_sources(&dir, &catalogs, &mut missing);
+        assert!(
+            missing.is_empty(),
+            "unknown i18n keys in the Rust sources: {missing:?}"
+        );
+        // A scan that matches nothing would pass forever: the sources
+        // hold well over a hundred key lookups.
+        assert!(
+            found > 100,
+            "the Rust scan found {found} keys, the regex no longer fits the sources"
         );
     }
 
@@ -561,6 +648,9 @@ mod tests {
             r#"{{ self.t("nav.dashboard") }}"#,
             r#"{{ self.t_args("probe.recs_head", &[]) }}"#,
             r#"{{ self.t_named("set.editing_path", &[]) }}"#,
+            // Spaces around the argument and a key with a dash and an
+            // uppercase letter: the scan has to see both.
+            r#"{{ self.t( "probe.rec-Sample" ) }}"#,
         );
         let keys: Vec<String> = TEMPLATE_KEY_RE
             .captures_iter(template)
@@ -568,7 +658,12 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            ["nav.dashboard", "probe.recs_head", "set.editing_path"]
+            [
+                "nav.dashboard",
+                "probe.recs_head",
+                "set.editing_path",
+                "probe.rec-Sample"
+            ]
         );
 
         let full: HashMap<String, String> =
@@ -632,10 +727,55 @@ mod tests {
         }
     }
 
+    /// The Rust sources, with their test modules cut off: a test may use a
+    /// throwaway key on purpose, and the shipped code must not. Returns
+    /// the number of key lookups the scan saw.
+    fn visit_rust_sources(
+        dir: &std::path::Path,
+        catalogs: &[(String, HashMap<String, String>)],
+        missing: &mut Vec<String>,
+    ) -> usize {
+        let mut found = 0;
+        for entry in std::fs::read_dir(dir).expect("src dir readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                found += visit_rust_sources(&path, catalogs, missing);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).expect("source readable");
+                let text = without_test_module(&text);
+                found += TEMPLATE_KEY_RE.captures_iter(text).count();
+                missing.extend(
+                    missing_keys(text, catalogs)
+                        .into_iter()
+                        .map(|entry| format!("{}: {entry}", path.display())),
+                );
+            }
+        }
+        found
+    }
+
+    /// The part of a source file that ships: everything before its
+    /// `#[cfg(test)] mod …` block.
+    fn without_test_module(text: &str) -> &str {
+        match text.find("\n#[cfg(test)]\nmod ") {
+            Some(idx) => &text[..idx],
+            None => text,
+        }
+    }
+
     /// The `\b` is load-bearing: without it any helper whose name ends in `t`
     /// (`self.range_text("…")`) is read as a catalog lookup for the wrong key.
+    ///
+    /// The character class covers the characters a key may hold (a dot
+    /// separates the domains, a dash and an uppercase letter are allowed so
+    /// a hand-written key is not silently skipped), and the spaces between
+    /// the parenthesis and the argument keep a call written as
+    /// `t( "key" )` in the scan. The scan stops at the closing quote: the
+    /// helpers that take arguments (`t_args`, `t_named`) carry a comma
+    /// there, not a parenthesis.
     static TEMPLATE_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"\b(?:t_args|t_named|t)\("([a-z0-9_.]+)""#).expect("valid regex")
+        regex::Regex::new(r#"\b(?:t_args|t_named|t)\(\s*"([a-zA-Z0-9_.\-]+)""#)
+            .expect("valid regex")
     });
 
     /// A form template as the macro consumers shape them: `lang` plus an

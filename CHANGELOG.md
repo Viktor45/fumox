@@ -439,6 +439,314 @@ Changes in the working tree, not yet on a published image.
   not reset the window either: the failures that filled it stay counted,
   so a correct guess between two wrong ones does not hand an attacker a
   fresh window.
+- The dashboard's per-source table follows the status machine order:
+  unknown, alive, ready, quarantine, removed, so a fresh row starts
+  the table instead of sitting between the quarantine and removed
+  counts. "Oldest alive" became "Oldest ready" (the age of the oldest
+  tunnel-verified proxy of the source, measured from `created_at`
+  like the column it replaces), and the "Protocols" and "Countries"
+  columns are gone: a bare count of distinct values read poorly, and
+  the protocol and country split panels below already carry the
+  breakdown.
+- The pipeline builder is three tabs instead of one column of seven
+  sections. The sections are grouped in the order the pipeline runs:
+  *Input* (protocol filter), *Rules* (renaming and discarding, the lists
+  that grow) and *Output* (health, geo, sorting, limit). Each tab states
+  in one line what it is for, and *Output* lays its four sections out
+  two-up on a wide screen. The tabs are CSS-only like the settings
+  editor (hidden radios drive the panes, no JavaScript). One component
+  renders both the source and the profile form, so both get the layout,
+  and the profile keeps its tri-state controls on renaming and
+  discarding.
+- Rule lists are capped in height and carry a live count. Ten discard
+  rules used to push the add button, the second list and the preview a
+  screen down; the list now scrolls inside its pane and a counter beside
+  each heading shows how many rules it holds. The count is recomputed
+  after every HTMX settle, and blank lines do not count: the rename
+  editor deliberately keeps one empty line as a place to start typing,
+  and an empty line emits no rule.
+- The dashboard stat cards lost their per-metric colour stripe. It read
+  as a status signal and it lied: green under "checks in 24h" over a
+  0/12, amber under a healthy median latency. Status colour belongs to
+  the badges, which mark a real state, and the cards now match every
+  other panel.
+- `/export/alive/{token}` and `/export/ready/{token}` re-read and
+  re-serialized the whole tier on every download. Both now render at
+  most once per 30 s (`EXPORT_TTL_SECS`) and are served from the
+  shared processed cache in between, like `/sub` and `/src`; the
+  entries carry no source id, so per-source invalidation never
+  touches them. The exports have no source TTL to inherit and no
+  invalidation trigger (the probe owns the tiers), so the window is
+  fixed and short, and an expired entry is re-rendered inline rather
+  than served stale: a download is a snapshot by definition, and a
+  quietly outdated one is worse than a slow request. A tier can
+  therefore lag a status change by up to 30 s.
+- The two export links are now capped at 50 000 rows, and the cap is
+  a setting rather than a constant: `[server].export_max_rows`
+  (`FUMOX_SERVER__EXPORT_MAX_ROWS`), defaulting to the number the
+  hard-coded `EXPORT_MAX_ROWS` used, so a deployment that never sets
+  it changes nothing and a bigger tier can be shipped whole. The
+  window above bounds the *rate* of rendering; nothing bounded the
+  *size*. Unlike `/sub` and `/src`, which a profile's `limit.count` and
+  a source's pipeline cap already bound, these two have no upstream
+  cap, so one download on a public cacheable URL meant an unbounded
+  `fetch_all`, an unbounded serialization and an unbounded body. The
+  cap is a `LIMIT ?` in the backing query (`list_alive` /
+  `list_ready`), not a post-read truncate, and it truncates the stable
+  id order (lowest ids first), so two renders of the same tier agree.
+  The `nodes count` header reports what the body really carries, so a
+  truncated download documents itself; the admin badge (`count_alive` /
+  `count_ready`) stays uncapped on purpose, so the operator can still
+  see that the export is smaller than the tier. The cap is applied
+  after the host and token gates: a rejected request cannot tell a
+  capped render from a full one, and costs no query. Guarded by
+  `export_body_is_capped_in_sql`,
+  `cap_is_applied_after_the_host_and_token_gates`,
+  `export_cap_follows_the_configured_setting` and
+  `server_export_max_rows_is_configurable`.
+- Ingest resolves geo facts concurrently instead of one await per
+  entry. Every unseen host costs up to `[geo].dns_timeout` (5 s by
+  default) when DNS hangs, so a feed of dead hosts cost the sum of
+  them. Lookups now overlap under a cap of 32 in flight
+  (`GEO_LOOKUP_CONCURRENCY`), keeping the input order the drop rules
+  and the reconcile upsert rely on (`buffered`, not
+  `buffer_unordered`).
+- The shipped `config/app.toml` no longer enables
+  `[probe].allow_private_targets`. The probe dials targets carried
+  by *feeds*, untrusted input, so the example now ships the same
+  `false` the built-in default uses, with the comment rewritten to
+  say what the flag actually disables (loopback / RFC1918 /
+  link-local / CGNAT) and that `true` is an explicit opt-in for
+  isolated test infrastructure. The Compose probe service passes
+  the variable explicitly
+  (`FUMOX_PROBE__ALLOW_PRIVATE_TARGETS`, default `false`, so the
+  environment outranks a hand-edited file the way every other key
+  does) and `.env.example` documents it.
+- `migration 0008` adds `idx_proxies_updated_at`, covering the
+  admin proxies list's default `ORDER BY p.updated_at DESC, p.id
+  DESC` (the id tiebreaker is part of the index, it is part of the
+  order). Without it every page of the list, and the matching
+  `COUNT`, walked the whole table.
+- The minimum supported Rust toolchain is **1.98** (up from 1.94).
+  `Cargo.toml`'s `rust-version` stays a floor, not a lock: CI builds
+  on current stable, and 1.98 is the oldest toolchain the workspace
+  must keep building on.
+- The import answers with a redirect and a toast instead of a summary
+  page. A successful import ends on `/admin/import` with the totals in
+  the flash message (how many sources and profiles were created, and
+  how many warnings the file produced), the way the other admin
+  actions report themselves. Every warning is logged as it happens,
+  one line each, so a file with a dozen slug collisions does not turn
+  the screen into a wall of text.
+- The import page states the limits it enforces. At most 500 rows per
+  table and a document of at most 256 KiB are accepted, and both
+  numbers are shown next to the upload control and next to the export
+  button. The document cap is smaller than the transport limit on
+  purpose: the payload travels urlencoded, where every byte may cost
+  three, so 256 KiB of JSON still fits the 1 MiB the panel accepts.
+- The export says when its own file cannot be imported back. A
+  deployment with more than 500 sources or profiles, or with a
+  configuration that serializes past 256 KiB, produced a file the
+  import screen refused. The export names the limit it exceeds in the
+  file itself (an `import_limit` field), logs a warning about it and
+  shows the limits next to the export button, so the operator learns
+  it at the download and not at the upload.
+- The alive/ready export links on the import screen degrade instead of
+  failing. A counter or a capability token that could not be read
+  replaced the whole page with an error page, losing the import form
+  itself. The block is hidden now and the reason goes to the log, so
+  the screen stays usable.
+- The import vets the URLs of the file with the policy of the
+  deployment. The private-address rule was hard-coded, so a deployment
+  that deliberately allows private URLs (isolated infrastructure) could
+  not import a source pointing at one, and one that does not allow
+  them got the check on a different code path than the source form.
+  The import follows `[admin].allow_private_urls` now, like the form
+  does.
+- The public subscription says what it could not deliver. An output
+  format that cannot express an entry (a protocol with no counterpart
+  in the target format) is served with the warning
+  `X-Fumox-Warning: incompatible-entries-skipped` and the number of
+  the skipped entries in `X-Fumox-Skipped`. A Clash document carries
+  the same count as a `# skipped: N (unsupported scheme)` comment, so a
+  file copied out of the browser still shows the loss. The warning
+  header may carry several values at once now, comma-separated
+  (`parse-error, incompatible-entries-skipped`).
+- The single-source endpoint reports the "everything is hidden" verdict
+  too: a source whose proxies are all quarantined or removed is served
+  with `X-Fumox-Warning: all-proxies-quarantined`, instead of an empty
+  list that reads like an empty feed.
+- The graceful shutdown is bounded now. Both listeners stop accepting
+  on SIGTERM/SIGINT and drain what they have for at most 10 seconds; a
+  drain that runs over the deadline is abandoned with a warning and
+  the open connections are dropped. The admin panel's SSE stream and a
+  slow export download never end on their own, so the wait could hold
+  the process forever, and the supervisor's kill skipped the drain and
+  the shutdown log behind it.
+- The health probe follows the configured bind address. `--health-check`
+  probed `127.0.0.1` with the configured port, so an instance bound to
+  another address (or to the IPv6 wildcard) was probed on a socket it
+  does not listen on. The probe uses the bound address itself now, and
+  the loopback only for a wildcard: `127.0.0.1` for `0.0.0.0`, `::1`
+  for `::`.
+- A render that wedges no longer holds the cache claim forever. The
+  background re-render has the same 30-second deadline as the inline
+  one, and the verdict of a failed render is remembered for the waiters
+  behind it, so a burst of clients on a failing key costs one attempt
+  instead of one per client.
+- The export links in the admin panel state that both links carry the
+  same token: one secret opens the alive and the ready tier, and a
+  rotation revokes both links at once. The panel's hint says it in both
+  languages.
+- The dashboard reads one snapshot. The per-status counters were one
+  query per status, and the screen mixed them with the lists, so a
+  proxy that changed status between two reads made the totals disagree
+  with the table below them. The counters are one grouped query now,
+  and the whole screen is read in a single transaction, so the numbers
+  and the lists describe the same moment. Guarded by
+  `dashboard_aggregates_stats_and_leads_with_source_errors`.
+- The latency aggregates cover the live pool the panel shows. The
+  averages counted every proxy that had a latency, the quarantined and
+  the removed ones included, while the "top alive" list showed only the
+  `alive` and `ready` rows. Both read the same predicate now
+  (`status IN ('alive', 'ready') AND latency_ms IS NOT NULL`), so a
+  slow dead node cannot drag the median of a healthy tier down.
+- A source URL with a password shows the password masked. The address
+  `https://user:pass@host/sub` was printed in full in the list, on the
+  card and in the edit form, and the mask that hid the same secret in
+  the headers was accepted back as a submitted value. The URL is masked
+  on every screen now, the stored address keeps the password (the
+  fetcher needs it), and a mask is only accepted back under the key it
+  was rendered for: under any other key, or when two keys share it,
+  the form asks for the value again. Guarded by
+  `the_url_password_is_masked`,
+  `the_stored_password_comes_back_under_the_mask` and
+  `a_shared_mask_under_a_new_key_is_reported`.
+- A profile's access token is a password field now. The token guards a
+  public endpoint, so the form renders it with `type="password"` and
+  `autocomplete="new-password"`: the secret is not in the DOM in clear
+  text, and the browser does not offer a stored password for it. The
+  field carries the placeholder and never the value, so an unchanged
+  placeholder keeps the stored token and a typed token replaces it. The
+  panel also refuses a token shorter than 16 characters now, the same
+  floor the import path applies, and the endpoint link got
+  `rel="noreferrer noopener"`.
+- The profile access token has a floor of 16 characters. The import
+  path already refused a shorter one and the form did not, so the two
+  paths disagreed about the same rule; a token guards a public endpoint
+  and must not be guessable. Guarded by
+  `a_short_typed_token_is_refused_like_in_the_import_path`.
+- A profile and its composition are written in one transaction. The row
+  was written first and the links second, so a failure in between left
+  a profile that belonged to no source. Both are one write now
+  (`upsert_with_sources`), and the profile cache is invalidated right
+  after a successful update, before the response goes out: the public
+  output used to keep the old composition until the cached entry
+  expired. Guarded by `the_public_output_follows_the_profile_writes`.
+- The profile toggle is a targeted update. It rewrote the whole row
+  with the values the form happened to hold, so a change made
+  elsewhere in the meantime was silently reverted. It is now
+  `UPDATE ... SET enabled = NOT enabled` on the one column the action
+  owns.
+- Changing a profile's slug warns. The old `/sub/{slug}` stops working
+  the moment the slug changes, and the panel said nothing about it. The
+  change is reported in a toast that names the old and the new address.
+- The proxy card refreshes the geo facts in the background. Opening a
+  card for a host whose country was unknown paid a DNS timeout on the
+  response path, so a dead host made the panel wait. The stored values
+  are rendered right away and the refresh runs as a background task; the
+  new facts show up on the next open of the card.
+- The purge of the removed proxies runs in batches. It deleted every
+  row in one statement, holding the WAL write lock for the whole set
+  and blocking the writers for as long as it took. The rows are deleted
+  in batches now with the lock released in between, and the total is
+  accumulated into the counter the panel reports. The event also
+  carries the peer the purge came from, so an action that removed
+  thousands of rows leaves a trace of who asked.
+- Deleting a source retires only the proxies that source fed, and only
+  under the strict policy. The orphan sweep was global: deleting one
+  source marked the proxies of every other source as removed. The sweep
+  is scoped to the links of the deleted source now, and the conservative
+  policy (`[ingest].drop_gate = false`) leaves the detached proxies
+  alone: a `ready` proxy is tunnel-verified and an `unknown` one has
+  not had its first verdict yet, so the probe stays the only authority
+  over their lifecycle. Guarded by
+  `mark_source_orphans_removed_protects_listed_statuses`.
+- The log filters are encoded in the pagination links. The result and
+  the error class were interpolated into the query string raw, so a
+  value with an `&` or a `#` broke the link and could smuggle a
+  parameter into the next page. Every filter goes through one
+  percent-encoding helper now. Guarded by
+  `the_pagination_link_encodes_every_filter`.
+- A pipeline `remove` that does not parse changes nothing. An
+  unparsable index read as "no remove at all", so the row request
+  appended a fresh empty line instead of leaving the rules as they
+  were. A broken `remove` is a broken request now: the rows stay as
+  they are. Guarded by `a_broken_remove_changes_nothing` and
+  `a_broken_remove_in_the_drop_section_changes_nothing`.
+- The probe cycle model moved into `fumox-core`, next to the heartbeat
+  contract it is derived from. The dashboard estimated the drain time
+  from a formula that lived in the handler and could drift from the one
+  the daemon actually runs; the estimate and the cycle are computed by
+  the same code now.
+- The probe screen reads its metadata through one helper. Four
+  separate lookups with their own error handling meant a single
+  unreadable record turned the whole panel into an error page, and an
+  unreadable heartbeat was indistinguishable from a missing one. The
+  reads are collected into one pass now, and a record that cannot be
+  parsed is reported as such instead of being read as "no record".
+- The proxy status filter has one source of truth. The list of the
+  statuses the filter accepts, the list of all statuses and the badge
+  that names the status were three separate lists that could drift.
+  They are derived from one table now, and a rejected status value is
+  logged instead of silently dropped.
+- The scheduler takes its retention windows from the entry point. The
+  windows were derived from the command line inside the scheduler
+  itself, so a server started without the argument the probe daemon
+  expects swept the journals on a different cadence than the
+  configuration asked for. The parsed configuration is handed over
+  now, and the argument parsing lives at the entry point alone.
+- The journal retention sweep is one routine in `fumox-core`. The
+  server and the probe daemon each carried their own copy of the
+  cut-off arithmetic and the purge order, and they could drift: a
+  zero-day window is clamped to one day in both now, and the purge
+  order is asserted by one test instead of two. Both call
+  `repo::retention::sweep_shared_journals`, so the clamp and the
+  order live in one place.
+- The pipeline editor and the pipeline engine describe the same
+  contract. The editor accepted a form the engine read differently —
+  a trimmed rule text, a mistyped sort key, an unchecked checkbox read
+  as "on" — so the preview could disagree with what the saved
+  pipeline actually did. The editor reports the problems it finds in
+  the field they came from, and a configuration the builder cannot
+  represent is shown as raw JSON instead of being silently rewritten.
+- The admin panel's script is a file. The inline bootstrap of
+  `base.html` moved to `/admin/static/app.js` and every handler is
+  delegated from there, so the content-security policy allows scripts
+  from the origin only: no inline script and no inline event handler
+  (`script-src 'self'`). Inline styles stay for now, the templates
+  still carry a `<noscript>` block and a few style attributes. The
+  panel works with JavaScript disabled as before; the file is what
+  makes the policy a second barrier instead of a note.
+- A locale file on disk overlays the built-in catalog **key by key**.
+  Before, a file replaced the whole language: a partial translation
+  (a single translated phrase) emptied every other key of that
+  language, and the panel fell back to echoing the raw keys. The
+  built-in catalog is the base now, the file wins for the keys it
+  defines, and the keys it leaves out keep the built-in text. A file
+  for a language the binary does not ship is the whole catalog, as
+  before.
+- The toast of a plain-browser action no longer rides on the redirect
+  URL. The message used to travel as a `flash` query parameter, which
+  put it into the address bar, the browser history and every copied
+  link — and a crafted link could show a message of the attacker's
+  choosing. It waits in the server-side session now, keyed by the
+  session cookie, and is handed out once: a refresh or a copied link
+  does not replay it, and a crafted link cannot add one.
+- The refresh status says what a running refresh is doing. The card
+  shows the seconds the refresh has been running and what it may cost
+  (the wall-clock budget and the number of attempts), so a stalled
+  refresh reads as stalled instead of as a spinner that never ends.
 
 ### Fixed
 
@@ -1441,7 +1749,10 @@ Changes in the working tree, not yet on a published image.
   real `0`, so a 25-row queue read "25× the per-cycle sample" above a
   "sample 0/cycle". Both triggers now stay off at zero: there is no
   sample to measure against, and the `all_idle` line already reports
-  the state with the numbers an operator can act on. Guarded by
+  the state with the numbers an operator can act on. The config bounds
+  table starts the sample at 1 and refuses the file at startup
+  otherwise, so the zero branch is now a guard rather than a state an
+  operator can reach. Guarded by
   `sample_size_zero_reports_idleness_not_a_ratio_over_zero`.
 - The banner's `cycle_interval_secs` recommendation could ask for a
   cycle faster than the daemon's own heartbeat floor. The period is
@@ -1924,6 +2235,192 @@ Changes in the working tree, not yet on a published image.
   carrying the raw parser message. Both are refused with `422` and a
   localized message now, and nothing is written. A document past the
   256 KiB cap is refused the same way, before it is parsed at all.
+- The `Authorization` header of a protected profile accepted only the
+  exact spelling `Bearer`. The scheme is compared case-insensitively
+  now (RFC 7235 makes the scheme case-insensitive, and clients spell it
+  `bearer` as often as `Bearer`), so `bearer <token>` opens the profile.
+  Another scheme is not a bearer token at all: `Basic <token>` is
+  refused like a missing token. The token itself is still compared
+  verbatim against the stored hash.
+- The failed-access-token log could be out-warned. A client that came
+  back after its own window elapsed was warned again without spending
+  the per-window budget, so a small set of rotating clients could flood
+  the log past the budget the limiter enforces. The budget covers every
+  warning of the window now, not only the ones issued to a client seen
+  for the first time.
+- A render logged one line per corrupt proxy row. The skipped rows are
+  counted and reported in one line per render now (the count, the first
+  row and the first reason), so a feed full of broken rows cannot
+  flood the log.
+- The upstream status of a broken source was substituted with a guess.
+  When the real status is unknown (the fetch log could not be read, or
+  the last attempt recorded no HTTP status), the substituted `502` goes
+  to the log with the reason, so an operator reading the log sees why
+  the answer is 502 and not 404.
+- A failed read of the source list renders a server error. The profile
+  form replaced it with an empty checklist, which reads as "there are
+  no sources" and invites the operator to save a profile that composes
+  nothing.
+- The source edit form reads the stored row once. It read it twice and
+  swallowed the second failure, so a row that could not be read left
+  the form showing empty timestamps instead of an error.
+- The admin write path does not own the fetcher's columns. Saving a
+  source rewrote `last_fetched_at`, `last_error` and `error_class`
+  with the values the form held, which were empty. The edit form writes
+  the admin columns only, and the toggle is a targeted update, so a
+  fetch that lands during the edit is not erased by it. Guarded by
+  `set_enabled_flips_the_flag_without_rewriting_the_row`.
+- A duplicate header key in the source form is a field error. The
+  second value silently overwrote the first.
+- A source deletion that cannot flag the orphans says so. The failure
+  went to the log only, so the panel reported a clean delete while the
+  proxies it fed were left in an unknown state. The warning toast
+  names it now.
+- The "refresh now" action answers with the real status fragment and
+  `202 Accepted`. The state was rendered from a formatted string
+  instead of the fragment the other actions use, so the busy state and
+  the final verdict were assembled in two different places.
+- A source lookup tells "not found" from "the database said no". Both
+  answered with the same empty page, so a failing database looked like
+  a deleted source.
+- The probe backlog estimate cannot overflow. The retirement rate was
+  multiplied by the check period without a saturating multiply, so a
+  large rate and a large period wrapped around and reported a drain
+  time of seconds.
+- A quarantine queue that is not being drained is a warning. The panel
+  reported "all idle" for a daemon whose sampling is disabled while
+  its queue is non-empty, which is the opposite of what the operator
+  needs to see.
+- The pipeline editor read an unbounded number of rule rows from the
+  form. A submission carrying thousands of `ped_rename_<i>_` fields
+  was parsed row by row, so a programmatic client could make the panel
+  spend its memory on the rows it was going to drop anyway. The cap is
+  256 rows per section now; the limit is unreachable from the UI.
+  Guarded by `from_form_caps_the_number_of_rows_per_section`.
+- The pipeline editor trimmed the rule text it read. A regular
+  expression or a replacement string that starts or ends with a space
+  lost it, so the rule the operator typed was not the rule the
+  pipeline ran. The rule fields (match, replace, flags, key, ASNs) and
+  the geo template are read verbatim now; only the scalar fields (the
+  target, the cap) are trimmed. A whitespace-only pattern survives in
+  raw mode as well, where it is a legitimate pattern.
+  Guarded by `from_form_keeps_the_rule_text_verbatim` and
+  `ingest_keeps_a_whitespace_only_pattern_in_raw_mode`.
+- The ASN fields of the pipeline editor accepted a list of separators
+  as if it were an allowlist. A field holding only commas and spaces
+  parsed into an empty list, and an empty list dropped every proxy
+  that carries an ASN. The field means "no ASN list" when nothing
+  survives the split now, and the drop branch goes through the same
+  helper the other branches use.
+  Guarded by `an_asn_field_of_separators_is_not_an_allowlist`.
+- A mistyped sort key or cap was dropped instead of reported. The
+  editor fell back to the default, so the operator saw a working
+  pipeline that ignored the key they had chosen. The raw value is kept
+  now and the validation names the field it came from.
+  Guarded by `an_unknown_sort_key_is_reported_and_kept` and
+  `a_mistyped_cap_is_reported_from_the_field`.
+- The checkboxes of the pipeline editor read an absent field as "on".
+  A form that does not send the field at all — a programmatic client,
+  a browser that skipped it — turned the built-in default off. The
+  switches are tri-state now: absent means "keep the default", and an
+  unchecked box submits its own "off". Guarded by
+  `the_built_in_default_switches_are_tri_state`.
+- A profile pipeline of `null` overrode the pipeline it was supposed
+  to extend. The null was read as "no pipeline", so the profile
+  replaced the source pipeline with nothing. A null profile pipeline
+  overrides nothing now. Guarded by
+  `a_null_profile_pipeline_overrides_nothing`.
+- The pipeline resolved the ASN of a proxy on every request, even when
+  no ASN rule was in play. The resolver was called for a pipeline that
+  never looks at an ASN, so a request spent a database lookup it did
+  not need. The lookup happens only when a rule filters on an ASN; the
+  missing ASNs are filled on the ingest side and by the backfill.
+  Guarded by `a_pipeline_without_an_asn_rule_resolves_no_asn` and
+  `a_proxy_without_a_stored_asn_still_honours_the_exclude_list`.
+- The insecure-parameter filter ran before the rename rules. A proxy
+  whose insecure parameter was rewritten by a rename rule was dropped
+  anyway, so the filter judged the parameters before the pipeline had
+  finished with them. The filter runs after the renames now and sees
+  the final parameters. Guarded by
+  `the_insecure_filter_sees_the_renamed_parameters` and
+  `a_stored_insecure_proxy_is_dropped_even_when_a_rename_rewrites_it`.
+- A broken rename rule logged one line per proxy it skipped. A feed of
+  a thousand proxies with an unparsable pattern filled the log with a
+  thousand lines. The skips are counted per rule and reported in one
+  WARN line per rule now (the rule index, the target, the count and a
+  truncated sample of the value); the per-entry event stays at TRACE.
+  Guarded by `a_broken_rename_rule_warns_once_per_rule`.
+- The scheduler could not tell "no history" from "the history could
+  not be read". A read error fell back to the TTL cadence, so a source
+  whose journal was unreadable was fetched on every sweep. The source
+  is held back now and the failure is logged. Guarded by
+  `an_unreadable_history_holds_the_source_back_and_is_logged` and
+  `the_history_is_read_only_for_the_sources_that_pass_the_ttl_check`.
+- The retention sweep of the server ran inside the scheduler loop. A
+  sweep that took longer than the tick blocked the source refreshes
+  behind it. The sweep runs detached now, behind its own overlap
+  guard, like the source sweep and the geo backfill.
+- A tick that arrives while a background pass is still running was
+  skipped silently. The skip is counted and reported at WARN now, so
+  an operator sees that the loop is not keeping up with its own
+  cadence. Guarded by `an_overlapping_pass_is_skipped_and_counted`.
+- A source fetch could hold a concurrency permit forever. A hung
+  upstream kept the permit and the in-flight mark, and the scheduler
+  lost one of its slots until the process was restarted. The ingest
+  runs under a budget derived from the fetch timeouts now; an attempt
+  that exceeds it is abandoned, the permit and the mark are released
+  and the failure is published to the admin panel. Guarded by
+  `an_ingest_that_exceeds_its_budget_is_abandoned`.
+- A background task that panicked took its failure with it. The
+  scheduled sweep, the retention sweep, the geo backfill and the
+  manual refresh now report a panic as a failed fetch instead of
+  leaving the panel waiting for an answer that never comes.
+- The proxy card showed the secret parts in full. The credential, the
+  password in the proxy line and the values of the credential-bearing
+  parameters were rendered as stored, so a screen (a shared screen, a
+  screenshot in a ticket, a shoulder surfer) carried the working
+  secret. They are masked now — `user:sec…••••` for a credential,
+  `[redacted]` for a secret parameter value — and the card says that
+  the value is a secret and never reaches the log.
+- The sources screens showed the secret parts of a URL. A source whose
+  address carries a password (`https://user:pass@host/sub`) or a
+  secret query value (`?token=…`) showed it on the list, on the card
+  and in the edit form. The password and the secret query values are
+  masked now, the safe part of the address is printed as it is, and
+  the stored values are put back where the mask was when the form is
+  saved unchanged — the fetcher still gets the real address, and an
+  edit of the name cannot silently drop the token.
+- The export-token rotation was confirmed by a JavaScript dialog. The
+  dialog was the only thing standing between the operator and the loss
+  of both export links, and it did not work without JavaScript. The
+  rotation has a page of its own now: it names both links that stop
+  working, states that the old token cannot be recovered, and the
+  confirmation is an ordinary form post.
+- A refused form did not say which field was wrong. The message was
+  rendered, but it had no id, the control did not point at it and it
+  was not marked invalid, so a screen reader read the text without
+  saying which input it belonged to. The message carries an id now,
+  the control points at it (`aria-describedby`) and is marked invalid
+  (`aria-invalid`), and the message itself is announced
+  (`role="alert"`).
+- A refused settings save opened the wrong tab. The message was
+  rendered on the field it belongs to, but the editor's panes are
+  tabs, and the pane holding the error was usually not the open one —
+  the operator was shown a form that looked fine. The pane that holds
+  the first error opens now, and every pane with an error is marked in
+  the tab strip, so a second broken pane is not silently wrong.
+- The confirmation dialogs put the focus on the destructive button. The
+  first thing a keyboard or a screen reader met inside an open dialog
+  was the button that removes the rows. The cancel button takes the
+  focus now (the heading, where the dialog has one).
+- The live regions were re-created on every swap. A container that
+  carries `aria-live` was replaced together with its content, so the
+  announcement was cut off and the whole table was read out again on
+  every poll. The wrapper is stable now and only its content changes.
+- The enable/disable toggles mixed two state semantics. The button
+  label changed with the state while the button kept a fixed
+  `aria-pressed`, so the accessible state contradicted the visible
+  one. One of the two is used now.
 
 ### Security
 
@@ -2083,6 +2580,14 @@ Changes in the working tree, not yet on a published image.
   declared. The startup log names the accepted hosts, and a non-empty
   allowlist is a breaking change for a deployment that relied on every
   host being served.
+- The content-security policy of the admin panel allowed inline script.
+  `script-src` carried `'unsafe-inline'` for the bootstrap of
+  `base.html` and for the event handlers the templates put on their
+  elements, so an injected markup ran in the panel's own origin — with
+  the session cookie and the CSRF token of the operator. The panel's
+  script is a file now (`/admin/static/app.js`), every handler is
+  delegated from there, and the policy allows scripts from the origin
+  only: `script-src 'self'`. Inline styles stay for now.
 
 ### Docs
 
@@ -2268,133 +2773,39 @@ Changes in the working tree, not yet on a published image.
   limit counting the front's own address (one budget for the whole
   fleet), the links staying on `http` behind a TLS front, and the `Host`
   header being taken as it comes.
-
-### Changed
-
-- The dashboard's per-source table follows the status machine order:
-  unknown, alive, ready, quarantine, removed, so a fresh row starts
-  the table instead of sitting between the quarantine and removed
-  counts. "Oldest alive" became "Oldest ready" (the age of the oldest
-  tunnel-verified proxy of the source, measured from `created_at`
-  like the column it replaces), and the "Protocols" and "Countries"
-  columns are gone: a bare count of distinct values read poorly, and
-  the protocol and country split panels below already carry the
-  breakdown.
-- The pipeline builder is three tabs instead of one column of seven
-  sections. The sections are grouped in the order the pipeline runs:
-  *Input* (protocol filter), *Rules* (renaming and discarding, the lists
-  that grow) and *Output* (health, geo, sorting, limit). Each tab states
-  in one line what it is for, and *Output* lays its four sections out
-  two-up on a wide screen. The tabs are CSS-only like the settings
-  editor (hidden radios drive the panes, no JavaScript). One component
-  renders both the source and the profile form, so both get the layout,
-  and the profile keeps its tri-state controls on renaming and
-  discarding.
-- Rule lists are capped in height and carry a live count. Ten discard
-  rules used to push the add button, the second list and the preview a
-  screen down; the list now scrolls inside its pane and a counter beside
-  each heading shows how many rules it holds. The count is recomputed
-  after every HTMX settle, and blank lines do not count: the rename
-  editor deliberately keeps one empty line as a place to start typing,
-  and an empty line emits no rule.
-- The dashboard stat cards lost their per-metric colour stripe. It read
-  as a status signal and it lied: green under "checks in 24h" over a
-  0/12, amber under a healthy median latency. Status colour belongs to
-  the badges, which mark a real state, and the cards now match every
-  other panel.
-- `/export/alive/{token}` and `/export/ready/{token}` re-read and
-  re-serialized the whole tier on every download. Both now render at
-  most once per 30 s (`EXPORT_TTL_SECS`) and are served from the
-  shared processed cache in between, like `/sub` and `/src`; the
-  entries carry no source id, so per-source invalidation never
-  touches them. The exports have no source TTL to inherit and no
-  invalidation trigger (the probe owns the tiers), so the window is
-  fixed and short, and an expired entry is re-rendered inline rather
-  than served stale: a download is a snapshot by definition, and a
-  quietly outdated one is worse than a slow request. A tier can
-  therefore lag a status change by up to 30 s.
-- The two export links are now capped at 50 000 rows, and the cap is
-  a setting rather than a constant: `[server].export_max_rows`
-  (`FUMOX_SERVER__EXPORT_MAX_ROWS`), defaulting to the number the
-  hard-coded `EXPORT_MAX_ROWS` used, so a deployment that never sets
-  it changes nothing and a bigger tier can be shipped whole. The
-  window above bounds the *rate* of rendering; nothing bounded the
-  *size*. Unlike `/sub` and `/src`, which a profile's `limit.count` and
-  a source's pipeline cap already bound, these two have no upstream
-  cap, so one download on a public cacheable URL meant an unbounded
-  `fetch_all`, an unbounded serialization and an unbounded body. The
-  cap is a `LIMIT ?` in the backing query (`list_alive` /
-  `list_ready`), not a post-read truncate, and it truncates the stable
-  id order (lowest ids first), so two renders of the same tier agree.
-  The `nodes count` header reports what the body really carries, so a
-  truncated download documents itself; the admin badge (`count_alive` /
-  `count_ready`) stays uncapped on purpose, so the operator can still
-  see that the export is smaller than the tier. The cap is applied
-  after the host and token gates: a rejected request cannot tell a
-  capped render from a full one, and costs no query. Guarded by
-  `export_body_is_capped_in_sql`,
-  `cap_is_applied_after_the_host_and_token_gates`,
-  `export_cap_follows_the_configured_setting` and
-  `server_export_max_rows_is_configurable`.
-- Ingest resolves geo facts concurrently instead of one await per
-  entry. Every unseen host costs up to `[geo].dns_timeout` (5 s by
-  default) when DNS hangs, so a feed of dead hosts cost the sum of
-  them. Lookups now overlap under a cap of 32 in flight
-  (`GEO_LOOKUP_CONCURRENCY`), keeping the input order the drop rules
-  and the reconcile upsert rely on (`buffered`, not
-  `buffer_unordered`).
-- The shipped `config/app.toml` no longer enables
-  `[probe].allow_private_targets`. The probe dials targets carried
-  by *feeds*, untrusted input, so the example now ships the same
-  `false` the built-in default uses, with the comment rewritten to
-  say what the flag actually disables (loopback / RFC1918 /
-  link-local / CGNAT) and that `true` is an explicit opt-in for
-  isolated test infrastructure. The Compose probe service passes
-  the variable explicitly
-  (`FUMOX_PROBE__ALLOW_PRIVATE_TARGETS`, default `false`, so the
-  environment outranks a hand-edited file the way every other key
-  does) and `.env.example` documents it.
-- `migration 0008` adds `idx_proxies_updated_at`, covering the
-  admin proxies list's default `ORDER BY p.updated_at DESC, p.id
-  DESC` (the id tiebreaker is part of the index, it is part of the
-  order). Without it every page of the list, and the matching
-  `COUNT`, walked the whole table.
-- The minimum supported Rust toolchain is **1.98** (up from 1.94).
-  `Cargo.toml`'s `rust-version` stays a floor, not a lock: CI builds
-  on current stable, and 1.98 is the oldest toolchain the workspace
-  must keep building on.
-- The import answers with a redirect and a toast instead of a summary
-  page. A successful import ends on `/admin/import` with the totals in
-  the flash message (how many sources and profiles were created, and
-  how many warnings the file produced), the way the other admin
-  actions report themselves. Every warning is logged as it happens,
-  one line each, so a file with a dozen slug collisions does not turn
-  the screen into a wall of text.
-- The import page states the limits it enforces. At most 500 rows per
-  table and a document of at most 256 KiB are accepted, and both
-  numbers are shown next to the upload control and next to the export
-  button. The document cap is smaller than the transport limit on
-  purpose: the payload travels urlencoded, where every byte may cost
-  three, so 256 KiB of JSON still fits the 1 MiB the panel accepts.
-- The export says when its own file cannot be imported back. A
-  deployment with more than 500 sources or profiles, or with a
-  configuration that serializes past 256 KiB, produced a file the
-  import screen refused. The export names the limit it exceeds in the
-  file itself (an `import_limit` field), logs a warning about it and
-  shows the limits next to the export button, so the operator learns
-  it at the download and not at the upload.
-- The alive/ready export links on the import screen degrade instead of
-  failing. A counter or a capability token that could not be read
-  replaced the whole page with an error page, losing the import form
-  itself. The block is hidden now and the reason goes to the log, so
-  the screen stays usable.
-- The import vets the URLs of the file with the policy of the
-  deployment. The private-address rule was hard-coded, so a deployment
-  that deliberately allows private URLs (isolated infrastructure) could
-  not import a source pointing at one, and one that does not allow
-  them got the check on a different code path than the source form.
-  The import follows `[admin].allow_private_urls` now, like the form
-  does.
+- The user guide (both languages) documents what the public endpoints
+  answer now: the `X-Fumox-Skipped` header and the
+  `incompatible-entries-skipped` warning, that the warning header may
+  carry several values, the quarantined verdict of `/src`, the 10-second
+  bound on the shutdown drain and the address the `--health-check`
+  probe uses.
+- The user guide (both languages) documents what the admin panel does
+  with a secret and what it does with a deleted source. A password
+  inside a source URL is masked on every screen while the stored address
+  keeps it, a profile's access token is a password field with a floor of
+  16 characters and the panel shows a placeholder instead of the value,
+  the dashboard shows the top failure reasons of the last 24 hours, and
+  a new *Deleting a source* section explains the two orphan policies
+  (`[ingest].drop_gate`) and the warning toast a failed sweep produces.
+- The changelog had two `### Changed` sections inside one release
+  block, so the second one rendered as a stray heading and its
+  entries sat apart from the rest of the category. The two are merged
+  into one section, and the entries are in the order the changes
+  landed.
+- The user guide (both languages) documents what the admin panel does
+  with a secret, with a refused form and with a keyboard. The signing-in
+  section now names the content-security policy (`script-src 'self'`, the
+  script shipped as a file) and the mask formats the panel uses
+  (`user:sec…••••` for a proxy credential, `[redacted]` for a
+  credential-bearing parameter, the same for a URL password and a secret
+  query value); the source and proxy rows of the screen table name the
+  masks and the refresh cost the panel now shows; and a new *Keyboard and
+  screen reader* section lists what a refused form does (the message sits
+  on its field, the control points at it, the settings editor opens the
+  pane with the first error and marks every broken pane), what a
+  confirmation dialog focuses, and what the toggles announce. The export
+  screen notes that rotating the token asks for confirmation on a page of
+  its own.
 
 ## 2026-09-23 · sha-b72b03f
 

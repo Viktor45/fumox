@@ -9,9 +9,9 @@
     {% if detached_count > 0 %}
       <span class="badge neutral" title="{{ self.t("px.detached_title") }}">{{ self.t("px.detached_label") }}: {{ detached_count }}</span>
     {% endif %}
-    <button class="btn" type="button" onclick="document.getElementById('revive-dialog').showModal()" aria-haspopup="dialog" aria-controls="revive-dialog">{{ self.t("px.revive_button") }}</button>
-    <button class="btn danger" type="button" onclick="document.getElementById('cleanup-dialog').showModal()" aria-haspopup="dialog" aria-controls="cleanup-dialog">{{ self.t("px.cleanup_button") }}</button>
-    <button class="btn danger" type="button" onclick="document.getElementById('purge-dialog').showModal()" aria-haspopup="dialog" aria-controls="purge-dialog">{{ self.t("px.purge_button") }}</button>
+    <button class="btn" type="button" data-dialog-open="revive-dialog" aria-haspopup="dialog" aria-controls="revive-dialog">{{ self.t("px.revive_button") }}</button>
+    <button class="btn danger" type="button" data-dialog-open="cleanup-dialog" aria-haspopup="dialog" aria-controls="cleanup-dialog">{{ self.t("px.cleanup_button") }}</button>
+    <button class="btn danger" type="button" data-dialog-open="purge-dialog" aria-haspopup="dialog" aria-controls="purge-dialog">{{ self.t("px.purge_button") }}</button>
   </div>
 </div>
 
@@ -20,7 +20,7 @@
      actual delete from the database stays the "purge removed" button
      above. Keeping the two buttons apart makes a mistake reversible. -->
 <dialog id="cleanup-dialog" aria-labelledby="cleanup-dialog-title">
-  <h2 id="cleanup-dialog-title">{{ self.t("px.cleanup_title") }}</h2>
+  <h2 id="cleanup-dialog-title" tabindex="-1">{{ self.t("px.cleanup_title") }}</h2>
   <p class="muted small">{{ self.t("px.cleanup_note") }}</p>
   <ul class="cleanup-ops">
     <li>
@@ -108,12 +108,12 @@
     </li>
   </ul>
   <div class="form-actions">
-    <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
+    <button class="btn" type="button" data-dialog-close>{{ self.t("common.cancel") }}</button>
   </div>
 </dialog>
 
 <dialog id="purge-dialog" aria-labelledby="purge-dialog-title">
-  <h2 id="purge-dialog-title">{{ self.t("px.purge_button") }}</h2>
+  <h2 id="purge-dialog-title" tabindex="-1">{{ self.t("px.purge_button") }}</h2>
   <form method="post" action="/admin/proxies/purge-removed">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <p class="muted small">{{ self.t("px.purge_count").replace("{}", &removed_count.to_string()) }}</p>
@@ -121,7 +121,7 @@
     <p class="muted small">{{ self.t("px.purge_note") }}</p>
     <div class="form-actions">
       <button class="btn danger" type="submit">{{ self.t("common.delete") }}</button>
-      <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
+      <button class="btn" type="button" data-dialog-close>{{ self.t("common.cancel") }}</button>
     </div>
   </form>
 </dialog>
@@ -131,7 +131,7 @@
      priority probing so the daemon picks them up on its next cycle
      instead of waiting for the random sample. -->
 <dialog id="revive-dialog" aria-labelledby="revive-dialog-title">
-  <h2 id="revive-dialog-title">{{ self.t("px.revive_title") }}</h2>
+  <h2 id="revive-dialog-title" tabindex="-1">{{ self.t("px.revive_title") }}</h2>
   <p class="muted small">{{ self.t("px.revive_note") }}</p>
   <ul class="cleanup-ops">
     <li>
@@ -195,7 +195,7 @@
     </li>
   </ul>
   <div class="form-actions">
-    <button class="btn" type="button" onclick="this.closest('dialog').close()">{{ self.t("common.cancel") }}</button>
+    <button class="btn" type="button" data-dialog-close>{{ self.t("common.cancel") }}</button>
   </div>
 </dialog>
 

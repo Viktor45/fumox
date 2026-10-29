@@ -226,8 +226,18 @@ fn strip_obfuscation(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+/// Default number of keys a limiter's counter cache holds.
+const DEFAULT_MAX_KEYS: u64 = 100_000;
+
 /// Fixed-window per-key rate limiter: counters live in a moka cache with
 /// TTL = window, so expiry resets the window.
+///
+/// The counter cache holds at most `max_keys` keys (100 000 by default);
+/// past that the least-recently-used counters are evicted, and an evicted
+/// key starts a fresh window — its counter is gone, so the next request
+/// from it counts as the first one again. The ceiling bounds the memory a
+/// flood of distinct keys could pin; it never bounds the number of
+/// requests a single key may make.
 pub struct RateLimiter {
     counters: Cache<String, Arc<AtomicU64>>,
     limit: u64,
@@ -235,9 +245,18 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(limit: u64, window: Duration) -> Self {
+        Self::with_capacity(limit, window, DEFAULT_MAX_KEYS)
+    }
+
+    /// A limiter with its own key ceiling. The admin panel counts compact
+    /// address keys and serves far fewer clients than the public
+    /// listener, so it can afford a larger ceiling than the default one:
+    /// a flood of distinct addresses must not push the counters of the
+    /// real operators out of the cache.
+    pub fn with_capacity(limit: u64, window: Duration, max_keys: u64) -> Self {
         Self {
             counters: Cache::builder()
-                .max_capacity(100_000)
+                .max_capacity(max_keys)
                 .time_to_live(window)
                 .build(),
             limit,
@@ -354,7 +373,10 @@ mod tests {
     fn an_undeclared_forwarding_header_never_moves_the_key() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        headers.insert(header::FORWARDED, "for=1.2.3.4;proto=https".parse().unwrap());
+        headers.insert(
+            header::FORWARDED,
+            "for=1.2.3.4;proto=https".parse().unwrap(),
+        );
         assert_eq!(
             client_key(peer(), &headers, &trusted_v4(), TrustedHeader::None),
             peer().ip(),
@@ -362,10 +384,7 @@ mod tests {
         );
         // The same pair under a declaration names the client: the operator
         // has taken responsibility for the header.
-        assert_eq!(
-            key_both(&headers),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_both(&headers), "1.2.3.4".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -585,7 +604,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append(header::FORWARDED, "for=6.6.6.6".parse().unwrap());
         headers.append(header::FORWARDED, "for=9.9.9.9".parse().unwrap());
-        assert_eq!(key_forwarded(&headers), "9.9.9.9".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            key_forwarded(&headers),
+            "9.9.9.9".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -630,10 +652,7 @@ mod tests {
     #[test]
     fn forwarded_with_bracketed_ipv6_literal_is_bracket_stripped() {
         let h = fwd("for=[2001:db8::1];proto=https");
-        assert_eq!(
-            key_forwarded(&h),
-            "2001:db8::1".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_forwarded(&h), "2001:db8::1".parse::<IpAddr>().unwrap());
     }
 
     /// RFC 7239 §4 does not pin parameter ordering. A non-`for=` parameter

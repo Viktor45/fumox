@@ -15,29 +15,32 @@
 
     <div class="field">
       <label for="src-name">{{ self.t("common.name") }} *</label>
-      <input type="text" id="src-name" name="name" value="{{ values.name }}" maxlength="200" required>
+      <input type="text" id="src-name" name="name" value="{{ values.name }}" maxlength="200" required{{ self.error_attrs("name") | safe }}>
       {% match self.error_for("name") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-name" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
 
     <div class="field">
       <label for="src-slug">Slug</label>
-      <input type="text" id="src-slug" name="slug" value="{{ values.slug }}" maxlength="64">
+      <input type="text" id="src-slug" name="slug" value="{{ values.slug }}" maxlength="64"{{ self.error_attrs("slug") | safe }}>
       <div class="hint">{{ self.t("src.slug_hint") }}</div>
       {% match self.error_for("slug") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-slug" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
 
     <div class="field">
       <label for="src-url">{{ self.t("src.url_label") }}</label>
-      <input type="url" id="src-url" name="url" value="{{ values.url }}" required>
+      <input type="url" id="src-url" name="url" value="{{ values.url }}" required{{ self.error_attrs("url") | safe }}>
       <div class="hint">{{ self.t("src.url_hint") }}</div>
+      {% if values.url_masked %}
+        <div class="hint">{{ self.t("src.url_masked_note") }}</div>
+      {% endif %}
       {% match self.error_for("url") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-url" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
@@ -55,34 +58,34 @@
 
     <div class="field">
       <label for="src-encoding">{{ self.t("src.encoding_label") }}</label>
-      <select id="src-encoding" name="encoding">
+      <select id="src-encoding" name="encoding"{{ self.error_attrs("encoding") | safe }}>
         <option value="auto" {% if values.encoding == "auto" %}selected{% endif %}>{{ self.t("src.detect_auto") }}</option>
         <option value="plain" {% if values.encoding == "plain" %}selected{% endif %}>plain</option>
         <option value="base64" {% if values.encoding == "base64" %}selected{% endif %}>base64</option>
       </select>
       {% match self.error_for("encoding") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-encoding" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
 
     <div class="field">
       <label for="src-input-format">{{ self.t("src.input_format_label") }}</label>
-      <select id="src-input-format" name="input_format">
+      <select id="src-input-format" name="input_format"{{ self.error_attrs("input_format") | safe }}>
         <option value="" {% if values.input_format.is_empty() %}selected{% endif %}>{{ self.t("src.detect_auto") }}</option>
         <option value="uri_list" {% if values.input_format == "uri_list" %}selected{% endif %}>{{ self.t("src.uri_list") }}</option>
         <option value="clash_yaml" {% if values.input_format == "clash_yaml" %}selected{% endif %}>Clash YAML</option>
         <option value="sing_box_json" {% if values.input_format == "sing_box_json" %}selected{% endif %}>sing-box JSON</option>
       </select>
       {% match self.error_for("input_format") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-input_format" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
 
     <div class="field">
       <label for="src-ip-family">{{ self.t("src.ip_family_label") }}</label>
-      <select id="src-ip-family" name="ip_family">
+      <select id="src-ip-family" name="ip_family"{{ self.error_attrs("ip_family") | safe }}>
         <option value="" {% if values.ip_family.is_empty() %}selected{% endif %}>{{ self.t("src.ip_family_inherit") }}</option>
         <option value="any" {% if values.ip_family == "any" %}selected{% endif %}>{{ self.t("src.ip_family_any") }}</option>
         <option value="ipv4" {% if values.ip_family == "ipv4" %}selected{% endif %}>IPv4</option>
@@ -90,12 +93,15 @@
       </select>
       <div class="hint">{{ self.t("src.ip_family_hint") }}</div>
       {% match self.error_for("ip_family") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-ip_family" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
 
-    <fieldset class="field">
+    {# The protocols are one field of the form, a group of checkboxes:
+       the group carries the reference to its message, not the invalid
+       state, since the box that was left out is not known. #}
+    <fieldset class="field"{{ self.describedby("protocols") | safe }}>
       <legend>{{ self.t("src.protocols_label") }}</legend>
       <div class="hint">{{ self.t("src.protocols_hint") }}</div>
       {% for (protocol, selected) in all_protocols %}
@@ -105,17 +111,17 @@
         </span>
       {% endfor %}
       {% match self.error_for("protocols") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-protocols" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </fieldset>
 
     <div class="field">
       <label for="src-ttl">{{ self.t("src.ttl_label") }}</label>
-      <input type="number" id="src-ttl" name="cache_ttl_seconds" value="{{ values.cache_ttl_seconds }}" min="60" max="86400">
+      <input type="number" id="src-ttl" name="cache_ttl_seconds" value="{{ values.cache_ttl_seconds }}" min="60" max="86400"{{ self.error_attrs("cache_ttl_seconds") | safe }}>
       <div class="hint">{{ self.t("src.ttl_hint") }}</div>
       {% match self.error_for("cache_ttl_seconds") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-cache_ttl_seconds" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
@@ -129,13 +135,13 @@
     <div class="field">
       <label for="src-headers">{{ self.t("src.headers_label") }}</label>
       <textarea class="mono" id="src-headers" name="headers" rows="3" placeholder="User-Agent: …
-Authorization: Bearer …">{{ values.headers }}</textarea>
+Authorization: Bearer …"{{ self.error_attrs("headers") | safe }}>{{ values.headers }}</textarea>
       <div class="hint">{{ self.t("src.headers_hint") }}</div>
       {% if headers_masked_note %}
         <div class="hint">{{ self.t("src.headers_masked_note") }}</div>
       {% endif %}
       {% match self.error_for("headers") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-headers" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>

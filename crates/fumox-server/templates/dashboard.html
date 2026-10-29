@@ -8,7 +8,7 @@
   <form method="get" action="/admin/set-dash-top-n" class="topn-picker">
     <label>
       <span>{{ self.t("dash.top_n_label") }}</span>
-      <select name="n" onchange="this.form.submit()">
+      <select name="n" data-submit-form>
         {% for n in [5_i64, 10_i64, 15_i64, 25_i64, 50_i64] %}
           <option value="{{ n }}"{% if top_n.as_i64() == *n %} selected{% endif %}>{{ n }}</option>
         {% endfor %}

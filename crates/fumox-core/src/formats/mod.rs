@@ -13,12 +13,34 @@
 pub mod clash;
 pub mod singbox;
 
+use crate::models::{OutputFormat, ProxyEntry};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) use crate::params::{
     is_insecure, list as param_list, map_first, map_header, map_list, map_str,
     truthy as param_truthy, value as param_value,
 };
+
+/// How many entries an output format cannot represent.
+///
+/// The structured formats have no counterpart for some schemes and
+/// leave exactly those entries out of the document; the plain formats
+/// carry every scheme. The count is what the served response reports,
+/// so a subscriber can see how much of the list the format could not
+/// express instead of silently receiving a shorter one.
+pub fn skipped_count(format: OutputFormat, entries: &[ProxyEntry]) -> usize {
+    match format {
+        OutputFormat::UriList | OutputFormat::Base64 => 0,
+        OutputFormat::Clash => entries
+            .iter()
+            .filter(|entry| !clash::is_supported(entry.scheme))
+            .count(),
+        OutputFormat::SingBox => entries
+            .iter()
+            .filter(|entry| !singbox::is_supported(entry.scheme))
+            .count(),
+    }
+}
 
 /// Resolve duplicate names by suffixing later occurrences with « (2)»,
 /// « (3)» and so on. The first occurrence keeps its name
@@ -124,7 +146,7 @@ mod tests {
 #[cfg(test)]
 mod agreement {
     use super::{clash, singbox};
-    use crate::models::{Param, ProxyEntry, Scheme};
+    use crate::models::{OutputFormat, Param, ProxyEntry, Scheme};
 
     fn entry(scheme: Scheme, params: &[(&str, &str)]) -> ProxyEntry {
         ProxyEntry {
@@ -301,5 +323,39 @@ mod agreement {
         let (clash, singbox) = transport(&entry);
         assert_eq!(clash.as_deref(), Some("xhttp"));
         assert_eq!(singbox, None);
+    }
+
+    /// The skipped count the served response reports must be the number
+    /// of entries the encoder really left out, not a second list of
+    /// schemes that could drift from the encoders'.
+    #[test]
+    fn the_skipped_count_matches_what_the_encoders_drop() {
+        let entries = vec![
+            entry(Scheme::Vless, &[]),
+            entry(Scheme::Tuic, &[]),
+            entry(Scheme::Vmess, &[]),
+            entry(Scheme::Snell, &[]),
+        ];
+        let clash_doc: serde_norway::Value =
+            serde_norway::from_str(&clash::encode_clash(&entries)).expect("clash YAML");
+        let clash_kept = clash_doc["proxies"].as_sequence().expect("proxies").len();
+        let singbox_doc: serde_json::Value =
+            serde_json::from_str(&singbox::encode_singbox(&entries)).expect("sing-box JSON");
+        let singbox_kept = singbox_doc["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .len();
+
+        assert_eq!(
+            super::skipped_count(OutputFormat::Clash, &entries),
+            entries.len() - clash_kept
+        );
+        assert_eq!(
+            super::skipped_count(OutputFormat::SingBox, &entries),
+            entries.len() - singbox_kept
+        );
+        // The plain formats carry every scheme.
+        assert_eq!(super::skipped_count(OutputFormat::UriList, &entries), 0);
+        assert_eq!(super::skipped_count(OutputFormat::Base64, &entries), 0);
     }
 }

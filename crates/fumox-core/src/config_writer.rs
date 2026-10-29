@@ -1000,7 +1000,8 @@ mod tests {
         // A second create must not overwrite what is there: the panel
         // offers the button only for a missing file, and a create that
         // clobbered an existing config would lose the operator's edits.
-        let err = create_private_file_atomic(&path, "[server]\nbind = \"0.0.0.0:1\"\n").unwrap_err();
+        let err =
+            create_private_file_atomic(&path, "[server]\nbind = \"0.0.0.0:1\"\n").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(
             std::fs::read_to_string(&path)

@@ -5,8 +5,12 @@ use axum::{Json, Router};
 
 #[test]
 fn zero_retention_window_is_clamped_to_one_day() {
-    assert_eq!(retention_cutoff(100_000, 0), 100_000 - 86_400);
-    assert_eq!(retention_cutoff(100_000, 7), 100_000 - 7 * 86_400);
+    assert_eq!(
+        retention::cutoff(100_000, 0),
+        100_000 - 86_400,
+        "the shared clamp keeps a zero window at one day"
+    );
+    assert_eq!(retention::cutoff(100_000, 7), 100_000 - 7 * 86_400);
 }
 
 /// Hardening: with

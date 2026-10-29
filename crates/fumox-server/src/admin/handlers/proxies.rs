@@ -4,20 +4,24 @@
 //! action.
 
 use super::{
-    QueryPairs, action_response, action_response_err, clamp_limit, flag_for, fmt_opt_ts_element,
-    fmt_ts_element, is_htmx, not_found, server_error,
+    QueryPairs, action_response, action_response_err, clamp_limit, flag_for, is_htmx, mask_secret,
+    not_found, server_error,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
+use crate::admin::presentation::{fmt_opt_ts_element, fmt_ts_element};
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
+use crate::redact::{REDACTED, is_sensitive_param, mask_query, userinfo_span};
 use askama::Template;
-use axum::extract::{Form, Path, Query, State};
+use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use std::net::SocketAddr;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use fumox_core::models::{Scheme, now_ts};
+use fumox_core::models::{ProxyStatus, Scheme, now_ts};
 use fumox_core::repo::probe as probe_repo;
 use fumox_core::repo::proxies::{
     self, CheckCoverage, ProxyLinkRow, ProxyListCursor, ProxyListDirection, ProxyListFilter,
@@ -257,11 +261,30 @@ pub async fn proxies_list(
     let theme = theme::from_headers(&headers);
     // `status` may repeat (multi-select); the rest are single-valued. This
     // needs QueryPairs, a HashMap would keep only the last value.
-    let f_statuses: Vec<String> = params
-        .all("status")
-        .filter(|v| ["unknown", "alive", "ready", "quarantine", "removed"].contains(&v.as_str()))
+    //
+    // The whitelist is the status vocabulary of the core model: a value
+    // outside it is not a filter, it is a typo or a probe at the URL, and
+    // it is logged instead of being silently dropped.
+    let requested_statuses = params.all("status").cloned().collect::<Vec<String>>();
+    let mut rejected: Vec<&str> = Vec::new();
+    let f_statuses: Vec<String> = requested_statuses
+        .iter()
+        .filter(|value| {
+            if value.parse::<ProxyStatus>().is_ok() {
+                true
+            } else {
+                rejected.push(value.as_str());
+                false
+            }
+        })
         .cloned()
         .collect();
+    if !rejected.is_empty() {
+        tracing::warn!(
+            rejected = ?rejected,
+            "proxy list filter carries unknown status values"
+        );
+    }
     let f_scheme = params.get("scheme").cloned().unwrap_or_default();
     let f_country = params.get("country").cloned().unwrap_or_default();
     let f_source = params.get("source").cloned().unwrap_or_default();
@@ -428,23 +451,15 @@ pub async fn proxies_list(
             theme,
             active: "proxies",
             csrf: state.csrf_for(&headers),
-            all_statuses: [
-                (
-                    "unknown".to_string(),
-                    f_statuses.iter().any(|s| s == "unknown"),
-                ),
-                ("alive".to_string(), f_statuses.iter().any(|s| s == "alive")),
-                ("ready".to_string(), f_statuses.iter().any(|s| s == "ready")),
-                (
-                    "quarantine".to_string(),
-                    f_statuses.iter().any(|s| s == "quarantine"),
-                ),
-                (
-                    "removed".to_string(),
-                    f_statuses.iter().any(|s| s == "removed"),
-                ),
-            ]
-            .to_vec(),
+            all_statuses: ProxyStatus::all()
+                .iter()
+                .map(|status| {
+                    (
+                        status.as_str().to_string(),
+                        f_statuses.iter().any(|s| s == status.as_str()),
+                    )
+                })
+                .collect(),
             all_schemes: Scheme::all()
                 .iter()
                 .map(|scheme| (scheme.as_str().to_string(), scheme.as_str() == f_scheme))
@@ -481,8 +496,13 @@ struct ProxyDetailTemplate {
     active: &'static str,
     csrf: String,
     proxy: proxies::ProxyRow,
+    /// The credential of the row with its secret masked; the panel never
+    /// renders the stored value.
+    credential_display: String,
     params_display: String,
     unknown_params_display: String,
+    /// The stored subscription line with its secrets masked.
+    raw_line_display: Option<String>,
     lifecycle: Vec<(String, String)>,
     probes: Vec<probe_repo::ProbeHistoryRow>,
     links: Vec<ProxyLinkRow>,
@@ -497,8 +517,62 @@ impl ProxyDetailTemplate {
 
 impl_i18n!(ProxyDetailTemplate);
 
-/// Pretty-print a stored params JSON column; corrupt JSON is shown verbatim
-/// rather than hiding the problem.
+/// The credential of a proxy row as the panel shows it: the secret
+/// masked.
+///
+/// A credential is either `user:pass` (the socks/http style) or a single
+/// secret (the uuid of a vless line): with no colon there is no account
+/// name to keep, and the whole value is the secret.
+fn mask_credential(credential: &str) -> String {
+    if credential.is_empty() {
+        return String::new();
+    }
+    match credential.split_once(':') {
+        Some((user, password)) => format!("{user}:{}", mask_secret(password)),
+        None => mask_secret(credential),
+    }
+}
+
+/// A proxy line as the panel shows it: the credential of the userinfo
+/// masked and the value of every credential-bearing query pair redacted.
+fn mask_proxy_line(line: &str) -> String {
+    let masked = match userinfo_span(line) {
+        Some((start, end)) => {
+            let userinfo = &line[start..end];
+            format!(
+                "{}{}{}",
+                &line[..start],
+                mask_credential(userinfo),
+                &line[end..]
+            )
+        }
+        None => line.to_string(),
+    };
+    mask_query(&masked)
+}
+
+/// The value of every credential-bearing parameter replaced by the
+/// redaction marker; the parameters themselves are the diagnostics.
+fn mask_param_values(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let value = if is_sensitive_param(key) {
+                        serde_json::Value::String(REDACTED.to_string())
+                    } else {
+                        mask_param_values(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Pretty-print a stored params JSON column with the secrets masked;
+/// corrupt JSON is shown verbatim rather than hiding the problem.
 fn pretty_params(column: &Option<String>) -> String {
     column
         .as_deref()
@@ -506,6 +580,7 @@ fn pretty_params(column: &Option<String>) -> String {
         .map(|text| {
             serde_json::from_str::<serde_json::Value>(text)
                 .ok()
+                .map(|value| mask_param_values(&value))
                 .and_then(|value| serde_json::to_string_pretty(&value).ok())
                 .unwrap_or_else(|| text.to_string())
         })
@@ -519,15 +594,17 @@ pub async fn proxy_detail(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
-    let mut proxy = match proxies::get_by_id(&state.pool, id).await {
+    let proxy = match proxies::get_by_id(&state.pool, id).await {
         Ok(Some(proxy)) => proxy,
         Ok(None) => return not_found(lang, "err.proxy_not_found"),
         Err(err) => return server_error(lang, &err),
     };
 
     // Opening the card refreshes the geo facts from every available
-    // GeoLite2 database (City/ASN included), no button to click.
-    refresh_geo(&state, &mut proxy).await;
+    // GeoLite2 database (City/ASN included), no button to click. The
+    // lookup runs in the background: the card renders the stored facts
+    // now and shows the fresh ones on the next open.
+    refresh_geo(&state, proxy.id, &proxy.host);
 
     // Every value is server-generated (statuses, counters, timestamps,
     // numbers), the template renders them with askama's `| safe` so the
@@ -610,8 +687,10 @@ pub async fn proxy_detail(
             theme,
             active: "proxies",
             csrf: state.csrf_for(&headers),
+            credential_display: mask_credential(&proxy.credential),
             params_display: pretty_params(&proxy.params),
             unknown_params_display: pretty_params(&proxy.unknown_params),
+            raw_line_display: proxy.raw_line.as_deref().map(mask_proxy_line),
             proxy,
             lifecycle,
             probes,
@@ -663,6 +742,7 @@ pub async fn proxy_probe_history(
 /// probe history). Guarded by a confirmation dialog in the UI.
 pub async fn proxies_purge_removed(
     State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
@@ -670,7 +750,9 @@ pub async fn proxies_purge_removed(
         Ok(deleted) => deleted,
         Err(err) => return server_error(lang, &err),
     };
-    tracing::info!(deleted, "purged removed proxies");
+    // The peer names who ran the destructive action: the purge cannot be
+    // undone.
+    tracing::info!(deleted, peer = %peer, "purged removed proxies");
     let fragment = format!(
         "<span class=\"badge on\">{}</span>",
         lang.t("px.purged_rows").replace("{}", &deleted.to_string())
@@ -696,13 +778,17 @@ pub async fn proxies_purge_removed(
 /// transition, log it and answer with the count badge + toast.
 macro_rules! bulk_cleanup_handler {
     ($name:ident, $repo_fn:ident, $log_msg:literal) => {
-        pub async fn $name(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+        pub async fn $name(
+            State(state): State<AdminState>,
+            ConnectInfo(peer): ConnectInfo<SocketAddr>,
+            headers: HeaderMap,
+        ) -> Response {
             let lang = state.locales.lang_from_headers(&headers);
             let moved = match proxies::$repo_fn(&state.pool).await {
                 Ok(moved) => moved,
                 Err(err) => return server_error(lang, &err),
             };
-            tracing::info!(moved, $log_msg);
+            tracing::info!(moved, peer = %peer, $log_msg);
             let fragment = format!(
                 "<span class=\"badge removed\">{}</span>",
                 lang.t("px.cleanup_moved_rows")
@@ -753,6 +839,7 @@ fn normalize_asn(input: &str) -> Option<String> {
 /// (cleanup panel). The form field `asn` accepts `24940` and `AS24940`.
 pub async fn proxies_remove_alive_by_asn(
     State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(form): Form<Vec<(String, String)>>,
 ) -> Response {
@@ -775,7 +862,7 @@ pub async fn proxies_remove_alive_by_asn(
         Ok(moved) => moved,
         Err(err) => return server_error(lang, &err),
     };
-    tracing::info!(asn = %asn, moved, "removed alive proxies by ASN");
+    tracing::info!(asn = %asn, moved, peer = %peer, "removed alive proxies by ASN");
     let fragment = format!(
         "<span class=\"badge removed\">{}</span>",
         lang.t("px.cleanup_asn_rows")
@@ -797,6 +884,7 @@ pub async fn proxies_remove_alive_by_asn(
 /// country dropdown.
 pub async fn proxies_remove_alive_by_country(
     State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(form): Form<Vec<(String, String)>>,
 ) -> Response {
@@ -820,7 +908,7 @@ pub async fn proxies_remove_alive_by_country(
         Ok(moved) => moved,
         Err(err) => return server_error(lang, &err),
     };
-    tracing::info!(country = %code, moved, "removed alive proxies by country");
+    tracing::info!(country = %code, moved, peer = %peer, "removed alive proxies by country");
     let fragment = format!(
         "<span class=\"badge removed\">{}</span>",
         lang.t("px.cleanup_country_rows")
@@ -875,14 +963,18 @@ async fn enqueue_revived(state: &AdminState, ids: &[i64]) {
 /// priority probing, log the count, answer with the badge + toast.
 macro_rules! bulk_revival_handler {
     ($name:ident, $repo_fn:ident, $log_msg:literal, $rows_key:literal) => {
-        pub async fn $name(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+        pub async fn $name(
+            State(state): State<AdminState>,
+            ConnectInfo(peer): ConnectInfo<SocketAddr>,
+            headers: HeaderMap,
+        ) -> Response {
             let lang = state.locales.lang_from_headers(&headers);
             let outcome = match proxies::$repo_fn(&state.pool, now_ts()).await {
                 Ok(outcome) => outcome,
                 Err(err) => return server_error(lang, &err),
             };
             let revived = outcome.revived;
-            tracing::info!(revived, $log_msg);
+            tracing::info!(revived, peer = %peer, $log_msg);
             enqueue_revived(&state, &outcome.ids).await;
             let fragment = format!(
                 "<span class=\"badge unknown\">{}</span>",
@@ -919,6 +1011,7 @@ bulk_revival_handler!(
 /// SQL.
 pub async fn proxies_revive_removed_by_asn(
     State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(form): Form<Vec<(String, String)>>,
 ) -> Response {
@@ -942,7 +1035,7 @@ pub async fn proxies_revive_removed_by_asn(
         Err(err) => return server_error(lang, &err),
     };
     let revived = outcome.revived;
-    tracing::info!(asn = %asn, revived, "revived removed proxies by ASN");
+    tracing::info!(asn = %asn, revived, peer = %peer, "revived removed proxies by ASN");
     enqueue_revived(&state, &outcome.ids).await;
     let fragment = format!(
         "<span class=\"badge unknown\">{}</span>",
@@ -965,6 +1058,7 @@ pub async fn proxies_revive_removed_by_asn(
 /// by the country dropdown.
 pub async fn proxies_revive_removed_by_country(
     State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(form): Form<Vec<(String, String)>>,
 ) -> Response {
@@ -989,7 +1083,7 @@ pub async fn proxies_revive_removed_by_country(
         Err(err) => return server_error(lang, &err),
     };
     let revived = outcome.revived;
-    tracing::info!(country = %code, revived, "revived removed proxies by country");
+    tracing::info!(country = %code, revived, peer = %peer, "revived removed proxies by country");
     enqueue_revived(&state, &outcome.ids).await;
     let fragment = format!(
         "<span class=\"badge unknown\">{}</span>",
@@ -1013,12 +1107,15 @@ pub async fn proxies_revive_removed_by_country(
 /// same shape the detail template renders: the form's `hx-target` points
 /// at the wrapper, so a refusal has to answer with it or the button dies.
 /// The class is picked from the status value, never interpolated.
+///
+/// The badge vocabulary is the status model of the core: a value outside
+/// it is not a status, and the badge falls back to `unknown`.
 fn status_badge(lang: &Lang, status: &str) -> String {
-    let (class, key) = match status {
-        "alive" => ("alive", "common.status_alive"),
-        "ready" => ("ready", "common.status_ready"),
-        "quarantine" => ("quarantine", "common.status_quarantine"),
-        "removed" => ("removed", "common.status_removed"),
+    let (class, key) = match status.parse::<ProxyStatus>() {
+        Ok(ProxyStatus::Alive) => ("alive", "common.status_alive"),
+        Ok(ProxyStatus::Ready) => ("ready", "common.status_ready"),
+        Ok(ProxyStatus::Quarantine) => ("quarantine", "common.status_quarantine"),
+        Ok(ProxyStatus::Removed) => ("removed", "common.status_removed"),
         _ => ("unknown", "common.status_unknown"),
     };
     format!(
@@ -1074,44 +1171,104 @@ pub async fn proxy_reset(
 
 /// Refresh the geo facts of one proxy (Country, City, ASN, every GeoLite2
 /// database in `[geo].db_dir` contributes, the same merge the pipeline
-/// resolver uses). Called while rendering the card, so opening the page is
-/// enough and no button is needed. A host that does not resolve keeps its
-/// stored facts, an empty stamp must never wipe them; the resolver's
-/// DNS+lookup cache makes repeat opens cheap.
-async fn refresh_geo(state: &AdminState, proxy: &mut proxies::ProxyRow) {
+/// resolver uses) and store them.
+///
+/// The lookup runs in the background: a DNS timeout must not hold the
+/// response of the card that triggered it, and the card renders the
+/// stored facts right away. A host that does not resolve keeps its stored
+/// facts, an empty stamp must never wipe them; the resolver's DNS+lookup
+/// cache (negative results included) makes repeat opens cheap.
+///
+/// The handle is returned for the callers that want to wait for the
+/// write; the request path drops it and the task runs detached.
+fn refresh_geo(state: &AdminState, proxy_id: i64, host: &str) -> tokio::task::JoinHandle<()> {
     if !state.geo_full.is_active() {
-        return;
+        return tokio::spawn(async {});
     }
-    let Some(info) = state.geo_full.resolve(&proxy.host).await else {
-        return;
-    };
-    let stamp = proxies::GeoStamp::from_info(&info);
-    if let Err(err) = proxies::update_geo_full(&state.pool, proxy.id, &stamp, &info.ip).await {
-        tracing::warn!(proxy_id = proxy.id, error = %err, "card geo refresh failed");
-        return;
-    }
-    tracing::debug!(proxy_id = proxy.id, host = %proxy.host, "card geo refreshed");
-    merge_geo_stamp(proxy, &stamp);
-    proxy.resolved_ip = Some(info.ip);
-}
-
-/// Overwrite a field only when the stamp carries it: a partial stamp
-/// must not turn a stored country or city into `None`.
-fn merge_geo_stamp(proxy: &mut proxies::ProxyRow, stamp: &proxies::GeoStamp) {
-    if let Some(country) = &stamp.country {
-        proxy.geo_country = Some(country.clone());
-    }
-    if let Some(city) = &stamp.city {
-        proxy.geo_city = Some(city.clone());
-    }
-    if let Some(asn) = &stamp.asn {
-        proxy.geo_asn = Some(asn.clone());
-    }
+    let pool = state.pool.clone();
+    let resolver = state.geo_full.clone();
+    let host = host.to_string();
+    tokio::spawn(async move {
+        let Some(info) = resolver.resolve(&host).await else {
+            return;
+        };
+        let stamp = proxies::GeoStamp::from_info(&info);
+        if let Err(err) = proxies::update_geo_full(&pool, proxy_id, &stamp, &info.ip).await {
+            tracing::warn!(proxy_id, error = %err, "card geo refresh failed");
+            return;
+        }
+        tracing::debug!(proxy_id, host = %host, "card geo refreshed");
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The credential of a proxy card is a secret: the card shows the
+    /// mask, never the stored value. A `user:pass` credential keeps the
+    /// account name (it tells the operator which account it is); a
+    /// credential without a colon is a single secret (the uuid of a
+    /// vless line) and is masked whole.
+    #[test]
+    fn the_credential_is_masked() {
+        assert_eq!(mask_credential("user:secret123"), "user:sec…••••");
+        assert_eq!(mask_credential("a-very-long-uuid"), "a-v…••••");
+        // A short credential is hidden entirely.
+        assert_eq!(mask_credential("ab:cd"), "ab:••••");
+        // No credential, no mask.
+        assert_eq!(mask_credential(""), "");
+    }
+
+    /// The stored subscription line carries the credential in its
+    /// userinfo and the token in its query: the card shows both masked.
+    #[test]
+    fn the_raw_line_is_masked() {
+        let line = "vless://user:secret123@example.com:443?token=ABC&type=ws#node";
+        let masked = mask_proxy_line(line);
+        assert!(!masked.contains("secret123"), "{masked}");
+        assert!(!masked.contains("ABC"), "{masked}");
+        // The parts that are not secrets survive: they are the
+        // diagnostics of the line.
+        assert!(masked.contains("vless://user:"), "{masked}");
+        assert!(masked.contains("@example.com:443"), "{masked}");
+        assert!(masked.contains("type=ws"), "{masked}");
+        assert!(masked.contains("token=[redacted]"), "{masked}");
+    }
+
+    /// The parameters of a proxy row are a JSON blob; the credential-
+    /// bearing ones are redacted and the rest survive.
+    #[test]
+    fn the_secret_parameters_are_redacted() {
+        let params = serde_json::json!({
+            "password": "secret",
+            "username": "user",
+            "tls": {"sni": "example.com"},
+            "nested": {"api_key": "ABC"},
+        });
+        let masked = mask_param_values(&params);
+        assert_eq!(masked["password"], serde_json::json!("[redacted]"));
+        assert_eq!(masked["username"], serde_json::json!("user"));
+        assert_eq!(masked["nested"]["api_key"], serde_json::json!("[redacted]"));
+        assert_eq!(masked["tls"]["sni"], serde_json::json!("example.com"));
+    }
+
+    /// The pretty-printed parameters of the card carry the same masks:
+    /// the JSON blob is rendered from the masked value, not from the
+    /// stored one.
+    #[test]
+    fn the_pretty_printed_parameters_are_masked() {
+        let column = serde_json::json!({"password": "secret", "host": "example.com"}).to_string();
+        let pretty = pretty_params(&Some(column));
+        assert!(!pretty.contains("secret"), "{pretty}");
+        assert!(pretty.contains("example.com"), "{pretty}");
+        // A corrupt column is shown verbatim: hiding the problem would
+        // leave the operator without a clue.
+        assert_eq!(
+            pretty_params(&Some("not json".to_string())),
+            "not json".to_string()
+        );
+    }
 
     /// The cursor token is the whole contract between the browser and
     /// the database: the sort key of the row a page resumes from and the
@@ -1235,96 +1392,6 @@ mod tests {
         );
     }
 
-    /// A card row as the database hands it over: the stored geo facts are
-    /// whatever the ingest path resolved.
-    fn card_row(country: Option<&str>, city: Option<&str>, asn: Option<&str>) -> proxies::ProxyRow {
-        proxies::ProxyRow {
-            id: 1,
-            fingerprint: "fp".into(),
-            scheme: "vless".into(),
-            name: "n".into(),
-            host: "h1.example.com".into(),
-            port: 443,
-            credential: "uuid".into(),
-            params: None,
-            unknown_params: None,
-            raw_line: None,
-            raw_path: None,
-            geo_country: country.map(str::to_string),
-            geo_city: city.map(str::to_string),
-            geo_asn: asn.map(str::to_string),
-            geo_attempts: 0,
-            last_geo_attempt_at: None,
-            resolved_ip: None,
-            status: "unknown".into(),
-            fail_count: 0,
-            last_checked_at: None,
-            last_alive_at: None,
-            quarantined_at: None,
-            ladder_at: None,
-            ladder_step: 0,
-            removed_at: None,
-            latency_ms: None,
-            speed_mbps: None,
-            last_t2_failed_at: None,
-            created_at: 1,
-            updated_at: 1,
-        }
-    }
-
-    /// The card is rendered from this `ProxyRow`, never re-read from the
-    /// database, so the refresh must not turn a stored fact into `None` on
-    /// the struct either. The resolver merges the databases with an
-    /// `any`-hit, so a partial stamp is an ordinary outcome: an ASN-only
-    /// hit (a City record that decodes with an empty country, as for the
-    /// Cloudflare `104.16.0.0/12` block) must keep the country and city the
-    /// card shows, exactly as `update_geo_full`'s `COALESCE` keeps them in
-    /// the database.
-    #[test]
-    fn a_partial_stamp_does_not_clear_the_rendered_geo_fields() {
-        let mut row = card_row(Some("US"), Some("New York"), None);
-        merge_geo_stamp(
-            &mut row,
-            &proxies::GeoStamp {
-                country: None,
-                city: None,
-                asn: Some("AS13335".into()),
-            },
-        );
-        assert_eq!(
-            row.geo_country.as_deref(),
-            Some("US"),
-            "an ASN-only stamp must not render an empty Country over a stored 'US'"
-        );
-        assert_eq!(
-            row.geo_city.as_deref(),
-            Some("New York"),
-            "an ASN-only stamp must not render an empty City over a stored one"
-        );
-        assert_eq!(
-            row.geo_asn.as_deref(),
-            Some("AS13335"),
-            "the ASN the lookup did resolve is shown"
-        );
-    }
-
-    /// A stamp that does carry the fields still refreshes them.
-    #[test]
-    fn a_full_stamp_refreshes_the_rendered_geo_fields() {
-        let mut row = card_row(Some("US"), Some("New York"), Some("AS13335"));
-        merge_geo_stamp(
-            &mut row,
-            &proxies::GeoStamp {
-                country: Some("DE".into()),
-                city: Some("Frankfurt".into()),
-                asn: Some("AS24940".into()),
-            },
-        );
-        assert_eq!(row.geo_country.as_deref(), Some("DE"));
-        assert_eq!(row.geo_city.as_deref(), Some("Frankfurt"));
-        assert_eq!(row.geo_asn.as_deref(), Some("AS24940"));
-    }
-
     /// The workspace `config/` directory with the gitignored GeoLite2 files
     /// (the test skips itself when it is empty, CI runs without them), the
     /// same fixture convention as the resolver tests in `fumox-core::geo`.
@@ -1336,12 +1403,23 @@ mod tests {
         has_any.then(|| dir.canonicalize().unwrap())
     }
 
+    /// A throwaway directory per call: the tests of one binary run in
+    /// parallel, and a second-resolution timestamp would hand two tests
+    /// the same database file.
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("fumox-{label}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// An admin state on a throwaway database, with the card resolver
     /// pointed at the workspace GeoLite2 files. `None` when none are
     /// present.
     async fn geo_card_state() -> Option<AdminState> {
         let db_dir = workspace_db_dir()?;
-        let dir = std::env::temp_dir().join(format!("fumox-card-test-{}", now_ts()));
+        let dir = unique_dir("card-test");
         std::fs::create_dir_all(&dir).unwrap();
         let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
             path: dir.join("test.db"),
@@ -1410,23 +1488,23 @@ mod tests {
         .await
         .unwrap();
 
-        let mut row = proxies::get_by_id(&state.pool, id).await.unwrap().unwrap();
-        refresh_geo(&state, &mut row).await;
+        let row = proxies::get_by_id(&state.pool, id).await.unwrap().unwrap();
+        // The refresh runs in the background: the test waits for the
+        // write it triggers.
+        refresh_geo(&state, id, &row.host).await.unwrap();
 
-        // What the card renders: a `-` here would hide a country the row
-        // still holds.
+        // What the next card renders: the row the refresh wrote. A `-`
+        // here would hide a country the row still holds.
+        let card = proxies::get_by_id(&state.pool, id).await.unwrap().unwrap();
         assert_eq!(
-            row.geo_country.as_deref(),
+            card.geo_country.as_deref(),
             Some("US"),
             "the card must keep showing the stored country"
         );
-        assert_eq!(row.geo_city.as_deref(), Some("New York"));
-        assert!(row.geo_asn.is_some(), "the resolved ASN is shown");
-        assert_eq!(row.resolved_ip.as_deref(), Some(host));
-        // And the database kept them too.
-        let stored = proxies::get_by_id(&state.pool, id).await.unwrap().unwrap();
-        assert_eq!(stored.geo_country.as_deref(), Some("US"));
-        assert_eq!(stored.geo_city.as_deref(), Some("New York"));
+        assert_eq!(card.geo_city.as_deref(), Some("New York"));
+        // And the row gained the resolved facts.
+        assert!(card.geo_asn.is_some(), "the resolved ASN is stored");
+        assert_eq!(card.resolved_ip.as_deref(), Some(host));
     }
 
     /// Admin state with `[ingest].refresh_check_limit = 0`: the operator
@@ -1434,8 +1512,7 @@ mod tests {
     /// by hand (the `test_admin_state` helper fixes the default config)
     /// with the same shape as the geo card fixture above.
     async fn no_ingest_queue_state() -> AdminState {
-        let dir = std::env::temp_dir().join(format!("fumox-revive-test-{}", now_ts()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_dir("revive-test");
         let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
             path: dir.join("test.db"),
             ..Default::default()
@@ -1527,6 +1604,67 @@ mod tests {
         assert_eq!(
             queued, 1,
             "the revival hand-off must enqueue despite refresh_check_limit = 0"
+        );
+    }
+
+    /// The handler itself, not only the repo calls behind it: the form
+    /// field `country` must reach the revival and the revived row must
+    /// end up in `probe_requests` (the queue the probe daemon reads).
+    #[tokio::test]
+    async fn the_country_revival_handler_enqueues_the_revived_rows() {
+        let state = no_ingest_queue_state().await;
+        sqlx::query(
+            "INSERT OR IGNORE INTO sources (id, name, url, enabled, cache_ttl_seconds, created_at, updated_at)
+             VALUES ('srcB0000000', 's', 'https://example.com', 1, 3600, 1, 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, geo_country, created_at, updated_at)
+             VALUES ('fp-revive-country', 'trojan', 'n', 'h', 443, 'c', 'removed', 'DE', 1, 1)
+             RETURNING id",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, 'srcB0000000', 1)",
+        )
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = proxies_revive_removed_by_country(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:41000".parse().unwrap()),
+            HeaderMap::new(),
+            Form(vec![("country".to_string(), "DE".to_string())]),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "the plain-browser path answers with a redirect"
+        );
+
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM proxies WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "unknown", "the removed row must be revived");
+
+        let (queued,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM probe_requests WHERE proxy_id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            queued, 1,
+            "the handler must hand the revived row to the probe queue"
         );
     }
 }

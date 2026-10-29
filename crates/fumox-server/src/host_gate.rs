@@ -185,7 +185,10 @@ pub fn validate_forwarded_host(
     if allowed_hosts.is_empty() {
         return Ok(());
     }
-    validate_canonical_host(&canonical_forwarded_host(headers, trusted_header), allowed_hosts)
+    validate_canonical_host(
+        &canonical_forwarded_host(headers, trusted_header),
+        allowed_hosts,
+    )
 }
 
 /// True when the canonical host is a well-formed authority component: a
@@ -368,7 +371,9 @@ mod tests {
         assert!(!out.host.contains('@'), "{out:?}");
         // An ordinary host still canonicalizes as before, allowlist or not.
         assert_eq!(
-            build_serve_link_host(bind, &host("VPN.EXAMPLE.COM:8081"), &[]).unwrap().host,
+            build_serve_link_host(bind, &host("VPN.EXAMPLE.COM:8081"), &[])
+                .unwrap()
+                .host,
             "vpn.example.com"
         );
     }

@@ -15,55 +15,62 @@
 
     <div class="field">
       <label for="profile-name">{{ self.t("common.name") }} *</label>
-      <input type="text" id="profile-name" name="name" value="{{ values.name }}" maxlength="200" required>
+      <input type="text" id="profile-name" name="name" value="{{ values.name }}" maxlength="200" required{{ self.error_attrs("name") | safe }}>
       {% match self.error_for("name") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-name" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
 
     <div class="field">
       <label for="profile-slug">Slug</label>
-      <input type="text" id="profile-slug" name="slug" value="{{ values.slug }}" maxlength="64">
+      <input type="text" id="profile-slug" name="slug" value="{{ values.slug }}" maxlength="64"{{ self.error_attrs("slug") | safe }}>
       <div class="hint">{{ self.t("prof.slug_hint") }}</div>
+      {% if slug_warning %}
+        <div class="hint">{{ self.t("prof.slug_change_warning") }}</div>
+      {% endif %}
       {% match self.error_for("slug") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-slug" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
 
     <div class="field">
       <label for="profile-token">{{ self.t("prof.token_label") }}</label>
-      <input type="text" id="profile-token" name="access_token" value="{{ values.access_token }}">
+      {#- The field is a password input: the token is a secret and must
+          not sit in the DOM in clear text, and the browser must not fill
+          it with a stored password. The value is a placeholder or the
+          masked legacy token, never the secret itself. -#}
+      <input type="password" id="profile-token" name="access_token" value="{{ values.access_token }}" autocomplete="new-password" spellcheck="false"{{ self.error_attrs("access_token") | safe }}>
       <div class="hint">{{ self.t("prof.token_hint") }}</div>
       {% if token_masked_note %}
         <div class="hint">{{ self.t("prof.token_masked_note") }}</div>
       {% endif %}
       {% match self.error_for("access_token") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-access_token" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
 
     <div class="field">
       <label for="profile-output-format">{{ self.t("prof.output_format") }}</label>
-      <select id="profile-output-format" name="output_format">
+      <select id="profile-output-format" name="output_format"{{ self.error_attrs("output_format") | safe }}>
         {% for option in formats %}
           <option value="{{ option.value }}" {% if !option.available %}disabled{% endif %} {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
         {% endfor %}
       </select>
       {% match self.error_for("output_format") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-output_format" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
 
     <div class="field">
       <label for="profile-countries">{{ self.t("prof.countries_label") }}</label>
-      <input type="text" id="profile-countries" name="countries" value="{{ values.countries }}" placeholder="DE, US">
+      <input type="text" id="profile-countries" name="countries" value="{{ values.countries }}" placeholder="DE, US"{{ self.error_attrs("countries") | safe }}>
       <div class="hint">{{ self.t("prof.countries_hint") }}</div>
       {% match self.error_for("countries") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-countries" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
@@ -79,11 +86,14 @@
   <div class="panel">
     <h2>{{ self.t("prof.composition_title") }}</h2>
     <div class="hint">{{ self.t("prof.composition_hint") }}</div>
+    {# The composition is one field of the form, a table of checkboxes:
+       the group carries the reference to its message, not the invalid
+       state, since the box that was left out is not known. #}
     {% if source_picks.is_empty() %}
       <p class="muted">{{ self.t("prof.no_sources") }}</p>
     {% else %}
       <div class="table-scroll">
-        <table class="data">
+        <table class="data"{{ self.describedby("sources") | safe }}>
           <thead>
             <tr><th></th><th>{{ self.t("common.source") }}</th><th>{{ self.t("prof.order_column") }}</th></tr>
           </thead>
@@ -102,7 +112,7 @@
         </table>
       </div>
       {% match self.error_for("sources") %}
-        {% when Some with (message) %}<div class="error-text">{{ message }}</div>
+        {% when Some with (message) %}<div class="error-text" id="err-sources" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     {% endif %}

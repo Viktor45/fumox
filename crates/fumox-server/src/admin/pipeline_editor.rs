@@ -11,10 +11,16 @@
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::pipeline::{
     DEFAULT_GEO_TEMPLATE, DropRule, FilterConfig, GeoStepConfig, HealthConfig, LimitConfig,
-    PipelineConfig, RenameRule, SortBy, SortConfig,
+    PipelineConfig, PipelineIssue, RenameRule, SortBy, SortConfig,
 };
 use askama::Template;
 use fumox_core::models::{ProxyStatus, Scheme};
+
+/// The most rule rows one section of the builder may hold. The widget
+/// renders a handful at most, so the cap only bounds a programmatic
+/// submission: a form with thousands of rows must not make the server
+/// build thousands of rules (and thousands of regexes).
+const MAX_RULE_ROWS: usize = 256;
 
 /// One rename row of the builder (a `rename[]` entry).
 ///
@@ -208,6 +214,29 @@ impl BuilderState {
                 .filter(|v| !v.is_empty())
                 .collect()
         };
+        // The same lookup without the trim: a rule's own text (the
+        // pattern, the replacement, the flags, the key, the ASN list) is
+        // taken verbatim, whitespace included. A pattern may end with a
+        // space, a replacement may start with one, and the validator
+        // reports what it cannot accept.
+        let get_raw = |key: &str| -> String {
+            form.iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default()
+        };
+        // A tri-state flag. The widget renders a hidden companion with
+        // the value "0" before the checkbox, so an unchecked box submits
+        // "0" and a checked one "1" (the last value of the name wins).
+        // A field that is absent means the client does not know it: the
+        // built-in default stays in place.
+        let flag = |key: &str, default: bool| -> bool {
+            match form.iter().rev().find(|(k, _)| k == key) {
+                Some((_, value)) => value.trim() != "0",
+                None => default,
+            }
+        };
 
         // Rows are collected through an index map, so gaps (a dropped row)
         // and out-of-order fields parse identically.
@@ -229,25 +258,40 @@ impl BuilderState {
             let Ok(index) = index.parse::<usize>() else {
                 continue;
             };
-            let value = value.trim().to_string();
+            // The cap on the number of rows a section may hold. The
+            // widget never renders more than a handful, so the limit only
+            // bounds a programmatic submission: a form with a thousand
+            // rows must not make the server build a thousand rules.
+            let (known, held) = if rows {
+                (rename_rows.contains_key(&index), rename_rows.len())
+            } else {
+                (drop_rows.contains_key(&index), drop_rows.len())
+            };
+            if !known && held >= MAX_RULE_ROWS {
+                continue;
+            }
+            // The rule's own text is taken verbatim, the selector value
+            // is trimmed (it comes from a fixed list).
+            let raw = value.to_string();
+            let target = value.trim().to_string();
             if rows {
                 let row = rename_rows.entry(index).or_default();
                 match field {
-                    "match" => row.match_pattern = value,
-                    "replace" => row.replace = value,
-                    "flags" => row.flags = value,
-                    "target" => row.target = value,
-                    "key" => row.param_key = value,
+                    "match" => row.match_pattern = raw,
+                    "replace" => row.replace = raw,
+                    "flags" => row.flags = raw,
+                    "target" => row.target = target,
+                    "key" => row.param_key = raw,
                     _ => {}
                 }
             } else {
                 let row = drop_rows.entry(index).or_default();
                 match field {
-                    "match" => row.match_pattern = value,
-                    "flags" => row.flags = value,
-                    "target" => row.target = value,
-                    "key" => row.param_key = value,
-                    "asns" => row.asns = value,
+                    "match" => row.match_pattern = raw,
+                    "flags" => row.flags = raw,
+                    "target" => row.target = target,
+                    "key" => row.param_key = raw,
+                    "asns" => row.asns = raw,
                     _ => {}
                 }
             }
@@ -268,7 +312,7 @@ impl BuilderState {
             exclude_protocols: get_all("ped_filter_exclude"),
             asns: get("ped_filter_asns"),
             exclude_asns: get("ped_filter_exclude_asns"),
-            forbid_insecure: get("ped_forbid_insecure") == "1",
+            forbid_insecure: flag("ped_forbid_insecure", true),
             rename: rename_rows.into_values().collect(),
             rename_skip: rename_mode == "skip",
             rename_defaults: rename_mode == "defaults",
@@ -277,8 +321,8 @@ impl BuilderState {
             drop_defaults: drop_mode == "defaults",
             geo_set,
             geo_defaults,
-            geo_enabled: get("ped_geo_enabled") == "1",
-            geo_template: get("ped_geo_template"),
+            geo_enabled: flag("ped_geo_enabled", true),
+            geo_template: get_raw("ped_geo_template"),
             health_set,
             health_defaults,
             exclude_statuses: get_all("ped_health_exclude"),
@@ -304,7 +348,14 @@ impl BuilderState {
     /// policy (`skip_serializing_if` per field), so the emitted keys are
     /// the schema's own and a new schema field cannot be missed here
     /// without a compile error at the struct literals below.
-    pub(crate) fn emit(&self) -> Option<serde_json::Value> {
+    ///
+    /// Two values the typed schema cannot hold — a mistyped cap and an
+    /// unknown sort key — ride along in the emitted document, so the
+    /// preview shows what was typed instead of the widget dropping it.
+    /// They are reported from the field that holds them, and the readable
+    /// document leaves them out: one value the validator cannot parse
+    /// would mask every other problem the validator would find.
+    pub(crate) fn emit(&self) -> Option<Emitted> {
         let mut config = PipelineConfig {
             version: 1,
             filter: None,
@@ -316,6 +367,9 @@ impl BuilderState {
             sort: None,
             limit: None,
         };
+        let mut issues: Vec<PipelineIssue> = Vec::new();
+        let mut mistyped_limit: Option<String> = None;
+        let mut mistyped_sort: Option<String> = None;
 
         if self.filter_defaults {
             // An explicit `{}`: a profile resets the source's filter.
@@ -352,12 +406,15 @@ impl BuilderState {
             // An explicit `[]`: a profile resets the source's rename rules.
             config.rename = Some(Vec::new());
         } else if !self.rename_skip {
-            // Empty rows (no `match`) are work-in-progress lines of the
-            // widget and never reach the JSON.
+            // Rows without a pattern are work-in-progress lines of the
+            // widget and never reach the JSON. A pattern of whitespace
+            // only is the same thing: the widget cannot express it (the
+            // stored form of it goes to raw mode), so it is not typed
+            // yet either.
             let rules: Vec<RenameRule> = self
                 .rename
                 .iter()
-                .filter(|row| !row.match_pattern.is_empty())
+                .filter(|row| !row.match_pattern.trim().is_empty())
                 .map(|row| RenameRule {
                     match_pattern: row.match_pattern.clone(),
                     replace: row.replace.clone(),
@@ -378,15 +435,15 @@ impl BuilderState {
             //  * `target == "asn"` → ASN-list rule (no `match`).
             //  * any other target → regex rule with optional `match` /
             //    `flags`. The "work-in-progress" filter is on `match` for
-            //    regex rows and on `asns` for ASN rows.
+            //    regex rows and on the ASN list for ASN rows.
             let rules: Vec<DropRule> = self
                 .drop
                 .iter()
                 .filter(|row| {
                     if row.target.trim() == "asn" {
-                        !row.asns.trim().is_empty()
+                        split_asn_field(&row.asns).is_some()
                     } else {
-                        !row.match_pattern.is_empty()
+                        !row.match_pattern.trim().is_empty()
                     }
                 })
                 .map(|row| {
@@ -395,13 +452,7 @@ impl BuilderState {
                             match_pattern: String::new(),
                             flags: String::new(),
                             target: Some("asn".to_string()),
-                            asns: Some(
-                                row.asns
-                                    .split(',')
-                                    .map(|value| value.trim().to_string())
-                                    .filter(|value| !value.is_empty())
-                                    .collect(),
-                            ),
+                            asns: Some(split_asn_field(&row.asns).unwrap_or_default()),
                         }
                     } else {
                         DropRule {
@@ -425,6 +476,9 @@ impl BuilderState {
                 template: DEFAULT_GEO_TEMPLATE.to_string(),
             });
         } else if self.geo_set {
+            // The trimmed copy recognises the default and the empty
+            // field; the raw text is what the template holds, its spaces
+            // are part of the format.
             let template = self.geo_template.trim();
             let has_values =
                 !self.geo_enabled || (!template.is_empty() && template != DEFAULT_GEO_TEMPLATE);
@@ -435,7 +489,7 @@ impl BuilderState {
                 config.geo = Some(GeoStepConfig {
                     enabled: self.geo_enabled,
                     template: if !template.is_empty() && template != DEFAULT_GEO_TEMPLATE {
-                        template.to_string()
+                        self.geo_template.clone()
                     } else {
                         DEFAULT_GEO_TEMPLATE.to_string()
                     },
@@ -467,15 +521,41 @@ impl BuilderState {
         } else if self.sort_set {
             let by = SortBy::ALL
                 .iter()
-                .find(|sort| sort.as_str() == self.sort_by)
+                .find(|sort| sort.as_str() == self.sort_by.trim())
                 .copied();
-            if by.is_some_and(|by| by != SortBy::Source) || self.sort_desc {
-                config.sort = Some(SortConfig {
-                    by: by
-                        .filter(|by| *by != SortBy::Source)
-                        .unwrap_or(SortBy::Source),
-                    desc: self.sort_desc,
-                });
+            match by {
+                Some(by) => {
+                    if by != SortBy::Source || self.sort_desc {
+                        config.sort = Some(SortConfig {
+                            by,
+                            desc: self.sort_desc,
+                        });
+                    }
+                }
+                None if !self.sort_by.trim().is_empty() => {
+                    // An unknown key: the raw value rides along in the
+                    // document, the typed one keeps the rest of the
+                    // section.
+                    mistyped_sort = Some(self.sort_by.clone());
+                    issues.push(PipelineIssue {
+                        key: "pipeline.unknown_sort",
+                        args: vec![self.sort_by.clone()],
+                    });
+                    if self.sort_desc {
+                        config.sort = Some(SortConfig {
+                            by: SortBy::Source,
+                            desc: true,
+                        });
+                    }
+                }
+                None => {
+                    if self.sort_desc {
+                        config.sort = Some(SortConfig {
+                            by: SortBy::Source,
+                            desc: true,
+                        });
+                    }
+                }
             }
         }
 
@@ -485,7 +565,6 @@ impl BuilderState {
         // output is deliberately not a valid v1 config, so it cannot
         // travel inside `LimitConfig` (whose `count` is `Option<i64>`) and
         // is patched into the serialized document below.
-        let mut mistyped_limit: Option<String> = None;
         if self.limit_defaults {
             // An explicit `null` cap: a profile resets the source's limit
             // back to "no cap" (the same reset semantics as an empty
@@ -496,35 +575,58 @@ impl BuilderState {
             if !raw.is_empty() {
                 match raw.parse::<i64>() {
                     Ok(count) => config.limit = Some(LimitConfig { count: Some(count) }),
-                    Err(_) => mistyped_limit = Some(raw.to_string()),
+                    Err(_) => {
+                        mistyped_limit = Some(raw.to_string());
+                        issues.push(PipelineIssue {
+                            key: "pipeline.invalid_limit",
+                            args: vec![raw.to_string()],
+                        });
+                    }
                 }
             }
         }
 
-        let mut value =
-            serde_json::to_value(&config).expect("pipeline v1 config always serializes");
-        if let Some(raw) = mistyped_limit {
-            value["limit"] = serde_json::json!({ "count": raw });
+        let readable = serde_json::to_value(&config).expect("pipeline v1 config always serializes");
+        if issues.is_empty() && readable.as_object().is_some_and(|map| map.len() == 1) {
+            return None; // only "version", nothing configured
         }
-        if value.as_object().is_some_and(|map| map.len() == 1) {
-            None // only "version", nothing configured
+        let mut document = readable.clone();
+        if let Some(raw) = &mistyped_limit {
+            document["limit"] = serde_json::json!({ "count": raw });
+        }
+        if let Some(raw) = &mistyped_sort {
+            document["sort"]["by"] = serde_json::json!(raw);
+        }
+        if issues.is_empty() {
+            Some(Emitted::Config(document))
         } else {
-            Some(value)
+            Some(Emitted::NeedsValidation {
+                document,
+                readable,
+                issues,
+            })
         }
     }
 
     /// Canonical round-trip: rebuilding the state from the
-    /// emitted JSON and emitting again produces the same JSON. Holds for
-    /// every state, including degenerate ones (a set section with no
-    /// non-default value collapses in the first emit).
+    /// emitted document and emitting again produces the same document.
+    /// Holds for every state the builder can represent, including
+    /// degenerate ones (a set section with no non-default value collapses
+    /// in the first emit). A value the typed schema cannot hold (a
+    /// mistyped cap, an unknown sort key) is left out of the readable
+    /// document, so the round trip covers the rest of the pipeline.
     #[cfg(test)]
     fn emit_is_idempotent(&self) -> bool {
-        match self.emit() {
-            None => true, // NULL stays NULL
-            Some(json) => match BuilderState::ingest(Some(&json)) {
-                Ingest::Builder(rebuilt) => rebuilt.emit() == Some(json),
-                Ingest::Raw => false,
-            },
+        let Some(emitted) = self.emit() else {
+            return true; // NULL stays NULL
+        };
+        let Ingest::Builder(round_trip) = BuilderState::ingest(Some(emitted.readable())) else {
+            return false;
+        };
+        match round_trip.emit() {
+            Some(again) => again.readable() == emitted.readable(),
+            // Nothing configured is the bare version document.
+            None => emitted.readable() == &serde_json::json!({ "version": 1 }),
         }
     }
 }
@@ -539,6 +641,52 @@ pub(crate) enum Ingest {
     /// widget stays out of the way and the raw JSON is edited by hand;
     /// nothing is reinterpreted silently.
     Raw,
+}
+
+/// Result of [`BuilderState::emit`].
+///
+/// `Config` is a document the typed schema could hold: the validator
+/// reads it as it is. `NeedsValidation` is a document carrying a value
+/// the typed schema cannot express — a mistyped cap, an unknown sort
+/// key. The value rides along in `document` (the preview shows what was
+/// typed), `readable` is the same document without it (the one the
+/// validator can read, so one unreadable value cannot mask the problems
+/// in the rest of the pipeline), and `issues` names the field to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Emitted {
+    Config(serde_json::Value),
+    NeedsValidation {
+        document: serde_json::Value,
+        readable: serde_json::Value,
+        issues: Vec<PipelineIssue>,
+    },
+}
+
+impl Emitted {
+    /// The document as the administrator configured it.
+    pub(crate) fn document(&self) -> &serde_json::Value {
+        match self {
+            Emitted::Config(value) => value,
+            Emitted::NeedsValidation { document, .. } => document,
+        }
+    }
+
+    /// The document the validator reads: the same one without the values
+    /// the typed schema could not hold.
+    pub(crate) fn readable(&self) -> &serde_json::Value {
+        match self {
+            Emitted::Config(value) => value,
+            Emitted::NeedsValidation { readable, .. } => readable,
+        }
+    }
+
+    /// The issues of the fields the typed schema could not hold.
+    pub(crate) fn issues(&self) -> &[PipelineIssue] {
+        match self {
+            Emitted::Config(_) => &[],
+            Emitted::NeedsValidation { issues, .. } => issues,
+        }
+    }
 }
 
 impl BuilderState {
@@ -571,6 +719,8 @@ impl BuilderState {
         // An empty allowlist means "output nothing" and an empty `match`
         // pattern matches everywhere, real configs the widget cannot
         // express, so they stay in raw mode instead of flipping meaning.
+        // A pattern of whitespace only is the same thing: the widget
+        // cannot type it (an empty row means "not typed yet").
         if config
             .filter
             .as_ref()
@@ -591,7 +741,7 @@ impl BuilderState {
         if config
             .rename
             .as_ref()
-            .is_some_and(|rules| rules.iter().any(|r| r.match_pattern.is_empty()))
+            .is_some_and(|rules| rules.iter().any(|r| r.match_pattern.trim().is_empty()))
         {
             return Ingest::Raw;
         }
@@ -602,7 +752,7 @@ impl BuilderState {
         if config.drop.as_ref().is_some_and(|rules| {
             rules
                 .iter()
-                .any(|r| r.target.as_deref() != Some("asn") && r.match_pattern.is_empty())
+                .any(|r| r.target.as_deref() != Some("asn") && r.match_pattern.trim().is_empty())
         }) {
             return Ingest::Raw;
         }
@@ -757,7 +907,7 @@ pub(crate) struct BuilderView {
     pub protocols: Vec<(String, bool)>,
     pub exclude_protocols: Vec<(String, bool)>,
     pub statuses: Vec<(String, bool)>,
-    pub sort_options: Vec<(&'static str, bool)>,
+    pub sort_options: Vec<(String, bool)>,
 }
 
 impl BuilderView {
@@ -781,14 +931,18 @@ impl BuilderView {
             .map(|name| (name.to_string(), any_of(&state.exclude_statuses, name)))
             .collect();
         append_outsiders(&mut statuses, &state.exclude_statuses);
+        let mut sort_options: Vec<(String, bool)> = Schema::sort_options()
+            .into_iter()
+            .map(|name| (name.to_string(), state.sort_by == name))
+            .collect();
+        if !state.sort_by.is_empty() {
+            append_outsiders(&mut sort_options, std::slice::from_ref(&state.sort_by));
+        }
         Self {
             protocols,
             exclude_protocols,
             statuses,
-            sort_options: Schema::sort_options()
-                .into_iter()
-                .map(|name| (name, state.sort_by == name))
-                .collect(),
+            sort_options,
             state: BuilderState {
                 rename: display_rows(&state.rename),
                 drop: display_rows(&state.drop),
@@ -884,7 +1038,7 @@ impl Schema {
     }
 
     pub(crate) fn statuses() -> Vec<&'static str> {
-        ProxyStatus::ALL.iter().map(|s| s.as_str()).collect()
+        ProxyStatus::all().iter().map(|s| s.as_str()).collect()
     }
 
     pub(crate) fn sort_options() -> Vec<&'static str> {
@@ -907,22 +1061,26 @@ impl Schema {
 }
 
 /// Split the comma-separated ASN text field into trimmed entries. `None`
-/// when the field is empty (nothing configured, the key is not emitted);
-/// a non-numeric entry survives verbatim, exactly like an unknown protocol
-/// in a checkbox: the preview/save validation reports it instead of the
-/// widget silently dropping what was typed.
+/// when the field holds no entry at all (nothing configured, the key is
+/// not emitted): an empty field and a field of separators only are the
+/// same thing. A non-numeric entry survives verbatim, exactly like an
+/// unknown protocol in a checkbox: the preview/save validation reports
+/// it instead of the widget silently dropping what was typed.
 fn split_asn_field(raw: &str) -> Option<Vec<String>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    Some(
-        trimmed
-            .split(',')
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .collect(),
-    )
+    let entries: Vec<String> = trimmed
+        .split(',')
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
 }
 
 // Widget rendering
@@ -950,24 +1108,26 @@ pub(crate) fn preview_body(lang: &Lang, built: &BuilderState) -> String {
             valid: false,
             errors: Vec::new(),
         },
-        Some(value) => {
-            let json = serde_json::to_string_pretty(&value).unwrap_or_default();
-            match crate::pipeline::CompiledPipeline::from_json(Some(&value)) {
-                Ok(_) => PreviewFragment {
-                    lang: lang.clone(),
-                    json: Some(json),
-                    valid: true,
-                    errors: Vec::new(),
-                },
-                Err(issues) => PreviewFragment {
-                    lang: lang.clone(),
-                    json: Some(json),
-                    valid: false,
-                    errors: issues
-                        .iter()
-                        .map(|issue| lang.t_args(issue.key, &issue.args))
-                        .collect(),
-                },
+        Some(emitted) => {
+            let json = serde_json::to_string_pretty(emitted.document()).unwrap_or_default();
+            // The field issues come first: they name the input to fix.
+            // The validator reads the document without the values the
+            // typed schema could not hold, so one unreadable value does
+            // not mask the problems in the rest of the pipeline.
+            let mut issues = emitted.issues().to_vec();
+            if let Err(found) =
+                crate::pipeline::CompiledPipeline::from_json(Some(emitted.readable()))
+            {
+                issues.extend(found);
+            }
+            PreviewFragment {
+                lang: lang.clone(),
+                json: Some(json),
+                valid: issues.is_empty(),
+                errors: issues
+                    .iter()
+                    .map(|issue| lang.t_args(issue.key, &issue.args))
+                    .collect(),
             }
         }
     };
@@ -1135,15 +1295,23 @@ mod tests {
             .collect()
     }
 
+    impl BuilderState {
+        /// The document the editor would store: the emit policy's output,
+        /// the values the typed schema could not hold included.
+        fn doc(&self) -> Option<serde_json::Value> {
+            self.emit().map(|emitted| emitted.document().clone())
+        }
+    }
+
     #[test]
     fn empty_state_emits_none() {
-        assert_eq!(state().emit(), None);
+        assert_eq!(state().doc(), None);
         // Only the toggle without any non-default value is still NULL.
         let mut s = state();
         s.filter_set = true;
         s.geo_set = true;
         s.sort_set = true;
-        assert_eq!(s.emit(), None);
+        assert_eq!(s.doc(), None);
     }
 
     #[test]
@@ -1190,7 +1358,7 @@ mod tests {
         s.sort_desc = true;
 
         assert_eq!(
-            s.emit(),
+            s.doc(),
             Some(json!({
                 "version": 1,
                 "filter": {
@@ -1203,7 +1371,7 @@ mod tests {
             }))
         );
         // Everything the emit produced must pass the real validator.
-        assert!(crate::pipeline::CompiledPipeline::from_json(s.emit().as_ref()).is_ok());
+        assert!(crate::pipeline::CompiledPipeline::from_json(s.doc().as_ref()).is_ok());
     }
 
     #[test]
@@ -1224,7 +1392,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            s.emit(),
+            s.doc(),
             Some(json!({
                 "version": 1,
                 "filter": { "protocols": ["ss"] },
@@ -1261,7 +1429,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            s.emit(),
+            s.doc(),
             Some(json!({
                 "version": 1,
                 "rename": [
@@ -1273,7 +1441,7 @@ mod tests {
         );
         // …and the emitted JSON rebuilds the same split form, `name`, the
         // schema default, comes back as the select's implicit value ("").
-        let Some(json) = s.emit() else {
+        let Some(json) = s.doc() else {
             panic!("must emit")
         };
         let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
@@ -1314,7 +1482,7 @@ mod tests {
                 flags: String::new(),
             },
         ];
-        let json = s.emit().unwrap();
+        let json = s.doc().unwrap();
         assert_eq!(json["rename"][0]["target"], json!("param:"));
         assert_eq!(json["rename"][1]["target"], json!("bogus"));
         assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_err());
@@ -1354,7 +1522,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            s.emit(),
+            s.doc(),
             Some(json!({
                 "version": 1,
                 "rename": [
@@ -1385,7 +1553,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            s.emit(),
+            s.doc(),
             Some(json!({
                 "version": 1,
                 "drop": [
@@ -1394,7 +1562,7 @@ mod tests {
                 ]
             }))
         );
-        let Some(json) = s.emit() else {
+        let Some(json) = s.doc() else {
             panic!("must emit")
         };
         let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
@@ -1418,13 +1586,13 @@ mod tests {
             asns: "24940, AS13335".into(),
         }];
         assert_eq!(
-            s.emit(),
+            s.doc(),
             Some(json!({
                 "version": 1,
                 "drop": [{ "target": "asn", "asns": ["24940", "AS13335"] }]
             }))
         );
-        let Some(json) = s.emit() else {
+        let Some(json) = s.doc() else {
             panic!("must emit")
         };
         // Validator accepts it and produces an ASN-list compiled drop.
@@ -1451,7 +1619,7 @@ mod tests {
             asns: "24940".into(),
         }];
         assert_eq!(
-            s.emit(),
+            s.doc(),
             Some(json!({
                 "version": 1,
                 "drop": [{ "target": "asn", "asns": ["24940"] }]
@@ -1465,7 +1633,7 @@ mod tests {
         // profile semantics as rename.
         let mut s = state();
         s.drop_defaults = true;
-        let Some(json) = s.emit() else {
+        let Some(json) = s.doc() else {
             panic!("must emit")
         };
         assert_eq!(json["drop"], json!([]));
@@ -1516,7 +1684,7 @@ mod tests {
         // The rename rows are untouched by the drop fields.
         assert_eq!(s.rename.len(), 1);
         assert_eq!(s.rename[0].match_pattern, "unrelated");
-        let emitted = s.emit().unwrap();
+        let emitted = s.doc().unwrap();
         assert_eq!(
             emitted["drop"],
             json!([
@@ -1542,7 +1710,7 @@ mod tests {
         s.sort_set = true;
         s.sort_by = "source".into();
         s.sort_desc = false;
-        assert_eq!(s.emit(), None);
+        assert_eq!(s.doc(), None);
     }
 
     #[test]
@@ -1554,7 +1722,7 @@ mod tests {
         s.health_defaults = true;
         s.sort_defaults = true;
         assert_eq!(
-            s.emit(),
+            s.doc(),
             Some(json!({
                 "version": 1,
                 "filter": {},
@@ -1565,7 +1733,7 @@ mod tests {
             }))
         );
         // Every empty section is valid for the real validator.
-        assert!(crate::pipeline::CompiledPipeline::from_json(s.emit().as_ref()).is_ok());
+        assert!(crate::pipeline::CompiledPipeline::from_json(s.doc().as_ref()).is_ok());
     }
 
     #[test]
@@ -1581,7 +1749,7 @@ mod tests {
         s.filter_set = true;
         s.protocols = vec!["vless".into()];
         assert_eq!(
-            s.emit(),
+            s.doc(),
             Some(json!({ "version": 1, "filter": { "protocols": ["vless"] } }))
         );
     }
@@ -1595,6 +1763,8 @@ mod tests {
             vec![("ped_filter_asns".to_string(), "24940, AS13335".to_string())],
             vec![("ped_filter_exclude_asns".to_string(), " 9009 ".to_string())],
             vec![("ped_forbid_insecure".to_string(), "1".to_string())],
+            // The unchecked box submits the hidden companion's "0".
+            vec![("ped_geo_enabled".to_string(), "0".to_string())],
             vec![
                 ("ped_rename_1_match".to_string(), "b".to_string()),
                 ("ped_rename_1_replace".to_string(), "B".to_string()),
@@ -1660,7 +1830,7 @@ mod tests {
         s.asns = "24940, AS13335".into();
         s.exclude_asns = "9009".into();
 
-        let json = s.emit().expect("must emit");
+        let json = s.doc().expect("must emit");
         assert_eq!(
             json,
             json!({
@@ -1702,7 +1872,7 @@ mod tests {
         s.filter_set = true;
         s.asns = " 24940 , oops ".into();
 
-        let json = s.emit().expect("must emit");
+        let json = s.doc().expect("must emit");
         assert_eq!(
             json,
             json!({
@@ -1722,7 +1892,7 @@ mod tests {
         let mut s = state();
         s.limit_set = true;
         s.limit_count = "100".into();
-        let json = s.emit().expect("must emit");
+        let json = s.doc().expect("must emit");
         assert_eq!(json, json!({ "version": 1, "limit": { "count": 100 } }));
         assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_ok());
         let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
@@ -1735,7 +1905,7 @@ mod tests {
         // source's limit back to "no cap".
         let mut d = state();
         d.limit_defaults = true;
-        let json = d.emit().expect("must emit");
+        let json = d.doc().expect("must emit");
         assert_eq!(json, json!({ "version": 1, "limit": { "count": null } }));
         assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_ok());
         let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
@@ -1747,7 +1917,7 @@ mod tests {
         let mut e = state();
         e.limit_set = true;
         e.limit_count = "  ".into();
-        assert_eq!(e.emit(), None);
+        assert_eq!(e.doc(), None);
     }
 
     #[test]
@@ -1757,7 +1927,7 @@ mod tests {
         let mut s = state();
         s.limit_set = true;
         s.limit_count = "many".into();
-        let json = s.emit().expect("must emit");
+        let json = s.doc().expect("must emit");
         assert_eq!(json, json!({ "version": 1, "limit": { "count": "many" } }));
         assert!(crate::pipeline::CompiledPipeline::from_json(Some(&json)).is_err());
     }
@@ -1788,13 +1958,16 @@ mod tests {
 
     #[test]
     fn from_form_without_fields_is_a_clean_slate() {
-        // No `ped_*` fields at all: every checkbox unchecked, every list
-        // empty, the emit is NULL, exactly like an untouched widget.
+        // No `ped_*` fields at all: every section off, every list empty, the
+        // emit is NULL, exactly like an untouched widget. The two switches
+        // that carry a built-in default keep it when the field is absent:
+        // a non-browser client that knows nothing about them must not
+        // silently switch them off.
         let s = BuilderState::from_form(&[("name".into(), "x".into())]);
         assert!(!s.filter_set && !s.geo_set && !s.health_set && !s.sort_set);
-        assert!(!s.forbid_insecure && !s.geo_enabled && !s.sort_desc);
+        assert!(s.forbid_insecure && s.geo_enabled && !s.sort_desc);
         assert!(s.rename.is_empty());
-        assert_eq!(s.emit(), None);
+        assert_eq!(s.doc(), None);
         // A rendered widget starts from different defaults, the built-in ones.
         let fresh = BuilderState::new();
         assert!(fresh.forbid_insecure && fresh.geo_enabled);
@@ -1841,7 +2014,7 @@ mod tests {
         assert_eq!(s.sort_by, "name");
 
         // And the rebuilt state emits the same JSON back.
-        assert_eq!(s.emit().unwrap(), json);
+        assert_eq!(s.doc().unwrap(), json);
     }
 
     #[test]
@@ -1859,7 +2032,7 @@ mod tests {
         assert!(s.filter_set);
         assert!(!s.forbid_insecure);
         assert_eq!(
-            s.emit().unwrap(),
+            s.doc().unwrap(),
             json!({
                 "version": 1,
                 "filter": { "forbid_insecure": false }
@@ -1891,7 +2064,7 @@ mod tests {
         // Emitting produces the canonical form: same effective values (the
         // defaults the sections carried), without spelling them out.
         assert_eq!(
-            s.emit().unwrap(),
+            s.doc().unwrap(),
             json!({
                 "version": 1,
                 "filter": {},
@@ -1915,7 +2088,7 @@ mod tests {
         assert!(s.geo_set && !s.geo_enabled);
         assert_eq!(s.geo_template, "");
         assert_eq!(
-            s.emit().unwrap(),
+            s.doc().unwrap(),
             json!({ "version": 1, "geo": { "enabled": false } })
         );
     }
@@ -1965,7 +2138,7 @@ mod tests {
         assert_eq!(s.exclude_statuses, ["sleeping"]);
         assert_eq!(s.rename[0].match_pattern, "(");
         // Emitting them back produces the same JSON, which the validator rejects.
-        let emitted = s.emit().unwrap();
+        let emitted = s.doc().unwrap();
         assert!(crate::pipeline::CompiledPipeline::from_json(Some(&emitted)).is_err());
     }
 
@@ -1976,7 +2149,7 @@ mod tests {
             panic!("must parse");
         };
         assert_eq!(*s, BuilderState::new()); // nothing to configure
-        assert_eq!(s.emit(), None); // NULL is the equivalent config
+        assert_eq!(s.doc(), None); // NULL is the equivalent config
     }
 
     #[test]
@@ -2023,8 +2196,180 @@ mod tests {
         everything.sort_desc = true;
         states.push(everything);
 
+        // A field that holds nothing: ", ," is no AS number.
+        let mut separators = state();
+        separators.filter_set = true;
+        separators.asns = ", ,".into();
+        separators.exclude_asns = ", ,".into();
+        states.push(separators);
+
+        // A value the typed schema cannot hold: the mistyped cap.
+        let mut mistyped = state();
+        mistyped.limit_set = true;
+        mistyped.limit_count = "many".into();
+        states.push(mistyped);
+
         for s in &states {
             assert!(s.emit_is_idempotent(), "{s:?}");
+        }
+    }
+
+    /// A programmatic submission with thousands of rows must not make the
+    /// server build thousands of rules (and thousands of regexes).
+    #[test]
+    fn from_form_caps_the_number_of_rows_per_section() {
+        let mut form = Vec::new();
+        for index in 0..(MAX_RULE_ROWS + 50) {
+            form.push((format!("ped_rename_{index}_match"), format!("r{index}")));
+            form.push((format!("ped_drop_{index}_match"), format!("d{index}")));
+        }
+        let s = BuilderState::from_form(&form);
+        assert_eq!(s.rename.len(), MAX_RULE_ROWS);
+        assert_eq!(s.drop.len(), MAX_RULE_ROWS);
+        // The rows that made the cut are the first ones.
+        assert_eq!(s.rename[0].match_pattern, "r0");
+        assert_eq!(
+            s.rename[MAX_RULE_ROWS - 1].match_pattern,
+            format!("r{}", MAX_RULE_ROWS - 1)
+        );
+    }
+
+    /// The rule text is taken as typed: a pattern may end with a space, a
+    /// replacement may start with one. Only the selectors are trimmed.
+    #[test]
+    fn from_form_keeps_the_rule_text_verbatim() {
+        let form: Vec<(String, String)> = vec![
+            ("ped_rename_0_match".into(), " free ".into()),
+            ("ped_rename_0_replace".into(), " paid ".into()),
+            ("ped_rename_0_flags".into(), " i ".into()),
+            ("ped_rename_0_target".into(), " host ".into()),
+            ("ped_rename_0_key".into(), " fp ".into()),
+            ("ped_drop_0_asns".into(), " 24940 , AS13335 ".into()),
+            ("ped_geo_template".into(), " {name} ".into()),
+        ];
+        let mut s = BuilderState::from_form(&form);
+        s.geo_set = true;
+        assert_eq!(s.rename[0].match_pattern, " free ");
+        assert_eq!(s.rename[0].replace, " paid ");
+        assert_eq!(s.rename[0].flags, " i ");
+        assert_eq!(s.rename[0].target, "host");
+        assert_eq!(s.rename[0].param_key, " fp ");
+        assert_eq!(s.drop[0].asns, " 24940 , AS13335 ");
+        assert_eq!(s.geo_template, " {name} ");
+        // …and the emit writes the same text.
+        let json = s.doc().expect("must emit");
+        assert_eq!(json["rename"][0]["match"], " free ");
+        assert_eq!(json["rename"][0]["replace"], " paid ");
+        assert_eq!(json["geo"]["template"], " {name} ");
+    }
+
+    /// The widget cannot type a whitespace-only pattern (an empty row means
+    /// "not typed yet"), so a stored rule like that stays in raw mode
+    /// instead of losing the rule.
+    #[test]
+    fn ingest_keeps_a_whitespace_only_pattern_in_raw_mode() {
+        let rename = json!({ "version": 1, "rename": [{ "match": "   ", "replace": "x" }] });
+        assert_eq!(BuilderState::ingest(Some(&rename)), Ingest::Raw);
+        let drop = json!({ "version": 1, "drop": [{ "match": " " }] });
+        assert_eq!(BuilderState::ingest(Some(&drop)), Ingest::Raw);
+    }
+
+    /// ", ," holds no AS number: an empty allowlist means "keep nothing",
+    /// a meaning the text field cannot express.
+    #[test]
+    fn an_asn_field_of_separators_is_not_an_allowlist() {
+        assert_eq!(split_asn_field(", ,"), None);
+        assert_eq!(split_asn_field("  "), None);
+        assert_eq!(
+            split_asn_field("24940, AS13335"),
+            Some(vec!["24940".to_string(), "AS13335".to_string()])
+        );
+        // The empty list is not written as an allowlist.
+        let mut s = state();
+        s.filter_set = true;
+        s.protocols = vec!["vless".into()];
+        s.asns = ", ,".into();
+        s.exclude_asns = ", ,".into();
+        let json = s.doc().expect("must emit");
+        assert_eq!(json["filter"], json!({ "protocols": ["vless"] }));
+    }
+
+    /// An unknown sort key is reported from the field that holds it and
+    /// rides along in the document, so the preview shows what was typed.
+    #[test]
+    fn an_unknown_sort_key_is_reported_and_kept() {
+        let mut s = state();
+        s.sort_set = true;
+        s.sort_by = "bogus".into();
+        let emitted = s.emit().expect("must emit");
+        assert_eq!(emitted.document()["sort"]["by"], json!("bogus"));
+        assert_eq!(emitted.issues().len(), 1);
+        assert_eq!(emitted.issues()[0].key, "pipeline.unknown_sort");
+        assert_eq!(emitted.issues()[0].args, vec!["bogus".to_string()]);
+        // The readable document leaves the unknown key out: one unreadable
+        // value must not mask the problems in the rest of the pipeline.
+        assert!(emitted.readable().get("sort").is_none());
+        // The select keeps the unknown key visible and checked.
+        let view = BuilderView::new(&s);
+        assert!(view.sort_options.contains(&("bogus".to_string(), true)));
+    }
+
+    /// A mistyped cap is reported from the field that holds it and rides
+    /// along in the document, so the preview shows what was typed.
+    #[test]
+    fn a_mistyped_cap_is_reported_from_the_field() {
+        let mut s = state();
+        s.limit_set = true;
+        s.limit_count = "many".into();
+        let emitted = s.emit().expect("must emit");
+        assert_eq!(emitted.document()["limit"]["count"], json!("many"));
+        assert_eq!(emitted.issues().len(), 1);
+        assert_eq!(emitted.issues()[0].key, "pipeline.invalid_limit");
+        assert_eq!(emitted.issues()[0].args, vec!["many".to_string()]);
+        // The readable document leaves it out, so the rest of the pipeline
+        // is still validated.
+        assert!(emitted.readable().get("limit").is_none());
+        assert!(crate::pipeline::CompiledPipeline::from_json(Some(emitted.readable())).is_ok());
+    }
+
+    /// The two switches that carry a built-in default are tri-state: the
+    /// widget submits "0" for an unchecked box, a missing field keeps the
+    /// built-in default.
+    #[test]
+    fn the_built_in_default_switches_are_tri_state() {
+        let off = BuilderState::from_form(&[
+            ("ped_forbid_insecure".into(), "0".into()),
+            ("ped_geo_enabled".into(), "0".into()),
+        ]);
+        assert!(!off.forbid_insecure && !off.geo_enabled);
+        let on = BuilderState::from_form(&[
+            ("ped_forbid_insecure".into(), "1".into()),
+            ("ped_geo_enabled".into(), "1".into()),
+        ]);
+        assert!(on.forbid_insecure && on.geo_enabled);
+        // A client that does not know the fields keeps the defaults.
+        let absent = BuilderState::from_form(&[]);
+        assert!(absent.forbid_insecure && absent.geo_enabled);
+        // The widget renders the companion before the checkbox: the last
+        // submitted value of the name wins.
+        let html = widget_from_posted(
+            test_lang(),
+            "c",
+            &[("pipeline_mode".into(), "builder".into())],
+            false,
+            None,
+        );
+        for name in ["ped_forbid_insecure", "ped_geo_enabled"] {
+            let companion = html
+                .find(&format!(r#"name="{name}" value="0""#))
+                .unwrap_or_else(|| panic!("the hidden companion of {name}"));
+            let checkbox = html
+                .find(&format!(r#"name="{name}" value="1""#))
+                .unwrap_or_else(|| panic!("the checkbox of {name}"));
+            assert!(
+                companion < checkbox,
+                "the companion of {name} must come first"
+            );
         }
     }
 
@@ -2049,7 +2394,7 @@ mod tests {
         s.sort_set = true;
         s.sort_by = "latency".into();
 
-        let Some(json) = s.emit() else {
+        let Some(json) = s.doc() else {
             panic!("must emit");
         };
         let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
@@ -2066,7 +2411,7 @@ mod tests {
         s.exclude_statuses = vec!["alive".into()];
         s.rename_defaults = true;
 
-        let Some(json) = s.emit() else {
+        let Some(json) = s.doc() else {
             panic!("must emit");
         };
         let Ingest::Builder(rebuilt) = BuilderState::ingest(Some(&json)) else {
@@ -2083,7 +2428,7 @@ mod tests {
             workers.exclude_statuses,
             ["unknown", "quarantine", "removed"]
         );
-        assert!(crate::pipeline::CompiledPipeline::from_json(workers.emit().as_ref()).is_ok());
+        assert!(crate::pipeline::CompiledPipeline::from_json(workers.doc().as_ref()).is_ok());
 
         let country = preset("country");
         assert!(country.geo_set);
@@ -2417,7 +2762,7 @@ mod tests {
     fn geo_defaults_round_trips_through_emit() {
         let mut s = state();
         s.geo_defaults = true;
-        let json = s.emit().expect("geo_defaults must produce a JSON");
+        let json = s.doc().expect("geo_defaults must produce a JSON");
         let geo = json
             .get("geo")
             .expect("emit must include geo under defaults: {json}");
@@ -2442,7 +2787,7 @@ mod tests {
         s.geo_set = true;
         s.geo_enabled = false; // inner checkbox unchecked
         s.geo_template = "{asn} · {name}".into();
-        let json = s.emit().expect("geo_set must produce a JSON");
+        let json = s.doc().expect("geo_set must produce a JSON");
         assert_eq!(
             json.get("geo").and_then(|g| g.get("enabled")),
             Some(&serde_json::Value::from(false)),
@@ -2490,7 +2835,7 @@ mod tests {
     fn sort_defaults_round_trips_through_emit() {
         let mut s = state();
         s.sort_defaults = true;
-        let json = s.emit().expect("sort_defaults must produce a JSON");
+        let json = s.doc().expect("sort_defaults must produce a JSON");
         let sort = json
             .get("sort")
             .expect("emit must include sort under defaults: {json}");
@@ -2530,7 +2875,7 @@ mod tests {
     fn limit_defaults_round_trips_through_emit() {
         let mut s = state();
         s.limit_defaults = true;
-        let json = s.emit().expect("limit_defaults must produce a JSON");
+        let json = s.doc().expect("limit_defaults must produce a JSON");
         let limit = json
             .get("limit")
             .expect("emit must include limit under defaults: {json}");
@@ -2606,17 +2951,17 @@ mod tests {
         fn check(form: Vec<(String, String)>) {
             let s = BuilderState::from_form(&form);
             let json = s
-                .emit()
+                .doc()
                 .expect("every field populated must emit non-null JSON");
             let Ingest::Builder(loaded) = BuilderState::ingest(Some(&json)) else {
                 panic!("ingest must return Builder, got Raw: {json}");
             };
             // Re-emit; idempotency.
             assert_eq!(
-                loaded.emit(),
+                loaded.doc(),
                 Some(json.clone()),
                 "round-trip lost data: emit={json}, ingest={:?}",
-                loaded.emit()
+                loaded.doc()
             );
             // Per-field checks against the *re-emitted* JSON.
             let v = &json;
@@ -2651,11 +2996,11 @@ mod tests {
             ("ped_filter_asns".into(), "24940, AS13335".into()),
             ("ped_filter_exclude_asns".into(), " 9009 ".into()),
             // forbid_insecure explicitly off
-            ("ped_forbid_insecure".into(), "".into()),
+            ("ped_forbid_insecure".into(), "0".into()),
             ("ped_rename_0_match".into(), "a".into()),
             ("ped_rename_0_replace".into(), "A".into()),
             ("ped_rename_0_flags".into(), "i".into()),
-            ("ped_geo_enabled".into(), "".into()),
+            ("ped_geo_enabled".into(), "0".into()),
             ("ped_geo_template".into(), "{asn} · {name}".into()),
             // override the built-in default exclude_statuses (q+r) so the
             // builder emits the section
@@ -2705,7 +3050,7 @@ mod tests {
         s.health_defaults = true;
         s.sort_defaults = true;
         s.limit_defaults = true;
-        let json = s.emit().expect("all-defaults state must emit");
+        let json = s.doc().expect("all-defaults state must emit");
         assert_eq!(json["filter"], serde_json::json!({}));
         assert_eq!(json["rename"], serde_json::json!([]));
         assert_eq!(json["drop"], serde_json::json!([]));

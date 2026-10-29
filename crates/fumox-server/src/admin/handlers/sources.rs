@@ -3,9 +3,10 @@
 //! toggle / *Refresh now* / delete actions.
 
 use super::{
-    FormError, FormMap, action_response, caps, flash_redirect, fmt_bytes, is_htmx, mask_secret,
-    not_found, page_offset, pagination_pages, pipeline_from_form, row_error_response, server_error,
-    validate_header_map, validate_name, validate_slug, validate_tags, validate_ttl,
+    FormError, FormMap, action_response, action_response_err, caps, flash_redirect, fmt_bytes,
+    is_htmx, mask_secret, not_found, page_offset, pagination_pages, pipeline_from_form,
+    row_error_response, server_error, validate_header_map, validate_name, validate_slug,
+    validate_tags, validate_ttl,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -13,6 +14,7 @@ use crate::admin::pipeline_editor::{widget_from_posted, widget_from_stored};
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
 use crate::fetcher;
+use crate::redact::{REDACTED, is_sensitive_param, mask_query, query_span, userinfo_span};
 use askama::Template;
 use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -21,6 +23,7 @@ use fumox_core::models::{
     Encoding, ErrorClass, InputFormat, IpFamily, Scheme, Source, new_id, now_ts,
 };
 use fumox_core::repo::{fetch_log, proxies, sources};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
@@ -119,7 +122,16 @@ pub async fn sources_list(
         query: f_q.clone(),
     };
     let rows = match sources::list_filtered(&state.pool, &filter).await {
-        Ok(rows) => rows,
+        Ok(rows) => rows
+            .into_iter()
+            .map(|mut row| {
+                // The list shows the URL of every source: the password
+                // of the userinfo and the value of a credential-bearing
+                // query pair are secrets and stay in the database.
+                row.url = mask_url_secrets(&row.url);
+                row
+            })
+            .collect(),
         Err(err) => return server_error(lang, &err),
     };
 
@@ -155,6 +167,9 @@ struct SourceFormValues {
     name: String,
     slug: String,
     url: String,
+    /// Whether the URL field carries a mask: the note about the restore
+    /// is only shown when there is a secret to restore.
+    url_masked: bool,
     enabled: bool,
     encoding: String,
     input_format: String,
@@ -266,7 +281,10 @@ pub async fn source_edit_form(
     let values = SourceFormValues {
         name: source.name.clone(),
         slug: source.slug.clone().unwrap_or_default(),
-        url: source.url.clone(),
+        // The secrets of the URL are masked: the form hands the masks
+        // back on submit, and the save puts the stored values under them.
+        url: mask_url_secrets(&source.url),
+        url_masked: mask_url_secrets(&source.url) != source.url,
         enabled: source.enabled,
         encoding: source.encoding.as_str().to_string(),
         input_format: source
@@ -327,6 +345,134 @@ fn values_for_select(source: &Source) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// The URL and the header values carry the credentials of the upstream
+// feed. The admin screens show them, so the secrets are masked there and
+// restored from the stored row when the form comes back — the mask is a
+// display form, never the value that is stored.
+
+/// The password of a URL's userinfo, if it has one.
+fn url_password(url: &str) -> Option<&str> {
+    let (start, end) = userinfo_span(url)?;
+    let userinfo = &url[start..end];
+    let colon = userinfo.find(':')?;
+    Some(&userinfo[colon + 1..])
+}
+
+/// The URL as the admin shows it: the password of the userinfo masked.
+///
+/// The username stays: it tells the operator which account the feed
+/// belongs to. The password is the secret, so it is replaced by its
+/// mask, exactly like the header values.
+fn mask_url_userinfo(url: &str) -> String {
+    let Some((start, end)) = userinfo_span(url) else {
+        return url.to_string();
+    };
+    let userinfo = &url[start..end];
+    let Some(colon) = userinfo.find(':') else {
+        // A userinfo without a password carries no secret.
+        return url.to_string();
+    };
+    let masked = mask_secret(&userinfo[colon + 1..]);
+    format!(
+        "{}{}:{masked}{}",
+        &url[..start],
+        &userinfo[..colon],
+        &url[end..]
+    )
+}
+
+/// The URL as the admin shows it: the password of the userinfo masked and
+/// the value of every credential-bearing query pair redacted.
+///
+/// A subscription token travels in the query as often as a password
+/// travels in the userinfo, and the query value is replaced whole: there
+/// is no account name to keep, the pair itself is the secret.
+fn mask_url_secrets(url: &str) -> String {
+    mask_query(&mask_url_userinfo(url))
+}
+
+/// The submitted URL with the stored password put back where the form
+/// still carries the mask rendered from it.
+///
+/// The mask is valid in the one place it was rendered for — the password
+/// of the userinfo — so it is restored only there. A password that is
+/// not the mask is kept exactly as typed: a fresh secret replaces the
+/// mask, and a URL without a password keeps the one it was given.
+fn restore_url_password(submitted: &str, stored: &str) -> String {
+    let Some(stored_password) = url_password(stored) else {
+        return submitted.to_string();
+    };
+    let Some(submitted_password) = url_password(submitted) else {
+        return submitted.to_string();
+    };
+    if submitted_password != mask_secret(stored_password) {
+        return submitted.to_string();
+    }
+    let (start, end) = match userinfo_span(submitted) {
+        Some(span) => span,
+        None => return submitted.to_string(),
+    };
+    let userinfo = &submitted[start..end];
+    let Some(colon) = userinfo.find(':') else {
+        return submitted.to_string();
+    };
+    format!(
+        "{}{}:{stored_password}{}",
+        &submitted[..start],
+        &userinfo[..colon],
+        &submitted[end..]
+    )
+}
+
+/// The query of the submitted URL with the stored values put back where
+/// the form still carries the redaction marker.
+///
+/// The marker is valid in the one place it was rendered for — the value
+/// of a credential-bearing pair — so it is restored only there, and only
+/// for a pair the stored URL still carries: a pair the operator added
+/// keeps the value that was typed.
+fn restore_url_query(submitted: &str, stored: &str) -> String {
+    let Some((s_start, s_end)) = query_span(submitted) else {
+        return submitted.to_string();
+    };
+    let Some((t_start, t_end)) = query_span(stored) else {
+        return submitted.to_string();
+    };
+    let mut pool: HashMap<&str, VecDeque<&str>> = HashMap::new();
+    for pair in stored[t_start..t_end].split('&') {
+        if let Some((name, value)) = pair.split_once('=')
+            && is_sensitive_param(name)
+        {
+            pool.entry(name).or_default().push_back(value);
+        }
+    }
+    let mut restored: Vec<String> = Vec::with_capacity(4);
+    for pair in submitted[s_start..s_end].split('&') {
+        let value = match pair.split_once('=') {
+            Some((name, value)) if value == REDACTED && is_sensitive_param(name) => {
+                match pool.get_mut(name).and_then(|values| values.pop_front()) {
+                    Some(stored_value) => format!("{name}={stored_value}"),
+                    None => pair.to_string(),
+                }
+            }
+            _ => pair.to_string(),
+        };
+        restored.push(value);
+    }
+    format!(
+        "{}{}{}",
+        &submitted[..s_start],
+        restored.join("&"),
+        &submitted[s_end..]
+    )
+}
+
+/// The submitted URL with the stored secrets put back where the form
+/// still carries the masks rendered from them.
+fn restore_url_secrets(submitted: &str, stored: &str) -> String {
+    restore_url_query(&restore_url_password(submitted, stored), stored)
+}
+
 /// Validate + assemble a `Source` from form fields. Returns the model or
 /// the reason it could not be built: per-field errors (translated, shown
 /// next to fields) or a row that could not be read.
@@ -352,6 +498,28 @@ async fn build_source_from_form(
     };
 
     let mut errors: Vec<(String, String)> = Vec::new();
+
+    // The stored row is read once, up front: the form hands back the
+    // secrets it masked (the password of the URL, the header values),
+    // and the updated row carries the creation stamp of the row it
+    // replaces. A row that cannot be read is a broken database or a
+    // vanished source, never a form error.
+    let existing = match existing_id {
+        Some(id) => match sources::get(&state.pool, id).await {
+            Ok(Some(stored)) => Some(stored),
+            // The row is gone: the save has nothing to update.
+            Ok(None) => {
+                return Err(FormError::Server(fumox_core::Error::NotFound(format!(
+                    "source {id}"
+                ))));
+            }
+            Err(err) => {
+                tracing::error!(error = %err, source = %id, "failed to read the source row");
+                return Err(FormError::Server(err));
+            }
+        },
+        None => None,
+    };
 
     let name = get("name");
     if let Err(message) = validate_name(&name, lang) {
@@ -383,7 +551,14 @@ async fn build_source_from_form(
         }
     };
 
-    let url = get("url");
+    // The URL: the edit form shows the secrets of the URL masked, so the
+    // stored values go back where the form still carries those masks.
+    // The restored URL is the one that is vetted and stored.
+    let url_raw = get("url");
+    let url = match existing.as_ref() {
+        Some(stored) => restore_url_secrets(&url_raw, &stored.url),
+        None => url_raw.clone(),
+    };
     if url.is_empty() {
         errors.push(("url".into(), lang.t("val.required").into()));
     } else if url.len() > caps::URL {
@@ -500,7 +675,27 @@ async fn build_source_from_form(
             continue;
         }
         let value = value.trim().to_string();
-        headers_map.insert(key, value);
+        // Two lines for one header are a mistake, not a silent overwrite:
+        // the second value would replace the first without a trace.
+        if headers_map.insert(key.clone(), value).is_some() {
+            errors.push((
+                "headers".into(),
+                lang.t("val.header_duplicate").replace("{}", &key),
+            ));
+        }
+    }
+    // The masked values go back where the form still carries the mask
+    // rendered from them. A mask is valid only under the key it was
+    // rendered for: under any other key it is reported, so the operator
+    // enters the value again instead of a mask reaching the upstream
+    // fetch as a credential.
+    if let Some(stored_headers) = existing.as_ref().and_then(|s| s.headers.as_ref())
+        && let Some(key) = restore_masked_headers(&mut headers_map, stored_headers)
+    {
+        errors.push((
+            "headers".into(),
+            lang.t("val.header_mask").replace("{}", &key),
+        ));
     }
     // The caps and the header syntax are the shared rules: the whole map
     // is replayed on every fetch of the source, so it is bounded like
@@ -517,27 +712,6 @@ async fn build_source_from_form(
 
     if !errors.is_empty() {
         return Err(FormError::Validation(errors));
-    }
-
-    // The stored row: its masked header secrets go back where the form
-    // still carries the mask, and its creation stamp and last fetch
-    // state carry over into the updated row. A failed read is a broken
-    // database, not a missing row: the two must not answer alike.
-    let existing = match existing_id {
-        Some(id) => match sources::get(&state.pool, id).await {
-            Ok(Some(stored)) => Some(stored),
-            // The row is gone: the save has nothing to update.
-            Ok(None) => {
-                return Err(FormError::Server(fumox_core::Error::NotFound(format!(
-                    "source {id}"
-                ))));
-            }
-            Err(err) => return Err(FormError::Server(err)),
-        },
-        None => None,
-    };
-    if let Some(stored_headers) = existing.as_ref().and_then(|s| s.headers.as_ref()) {
-        restore_masked_headers(&mut headers_map, stored_headers);
     }
 
     let now = now_ts();
@@ -562,68 +736,58 @@ async fn build_source_from_form(
         ip_family,
         created_at: existing.as_ref().map(|s| s.created_at).unwrap_or(now),
         updated_at: now,
-        last_fetched_at: existing.as_ref().and_then(|s| s.last_fetched_at),
-        last_error: existing.as_ref().and_then(|s| s.last_error.clone()),
-        error_class: existing.as_ref().and_then(|s| s.error_class),
+        // The fetcher owns these three columns: the admin write path
+        // does not carry them (`sources::update_settings` leaves the
+        // stored values alone), so the assembled row leaves them empty.
+        last_fetched_at: None,
+        last_error: None,
+        error_class: None,
     })
 }
 
 /// Put the stored secret back where the form still carries the mask
 /// rendered from it (`mask_secret`).
 ///
-/// An unchanged key is matched by key *and* mask, so it restores its own
-/// secret exactly and a value the operator retyped (`tok•en`, or a fresh
-/// secret replacing the mask) is left alone. Only a key that is not in the
-/// stored row falls back to the mask lookup, which is what restores a mask
-/// whose header was renamed.
+/// A mask is valid only under the key it was rendered for: the key and
+/// the mask must both match the stored pair, so a secret is restored
+/// into its own header and nowhere else. A mask under any other key —
+/// or a mask several stored secrets could have been rendered from — is
+/// not a secret to be guessed: the header key is reported and the form
+/// asks for the value again.
 ///
-/// Matching on the mask itself, not on "the value contains a bullet", is
-/// what keeps a real header value the operator typed with a bullet in it
-/// from being silently reverted. Anything that is not a mask of a stored
-/// secret stays exactly as typed.
+/// Anything that is not a mask of a stored secret stays exactly as
+/// typed, a real value that happens to contain a bullet included.
 fn restore_masked_headers(
     headers_map: &mut std::collections::BTreeMap<String, String>,
     stored: &std::collections::BTreeMap<String, String>,
-) {
+) -> Option<String> {
     if headers_map.is_empty() || stored.is_empty() {
-        return;
+        return None;
     }
-    // The mask is a three-character prefix, so two secrets sharing one
-    // (any two JWTs, both starting `eyJ`) render identically. Such a mask
-    // is left out of the fallback map entirely rather than resolved to an
-    // arbitrary one of its candidates: the key path above already gave
-    // every unchanged key its own secret, and a renamed key carrying a
-    // colliding mask is kept as typed instead of being rewritten into
-    // somebody else's secret. Only *different* secrets colliding make it
-    // ambiguous - two stored headers carrying the same secret render the
-    // same mask but have one single answer, and that answer is the secret.
-    let mut masks: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
-    let mut ambiguous: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for original in stored.values() {
-        let mask = mask_secret(original);
-        if ambiguous.contains(&mask) {
-            continue;
-        }
-        match masks.get(mask.as_str()) {
-            Some(previous) if *previous != original.as_str() => {
-                masks.remove(&mask);
-                ambiguous.insert(mask);
-            }
-            Some(_) => {}
-            None => {
-                masks.insert(mask, original.as_str());
-            }
-        }
-    }
+    // The masks of the stored values: a submitted value that equals one
+    // of them is a mask, whichever key it was rendered for.
+    let masks: std::collections::BTreeSet<String> =
+        stored.values().map(|value| mask_secret(value)).collect();
+    let mut offender: Option<String> = None;
     for (key, value) in headers_map.iter_mut() {
-        let restored = match stored.get(key.as_str()) {
-            Some(original) if *value == mask_secret(original) => Some(original.as_str()),
-            _ => masks.get(value.as_str()).copied(),
-        };
-        if let Some(original) = restored {
-            *value = original.to_string();
+        match stored.get(key.as_str()) {
+            Some(original) if *value == mask_secret(original) => {
+                *value = original.to_string();
+                continue;
+            }
+            _ => {}
+        }
+        if masks.contains(value.as_str()) {
+            offender.get_or_insert_with(|| key.clone());
         }
     }
+    offender
+}
+
+/// Whether a URL field carries a mask that the save restores: the
+/// redaction marker of a secret query value or the mask of a password.
+fn url_carries_mask(url: &str) -> bool {
+    url.contains(REDACTED) || url.contains(super::MASK_TAIL)
 }
 
 fn form_values_from(form: &[(String, String)]) -> SourceFormValues {
@@ -634,10 +798,12 @@ fn form_values_from(form: &[(String, String)]) -> SourceFormValues {
             .map(|(_, v)| v.trim().to_string())
             .unwrap_or_default()
     };
+    let url = get("url");
     SourceFormValues {
         name: get("name"),
         slug: get("slug"),
-        url: get("url"),
+        url_masked: url_carries_mask(&url),
+        url,
         enabled: form.iter().any(|(k, _)| k == "enabled"),
         encoding: get("encoding"),
         input_format: get("input_format"),
@@ -750,12 +916,13 @@ pub async fn source_update(
             return row_error_response(lang, &err, "err.source_not_found");
         }
     };
-    if let Err(err) = sources::update(&state.pool, &source).await {
+    if let Err(err) = sources::update_settings(&state.pool, &source).await {
         return row_error_response(lang, &err, "err.source_not_found");
     }
     // Saved → effective immediately. The freshness stamp lives on the
-    // source row (`sources::update` resets it when a fetch-relevant field
-    // changed); only the rendered outputs need dropping here.
+    // source row (`sources::update_settings` resets it when a
+    // fetch-relevant field changed); only the rendered outputs need
+    // dropping here.
     state
         .caches
         .invalidate_processed_for_source(&source.id)
@@ -785,6 +952,9 @@ struct SourceDetailTemplate {
     csrf: String,
     source: SourceCard,
     url_display: String,
+    /// Whether the URL carries a mask: the note about the secrets is
+    /// only shown when there is something to hide.
+    url_masked: bool,
     headers_display: Vec<(String, String)>,
     pipeline_display: String,
     protocols_display: String,
@@ -901,7 +1071,10 @@ fn render_source_detail(
             theme: theme::from_headers(headers),
             active: "sources",
             csrf: state.csrf_for(headers),
-            url_display: source.url.clone(),
+            // The secrets of the URL are secrets: the card shows their
+            // masks, the full URL stays in the database.
+            url_display: mask_url_secrets(&source.url),
+            url_masked: mask_url_secrets(&source.url) != source.url,
             source: SourceCard::from_source(&source),
             headers_display,
             pipeline_display,
@@ -1007,13 +1180,18 @@ pub async fn source_toggle(
         Ok(None) => return not_found(lang, "err.source_not_found"),
         Err(err) => return server_error(lang, &err),
     };
-    source.enabled = !source.enabled;
-    source.updated_at = now_ts();
-    if let Err(err) = sources::update(&state.pool, &source).await {
-        return row_error_response(lang, &err, "err.source_not_found");
+    let enabled = !source.enabled;
+    // The toggle writes the flag and nothing else: the settings columns
+    // keep the values they have.
+    match sources::set_enabled(&state.pool, &id, enabled).await {
+        Ok(true) => {}
+        Ok(false) => return not_found(lang, "err.source_not_found"),
+        Err(err) => return row_error_response(lang, &err, "err.source_not_found"),
     }
+    source.enabled = enabled;
+    source.updated_at = now_ts();
     // The enabled flip reset the row's freshness stamp (a fetch-relevant
-    // change, see `sources::update`); the rendered outputs go here.
+    // change, see `sources::set_enabled`); the rendered outputs go here.
     state.caches.invalidate_processed_for_source(&id).await;
     let message = if source.enabled {
         lang.t("src.enabled_toast")
@@ -1058,20 +1236,25 @@ pub async fn source_refresh(
     }
     tracing::info!(source = %id, "immediate refresh queued");
     if is_htmx(&headers) {
-        let fragment = format!(
-            r#"<span id="refresh-status" data-busy="1"
-                  hx-get="/admin/sources/{id}/refresh-status"
-                  hx-trigger="every 2s" hx-swap="outerHTML">
-                 <span class="badge neutral">{}</span>
-               </span>"#,
-            lang.t("common.refreshing")
-        );
-        (
+        // The initial state is the fragment the polled status renders,
+        // so the two cannot drift apart: the swap and the first render
+        // carry the same markup and the same polling contract.
+        render_html(
+            lang.clone(),
+            &RefreshStatusFragment {
+                lang: lang.clone(),
+                source_id: id.clone(),
+                busy: true,
+                done_at: None,
+                error_message: None,
+                ok: true,
+                // The task is queued, not running yet: the elapsed time
+                // starts when the scheduler picks the source up.
+                elapsed_seconds: None,
+                budget_hint: refresh_budget_hint(&lang),
+            },
             StatusCode::ACCEPTED,
-            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            fragment,
         )
-            .into_response()
     } else {
         Redirect::to(&format!("/admin/sources/{id}")).into_response()
     }
@@ -1092,9 +1275,28 @@ struct RefreshStatusFragment {
     /// Escaped human-readable fetch error; `None` while busy or on success.
     error_message: Option<String>,
     ok: bool,
+    /// Seconds since the running refresh started; `None` when no refresh
+    /// is running or it has not been picked up yet.
+    elapsed_seconds: Option<i64>,
+    /// What a refresh may cost: the wall-clock budget and the number of
+    /// requests it may make. Quoted next to the spinner so a slow source
+    /// looks like a slow source and not like a stuck panel.
+    budget_hint: String,
 }
 
 impl_i18n!(RefreshStatusFragment);
+
+/// The text of the refresh budget: the wall-clock ceiling of one fetch
+/// and the number of requests it may make.
+fn refresh_budget_hint(lang: &Lang) -> String {
+    lang.t_named(
+        "src.refresh_budget",
+        &[
+            ("seconds", crate::fetcher::budget_seconds().to_string()),
+            ("attempts", crate::fetcher::max_requests().to_string()),
+        ],
+    )
+}
 
 pub async fn source_refresh_status(
     State(state): State<AdminState>,
@@ -1103,41 +1305,52 @@ pub async fn source_refresh_status(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let busy = state.scheduler.is_in_flight(&id).await;
+    // How long the running refresh has been going. The clock starts when
+    // the scheduler picks the source up, so a request that waits for a
+    // concurrency permit is counted too.
+    let elapsed_seconds = state
+        .scheduler
+        .in_flight_since(&id)
+        .await
+        .map(|started_at| now_ts().saturating_sub(started_at).max(0));
     let (done_at, error_message, ok) = if busy {
         (None, None, true)
     } else {
         let source = match sources::get(&state.pool, &id).await {
-            Ok(source) => source,
+            Ok(Some(source)) => source,
+            // The source is gone: the poll has nothing left to report.
+            Ok(None) => return not_found(lang, "err.source_not_found"),
             Err(err) => return server_error(lang, &err),
         };
-        match source {
-            Some(s) if s.error_class.is_none() && s.last_fetched_at.is_some() => {
-                (s.last_fetched_at, None, true)
-            }
-            Some(s) => (
+        if source.error_class.is_none() && source.last_fetched_at.is_some() {
+            (source.last_fetched_at, None, true)
+        } else {
+            (
                 None,
                 Some(
                     lang.t("src.refresh_error").replace(
                         "{}",
-                        s.last_error
+                        source
+                            .last_error
                             .as_deref()
                             .unwrap_or_else(|| lang.t("src.refresh_error_unknown")),
                     ),
                 ),
                 false,
-            ),
-            None => (None, Some(lang.t("err.source_not_found").into()), false),
+            )
         }
     };
     render_html(
         lang.clone(),
         &RefreshStatusFragment {
-            lang,
+            lang: lang.clone(),
             source_id: id,
             busy,
             done_at,
             error_message,
             ok,
+            elapsed_seconds,
+            budget_hint: refresh_budget_hint(&lang),
         },
         StatusCode::OK,
     )
@@ -1149,24 +1362,33 @@ pub async fn source_delete(
     headers: HeaderMap,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
+    // Orphaned proxies (no remaining links) transition to `removed`;
+    // reconciliation never resets it, a proxy that reappears in a fetch
+    // keeps its state. The sweep runs while the links still name this
+    // source, so it picks exactly the proxies it fed and leaves the
+    // ones another source still feeds alone: deleting one source must
+    // not walk the whole table.
+    //
+    // With `drop_gate = false` the admin click is intentionally
+    // conservative: a `ready` row is tunnel-verified and an `unknown`
+    // row has not yet had its first verdict, neither should be retired
+    // just because its source went away. The probe is the only authority
+    // on the lifecycle of a verified proxy, and the priority queue is
+    // the only authority on a not-yet-checked one.
+    // With `drop_gate = true` the strict policy applies and every
+    // orphan retires.
+    let protected = fumox_core::ingest::IngestPolicy::from_drop_gate(state.ingest().drop_gate)
+        .protected_statuses();
+    let sweep = proxies::mark_source_orphans_removed(&state.pool, &id, protected).await;
     match sources::delete(&state.pool, &id).await {
         Ok(true) => {}
         Ok(false) => return not_found(lang, "err.source_not_found"),
         Err(err) => return server_error(lang, &err),
     }
-    // Orphaned proxies (no remaining links) transition to `removed`;
-    // reconciliation never resets it, a proxy that reappears in a fetch
-    // keeps its state. With `drop_gate = false` the admin click is
-    // intentionally conservative: a `ready` row is tunnel-verified and
-    // an `unknown` row has not yet had its first verdict, neither
-    // should be retired just because its source went away. The probe is
-    // the only authority on the lifecycle of a verified proxy, and the
-    // priority queue is the only authority on a not-yet-checked one.
-    // With `drop_gate = true` the strict policy applies and every
-    // orphan retires.
-    let protected = fumox_core::ingest::IngestPolicy::from_drop_gate(state.ingest().drop_gate)
-        .protected_statuses();
-    match proxies::mark_orphans_removed(&state.pool, protected).await {
+    // The row is gone; the rendered outputs that still name it go here.
+    state.caches.invalidate_processed_for_source(&id).await;
+    tracing::info!(source = %id, "source deleted");
+    match sweep {
         Ok(sweep) => {
             if sweep.retired > 0 {
                 tracing::info!(retired = sweep.retired, "orphaned proxies marked removed");
@@ -1179,18 +1401,26 @@ pub async fn source_delete(
                     "orphaned proxies left detached by the protected statuses"
                 );
             }
+            action_response(
+                is_htmx(&headers),
+                "/admin/sources",
+                String::new(),
+                lang.t("src.deleted_toast"),
+            )
         }
-        Err(err) => tracing::error!(error = %err, "failed to mark orphans removed"),
+        Err(err) => {
+            // The source is gone, but the proxies it fed are not
+            // flagged: the operator has to hear it, the toast is the
+            // only place they will see it.
+            tracing::error!(error = %err, "failed to mark orphans removed");
+            action_response_err(
+                is_htmx(&headers),
+                "/admin/sources",
+                String::new(),
+                lang.t("src.deleted_orphans_failed"),
+            )
+        }
     }
-    // The row is gone; the rendered outputs that still name it go here.
-    state.caches.invalidate_processed_for_source(&id).await;
-    tracing::info!(source = %id, "source deleted");
-    action_response(
-        is_htmx(&headers),
-        "/admin/sources",
-        String::new(),
-        lang.t("src.deleted_toast"),
-    )
 }
 
 // Dry-run fetch
@@ -1334,24 +1564,32 @@ mod tests {
     }
 
     /// The mask the edit form renders is replaced by the stored secret
-    /// under its own key, as before.
+    /// under its own key.
     #[test]
     fn unchanged_mask_is_restored_from_the_stored_secret() {
         let stored = headers(&[("X-Token", "supersecretvalue")]);
         let mut submitted = headers(&[("X-Token", &super::mask_secret("supersecretvalue"))]);
-        restore_masked_headers(&mut submitted, &stored);
+        assert_eq!(restore_masked_headers(&mut submitted, &stored), None);
         assert_eq!(submitted["X-Token"], "supersecretvalue");
     }
 
-    /// A header the operator renamed keeps its secret: the mask is matched
-    /// by value, not by key, so it never reaches the upstream fetch as a
-    /// literal `abc…••••`.
+    /// A mask is valid only under the key it was rendered for: under
+    /// any other key it is reported, so the operator enters the value
+    /// again instead of a mask reaching the upstream fetch as a
+    /// credential.
     #[test]
-    fn mask_under_a_renamed_key_is_restored() {
+    fn a_mask_under_a_renamed_key_is_reported() {
         let stored = headers(&[("X-Token", "supersecretvalue")]);
         let mut submitted = headers(&[("Authorization", &super::mask_secret("supersecretvalue"))]);
-        restore_masked_headers(&mut submitted, &stored);
-        assert_eq!(submitted["Authorization"], "supersecretvalue");
+        assert_eq!(
+            restore_masked_headers(&mut submitted, &stored),
+            Some("Authorization".to_string())
+        );
+        assert_eq!(
+            submitted["Authorization"],
+            super::mask_secret("supersecretvalue"),
+            "the mask must not be stored as a credential"
+        );
     }
 
     /// A real value that happens to contain the bullet the mask is drawn
@@ -1361,36 +1599,38 @@ mod tests {
     fn typed_value_with_a_bullet_is_kept() {
         let stored = headers(&[("X-Token", "supersecretvalue")]);
         let mut submitted = headers(&[("X-Token", "tok•en"), ("X-Other", "abc…••••extra")]);
-        restore_masked_headers(&mut submitted, &stored);
+        assert_eq!(restore_masked_headers(&mut submitted, &stored), None);
         assert_eq!(submitted["X-Token"], "tok•en");
         assert_eq!(submitted["X-Other"], "abc…••••extra");
     }
 
-    /// Two stored headers holding the *same* secret render one mask with
-    /// one single answer, so a renamed key carrying that mask restores it
-    /// instead of keeping the mask and replaying `sup…••••` upstream as a
-    /// credential. Blacklisting the mask on a duplicate key rather than on
-    /// two different secrets is what made this one a no-op.
+    /// Two stored headers holding the *same* secret render one mask. Under
+    /// a new key that mask names no single secret any more, so it is
+    /// reported instead of being guessed.
     #[test]
-    fn renamed_key_mask_restores_a_secret_two_headers_share() {
+    fn a_shared_mask_under_a_new_key_is_reported() {
         let stored = headers(&[("X-A", "supersecretvalue"), ("X-B", "supersecretvalue")]);
         let mut submitted = headers(&[("X-Renamed", &super::mask_secret("supersecretvalue"))]);
-        restore_masked_headers(&mut submitted, &stored);
-        assert_eq!(submitted["X-Renamed"], "supersecretvalue");
+        assert_eq!(
+            restore_masked_headers(&mut submitted, &stored),
+            Some("X-Renamed".to_string())
+        );
     }
 
     /// A new source has nothing stored to restore from.
     #[test]
     fn restore_is_a_noop_without_stored_headers() {
         let mut submitted = headers(&[("X-Token", "tok•en")]);
-        restore_masked_headers(&mut submitted, &BTreeMap::new());
+        assert_eq!(
+            restore_masked_headers(&mut submitted, &BTreeMap::new()),
+            None
+        );
         assert_eq!(submitted["X-Token"], "tok•en");
     }
 
     /// Two secrets whose first three characters are equal (any two JWTs)
-    /// mask identically. Keyed by mask alone they collapse into one entry
-    /// and the second secret is written over the first, so each header
-    /// keeps its own.
+    /// mask identically. Each header keeps its own: the key and the mask
+    /// are compared together.
     #[test]
     fn secrets_sharing_a_mask_prefix_restore_independently() {
         let stored = headers(&[
@@ -1401,26 +1641,185 @@ mod tests {
             ("Authorization", &super::mask_secret("eyJAAA-first-secret")),
             ("X-Api-Key", &super::mask_secret("eyJBBB-second-secret")),
         ]);
-        restore_masked_headers(&mut submitted, &stored);
+        assert_eq!(restore_masked_headers(&mut submitted, &stored), None);
         assert_eq!(submitted["Authorization"], "eyJAAA-first-secret");
         assert_eq!(submitted["X-Api-Key"], "eyJBBB-second-secret");
     }
 
     /// A mask that several stored secrets could have been rendered from is
     /// not resolved by guesswork when its key is new: the form rendered it
-    /// ambiguous, so it stays as submitted.
+    /// ambiguous, so it is reported and the operator enters the value
+    /// again.
     #[test]
-    fn colliding_mask_under_a_new_key_is_not_guessed() {
+    fn a_colliding_mask_under_a_new_key_is_reported() {
         let stored = headers(&[
             ("Authorization", "eyJAAA-first-secret"),
             ("X-Api-Key", "eyJBBB-second-secret"),
         ]);
         let mut submitted = headers(&[("X-Renamed", &super::mask_secret("eyJAAA-first-secret"))]);
-        restore_masked_headers(&mut submitted, &stored);
         assert_eq!(
-            submitted["X-Renamed"],
-            super::mask_secret("eyJAAA-first-secret")
+            restore_masked_headers(&mut submitted, &stored),
+            Some("X-Renamed".to_string())
         );
+    }
+
+    /// The URL of the card and of the edit form shows the password of the
+    /// userinfo masked: the secret stays in the database and in the
+    /// fetcher.
+    #[test]
+    fn the_url_password_is_masked() {
+        assert_eq!(
+            mask_url_userinfo("https://user:secret123@example.com/sub"),
+            "https://user:sec…••••@example.com/sub"
+        );
+        // A userinfo without a password carries no secret.
+        assert_eq!(
+            mask_url_userinfo("https://user@example.com/sub"),
+            "https://user@example.com/sub"
+        );
+        // A URL without a userinfo is untouched.
+        assert_eq!(
+            mask_url_userinfo("https://example.com/sub"),
+            "https://example.com/sub"
+        );
+    }
+
+    /// The mask the form hands back is restored under the stored
+    /// password; a password the operator typed is kept as typed.
+    #[test]
+    fn the_stored_password_comes_back_under_the_mask() {
+        let stored = "https://user:secret123@example.com/sub";
+        let masked = mask_url_userinfo(stored);
+        assert_eq!(restore_url_password(&masked, stored), stored);
+        // A fresh password replaces the mask.
+        assert_eq!(
+            restore_url_password("https://user:fresh456@example.com/sub", stored),
+            "https://user:fresh456@example.com/sub"
+        );
+        // A URL without a password stays as typed.
+        assert_eq!(
+            restore_url_password("https://example.com/sub", stored),
+            "https://example.com/sub"
+        );
+    }
+
+    /// The subscription token travels in the query of the feed URL, so
+    /// the query value is redacted in the panel the same way it is in
+    /// the log. The harmless pairs survive: they are the diagnostics.
+    #[test]
+    fn the_secret_query_values_are_redacted() {
+        assert_eq!(
+            mask_url_secrets("https://example.com/sub?token=SECRET&page=2"),
+            "https://example.com/sub?token=[redacted]&page=2"
+        );
+        // The name is kept, the value is not: the operator must see
+        // which parameter carries the credential.
+        assert_eq!(
+            mask_url_secrets("https://example.com/sub?api_key=x&ok=1"),
+            "https://example.com/sub?api_key=[redacted]&ok=1"
+        );
+        // A URL without a query is untouched.
+        assert_eq!(
+            mask_url_secrets("https://example.com/sub"),
+            "https://example.com/sub"
+        );
+    }
+
+    /// The masked URL is what the edit form shows, and the form hands it
+    /// back on submit: the stored secret must come back under the mask,
+    /// or saving the form would silently drop the token and the feed
+    /// would stop working.
+    #[test]
+    fn the_stored_secrets_come_back_under_the_masks() {
+        let stored = "https://user:secret123@example.com/sub?token=ABC&page=2";
+        let masked = mask_url_secrets(stored);
+        assert!(!masked.contains("secret123"), "{masked}");
+        assert!(!masked.contains("ABC"), "{masked}");
+        assert_eq!(restore_url_secrets(&masked, stored), stored);
+
+        // A typed token replaces the mask.
+        assert_eq!(
+            restore_url_secrets("https://example.com/sub?token=NEW&page=2", stored),
+            "https://example.com/sub?token=NEW&page=2"
+        );
+        // A pair the operator added keeps the value that was typed.
+        assert_eq!(
+            restore_url_secrets("https://example.com/sub?token=[redacted]&new=1", stored),
+            "https://example.com/sub?token=ABC&new=1"
+        );
+    }
+
+    /// The mask is restored only under the pair it was rendered for: a
+    /// stored URL with two credential-bearing pairs gives each of them
+    /// its own value back, in the order they appear.
+    #[test]
+    fn every_masked_pair_gets_its_own_value_back() {
+        let stored = "https://example.com/sub?token=AAA&api_key=BBB";
+        let masked = mask_url_secrets(stored);
+        assert_eq!(
+            masked,
+            "https://example.com/sub?token=[redacted]&api_key=[redacted]"
+        );
+        assert_eq!(restore_url_secrets(&masked, stored), stored);
+    }
+
+    /// A URL without a secret is not marked as masked: the note about
+    /// the restore would then describe a restore that never happens.
+    #[test]
+    fn the_mask_is_recognized_in_a_url() {
+        assert!(url_carries_mask("https://example.com/sub?token=[redacted]"));
+        assert!(url_carries_mask("https://user:sec…••••@example.com/sub"));
+        assert!(!url_carries_mask("https://example.com/sub?page=2"));
+        assert!(!url_carries_mask("https://example.com/sub"));
+    }
+
+    /// L-185: a running refresh shows how long it has been going and
+    /// what it may cost. The operator must be able to tell a slow
+    /// source from a stuck panel.
+    #[test]
+    fn the_running_refresh_shows_the_elapsed_time_and_the_budget() {
+        let lang = test_lang();
+        let fragment = RefreshStatusFragment {
+            lang: lang.clone(),
+            source_id: "src1".into(),
+            busy: true,
+            done_at: None,
+            error_message: None,
+            ok: true,
+            elapsed_seconds: Some(42),
+            budget_hint: refresh_budget_hint(&lang),
+        };
+        let html = fragment.render().unwrap();
+        let elapsed = lang.t_named("src.refresh_elapsed", &[("seconds", "42".to_string())]);
+        assert!(html.contains(&elapsed), "{html}");
+        // The budget is quoted next to the spinner: the ceiling of one
+        // fetch and the number of requests it may make.
+        assert!(html.contains(&refresh_budget_hint(&lang)), "{html}");
+        // The polled element stays the one that carries the polling
+        // contract: everything the busy state shows lives inside it, or
+        // the swap would leave the rest behind on every poll.
+        assert!(html.contains(r#"id="refresh-status""#), "{html}");
+        assert!(html.contains(r#"data-busy="1""#), "{html}");
+    }
+
+    /// A finished refresh has no elapsed time: the moment it ended is
+    /// what the fragment shows then.
+    #[test]
+    fn a_finished_refresh_shows_no_elapsed_time() {
+        let lang = test_lang();
+        let fragment = RefreshStatusFragment {
+            lang: lang.clone(),
+            source_id: "src1".into(),
+            busy: false,
+            done_at: Some(1_700_000_000),
+            error_message: None,
+            ok: true,
+            elapsed_seconds: None,
+            budget_hint: refresh_budget_hint(&lang),
+        };
+        let html = fragment.render().unwrap();
+        assert!(!html.contains("refresh_elapsed"), "{html}");
+        assert!(!html.contains("data-busy"), "{html}");
     }
 
     /// A source row as the toggle action holds it after the flip.
@@ -1454,9 +1853,10 @@ mod tests {
 
     /// The toggle swap is rendered from the fragment templates the detail
     /// page includes, so the ids, aria attributes and the hx-* contract
-    /// cannot drift apart: the badge half must announce itself as a live
-    /// region and the form half must replace itself out-of-band with the
-    /// pressed state flipped.
+    /// cannot drift apart: the badge half must be the plain badge the
+    /// page wraps in a live region (a live region that is recreated with
+    /// every swap is never announced), and the form half must fill that
+    /// region, replace itself out-of-band and flip its action label.
     #[test]
     fn toggle_swap_fragment_carries_the_page_contract() {
         let lang = test_lang();
@@ -1464,8 +1864,8 @@ mod tests {
         let swap = toggle_swap_fragment(&lang, &source, "csrf-token");
 
         assert!(
-            swap.contains(r#"<span id="enabled-badge" aria-live="polite" aria-atomic="true">"#),
-            "the badge half lost the live-region contract: {swap}"
+            !swap.contains(r#"id="enabled-badge""#),
+            "the badge half must not carry the live region, the page owns it: {swap}"
         );
         assert!(swap.contains(r#"<span class="badge on">"#), "{swap}");
         assert!(swap.contains(r#"id="toggle-form""#), "{swap}");
@@ -1478,20 +1878,32 @@ mod tests {
             "the form must keep targeting the badge: {swap}"
         );
         assert!(
+            swap.contains(r##"hx-swap="innerHTML""##),
+            "the form must fill the badge, not replace the live region: {swap}"
+        );
+        assert!(
             swap.contains(r#"hx-swap-oob="outerHTML:#toggle-form""#),
             "the form must travel as an out-of-band swap: {swap}"
         );
         assert!(
-            swap.contains(r#"aria-pressed="true""#),
-            "the pressed state must flip with the badge: {swap}"
+            swap.contains(r#"hx-disabled-elt="find button""#),
+            "the button must be locked while the request runs: {swap}"
+        );
+        assert!(
+            swap.contains(r#"data-error-target="toggle-error""#),
+            "a failed toggle needs a slot to write into: {swap}"
+        );
+        assert!(
+            !swap.contains(r#"aria-pressed"#),
+            "the button carries the action, the badge carries the state: {swap}"
         );
         assert!(swap.contains(r#"value="csrf-token""#), "{swap}");
         assert!(swap.contains(lang.t("common.disable")), "{swap}");
         assert!(swap.contains(lang.t("common.on")), "{swap}");
     }
 
-    /// The disabled flip: badge class, pressed state and button label all
-    /// follow the stored state.
+    /// The disabled flip: the badge class and the button label follow the
+    /// stored state.
     #[test]
     fn toggle_swap_fragment_flips_with_the_disabled_state() {
         let lang = test_lang();
@@ -1499,7 +1911,6 @@ mod tests {
 
         assert!(swap.contains(r#"<span class="badge off">"#), "{swap}");
         assert!(!swap.contains(r#"<span class="badge on">"#), "{swap}");
-        assert!(swap.contains(r#"aria-pressed="false""#), "{swap}");
         assert!(swap.contains(lang.t("common.enable")), "{swap}");
     }
 

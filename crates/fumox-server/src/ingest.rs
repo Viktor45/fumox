@@ -1646,7 +1646,7 @@ mod tests {
             "version": 1,
             "drop": [{ "match": "^zzz-nonexistent$", "target": "name" }]
         }));
-        sources::update(&pool, &source).await.unwrap();
+        sources::update_settings(&pool, &source).await.unwrap();
 
         let settings = settings_with_drop_gate(drop_gate);
         let first = ingest_source(

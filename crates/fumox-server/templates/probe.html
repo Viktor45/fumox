@@ -58,9 +58,15 @@
         <div class="label">{{ self.t("probe.daemon") }}</div>
         <div class="sub">{{ self.t("probe.last_beat") }} {{ self.ts(hb.ts) | safe }} · pid {{ hb.pid }} · v{{ hb.version }}</div>
       {% when None %}
-        <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>
-        <div class="label">{{ self.t("probe.daemon") }}</div>
-        <div class="sub">{{ self.t("probe.no_heartbeat") }}</div>
+        {% if heartbeat_unreadable %}
+          <div class="num"><span class="badge error">{{ self.t("probe.dead") }}</span></div>
+          <div class="label">{{ self.t("probe.daemon") }}</div>
+          <div class="sub">{{ self.t("probe.heartbeat_unreadable") }}</div>
+        {% else %}
+          <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>
+          <div class="label">{{ self.t("probe.daemon") }}</div>
+          <div class="sub">{{ self.t("probe.no_heartbeat") }}</div>
+        {% endif %}
     {% endmatch %}
   </div>
   <div class="panel stat-card">
@@ -77,16 +83,22 @@
           <div class="sub">{{ self.mem_line() }} · {{ self.ts(&self.mem_ts()) | safe }}</div>
         {% endif %}
       {% when None %}
-        <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>
-        <div class="label">meow-rs (T2)</div>
-        <div class="sub">{{ self.t("probe.no_contacts") }}</div>
+        {% if meow_unreadable %}
+          <div class="num"><span class="badge error">{{ self.t("probe.stale") }}</span></div>
+          <div class="label">meow-rs (T2)</div>
+          <div class="sub">{{ self.t("probe.contact_unreadable") }}</div>
+        {% else %}
+          <div class="num"><span class="badge neutral">{{ self.t("probe.no_data") }}</span></div>
+          <div class="label">meow-rs (T2)</div>
+          <div class="sub">{{ self.t("probe.no_contacts") }}</div>
+        {% endif %}
     {% endmatch %}
   </div>
   <div class="panel stat-card">
     <div class="num">{{ quarantine_count }}</div>
     <div class="label">{{ self.t("probe.quarantine_queue_card") }}</div>
     {% if quarantine_count > queue_shown() %}
-      <div class="sub">{{ self.t("probe.queue_nearest").replace("{}", &queue_shown().to_string()) }}</div>
+      <div class="sub">{{ self.queue_hint() }}</div>
     {% endif %}
   </div>
 </div>

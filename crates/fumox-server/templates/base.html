@@ -6,6 +6,15 @@
   <title>{% block title %}{{ self.t("common.admin") }}{% endblock %} · Fumox</title>
   <link rel="stylesheet" href="/admin/static/app.css">
   <script src="/admin/static/htmx.min.js" defer></script>
+  {#- The panel's script is a file, not an inline block: the
+      content-security policy allows scripts from this origin only. It
+      carries every handler of the panel, delegated from the document
+      body, so no template needs an inline event handler either.
+      `allowEval` and `allowScriptTags` are off: htmx would otherwise
+      evaluate a `js:` value or run a script inside a swapped fragment,
+      which the policy would block anyway. -#}
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false}'>
+  <script src="/admin/static/app.js" defer></script>
   {#- No-JS fallback for the destructive dialogs (source/profile delete,
       proxies revive/cleanup/purge): a closed <dialog> is display:none and
       showModal() never fires without JavaScript, so the POST forms inside
@@ -17,8 +26,8 @@
   <noscript>
     <style>
       dialog { display: block; position: static; margin: 16px 0; }
-      dialog button[type="button"] { display: none; }
-      button[aria-haspopup="dialog"] { display: none; }
+      dialog button[data-dialog-close] { display: none; }
+      button[data-dialog-open] { display: none; }
     </style>
   </noscript>
 </head>
@@ -46,34 +55,31 @@
           data-stale="{{ self.t("common.sse_stale") }}">{{ self.t("common.sse_stale") }}</span>
     {# Theme switcher (day/night): the choice is stored in the fumox_theme
        cookie and rendered server-side as data-theme on <html>, so it works
-       without JavaScript. The onclick appends the current path as `next`,
-       same as the language switcher below. On narrow screens CSS swaps the
-       text labels for the inline SVG sun/moon icons so the whole first
-       topbar row fits. #}
+       without JavaScript. The link carries `data-next`: the panel's script
+       appends the current path as `next`, same as the language switcher
+       below. On narrow screens CSS swaps the text labels for the inline
+       SVG sun/moon icons so the whole first topbar row fits. #}
     <span class="lang-switch theme-switch" role="group" aria-label="{{ self.t("nav.theme") }}">
-      <a href="/admin/set-theme?theme=light"
+      <a href="/admin/set-theme?theme=light" data-next
          aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
-         onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
          {% if theme.is_light() %}class="active" aria-current="true"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
         <span class="theme-label">{{ self.t("theme.light") }}</span>
       </a>
-      <a href="/admin/set-theme?theme=dark"
+      <a href="/admin/set-theme?theme=dark" data-next
          aria-label="{{ self.t("theme.dark") }}" title="{{ self.t("theme.dark") }}"
-         onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
          {% if theme.is_dark() %}class="active" aria-current="true"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
         <span class="theme-label">{{ self.t("theme.dark") }}</span>
       </a>
     </span>
     {# Language switcher: iterates every loaded catalog (`langs`), so new
-       languages appear automatically. The onclick appends the current path
-       as `next` so the user lands back on the same page; without JS the
-       redirect falls back to the dashboard. #}
+       languages appear automatically. The link carries `data-next` too: the
+       panel's script appends the current path so the user lands back on
+       the same page; without JS the redirect falls back to the dashboard. #}
     <span class="lang-switch" role="group" aria-label="{{ self.t("nav.language") }}">
       {% for (code, _label) in langs %}
-      <a href="/admin/set-lang?lang={{ code }}"
-         onclick="this.href += '&next=' + encodeURIComponent(location.pathname + location.search);"
+      <a href="/admin/set-lang?lang={{ code }}" data-next
          {% if self.lang_code() == code.as_str() %}class="active" aria-current="true"{% endif %}>{{ code | upper }}</a>
       {% endfor %}
     </span>
@@ -86,242 +92,5 @@
     {% block content %}{% endblock %}
   </div>
   <div class="toast-wrap" id="toast-wrap"></div>
-  <script>
-    // Flash/toast: handlers send HX-Trigger: {"toast": {"message": ..., "level": ...}}.
-    // The message travels percent-encoded, header bytes are Latin-1 on the
-    // wire, raw UTF-8 would arrive as mojibake.
-    document.body.addEventListener('toast', function (e) {
-      var wrap = document.getElementById('toast-wrap');
-      if (!wrap) return;
-      var detail = e.detail || {};
-      var div = document.createElement('div');
-      var isError = detail.level === 'error';
-      div.className = 'toast' + (isError ? ' error' : '');
-      // role=status/alert makes the toast announced by screen readers;
-      // errors stay longer and are dismissable by click.
-      div.setAttribute('role', isError ? 'alert' : 'status');
-      var message = detail.message || '';
-      try { message = decodeURIComponent(message); } catch (_) {}
-      div.textContent = message || String(e.detail);
-      div.addEventListener('click', function () { div.remove(); });
-      wrap.appendChild(div);
-      setTimeout(function () { div.remove(); }, isError ? 10000 : 4000);
-    });
-
-    // Flash toasts for the plain-browser path: action_response redirects
-    // carry `flash` / `flash_level` query parameters (percent-encoded) and
-    // the parameters are stripped from the URL immediately, so a refresh
-    // or a copied URL does not replay a stale message.
-    (function () {
-      var params = new URLSearchParams(location.search);
-      var flash = params.get('flash');
-      if (!flash) return;
-      document.body.dispatchEvent(new CustomEvent('toast', {
-        detail: { message: flash, level: params.get('flash_level') || 'ok' }
-      }));
-      params.delete('flash');
-      params.delete('flash_level');
-      var rest = params.toString();
-      history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
-    })();
-
-    // SSE: push updates from the server. Each event is
-    // re-broadcast on <body> as a namespaced DOM event so HTMX fragments
-    // can react with hx-trigger="fumox:*". Polling fragments remain the
-    // no-JS fallback, SSE is a pure enhancement.
-    (function () {
-      if (!window.EventSource) return;
-      var statusEl = document.getElementById('sse-status');
-      function setStatus(state) {
-        if (!statusEl) return;
-        statusEl.setAttribute('data-state', state);
-        statusEl.textContent = state === 'live'
-          ? statusEl.getAttribute('data-live')
-          : statusEl.getAttribute('data-stale');
-        statusEl.hidden = false;
-      }
-      var es = new EventSource('/admin/events');
-      es.addEventListener('open', function () { setStatus('live'); });
-      es.addEventListener('error', function () {
-        // EventSource reconnects on its own; show the gap meanwhile.
-        setStatus(es.readyState === EventSource.OPEN ? 'live' : 'stale');
-      });
-      ['fetch.started', 'fetch.done', 'fetch.failed']
-        .forEach(function (name) {
-          es.addEventListener(name, function (e) {
-            var data = {};
-            try { data = JSON.parse(e.data); } catch (_) {}
-            document.body.dispatchEvent(new CustomEvent('fumox:' + name, { detail: data }));
-          });
-        });
-      // When any fetch finishes, refresh the in-flight status fragment and
-      // the source fetch-log if either is present on the page.
-      function refreshAfterFetch() {
-        if (!window.htmx) return;
-        ['refresh-status', 'log-live'].forEach(function (id) {
-          var el = document.getElementById(id);
-          if (el) window.htmx.trigger(el, 'fumox:refresh');
-        });
-      }
-      document.body.addEventListener('fumox:fetch.done', refreshAfterFetch);
-      document.body.addEventListener('fumox:fetch.failed', refreshAfterFetch);
-    })();
-
-    // Toggle swaps replace the button the user just activated (the form
-    // travels out-of-band with the badge), so keyboard focus falls to
-    // <body> after every click. Put it back on the re-created button, but
-    // only when focus was not moved elsewhere in the meantime.
-    (function () {
-      function restoreToggleFocus(event) {
-        var target = event.detail && event.detail.target;
-        if (!target || target.id !== 'enabled-badge') return;
-        if (document.activeElement !== document.body) return;
-        requestAnimationFrame(function () {
-          var form = document.getElementById('toggle-form');
-          var btn = form && form.querySelector('button[type="submit"]');
-          if (btn) btn.focus();
-        });
-      }
-      document.body.addEventListener('htmx:afterSwap', restoreToggleFocus);
-      document.body.addEventListener('htmx:oobAfterSwap', restoreToggleFocus);
-    })();
-
-    // Local time: the server emits every
-    // timestamp as <time class="ts" datetime="RFC3339 UTC">UTC text</time>.
-    // The browser rewrites the text into the user's timezone, formatted in
-    // the panel language (<html lang>), without JS the UTC text stays.
-    // Re-run after every HTMX swap: fragments carry <time> elements too.
-    // Idempotent: the text is always rebuilt from the datetime attribute.
-    (function () {
-      function localize(root) {
-        if (!root.querySelectorAll) return;
-        var lang = document.documentElement.lang || undefined;
-        var full, dayOnly;
-        try {
-          full = new Intl.DateTimeFormat(lang, {
-            year: 'numeric', month: '2-digit', day: '2-digit',
-            hour: '2-digit', minute: '2-digit', second: '2-digit'
-          });
-          // `time.ts.day` marks a calendar-day bucket (the ingest chart's
-          // columns): the time of day is always 00:00 and only crowds out
-          // the date in a 64px column, so those keep the date alone.
-          dayOnly = new Intl.DateTimeFormat(lang, {
-            year: 'numeric', month: '2-digit', day: '2-digit'
-          });
-        } catch (_) { return; }
-        var zone = '';
-        try {
-          zone = ' (' + (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC') + ')';
-        } catch (_) {}
-        root.querySelectorAll('time.ts').forEach(function (el) {
-          var attr = el.getAttribute('datetime');
-          if (!attr) return;
-          var stamp = new Date(attr);
-          if (isNaN(stamp)) return;
-          var isDay = el.classList.contains('day');
-          var fmt = isDay ? dayOnly : full;
-          var local = fmt.format(stamp);
-          el.textContent = local;
-          // Language-neutral tooltip: the original UTC instant and the zone used.
-          el.title = attr + ' → ' + local + zone;
-        });
-      }
-      localize(document);
-      document.body.addEventListener('htmx:afterSettle', function () {
-        localize(document);
-      });
-    })();
-
-    // Pipeline widget: show/hide the inner fields of a tri-state section
-    // (geo / sort / limit) based on which radio is checked. The inner
-    // fields are always in the DOM so the browser can hold typed values
-    // across toggles; the `hidden` attribute is the only visibility knob.
-    // Runs on initial load (initial state) and on every HTMX settle (the
-    // widget re-renders on preset / mode / preview refresh).
-    (function () {
-      function syncSection(section) {
-        var name = section.getAttribute('data-ped-section');
-        if (!name) return;
-        var checked = section.querySelector('input[name="ped_' + name + '"]:checked');
-        var inner = section.querySelector('[data-ped-inner="' + name + '"]');
-        if (!inner) return;
-        // Hide when the section is `skip`; show otherwise. `defaults`
-        // and `set` keep the inner fields visible so the user can edit.
-        if (checked && checked.value === 'skip') {
-          inner.setAttribute('hidden', '');
-        } else {
-          inner.removeAttribute('hidden');
-        }
-      }
-      function syncAll(root) {
-        var sections = (root || document).querySelectorAll('[data-ped-section]');
-        for (var i = 0; i < sections.length; i++) syncSection(sections[i]);
-      }
-      syncAll(document);
-      // User clicks on a tri-state radio.
-      document.body.addEventListener('change', function (event) {
-        var target = event.target;
-        if (!(target instanceof HTMLInputElement)) return;
-        var name = target.name;
-        if (!name || name.indexOf('ped_') !== 0) return;
-        var section = target.closest('[data-ped-section]');
-        if (section) syncSection(section);
-      });
-      // The widget is re-rendered by HTMX on preset / mode / preview
-      // refresh, re-run after every settle so the initial state matches
-      // the rendered radios.
-      document.body.addEventListener('htmx:afterSettle', function () {
-        syncAll(document);
-      });
-    })();
-
-    // Settings tabs: the panes swap on the radio's :checked, but
-    // `aria-selected` is server-rendered and would keep naming the tab the
-    // page loaded with. Mirror the radio onto the labels.
-    (function () {
-      function syncTabs() {
-        document.querySelectorAll('input.tab-input').forEach(function (input) {
-          var label = document.querySelector('label[for="' + input.id + '"]');
-          if (label) label.setAttribute('aria-selected', input.checked ? 'true' : 'false');
-        });
-      }
-      document.body.addEventListener('change', function (event) {
-        if (event.target instanceof HTMLInputElement && event.target.classList.contains('tab-input')) syncTabs();
-      });
-      syncTabs();
-    })();
-
-    // Rule counters: the lists are capped in height, so the number is the
-    // only way to see how many rules a section holds, and htmx changes the
-    // rows without a page render. Blank lines do not count, the rename
-    // editor always keeps one and it emits no rule.
-    (function () {
-      function filledRows(container) {
-        if (!container) return 0;
-        return Array.prototype.filter.call(
-          container.querySelectorAll('.ped-row'),
-          function (row) {
-            return Array.prototype.some.call(
-              row.querySelectorAll('input[type="text"]'),
-              function (input) { return input.value.trim() !== ''; }
-            );
-          }
-        ).length;
-      }
-      function syncRuleCounts() {
-        document.querySelectorAll('[data-ped-count]').forEach(function (badge) {
-          var which = badge.getAttribute('data-ped-count');
-          var count = filledRows(
-            document.querySelector(which === 'rename' ? '#ped-rows' : '#ped-drop-rows')
-          );
-          badge.textContent = String(count);
-          if (count === 0) badge.setAttribute('hidden', '');
-          else badge.removeAttribute('hidden');
-        });
-      }
-      document.body.addEventListener('htmx:afterSettle', syncRuleCounts);
-      syncRuleCounts();
-    })();
-  </script>
 </body>
 </html>

@@ -35,16 +35,18 @@
       <tr><th>{{ self.t("common.name") }}</th><td class="small">{{ self.display_name(&proxy.name, &proxy.host, proxy.port) }}</td></tr>
       <tr><th>{{ self.t("common.protocol") }}</th><td class="mono small">{{ proxy.scheme }}</td></tr>
       <tr><th>{{ self.t("px.address") }}</th><td class="mono small">{{ proxy.host }}:<wbr>{{ proxy.port }}</td></tr>
-      {# The credential is shown in the open: the card also renders the raw
-         subscription line and the parsed params JSON below, both of which
-         carry the same secret, masking just this row was a false comfort. #}
-      <tr><th>{{ self.t("px.credential") }}</th><td class="mono small">{{ proxy.credential }}</td></tr>
+      {# The credential is a secret and the panel never shows it in the
+         open: the card renders the mask, and so do the params and the
+         raw line below — masking this row alone would be a false comfort. #}
+      <tr><th>{{ self.t("px.credential") }}</th><td class="mono small">{{ credential_display }}</td></tr>
       <tr><th>{{ self.t("px.fingerprint") }}</th><td class="mono small">{{ proxy.fingerprint }}</td></tr>
     </table>
+    <p class="hint">{{ self.t("px.secret_note") }}</p>
 
-    {# Opening the card auto-refreshes these facts from every available
-       GeoLite2 database (the server does it while rendering the row) ,
-       Country/City/ASN and the resolved IP are always current. #}
+    {# Opening the card schedules a geo refresh from every available
+       GeoLite2 database (the server does it in the background, so the
+       card never waits for the resolver). The values below are the
+       stored ones: the fresh facts show up on the next open. #}
     <h3>{{ self.t("px.geography") }}</h3>
     <table class="kv">
       <tr><th>{{ self.t("common.country") }}</th><td>{{ self.flag(proxy.geo_country) }}
@@ -102,7 +104,7 @@
 
   <div class="panel">
     <h2>{{ self.t("px.raw_line") }}</h2>
-    {% match proxy.raw_line %}
+    {% match raw_line_display %}
       {% when Some with (line) %}<pre class="mono small">{{ line }}</pre>
       {% when None %}<p class="muted">{{ self.t("px.raw_line_missing") }}</p>
     {% endmatch %}
@@ -136,9 +138,12 @@
 <div class="panel">
   <h2>{{ self.t("px.history_title") }}</h2>
   {#- Live refresh: the same fragment is re-fetched every 10 s. Works with
-      plain HTMX; without JS the initial server render is shown. -#}
-  <div id="probe-history"
-       aria-live="polite" aria-atomic="false"
+      plain HTMX; without JS the initial server render is shown. The table
+      is silent, the status line next to it counts the rows that appeared
+      since the last poll: a live region on a table that is re-rendered
+      wholesale would read the whole table out every time. -#}
+  <span id="probe-status" class="live-status" role="status" aria-live="polite" data-new-records="{{ self.t("common.new_records") }}"></span>
+  <div id="probe-history" data-live-status="probe-status"
        hx-get="/admin/proxies/{{ proxy.id }}/probe-history"
        hx-trigger="every 10s" hx-swap="innerHTML">
     {% include "proxies/_history.html" %}

@@ -7,8 +7,11 @@
   <h1>{{ self.t("io.title") }}</h1>
 </div>
 
+{# The import was refused and the problems are listed here. The block
+   carries an id and the alert role, so the form below can point at it
+   and a screen reader announces the list when the page comes back. #}
 {% if !errors.is_empty() %}
-<div class="panel">
+<div class="panel" id="io-errors" role="alert">
   <h2>{{ self.t("io.errors_title") }}</h2>
   <ul class="error-list">
     {% for e in errors %}
@@ -49,13 +52,12 @@
       </tbody>
     </table>
   </div>
-  <form method="post" action="/admin/import/alive-token" class="rotate-actions"
-        data-confirm="{{ self.t("io.alive_rotate_confirm") }}"
-        onsubmit="return confirm(this.dataset.confirm)">
-    <input type="hidden" name="_csrf" value="{{ csrf }}">
-    <button class="btn" type="submit">{{ self.t("io.alive_rotate") }}</button>
+  {#- The rotation is confirmed on a page of its own: it states the
+      consequences before the capability is revoked. -#}
+  <div class="rotate-actions">
+    <a class="btn" href="/admin/import/alive-token">{{ self.t("io.alive_rotate") }}</a>
     <span class="hint">{{ self.t("io.rotate_hint") }}</span>
-  </form>
+  </div>
 </div>
   {% when None %}
 <div class="panel">
@@ -74,16 +76,21 @@
 
   <h3>{{ self.t("io.import_title") }}</h3>
   <div class="hint">{{ self.t("io.import_hint") }}</div>
+  {# The problems of the refused import are listed above the form: the
+     link ties the two together for a reader who starts at the form. #}
+  {% if !errors.is_empty() %}
+  <p><a href="#io-errors">{{ self.t("io.errors_link") }}</a></p>
+  {% endif %}
   <form method="post" action="/admin/import">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <div class="field">
       <label for="io-payload">{{ self.t("io.payload_label") }}</label>
-      <textarea class="mono" id="io-payload" name="payload" rows="12" placeholder='{ "version": 1, … }'>{{ payload }}</textarea>
+      <textarea class="mono" id="io-payload" name="payload" rows="12" placeholder='{ "version": 1, … }'{% if !errors.is_empty() %} aria-describedby="io-errors" aria-invalid="true"{% endif %}>{{ payload }}</textarea>
       <div class="hint">{{ self.t("io.payload_hint") }}</div>
     </div>
     <div class="field">
       <label for="io-file">{{ self.t("io.file_label") }}</label>
-      <input type="file" id="io-file" name="file" accept=".json,application/json">
+      <input type="file" id="io-file" name="file" accept=".json,application/json"{% if !errors.is_empty() %} aria-describedby="io-errors"{% endif %}>
       <div class="hint">{{ self.t("io.file_hint") }}</div>
     </div>
     <div class="hint">{{ limits_hint }}</div>
@@ -93,22 +100,4 @@
   </form>
 </div>
 
-<script>
-  // Load a chosen JSON file into the payload textarea (FileReader). The
-  // textarea also accepts a manual paste, so the flow works without JS.
-  (function () {
-    var input = document.getElementById('io-file');
-    if (!input || !window.FileReader) return;
-    input.addEventListener('change', function () {
-      var file = input.files && input.files[0];
-      if (!file) return;
-      var reader = new FileReader();
-      reader.onload = function () {
-        var area = document.querySelector('textarea[name="payload"]');
-        if (area) area.value = reader.result;
-      };
-      reader.readAsText(file);
-    });
-  })();
-</script>
 {% endblock %}

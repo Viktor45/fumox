@@ -45,15 +45,23 @@
 //! built from, so an invalidation touches exactly those.
 
 use axum::body::Bytes;
+use fumox_core::db::DbPool;
 use moka::future::Cache;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, watch};
 
 /// Safety net so abandoned entries eventually leave the caches even without
 /// explicit invalidation (e.g. a deleted source).
 const ENTRY_IDLE_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long the verdict of a failed inline render stays available for the
+/// requests that arrive right after it. They answer from it instead of
+/// running the same failing render again: a broken upstream has to cost
+/// one render per window, not one render per request. The verdict expires
+/// on its own, so a recovered upstream is picked up again.
+const FAILED_RENDER_TTL: Duration = Duration::from_secs(5);
 
 /// Memory ceiling of the processed layer, in bytes. One rendered
 /// subscription body is megabytes, so the ceiling has to be a byte
@@ -174,6 +182,11 @@ struct InlineRenderState {
     /// and resolves every waiter's `changed()`; the last value outlives the
     /// close, so a waiter woken by the close still reads the verdict.
     done: watch::Sender<InlineOutcome>,
+    /// When the leader's render failed. A failed render keeps its entry
+    /// for [`FAILED_RENDER_TTL`], so the requests that arrive right after
+    /// the failure answer from its verdict instead of running the same
+    /// failing render again.
+    failed_at: Option<Instant>,
 }
 
 /// What the leader of an inline render did, published to its waiters so a
@@ -191,7 +204,8 @@ pub enum InlineOutcome {
 }
 
 /// Outcome of [`Caches::begin_inline_render`]: the caller either owns the
-/// render or waits for the one already running.
+/// render, waits for the one already running, or repeats the verdict of a
+/// render that just failed.
 pub enum InlineClaim {
     /// No render of the key is in flight: the caller renders it and stores
     /// the result through the guard's generation.
@@ -200,6 +214,9 @@ pub enum InlineClaim {
     /// receiver resolves when that claim ends, including on unwind. The
     /// channel then carries what the leader did.
     Wait(watch::Receiver<InlineOutcome>),
+    /// A render of this key failed a moment ago; its verdict is repeated
+    /// instead of running the same failing render again.
+    Failed { status: u16, message: String },
 }
 
 impl Caches {
@@ -230,7 +247,9 @@ impl Caches {
     /// Put a rendering into the cache and record the sources it was built
     /// from, so an invalidation of one of them finds the key.
     async fn store(&self, key: &str, rendered: Arc<Rendered>) {
-        self.processed.insert(key.to_string(), rendered.clone()).await;
+        self.processed
+            .insert(key.to_string(), rendered.clone())
+            .await;
         self.index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -392,8 +411,28 @@ impl Caches {
     /// makes the claim invisible to every invalidation.
     pub async fn begin_inline_render(&self, key: &str, source_ids: Vec<String>) -> InlineClaim {
         let mut map = self.inline_rendering.lock().await;
+        let mut stale_verdict = false;
         if let Some(state) = map.get(key) {
-            return InlineClaim::Wait(state.done.subscribe());
+            match state.failed_at {
+                // A live render: wait for it.
+                None => return InlineClaim::Wait(state.done.subscribe()),
+                Some(failed_at) => {
+                    let verdict = state.done.borrow().clone();
+                    if failed_at.elapsed() < FAILED_RENDER_TTL
+                        && let InlineOutcome::Failed { status, message } = verdict
+                    {
+                        // The render failed a moment ago: its verdict is
+                        // the answer, a second render would fail the same
+                        // way.
+                        return InlineClaim::Failed { status, message };
+                    }
+                    // The verdict is stale: the key is free again.
+                    stale_verdict = true;
+                }
+            }
+        }
+        if stale_verdict {
+            map.remove(key);
         }
         let (done, _) = watch::channel(InlineOutcome::Stored);
         map.insert(
@@ -401,6 +440,7 @@ impl Caches {
             InlineRenderState {
                 sources: source_ids.into_iter().collect(),
                 done,
+                failed_at: None,
             },
         );
         drop(map);
@@ -434,14 +474,19 @@ impl InlineRenderGuard {
     /// it instead of each re-running a render that is known to fail. Call
     /// this before the guard drops.
     ///
+    /// The claim keeps its entry for [`FAILED_RENDER_TTL`] afterwards: the
+    /// requests that arrive right after the failure answer from the same
+    /// verdict instead of running the same failing render again.
+    ///
     /// Best-effort by design: the map lock is only ever held for a set
     /// insert or remove, so losing this race is close to impossible, and a
     /// waiter that misses the verdict simply falls back to claiming the
     /// render itself, which is what it did before outcomes existed.
     pub fn fail(&self, status: u16, message: String) {
-        if let Ok(map) = self.inline_rendering.try_lock()
-            && let Some(state) = map.get(&self.key)
+        if let Ok(mut map) = self.inline_rendering.try_lock()
+            && let Some(state) = map.get_mut(&self.key)
         {
+            state.failed_at = Some(Instant::now());
             state
                 .done
                 .send_replace(InlineOutcome::Failed { status, message });
@@ -456,7 +501,14 @@ impl Drop for InlineRenderGuard {
         // here cannot deadlock.
         let key = std::mem::take(&mut self.key);
         if let Ok(mut guard) = self.inline_rendering.try_lock() {
-            guard.remove(&key);
+            // A failed render keeps its entry: the verdict stays available
+            // for the requests that arrive right after it, so a broken
+            // upstream costs one render per window and not one per
+            // request.
+            let failed = guard.get(&key).and_then(|state| state.failed_at).is_some();
+            if !failed {
+                guard.remove(&key);
+            }
             return;
         }
         // Contended: hand the removal to the runtime rather than block.
@@ -507,6 +559,47 @@ impl Default for Caches {
     }
 }
 
+/// The two journal row counts, with the moment they were taken.
+type JournalCountEntry = (Instant, (i64, i64));
+
+/// Row counts of the two journals (`probe_results`, `fetch_log`),
+/// cached for a minute.
+///
+/// The retention card compares the current sizes against the last
+/// rotation stamp; two COUNT scans of a growing table on every panel
+/// render are the most expensive reads on the probe page, and the card
+/// does not need second-by-second fresh numbers.
+#[derive(Clone)]
+pub struct JournalCounts {
+    ttl: Duration,
+    inner: Arc<StdMutex<Option<JournalCountEntry>>>,
+}
+
+impl JournalCounts {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            inner: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    /// The current counts, counted only when the cached ones expired.
+    /// The two counts are independent scans, so they run in parallel.
+    pub async fn get(&self, pool: &DbPool) -> anyhow::Result<(i64, i64)> {
+        if let Some((at, counts)) = *self.inner.lock().expect("journal counts cache")
+            && at.elapsed() < self.ttl
+        {
+            return Ok(counts);
+        }
+        let counts = tokio::try_join!(
+            fumox_core::repo::probe::count_all(pool),
+            fumox_core::repo::fetch_log::count_all(pool),
+        )?;
+        *self.inner.lock().expect("journal counts cache") = Some((Instant::now(), counts));
+        Ok(counts)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +623,9 @@ mod tests {
         {
             InlineClaim::Leader(guard) => guard,
             InlineClaim::Wait(_) => panic!("expected to lead the cold render of {key}"),
+            InlineClaim::Failed { status, message } => {
+                panic!("expected to lead the cold render of {key}, got {status}: {message}")
+            }
         }
     }
 
@@ -733,6 +829,9 @@ mod tests {
         let mut waiter = match caches.begin_inline_render("sub:p1", Vec::new()).await {
             InlineClaim::Wait(rx) => rx,
             InlineClaim::Leader(_) => panic!("a taken claim cannot be led"),
+            InlineClaim::Failed { status, message } => {
+                panic!("a taken claim cannot carry a verdict: {status}: {message}")
+            }
         };
         let parked = tokio::spawn(async move { waiter.changed().await });
 
@@ -859,6 +958,47 @@ mod tests {
         keys.sort();
         assert_eq!(keys, vec!["sub:p1".to_string(), "sub:p2".to_string()]);
         assert!(index.keys_for_source("s3").is_empty());
+    }
+
+    /// The journal counts are read once per TTL window: a render inside
+    /// the window answers from the cache, a render after it counts
+    /// again. The two COUNT scans are the most expensive reads on the
+    /// probe page, so they must not run per render.
+    #[tokio::test]
+    async fn the_journal_counts_are_cached_for_the_ttl() {
+        let dir = fumox_core::tempdir_lite::TempDir::new("journal-counts");
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: dir.path().join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+
+        let cache = JournalCounts::new(Duration::from_secs(60));
+        assert_eq!(cache.get(&pool).await.unwrap(), (0, 0));
+
+        // A row lands in the journal.
+        sqlx::query(
+            "INSERT INTO sources (id, name, url, enabled, cache_ttl_seconds, created_at, updated_at)
+             VALUES ('srcA0000000', 's', 'https://example.com', 1, 3600, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO fetch_log (source_id, fetched_at, ok) VALUES ('srcA0000000', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Inside the TTL the cached count is served.
+        assert_eq!(cache.get(&pool).await.unwrap(), (0, 0));
+
+        // After the TTL the counts are read again.
+        let fresh = JournalCounts::new(Duration::ZERO);
+        assert_eq!(fresh.get(&pool).await.unwrap(), (0, 1));
     }
 
     /// An invalidation reaches the keys the index names, and only those:

@@ -4,7 +4,7 @@
 //! Two paths retire a proxy without a verdict, the refresh of a source
 //! ([`crate::repo::proxies::reconcile_source`]) and the admin's
 //! source-delete click
-//! ([`crate::repo::proxies::mark_orphans_removed`]). Both read their
+//! ([`crate::repo::proxies::mark_source_orphans_removed`]). Both read their
 //! rules from [`IngestPolicy`], so the two cannot disagree about which
 //! statuses survive an ingest-side retirement.
 

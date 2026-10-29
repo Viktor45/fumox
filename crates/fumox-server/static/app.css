@@ -509,6 +509,20 @@ input.tab-input {
   align-items: center;
 }
 .tabs label:hover { color: var(--text); }
+/* Marker on a tab whose pane holds a validation error: the pane that
+   opens is the one with the first error, but a second broken pane has
+   to say so too, otherwise its message stays hidden behind the tab. */
+.tab-error {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 700;
+  color: var(--on-accent);
+  background: var(--danger);
+}
 /* Global keyboard focus ring for interactive elements that have hover/active
    state rules but no explicit focus-visible. :where() keeps specificity at
    zero so the per-element hover/active styling keeps priority when not
@@ -552,6 +566,14 @@ input.tab-input {
 #pedtab-input:checked ~ #pedtab-input-pane,
 #pedtab-rules:checked ~ #pedtab-rules-pane,
 #pedtab-output:checked ~ #pedtab-output-pane {
+  display: block;
+}
+/* The settings panes sit inside the fieldset that carries the read-only
+   `disabled`, so they are not siblings of the radio that drives them and
+   the general sibling combinator above cannot reach them. */
+#tab-server:checked ~ fieldset.settings-panes #pane-server,
+#tab-probe:checked ~ fieldset.settings-panes #pane-probe,
+#tab-shared:checked ~ fieldset.settings-panes #pane-shared {
   display: block;
 }
 
@@ -633,6 +655,9 @@ input.tab-input {
 
 .muted { color: var(--muted); }
 .small { font-size: 13px; }
+/* The status line of a table that refreshes itself ("New records: 3"):
+   it sits next to the table and stays empty until something arrives. */
+.live-status { display: block; min-height: 18px; color: var(--muted); font-size: 13px; }
 /* Focused or program-scrolled controls must stay clear of the sticky
    topbar (52px + margin). */
 input, select, textarea, button, a, [tabindex] { scroll-margin-top: 64px; }

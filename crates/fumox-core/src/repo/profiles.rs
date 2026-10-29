@@ -114,8 +114,12 @@ where
 
 /// Update mutable profile fields. `id` and `created_at` are immutable.
 ///
-/// The access token is stored as a hash, like [`create`].
-pub async fn update(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
+/// The access token is stored as a hash, like [`create`]. The write runs
+/// on the caller's executor, so it can join a transaction.
+pub async fn update<'c, E>(executor: E, profile: &Profile) -> crate::Result<()>
+where
+    E: sqlx::Executor<'c, Database = Sqlite>,
+{
     let affected = sqlx::query(
         "UPDATE profiles SET
             slug = ?, access_token = ?, name = ?, output_format = ?, pipeline = ?,
@@ -137,7 +141,7 @@ pub async fn update(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
     .bind(profile.enabled)
     .bind(profile.updated_at)
     .bind(&profile.id)
-    .execute(pool)
+    .execute(executor)
     .await?
     .rows_affected();
     if affected == 0 {
@@ -146,6 +150,55 @@ pub async fn update(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
         return Err(crate::Error::NotFound(format!("profile {}", profile.id)));
     }
     Ok(())
+}
+
+/// Write a profile and its source composition in one transaction.
+///
+/// The profile row and the composition rows are one object: a profile
+/// whose composition failed to write would be a profile without (or with
+/// a stale) sources, and the caller would have to repair it by hand. The
+/// pair is written atomically instead, so the row and its composition
+/// are either both there or both absent.
+///
+/// `is_new` selects the insert ([`create`]) over the update ([`update`]).
+/// The composition is `source_id, position` in merge order.
+pub async fn upsert_with_sources(
+    pool: &DbPool,
+    profile: &Profile,
+    sources: &[(String, i64)],
+    is_new: bool,
+) -> crate::Result<()> {
+    // BEGIN IMMEDIATE: grabs the WAL write lock up front instead of a
+    // deferred read→write upgrade (see [`replace_sources`]).
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    if is_new {
+        create(&mut *tx, profile).await?;
+    } else {
+        update(&mut *tx, profile).await?;
+    }
+    set_sources(&mut tx, &profile.id, sources).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Flip the enabled flag of a profile and return the new state with the
+/// stamp of the change.
+///
+/// A targeted `UPDATE` instead of rewriting the whole row: the toggle
+/// must not depend on the row the caller read a moment earlier, and it
+/// must not write back fields it never looked at.
+pub async fn toggle_enabled(pool: &DbPool, id: &str) -> crate::Result<(bool, i64)> {
+    let now = crate::models::now_ts();
+    let row: Option<(bool, i64)> = sqlx::query_as(
+        "UPDATE profiles SET enabled = NOT enabled, updated_at = ?
+         WHERE id = ?
+         RETURNING enabled, updated_at",
+    )
+    .bind(now)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.ok_or_else(|| crate::Error::NotFound(format!("profile {id}")))
 }
 
 pub async fn get(pool: &DbPool, id: &str) -> crate::Result<Option<Profile>> {

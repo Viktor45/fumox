@@ -47,33 +47,68 @@ pub async fn pipeline_rows(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let mut built = BuilderState::from_form(&form);
-    let index = params
-        .get("remove")
-        .and_then(|index| index.parse::<usize>().ok());
+    apply_rows_request(&mut built, &params);
+    let section = params.get("section").cloned().unwrap_or_default();
+    let fragment = RowsFragment::for_section(lang.clone(), BuilderView::new(&built), &section);
+    render_html(lang, &fragment, StatusCode::OK)
+}
+
+/// What the `remove` parameter asks the rows endpoint for.
+///
+/// Absent means "add a line" (the *Add rule* button), an index means
+/// "drop that line", and a value that does not parse is a broken
+/// request: it changes nothing at all. The two used to collapse into
+/// one, so a malformed `remove` appended a fresh line instead of
+/// leaving the rows as they were.
+#[derive(Debug, PartialEq, Eq)]
+enum Remove {
+    Absent,
+    Index(usize),
+    Broken,
+}
+
+/// Read the `remove` parameter of a rows request.
+fn remove_request(params: &FormMap) -> Remove {
+    match params.get("remove") {
+        None => Remove::Absent,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(index) => Remove::Index(index),
+            Err(_) => Remove::Broken,
+        },
+    }
+}
+
+/// Apply a rows request to the builder state: drop the named line, or
+/// append a fresh empty one.
+fn apply_rows_request(built: &mut BuilderState, params: &FormMap) {
     // `?render=1` is the change-trigger from a target select: the
     // browser already has the row count it wants, the round-trip only
     // has to repaint the row layout (regex ↔ ASN switch). Without this
     // flag every change would append a fresh empty row, exactly like the
     // explicit *Add rule* button does.
     let append = !params.contains_key("render");
-    match (params.get("section").map(String::as_str), index, append) {
-        (Some("drop"), Some(index), _) => {
+    match (
+        params.get("section").map(String::as_str),
+        remove_request(params),
+        append,
+    ) {
+        // A `remove` that does not parse is a broken request: the rows
+        // stay as they are, no line is appended.
+        (_, Remove::Broken, _) => {}
+        (Some("drop"), Remove::Index(index), _) => {
             if index < built.drop.len() {
                 built.drop.remove(index);
             }
         }
-        (Some("drop"), None, true) => built.drop.push(Default::default()),
-        (_, Some(index), _) => {
+        (Some("drop"), Remove::Absent, true) => built.drop.push(Default::default()),
+        (_, Remove::Index(index), _) => {
             if index < built.rename.len() {
                 built.rename.remove(index);
             }
         }
-        (_, None, true) => built.rename.push(Default::default()),
+        (_, Remove::Absent, true) => built.rename.push(Default::default()),
         _ => {}
     }
-    let section = params.get("section").cloned().unwrap_or_default();
-    let fragment = RowsFragment::for_section(lang.clone(), BuilderView::new(&built), &section);
-    render_html(lang, &fragment, StatusCode::OK)
 }
 
 /// Mode switch: the asymmetric builder ⇄ raw toggle.
@@ -100,7 +135,7 @@ pub async fn pipeline_mode(
     let widget = if params.get("to").map(String::as_str) == Some("raw") {
         let json = BuilderState::from_form(&form)
             .emit()
-            .map(|value| serde_json::to_string_pretty(&value).unwrap_or_default())
+            .map(|emitted| serde_json::to_string_pretty(emitted.document()).unwrap_or_default())
             .unwrap_or_default();
         WidgetFragment::raw_mode(lang, &csrf, json, false, None)
     } else if form.iter().any(|(k, _)| k.starts_with("ped_")) {
@@ -149,4 +184,87 @@ pub async fn pipeline_preset(
         widget.html(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::pipeline_editor::{DropRow, RenameRow};
+
+    fn params(pairs: &[(&str, &str)]) -> FormMap {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// A state with `rename` rename rows and `drop` drop rows.
+    fn state_with_rows(rename: usize, drop: usize) -> BuilderState {
+        BuilderState {
+            rename: vec![RenameRow::default(); rename],
+            drop: vec![DropRow::default(); drop],
+            ..BuilderState::new()
+        }
+    }
+
+    /// A `remove` that does not parse is a broken request: the rows stay
+    /// as they are. It used to read as "no remove at all", which
+    /// appended a fresh line to the section.
+    #[test]
+    fn a_broken_remove_changes_nothing() {
+        for broken in ["abc", "", "1.5", "-1"] {
+            let mut built = state_with_rows(2, 2);
+            apply_rows_request(&mut built, &params(&[("remove", broken)]));
+            assert_eq!(built.rename.len(), 2, "remove={broken:?}");
+            assert_eq!(built.drop.len(), 2, "remove={broken:?}");
+        }
+    }
+
+    /// A `remove` that does not parse in the drop section changes
+    /// nothing either.
+    #[test]
+    fn a_broken_remove_in_the_drop_section_changes_nothing() {
+        let mut built = state_with_rows(1, 3);
+        apply_rows_request(
+            &mut built,
+            &params(&[("section", "drop"), ("remove", "abc")]),
+        );
+        assert_eq!(built.rename.len(), 1);
+        assert_eq!(built.drop.len(), 3);
+    }
+
+    /// An absent `remove` is the *Add rule* button: a fresh empty line
+    /// is appended to the section.
+    #[test]
+    fn an_absent_remove_appends_a_line() {
+        let mut built = state_with_rows(1, 0);
+        apply_rows_request(&mut built, &params(&[]));
+        assert_eq!(built.rename.len(), 2);
+
+        let mut built = state_with_rows(0, 1);
+        apply_rows_request(&mut built, &params(&[("section", "drop")]));
+        assert_eq!(built.drop.len(), 2);
+    }
+
+    /// A `remove` with an index drops that line and leaves the others
+    /// alone.
+    #[test]
+    fn a_remove_with_an_index_drops_the_line() {
+        let mut built = state_with_rows(3, 0);
+        apply_rows_request(&mut built, &params(&[("remove", "1")]));
+        assert_eq!(built.rename.len(), 2);
+
+        let mut built = state_with_rows(0, 3);
+        apply_rows_request(&mut built, &params(&[("section", "drop"), ("remove", "2")]));
+        assert_eq!(built.drop.len(), 2);
+    }
+
+    /// An index past the end of the section changes nothing: there is no
+    /// such line to drop.
+    #[test]
+    fn a_remove_past_the_end_changes_nothing() {
+        let mut built = state_with_rows(2, 0);
+        apply_rows_request(&mut built, &params(&[("remove", "9")]));
+        assert_eq!(built.rename.len(), 2);
+    }
 }

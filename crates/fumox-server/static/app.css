@@ -444,6 +444,15 @@ fieldset {
 }
 legend { font-weight: 600; font-size: 14px; padding: 0 6px; }
 
+/* The settings editor wraps its panes in a fieldset only to carry the
+   `disabled` attribute of a read-only deployment. The panes bring their
+   own panels, so the fieldset chrome would double the frames. */
+fieldset.settings-panes {
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
 .form-actions { display: flex; gap: 10px; margin-top: 18px; align-items: center; flex-wrap: wrap; }
 
 /* CSS-only tabs, no JS: hidden sibling radios drive the panes through

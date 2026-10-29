@@ -2,7 +2,7 @@
 
 use crate::db::DbPool;
 use crate::models::Profile;
-use sqlx::FromRow;
+use sqlx::{FromRow, Sqlite};
 
 #[derive(FromRow)]
 struct ProfileRow {
@@ -79,16 +79,22 @@ const COLUMNS: &str = "id, slug, access_token, name, output_format, pipeline, co
 /// The access token is stored as a hash: the repository is the only place
 /// that writes the column, so the secret never reaches the database in
 /// plain text, whichever caller filled the model.
-pub async fn create(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
+///
+/// The row is written on the caller's executor: the pool, or the
+/// connection of an open transaction (see [`crate::repo::sources::create`]).
+pub async fn create<'c, E>(executor: E, profile: &Profile) -> crate::Result<()>
+where
+    E: sqlx::Executor<'c, Database = Sqlite>,
+{
     // sqlx 0.9 SqlSafeStr: {COLUMNS} is a compile-time constant; all data
     // flows through .bind().
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO profiles ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )))
-    .bind(&profile.id)
-    .bind(&profile.slug)
+    .bind(profile.id.clone())
+    .bind(profile.slug.clone())
     .bind(crate::token::stored(profile.access_token.clone()))
-    .bind(&profile.name)
+    .bind(profile.name.clone())
     .bind(profile.output_format.as_str())
     .bind(
         profile
@@ -101,7 +107,7 @@ pub async fn create(pool: &DbPool, profile: &Profile) -> crate::Result<()> {
     .bind(profile.enabled)
     .bind(profile.created_at)
     .bind(profile.updated_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -163,10 +169,17 @@ pub async fn get_by_slug(pool: &DbPool, slug: &str) -> crate::Result<Option<Prof
 }
 
 /// Resolve a `/sub/{token}` path segment: slug first, then raw id.
+///
+/// The order is by the *match*, not by the NULL-ness of the slug: a
+/// profile whose slug collides with another profile's id must lose
+/// against the profile that owns the slug, whatever the row order of the
+/// table happens to be. `ORDER BY (slug = ?) DESC` puts the slug match
+/// first (1 before 0) and leaves the id match as the fallback.
 pub async fn resolve_token(pool: &DbPool, token: &str) -> crate::Result<Option<Profile>> {
     let row: Option<ProfileRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM profiles WHERE slug = ? OR id = ? ORDER BY slug IS NULL LIMIT 1"
+        "SELECT {COLUMNS} FROM profiles WHERE slug = ? OR id = ? ORDER BY (slug = ?) DESC LIMIT 1"
     )))
+    .bind(token)
     .bind(token)
     .bind(token)
     .fetch_optional(pool)
@@ -222,21 +235,20 @@ pub async fn hash_legacy_tokens(pool: &DbPool) -> crate::Result<usize> {
     Ok(rewritten)
 }
 
-/// Replace the full source composition of a profile in one transaction.
+/// Replace the full source composition of a profile.
 /// `sources` is `(source_id, position)` in merge order.
+///
+/// The rows are written on the caller's connection: inside a transaction
+/// they join that transaction, so a caller that writes the profile and
+/// its composition together can make both atomic.
 pub async fn set_sources(
-    pool: &DbPool,
+    conn: &mut sqlx::SqliteConnection,
     profile_id: &str,
     sources: &[(String, i64)],
 ) -> crate::Result<()> {
-    // BEGIN IMMEDIATE: grabs the WAL write lock up front instead of a
-    // deferred read→write upgrade (which busy_timeout cannot cover, the
-    // upgrade fails with SQLITE_BUSY_SNAPSHOT when another process
-    // committed since our snapshot; see proxies::reconcile_source).
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM profile_sources WHERE profile_id = ?")
         .bind(profile_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     for (source_id, position) in sources {
         sqlx::query(
@@ -245,9 +257,25 @@ pub async fn set_sources(
         .bind(profile_id)
         .bind(source_id)
         .bind(position)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
+    Ok(())
+}
+
+/// Replace the composition of a profile in a transaction of its own.
+///
+/// BEGIN IMMEDIATE: grabs the WAL write lock up front instead of a
+/// deferred read→write upgrade (which busy_timeout cannot cover, the
+/// upgrade fails with SQLITE_BUSY_SNAPSHOT when another process
+/// committed since our snapshot; see proxies::reconcile_source).
+pub async fn replace_sources(
+    pool: &DbPool,
+    profile_id: &str,
+    sources: &[(String, i64)],
+) -> crate::Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    set_sources(&mut tx, profile_id, sources).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -486,7 +514,7 @@ mod tests {
                 .unwrap();
         }
 
-        set_sources(
+        replace_sources(
             &pool,
             "prf2bbbbbbb",
             &[("srcB0000000".into(), 0), ("srcA0000000".into(), 1)],
@@ -499,7 +527,7 @@ mod tests {
         );
 
         // Replacement is full, not incremental.
-        set_sources(&pool, "prf2bbbbbbb", &[("srcA0000000".into(), 0)])
+        replace_sources(&pool, "prf2bbbbbbb", &[("srcA0000000".into(), 0)])
             .await
             .unwrap();
         assert_eq!(
@@ -555,7 +583,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        set_sources(
+        replace_sources(
             &pool,
             "prf3ccccccc",
             &[("srcA0000000".into(), 0), ("srcB0000000".into(), 1)],

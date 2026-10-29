@@ -54,7 +54,7 @@ use fumox_core::db::DbPool;
 use fumox_core::repo;
 use fumox_core::repo::proxies;
 use fumox_core::repo::proxies::ProxyRow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,22 +73,54 @@ const EXPORT_TTL_SECS: i64 = 30;
 /// ever fires when the leader is stuck.
 const EXPORT_RENDER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The current token, generating and persisting one on first use. Called
-/// from `main` at startup; every later call is a single meta read.
-pub async fn ensure_token(pool: &DbPool) -> fumox_core::Result<String> {
-    if let Some(token) = repo::meta_get(pool, TOKEN_KEY).await? {
-        return Ok(token);
-    }
-    let token = fumox_core::models::new_id();
-    repo::meta_set(pool, TOKEN_KEY, &token).await?;
-    Ok(token)
+/// The capability token shared by both export links, kept in process
+/// memory.
+///
+/// `meta` stays the source of truth across restarts; the copy here spares
+/// the public export endpoint a database read on every request. The admin
+/// panel and the public listener share one instance, so a rotation is seen
+/// by both at once — a rotation that only reached the panel would leave the
+/// old link working on the public endpoint.
+#[derive(Clone, Default)]
+pub struct TokenCache {
+    token: Arc<tokio::sync::RwLock<Option<String>>>,
 }
 
-/// Issue a fresh token; both export links stop working immediately.
-pub async fn rotate_token(pool: &DbPool) -> fumox_core::Result<String> {
-    let token = fumox_core::models::new_id();
-    repo::meta_set(pool, TOKEN_KEY, &token).await?;
-    Ok(token)
+impl TokenCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The token the export links are checked against. The stored one is
+    /// read on the first call and kept in memory afterwards; a missing row
+    /// is created on the spot.
+    pub async fn current(&self, pool: &DbPool) -> fumox_core::Result<String> {
+        if let Some(token) = self.token.read().await.clone() {
+            return Ok(token);
+        }
+        let mut guard = self.token.write().await;
+        if let Some(token) = guard.as_ref() {
+            return Ok(token.clone());
+        }
+        let token = match repo::meta_get(pool, TOKEN_KEY).await? {
+            Some(token) => token,
+            None => {
+                let token = fumox_core::models::new_id();
+                repo::meta_set(pool, TOKEN_KEY, &token).await?;
+                token
+            }
+        };
+        *guard = Some(token.clone());
+        Ok(token)
+    }
+
+    /// Issue a fresh token; both export links stop working immediately.
+    pub async fn rotate(&self, pool: &DbPool) -> fumox_core::Result<String> {
+        let token = fumox_core::models::new_id();
+        repo::meta_set(pool, TOKEN_KEY, &token).await?;
+        *self.token.write().await = Some(token.clone());
+        Ok(token)
+    }
 }
 
 /// UTC calendar date for export file names (shared with the config export).
@@ -126,7 +158,14 @@ static HOST_REJECT_LOG: LazyLock<Mutex<HostRejectLog>> =
 
 #[derive(Default)]
 struct HostRejectLog {
-    seen: HashMap<String, Instant>,
+    /// Tracked hosts: when they were last seen and the slot they hold in
+    /// the eviction order.
+    seen: HashMap<String, (Instant, u64)>,
+    /// The tracked hosts by slot number, so the oldest one is dropped
+    /// without a scan over the whole map.
+    order: BTreeMap<u64, String>,
+    /// Next slot number handed out.
+    next_slot: u64,
     /// Start of the current warn window, and how much of
     /// [`HOST_REJECT_MAX_WARNS`] it has spent.
     window_start: Option<Instant>,
@@ -162,6 +201,29 @@ impl HostRejectLog {
         })
     }
 
+    /// Remember `host` as seen, dropping the oldest tracked host when the
+    /// set is full. The order map makes that drop O(log n) instead of a
+    /// scan over every tracked host.
+    fn track(&mut self, host: &str, now: Instant) {
+        if !self.seen.contains_key(host) {
+            if self.seen.len() >= HOST_REJECT_MAX_TRACKED {
+                // Bound the map, not the warnings: drop the oldest entry.
+                if let Some((_, oldest)) = self.order.pop_first() {
+                    self.seen.remove(&oldest);
+                }
+            }
+            self.next_slot += 1;
+            let slot = self.next_slot;
+            self.seen.insert(host.to_string(), (now, slot));
+            self.order.insert(slot, host.to_string());
+            return;
+        }
+        // A host that comes back after its own window keeps its slot: only
+        // the quiet window restarts.
+        let slot = self.seen.get(host).map(|(_, slot)| *slot).unwrap_or(0);
+        self.seen.insert(host.to_string(), (now, slot));
+    }
+
     /// `true` when this rejection of `host` should warn, plus a summary to
     /// log when a window rolls over (see [`Self::roll_window`]).
     ///
@@ -174,27 +236,18 @@ impl HostRejectLog {
     /// is rejected on every request under a broken allowlist, so even as
     /// the hundred-and-first host of a busy hour it is named once at the
     /// rollover.
+    ///
+    /// The budget covers a host that returns after its own quiet window as
+    /// well: a flood of *repeat* visitors must not be able to spend the
+    /// window's warns either.
     fn should_warn(&mut self, host: &str, now: Instant) -> (bool, Option<String>) {
         let summary = self.roll_window(now);
-        if let Some(first) = self.seen.get(host) {
-            if now.duration_since(*first) < HOST_REJECT_WARN_WINDOW {
-                return (false, summary);
-            }
-            self.seen.insert(host.to_string(), now);
-            return (true, summary);
+        if let Some((first, _)) = self.seen.get(host)
+            && now.duration_since(*first) < HOST_REJECT_WARN_WINDOW
+        {
+            return (false, summary);
         }
-        if self.seen.len() >= HOST_REJECT_MAX_TRACKED {
-            // Bound the map, not the warnings: drop the oldest entry.
-            if let Some(oldest) = self
-                .seen
-                .iter()
-                .min_by_key(|(_, first)| **first)
-                .map(|(host, _)| host.clone())
-            {
-                self.seen.remove(&oldest);
-            }
-        }
-        self.seen.insert(host.to_string(), now);
+        self.track(host, now);
         if self.warns_emitted >= HOST_REJECT_MAX_WARNS {
             self.suppressed.get_or_insert_with(|| host.to_string());
             self.suppressed_total += 1;
@@ -277,9 +330,8 @@ async fn serve_tier(
             "the ?format= parameter is not supported: the export is always a plain url_list",
         );
     }
-    let expected = match repo::meta_get(&state.pool, TOKEN_KEY).await {
-        Ok(Some(expected)) => expected,
-        Ok(None) => return serve::error_response(StatusCode::NOT_FOUND, "link not found"),
+    let expected = match state.export_token.current(&state.pool).await {
+        Ok(expected) => expected,
         Err(err) => {
             tracing::error!(error = %err, "export token lookup failed");
             return serve::error_response(
@@ -371,13 +423,24 @@ async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fu
             Ok(stored)
         }
         InlineClaim::Wait(mut ended) => {
-            if tokio::time::timeout(EXPORT_RENDER_DEADLINE, ended.changed())
-                .await
-                .is_ok()
-                && let Some(cached) = state.caches.processed_get(&key).await
-                && cached.is_fresh(fumox_core::models::now_ts())
-            {
-                return Ok(cached);
+            match tokio::time::timeout(EXPORT_RENDER_DEADLINE, ended.changed()).await {
+                Ok(_) => {
+                    if let Some(cached) = state.caches.processed_get(&key).await
+                        && cached.is_fresh(fumox_core::models::now_ts())
+                    {
+                        return Ok(cached);
+                    }
+                }
+                Err(_) => {
+                    // The leader did not finish inside the deadline: this
+                    // request renders on its own. The line says so, because
+                    // a leader that never ends turns every waiter into a
+                    // render of its own.
+                    tracing::warn!(
+                        tier,
+                        "export render single-flight deadline exceeded, rendering independently"
+                    );
+                }
             }
             let rendered = render_tier(&state.pool, tier, state.export_max_rows).await?;
             Ok(state.caches.processed_put(&key, rendered).await)
@@ -395,24 +458,50 @@ async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fu
 ///
 /// The `nodes count` header reports how many rows this body carries, which
 /// is *not* the same as how many the tier holds: a capped render reports the
-/// cap. The body itself carries no truncation marker, so a download cannot
-/// be distinguished from a complete one without comparing that number with
-/// the uncapped tier count shown in the admin panel.
+/// cap. A truncated body therefore says so in its own header — the tier
+/// size is looked up in the same request and written into the body, so a
+/// download states what it left out instead of looking like a complete
+/// tier.
 async fn render_tier(pool: &DbPool, tier: &str, limit: u32) -> Result<Rendered, fumox_core::Error> {
     let rows: Vec<ProxyRow> = match tier {
         "ready" => proxies::list_ready(pool, limit).await?,
         _ => proxies::list_alive(pool, limit).await?,
     };
     let mut lines: Vec<String> = Vec::with_capacity(rows.len());
+    let mut skipped: Vec<i64> = Vec::new();
+    let returned = rows.len();
     for row in rows {
         match row.to_entry() {
             Ok(entry) => lines.push(fumox_core::parsers::serialize(&entry)),
-            Err(err) => {
-                tracing::warn!(proxy_id = row.id, error = %err, "skipping corrupt proxy row");
-            }
+            Err(_) => skipped.push(row.id),
         }
     }
-    let header = serve::url_list_header_block(&format!("export/{tier}"), 1, lines.len());
+    // One line for the whole render: a tier of thousands of corrupt rows
+    // would otherwise write thousands of warnings into the log.
+    if !skipped.is_empty() {
+        let examples: Vec<i64> = skipped.iter().take(5).copied().collect();
+        tracing::warn!(
+            tier,
+            skipped = skipped.len(),
+            examples = ?examples,
+            "corrupt proxy rows skipped in export render"
+        );
+    }
+    let mut header = serve::url_list_header_block(&format!("export/{tier}"), 1, lines.len());
+    // A body that holds exactly the cap may be truncated or may be the
+    // whole tier; the tier size tells the two apart.
+    if returned as u32 == limit {
+        let total = match tier {
+            "ready" => proxies::count_ready(pool).await?,
+            _ => proxies::count_alive(pool).await?,
+        };
+        if total > i64::from(limit) {
+            header.push_str(&format!(
+                "# truncated: showing {limit} of {total} — raise [server].export_max_rows\n"
+            ));
+            warn_truncation(tier, limit, total);
+        }
+    }
     let body = format!("{header}{}", lines.join("\n"));
     Ok(Rendered {
         status: 200,
@@ -424,6 +513,24 @@ async fn render_tier(pool: &DbPool, tier: &str, limit: u32) -> Result<Rendered, 
         // invalidation must never touch the export entries.
         source_ids: Vec::new(),
     })
+}
+
+/// When a tier is larger than the cap, the render says so once per
+/// window: the export is rendered once per [`EXPORT_TTL_SECS`] anyway, but
+/// a leader that times out renders a second time, and a warning per
+/// render would turn one oversized tier into a log stream.
+fn warn_truncation(tier: &str, cap: u32, total: i64) {
+    static LAST_WARNING: LazyLock<Mutex<HashMap<String, Instant>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    let mut last = LAST_WARNING.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(previous) = last.get(tier)
+        && now.duration_since(*previous) < Duration::from_secs(EXPORT_TTL_SECS as u64)
+    {
+        return;
+    }
+    last.insert(tier.to_string(), now);
+    tracing::warn!(tier, cap, total, "export render truncated at the row cap");
 }
 
 #[cfg(test)]
@@ -475,8 +582,10 @@ mod tests {
             )),
             crate::serve::PublicRateLimits::unlimited(),
             Vec::new(),
+            fumox_core::config::TrustedHeader::None,
             allowed_hosts,
             export_max_rows,
+            TokenCache::new(),
         );
         let app = crate::serve::router(state.clone());
         (app, token, state)
@@ -678,7 +787,7 @@ mod tests {
             std::slice::from_ref(&entry),
             &[],
             fumox_core::models::now_ts(),
-            true,
+            fumox_core::ingest::IngestPolicy::from_drop_gate(false),
         )
         .await
         .unwrap();
@@ -791,6 +900,114 @@ mod tests {
         // The admin badge stays uncapped: the operator must be able to
         // see that the tier is bigger than what the export ships.
         assert_eq!(proxies::count_alive(&pool).await.unwrap(), 5);
+    }
+
+    /// A body that hits the cap says so: the tier size is written into the
+    /// header, so a download states what it left out instead of looking
+    /// like a complete tier.
+    #[tokio::test]
+    async fn a_truncated_export_states_what_it_left_out() {
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: std::env::temp_dir()
+                .join(format!("fumox-alive-trunc-{}", fumox_core::models::new_id()))
+                .join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        seed_alive_tier(&pool, "srcF0000000", 5).await;
+
+        // Under the cap: the whole tier ships and says nothing about a
+        // truncation that did not happen.
+        let full = render_tier(&pool, "alive", 100).await.unwrap();
+        let body = String::from_utf8(full.body.to_vec()).unwrap();
+        assert!(!body.contains("truncated"), "{body:?}");
+
+        // Exactly the tier size: nothing was left out, so nothing is
+        // announced.
+        let exact = render_tier(&pool, "alive", 5).await.unwrap();
+        let body = String::from_utf8(exact.body.to_vec()).unwrap();
+        assert!(!body.contains("truncated"), "{body:?}");
+
+        // At the cap with a larger tier: the body names the cap, the tier
+        // size and the setting to raise.
+        let capped = render_tier(&pool, "alive", 2).await.unwrap();
+        let body = String::from_utf8(capped.body.to_vec()).unwrap();
+        assert!(body.contains("# truncated: showing 2 of 5"), "{body:?}");
+        assert!(body.contains("[server].export_max_rows"), "{body:?}");
+    }
+
+    /// Rows that cannot be rendered are skipped, and the render says so in
+    /// one line: a tier of thousands of corrupt rows would otherwise write
+    /// thousands of warnings into the log.
+    #[tokio::test]
+    async fn corrupt_rows_are_skipped_and_reported_once() {
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: std::env::temp_dir()
+                .join(format!("fumox-alive-corrupt-{}", fumox_core::models::new_id()))
+                .join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        seed_alive_tier(&pool, "srcG0000000", 2).await;
+        // Two rows that cannot be turned into an entry: an unknown scheme
+        // and a port that does not fit.
+        for (fingerprint, scheme, port) in [("fp-bad-1", "nosuchscheme", 443i64), ("fp-bad-2", "vless", 70000)] {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+                 VALUES (?1, ?2, 'n', 'bad.example.com', ?3, 'c', 'alive', 1, 1)",
+            )
+            .bind(fingerprint)
+            .bind(scheme)
+            .bind(port)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
+                 SELECT id, 'srcG0000000', 1 FROM proxies WHERE fingerprint = ?1",
+            )
+            .bind(fingerprint)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_writer = captured.clone();
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let rendered = render_tier(&pool, "alive", 100).await.unwrap();
+        let body = String::from_utf8(rendered.body.to_vec()).unwrap();
+        // The good rows still ship.
+        assert!(body.contains("tier1.example.com"), "{body:?}");
+        assert!(!body.contains("bad.example.com"), "{body:?}");
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let lines = log
+            .lines()
+            .filter(|line| line.contains("corrupt proxy rows skipped in export render"))
+            .count();
+        assert_eq!(lines, 1, "one line for the whole render: {log}");
+        assert!(log.contains("skipped=2"), "{log}");
     }
 
     /// Five linked `alive` rows under one source, ids 1..5.
@@ -964,5 +1181,32 @@ mod tests {
             log.should_warn(&format!("h-{i}.example"), t0);
             assert!(log.seen.len() <= HOST_REJECT_MAX_TRACKED);
         }
+    }
+
+    /// The per-window budget covers a host that comes back after its own
+    /// quiet window: a flood of *repeat* visitors must not be able to
+    /// spend the window's warns either.
+    #[test]
+    fn a_returning_host_does_not_bypass_the_window_budget() {
+        let mut log = HostRejectLog::default();
+        let t0 = Instant::now();
+        // A host that warns early in the window.
+        assert!(log.should_warn("repeat.example", t0).0);
+        // The window budget is spent by the other hosts.
+        for i in 0..HOST_REJECT_MAX_WARNS - 1 {
+            assert!(log.should_warn(&format!("flood-{i}.example"), t0).0);
+        }
+        // The window rolls over and is spent again by other hosts.
+        let t1 = t0 + Duration::from_secs(3_601);
+        for i in 0..HOST_REJECT_MAX_WARNS {
+            assert!(log.should_warn(&format!("second-{i}.example"), t1).0);
+        }
+        // The host that warned before comes back after its own quiet
+        // window: it must not warn past the budget.
+        let (warn, _) = log.should_warn("repeat.example", t1 + Duration::from_secs(1));
+        assert!(
+            !warn,
+            "a returning host must not spend the window's warns"
+        );
     }
 }

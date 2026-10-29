@@ -43,6 +43,17 @@ bind = "0.0.0.0:8080"
 # the per-IP rate-limit key. Empty = never trust forwarded headers (any
 # caller can otherwise spoof the key).
 trust_proxy_ips = []
+# Диапазон: none | xff | forwarded | both, дефолт none.
+# Какой forwarded-заголовок пишет доверенный reverse-proxy: none = не читать
+# никакой, xff = семейство X-Forwarded-*, forwarded = RFC 7239 Forwarded,
+# both = любой из двух. Пока объявления нет, forwarded-заголовки не читаются:
+# иначе клиент подменяет ими per-IP ключ rate-limit сам.
+# Range: none | xff | forwarded | both, default none.
+# Which forwarding header the trusted reverse proxy writes: none = read none,
+# xff = the X-Forwarded-* family, forwarded = RFC 7239 Forwarded, both = either.
+# Without the declaration the forwarding headers are not read: otherwise a
+# client spoofs the per-IP rate-limit key with them.
+trust_proxy_header = "none"
 # Список hostname/IP произвольной длины; пусто = принять любой Host.
 # Задайте, чтобы привязать /export/alive/… к своему домену.
 # Hostnames/IPs allowed to reach the public listener. Empty = accept any
@@ -110,6 +121,23 @@ synchronous = "normal"
 # Range: 1..=1024 connections (form). SQLite serializes writes, so a
 # measurable gain past a modest value is uncommon.
 max_connections = 8
+# Диапазон: true | false, дефолт false.
+# Пере-подписать чек-сумму применённой миграции, если файл миграции
+# изменился после применения. По умолчанию false: sqlx считает хеш всего
+# файла, поэтому правку комментария и правку DDL он не различает, а тихая
+# пере-подпись скрывает схему, отставшую от файлов. С false сервер
+# останавливается и называет версию: запустите
+# `cargo run -p fumox-core --example repair_migration_checksums -- <путь к базе>`
+# или включите флаг на один запуск.
+# Range: true | false, default false.
+# Re-stamp the checksum of an applied migration whose file changed after it
+# was applied. False by default: sqlx hashes the whole file, so it cannot
+# tell a comment edit from a DDL edit, and a silent re-stamp hides a schema
+# that fell behind the files. With false the server stops and names the
+# version: run
+# `cargo run -p fumox-core --example repair_migration_checksums -- <db path>`
+# or turn the flag on for that run.
+allow_checksum_repair = false
 
 [fetch]
 # Диапазон: 1..=600 секунд (форма).
@@ -172,19 +200,22 @@ ip_family = "any"
 # Newly inserted unknown proxies per source refresh queued for priority
 # checking.
 refresh_check_limit = 100
-# Диапазон: true | false, дефолт false.
+# Диапазон: true | false, дефолт true.
 # Как поступать с живым прокси, исчезнувшим из выдачи источника.
-# false (дефолт): прокси остается за источником, пока проверки подтверждают,
-# что он жив; как только проверки завалят его, прокси удаляется из базы автоматически.
-# true: если у источника есть правила отбрасывания (drop) в pipeline, живой
-# прокси под таким правилом убирается уже на ближайшем обновлении.
-# Range: true | false, default false.
+# true (дефолт): если у источника есть правила отбрасывания (drop) в
+# pipeline, живой прокси под таким правилом убирается уже на ближайшем
+# обновлении; прокси без правил остается за источником, пока проверки
+# подтверждают, что он жив.
+# false: прокси остается за источником, пока проверки подтверждают, что он
+# жив; как только проверки завалят его, прокси удаляется из базы автоматически.
+# Range: true | false, default true.
 # What happens to an alive proxy that vanished from a source feed.
-# false (the default): the proxy stays linked to the source while checks
-# keep confirming it is alive; once the checks fail it, the proxy gets
-# removed automatically. true: when the source has pipeline drop rules, an alive
-# proxy caught by a rule is removed on the very next refresh.
-drop_gate = false
+# true (the default): when the source has pipeline drop rules, an alive
+# proxy caught by a rule is removed on the very next refresh; a proxy no
+# rule touches stays linked to the source while checks keep confirming it
+# is alive. false: every proxy stays linked until the checks fail it, and
+# it is removed from the database automatically.
+drop_gate = true
 # Диапазон: true | false, дефолт false.
 # Возврат удаленного прокси, который снова появился в источнике.
 # false (дефолт): removed терминален, возврат только вручную («сбросить
@@ -245,19 +276,53 @@ cache_max_entries = 16384
 # Range: 1..=60 seconds (form).
 # Timeout for the async DNS resolution step.
 dns_timeout_secs = 5
-# Диапазон: 0 = не ждать вовсе, сверху не ограничено (u64, форма ключа нет).
+# Диапазон: 0..=300 секунд (форма).
 # Сколько секунд старт ждет скачивания баз GeoLite2, прежде чем поднять
 # слушатели: медленное зеркало не должно держать /healthz недоступным.
 # По истечении бюджета загрузка продолжается в фоне, а текущий запуск
 # работает без гео-обогащения до следующего старта (файл ставится
 # атомарным rename, поэтому частичный .mmdb никто не увидит).
-# Range: 0 = do not wait at all, no upper bound (u64, not in the form).
+# Range: 0..=300 seconds (form).
 # How many seconds startup waits for the GeoLite2 download before binding
 # the listeners, so a slow mirror cannot keep /healthz unreachable. Past
 # the budget the download continues in the background and this run serves
 # without geo enrichment until the next start (the file lands via an
 # atomic rename, so no partial .mmdb is ever visible).
 startup_download_budget_secs = 60
+# Диапазон: true | false, дефолт true.
+# Скачивать ли базы GeoLite2 вообще. false = файлы .mmdb кладет оператор
+# сам (зеркало MaxMind, внутренняя копия, read-only том), fumox никогда не
+# пишет в db_dir и не ждет загрузки на старте.
+# Range: true | false, default true.
+# Whether the GeoLite2 databases are downloaded at all. false = the
+# operator provides the .mmdb files by hand (a MaxMind mirror, an internal
+# copy, a read-only volume), fumox never writes into db_dir and never
+# waits for a download at startup.
+auto_download = true
+
+# Зеркала для скачивания баз: имя файла → URL. Значения по умолчанию
+# указывают на публичные релизы P3TERX; оператор может подставить
+# другое зеркало (своё или MaxMind) без выпуска новой версии.
+# Download mirrors: file name → URL. The defaults point at the public
+# P3TERX releases; an operator points them at another mirror (their own
+# or MaxMind's) without waiting for a release.
+[geo.download_urls]
+"GeoLite2-ASN.mmdb" = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb"
+"GeoLite2-City.mmdb" = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb"
+
+# Ожидаемые контрольные суммы: имя файла → SHA-256. Файл, для которого
+# сумма указана, устанавливается только когда скачанный файл ей
+# соответствует; несовпадение оставляет прежнюю базу на месте. Файл без
+# указанной суммы устанавливается по проверке формата (.mmdb с
+# метаданными MaxMind). Раскомментируйте и подставьте свои суммы, если
+# зеркала свои.
+# Expected checksums: file name → SHA-256. A file whose checksum is
+# listed here is installed only when the download matches it; a mismatch
+# leaves the previous database in place. A file without a listed checksum
+# is installed on the format check alone (an .mmdb with MaxMind metadata).
+# Uncomment and fill in your own sums when you run your own mirrors.
+# [geo.sha256]
+# "GeoLite2-City.mmdb" = "0000000000000000000000000000000000000000000000000000000000000000"
 
 [network]
 # Диапазон: 0..=60 секунд (форма). 0 = брать значение из [geo].dns_timeout_secs.
@@ -325,6 +390,17 @@ locales_dir = "locales"
 # Reverse-proxy CIDRs for the admin per-IP rate-limit key. Empty = ignore
 # forwarded headers.
 trust_proxy_ips = []
+# Диапазон: none | xff | forwarded | both, дефолт none.
+# Какой forwarded-заголовок пишет доверенный reverse-proxy: none = не читать
+# никакой, xff = семейство X-Forwarded-*, forwarded = RFC 7239 Forwarded,
+# both = любой из двух. Пока объявления нет, forwarded-заголовки не читаются:
+# иначе клиент подменяет ими per-IP ключ rate-limit сам.
+# Range: none | xff | forwarded | both, default none.
+# Which forwarding header the trusted reverse proxy writes: none = read none,
+# xff = the X-Forwarded-* family, forwarded = RFC 7239 Forwarded, both = either.
+# Without the declaration the forwarding headers are not read: otherwise a
+# client spoofs the per-IP rate-limit key with them.
+trust_proxy_header = "none"
 # Список hostname/IP произвольной длины; пусто = принять любой Host.
 # Hostnames/IPs allowed to reach the admin listener. Empty = accept any Host.
 allowed_hosts = []

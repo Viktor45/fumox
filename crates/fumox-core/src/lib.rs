@@ -11,6 +11,7 @@ pub mod error;
 pub mod fingerprint;
 pub mod formats;
 pub mod geo;
+pub mod ingest;
 pub mod logging;
 pub mod models;
 pub mod params;

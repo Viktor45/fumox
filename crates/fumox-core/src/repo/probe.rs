@@ -203,6 +203,54 @@ pub struct ProbeResultEntry<'a> {
     pub probe_kind: &'a str,
 }
 
+/// Refresh the denormalised T2 recency stamp of the proxies whose
+/// journal rows were just written.
+///
+/// The stamp is the moment of the last T2 *attempt*, the verified one and
+/// the unverified one alike: the recency queue has to move past a row
+/// whose tunnel check never ran. It never moves backwards, so a replayed
+/// or out-of-order batch cannot make a proxy look older than it is, and
+/// it stays NULL for a proxy that never had a T2 attempt.
+async fn stamp_last_t2_checked(
+    pool: &DbPool,
+    entries: &[ProbeResultEntry<'_>],
+) -> crate::Result<()> {
+    // One stamp per proxy: the newest attempt of the batch wins.
+    let mut newest: Vec<(i64, i64)> = Vec::new();
+    for entry in entries {
+        if !is_t2_kind(entry.probe_kind) {
+            continue;
+        }
+        match newest.iter_mut().find(|(id, _)| *id == entry.proxy_id) {
+            Some((_, at)) => *at = (*at).max(entry.checked_at),
+            None => newest.push((entry.proxy_id, entry.checked_at)),
+        }
+    }
+    if newest.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["(?, ?)"; newest.len()].join(", ");
+    let sql = format!(
+        "WITH stamps(id, at) AS (VALUES {placeholders})
+         UPDATE proxies
+            SET last_t2_checked_at = CASE
+                    WHEN proxies.last_t2_checked_at IS NULL
+                      OR proxies.last_t2_checked_at < stamps.at
+                        THEN stamps.at
+                    ELSE proxies.last_t2_checked_at
+                END
+           FROM stamps
+          WHERE proxies.id = stamps.id"
+    );
+    // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+    for (id, at) in &newest {
+        query = query.bind(id).bind(at);
+    }
+    query.execute(pool).await?;
+    Ok(())
+}
+
 pub async fn insert(pool: &DbPool, entry: &ProbeResultEntry<'_>) -> crate::Result<()> {
     sqlx::query(
         "INSERT INTO probe_results
@@ -217,6 +265,7 @@ pub async fn insert(pool: &DbPool, entry: &ProbeResultEntry<'_>) -> crate::Resul
     .bind(entry.probe_kind)
     .execute(pool)
     .await?;
+    stamp_last_t2_checked(pool, std::slice::from_ref(entry)).await?;
     Ok(())
 }
 
@@ -251,17 +300,50 @@ pub async fn insert_many(pool: &DbPool, entries: &[ProbeResultEntry<'_>]) -> cra
         }
         written += query.execute(pool).await?.rows_affected();
     }
+    stamp_last_t2_checked(pool, entries).await?;
     Ok(written)
 }
 
+/// How many journal rows one purge batch deletes.
+const PURGE_BATCH_SIZE: i64 = 1_000;
+
+/// The pause between two purge batches.
+///
+/// The purge holds the WAL write lock for the duration of a batch, and
+/// the probe daemon writes its own verdicts into the same table. The
+/// pause gives them a window between two batches instead of making them
+/// wait for the whole sweep.
+const PURGE_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Delete probe history older than the cutoff (retention).
+///
+/// The delete runs in bounded batches, one statement each: a single
+/// `DELETE` over the whole expired population holds the write lock until
+/// the last row is gone and grows the WAL with one giant commit. The
+/// journal is the largest table in the database (one row per check
+/// attempt, every tier, every cycle), so this is exactly the sweep that
+/// must not monopolise the lock. Each statement is its own transaction,
+/// so the lock is released between the batches.
 pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
-    let affected = sqlx::query("DELETE FROM probe_results WHERE checked_at < ?")
+    let mut total = 0u64;
+    loop {
+        let affected = sqlx::query(
+            "DELETE FROM probe_results WHERE id IN (
+                 SELECT id FROM probe_results WHERE checked_at < ? ORDER BY id LIMIT ?
+             )",
+        )
         .bind(cutoff)
+        .bind(PURGE_BATCH_SIZE)
         .execute(pool)
         .await?
         .rows_affected();
-    Ok(affected)
+        total += affected;
+        if affected < PURGE_BATCH_SIZE as u64 {
+            break;
+        }
+        tokio::time::sleep(PURGE_BATCH_PAUSE).await;
+    }
+    Ok(total)
 }
 
 /// Total journal size. Reported on the probe page next to the rotation
@@ -578,6 +660,45 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The retention purge runs in bounded batches, so a journal larger
+    /// than one batch is swept completely and the lock is released
+    /// between the batches.
+    #[tokio::test]
+    async fn the_retention_purge_sweeps_more_than_one_batch() {
+        let (_dir, pool) = temp_pool().await;
+        let id = insert_proxy(&pool, "fp-purge", "vless", "alive", true).await;
+
+        let expired = PURGE_BATCH_SIZE + 1;
+        let mut entries: Vec<ProbeResultEntry<'_>> = Vec::with_capacity(expired as usize + 1);
+        for _ in 0..expired {
+            entries.push(ProbeResultEntry {
+                proxy_id: id,
+                checked_at: 1000,
+                ok: true,
+                latency_ms: None,
+                error: None,
+                probe_kind: "tcp",
+            });
+        }
+        // One fresh row survives the sweep.
+        entries.push(ProbeResultEntry {
+            proxy_id: id,
+            checked_at: 2000,
+            ok: true,
+            latency_ms: None,
+            error: None,
+            probe_kind: "tcp",
+        });
+        insert_many(&pool, &entries).await.unwrap();
+
+        assert_eq!(purge_before(&pool, 1500).await.unwrap(), expired as u64);
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_results")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(count, 1);
     }
 

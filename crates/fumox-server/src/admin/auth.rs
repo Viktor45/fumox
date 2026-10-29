@@ -63,29 +63,36 @@ const SESSION_EPOCH_KEY: &str = "admin_session_epoch";
 /// Read on every session check instead of cached per process: one indexed
 /// SELECT on the tiny `meta` table is noise next to a panel request, and a
 /// per-process cache would go stale against the source of truth the moment
-/// anything but this process writes the row. A read error yields 0 without
-/// failing the request: a stricter epoch, never a looser one, so live
-/// cookies either verify as usual or fail closed (the panel is useless
-/// with the database down anyway).
-async fn session_epoch(pool: &fumox_core::db::DbPool) -> u64 {
+/// anything but this process writes the row.
+///
+/// A read error is an error, not a zero. Zero is the epoch of a world
+/// before the first bump: a cookie minted back then would verify again,
+/// which is exactly what the epoch exists to prevent. A value that is not
+/// a number is the same case: the row was written by something else and
+/// its meaning is unknown. The caller rejects the request instead — the
+/// panel is unusable with the database down anyway, and a session must not
+/// outlive a revocation.
+async fn session_epoch(pool: &fumox_core::db::DbPool) -> Result<u64, fumox_core::Error> {
     match fumox_core::repo::meta_get(pool, SESSION_EPOCH_KEY).await {
-        Ok(Some(value)) => value.trim().parse().unwrap_or(0),
-        Ok(None) => 0,
-        Err(err) => {
-            tracing::warn!(error = %err, "cannot read the session epoch; failing closed to 0");
-            0
-        }
+        Ok(Some(value)) => value.trim().parse::<u64>().map_err(|err| {
+            fumox_core::Error::Database(format!(
+                "the session epoch in `meta` is not a number ({value:?}): {err}"
+            ))
+        }),
+        Ok(None) => Ok(0),
+        Err(err) => Err(err),
     }
 }
 
 /// Bump the session-revocation epoch in `meta`: every cookie minted before
 /// this call stops verifying. Called on logout and when the settings
-/// screen rotates `[admin].token` (the session key itself is frozen at
-/// startup, so the epoch is the only revocation that survives a
-/// mid-run credential change). Returns `false` when the bump could not be
-/// persisted (database error); the caller then still clears the cookie,
-/// but a copy of it keeps working until the TTL or the next successful
-/// bump.
+/// screen rotates `[admin].token`. A rotation already changes the
+/// effective key (it is derived from the live token), but the epoch is
+/// what ends the sessions of the other browsers as well, and what a
+/// logout can do without touching the credential. Returns `false` when
+/// the bump could not be persisted (database error); the caller then
+/// still clears the cookie, but a copy of it keeps working until the TTL
+/// or the next successful bump.
 pub(crate) async fn revoke_all_sessions(pool: &fumox_core::db::DbPool) -> bool {
     match fumox_core::repo::meta_increment(pool, SESSION_EPOCH_KEY).await {
         Ok(_) => true,
@@ -111,27 +118,58 @@ fn epoch_session_key(key: &[u8], epoch: u64) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Mint a session cookie value: `{expires_unix}.{hmac(epoch, expires_unix)}`
-/// over the epoch-mixed session key. `epoch` must be the value
+/// Version tag of the current session-cookie format. The cookie value
+/// carries it, so a future format change can accept the formats it means
+/// to keep and reject the ones it does not, instead of guessing from the
+/// shape of the value.
+const COOKIE_VERSION: &str = "v2";
+
+/// Mint a session cookie value: `{version}.{expires_unix}.{hmac}` over
+/// the epoch-mixed session key. `epoch` must be the value
 /// [`session_epoch`] returned for the request that issues the cookie.
 pub fn issue_session(key: &[u8], ttl: Duration, epoch: u64) -> String {
     let expires = fumox_core::models::now_ts() + ttl.as_secs() as i64;
+    let epoch_key = epoch_session_key(key, epoch);
     format!(
-        "{expires}.{}",
-        mac_hex(&epoch_session_key(key, epoch), &expires.to_string())
+        "{COOKIE_VERSION}.{expires}.{}",
+        mac_hex(&epoch_key, &format!("{COOKIE_VERSION}.{expires}"))
     )
 }
 
 /// Verify a session cookie value; returns the expiry timestamp when valid.
 /// `epoch` must be the current server-side epoch: a cookie minted under an
 /// older one (before a logout bump) is rejected here.
+///
+/// Two formats are accepted:
+///
+/// * `v2.{expires}.{mac}` — the current one, issued by this build.
+/// * `{expires}.{mac}` — the previous build's format, accepted during the
+///   transition so the upgrade does not cost the operator a re-login. Its
+///   MAC covers the epoch-mixed key exactly like the current one, so it is
+///   no weaker; only the version tag and the covered message differ.
+///
+/// The pre-epoch format (a MAC over the bare session key, before the
+/// revocation epoch existed) is not accepted: it matches no epoch, and
+/// honoring it would hand a copied cookie back the lifetime the epoch
+/// exists to cut short. It never shipped in a published image, so no
+/// upgrade pays for that rejection.
 pub fn verify_session(key: &[u8], value: &str, epoch: u64) -> Option<i64> {
-    let (expires, provided) = value.split_once('.')?;
+    let epoch_key = epoch_session_key(key, epoch);
+    let (version, rest) = match value.strip_prefix(COOKIE_VERSION) {
+        Some(rest) => (COOKIE_VERSION, rest.strip_prefix('.')?),
+        None => ("", value),
+    };
+    let (expires, provided) = rest.split_once('.')?;
     let expires_ts: i64 = expires.parse().ok()?;
     if expires_ts <= fumox_core::models::now_ts() {
         return None;
     }
-    ct_eq(&mac_hex(&epoch_session_key(key, epoch), expires), provided).then_some(expires_ts)
+    let message = if version.is_empty() {
+        expires.to_string()
+    } else {
+        format!("{version}.{expires}")
+    };
+    ct_eq(&mac_hex(&epoch_key, &message), provided).then_some(expires_ts)
 }
 
 /// CSRF token bound to the session cookie value; deterministic, so no
@@ -270,12 +308,19 @@ fn cross_site_context(method: &Method, headers: &HeaderMap) -> bool {
 /// Outermost admin middleware: per-IP rate limiting. Login gets the hard
 /// limit, everything else the soft one.
 ///
-/// `/admin/static/*` (the vendored CSS/htmx assets) and HEAD requests are
-/// exempt: they carry no state and answer identically for everyone, but
-/// each would otherwise burn the same per-IP window as a panel action, a
-/// page referencing them re-opens after a burst of fragment loads could be
-/// pushed to 429 by asset fetches alone, and an anonymous passer-by could
-/// exhaust someone else's NAT-shared window with cheap GETs of the CSS.
+/// The login window counts failed attempts: a successful login returns
+/// the slot it took, so the operator's own sign-in never eats the
+/// brute-force budget of the address the panel is reached on.
+///
+/// `/admin/static/*` (the vendored CSS/htmx assets) is exempt: it carries
+/// no state and answers identically for everyone, but it would otherwise
+/// burn the same per-IP window as a panel action, a page referencing them
+/// re-opens after a burst of fragment loads could be pushed to 429 by asset
+/// fetches alone, and an anonymous passer-by could exhaust someone else's
+/// NAT-shared window with cheap GETs of the CSS. Every other path counts,
+/// `HEAD` included: a HEAD is a request for a resource just like the GET
+/// is, and exempting it would hand an attacker a free window on the paths
+/// that matter.
 ///
 /// Cross-site requests are rejected *without counting*: the windows exist
 /// to cap the operator's own panel usage and login brute-force, and before
@@ -289,7 +334,7 @@ pub async fn rate_limit(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    if req.method() == Method::HEAD || path.starts_with("/admin/static/") {
+    if path.starts_with("/admin/static/") {
         return next.run(req).await;
     }
     if cross_site_context(req.method(), req.headers()) {
@@ -297,7 +342,13 @@ pub async fn rate_limit(
         let lang = state.locales.lang_from_headers(req.headers());
         return plain(StatusCode::FORBIDDEN, lang.t("err.cross_site"));
     }
-    let ip = client_key(addr, req.headers(), &state.trusted_cidrs).to_string();
+    let ip = client_key(
+        addr,
+        req.headers(),
+        &state.trusted_cidrs,
+        state.trusted_header,
+    )
+    .to_string();
     let is_login = req.method() == Method::POST && path == "/admin/login";
     let limiter = if is_login {
         state.login_limiter.clone()
@@ -325,6 +376,15 @@ pub async fn rate_limit(
     if response.status() == StatusCode::TOO_MANY_REQUESTS {
         limiter.refund(&ip).await;
     }
+    // The login window counts *failed* attempts: a successful login is
+    // not a guess, and it must not cost the operator a slot in the
+    // brute-force window. The slot is given back, the window is not
+    // reset: the failures that filled it stay counted, so a successful
+    // login between two wrong guesses does not hand the attacker a fresh
+    // window.
+    if is_login && response.status() != StatusCode::UNPROCESSABLE_ENTITY {
+        limiter.refund(&ip).await;
+    }
     // A failed login is the panel's primary brute-force audit signal, but
     // the handler never sees the client address (it extracts no
     // ConnectInfo). Attribute the 422 it renders to its source here, where
@@ -339,10 +399,25 @@ pub async fn rate_limit(
 /// Authentication gate for `/admin/*` (except login/static). Browsers are
 /// redirected; HTMX requests get an `HX-Redirect` so the whole page
 /// transitions to the login screen.
+///
+/// The session key is derived from the *live* admin token, so a token
+/// rotated through the settings screen changes the effective key at once
+/// and every cookie minted under the old one stops verifying.
 pub async fn require_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
-    let epoch = session_epoch(&state.pool).await;
+    let epoch = match session_epoch(&state.pool).await {
+        Ok(epoch) => epoch,
+        Err(err) => {
+            // The epoch is the revocation state: without it a session
+            // could outlive the revocation it was supposed to die in.
+            tracing::error!(error = %err, "cannot read the session epoch; rejecting the request");
+            return plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the session revocation state is unavailable, try again\n",
+            );
+        }
+    };
     let authenticated = session_cookie_value(req.headers())
-        .and_then(|value| verify_session(&state.session_key, &value, epoch))
+        .and_then(|value| verify_session(&state.session_key(), &value, epoch))
         .is_some();
     if authenticated {
         return next.run(req).await;
@@ -362,7 +437,7 @@ pub async fn csrf_protect(State(state): State<AdminState>, req: Request, next: N
     }
     let lang = state.locales.lang_from_headers(req.headers());
     let session = session_cookie_value(req.headers()).unwrap_or_default();
-    let expected = csrf_token(&state.csrf_key, &session);
+    let expected = csrf_token(&state.csrf_key(), &session);
 
     let (parts, body) = req.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
@@ -393,6 +468,10 @@ struct LoginTemplate {
     /// Active interface theme (rendered as `data-theme` on `<html>`).
     theme: Theme,
     error: Option<String>,
+    /// Set when the previous logout could not revoke the sessions (the
+    /// database refused the epoch bump): the operator has to know that
+    /// the cookie they hold may still work.
+    notice: Option<String>,
 }
 
 i18n::impl_i18n!(LoginTemplate);
@@ -413,11 +492,19 @@ pub async fn login_form(
         }
         None => (state.locales.lang_from_headers(&headers), None),
     };
+    // `?revoked=0` is the logout's answer when the revocation did not
+    // happen: the session the browser held may still work, and the
+    // operator has to hear it instead of a silent redirect.
+    let notice = match params.get("revoked").map(String::as_str) {
+        Some("0") => Some(lang.t("login.not_revoked").to_string()),
+        _ => None,
+    };
     let template = LoginTemplate {
         langs: state.locales.choices().to_vec(),
         theme: theme::from_headers(&headers),
         lang,
         error: None,
+        notice,
     };
     let mut response = crate::admin::render_html(template.lang.clone(), &template, StatusCode::OK);
     if let Some(cookie) = set_cookie
@@ -445,10 +532,21 @@ pub async fn login_submit(
         && ct_eq(&form.token, &admin.token)
     {
         let ttl = state.session_ttl();
-        let epoch = session_epoch(&state.pool).await;
-        let value = issue_session(&state.session_key, ttl, epoch);
+        // Without the epoch there is no key to mint a cookie under: the
+        // cookie would carry no revocation state at all.
+        let epoch = match session_epoch(&state.pool).await {
+            Ok(epoch) => epoch,
+            Err(err) => {
+                tracing::error!(error = %err, "cannot read the session epoch; refusing the login");
+                return plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the session revocation state is unavailable, try again\n",
+                );
+            }
+        };
+        let value = issue_session(&state.session_key(), ttl, epoch);
         let mut cookie = format!(
-            "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+            "{SESSION_COOKIE}={value}; Path=/admin; HttpOnly; SameSite=Lax; Max-Age={}",
             ttl.as_secs()
         );
         if admin.secure_cookies {
@@ -471,6 +569,7 @@ pub async fn login_submit(
         theme: theme::from_headers(&headers),
         lang,
         error: Some(error),
+        notice: None,
     };
     crate::admin::render_html(
         template.lang.clone(),
@@ -510,14 +609,23 @@ pub async fn set_lang(
 /// bump. One global epoch, one bump: logging out in one browser also ends
 /// any other browser's session: the accepted cost for a single-user panel
 /// whose only alternative is leaving every session irrevocable.
+///
+/// When the bump could not be persisted the cookie is cleared anyway, but
+/// the redirect says so: a copy of it may keep working, and the operator
+/// has to know that the revocation did not happen.
 pub async fn logout(State(state): State<AdminState>) -> Response {
-    revoke_all_sessions(&state.pool).await;
-    let cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    let revoked = revoke_all_sessions(&state.pool).await;
+    let cookie = format!("{SESSION_COOKIE}=; Path=/admin; HttpOnly; SameSite=Lax; Max-Age=0");
+    let location = if revoked {
+        "/admin/login".to_string()
+    } else {
+        "/admin/login?revoked=0".to_string()
+    };
     (
         StatusCode::SEE_OTHER,
         [
             (header::SET_COOKIE, cookie),
-            (header::LOCATION, "/admin/login".to_string()),
+            (header::LOCATION, location),
         ],
     )
         .into_response()
@@ -695,7 +803,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Logout, carrying the CSRF token the login form ships.
-        let csrf = csrf_token(&state.csrf_key, cookie_value(&cookie));
+        let csrf = csrf_token(&state.csrf_key(), cookie_value(&cookie));
         let response = app
             .clone()
             .oneshot(request(
@@ -746,6 +854,317 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// L-113: the strict window exists and the login endpoint is the one
+    /// it guards. One wrong token is answered with the 422 the login
+    /// form renders, the second is refused with 429 before the handler
+    /// ever sees the token.
+    #[tokio::test]
+    async fn the_login_window_refuses_after_the_configured_failures() {
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                login_rate_limit: fumox_core::config::RateLimit::new(
+                    1,
+                    Duration::from_secs(60),
+                ),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(state);
+
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/login", "token=wrong", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/login", "token=wrong", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// L-099: the login window counts *failed* attempts. A successful
+    /// login is not a guess, so it neither takes a slot of its own nor
+    /// clears the failures already counted: the failure before it still
+    /// counts, and the window still runs out.
+    #[tokio::test]
+    async fn a_successful_login_neither_takes_a_slot_nor_resets_the_window() {
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                login_rate_limit: fumox_core::config::RateLimit::new(
+                    2,
+                    Duration::from_secs(60),
+                ),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(state);
+
+        // One failure: counted.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/login", "token=wrong", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // The operator signs in: the attempt is not a guess, so it must
+        // not cost the brute-force budget.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The failure before the successful login still counts: the
+        // window holds one slot left, not two.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/login", "token=wrong", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // And the window is not reset either: the next attempt is out.
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/admin/login", "token=wrong", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// L-114/L-115: the session cookie is scoped to the panel and
+    /// carries the attributes that keep it away from scripts and from
+    /// other sites. The `Secure` flag appears only when the operator
+    /// asked for it, a panel served over plain http would never get a
+    /// cookie back at all.
+    #[tokio::test]
+    async fn the_session_cookie_is_scoped_to_the_panel_and_hardened() {
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            set_cookie.contains("Path=/admin"),
+            "the cookie must not travel outside the panel: {set_cookie}"
+        );
+        assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+        assert!(set_cookie.contains("SameSite=Lax"), "{set_cookie}");
+        assert!(set_cookie.contains("Max-Age="), "{set_cookie}");
+        assert!(
+            !set_cookie.contains("; Secure"),
+            "a plain-http panel must not demand an https cookie: {set_cookie}"
+        );
+
+        // The logout clears the cookie on the same path, with the same
+        // attributes and an immediate expiry.
+        let cookie = cookie_from(&response);
+        let csrf = csrf_token(&state.csrf_key(), cookie_value(&cookie));
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/logout",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cleared = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cleared.contains("Path=/admin"), "{cleared}");
+        assert!(cleared.contains("HttpOnly"), "{cleared}");
+        assert!(cleared.contains("SameSite=Lax"), "{cleared}");
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+
+        // With `secure_cookies` the flag travels with the cookie.
+        let (_dir, secure_state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                secure_cookies: true,
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(secure_state);
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.contains("; Secure"), "{set_cookie}");
+    }
+
+    /// M-012: the cookie value carries the format version, so a future
+    /// change can accept the formats it means to keep and reject the
+    /// ones it does not, instead of guessing from the shape of the
+    /// value. The previous build's format (no version tag, the MAC over
+    /// the epoch-mixed key) stays accepted through the transition; the
+    /// pre-epoch format (a MAC over the bare session key) does not.
+    #[test]
+    fn the_cookie_format_is_versioned_and_the_transition_is_accepted() {
+        let key = derive_key(b"test", "token");
+        let value = issue_session(&key, Duration::from_secs(3600), 0);
+        assert!(value.starts_with("v2."), "{value}");
+        assert!(verify_session(&key, &value, 0).is_some());
+
+        let expires = fumox_core::models::now_ts() + 3600;
+        let epoch_key = epoch_session_key(&key, 0);
+        let legacy = format!("{expires}.{}", mac_hex(&epoch_key, &expires.to_string()));
+        assert!(
+            verify_session(&key, &legacy, 0).is_some(),
+            "the previous build's format must keep working through the transition"
+        );
+
+        let pre_epoch = format!("{expires}.{}", mac_hex(&key, &expires.to_string()));
+        assert!(
+            verify_session(&key, &pre_epoch, 0).is_none(),
+            "a cookie MACed over the bare key predates the revocation epoch and must not verify"
+        );
+    }
+
+    /// M-104: a logout whose revocation could not be persisted says so
+    /// instead of redirecting silently. The cookie is cleared anyway,
+    /// but a copy of it may keep working until the TTL, so the operator
+    /// has to learn that the revocation did not happen.
+    #[tokio::test]
+    async fn a_failed_revocation_is_announced_instead_of_being_silent() {
+        use http_body_util::BodyExt;
+
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        // The database refuses the epoch bump: every write of that key
+        // aborts, so the revocation cannot be persisted.
+        for trigger in [
+            "CREATE TRIGGER block_epoch_insert BEFORE INSERT ON meta
+             WHEN NEW.key = 'admin_session_epoch'
+             BEGIN SELECT RAISE(ABORT, 'the epoch bump is denied'); END",
+            "CREATE TRIGGER block_epoch_update BEFORE UPDATE ON meta
+             WHEN OLD.key = 'admin_session_epoch'
+             BEGIN SELECT RAISE(ABORT, 'the epoch bump is denied'); END",
+        ] {
+            sqlx::query(trigger).execute(&state.pool).await.unwrap();
+        }
+
+        let app = crate::admin::router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = cookie_from(&response);
+
+        let csrf = csrf_token(&state.csrf_key(), cookie_value(&cookie));
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/logout",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/login?revoked=0",
+            "the redirect must say that the revocation did not happen"
+        );
+
+        // The login screen turns the flag into a banner the operator
+        // cannot miss.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/login?revoked=0&lang=en", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains("not revoked"),
+            "the login screen must carry the revocation notice: {html:.400}"
+        );
+    }
+
     /// f18 end to end, token-change path: rotating `[admin].token` through
     /// the settings screen bumps the persisted epoch, so the cookie the
     /// browser held (a stolen copy included) stops authenticating even
@@ -791,7 +1210,7 @@ mod tests {
 
         // A save that leaves the token unchanged must neither bump the
         // epoch nor revoke the session performing it.
-        let csrf = csrf_token(&state.csrf_key, cookie_value(&cookie));
+        let csrf = csrf_token(&state.csrf_key(), cookie_value(&cookie));
         let response = app
             .clone()
             .oneshot(request(

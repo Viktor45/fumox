@@ -37,7 +37,6 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use sqlx::Executor;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
@@ -69,11 +68,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Pre-flight: every embedded migration must already be applied (we are
     // re-stamping checksums, not applying anything new). A version mismatch
     // means the user's setup is in a state this utility cannot fix.
-    let applied_versions: Vec<i64> = sqlx::query_scalar(
-        "SELECT version FROM _sqlx_migrations WHERE success = 1 ORDER BY version",
-    )
-    .fetch_all(&pool)
-    .await?;
+    //
+    // The whole table is read, not only the successful rows: a failed
+    // migration (sqlx's `success = 0`) is a database that stopped halfway
+    // through a migration, and re-stamping checksums over it would paper
+    // over the half-applied DDL.
+    let rows: Vec<(i64, bool)> =
+        sqlx::query_as("SELECT version, success FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await?;
+    for (version, success) in &rows {
+        if !*success {
+            return Err(format!(
+                "migration {version} is in a failed/dirty state — fix it before running the utility"
+            )
+            .into());
+        }
+    }
+    let applied_versions: Vec<i64> = rows.iter().map(|(version, _)| *version).collect();
     let applied: std::collections::HashSet<i64> = applied_versions.iter().copied().collect();
     let embedded_versions: Vec<i64> = migrator.iter().map(|m| m.version).collect();
     let only_in_embedded: Vec<i64> = embedded_versions
@@ -83,8 +95,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .collect();
     if !only_in_embedded.is_empty() {
         return Err(format!(
-            "these migrations have never been applied: {only_in_embedded:?}; \
-             run the server once to apply them, then re-run this utility"
+            "migration(s) {only_in_embedded:?} were not applied successfully — they have \
+             never been applied; run the server once to apply them, then re-run this utility"
         )
         .into());
     }
@@ -124,7 +136,38 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     }
 
-    pool.execute("PRAGMA wal_checkpoint(TRUNCATE)").await.ok();
+    // The re-stamp is a write, so it may still sit in the write-ahead log
+    // when this process exits. The checkpoint that pushes it into the
+    // database file is what makes the repair visible to a reader that opens
+    // the file without its own `-wal`. A checkpoint that fails leaves the
+    // repair in the log, and a copy of the database file alone would not
+    // carry it, so the failure is reported instead of swallowed.
+    let checkpoint = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(&pool)
+        .await;
+    match checkpoint {
+        Ok(row) => {
+            let busy: i64 = sqlx::Row::try_get(&row, 0).unwrap_or_default();
+            if busy != 0 {
+                return Err(format!(
+                    "the write-ahead log could not be checkpointed (busy); the re-stamp is \
+                     in {}-wal, so copy the -wal and -shm files as well, or re-run the \
+                     utility once nothing else has the database open",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        Err(err) => {
+            return Err(format!(
+                "the write-ahead log could not be checkpointed: {err}; the re-stamp is in \
+                 {}-wal, so copy the -wal and -shm files as well, or re-run the utility once \
+                 nothing else has the database open",
+                path.display()
+            )
+            .into());
+        }
+    }
 
     println!(
         "done: {} checksum(s) re-stamped in {}",

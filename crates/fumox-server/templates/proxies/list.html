@@ -6,6 +6,9 @@
 <div class="page-head">
   <h1>{{ self.t("nav.proxies") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
   <div class="row-actions">
+    {% if detached_count > 0 %}
+      <span class="badge neutral" title="{{ self.t("px.detached_title") }}">{{ self.t("px.detached_label") }}: {{ detached_count }}</span>
+    {% endif %}
     <button class="btn" type="button" onclick="document.getElementById('revive-dialog').showModal()" aria-haspopup="dialog" aria-controls="revive-dialog">{{ self.t("px.revive_button") }}</button>
     <button class="btn danger" type="button" onclick="document.getElementById('cleanup-dialog').showModal()" aria-haspopup="dialog" aria-controls="cleanup-dialog">{{ self.t("px.cleanup_button") }}</button>
     <button class="btn danger" type="button" onclick="document.getElementById('purge-dialog').showModal()" aria-haspopup="dialog" aria-controls="purge-dialog">{{ self.t("px.purge_button") }}</button>
@@ -76,6 +79,18 @@
             </select>
             <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_country_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
           </div>
+        </div>
+      </form>
+    </li>
+    <li>
+      <form method="post" action="/admin/proxies/remove-detached">
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <div class="cleanup-op">
+          <div>
+            <strong>{{ self.t("px.cleanup_detached_title") }}</strong>
+            <p class="muted small">{{ self.t("px.cleanup_detached_desc").replace("{}", &detached_count.to_string()) }}</p>
+          </div>
+          <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_detached_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
         </div>
       </form>
     </li>
@@ -155,12 +170,12 @@
       </form>
     </li>
     <li>
-      <form method="post" action="/admin/proxies/revive-removed-no-history">
+      <form method="post" action="/admin/proxies/revive-removed-never-checked">
         <input type="hidden" name="_csrf" value="{{ csrf }}">
         <div class="cleanup-op">
           <div>
-            <strong>{{ self.t("px.revive_no_history_title") }}</strong>
-            <p class="muted small">{{ self.t("px.revive_no_history_desc") }}</p>
+            <strong>{{ self.t("px.revive_never_checked_title") }}</strong>
+            <p class="muted small">{{ self.t("px.revive_never_checked_desc") }}</p>
           </div>
           <button class="btn small" type="submit" aria-label="{{ self.t("px.revive_apply_no_history_aria") }}">{{ self.t("px.revive_apply") }}</button>
         </div>
@@ -293,7 +308,9 @@
                 {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
-            <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(&self.display_name(&row.name, &row.host, row.port)) }}</a></td>
+            <td class="small truncate"><a href="/admin/proxies/{{ row.id }}">{{ self.short_name(&self.display_name(&row.name, &row.host, row.port)) }}</a>
+              {% if row.detached %}<span class="badge neutral" title="{{ self.t("px.detached_title") }}">{{ self.t("px.detached_label") }}</span>{% endif %}
+            </td>
             <td class="num small">
               {% match row.latency_ms %}
                 {% when Some with (ms) %}{{ ms }} {{ self.t("common.ms") }}
@@ -306,9 +323,16 @@
         </tbody>
       </table>
     </div>
+  {% endif %}
 
-    {% let page_base = "/admin/proxies" %}
-    {% include "_pagination.html" %}
+  <!-- Keyset navigation: the links carry the cursor of the page they
+       lead to, so the browser seeks straight to it. -->
+  {% if nav_first.is_some() || nav_prev.is_some() || nav_next.is_some() %}
+    <nav class="pagination" aria-label="{{ self.t("px.pagination_label") }}">
+      {% if let Some(link) = nav_first %}<a class="page" href="{{ link }}">{{ self.t("px.page_first") }}</a>{% endif %}
+      {% if let Some(link) = nav_prev %}<a class="page" href="{{ link }}" rel="prev">{{ self.t("px.page_prev") }}</a>{% endif %}
+      {% if let Some(link) = nav_next %}<a class="page" href="{{ link }}" rel="next">{{ self.t("px.page_next") }}</a>{% endif %}
+    </nav>
   {% endif %}
 </div>
 {% endblock %}

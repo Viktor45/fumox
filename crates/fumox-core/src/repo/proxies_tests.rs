@@ -1,4 +1,5 @@
 use super::*;
+use crate::ingest::IngestPolicy;
 use crate::models::ProxyStatus;
 use crate::models::Scheme;
 use crate::models::{Encoding, Source};
@@ -105,7 +106,7 @@ async fn coverage_buckets_partition_the_population() {
             std::slice::from_ref(e),
             &[],
             1000,
-            false,
+            IngestPolicy::refresh(true, true),
         )
         .await
         .unwrap();
@@ -154,7 +155,7 @@ async fn an_unverified_t2_attempt_counts_as_a_t2_attempt() {
         std::slice::from_ref(&unverified),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -167,15 +168,14 @@ async fn an_unverified_t2_attempt_counts_as_a_t2_attempt() {
         .await
         .unwrap()
         .unwrap();
-    sqlx::query(
-        "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
-         VALUES (?, 1000, 0, NULL, 'meow-rs unavailable', ?)",
+    journal_result(
+        &pool,
+        row.id,
+        1000,
+        false,
+        crate::repo::probe::T2_UNVERIFIED_KIND,
     )
-    .bind(row.id)
-    .bind(crate::repo::probe::T2_UNVERIFIED_KIND)
-    .execute(&pool)
-    .await
-    .unwrap();
+    .await;
     assert_eq!(coverage_of(&pool).await, ("t2_only".to_string(), 1));
 
     // The admin browser flags the proxy as T2-checked as well.
@@ -222,15 +222,14 @@ async fn an_unverified_attempt_advances_the_t2_recency_queue() {
 
     // An unverified attempt is an attempt: the proxy moves to the back
     // of the queue.
-    sqlx::query(
-        "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
-         VALUES (?, 1000, 0, NULL, 'meow-rs unavailable', ?)",
+    journal_result(
+        &pool,
+        a,
+        1000,
+        false,
+        crate::repo::probe::T2_UNVERIFIED_KIND,
     )
-    .bind(a)
-    .bind(crate::repo::probe::T2_UNVERIFIED_KIND)
-    .execute(&pool)
-    .await
-    .unwrap();
+    .await;
 
     let rows = select_t2_candidates(&pool, 10).await.unwrap();
     assert_eq!(
@@ -247,9 +246,16 @@ async fn inserts_new_proxies_as_unknown() {
         entry("one", "h1.example.com", 443),
         entry("two", "h2.example.com", 8443),
     ];
-    let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.inserted, 2);
     assert_eq!(stats.inserted_ids.len(), 2);
     assert_eq!(stats.updated, 0);
@@ -258,9 +264,16 @@ async fn inserts_new_proxies_as_unknown() {
     }
 
     // A refetch updates instead of inserting, no new ids are reported.
-    let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 2000, false)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &[],
+        2000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.updated, 2);
     assert!(stats.inserted_ids.is_empty());
 }
@@ -288,9 +301,16 @@ async fn reconcile_batches_large_feeds_with_duplicate_fingerprints() {
     // the original sits in the first.
     entries.push(entries[0].clone());
     let unique = 600;
-    let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.inserted, unique);
     assert_eq!(stats.updated, 2, "both repeats count as updates");
     assert_eq!(stats.inserted_ids.len(), unique);
@@ -311,9 +331,16 @@ async fn reconcile_batches_large_feeds_with_duplicate_fingerprints() {
 
     // A refetch updates every entry (repeats included) and the sweep
     // finds nothing to retire.
-    let stats = reconcile_source(&pool, "srcA0000000", &entries, &[], 2000, false)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &[],
+        2000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.updated, entries.len());
     assert_eq!(stats.inserted, 0);
     assert_eq!(stats.removed, 0);
@@ -339,9 +366,16 @@ async fn reconcile_refuses_more_geo_stamps_than_entries() {
             ..Default::default()
         }),
     ];
-    let err = reconcile_source(&pool, "srcA0000000", &entries, &stamps, 1000, false)
-        .await
-        .expect_err("a longer stamp slice must be refused");
+    let err = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &stamps,
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .expect_err("a longer stamp slice must be refused");
     assert!(
         err.to_string().contains("stamp count"),
         "unexpected error: {err}"
@@ -374,9 +408,16 @@ async fn reconcile_stamps_each_entry_with_its_own_geo() {
             ..Default::default()
         }),
     ];
-    reconcile_source(&pool, "srcA0000000", &entries, &stamps, 1000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &stamps,
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     for (e, country, asn) in [(&entries[0], "AA", "AS100"), (&entries[1], "BB", "AS200")] {
         let (c, a): (Option<String>, Option<String>) =
             sqlx::query_as("SELECT geo_country, geo_asn FROM proxies WHERE host = ?")
@@ -399,9 +440,16 @@ async fn reconcile_keeps_the_raw_path_of_an_entry() {
     make_source(&pool, "srcA0000000").await;
     let mut with_path = entry("one", "h1.example.com", 443);
     with_path.raw_path = "/ws".to_string();
-    reconcile_source(&pool, "srcA0000000", &[with_path.clone()], &[], 1000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[with_path.clone()],
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
 
     let row = get_by_fingerprint(&pool, &with_path.fingerprint())
         .await
@@ -411,14 +459,155 @@ async fn reconcile_keeps_the_raw_path_of_an_entry() {
     assert_eq!(row.to_entry().unwrap().raw_path, "/ws");
 }
 
+/// Two feeds advertising the same server under different names share
+/// one row, and the row keeps the name of the feed that got there
+/// first: the panel and the exported subscription show a stable name
+/// instead of one that flips on every refresh.
+#[tokio::test]
+async fn reconcile_keeps_the_first_source_values_of_a_shared_proxy() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcA0000000").await;
+    make_source(&pool, "srcB0000000").await;
+
+    let from_a = entry("name-from-a", "shared.example.com", 443);
+    let mut from_b = entry("name-from-b", "shared.example.com", 443);
+    from_b.raw_line = "vless://uuid-1@shared.example.com:443#name-from-b".to_string();
+    assert_eq!(from_a.fingerprint(), from_b.fingerprint());
+
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        std::slice::from_ref(&from_a),
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
+    reconcile_source(
+        &pool,
+        "srcB0000000",
+        std::slice::from_ref(&from_b),
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
+
+    let row = get_by_fingerprint(&pool, &from_a.fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.name, "name-from-a");
+    assert_eq!(row.raw_line.as_deref(), Some(from_a.raw_line.as_str()));
+
+    // Both sources are linked: the second one does not take the row over.
+    let links: Vec<(String,)> = sqlx::query_as(
+        "SELECT source_id FROM proxy_source_links WHERE proxy_id = ? ORDER BY source_id",
+    )
+    .bind(row.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        links,
+        vec![("srcA0000000".to_string(),), ("srcB0000000".to_string(),)]
+    );
+}
+
+/// The other order gives the same answer: whoever reconciles first owns
+/// the row, and the latecomer leaves its own values alone.
+#[tokio::test]
+async fn reconcile_keeps_the_first_source_values_regardless_of_the_order() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcA0000000").await;
+    make_source(&pool, "srcB0000000").await;
+
+    let from_b = entry("name-from-b", "shared.example.com", 443);
+    let from_a = entry("name-from-a", "shared.example.com", 443);
+
+    reconcile_source(
+        &pool,
+        "srcB0000000",
+        std::slice::from_ref(&from_b),
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        std::slice::from_ref(&from_a),
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
+
+    let row = get_by_fingerprint(&pool, &from_b.fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.name, "name-from-b");
+}
+
+/// A proxy that only one source carries keeps following that source:
+/// the guard only speaks for rows another source also claims.
+#[tokio::test]
+async fn reconcile_updates_a_proxy_that_only_one_source_carries() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcA0000000").await;
+
+    let first = entry("first-name", "solo.example.com", 443);
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        std::slice::from_ref(&first),
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
+
+    let renamed = entry("second-name", "solo.example.com", 443);
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        std::slice::from_ref(&renamed),
+        &[],
+        2000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
+
+    let row = get_by_fingerprint(&pool, &first.fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.name, "second-name");
+}
+
 #[tokio::test]
 async fn revive_removed_resets_terminal_rows_and_reconcile_keeps_them() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
     let entries = vec![entry("one", "h1.example.com", 443)];
-    reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     let fp = entries[0].fingerprint();
     sqlx::query(
         "UPDATE proxies SET status = 'removed', fail_count = 3,
@@ -431,9 +620,16 @@ async fn revive_removed_resets_terminal_rows_and_reconcile_keeps_them() {
     .unwrap();
 
     // Reconciliation itself never touches the terminal state.
-    reconcile_source(&pool, "srcA0000000", &entries, &[], 2000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &[],
+        2000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(status_of(&pool, &entries[0]).await, ("removed".into(), 3));
 
     // The opt-in revival resets the pristine state and returns the id.
@@ -484,7 +680,7 @@ async fn refetch_updates_name_and_keeps_probe_state() {
         std::slice::from_ref(&original),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -504,7 +700,7 @@ async fn refetch_updates_name_and_keeps_probe_state() {
         std::slice::from_ref(&renamed),
         &[],
         2000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -529,7 +725,7 @@ async fn disappearance_removes_proxy() {
         &[kept.clone(), gone.clone()],
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -540,7 +736,7 @@ async fn disappearance_removes_proxy() {
         std::slice::from_ref(&kept),
         &[],
         2000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -568,7 +764,7 @@ async fn alive_linger_keeps_link_and_serves_while_alive() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
@@ -580,9 +776,16 @@ async fn alive_linger_keeps_link_and_serves_while_alive() {
         .unwrap();
 
     // The feed no longer carries it; linger keeps the link.
-    let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[],
+        &[],
+        2000,
+        IngestPolicy::from_drop_gate(false),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.unlinked, 0, "the alive proxy keeps its link");
     assert_eq!(stats.removed, 0);
     assert_eq!(status_of(&pool, &e).await.0, "alive");
@@ -600,7 +803,7 @@ async fn alive_linger_keeps_link_and_serves_while_alive() {
         std::slice::from_ref(&e),
         &[],
         3000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
@@ -624,7 +827,7 @@ async fn quarantined_linger_survives_the_next_refresh() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
@@ -636,9 +839,16 @@ async fn quarantined_linger_survives_the_next_refresh() {
     .await
     .unwrap();
 
-    let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[],
+        &[],
+        2000,
+        IngestPolicy::from_drop_gate(false),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.unlinked, 0, "quarantine lingers like the live tiers");
     assert_eq!(stats.removed, 0, "reconcile must not retire anything");
     assert_eq!(status_of(&pool, &e).await.0, "quarantine");
@@ -668,7 +878,7 @@ async fn drop_gate_still_retires_proxies_that_left_the_feed() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
@@ -678,9 +888,16 @@ async fn drop_gate_still_retires_proxies_that_left_the_feed() {
         .await
         .unwrap();
 
-    let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, false)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[],
+        &[],
+        2000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.unlinked, 1);
     assert_eq!(stats.removed, 1);
     assert_eq!(status_of(&pool, &e).await.0, "removed");
@@ -702,16 +919,23 @@ async fn unknown_lingers_until_next_seen_or_quarantined() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
     assert_eq!(status_of(&pool, &e).await.0, "unknown");
 
     // Source drops the proxy on the next refresh (entry omitted).
-    let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[],
+        &[],
+        2000,
+        IngestPolicy::from_drop_gate(false),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.unlinked, 0, "unknown rows linger like alive/ready");
     assert_eq!(stats.removed, 0);
     assert_eq!(status_of(&pool, &e).await.0, "unknown");
@@ -723,7 +947,7 @@ async fn unknown_lingers_until_next_seen_or_quarantined() {
         std::slice::from_ref(&e),
         &[],
         3000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
@@ -739,9 +963,16 @@ async fn unknown_lingers_until_next_seen_or_quarantined() {
         .execute(&pool)
         .await
         .unwrap();
-    let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 4000, true)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[],
+        &[],
+        4000,
+        IngestPolicy::from_drop_gate(false),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.unlinked, 0, "quarantine lingers too");
     assert_eq!(stats.removed, 0);
     assert_eq!(status_of(&pool, &e).await.0, "quarantine");
@@ -763,7 +994,7 @@ async fn linger_is_per_proxy_not_per_batch() {
         &[alive.clone(), dying.clone()],
         &[],
         1000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
@@ -776,9 +1007,16 @@ async fn linger_is_per_proxy_not_per_batch() {
             .unwrap();
     }
 
-    let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[],
+        &[],
+        2000,
+        IngestPolicy::from_drop_gate(false),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.unlinked, 1, "only the terminal row loses its link");
     assert_eq!(stats.removed, 0, "the terminal row is already removed");
     assert_eq!(status_of(&pool, &alive).await.0, "alive");
@@ -800,7 +1038,7 @@ async fn multi_source_linger_stays_linked_to_the_other_source() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -810,7 +1048,7 @@ async fn multi_source_linger_stays_linked_to_the_other_source() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -822,9 +1060,16 @@ async fn multi_source_linger_stays_linked_to_the_other_source() {
 
     // Source B drops it, source B does not linger (drop-rules gate):
     // the row stays alive thanks to A's link.
-    reconcile_source(&pool, "srcB0000000", &[], &[], 2000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcB0000000",
+        &[],
+        &[],
+        2000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(status_of(&pool, &e).await.0, "alive");
 }
 
@@ -839,13 +1084,20 @@ async fn reappearing_removed_proxy_stays_removed() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
-    reconcile_source(&pool, "srcA0000000", &[], &[], 2000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[],
+        &[],
+        2000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(status_of(&pool, &e).await.0, "removed");
 
     // Reappearing in a live source does NOT reset the lifecycle
@@ -857,7 +1109,7 @@ async fn reappearing_removed_proxy_stays_removed() {
         std::slice::from_ref(&e),
         &[],
         3000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -884,7 +1136,7 @@ async fn reappearing_quarantined_proxy_keeps_ladder() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -908,7 +1160,7 @@ async fn reappearing_quarantined_proxy_keeps_ladder() {
         std::slice::from_ref(&e),
         &[],
         2000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -933,7 +1185,7 @@ async fn shared_proxy_survives_until_last_source_lets_go() {
         std::slice::from_ref(&shared),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -943,7 +1195,7 @@ async fn shared_proxy_survives_until_last_source_lets_go() {
         std::slice::from_ref(&shared),
         &[],
         1100,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -961,17 +1213,31 @@ async fn shared_proxy_survives_until_last_source_lets_go() {
     assert_eq!(links.len(), 2);
 
     // Dropping from source A only: still linked via B.
-    let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, false)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[],
+        &[],
+        2000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.unlinked, 1);
     assert_eq!(stats.removed, 0);
     assert_eq!(status_of(&pool, &shared).await.0, "unknown");
 
     // Dropping from B as well: now it is removed.
-    let stats = reconcile_source(&pool, "srcB0000000", &[], &[], 3000, false)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcB0000000",
+        &[],
+        &[],
+        3000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.removed, 1);
     assert_eq!(status_of(&pool, &shared).await.0, "removed");
 }
@@ -996,7 +1262,7 @@ async fn reconcile_of_another_source_leaves_protected_orphans_alone() {
         &[doomed_ready.clone(), doomed_unknown.clone()],
         &[],
         1_000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
@@ -1012,7 +1278,8 @@ async fn reconcile_of_another_source_leaves_protected_orphans_alone() {
     assert_eq!(
         mark_orphans_removed(&pool, &["ready", "unknown"])
             .await
-            .unwrap(),
+            .unwrap()
+            .retired,
         0
     );
 
@@ -1026,7 +1293,7 @@ async fn reconcile_of_another_source_leaves_protected_orphans_alone() {
         std::slice::from_ref(&survivor),
         &[],
         2_000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
@@ -1043,9 +1310,16 @@ async fn duplicate_entries_in_one_batch_collapse() {
     make_source(&pool, "srcA0000000").await;
     let a = entry("name-A", "h1.example.com", 443);
     let b = entry("name-B", "h1.example.com", 443); // same fingerprint
-    let stats = reconcile_source(&pool, "srcA0000000", &[a, b], &[], 1000, false)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[a, b],
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.inserted, 1);
     assert_eq!(stats.updated, 1);
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
@@ -1066,7 +1340,7 @@ async fn row_converts_back_to_entry() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -1104,7 +1378,7 @@ async fn list_alive_and_count_cover_linked_alive_only() {
         ],
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -1151,12 +1425,19 @@ async fn list_alive_and_count_cover_linked_alive_only() {
 async fn list_alive_and_list_ready_apply_the_sql_cap() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcA0000000").await;
-    let entries: Vec<_> = (0..5)
+    let entries: Vec<_> = (0..6)
         .map(|i| entry(&format!("cap{i}"), &format!("cap{i}.example.com"), 443))
         .collect();
-    reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     for (i, e) in entries.iter().enumerate() {
         let status = if i < 3 { "alive" } else { "ready" };
         sqlx::query("UPDATE proxies SET status = ? WHERE fingerprint = ?")
@@ -1167,11 +1448,11 @@ async fn list_alive_and_list_ready_apply_the_sql_cap() {
             .unwrap();
     }
     assert_eq!(count_alive(&pool).await.unwrap(), 3);
-    assert_eq!(count_ready(&pool).await.unwrap(), 2);
+    assert_eq!(count_ready(&pool).await.unwrap(), 3);
 
     // Under the cap the tier comes back whole.
     assert_eq!(list_alive(&pool, 10).await.unwrap().len(), 3);
-    assert_eq!(list_ready(&pool, 10).await.unwrap().len(), 2);
+    assert_eq!(list_ready(&pool, 10).await.unwrap().len(), 3);
 
     // At the cap it is truncated to the lowest ids, deterministically
     // across two reads.
@@ -1199,6 +1480,28 @@ async fn list_alive_and_list_ready_apply_the_sql_cap() {
     assert_eq!(list_alive(&pool, 0).await.unwrap().len(), 1);
     // An absurd cap does not overflow the bind.
     assert_eq!(list_alive(&pool, u32::MAX).await.unwrap().len(), 3);
+
+    // The ready tier is capped the same way: the export link and the
+    // badge share the tier, so the truncation must not differ between
+    // them.
+    let ready_capped: Vec<i64> = list_ready(&pool, 2)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let ready_all: Vec<i64> = list_ready(&pool, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ready_capped, ready_all[..2].to_vec());
+    assert_eq!(list_ready(&pool, 0).await.unwrap().len(), 1);
+    assert_eq!(list_ready(&pool, u32::MAX).await.unwrap().len(), 3);
+    // The badge stays the full tier: the operator must be able to see
+    // that the export is smaller than the tier.
+    assert_eq!(count_ready(&pool).await.unwrap(), 3);
 }
 
 /// Admin *Reset status* is "check this proxy again from scratch", and
@@ -1344,6 +1647,47 @@ async fn reset_status_refuses_a_row_no_probe_lane_can_reach() {
     }
 }
 
+/// A linked `hysteria2` row is reachable, so a reset of it must
+/// succeed: hysteria2 is excluded from the T1 sample, but the T2 sample
+/// offers it while it is still `unknown`. A reset that refused it would
+/// leave the row exactly where it was, and a reset that cleared the T2
+/// block but reported failure would send the operator looking for a
+/// failure that did not happen.
+#[tokio::test]
+async fn reset_status_accepts_a_linked_hysteria2_row() {
+    let (_dir, pool) = temp_pool().await;
+    let id = seed_proxy(&pool, "hysteria2", "hy.example.com").await;
+    sqlx::query(
+        "UPDATE proxies SET status = 'unknown', fail_count = 2, last_t2_failed_at = 700 WHERE id = ?",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(reset_status(&pool, id).await.unwrap());
+
+    let row = get_by_id(&pool, id).await.unwrap().unwrap();
+    assert_eq!(row.status, "unknown");
+    assert_eq!(row.fail_count, 0);
+    assert_eq!(
+        row.last_t2_failed_at, None,
+        "a reset row must not stay behind a stale T2 block"
+    );
+
+    // The row stays in the T2 sample: it is the one lane that judges it.
+    let t2_ids: Vec<i64> = select_t2_candidates(&pool, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert!(
+        t2_ids.contains(&id),
+        "the reset hysteria2 row must stay reachable for the T2 sample"
+    );
+}
+
 // Probe state machine.
 
 /// Insert a bare proxy row with the given scheme and link it to a source
@@ -1405,7 +1749,7 @@ async fn success_without_reset_keeps_fail_count_and_removed_stays_removed() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -1498,6 +1842,34 @@ async fn ready_tier_lifecycle() {
     let row = get_by_id(&pool, id).await.unwrap().unwrap();
     assert_eq!(row.status, "ready");
 
+    // The verified row is served by the ready export and by no other
+    // one: the two tiers are disjoint, and a `ready` row is not also
+    // counted as `alive`.
+    let alive_ids: Vec<i64> = list_alive(&pool, 1_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let ready_ids: Vec<i64> = list_ready(&pool, 1_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert!(
+        ready_ids.contains(&id),
+        "the verified row is served as ready"
+    );
+    assert!(
+        !alive_ids.contains(&id),
+        "the verified row is not served as alive"
+    );
+    assert!(
+        alive_ids.iter().all(|other| !ready_ids.contains(other)),
+        "the alive and ready tiers must not overlap"
+    );
+
     // Reaching the fail limit from ready quarantines like from alive.
     for _ in 0..2 {
         check_failed(&pool, id, 6000, 2, 86_400, 0, false)
@@ -1508,13 +1880,7 @@ async fn ready_tier_lifecycle() {
     assert_eq!(row.status, "quarantine");
     assert_eq!(row.fail_count, 2);
 
-    // list_alive/list_ready are disjoint tiers.
-    make_source(&pool, "srcR0000000").await;
-    sqlx::query("INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, 'srcR0000000', 1)")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
+    // A quarantined row is served by neither tier.
     let alive_rows = list_alive(&pool, 1_000).await.unwrap();
     let ready_rows = list_ready(&pool, 1_000).await.unwrap();
     assert!(alive_rows.iter().all(|r| r.id != id));
@@ -1534,7 +1900,7 @@ async fn linger_protects_ready() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        true,
+        IngestPolicy::from_drop_gate(false),
     )
     .await
     .unwrap();
@@ -1550,9 +1916,16 @@ async fn linger_protects_ready() {
         .unwrap();
 
     // The feed no longer carries it; linger keeps the link.
-    let stats = reconcile_source(&pool, "srcA0000000", &[], &[], 2000, true)
-        .await
-        .unwrap();
+    let stats = reconcile_source(
+        &pool,
+        "srcA0000000",
+        &[],
+        &[],
+        2000,
+        IngestPolicy::from_drop_gate(false),
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.unlinked, 0, "the ready proxy keeps its link");
     assert_eq!(stats.removed, 0);
     let row = get_by_id(&pool, id).await.unwrap().unwrap();
@@ -1583,19 +1956,47 @@ async fn failures_below_limit_only_bump_counter() {
 /// actions write to the same table) must both count: split into a
 /// read statement and a write statement, the second one writes back
 /// the value it read before the first bump landed and the failure is
-/// lost. Repeated: a single lost update is a scheduling accident,
-/// five rounds make it a certainty.
+/// lost.
+///
+/// The contention is forced, not hoped for: one connection holds the
+/// write lock inside an open transaction that bumps the counter, and
+/// the second failure is issued while that transaction is still open,
+/// so its statement waits for the lock. A split implementation would
+/// read the pre-transaction value on the waiting connection and write
+/// back 1, losing the first bump; the single atomic statement reads
+/// the committed value and writes 2.
 #[tokio::test]
 async fn check_failed_counts_every_overlapping_check() {
     let (_dir, pool) = temp_pool().await;
     for round in 0..5 {
-        let id = seed_proxy(&pool, "vless", &format!("race{}.example.com", round)).await;
-        let (first, second) = tokio::join!(
-            check_failed(&pool, id, 1_000, 100, 86_400, 0, false),
-            check_failed(&pool, id, 1_000, 100, 86_400, 0, false),
-        );
-        assert_eq!(first.unwrap(), Transition::Unchanged);
-        assert_eq!(second.unwrap(), Transition::Unchanged);
+        let id = seed_proxy(&pool, "vless", &format!("race{round}.example.com")).await;
+
+        let mut locked = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *locked)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE proxies SET fail_count = fail_count + 1, last_checked_at = ? WHERE id = ?",
+        )
+        .bind(1_000)
+        .bind(id)
+        .execute(&mut *locked)
+        .await
+        .unwrap();
+
+        // The second failure is issued while the first transaction is
+        // still open: it waits for the write lock.
+        let waiting = tokio::spawn({
+            let pool = pool.clone();
+            async move { check_failed(&pool, id, 1_000, 100, 86_400, 0, false).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        sqlx::query("COMMIT").execute(&mut *locked).await.unwrap();
+        drop(locked);
+
+        assert_eq!(waiting.await.unwrap().unwrap(), Transition::Unchanged);
 
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(
@@ -2220,9 +2621,16 @@ async fn t2_sample_offers_only_t1_passed_proxies() {
         fresh_hysteria2.clone(),
         alive_naive.clone(),
     ];
-    reconcile_source(&pool, "srcA0000000", &all, &[], 1000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &all,
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
 
     for (proxy, status) in [
         (&alive, "alive"),
@@ -2247,17 +2655,21 @@ async fn t2_sample_offers_only_t1_passed_proxies() {
     assert_eq!(hosts, vec!["h1.example.com", "h6.example.com"]);
 }
 
-/// Journal one probe result straight into the history table.
+/// Journal one probe result through the production write path, so the
+/// denormalised T2 recency stamp follows the journal the way it does in
+/// the probe daemon.
 async fn journal_result(pool: &DbPool, id: i64, at: i64, ok: bool, kind: &str) {
-    sqlx::query(
-        "INSERT INTO probe_results (proxy_id, checked_at, ok, probe_kind)
-             VALUES (?, ?, ?, ?)",
+    crate::repo::probe::insert(
+        pool,
+        &crate::repo::probe::ProbeResultEntry {
+            proxy_id: id,
+            checked_at: at,
+            ok,
+            latency_ms: None,
+            error: None,
+            probe_kind: kind,
+        },
     )
-    .bind(id)
-    .bind(at)
-    .bind(ok)
-    .bind(kind)
-    .execute(pool)
     .await
     .unwrap();
 }
@@ -2279,9 +2691,16 @@ async fn t2_sample_prioritizes_never_checked_then_oldest_last_check() {
         entry("mid", "m.example.com", 443),
         entry("recent", "r.example.com", 443),
     ];
-    reconcile_source(&pool, "srcA0000000", &all, &[], 1000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &all,
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     let id_of = async |fp: &str| get_by_fingerprint(&pool, fp).await.unwrap().unwrap().id;
     let stale_id = id_of(&entry("stale", "s.example.com", 443).fingerprint()).await;
     let mid_id = id_of(&entry("mid", "m.example.com", 443).fingerprint()).await;
@@ -2320,6 +2739,127 @@ async fn t2_sample_prioritizes_never_checked_then_oldest_last_check() {
     assert_eq!(
         hosts,
         vec!["a.example.com", "b.example.com", "s.example.com"]
+    );
+}
+
+/// The recency stamp lives on the proxy row, not in the journal: the
+/// T2 batch must not walk the history to learn when a proxy was last
+/// tunnel-checked. The stamp is written by the journal write path, only
+/// for the T2 tier, and it never moves backwards.
+#[tokio::test]
+async fn the_t2_recency_stamp_follows_the_journal() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcA0000000").await;
+    let all = vec![
+        entry("a", "a.example.com", 443),
+        entry("b", "b.example.com", 443),
+    ];
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &all,
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
+    let id_of = async |fp: &str| get_by_fingerprint(&pool, fp).await.unwrap().unwrap().id;
+    let a = id_of(&entry("a", "a.example.com", 443).fingerprint()).await;
+    let b = id_of(&entry("b", "b.example.com", 443).fingerprint()).await;
+    sqlx::query("UPDATE proxies SET status = 'alive'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let stamp_of = async |id: i64| -> Option<i64> {
+        sqlx::query_scalar("SELECT last_t2_checked_at FROM proxies WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+
+    // A T1 attempt says nothing about the tunnel: no stamp.
+    journal_result(&pool, a, 500, true, "tcp").await;
+    assert_eq!(stamp_of(a).await, None, "a T1 attempt stamps nothing");
+
+    // A T2 attempt stamps the moment of the attempt.
+    journal_result(&pool, a, 1000, true, "t2").await;
+    assert_eq!(stamp_of(a).await, Some(1000));
+    assert_eq!(stamp_of(b).await, None, "the other row is untouched");
+
+    // An unverified attempt is an attempt too: the recency queue has to
+    // move past the row.
+    journal_result(
+        &pool,
+        b,
+        1200,
+        false,
+        crate::repo::probe::T2_UNVERIFIED_KIND,
+    )
+    .await;
+    assert_eq!(stamp_of(b).await, Some(1200));
+
+    // A replayed older attempt must not make the row look older.
+    journal_result(&pool, a, 700, true, "t2").await;
+    assert_eq!(stamp_of(a).await, Some(1000), "the stamp never goes back");
+
+    // A newer attempt moves it forward.
+    journal_result(&pool, a, 2000, true, "t2").await;
+    assert_eq!(stamp_of(a).await, Some(2000));
+}
+
+/// The stamp is a permanent fact about the proxy, not about the journal
+/// it was derived from: the retention sweep trims `probe_results`, and a
+/// proxy whose history was trimmed must not fall back into the
+/// never-checked tier and be served as a first-timer forever.
+#[tokio::test]
+async fn the_t2_recency_stamp_survives_the_history_sweep() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcA0000000").await;
+    let all = vec![
+        entry("a", "a.example.com", 443),
+        entry("b", "b.example.com", 443),
+    ];
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &all,
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
+    let id_of = async |fp: &str| get_by_fingerprint(&pool, fp).await.unwrap().unwrap().id;
+    let a = id_of(&entry("a", "a.example.com", 443).fingerprint()).await;
+    let b = id_of(&entry("b", "b.example.com", 443).fingerprint()).await;
+    sqlx::query("UPDATE proxies SET status = 'alive'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    journal_result(&pool, a, 1000, true, "t2").await;
+
+    // The journal is swept: the row that was checked has no history left.
+    let purged = crate::repo::probe::purge_before(&pool, 2_000)
+        .await
+        .unwrap();
+    assert_eq!(purged, 1);
+    let (left,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_results")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "the history is gone");
+
+    // The checked row stays behind the never-checked one: its stamp
+    // outlived the journal it came from.
+    let candidates = select_t2_candidates(&pool, 10).await.unwrap();
+    assert_eq!(
+        candidates.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![b, a],
+        "a swept history must not turn the row back into a first-timer"
     );
 }
 
@@ -2364,9 +2904,16 @@ async fn t2_scheme_allowlist_mirrors_meow_support() {
         mk(Scheme::AnyTls, "anytls.example.com"),
         mk(Scheme::Naive, "naive.example.com"),
     ];
-    reconcile_source(&pool, "srcA0000000", &entries, &[], 1000, false)
-        .await
-        .unwrap();
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        &entries,
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
     sqlx::query("UPDATE proxies SET status = 'alive'")
         .execute(&pool)
         .await
@@ -2514,21 +3061,34 @@ async fn quarantine_windowed_sample_fills_quota_and_covers_the_pool() {
     );
 }
 
-/// The window shuffle is what makes the bounded cut a random draw: it must
-/// never lose or duplicate a row, whatever the seed, and it must actually
-/// reorder (two seeds agreeing on a 32-row permutation is a 1-in-32!
-/// coincidence).
+/// The window draw is built from two core helpers, and both are pinned
+/// by a seeded RNG: the anchor is drawn inside the eligible rows' own id
+/// range, and the shuffle that cuts the window must never lose or
+/// duplicate a row, whatever the seed, and it must actually reorder (two
+/// seeds agreeing on a 32-row permutation is a 1-in-32! coincidence).
+///
+/// The test drives the helpers themselves, not the `rand` crate: a
+/// shuffle of the standard library says nothing about the sampler that
+/// uses it.
 #[test]
-fn window_shuffle_is_a_permutation_and_seed_sensitive() {
+fn the_window_draw_helpers_are_pinned_by_the_seed() {
     use rand::SeedableRng;
-    use rand::seq::SliceRandom;
 
     let base: Vec<usize> = (0..32).collect();
     let mut distinct = std::collections::HashSet::new();
     for seed in 0..16u64 {
-        let mut rows = base.clone();
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        rows.shuffle(&mut rng);
+
+        // The anchor stays inside the eligible range, the only range
+        // the draw is allowed to spend its luck on.
+        let anchor = choose_anchor(10, 20, &mut rng);
+        assert!(
+            (10..=20).contains(&anchor),
+            "seed {seed}: the anchor {anchor} left the eligible range"
+        );
+
+        let mut rows = base.clone();
+        shuffle_window(&mut rows, &mut rng);
         let mut sorted = rows.clone();
         sorted.sort_unstable();
         assert_eq!(
@@ -2559,7 +3119,7 @@ async fn reconcile_stores_geo_and_keeps_it_when_fresh_lookup_empty() {
         std::slice::from_ref(&e),
         &[Some(stamp)],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -2579,7 +3139,7 @@ async fn reconcile_stores_geo_and_keeps_it_when_fresh_lookup_empty() {
         std::slice::from_ref(&e),
         &[],
         2000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -2606,16 +3166,17 @@ async fn missing_geo_listing_and_update() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
 
+    let now = 1_000_000i64;
     let both = GeoFactMask {
         country: true,
         asn: true,
     };
-    let missing = list_missing_geo(&pool, 0, 500, both).await.unwrap();
+    let missing = list_missing_geo(&pool, 0, 500, both, now).await.unwrap();
     let id = missing
         .iter()
         .find(|(_, host)| host == "h1.example.com")
@@ -2636,7 +3197,7 @@ async fn missing_geo_listing_and_update() {
     assert_eq!(row.geo_city, None);
 
     // The country landed, the ASN did not: the row stays in the listing.
-    let missing = list_missing_geo(&pool, 0, 500, both).await.unwrap();
+    let missing = list_missing_geo(&pool, 0, 500, both, now).await.unwrap();
     assert!(
         missing.iter().any(|(walked, _)| walked == &id),
         "a row missing only its ASN must still be walked"
@@ -2649,7 +3210,7 @@ async fn missing_geo_listing_and_update() {
         asn: false,
     };
     assert!(
-        list_missing_geo(&pool, 0, 500, city_only)
+        list_missing_geo(&pool, 0, 500, city_only, now)
             .await
             .unwrap()
             .iter()
@@ -2678,11 +3239,90 @@ async fn missing_geo_listing_and_update() {
     assert_eq!(row.geo_country.as_deref(), Some("US"));
     assert_eq!(count_missing_geo(&pool, both).await.unwrap(), 0);
     assert!(
-        list_missing_geo(&pool, 0, 500, both)
+        list_missing_geo(&pool, 0, 500, both, now)
             .await
             .unwrap()
             .is_empty()
     );
+}
+
+/// A row whose lookup failed is left out of the listing until the retry
+/// window passed: a hopeless host must not take the backfill budget away
+/// from the rows that were never tried.
+#[tokio::test]
+async fn a_recently_attempted_row_is_not_walked_again() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcA0000000").await;
+    let e = entry("geo-retry", "h3.example.com", 443);
+    reconcile_source(
+        &pool,
+        "srcA0000000",
+        std::slice::from_ref(&e),
+        &[],
+        1000,
+        IngestPolicy::refresh(true, true),
+    )
+    .await
+    .unwrap();
+
+    let both = GeoFactMask {
+        country: true,
+        asn: true,
+    };
+    let now = 1_000_000i64;
+    let id = list_missing_geo(&pool, 0, 500, both, now)
+        .await
+        .unwrap()
+        .first()
+        .expect("row without geo must be listed")
+        .0;
+
+    mark_geo_attempt(&pool, id, now).await.unwrap();
+    let row = get_by_fingerprint(&pool, &e.fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.geo_attempts, 1);
+    assert_eq!(row.last_geo_attempt_at, Some(now));
+
+    assert!(
+        list_missing_geo(&pool, 0, 500, both, now)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a row that was just tried must not be walked again"
+    );
+    // The backlog is still real, the count does not hide it.
+    assert_eq!(count_missing_geo(&pool, both).await.unwrap(), 1);
+
+    // Once the retry window passed the row is walked again.
+    let later = now + GEO_RETRY_WINDOW_SECS + 1;
+    assert_eq!(
+        list_missing_geo(&pool, 0, 500, both, later)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A successful lookup clears the marker.
+    update_geo(
+        &pool,
+        id,
+        &GeoStamp {
+            country: Some("US".into()),
+            city: None,
+            asn: Some("AS15169".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let row = get_by_fingerprint(&pool, &e.fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.geo_attempts, 0);
+    assert_eq!(row.last_geo_attempt_at, None);
 }
 
 /// No database at all: nothing is obtainable, so nothing is walked.
@@ -2697,13 +3337,14 @@ async fn an_empty_fact_mask_walks_nothing() {
         std::slice::from_ref(&e),
         &[],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
 
+    let now = 1_000_000i64;
     assert!(
-        list_missing_geo(&pool, 0, 500, GeoFactMask::default())
+        list_missing_geo(&pool, 0, 500, GeoFactMask::default(), now)
             .await
             .unwrap()
             .is_empty()
@@ -2738,7 +3379,7 @@ async fn update_geo_full_keeps_stored_facts_a_partial_stamp_cannot_replace() {
             asn: None,
         })],
         1000,
-        false,
+        IngestPolicy::refresh(true, true),
     )
     .await
     .unwrap();
@@ -2841,12 +3482,22 @@ async fn link_row(pool: &DbPool, proxy_id: i64, source_id: &str) {
         .unwrap();
 }
 
-async fn bulk_status_of(pool: &DbPool, id: i64) -> (String, Option<i64>, Option<i64>, Option<i64>) {
-    sqlx::query_as("SELECT status, quarantined_at, ladder_at, removed_at FROM proxies WHERE id = ?")
-        .bind(id)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+/// The sampled state of a bulk fixture row: the status, the three
+/// lifecycle timestamps and the two lifecycle counters. The counters are
+/// part of the sample because a transition that retires a row has to
+/// clear the whole ladder, not only its timestamps.
+async fn bulk_status_of(
+    pool: &DbPool,
+    id: i64,
+) -> (String, Option<i64>, Option<i64>, Option<i64>, i64, i64) {
+    sqlx::query_as(
+        "SELECT status, quarantined_at, ladder_at, removed_at, ladder_step, fail_count
+         FROM proxies WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -2855,14 +3506,28 @@ async fn quarantine_to_removed_moves_only_quarantined() {
     let q = bulk_test_row(&pool, "bulk-q1", "vless", "quarantine", Some("DE"), None).await;
     let alive = bulk_test_row(&pool, "bulk-a1", "vless", "alive", Some("DE"), None).await;
 
+    // The stamp is "now", and "now" moves: the call is bracketed
+    // instead of compared against a second reading of the clock.
+    let before = crate::models::now_ts();
     assert_eq!(quarantine_to_removed(&pool).await.unwrap(), 1);
-    assert_eq!(
-        bulk_status_of(&pool, q).await,
-        ("removed".into(), None, None, Some(crate::models::now_ts()))
+    let after = crate::models::now_ts();
+
+    let (status, quarantined_at, ladder_at, removed_at, ladder_step, fail_count) =
+        bulk_status_of(&pool, q).await;
+    assert_eq!(status, "removed");
+    assert_eq!(quarantined_at, None);
+    assert_eq!(ladder_at, None);
+    assert_eq!(ladder_step, 0);
+    assert_eq!(fail_count, 0);
+    let removed_at = removed_at.expect("the retired row stamps removed_at");
+    assert!(
+        (before..=after).contains(&removed_at),
+        "removed_at {removed_at} is outside the call window {before}..={after}"
     );
+
     assert_eq!(
         bulk_status_of(&pool, alive).await,
-        ("alive".into(), None, None, None)
+        ("alive".into(), None, None, None, 0, 0)
     );
 }
 
@@ -2884,11 +3549,17 @@ async fn quarantine_to_removed_clears_ladder_and_quarantine_fields() {
     .unwrap();
 
     quarantine_to_removed(&pool).await.unwrap();
-    let (status, quarantined_at, ladder_at, removed_at) = bulk_status_of(&pool, id).await;
+    let (status, quarantined_at, ladder_at, removed_at, ladder_step, fail_count) =
+        bulk_status_of(&pool, id).await;
     assert_eq!(status, "removed");
     assert_eq!(quarantined_at, None);
     assert_eq!(ladder_at, None);
     assert!(removed_at.is_some());
+    assert_eq!(ladder_step, 0, "the recheck ladder is over");
+    assert_eq!(
+        fail_count, 3,
+        "the retirement does not touch the counter; the revival paths reset it"
+    );
 }
 
 #[tokio::test]
@@ -2909,41 +3580,50 @@ async fn remove_alive_without_country_targets_only_alive_without_geo() {
 #[tokio::test]
 async fn remove_alive_by_asn_matches_canonical_as_prefix() {
     let (_dir, pool) = temp_pool().await;
-    let target = bulk_test_row(
-        &pool,
-        "bulk-as1",
-        "vless",
-        "alive",
-        Some("DE"),
-        Some("AS24940"),
-    )
-    .await;
-    let other_asn = bulk_test_row(
-        &pool,
-        "bulk-as2",
-        "vless",
-        "alive",
-        Some("DE"),
-        Some("AS13335"),
-    )
-    .await;
-    let quarantined_same = bulk_test_row(
-        &pool,
-        "bulk-as3",
-        "vless",
-        "quarantine",
-        Some("DE"),
-        Some("AS24940"),
-    )
-    .await;
+    // The ASN is accepted in both spellings, each round on its own
+    // fixtures: the operator types "AS24940" or "24940" and both must
+    // hit the same rows.
+    for (round, spelling) in ["24940", "AS24940"].into_iter().enumerate() {
+        let target = bulk_test_row(
+            &pool,
+            &format!("bulk-as1-{round}"),
+            "vless",
+            "alive",
+            Some("DE"),
+            Some("AS24940"),
+        )
+        .await;
+        let other_asn = bulk_test_row(
+            &pool,
+            &format!("bulk-as2-{round}"),
+            "vless",
+            "alive",
+            Some("DE"),
+            Some("AS13335"),
+        )
+        .await;
+        let quarantined_same = bulk_test_row(
+            &pool,
+            &format!("bulk-as3-{round}"),
+            "vless",
+            "quarantine",
+            Some("DE"),
+            Some("AS24940"),
+        )
+        .await;
 
-    assert_eq!(remove_alive_by_asn(&pool, "24940").await.unwrap(), 1);
-    assert_eq!(bulk_status_of(&pool, target).await.0, "removed");
-    assert_eq!(bulk_status_of(&pool, other_asn).await.0, "alive");
-    assert_eq!(
-        bulk_status_of(&pool, quarantined_same).await.0,
-        "quarantine"
-    );
+        assert_eq!(
+            remove_alive_by_asn(&pool, spelling).await.unwrap(),
+            1,
+            "{spelling}: only the matching alive row is retired"
+        );
+        assert_eq!(bulk_status_of(&pool, target).await.0, "removed");
+        assert_eq!(bulk_status_of(&pool, other_asn).await.0, "alive");
+        assert_eq!(
+            bulk_status_of(&pool, quarantined_same).await.0,
+            "quarantine"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2995,27 +3675,64 @@ async fn mark_orphans_removed_retires_every_status_by_default() {
         None,
     )
     .await;
-    // Detach every row from the source: the function only acts on rows
-    // with no remaining links, exactly what happens after a source
-    // delete.
+    // The rows start linked and lose the link, exactly what happens
+    // after a source delete: the sweep only acts on rows with no
+    // remaining links.
+    for id in [ready, alive, unknown, quarantined] {
+        link_row(&pool, id, "srcO0000000").await;
+    }
     sqlx::query("DELETE FROM proxy_source_links")
         .execute(&pool)
         .await
         .unwrap();
 
-    let affected = mark_orphans_removed(&pool, &[]).await.unwrap();
-    assert_eq!(affected, 4, "every orphan must retire under strict policy");
+    // The fixtures carry a live ladder: a retired row must not keep a
+    // recheck schedule that describes a ladder nobody walks any more.
+    let now = crate::models::now_ts();
+    for id in [ready, alive, unknown, quarantined] {
+        sqlx::query(
+            "UPDATE proxies SET quarantined_at = ?, ladder_at = ?, ladder_step = 2,
+                    fail_count = 3 WHERE id = ?",
+        )
+        .bind(now)
+        .bind(now + 100)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let sweep = mark_orphans_removed(&pool, &[]).await.unwrap();
+    assert_eq!(
+        sweep.retired, 4,
+        "every orphan must retire under strict policy"
+    );
+    assert_eq!(
+        sweep.protected, 0,
+        "the strict policy protects nothing, so nothing is left detached"
+    );
     for (label, id) in [
         ("ready", ready),
         ("alive", alive),
         ("unknown", unknown),
         ("quarantine", quarantined),
     ] {
-        let (status, _q, _l, removed_at) = bulk_status_of(&pool, id).await;
+        let (status, quarantined_at, ladder_at, removed_at, ladder_step, fail_count) =
+            bulk_status_of(&pool, id).await;
         assert_eq!(status, "removed", "{label} proxy must retire");
         assert!(
             removed_at.unwrap_or(0) > 0,
             "{label} proxy must stamp removed_at"
+        );
+        assert_eq!(
+            quarantined_at, None,
+            "{label} proxy loses its quarantine stamp"
+        );
+        assert_eq!(ladder_at, None, "{label} proxy loses its recheck schedule");
+        assert_eq!(ladder_step, 0, "{label} proxy loses its ladder step");
+        assert_eq!(
+            fail_count, 3,
+            "{label} proxy keeps its counter; the revival paths reset it"
         );
     }
 }
@@ -3037,6 +3754,11 @@ async fn mark_orphans_removed_protects_listed_statuses() {
     // Already-removed row: keeps its removed_at untouched, the
     // protected list does not revive it.
     let already = bulk_test_row(&pool, "protect-gone", "vless", "removed", None, None).await;
+    // The rows start linked and lose the link, exactly what happens
+    // after a source delete.
+    for id in [ready, alive, unknown, already] {
+        link_row(&pool, id, "srcO0000001").await;
+    }
     sqlx::query("DELETE FROM proxy_source_links")
         .execute(&pool)
         .await
@@ -3051,12 +3773,16 @@ async fn mark_orphans_removed_protects_listed_statuses() {
     // `ready` (tunnel-verified, the probe is its only authority) and
     // `unknown` (not yet checked, the priority queue is its only
     // authority). Both must survive the click.
-    let affected = mark_orphans_removed(&pool, &["ready", "unknown"])
+    let sweep = mark_orphans_removed(&pool, &["ready", "unknown"])
         .await
         .unwrap();
     assert_eq!(
-        affected, 1,
+        sweep.retired, 1,
         "only the non-protected orphan (alive) retires; ready and unknown are spared"
+    );
+    assert_eq!(
+        sweep.protected, 2,
+        "the protected orphans are counted, not hidden: they are the detached rows"
     );
     assert_eq!(
         bulk_status_of(&pool, ready).await.0,
@@ -3070,7 +3796,7 @@ async fn mark_orphans_removed_protects_listed_statuses() {
     );
     assert_eq!(bulk_status_of(&pool, alive).await.0, "removed");
     assert_eq!(bulk_status_of(&pool, already).await.0, "removed");
-    let (_status, _q, _l, removed_at) = bulk_status_of(&pool, already).await;
+    let (_status, _q, _l, removed_at, _step, _fails) = bulk_status_of(&pool, already).await;
     assert_eq!(
         removed_at,
         Some(1234),
@@ -3088,18 +3814,62 @@ async fn mark_orphans_removed_accepts_multiple_protected_statuses() {
     let ready = bulk_test_row(&pool, "multi-ready", "vless", "ready", None, None).await;
     let alive = bulk_test_row(&pool, "multi-alive", "vless", "alive", None, None).await;
     let unknown = bulk_test_row(&pool, "multi-unknown", "vless", "unknown", None, None).await;
+    // The rows start linked and lose the link, exactly what happens
+    // after a source delete.
+    for id in [ready, alive, unknown] {
+        link_row(&pool, id, "srcO0000002").await;
+    }
     sqlx::query("DELETE FROM proxy_source_links")
         .execute(&pool)
         .await
         .unwrap();
 
-    let affected = mark_orphans_removed(&pool, &["ready", "alive"])
+    let sweep = mark_orphans_removed(&pool, &["ready", "alive"])
         .await
         .unwrap();
-    assert_eq!(affected, 1, "only the non-protected orphan retires");
+    assert_eq!(sweep.retired, 1, "only the non-protected orphan retires");
+    assert_eq!(sweep.protected, 2);
     assert_eq!(bulk_status_of(&pool, ready).await.0, "ready");
     assert_eq!(bulk_status_of(&pool, alive).await.0, "alive");
     assert_eq!(bulk_status_of(&pool, unknown).await.0, "removed");
+}
+
+/// The detached rows — the ones without a source link — are counted,
+/// marked in the browser and retired by the cleanup path. A link-less
+/// row is in no probe lane, so nothing else would ever end it.
+#[tokio::test]
+async fn the_detached_rows_are_counted_marked_and_cleanable() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcO0000003").await;
+
+    let linked = bulk_test_row(&pool, "detach-linked", "vless", "alive", None, None).await;
+    let detached = bulk_test_row(&pool, "detach-loose", "vless", "alive", None, None).await;
+    let gone = bulk_test_row(&pool, "detach-gone", "vless", "removed", None, None).await;
+    link_row(&pool, linked, "srcO0000003").await;
+
+    assert_eq!(count_detached(&pool).await.unwrap(), 1);
+
+    let rows = list_filtered(
+        &pool,
+        &ProxyListFilter::default(),
+        ProxyListOrder::Updated,
+        50,
+        None,
+    )
+    .await
+    .unwrap();
+    let detached_flag = |id: i64| rows.iter().find(|row| row.id == id).unwrap().detached;
+    assert!(!detached_flag(linked), "a linked row is not detached");
+    assert!(detached_flag(detached), "a link-less row is detached");
+    assert!(
+        !detached_flag(gone),
+        "an already-removed row is not counted as detached"
+    );
+
+    assert_eq!(remove_detached(&pool).await.unwrap(), 1);
+    assert_eq!(bulk_status_of(&pool, detached).await.0, "removed");
+    assert_eq!(count_detached(&pool).await.unwrap(), 0);
+    assert_eq!(bulk_status_of(&pool, linked).await.0, "alive");
 }
 
 /// `revive_removed_by_country` resets matching `removed` rows back to
@@ -3125,14 +3895,21 @@ async fn revive_removed_by_country_returns_unknown_and_clears_lifecycle() {
     .await
     .unwrap();
 
-    let ids = revive_removed_by_country(&pool, "DE", now).await.unwrap();
-    assert_eq!(ids, vec![de], "only the DE row revives; US stays removed");
+    let outcome = revive_removed_by_country(&pool, "DE", now).await.unwrap();
+    assert_eq!(
+        outcome.ids,
+        vec![de],
+        "only the DE row revives; US stays removed"
+    );
+    assert_eq!(outcome.revived, 1, "one row was revived");
 
-    let (status, q, l, removed_at) = bulk_status_of(&pool, de).await;
+    let (status, q, l, removed_at, ladder_step, fail_count) = bulk_status_of(&pool, de).await;
     assert_eq!(status, "unknown");
     assert_eq!(q, None, "quarantined_at must be cleared");
     assert_eq!(l, None, "ladder_at must be cleared");
     assert_eq!(removed_at, None, "removed_at must be cleared");
+    assert_eq!(ladder_step, 0, "the ladder step must be cleared");
+    assert_eq!(fail_count, 0, "the fail budget must be cleared");
     assert_eq!(bulk_status_of(&pool, us).await.0, "removed");
 }
 
@@ -3155,8 +3932,12 @@ async fn revive_removed_by_country_ignores_other_statuses() {
     .await;
     let now = crate::models::now_ts();
 
-    let ids = revive_removed_by_country(&pool, "DE", now).await.unwrap();
-    assert!(ids.is_empty(), "no row matches status='removed' + DE");
+    let outcome = revive_removed_by_country(&pool, "DE", now).await.unwrap();
+    assert!(
+        outcome.ids.is_empty(),
+        "no row matches status='removed' + DE"
+    );
+    assert_eq!(outcome.revived, 0);
     assert_eq!(bulk_status_of(&pool, alive).await.0, "alive");
     assert_eq!(bulk_status_of(&pool, q).await.0, "quarantine");
     assert_eq!(bulk_status_of(&pool, unknown).await.0, "unknown");
@@ -3169,53 +3950,75 @@ async fn revive_removed_by_country_ignores_other_statuses() {
 async fn revive_removed_by_asn_matches_canonical_prefix() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcR0000002").await;
-    let yes = bulk_test_row(&pool, "revive-asn-yes", "vless", "removed", None, None).await;
+    // One fixture per spelling: both spellings canonicalise to the
+    // stored `AS…` form, and each call has to hit its own row and
+    // nothing else.
+    let bare = bulk_test_row(&pool, "revive-asn-bare", "vless", "removed", None, None).await;
+    let prefixed =
+        bulk_test_row(&pool, "revive-asn-prefixed", "vless", "removed", None, None).await;
     let no = bulk_test_row(&pool, "revive-asn-no", "vless", "removed", None, None).await;
-    link_row(&pool, yes, "srcR0000002").await;
-    link_row(&pool, no, "srcR0000002").await;
-    sqlx::query("UPDATE proxies SET geo_asn = 'AS24940' WHERE id IN (?, ?)")
-        .bind(yes)
-        .bind(no)
+    for id in [bare, prefixed, no] {
+        link_row(&pool, id, "srcR0000002").await;
+    }
+    sqlx::query("UPDATE proxies SET geo_asn = 'AS24940' WHERE id = ?")
+        .bind(bare)
         .execute(&pool)
         .await
         .unwrap();
     sqlx::query("UPDATE proxies SET geo_asn = 'AS13335' WHERE id = ?")
+        .bind(prefixed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE proxies SET geo_asn = 'AS16509' WHERE id = ?")
         .bind(no)
         .execute(&pool)
         .await
         .unwrap();
     let now = crate::models::now_ts();
 
-    let ids = revive_removed_by_asn(&pool, "24940", now).await.unwrap();
-    assert_eq!(ids, vec![yes], "bare number and AS-prefix both work");
-    assert_eq!(bulk_status_of(&pool, yes).await.0, "unknown");
+    // The bare number works.
+    let outcome = revive_removed_by_asn(&pool, "24940", now).await.unwrap();
+    assert_eq!(outcome.ids, vec![bare], "the bare number canonicalises");
+    assert_eq!(outcome.revived, 1);
+    assert_eq!(bulk_status_of(&pool, bare).await.0, "unknown");
+
+    // The AS-prefix works as well.
+    let outcome = revive_removed_by_asn(&pool, "AS13335", now).await.unwrap();
+    assert_eq!(outcome.ids, vec![prefixed], "the AS-prefix works as well");
+    assert_eq!(outcome.revived, 1);
+    assert_eq!(bulk_status_of(&pool, prefixed).await.0, "unknown");
     assert_eq!(bulk_status_of(&pool, no).await.0, "removed");
 }
 
-/// `revive_removed_without_probe_history` only revives `removed` rows
-/// with no `probe_results` entry, a row that the probe once got to
-/// (even if it failed) stays removed.
+/// `revive_removed_never_checked` only revives `removed` rows the probe
+/// never reached, a row that was checked once (even if the check failed)
+/// stays removed.
+///
+/// The marker is the row's own `last_checked_at`, not a journal entry:
+/// the journal rotates, so a proxy checked long ago and dropped from the
+/// preserved history would look "never checked" and be revived on every
+/// pass.
 #[tokio::test]
-async fn revive_removed_without_probe_history_targets_only_historyless_rows() {
+async fn revive_removed_never_checked_targets_only_never_checked_rows() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcR0000003").await;
     let lonely = bulk_test_row(&pool, "revive-lonely", "vless", "removed", None, None).await;
     let tried = bulk_test_row(&pool, "revive-tried", "vless", "removed", None, None).await;
     link_row(&pool, lonely, "srcR0000003").await;
     link_row(&pool, tried, "srcR0000003").await;
-    sqlx::query(
-        "INSERT INTO probe_results (proxy_id, probe_kind, ok, checked_at) VALUES (?, 't1', 0, 1)",
-    )
-    .bind(tried)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let now = crate::models::now_ts();
-
-    let ids = revive_removed_without_probe_history(&pool, now)
+    // The probe reached the row once; its journal entry is long gone
+    // (the retention pass removed it), the row still knows.
+    sqlx::query("UPDATE proxies SET last_checked_at = 1 WHERE id = ?")
+        .bind(tried)
+        .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(ids, vec![lonely]);
+    let now = crate::models::now_ts();
+
+    let outcome = revive_removed_never_checked(&pool, now).await.unwrap();
+    assert_eq!(outcome.ids, vec![lonely]);
+    assert_eq!(outcome.revived, 1);
     assert_eq!(bulk_status_of(&pool, lonely).await.0, "unknown");
     assert_eq!(bulk_status_of(&pool, tried).await.0, "removed");
 }
@@ -3224,10 +4027,10 @@ async fn revive_removed_without_probe_history_targets_only_historyless_rows() {
 /// block. With `last_t2_failed_at` set they satisfy no probe lane at
 /// all (queue drain and T1 sample require it NULL, the T2 selector
 /// only offers `alive`/`ready`), so they are never checked and never
-/// can clear the flag on their own. A row that *has* probe history is
-/// left alone: the panel is for rows that never got a verdict.
+/// can clear the flag on their own. A row that *was* checked is left
+/// alone: the panel is for rows that never got a verdict.
 #[tokio::test]
-async fn revive_without_probe_history_releases_t2_frozen_unknown_rows() {
+async fn revive_never_checked_releases_t2_frozen_unknown_rows() {
     let (_dir, pool) = temp_pool().await;
     make_source(&pool, "srcR0000003").await;
     let frozen = bulk_test_row(&pool, "revive-frozen", "vless", "unknown", None, None).await;
@@ -3246,25 +4049,25 @@ async fn revive_without_probe_history_releases_t2_frozen_unknown_rows() {
     for id in [frozen, clear, frozen_with_history] {
         link_row(&pool, id, "srcR0000003").await;
     }
-    // frozen + frozen_with_history carry the T2 block; clear does not.
-    for id in [frozen, frozen_with_history] {
+    // frozen + frozen_with_history + unlinked carry the T2 block; clear
+    // does not. The unlinked row differs from the frozen one in the
+    // source link and in nothing else, so the assertion below really
+    // tests the link and not the block.
+    for id in [frozen, frozen_with_history, unlinked] {
         sqlx::query("UPDATE proxies SET last_t2_failed_at = 1700, fail_count = 3 WHERE id = ?")
             .bind(id)
             .execute(&pool)
             .await
             .unwrap();
     }
-    sqlx::query(
-        "INSERT INTO probe_results (proxy_id, probe_kind, ok, checked_at) VALUES (?, 't1', 0, 1)",
-    )
-    .bind(frozen_with_history)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let ids = revive_removed_without_probe_history(&pool, 2000)
+    sqlx::query("UPDATE proxies SET last_checked_at = 1700 WHERE id = ?")
+        .bind(frozen_with_history)
+        .execute(&pool)
         .await
         .unwrap();
+
+    let outcome = revive_removed_never_checked(&pool, 2000).await.unwrap();
+    let ids = &outcome.ids;
 
     assert!(ids.contains(&frozen), "the frozen row must be released");
     let (flag, fails): (Option<i64>, i64) =
@@ -3279,7 +4082,7 @@ async fn revive_without_probe_history_releases_t2_frozen_unknown_rows() {
     assert!(!ids.contains(&clear), "an unblocked row needs no revival");
     assert!(
         !ids.contains(&frozen_with_history),
-        "a row with probe history is not historyless"
+        "a row the probe already checked is not never-checked"
     );
     assert!(
         !ids.contains(&unlinked),
@@ -3316,9 +4119,11 @@ async fn revive_quarantine_returns_unknown_and_clears_ladder_fields() {
     .unwrap();
     let now = crate::models::now_ts();
 
-    let ids = revive_quarantine(&pool, now).await.unwrap();
-    assert_eq!(ids, vec![q]);
-    let (status, quarantined_at, ladder_at, removed_at) = bulk_status_of(&pool, q).await;
+    let outcome = revive_quarantine(&pool, now).await.unwrap();
+    assert_eq!(outcome.ids, vec![q]);
+    assert_eq!(outcome.revived, 1);
+    let (status, quarantined_at, ladder_at, removed_at, ladder_step, fail_count) =
+        bulk_status_of(&pool, q).await;
     assert_eq!(status, "unknown");
     assert_eq!(quarantined_at, None);
     assert_eq!(ladder_at, None);
@@ -3326,6 +4131,8 @@ async fn revive_quarantine_returns_unknown_and_clears_ladder_fields() {
         removed_at, None,
         "removed_at was never set on a quarantine row"
     );
+    assert_eq!(ladder_step, 0, "the ladder step must be cleared");
+    assert_eq!(fail_count, 0, "the fail budget must be cleared");
 }
 
 /// `revive_quarantine` only acts on `status = 'quarantine'`; every
@@ -3339,8 +4146,9 @@ async fn revive_quarantine_leaves_alive_and_removed_alone() {
     let unknown = bulk_test_row(&pool, "revive-unknown-skip", "vless", "unknown", None, None).await;
     let now = crate::models::now_ts();
 
-    let ids = revive_quarantine(&pool, now).await.unwrap();
-    assert!(ids.is_empty());
+    let outcome = revive_quarantine(&pool, now).await.unwrap();
+    assert!(outcome.ids.is_empty());
+    assert_eq!(outcome.revived, 0);
     assert_eq!(bulk_status_of(&pool, alive).await.0, "alive");
     assert_eq!(bulk_status_of(&pool, removed).await.0, "removed");
     assert_eq!(bulk_status_of(&pool, unknown).await.0, "unknown");
@@ -3425,17 +4233,21 @@ async fn bulk_revival_skips_rows_without_a_source_link() {
         .unwrap();
 
     assert_eq!(
-        revive_removed_by_country(&pool, "DE", now).await.unwrap(),
+        revive_removed_by_country(&pool, "DE", now)
+            .await
+            .unwrap()
+            .ids,
         vec![by_country]
     );
     assert_eq!(
-        revive_removed_by_asn(&pool, "24940", now).await.unwrap(),
+        revive_removed_by_asn(&pool, "24940", now)
+            .await
+            .unwrap()
+            .ids,
         vec![by_asn]
     );
     assert_eq!(
-        revive_removed_without_probe_history(&pool, now)
-            .await
-            .unwrap(),
+        revive_removed_never_checked(&pool, now).await.unwrap().ids,
         vec![by_history]
     );
     assert!(
@@ -3445,7 +4257,7 @@ async fn bulk_revival_skips_rows_without_a_source_link() {
             .is_empty()
     );
     assert_eq!(
-        revive_quarantine(&pool, now).await.unwrap(),
+        revive_quarantine(&pool, now).await.unwrap().ids,
         vec![from_quarantine]
     );
 
@@ -3634,6 +4446,24 @@ async fn admin_list_fixture(pool: &DbPool) -> Vec<(i64, &'static str)> {
     ids
 }
 
+/// The count and the rows of one filter, asserted together: the two
+/// queries share one clause set, and a filter that constrains only one
+/// of them would show a total that does not match the page.
+async fn filtered_ids(pool: &DbPool, filter: &ProxyListFilter) -> (i64, Vec<i64>) {
+    let total = count_filtered(pool, filter).await.unwrap();
+    let rows = list_filtered(pool, filter, ProxyListOrder::Updated, 50, None)
+        .await
+        .unwrap();
+    let mut ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        total,
+        ids.len() as i64,
+        "the count and the page of one filter must agree"
+    );
+    (total, ids)
+}
+
 /// The count and the page of the admin browser apply exactly the same
 /// filter clauses, and every filter column constrains the rows it is
 /// supposed to.
@@ -3642,28 +4472,26 @@ async fn admin_list_filter_count_and_rows_match() {
     let (_dir, pool) = temp_pool().await;
     let ids = admin_list_fixture(&pool).await;
     let id_of = |letter: &str| ids.iter().find(|(_, l)| *l == letter).unwrap().0;
+    let expected = |letters: &[&str]| -> Vec<i64> {
+        let mut out: Vec<i64> = letters.iter().map(|l| id_of(l)).collect();
+        out.sort_unstable();
+        out
+    };
 
     // Unfiltered: everything, and count and rows agree.
     let filter = ProxyListFilter::default();
-    let total = count_filtered(&pool, &filter).await.unwrap();
+    let (total, rows) = filtered_ids(&pool, &filter).await;
     assert_eq!(total, 4);
-    let rows = list_filtered(&pool, &filter, ProxyListOrder::Updated, 50, 0)
-        .await
-        .unwrap();
-    assert_eq!(rows.len() as i64, total);
+    assert_eq!(rows, expected(&["a", "b", "c", "d"]));
 
     // Status whitelist.
     let filter = ProxyListFilter {
         statuses: vec!["alive".into()],
         ..Default::default()
     };
-    let rows = list_filtered(&pool, &filter, ProxyListOrder::Updated, 50, 0)
-        .await
-        .unwrap();
-    assert_eq!(
-        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
-        vec![id_of("b")]
-    );
+    let (total, rows) = filtered_ids(&pool, &filter).await;
+    assert_eq!(total, 1);
+    assert_eq!(rows, expected(&["b"]));
 
     // Exact scheme and exact country.
     let filter = ProxyListFilter {
@@ -3671,38 +4499,37 @@ async fn admin_list_filter_count_and_rows_match() {
         country: "US".into(),
         ..Default::default()
     };
-    let total = count_filtered(&pool, &filter).await.unwrap();
+    let (total, rows) = filtered_ids(&pool, &filter).await;
     assert_eq!(total, 2, "a and d are vless in the US");
+    assert_eq!(rows, expected(&["a", "d"]));
 
     // Source filter through the link table.
     let filter = ProxyListFilter {
         source_id: "srcA0000000".into(),
         ..Default::default()
     };
-    let total = count_filtered(&pool, &filter).await.unwrap();
+    let (total, rows) = filtered_ids(&pool, &filter).await;
     assert_eq!(total, 2, "a and b are linked to srcA");
+    assert_eq!(rows, expected(&["a", "b"]));
 
     // Substring over host and name (both carry the fingerprint here).
     let filter = ProxyListFilter {
         query: "fp-admin-a.example".into(),
         ..Default::default()
     };
-    let rows = list_filtered(&pool, &filter, ProxyListOrder::Updated, 50, 0)
-        .await
-        .unwrap();
-    assert_eq!(
-        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
-        vec![id_of("a")]
-    );
+    let (total, rows) = filtered_ids(&pool, &filter).await;
+    assert_eq!(total, 1);
+    assert_eq!(rows, expected(&["a"]));
     let filter = ProxyListFilter {
         query: "fp-admin-b".into(),
         ..Default::default()
     };
-    let total = count_filtered(&pool, &filter).await.unwrap();
+    let (total, rows) = filtered_ids(&pool, &filter).await;
     assert_eq!(total, 1, "b matches on host and name");
+    assert_eq!(rows, expected(&["b"]));
 
     // Coverage buckets.
-    for (bucket, expected) in [
+    for (bucket, expected_letter) in [
         (CheckCoverage::T1Only, "b"),
         (CheckCoverage::T2Only, "d"),
         (CheckCoverage::Both, "a"),
@@ -3712,12 +4539,11 @@ async fn admin_list_filter_count_and_rows_match() {
             coverage: Some(bucket),
             ..Default::default()
         };
-        let rows = list_filtered(&pool, &filter, ProxyListOrder::Updated, 50, 0)
-            .await
-            .unwrap();
+        let (total, rows) = filtered_ids(&pool, &filter).await;
+        assert_eq!(total, 1, "coverage bucket {}", bucket.as_str());
         assert_eq!(
-            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
-            vec![id_of(expected)],
+            rows,
+            expected(&[expected_letter]),
             "coverage bucket {}",
             bucket.as_str()
         );
@@ -3729,7 +4555,7 @@ async fn admin_list_filter_count_and_rows_match() {
         &ProxyListFilter::default(),
         ProxyListOrder::Updated,
         50,
-        0,
+        None,
     )
     .await
     .unwrap();
@@ -3756,7 +4582,9 @@ async fn admin_list_orders_and_pages() {
     let ids = admin_list_fixture(&pool).await;
     let id_of = |letter: &str| ids.iter().find(|(_, l)| *l == letter).unwrap().0;
     // Distinct recency and latency so both orders are deterministic.
-    let recency = [("a", 100), ("b", 200), ("c", 300), ("d", 400)];
+    // b and c share their timestamp: the tie must break by id DESC, and
+    // a page boundary must not cut a tied pair in half.
+    let recency = [("a", 100), ("b", 300), ("c", 300), ("d", 400)];
     let latency = [
         ("a", Some(100)),
         ("b", Some(50)),
@@ -3779,14 +4607,29 @@ async fn admin_list_orders_and_pages() {
             .await
             .unwrap();
     }
+    // Mixed-case names, so the name order has to fold the case to
+    // order them the way an operator reads them.
+    for (letter, name) in [
+        ("a", "Alpha"),
+        ("b", "beta"),
+        ("c", "Gamma"),
+        ("d", "delta"),
+    ] {
+        sqlx::query("UPDATE proxies SET name = ? WHERE id = ?")
+            .bind(name)
+            .bind(id_of(letter))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 
-    // Updated: newest first.
+    // Updated: newest first, ties by id DESC (c before b).
     let rows = list_filtered(
         &pool,
         &ProxyListFilter::default(),
         ProxyListOrder::Updated,
         50,
-        0,
+        None,
     )
     .await
     .unwrap();
@@ -3800,7 +4643,7 @@ async fn admin_list_orders_and_pages() {
         &ProxyListFilter::default(),
         ProxyListOrder::Latency,
         50,
-        0,
+        None,
     )
     .await
     .unwrap();
@@ -3808,60 +4651,110 @@ async fn admin_list_orders_and_pages() {
         rows.iter().map(|r| r.id).collect::<Vec<_>>(),
         vec![id_of("b"), id_of("d"), id_of("a"), id_of("c")]
     );
-    // Name: case-insensitive ascending (the fixture names are the
-    // fingerprints, so plain alphabetical here).
+    // Name: case-insensitive ascending (the fixture names are mixed
+    // case, so a plain byte order would put "Gamma" and "Alpha" in the
+    // wrong places).
     let rows = list_filtered(
         &pool,
         &ProxyListFilter::default(),
         ProxyListOrder::Name,
         50,
-        0,
+        None,
     )
     .await
     .unwrap();
     assert_eq!(
         rows.iter().map(|r| r.id).collect::<Vec<_>>(),
-        vec![id_of("a"), id_of("b"), id_of("c"), id_of("d")]
+        vec![id_of("a"), id_of("b"), id_of("d"), id_of("c")]
     );
 
-    // Pagination windows of the Updated order.
-    let rows = list_filtered(
+    // Keyset pagination: the second page resumes after the last row of
+    // the first one, so the two pages cover every row exactly once.
+    let first_page = list_page(&pool, ProxyListOrder::Updated, 2, None).await;
+    let first_ids: Vec<i64> = first_page.iter().map(|r| r.id).collect();
+    assert_eq!(first_ids, vec![id_of("d"), id_of("c")]);
+    let second_page = list_page(
         &pool,
-        &ProxyListFilter::default(),
         ProxyListOrder::Updated,
         2,
-        0,
+        Some(&first_page[1].cursor(ProxyListOrder::Updated)),
     )
-    .await
-    .unwrap();
-    assert_eq!(
-        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
-        vec![id_of("d"), id_of("c")]
+    .await;
+    let second_ids: Vec<i64> = second_page.iter().map(|r| r.id).collect();
+    assert_eq!(second_ids, vec![id_of("b"), id_of("a")]);
+    // The two pages cover every row exactly once: a tied pair must not
+    // show up on both pages and must not be skipped between them.
+    assert!(
+        !first_ids.iter().any(|id| second_ids.contains(id)),
+        "the pages overlap"
     );
-    let rows = list_filtered(
+    let mut all: Vec<i64> = first_ids.iter().chain(second_ids.iter()).copied().collect();
+    all.sort_unstable();
+    let mut every: Vec<i64> = ids.iter().map(|(id, _)| *id).collect();
+    every.sort_unstable();
+    assert_eq!(all, every, "the pages leave a gap");
+
+    // The page before the first one is empty: past the end of the order
+    // there is nothing to walk back to.
+    let rows = list_page_backward(
         &pool,
-        &ProxyListFilter::default(),
         ProxyListOrder::Updated,
         2,
-        2,
+        &first_page[0].cursor(ProxyListOrder::Updated),
     )
-    .await
-    .unwrap();
-    assert_eq!(
-        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
-        vec![id_of("b"), id_of("a")]
-    );
-    // Past the end: empty page, no error.
-    let rows = list_filtered(
-        &pool,
-        &ProxyListFilter::default(),
-        ProxyListOrder::Updated,
-        2,
-        99,
-    )
-    .await
-    .unwrap();
+    .await;
     assert!(rows.is_empty());
+
+    // The page before the second one is the first one again, and it comes
+    // out in the reading order even though it is fetched backwards.
+    let rows = list_page_backward(
+        &pool,
+        ProxyListOrder::Updated,
+        2,
+        &second_page[0].cursor(ProxyListOrder::Updated),
+    )
+    .await;
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![id_of("d"), id_of("c")]);
+}
+
+/// One page of the admin list, taken after `cursor` (or the first page
+/// when there is none).
+async fn list_page(
+    pool: &DbPool,
+    order: ProxyListOrder,
+    limit: i64,
+    cursor: Option<&ProxyListCursor>,
+) -> Vec<ProxyListRow> {
+    let page = cursor.map(|cursor| ProxyListPage {
+        cursor: cursor.clone(),
+        direction: ProxyListDirection::Forward,
+    });
+    list_filtered(
+        pool,
+        &ProxyListFilter::default(),
+        order,
+        limit,
+        page.as_ref(),
+    )
+    .await
+    .unwrap()
+}
+
+/// The page of the admin list *before* `cursor`.
+async fn list_page_backward(
+    pool: &DbPool,
+    order: ProxyListOrder,
+    limit: i64,
+    cursor: &ProxyListCursor,
+) -> Vec<ProxyListRow> {
+    let page = ProxyListPage {
+        cursor: cursor.clone(),
+        direction: ProxyListDirection::Backward,
+    };
+    list_filtered(pool, &ProxyListFilter::default(), order, limit, Some(&page))
+        .await
+        .unwrap()
 }
 
 /// `from_bucket`/`from_param` are the whitelists: a garbage value is

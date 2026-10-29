@@ -10,6 +10,7 @@
 //! `alive_export`) must not depend on the admin module for them.
 
 use axum::http::HeaderMap;
+use fumox_core::config::TrustedHeader;
 use moka::future::Cache;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -61,41 +62,48 @@ fn sole(found: Forwarded, peer: SocketAddr) -> IpAddr {
 
 /// Compute the per-IP rate-limit key for the incoming request.
 ///
-/// The two early-return conditions stay as two distinct code paths (a single
-/// combined `if` would let a "trusted proxy, peer is the trusted CIDR" case
-/// fall through to header inspection when `trusted_cidrs` is empty by
-/// accident, easy bug, hard to catch in review).
+/// The operator's declaration ([`TrustedHeader`]) decides which header is
+/// read at all; the trusted CIDR list decides whether the peer may speak
+/// for a client. Both gates are closed by default:
 ///
-/// 1. No trusted proxies configured ⇒ never honor forwarded headers.
-/// 2. Peer is not in any trusted CIDR ⇒ the header is untrusted.
-/// 3. Trusted peer, exactly one forwarded header present ⇒ whatever that
-///    one walk returns, else the peer.
-/// 4. Both headers present and both name the same IP ⇒ that IP.
-/// 5. Both present, one names a client and the other is an exhausted
-///    trusted chain ⇒ that client.
-/// 6. Anything else ⇒ the peer IP.
+/// 1. No forwarding header declared ⇒ the peer address is the client.
+/// 2. No trusted proxies configured ⇒ never honor forwarded headers.
+/// 3. Peer is not in any trusted CIDR ⇒ the header is untrusted.
+/// 4. `xff` declared ⇒ whatever the `X-Forwarded-For` walk returns, else
+///    the peer. A `Forwarded` header beside it is ignored: it is text
+///    nobody vouched for.
+/// 5. `forwarded` declared ⇒ the same walk over the RFC 7239 header,
+///    `X-Forwarded-For` ignored.
+/// 6. `both` declared ⇒ the two walks must name the same address, or the
+///    peer wins.
 ///
 /// No precedence between `Forwarded` and `X-Forwarded-For`: the walk cannot
 /// tell a proxy-appended entry from a client-authored one, so either fixed
 /// order is client-chosen.
-pub fn client_key(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> IpAddr {
-    // 1. No trusted proxies configured ⇒ never honor forwarded headers.
+pub fn client_key(
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    trusted_cidrs: &[ipnet::IpNet],
+    trusted_header: TrustedHeader,
+) -> IpAddr {
+    // 1. The operator named no header: nothing a client sends can move the
+    // key off the peer address.
+    if trusted_header == TrustedHeader::None {
+        return peer.ip();
+    }
+    // 2. No trusted proxies configured ⇒ never honor forwarded headers.
     if trusted_cidrs.is_empty() {
         return peer.ip();
     }
-    // 2. Peer is not in any trusted CIDR ⇒ the header is untrusted.
+    // 3. Peer is not in any trusted CIDR ⇒ the header is untrusted.
     if !trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) {
         return peer.ip();
     }
-    // 3. Which headers the request carries, not which of them resolves.
-    let xff = headers.contains_key("x-forwarded-for");
-    let forwarded = headers.contains_key(axum::http::header::FORWARDED);
-    match (xff, forwarded) {
-        (true, false) => sole(walk_xff(headers, trusted_cidrs), peer),
-        (false, true) => sole(walk_forwarded(headers, trusted_cidrs), peer),
-        (false, false) => peer.ip(),
-        // 4/5/6. Both present: agreement, an exhausted chain, or the peer.
-        (true, true) => match (
+    match trusted_header {
+        TrustedHeader::None => peer.ip(),
+        TrustedHeader::Xff => sole(walk_xff(headers, trusted_cidrs), peer),
+        TrustedHeader::Forwarded => sole(walk_forwarded(headers, trusted_cidrs), peer),
+        TrustedHeader::Both => match (
             walk_xff(headers, trusted_cidrs),
             walk_forwarded(headers, trusted_cidrs),
         ) {
@@ -125,14 +133,23 @@ pub fn client_key(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet:
 /// reads the same whether the trusted proxy appended it or the client
 /// authored it, since the proxy either appends or overwrites. Callers must
 /// therefore establish that the trusted hop writes this header at all,
-/// see [`client_key`], which does it from which headers the request
-/// carries. A trust list broad enough to contain the clients themselves
-/// (`0.0.0.0/0`, a `/8` the subscribers live in) also erases the
+/// see [`client_key`], which does it from the operator's declaration
+/// ([`TrustedHeader`]). A trust list broad enough to contain the clients
+/// themselves (`0.0.0.0/0`, a `/8` the subscribers live in) also erases the
 /// distinction: their addresses are skipped like a hop's.
 fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
-    let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
+    // RFC 7230 §3.2.2: a repeated header field is equivalent to one field
+    // with the values joined by commas. Reading only the first value would
+    // silently drop the entries a proxy appended after it.
+    let value = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if value.is_empty() {
         return Forwarded::Nothing;
-    };
+    }
     let mut parsed_any = false;
     for raw in value.split(',').rev() {
         let candidate = raw.trim();
@@ -157,12 +174,16 @@ fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
 /// `for=unknown`, both mean the proxy declined to name the client, which
 /// is [`Forwarded::Nothing`], never a chain that ran past it.
 fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
-    let Some(value) = headers
-        .get(axum::http::header::FORWARDED)
-        .and_then(|v| v.to_str().ok())
-    else {
+    // Repeated `Forwarded` headers are one field with comma-joined values.
+    let value = headers
+        .get_all(axum::http::header::FORWARDED)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if value.is_empty() {
         return Forwarded::Nothing;
-    };
+    }
     let mut parsed_any = false;
     for raw in value.split(',').rev() {
         let entry = raw.trim();
@@ -296,23 +317,61 @@ mod tests {
         h
     }
 
+    /// The rate-limit key under each declaration, for the trusted peer of
+    /// the tests above.
+    fn key_xff(headers: &HeaderMap) -> IpAddr {
+        client_key(peer(), headers, &trusted_v4(), TrustedHeader::Xff)
+    }
+
+    fn key_forwarded(headers: &HeaderMap) -> IpAddr {
+        client_key(peer(), headers, &trusted_v4(), TrustedHeader::Forwarded)
+    }
+
+    fn key_both(headers: &HeaderMap) -> IpAddr {
+        client_key(peer(), headers, &trusted_v4(), TrustedHeader::Both)
+    }
+
     #[test]
     fn empty_trusted_list_never_honors_forwarded_headers() {
         // Even with XFF claiming 1.2.3.4, an unconfigured trust list must
         // not let the header influence the rate-limit key, peer wins.
         let h = xff("1.2.3.4");
-        assert_eq!(client_key(peer(), &h, &[]), peer().ip());
+        assert_eq!(
+            client_key(peer(), &h, &[], TrustedHeader::Both),
+            peer().ip()
+        );
         let h = fwd("for=1.2.3.4;proto=https");
-        assert_eq!(client_key(peer(), &h, &[]), peer().ip());
+        assert_eq!(
+            client_key(peer(), &h, &[], TrustedHeader::Both),
+            peer().ip()
+        );
+    }
+
+    /// The declaration is the gate: until the operator names a header, no
+    /// forwarded header moves the key off the peer address, not even one
+    /// the trusted proxy wrote.
+    #[test]
+    fn an_undeclared_forwarding_header_never_moves_the_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        headers.insert(header::FORWARDED, "for=1.2.3.4;proto=https".parse().unwrap());
+        assert_eq!(
+            client_key(peer(), &headers, &trusted_v4(), TrustedHeader::None),
+            peer().ip(),
+            "a consistent pair of headers must resolve to the peer without a declaration"
+        );
+        // The same pair under a declaration names the client: the operator
+        // has taken responsibility for the header.
+        assert_eq!(
+            key_both(&headers),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]
     fn trusted_peer_with_single_xff_hop_returns_that_ip() {
         let h = xff("1.2.3.4");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_xff(&h), "1.2.3.4".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -321,10 +380,7 @@ mod tests {
         // at the right, so the walk starts there, skips the trusted entry
         // and lands on the client IP the first trusted proxy observed.
         let h = xff("1.1.1.1, 2.2.2.2");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.1.1.1".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_xff(&h), "1.1.1.1".parse::<IpAddr>().unwrap());
     }
 
     /// The attack from security review f2: the client sends its own XFF
@@ -336,10 +392,7 @@ mod tests {
     #[test]
     fn client_supplied_xff_prefix_cannot_pick_the_rate_limit_key() {
         let h = xff("6.6.6.6, 9.9.9.9");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "9.9.9.9".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_xff(&h), "9.9.9.9".parse::<IpAddr>().unwrap());
     }
 
     /// Same property on the RFC 7239 header: a client-supplied `for=` in
@@ -348,19 +401,15 @@ mod tests {
     #[test]
     fn client_supplied_forwarded_prefix_cannot_pick_the_rate_limit_key() {
         let h = fwd("for=6.6.6.6, for=9.9.9.9");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "9.9.9.9".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_forwarded(&h), "9.9.9.9".parse::<IpAddr>().unwrap());
     }
 
     /// A proxy configured for RFC 7239 (`Forwarded`) leaves
     /// `X-Forwarded-For` alone, so a client-supplied XFF is the only XFF
-    /// text the request carries. The walk must not resolve on that header:
-    /// five forged XFFs must not produce five rate-limit keys on the login
-    /// brute-force cap. A second header beside the proxy's is evidence the
-    /// client wrote it, so the two disagree and the key falls back to the
-    /// trusted peer, the one bucket a client cannot pick its way out of.
+    /// text the request carries. Under the `forwarded` declaration the XFF
+    /// is not read at all, so the five forged XFFs cannot produce five
+    /// rate-limit keys on the login brute-force cap: the key is the
+    /// address the proxy itself observed.
     #[test]
     fn client_authored_xff_cannot_pick_the_key_when_the_proxy_writes_forwarded() {
         for forged in [
@@ -374,8 +423,8 @@ mod tests {
             headers.insert(header::FORWARDED, "for=9.9.9.9".parse().unwrap());
             headers.insert("x-forwarded-for", forged.parse().unwrap());
             assert_eq!(
-                client_key(peer(), &headers, &trusted_v4()),
-                peer().ip(),
+                key_forwarded(&headers),
+                "9.9.9.9".parse::<IpAddr>().unwrap(),
                 "a client-authored XFF beside the proxy's Forwarded chose the key"
             );
         }
@@ -383,8 +432,8 @@ mod tests {
 
     /// The mirror image: a proxy that writes only XFF (nginx, Caddy) and
     /// forwards the client's `Forwarded` verbatim, the default of
-    /// `proxy_pass_request_headers on`. A single client-authored `for=` is
-    /// non-trusted, so the walk over it hands the attacker the key.
+    /// `proxy_pass_request_headers on`. Under the `xff` declaration the
+    /// client's `for=` is not read, so it cannot pick the key.
     #[test]
     fn client_authored_forwarded_cannot_pick_the_key_when_the_proxy_writes_xff() {
         for forged in [
@@ -397,23 +446,22 @@ mod tests {
             headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
             headers.insert(header::FORWARDED, forged.parse().unwrap());
             assert_eq!(
-                client_key(peer(), &headers, &trusted_v4()),
-                peer().ip(),
+                key_xff(&headers),
+                "9.9.9.9".parse::<IpAddr>().unwrap(),
                 "a client-authored Forwarded beside the proxy's XFF chose the key"
             );
         }
     }
 
     /// A `Forwarded` the trusted proxy wrote but that yields no address
-    /// (`for=_hidden`) is still evidence about which header the proxy
-    /// writes: falling through to the XFF the proxy never touches is the
-    /// original bypass with the sign flipped.
+    /// (`for=_hidden`) is text from a header the operator did not
+    /// declare: it must not change the key the declared header produced.
     #[test]
-    fn a_hidden_forwarded_entry_never_falls_back_to_the_xff() {
+    fn a_hidden_forwarded_entry_never_changes_the_declared_headers_key() {
         let mut headers = HeaderMap::new();
         headers.insert(header::FORWARDED, "for=_hidden".parse().unwrap());
-        headers.insert("x-forwarded-for", "6.6.6.6".parse().unwrap());
-        assert_eq!(client_key(peer(), &headers, &trusted_v4()), peer().ip());
+        headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        assert_eq!(key_xff(&headers), "9.9.9.9".parse::<IpAddr>().unwrap());
     }
 
     /// A proxy that writes both headers (and appends to both) names the
@@ -428,10 +476,7 @@ mod tests {
             header::FORWARDED,
             "for=9.9.9.9;proto=https".parse().unwrap(),
         );
-        assert_eq!(
-            client_key(peer(), &headers, &trusted_v4()),
-            "9.9.9.9".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_both(&headers), "9.9.9.9".parse::<IpAddr>().unwrap());
     }
 
     /// A two-proxy chain where the outer hop writes `Forwarded` and the
@@ -457,7 +502,7 @@ mod tests {
             "for=9.9.9.9;proto=https".parse().unwrap(),
         );
         assert_eq!(
-            client_key(peer(), &headers, &trusted),
+            client_key(peer(), &headers, &trusted, TrustedHeader::Both),
             "9.9.9.9".parse::<IpAddr>().unwrap(),
             "a trusted chain through two proxies must keep its per-client key"
         );
@@ -478,7 +523,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "10.0.0.7, 10.0.0.8".parse().unwrap());
         headers.insert(header::FORWARDED, "for=10.0.0.9".parse().unwrap());
-        assert_eq!(client_key(peer(), &headers, &trusted), peer().ip());
+        assert_eq!(
+            client_key(peer(), &headers, &trusted, TrustedHeader::Both),
+            peer().ip()
+        );
 
         // Mirror: the `Forwarded` chain is the exhausted one.
         let mut headers = HeaderMap::new();
@@ -488,7 +536,7 @@ mod tests {
             "for=9.9.9.9, for=10.0.0.8".parse().unwrap(),
         );
         assert_eq!(
-            client_key(peer(), &headers, &trusted),
+            client_key(peer(), &headers, &trusted, TrustedHeader::Both),
             "9.9.9.9".parse::<IpAddr>().unwrap()
         );
     }
@@ -496,10 +544,10 @@ mod tests {
     /// The remaining disagreement, pinned deliberately: a client that sends
     /// its own `Forwarded` (or arrives behind a proxy that writes only
     /// `Forwarded`) beside an XFF-writing peer is indistinguishable from a
-    /// forgery, so the key is the peer's. That bucket is *shared*, one
-    /// window for everything that lands there, which is the documented cost
-    /// of failing closed here, never a bypass: the key is still not the
-    /// client's choice.
+    /// forgery, so under the `both` declaration the key is the peer's.
+    /// That bucket is *shared*, one window for everything that lands there,
+    /// which is the documented cost of failing closed here, never a
+    /// bypass: the key is still not the client's choice.
     #[test]
     fn a_disagreeing_client_forwarded_lands_in_the_shared_peer_bucket() {
         let mut headers = HeaderMap::new();
@@ -507,20 +555,37 @@ mod tests {
         headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
         // The client, or a proxy in front of nginx, writes this one.
         headers.insert(header::FORWARDED, "for=6.6.6.6".parse().unwrap());
-        assert_eq!(client_key(peer(), &headers, &trusted_v4()), peer().ip());
+        assert_eq!(key_both(&headers), peer().ip());
     }
 
     /// The same request with only the proxy's XFF and no `Forwarded` at all
-    /// still resolves through the XFF walk: a legacy proxy that writes
-    /// XFF only must keep its per-client rate-limit key.
+    /// still resolves through the XFF walk when the operator declared
+    /// `xff`: a legacy proxy that writes XFF only must keep its
+    /// per-client rate-limit key. Under the `both` declaration the missing
+    /// half is a disagreement and the peer wins.
     #[test]
     fn xff_is_still_honored_when_no_forwarded_is_present() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "6.6.6.6, 9.9.9.9".parse().unwrap());
-        assert_eq!(
-            client_key(peer(), &headers, &trusted_v4()),
-            "9.9.9.9".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_xff(&headers), "9.9.9.9".parse::<IpAddr>().unwrap());
+        assert_eq!(key_both(&headers), peer().ip());
+    }
+
+    /// RFC 7230 §3.2.2: a repeated header field is one field with the
+    /// values joined by commas. Reading only the first value would drop
+    /// the entries the proxy appended after it, and the client address
+    /// with them.
+    #[test]
+    fn a_repeated_forwarded_header_is_read_as_one_joined_field() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        headers.append("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        assert_eq!(key_xff(&headers), "9.9.9.9".parse::<IpAddr>().unwrap());
+
+        let mut headers = HeaderMap::new();
+        headers.append(header::FORWARDED, "for=6.6.6.6".parse().unwrap());
+        headers.append(header::FORWARDED, "for=9.9.9.9".parse().unwrap());
+        assert_eq!(key_forwarded(&headers), "9.9.9.9".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -528,7 +593,7 @@ mod tests {
         // Both hops are inside the trusted CIDR, walking past them all
         // leaves nothing usable, so the peer wins.
         let h = xff("2.2.2.2, 2.2.2.2");
-        assert_eq!(client_key(peer(), &h, &trusted_v4()), peer().ip());
+        assert_eq!(key_xff(&h), peer().ip());
     }
 
     #[test]
@@ -536,7 +601,7 @@ mod tests {
         let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
         let h = xff("1.2.3.4");
         assert_eq!(
-            client_key(untrusted_peer, &h, &trusted_v4()),
+            client_key(untrusted_peer, &h, &trusted_v4(), TrustedHeader::Both),
             untrusted_peer.ip()
         );
     }
@@ -544,16 +609,13 @@ mod tests {
     #[test]
     fn trusted_peer_with_rfc7239_forwarded_returns_first_untrusted_for() {
         let h = fwd("for=1.2.3.4;proto=https");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_forwarded(&h), "1.2.3.4".parse::<IpAddr>().unwrap());
     }
 
     #[test]
     fn forwarded_for_hidden_falls_back_to_peer() {
         let h = fwd("for=_hidden");
-        assert_eq!(client_key(peer(), &h, &trusted_v4()), peer().ip());
+        assert_eq!(key_forwarded(&h), peer().ip());
     }
 
     #[test]
@@ -562,17 +624,14 @@ mod tests {
         // (for=2.2.2.2); the walk starts there, skips the trusted entry and
         // returns the client IP the first trusted hop observed (1.1.1.1).
         let h = fwd("for=1.1.1.1, for=2.2.2.2");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.1.1.1".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_forwarded(&h), "1.1.1.1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
     fn forwarded_with_bracketed_ipv6_literal_is_bracket_stripped() {
         let h = fwd("for=[2001:db8::1];proto=https");
         assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
+            key_forwarded(&h),
             "2001:db8::1".parse::<IpAddr>().unwrap()
         );
     }
@@ -585,17 +644,11 @@ mod tests {
     #[test]
     fn walk_forwarded_takes_first_for_param_regardless_of_position() {
         let h = fwd("proto=https;for=1.2.3.4");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_forwarded(&h), "1.2.3.4".parse::<IpAddr>().unwrap());
         // Also pin a chain shape with a non-`for=` parameter in the same
         // entry to make sure the loop walks the whole `;`-separated list.
         let h = fwd("for=1.2.3.4;by=2.2.2.2;proto=https");
-        assert_eq!(
-            client_key(peer(), &h, &trusted_v4()),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(key_forwarded(&h), "1.2.3.4".parse::<IpAddr>().unwrap());
     }
 
     #[tokio::test]

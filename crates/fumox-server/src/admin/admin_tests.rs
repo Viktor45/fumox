@@ -1,8 +1,10 @@
 use super::*;
 use axum::body::Body;
-use axum::extract::ConnectInfo;
+use axum::extract::{ConnectInfo, Path, Query};
 use axum::http::{Request, StatusCode, header};
+use fumox_core::config::TrustedHeader;
 use http_body_util::BodyExt;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use tower::ServiceExt;
 
@@ -15,7 +17,7 @@ fn serve_base_uses_host_header_and_public_port() {
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com:8081".parse().unwrap());
     assert_eq!(
-        serve_base(bind, peer, &h, &[], &[]).unwrap(),
+        serve_base(bind, peer, &h, &[], TrustedHeader::None, &[]).unwrap(),
         "http://vpn.example.com:8080"
     );
 
@@ -23,7 +25,7 @@ fn serve_base_uses_host_header_and_public_port() {
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     assert_eq!(
-        serve_base(bind, peer, &h, &[], &[]).unwrap(),
+        serve_base(bind, peer, &h, &[], TrustedHeader::None, &[]).unwrap(),
         "http://vpn.example.com:8080"
     );
 
@@ -31,19 +33,19 @@ fn serve_base_uses_host_header_and_public_port() {
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "[::1]:8081".parse().unwrap());
     assert_eq!(
-        serve_base(bind, peer, &h, &[], &[]).unwrap(),
+        serve_base(bind, peer, &h, &[], TrustedHeader::None, &[]).unwrap(),
         "http://[::1]:8080"
     );
 
     // No Host header: loopback for an unspecified bind address,
     // the bound IP itself when it is specific.
     assert_eq!(
-        serve_base(bind, peer, &HeaderMap::new(), &[], &[]).unwrap(),
+        serve_base(bind, peer, &HeaderMap::new(), &[], TrustedHeader::None, &[]).unwrap(),
         "http://127.0.0.1:8080"
     );
     let bind: SocketAddr = "192.168.1.5:8080".parse().unwrap();
     assert_eq!(
-        serve_base(bind, peer, &HeaderMap::new(), &[], &[]).unwrap(),
+        serve_base(bind, peer, &HeaderMap::new(), &[], TrustedHeader::None, &[]).unwrap(),
         "http://192.168.1.5:8080"
     );
 }
@@ -55,8 +57,8 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
     let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
     let trusted: Vec<ipnet::IpNet> = vec!["2.2.2.2/32".parse().unwrap()];
 
-    // Empty allowlist: the forwarded header is *always* ignored, the
-    // safe default the empty `[admin].trust_proxy_ips` config advertises.
+    // No trusted proxies configured: the forwarded header is *always*
+    // ignored, even when the operator declared the header family.
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -64,9 +66,9 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "https".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &[], &[]).unwrap(),
+        serve_base(bind, trusted_peer, &h, &[], TrustedHeader::Xff, &[]).unwrap(),
         "http://vpn.example.com:8080",
-        "empty allowlist must not honor forwarded headers"
+        "no trusted proxy must not honor forwarded headers"
     );
 
     // Trusted peer + X-Forwarded-Proto: https ⇒ https.
@@ -77,7 +79,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "https".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &trusted, &[]).unwrap(),
+        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
         "https://vpn.example.com:8080",
         "trusted peer + XFP=https ⇒ https"
     );
@@ -90,7 +92,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "https".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, untrusted_peer, &h, &trusted, &[]).unwrap(),
+        serve_base(bind, untrusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
         "http://vpn.example.com:8080",
         "untrusted peer + XFP=https ⇒ http (header dropped)"
     );
@@ -103,7 +105,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "for=10.0.0.1;proto=https".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &trusted, &[]).unwrap(),
+        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Forwarded, &[]).unwrap(),
         "https://vpn.example.com:8080",
         "trusted peer + RFC 7239 Forwarded proto=https ⇒ https"
     );
@@ -116,7 +118,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "http".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &trusted, &[]).unwrap(),
+        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
         "http://vpn.example.com:8080",
         "explicit XFP=http wins"
     );
@@ -131,7 +133,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
     );
     let bind_443: SocketAddr = "0.0.0.0:443".parse().unwrap();
     assert_eq!(
-        serve_base(bind_443, trusted_peer, &h, &trusted, &[]).unwrap(),
+        serve_base(bind_443, trusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
         "https://vpn.example.com",
         "default-port strip on :443"
     );
@@ -140,13 +142,93 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
     let allowed = vec!["vpn.example.com".to_string()];
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "evil.example".parse().unwrap());
-    assert!(serve_base(bind, trusted_peer, &h, &trusted, &allowed).is_err());
+    assert!(
+        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Xff, &allowed).is_err()
+    );
+}
+
+/// The operator has to declare which header the trusted proxy writes
+/// (M-171). Without that declaration a scheme hint is text the client
+/// chose, and the link builder must not follow it either.
+#[test]
+fn serve_base_ignores_forwarded_headers_without_a_declaration() {
+    let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+    let trusted_peer: SocketAddr = "2.2.2.2:41000".parse().unwrap();
+    let trusted: Vec<ipnet::IpNet> = vec!["2.2.2.2/32".parse().unwrap()];
+
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+    h.insert(
+        header::HeaderName::from_static("x-forwarded-proto"),
+        "https".parse().unwrap(),
+    );
+    assert_eq!(
+        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::None, &[]).unwrap(),
+        "http://vpn.example.com:8080",
+        "no declared header ⇒ the proxy's hint is ignored"
+    );
+
+    // The same header the operator declared for the *other* family is
+    // still ignored.
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+    h.insert(
+        header::FORWARDED,
+        "for=10.0.0.1;proto=https".parse().unwrap(),
+    );
+    assert_eq!(
+        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
+        "http://vpn.example.com:8080",
+        "an undeclared family is never read"
+    );
+}
+
+/// M-158: the serve link points at the *public* listener, so its port
+/// is the one in `[server].bind` — the port the request carried is the
+/// panel's own. Behind a trusted proxy it is the other way round: there
+/// the `Host` header is the public authority the operator reached, and
+/// the public endpoint answers on that very authority. The port must
+/// not be dropped silently, the link would point at the wrong port.
+#[test]
+fn the_serve_link_prefers_the_request_port_behind_a_trusted_proxy() {
+    let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+    let trusted_peer: SocketAddr = "2.2.2.2:41000".parse().unwrap();
+    let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
+    let trusted: Vec<ipnet::IpNet> = vec!["2.2.2.2/32".parse().unwrap()];
+
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, "vpn.example.com:8443".parse().unwrap());
+
+    // Behind the trusted proxy the request's authority is the public
+    // one, so its port is the port of the link.
+    assert_eq!(
+        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
+        "http://vpn.example.com:8443",
+        "the request's port is the public authority's port"
+    );
+
+    // An untrusted peer is just a client: its `Host` header is text the
+    // client wrote, so the bind port wins.
+    assert_eq!(
+        serve_base(bind, untrusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
+        "http://vpn.example.com:8080",
+        "a client cannot move the link to a port of its choosing"
+    );
+
+    // The same peer without a declared header family: the declaration
+    // governs the *forwarded* headers (the scheme hint, the forwarded
+    // host), the `Host` header of the request is read either way.
+    assert_eq!(
+        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::None, &[]).unwrap(),
+        "http://vpn.example.com:8443",
+        "the request's own authority still names the public port"
+    );
 }
 
 /// Direct unit tests for `request_is_https`. These pin the trust gate
 /// without going through `serve_base` / host_header parsing, every
-/// assertion is "given this peer + these headers + this allowlist,
-/// `request_is_https` returns X".
+/// assertion is "given this peer + these headers + this trust list +
+/// this declaration, `request_is_https` returns X".
 fn xfp_https() -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert(
@@ -183,12 +265,22 @@ fn untrusted_peer() -> SocketAddr {
 
 #[test]
 fn request_is_https_empty_allowlist_never_honors_xfp() {
-    assert!(!request_is_https(trusted_peer(), &xfp_https(), &[]));
+    assert!(!request_is_https(
+        trusted_peer(),
+        &xfp_https(),
+        &[],
+        TrustedHeader::Xff
+    ));
 }
 
 #[test]
 fn request_is_https_empty_allowlist_never_honors_forwarded_proto() {
-    assert!(!request_is_https(trusted_peer(), &fwd_proto_https(), &[]));
+    assert!(!request_is_https(
+        trusted_peer(),
+        &fwd_proto_https(),
+        &[],
+        TrustedHeader::Forwarded
+    ));
 }
 
 #[test]
@@ -196,7 +288,8 @@ fn request_is_https_trusted_peer_honors_xfp() {
     assert!(request_is_https(
         trusted_peer(),
         &xfp_https(),
-        &trusted_v4()
+        &trusted_v4(),
+        TrustedHeader::Xff
     ));
 }
 
@@ -205,7 +298,8 @@ fn request_is_https_trusted_peer_honors_forwarded_proto() {
     assert!(request_is_https(
         trusted_peer(),
         &fwd_proto_https(),
-        &trusted_v4()
+        &trusted_v4(),
+        TrustedHeader::Forwarded
     ));
 }
 
@@ -214,7 +308,8 @@ fn request_is_https_untrusted_peer_drops_xfp() {
     assert!(!request_is_https(
         untrusted_peer(),
         &xfp_https(),
-        &trusted_v4()
+        &trusted_v4(),
+        TrustedHeader::Xff
     ));
 }
 
@@ -223,7 +318,39 @@ fn request_is_https_trusted_peer_with_explicit_http_stays_http() {
     assert!(!request_is_https(
         trusted_peer(),
         &xfp_http(),
-        &trusted_v4()
+        &trusted_v4(),
+        TrustedHeader::Xff
+    ));
+}
+
+/// M-171: the declaration is what turns a forwarded header into a
+/// statement of fact. Without it the header is the client's own text.
+#[test]
+fn request_is_https_needs_a_declared_header_family() {
+    assert!(!request_is_https(
+        trusted_peer(),
+        &xfp_https(),
+        &trusted_v4(),
+        TrustedHeader::None
+    ));
+    assert!(!request_is_https(
+        trusted_peer(),
+        &fwd_proto_https(),
+        &trusted_v4(),
+        TrustedHeader::None
+    ));
+    // A declaration for the other family does not cover this header.
+    assert!(!request_is_https(
+        trusted_peer(),
+        &fwd_proto_https(),
+        &trusted_v4(),
+        TrustedHeader::Xff
+    ));
+    assert!(!request_is_https(
+        trusted_peer(),
+        &xfp_https(),
+        &trusted_v4(),
+        TrustedHeader::Forwarded
     ));
 }
 
@@ -412,6 +539,130 @@ async fn test_state_with_admin(
     test_admin_state(admin, Default::default()).await
 }
 
+/// M-101: the export link the panel renders must point at a host the
+/// public listener accepts. The link is built from the panel's own
+/// host, so the operator's two allowlists have to name it: the panel
+/// gates the request on `[admin].allowed_hosts`, the public listener
+/// gates the link on `[server].allowed_hosts`. The link only works
+/// when the host is on both lists, and the test says so instead of
+/// leaving the operator to discover it on click.
+#[tokio::test]
+async fn the_export_link_points_at_a_host_the_public_listener_accepts() {
+    let mut admin = admin_config(1000);
+    admin.allowed_hosts = vec!["panel.example.com".to_string()];
+    let server = fumox_core::config::ServerConfig {
+        allowed_hosts: vec!["panel.example.com".to_string()],
+        ..Default::default()
+    };
+    let (_dir, state) = test_admin_state(admin, server.clone()).await;
+    let app = router(state.clone());
+
+    let with_host = |method: &str, uri: &str, body: &str, host: &str, cookie: Option<&str>| {
+        let mut r = request(method, uri, body, cookie);
+        r.headers_mut().insert(header::HOST, host.parse().unwrap());
+        r
+    };
+
+    let response = app
+        .clone()
+        .oneshot(with_host(
+            "POST",
+            "/admin/login",
+            &format!("token={TOKEN}"),
+            "panel.example.com",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let response = app
+        .clone()
+        .oneshot(with_host(
+            "GET",
+            "/admin/import",
+            "",
+            "panel.example.com",
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&html);
+
+    // The link carries the panel's own host and the public port.
+    assert!(
+        html.contains("http://panel.example.com:8080/export/alive/"),
+        "the export link must name the panel's host: {html:.400}"
+    );
+    let start = html.find("/export/alive/").expect("the export link");
+    let end = start + html[start..].find('"').expect("the link ends");
+    let link = html[start..end].to_string();
+
+    // The host of the link is on the public allowlist, so the public
+    // listener answers it.
+    let link_host = "panel.example.com";
+    assert!(
+        server.allowed_hosts.contains(&link_host.to_string()),
+        "the link host must be allowed by the public listener"
+    );
+
+    let public = crate::serve::router(crate::serve::AppState::new(
+        state.pool.clone(),
+        crate::cache::Caches::new(),
+        state.geo.clone(),
+        crate::serve::PublicRateLimits::unlimited(),
+        Vec::new(),
+        TrustedHeader::None,
+        server.allowed_hosts.clone(),
+        server.export_max_rows,
+        state.export_token.clone(),
+    ));
+
+    let response = public
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&link)
+                .header(header::HOST, link_host)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the rendered link must resolve on the public listener"
+    );
+
+    // The other half, pinned separately: the same link under a host the
+    // public listener does not allow is a 404 ("link not found"), not a
+    // leaked capability.
+    let response = public
+        .oneshot(
+            Request::builder()
+                .uri(&link)
+                .header(header::HOST, "evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 /// Build a request with the ConnectInfo extension the rate limiter
 /// needs; a real listener attaches it via
 /// `into_make_service_with_connect_info`.
@@ -479,7 +730,7 @@ fn csrf_for(state: &AdminState, cookie: &str) -> String {
         .split_once('=')
         .map(|(_, value)| value.to_string())
         .unwrap_or_default();
-    auth::csrf_token(&state.csrf_key, &session)
+    auth::csrf_token(&state.csrf_key(), &session)
 }
 
 #[tokio::test]
@@ -536,39 +787,60 @@ async fn unauthenticated_htmx_gets_hx_redirect() {
 /// The two used to travel as one (`Option::None` for both), so a broken
 /// database answered "not found" and a client could not tell a deleted
 /// row from a failed query.
+///
+/// The handler is called directly, not through the router: with the pool
+/// closed the authentication layer fails closed first (503, the epoch is
+/// the revocation state and cannot be read), and the handler would never
+/// be reached.
 #[tokio::test]
 async fn a_missing_row_and_a_broken_database_answer_differently() {
     let (_dir, state) = test_state(1000).await;
-    let app = router(state.clone());
-    let cookie = login(&app).await;
 
     // The row does not exist: the row is missing, the database is fine.
-    let response = app
-        .clone()
-        .oneshot(request(
-            "GET",
-            "/admin/sources/srcMissing00",
-            "",
-            Some(&cookie),
-        ))
-        .await
-        .unwrap();
+    let response = handlers::source_detail(
+        State(state.clone()),
+        Path("srcMissing00".to_string()),
+        ConnectInfo("127.0.0.1:41000".parse().unwrap()),
+        HeaderMap::new(),
+        Query(HashMap::new()),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     // The database is gone: the same request cannot be answered with a
     // "not found", the failure is on this side.
     state.pool.close().await;
+    let response = handlers::source_detail(
+        State(state.clone()),
+        Path("srcMissing00".to_string()),
+        ConnectInfo("127.0.0.1:41000".parse().unwrap()),
+        HeaderMap::new(),
+        Query(HashMap::new()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// With the database down the authentication layer itself fails closed:
+/// the revocation epoch cannot be read, so a session must not be treated
+/// as valid (M-102).
+#[tokio::test]
+async fn a_broken_database_refuses_the_session_before_the_handler() {
+    let (_dir, state) = test_state(1000).await;
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+
+    state.pool.close().await;
     let response = app
         .clone()
-        .oneshot(request(
-            "GET",
-            "/admin/sources/srcMissing00",
-            "",
-            Some(&cookie),
-        ))
+        .oneshot(request("GET", "/admin", "", Some(&cookie)))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unreadable revocation epoch must not be treated as a valid session"
+    );
 }
 
 #[tokio::test]
@@ -863,10 +1135,15 @@ async fn rate_limit_kicks_in_past_the_soft_limit() {
 /// fills its window while a different claim against the same peer stays
 /// unblocked. The claim that counts is the entry a trusted proxy
 /// appended (right-most), not the client-supplied left-most prefix.
+///
+/// The operator has to declare the header the proxy writes
+/// (`trust_proxy_header`); without the declaration the claim is the
+/// client's own text and the peer is the key.
 #[tokio::test]
 async fn rate_limit_uses_xff_ip_for_trusted_peer() {
     let (_dir, mut state) = test_state(1).await;
     state.trusted_cidrs = vec!["2.2.2.2/32".parse().unwrap()];
+    state.trusted_header = TrustedHeader::Xff;
     let app = router(state.clone());
     let cookie = login(&app).await;
 
@@ -962,12 +1239,104 @@ async fn admin_allowed_hosts_gates_every_route_at_the_edge() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-/// Vendored assets and HEAD requests bypass the admin rate limiter:
-/// they must stay servable even after the
-/// per-IP window is exhausted, a page hit by 429 still needs its CSS
-/// to render the rate-limit message.
+/// L-101: the allowlist gates *every* panel route, not only the login
+/// page. The gate is the outermost middleware, so a foreign Host is
+/// refused with 400 before the route is even matched, while the same
+/// route answers normally for an allowlisted host.
 #[tokio::test]
-async fn static_assets_and_head_bypass_the_rate_limit() {
+async fn the_host_allowlist_covers_every_panel_route() {
+    let mut admin = admin_config(1000);
+    admin.allowed_hosts = vec!["panel.example.com".to_string()];
+    let (_dir, state) = test_state_with_admin(admin).await;
+    let app = router(state);
+
+    let with_host = |method: &str, uri: &str, body: &str, host: &str, cookie: Option<&str>| {
+        let mut r = request(method, uri, body, cookie);
+        r.headers_mut().insert(header::HOST, host.parse().unwrap());
+        r
+    };
+
+    let routes = [
+        "/admin",
+        "/admin/sources",
+        "/admin/import",
+        "/admin/settings",
+    ];
+
+    for uri in routes {
+        let response = app
+            .clone()
+            .oneshot(with_host("GET", uri, "", "evil.example", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a foreign Host must be refused on {uri}"
+        );
+    }
+
+    // The same routes answer normally for an allowlisted host: the
+    // protected ones redirect to the login screen, the login page
+    // renders.
+    for uri in routes {
+        let response = app
+            .clone()
+            .oneshot(with_host("GET", uri, "", "panel.example.com", None))
+            .await
+            .unwrap();
+        let status = response.status();
+        assert!(
+            status == StatusCode::OK || status == StatusCode::SEE_OTHER,
+            "{uri} answered {status} for an allowlisted host"
+        );
+    }
+
+    // And with a session they render for real.
+    let response = app
+        .clone()
+        .oneshot(with_host(
+            "POST",
+            "/admin/login",
+            &format!("token={TOKEN}"),
+            "panel.example.com",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    for uri in routes {
+        let response = app
+            .clone()
+            .oneshot(with_host("GET", uri, "", "panel.example.com", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{uri} must render for an allowlisted host"
+        );
+    }
+}
+
+/// Vendored assets bypass the admin rate limiter: they must stay
+/// servable even after the per-IP window is exhausted, a page hit by 429
+/// still needs its CSS to render the rate-limit message.
+///
+/// A HEAD is not exempt. It is a request for a resource just like the GET
+/// is, and a free window on the paths that matter is a hole.
+#[tokio::test]
+async fn static_assets_bypass_the_rate_limit_but_a_head_counts() {
     let (_dir, state) = test_state(2).await;
     let app = router(state);
 
@@ -997,7 +1366,7 @@ async fn static_assets_and_head_bypass_the_rate_limit() {
         StatusCode::TOO_MANY_REQUESTS
     );
 
-    // The window is exhausted, yet the assets and a HEAD still serve.
+    // The window is exhausted, yet the assets still serve.
     for uri in ["/admin/static/app.css", "/admin/static/htmx.min.js"] {
         let response = app
             .clone()
@@ -1006,11 +1375,24 @@ async fn static_assets_and_head_bypass_the_rate_limit() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
     }
+
+    // A HEAD on an asset is exempt too: the exemption is the path, not
+    // the method.
     let response = app
-        .oneshot(request("HEAD", "/admin/login", "", None))
+        .clone()
+        .oneshot(request("HEAD", "/admin/static/app.css", "", None))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    // A HEAD on anything else counts against the window like the GET it
+    // shadows.
+    let response = app
+        .clone()
+        .oneshot(request("HEAD", "/admin/login", "", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]
@@ -1630,6 +2012,104 @@ async fn ready_tier_is_filterable_and_exported() {
         !html.contains("badge unknown"),
         "a ready proxy must not render the unknown badge: {html}"
     );
+}
+
+/// The href of the pagination link with the given `rel` attribute.
+///
+/// The rendered HTML escapes the `&` of the query string, so the
+/// extracted href is unescaped before it is used as a request URI.
+fn pagination_link(html: &str, rel: &str) -> Option<String> {
+    let marker = format!("rel=\"{rel}\"");
+    let at = html.find(&marker)?;
+    let prefix = &html[..at];
+    let href_at = prefix.rfind("href=\"")? + "href=\"".len();
+    let rest = &prefix[href_at..];
+    let end = rest.find('"')?;
+    Some(rest[..end].replace("&amp;", "&").replace("&#38;", "&"))
+}
+
+/// The proxy browser pages with a cursor instead of a page number: the
+/// links carry the sort key of the last row of the page, so the
+/// database seeks straight to the next one. Walking the whole list
+/// forwards and backwards must show every row exactly once.
+#[tokio::test]
+async fn the_proxy_browser_pages_with_a_cursor() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+
+    // Seven rows with distinct update times: the default order shows
+    // them from the newest to the oldest.
+    for index in 1..=7 {
+        sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, created_at, updated_at)
+             VALUES (?1, 'vless', ?2, ?3, 443, 'c', ?4, ?4)",
+        )
+        .bind(format!("fp-page-{index}"))
+        .bind(format!("row-{index}"))
+        .bind(format!("h{index}.example.com"))
+        .bind(index * 10)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let app = router(state);
+    let cookie = login(&app).await;
+
+    /// One page of the browser, rendered through the router.
+    async fn fetch(app: &axum::Router, cookie: &str, uri: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(request("GET", uri, "", Some(cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&body).to_string()
+    }
+
+    // The first page holds the three newest rows and offers a way
+    // forward, but no way back.
+    let first = fetch(&app, &cookie, "/admin/proxies?per_page=3").await;
+    for index in [7, 6, 5] {
+        assert!(first.contains(&format!("row-{index}")), "{first}");
+    }
+    assert!(!first.contains("row-4"), "{first}");
+    assert!(pagination_link(&first, "prev").is_none(), "{first}");
+    let next = pagination_link(&first, "next").expect("the first page has a next page");
+    assert!(next.contains("per_page=3"), "{next}");
+    assert!(next.contains("cur="), "{next}");
+
+    // The second page continues where the first one stopped: no row is
+    // shown twice and none is skipped.
+    let second = fetch(&app, &cookie, &next).await;
+    for index in [4, 3, 2] {
+        assert!(second.contains(&format!("row-{index}")), "{second}");
+    }
+    assert!(!second.contains("row-5"), "{second}");
+    assert!(pagination_link(&second, "prev").is_some(), "{second}");
+    let second_next = pagination_link(&second, "next").expect("the second page has a next page");
+
+    // The last page holds the oldest row and offers no way forward.
+    let third = fetch(&app, &cookie, &second_next).await;
+    assert!(third.contains("row-1"), "{third}");
+    assert!(!third.contains("row-2"), "{third}");
+    assert!(pagination_link(&third, "next").is_none(), "{third}");
+
+    // Going back returns to the page the browser came from.
+    let back = pagination_link(&third, "prev").expect("the last page has a previous page");
+    let again = fetch(&app, &cookie, &back).await;
+    for index in [4, 3, 2] {
+        assert!(again.contains(&format!("row-{index}")), "{again}");
+    }
+    assert!(!again.contains("row-1"), "{again}");
+
+    // A cursor of another sort is not a position in this one: the list
+    // falls back to the first page of the new sort instead of failing.
+    let foreign = pagination_link(&first, "next").expect("a cursor to walk with");
+    let by_name = fetch(&app, &cookie, &format!("{foreign}&sort=name")).await;
+    assert!(by_name.contains("row-1"), "{by_name}");
+    assert!(!by_name.contains("row-7"), "{by_name}");
 }
 
 #[tokio::test]
@@ -2745,6 +3225,7 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
         fetcher,
         config,
         ResolvedConfigPath::Missing,
+        crate::alive_export::TokenCache::new(),
     );
     let has_dbs = state.geo_full.is_active();
 
@@ -3712,6 +4193,115 @@ async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
     );
 }
 
+/// L-105: the `next` parameter of the preference setters points back
+/// into the panel. A panel path is kept as it is, nested paths
+/// included; anything that is not one falls back to the panel root.
+#[tokio::test]
+async fn the_next_parameter_stays_inside_the_panel() {
+    let (_dir, state) = test_state(1000).await;
+    let app = router(state);
+
+    for (uri, expected) in [
+        (
+            "/admin/set-lang?lang=en&next=/admin/proxies",
+            "/admin/proxies",
+        ),
+        (
+            "/admin/set-theme?theme=dark&next=/admin/proxies",
+            "/admin/proxies",
+        ),
+        (
+            "/admin/set-lang?lang=en&next=/admin/sources/src00000001",
+            "/admin/sources/src00000001",
+        ),
+        (
+            "/admin/set-theme?theme=dark&next=/admin/proxies/p00000001",
+            "/admin/proxies/p00000001",
+        ),
+    ] {
+        let response = app.clone().oneshot(request("GET", uri, "", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{uri}");
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            expected,
+            "{uri}"
+        );
+    }
+
+    // Everything else falls back to the panel root: an absolute URL, a
+    // protocol-relative one, a path outside the panel, and an empty
+    // value.
+    for uri in [
+        "/admin/set-lang?lang=en&next=https://evil.example.com",
+        "/admin/set-lang?lang=en&next=//evil.example.com",
+        "/admin/set-lang?lang=en&next=/etc/passwd",
+        "/admin/set-lang?lang=en&next=",
+        "/admin/set-lang?lang=en",
+    ] {
+        let response = app.clone().oneshot(request("GET", uri, "", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{uri}");
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin",
+            "{uri}"
+        );
+    }
+}
+
+/// L-106: a percent-decoded CR/LF inside `next` must reach no response
+/// header and no body. Such a value is not a legal `Location` header,
+/// and axum answers 500 instead of redirecting when one is built from
+/// it; the fallback keeps the answer a redirect and the header free of
+/// control characters.
+#[tokio::test]
+async fn a_control_character_in_next_reaches_no_header() {
+    let (_dir, state) = test_state(1000).await;
+    let app = router(state);
+
+    for uri in [
+        "/admin/set-lang?lang=en&next=%0D%0AX",
+        "/admin/set-lang?lang=en&next=%2Fadmin%0D%0AX",
+        "/admin/set-theme?theme=dark&next=%0D%0AX",
+        "/admin/set-theme?theme=dark&next=%2Fadmin%0D%0AX",
+        "/admin/set-dash-top-n?n=10&next=%0D%0AX",
+    ] {
+        let response = app.clone().oneshot(request("GET", uri, "", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{uri}");
+        for (name, value) in response.headers() {
+            let value = value.to_str().unwrap_or("<binary>");
+            assert!(
+                !value.chars().any(|c| c.is_ascii_control()),
+                "{uri}: header {name} carries a control character: {value:?}"
+            );
+        }
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            !body.contains(&b'\r') && !body.contains(&b'\n'),
+            "{uri}: the body carries a control character"
+        );
+    }
+
+    // The language the login screen renders is the catalog code, never
+    // the raw input, so a hostile `lang` stays out of the body too.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/admin/login?lang=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+            "",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        !body.contains("<script>alert(1)"),
+        "the hostile language value reached the body"
+    );
+}
+
 // Dashboard Top-N picker
 
 #[tokio::test]
@@ -4012,7 +4602,7 @@ async fn io_fixture(state: &AdminState) {
     fumox_core::repo::profiles::create(&state.pool, &profile)
         .await
         .unwrap();
-    fumox_core::repo::profiles::set_sources(
+    fumox_core::repo::profiles::replace_sources(
         &state.pool,
         "profX0000000",
         &[("srcX0000000".into(), 0)],
@@ -4110,10 +4700,29 @@ async fn import_creates_new_objects_and_remaps_composition() {
         .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
-    assert!(html.contains("Импорт завершён"), "{html}");
+    // A successful import answers with a redirect to the import screen;
+    // the totals ride along in the flash message.
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(location.starts_with("/admin/import?"), "{location}");
+    assert!(location.contains("flash="), "{location}");
+    // The flash is percent-encoded: the message is Russian here.
+    let flash = location
+        .split("flash=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
+    let message = percent_decode(flash);
+    assert!(message.contains("1"), "the totals must be in the flash: {message}");
+    assert!(!message.contains("предупреждений"), "{message}");
 
     // Fresh ids, slugs preserved (clean DB), composition remapped.
     let sources = fumox_core::repo::sources::list(&pool, false).await.unwrap();
@@ -4165,10 +4774,27 @@ async fn import_slug_collision_creates_objects_without_slug() {
         .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
-    assert!(html.contains("Предупреждения"), "{html}");
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    // The dropped slugs are warnings: the flash counts them.
+    let flash = location
+        .split("flash=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
+    let message = percent_decode(flash);
+    assert!(
+        message.contains("предупреждени"),
+        "the warnings must be counted in the flash: {message}"
+    );
 
     // Two sources now; the imported one lost its slug to the collision.
     let sources = fumox_core::repo::sources::list(&pool, false).await.unwrap();
@@ -4181,6 +4807,92 @@ async fn import_slug_collision_creates_objects_without_slug() {
     assert_eq!(profiles.len(), 2);
     let imported_profile = profiles.iter().find(|p| p.id != "profX0000000").unwrap();
     assert_eq!(imported_profile.slug, None);
+}
+
+/// A body that is not JSON and a document without the required `version`
+/// field are both refused with the error text, and neither writes a row.
+#[tokio::test]
+async fn import_rejects_a_malformed_body_and_a_document_without_a_version() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+
+    // Not JSON at all.
+    let body = urlencoded(&[("_csrf", &csrf), ("payload", "not json")]);
+    let response = app
+        .clone()
+        .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let html = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&html);
+    assert!(html.contains("ошибка разбора JSON"), "{html}");
+
+    // Valid JSON, but the required `version` field is missing.
+    let body = urlencoded(&[
+        ("_csrf", &csrf),
+        ("payload", r#"{"exported_at":0,"sources":[],"profiles":[]}"#),
+    ]);
+    let response = app
+        .clone()
+        .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let html = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&html);
+    assert!(html.contains("version"), "the missing field is named: {html}");
+
+    // Neither attempt wrote anything.
+    assert!(
+        fumox_core::repo::sources::list(&pool, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fumox_core::repo::profiles::list(&pool, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The document cap is the import's own, not the transport's: a payload
+/// over it is refused with the size in the message.
+#[tokio::test]
+async fn import_refuses_a_document_over_the_size_cap() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+
+    // A valid document padded past the cap.
+    let padding = "x".repeat(256 * 1024);
+    let payload = format!(
+        r#"{{"version":1,"exported_at":0,"sources":[],"profiles":[],"note":"{padding}"}}"#
+    );
+    assert!(payload.len() > 256 * 1024);
+    let body = urlencoded(&[("_csrf", &csrf), ("payload", &payload)]);
+    let response = app
+        .clone()
+        .oneshot(request("POST", "/admin/import", &body, Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let html = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&html);
+    assert!(html.contains("слишком большой"), "{html}");
+    assert!(
+        fumox_core::repo::sources::list(&pool, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -4897,6 +5609,9 @@ async fn source_form_saves_the_builder_state_as_pipeline_json() {
         html.contains(r#"value="quantum" id="ped-proto-quantum" checked"#),
         "{html}"
     );
+    let sources = fumox_core::repo::sources::list(&state.pool, false)
+        .await
+        .unwrap();
     assert!(!sources.iter().any(|s| s.name == "Bad builder"));
 }
 
@@ -5186,9 +5901,10 @@ async fn live_config_refresh_picks_up_post_save_state() {
     let (_dir, state) = test_state(1000).await;
 
     // The starting snapshot reflects `AppConfig::default()`; the
-    // toggle is *off* and the public listener sits on 8080.
-    assert!(!state.live().ingest.drop_gate);
-    assert!(!state.ingest().drop_gate);
+    // toggle is *on* (the drop gate is the default since the wave-B
+    // change) and the public listener sits on 8080.
+    assert!(state.live().ingest.drop_gate);
+    assert!(state.ingest().drop_gate);
     assert_eq!(state.server().bind.port(), 8080);
 
     // Drop a config file on disk that flips the bool and rebinds
@@ -5199,7 +5915,7 @@ async fn live_config_refresh_picks_up_post_save_state() {
     let path = dir.path().join("app.toml");
     std::fs::write(
         &path,
-        "[ingest]\ndrop_gate = true\n[server]\nbind = \"127.0.0.1:9999\"\n",
+        "[ingest]\ndrop_gate = false\n[server]\nbind = \"127.0.0.1:9999\"\n",
     )
     .unwrap();
 
@@ -5209,7 +5925,7 @@ async fn live_config_refresh_picks_up_post_save_state() {
 
     // The live figment-merged view reflects the file.
     let live = state.live();
-    assert!(live.ingest.drop_gate, "live.ingest.drop_gate");
+    assert!(!live.ingest.drop_gate, "live.ingest.drop_gate");
     assert_eq!(live.server.bind.port(), 9999, "live.server.bind");
     // Figment-merged defaults are written back into the in-memory view.
     assert_eq!(
@@ -5224,7 +5940,7 @@ async fn live_config_refresh_picks_up_post_save_state() {
     // The typed accessors read the same live view: there is no
     // second, frozen copy for a handler to read by mistake, so every
     // consumer sees the post-save state.
-    assert!(state.ingest().drop_gate, "state.ingest().drop_gate");
+    assert!(!state.ingest().drop_gate, "state.ingest().drop_gate");
     assert_eq!(state.server().bind.port(), 9999, "state.server().bind");
 
     // The genuinely startup-frozen values stay put: the socket is
@@ -5359,4 +6075,309 @@ async fn a_settings_save_over_an_unchanged_file_still_writes() {
         on_disk.contains("drop_gate = true"),
         "the setting must be written: {on_disk}"
     );
+}
+
+/// After a save through the panel, the live view must carry the values
+/// the operator just wrote, and the values that are startup-frozen by
+/// design must stay where they are.
+#[tokio::test]
+async fn a_settings_save_refreshes_the_live_view_and_leaves_the_frozen_values_alone() {
+    // The file carries the token, like a real deployment: the live view
+    // is reloaded from the file after a save, so a file without the
+    // token would drop it out of the running view.
+    let (_dir, _cfg_dir, path, state) = state_with_config_file(
+        "settings-refresh",
+        &format!("[ingest]\ndrop_gate = false\n[admin]\ntoken = \"{TOKEN}\"\n"),
+    )
+    .await;
+
+    // The startup-frozen values, captured before the save.
+    let session_key = state.session_key();
+    let csrf_key = state.csrf_key();
+    let admin_limiter = state.admin_limiter.clone();
+    let server_bind = state.server_bind;
+
+    // The login limiter's own window, seen through a key of its own:
+    // the test config allows 100 hits a minute, so the hit past that
+    // must be refused. A refresh that swapped the limiter would hand
+    // back a fresh counter and let the hit through.
+    let window_key = "9.9.9.9";
+    for _ in 0..100 {
+        assert!(
+            state.login_limiter.allow(window_key).await,
+            "the limiter must allow the hits inside its window"
+        );
+    }
+    assert!(
+        !state.login_limiter.allow(window_key).await,
+        "the limiter must refuse the hit past its window"
+    );
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+
+    let body = format!("_csrf={csrf}&ingest.drop_gate=on&server.bind=127.0.0.1:9999");
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/settings/update",
+            &body,
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    // The file carries the new values.
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("drop_gate = true"),
+        "the setting must be written: {on_disk}"
+    );
+    assert!(
+        on_disk.contains("127.0.0.1:9999"),
+        "the rebind must be written: {on_disk}"
+    );
+
+    // The live view carries them too: there is no second, frozen copy
+    // a handler could read by mistake.
+    assert!(state.live().ingest.drop_gate, "live.ingest.drop_gate");
+    assert!(state.ingest().drop_gate, "state.ingest().drop_gate");
+    assert_eq!(state.server().bind.port(), 9999, "state.server().bind");
+
+    // The keys follow the live token, not a startup snapshot: a save
+    // that leaves the token alone must not move them.
+    assert_eq!(
+        state.session_key(),
+        session_key,
+        "the session key is derived from the live token"
+    );
+    assert_eq!(
+        state.csrf_key(),
+        csrf_key,
+        "the CSRF key is derived from the live token"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&state.admin_limiter, &admin_limiter),
+        "the admin rate limiter must not be swapped by a refresh"
+    );
+    assert_eq!(
+        state.server_bind, server_bind,
+        "the bound socket is startup-frozen: the listener is already bound"
+    );
+
+    // The rate limiter's window survived the refresh.
+    assert!(
+        !state.login_limiter.allow(window_key).await,
+        "the limiter's window must survive the refresh"
+    );
+}
+
+/// A config file the panel cannot read must be explained on the edit
+/// page: the values below are the running ones, not the file's, and an
+/// operator who does not know that would believe they edited the file.
+#[tokio::test]
+async fn the_edit_page_explains_a_config_it_could_not_read() {
+    let (_dir, _cfg_dir, path, state) =
+        state_with_config_file("settings-broken", "[ingest\ndrop_gate = true\n").await;
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/admin/settings/edit", "", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let html = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&html);
+    // The banner names the file and the reason. The template is
+    // looked up in the catalog, so the assertion compares against the
+    // rendered prefix of the same message rather than an English
+    // sentence of its own.
+    let lang = state.locales.default_lang();
+    let template = lang.t("set.edit_load_failed");
+    let prefix = template.split("{reason}").next().unwrap_or_default();
+    let expected = prefix.replace("{path}", &path.display().to_string());
+    assert!(
+        html.contains(&expected),
+        "the page must explain the failed load: {html:.400}"
+    );
+}
+
+/// A file the loader refuses must not be written: the panel writes the
+/// config the binaries read at startup, and a file they refuse aborts
+/// both of them. The save is refused, the file stays byte-identical,
+/// and the operator gets the reason instead of a success toast.
+#[tokio::test]
+async fn a_config_the_loader_refuses_is_not_written() {
+    // A section the loader does not know. The panel only rewrites the
+    // settings it owns, so the section survives every save, and the
+    // file stays one the binaries refuse.
+    let (_dir, _cfg_dir, path, state) = state_with_config_file(
+        "settings-unknown-section",
+        "[ingest]\ndrop_gate = false\n[nonexistent]\nfoo = 1\n",
+    )
+    .await;
+    let before = std::fs::read(&path).unwrap();
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+
+    let body = format!("_csrf={csrf}&ingest.drop_gate=on");
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/settings/update",
+            &body,
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a refused save must not redirect with a success toast"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refused save must leave the file byte-identical"
+    );
+}
+
+/// The *Create from defaults* button: an existing file is left alone, a
+/// missing one is created from the embedded reference copy, and a
+/// directory that cannot be written to is refused.
+#[tokio::test]
+async fn the_create_from_defaults_button_creates_a_missing_config_only() {
+    // An existing config is never overwritten.
+    let (_dir, _cfg_dir, path, state) =
+        state_with_config_file("settings-create-existing", "[ingest]\ndrop_gate = false\n").await;
+    let before = std::fs::read(&path).unwrap();
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/settings/create",
+            &format!("_csrf={csrf}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "an existing config must not be overwritten"
+    );
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let flash = location
+        .split("flash=")
+        .nth(1)
+        .expect("a flash message")
+        .split('&')
+        .next()
+        .unwrap();
+    assert_eq!(
+        percent_decode(flash),
+        state.locales.default_lang().t("set.file_created_noop"),
+        "the toast must say that nothing was created: {location}"
+    );
+}
+
+/// The other half of the same button: a missing config is created from
+/// the embedded reference copy.
+#[tokio::test]
+async fn the_create_from_defaults_button_writes_the_reference_copy() {
+    let (_dir, mut state) = test_state(1000).await;
+    let cfg_dir = fumox_core::tempdir_lite::TempDir::new("settings-create-missing");
+    let path = cfg_dir.path().join("app.toml");
+    // The path the panel edits, with no file behind it yet. The
+    // startup path only reaches `Loaded` for a file that exists, but
+    // the button's own branch is the one under test: the target does
+    // not exist and the directory can be written to.
+    state.config_path = ResolvedConfigPath::Loaded(path.clone());
+    state.config_writable = true;
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/settings/create",
+            &format!("_csrf={csrf}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    assert!(path.is_file(), "the config must have been created");
+    let created = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        created.contains("[server]"),
+        "the reference copy must be written: {created}"
+    );
+    // The created file is a config the binaries can start from.
+    fumox_core::config::load_config(Some(&path)).expect("the created config must load");
+}
+
+/// A directory that cannot be written to is refused with the same
+/// answer the read-only deployment gets.
+#[tokio::test]
+async fn the_create_from_defaults_button_refuses_a_read_only_directory() {
+    let (_dir, mut state) = test_state(1000).await;
+    let cfg_dir = fumox_core::tempdir_lite::TempDir::new("settings-create-readonly");
+    let path = cfg_dir.path().join("app.toml");
+    state.config_path = ResolvedConfigPath::Loaded(path.clone());
+    state.config_writable = true;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(cfg_dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let app = router(state.clone());
+        let cookie = login(&app).await;
+        let csrf = csrf_for(&state, &cookie);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/settings/create",
+                &format!("_csrf={csrf}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a directory that cannot be written to must be refused"
+        );
+        assert!(
+            !path.exists(),
+            "no config must be written into a read-only directory"
+        );
+
+        // Restore the mode so the temp directory can be cleaned up.
+        std::fs::set_permissions(cfg_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }

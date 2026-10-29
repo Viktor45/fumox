@@ -105,6 +105,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    for warning in startup_warnings(&config) {
+        tracing::warn!("{warning}");
+    }
+
     // The loader cannot log (its own level comes from the config); report
     // the file actually used once tracing is up.
     match &loaded.path {
@@ -152,11 +156,19 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let pool = fumox_core::db::connect_pool(&config.database).await?;
-    fumox_core::db::migrate(&pool).await?;
-    // The public «all alive» export link: generate the
-    // capability token on first startup; it persists in `meta`, so the
-    // link is stable across restarts until rotated from the admin panel.
-    alive_export::ensure_token(&pool).await?;
+    fumox_core::db::migrate_with(
+        &pool,
+        fumox_core::db::ChecksumRepair::from_config(config.database.allow_checksum_repair),
+    )
+    .await?;
+    // The public «all alive» export link: the capability token is
+    // generated on first startup; it persists in `meta`, so the link is
+    // stable across restarts until rotated from the admin panel. The
+    // token itself is kept in process memory as well, so the public
+    // endpoint does not read the database on every request; the panel and
+    // the listener share the instance, so a rotation reaches both.
+    let export_token = alive_export::TokenCache::new();
+    export_token.current(&pool).await?;
 
     // Profile access tokens are stored as hashes. A row written before
     // that still holds the token in plain text, so it is rewritten in
@@ -189,19 +201,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Best-effort GeoLite2 database download into [geo].db_dir: fetch what
-    // is missing, broken or older than a month. It runs before the geo
-    // resolver opens the files, but only for `[geo].startup_download_budget_secs`:
-    // two slow mirrors must not hold `/healthz` and the whole public surface
-    // hostage for the sum of their per-file download budgets. Past the budget
-    // the task keeps running detached (the file is installed atomically, so
-    // the resolver and a later start never see a partial one) and this process
-    // simply runs without geo enrichment until the next start.
+    // is missing, broken or older than a month.
+    //
+    // The download runs in its own task and the listeners are bound
+    // without waiting for it: a mirror must not keep the public surface
+    // dark. The resolver asks the process-wide registry for the databases
+    // on every lookup, so a file that lands later is picked up without a
+    // restart. The budget is how long startup waits for the file
+    // afterwards, not how long the download may run.
     let geo_config = config.clone();
-    await_geo_within_budget(
-        tokio::spawn(async move { geo_download::ensure_geo_databases(&geo_config).await }),
-        config.geo.startup_download_budget(),
-    )
-    .await;
+    let geo_download =
+        tokio::spawn(async move { geo_download::ensure_geo_databases(&geo_config).await });
+    if config.geo.startup_download_budget_secs
+        > fumox_core::config::MAX_STARTUP_DOWNLOAD_BUDGET_SECS
+    {
+        tracing::warn!(
+            configured = config.geo.startup_download_budget_secs,
+            capped = fumox_core::config::MAX_STARTUP_DOWNLOAD_BUDGET_SECS,
+            "[geo].startup_download_budget_secs is above the cap; the effective budget is the cap"
+        );
+    }
 
     // Background source refresh loop: fetch → parse → reconcile → journal.
     let fetcher = Fetcher::new(
@@ -212,14 +231,6 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_state = SchedulerState::new(config.fetch.max_concurrency);
     let caches = Caches::new();
     let geo = Arc::new(fumox_core::geo::GeoResolver::new(&config.geo));
-    // Fill the geo columns of proxies ingested before a database existed
-    // (background: never blocks startup), bounded like the geo download
-    // above by the configured startup budget.
-    tokio::spawn(geo_backfill::backfill_missing_geo_within_budget(
-        pool.clone(),
-        geo.clone(),
-        config.geo.startup_download_budget(),
-    ));
     // Push updates to the admin panel over SSE; the
     // scheduler publishes fetch lifecycle events onto this bus.
     let events = events::EventBus::new();
@@ -259,8 +270,10 @@ async fn main() -> anyhow::Result<()> {
         geo.clone(),
         serve::PublicRateLimits::from_config(&config.server),
         admin::parse_trusted_cidrs(&config.server.trust_proxy_ips),
+        config.server.trust_proxy_header,
         config.server.allowed_hosts.clone(),
         config.server.export_max_rows,
+        export_token.clone(),
     );
     let app = serve::public_app(state, health_pool.clone());
 
@@ -278,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
             fetcher.clone(),
             config.clone(),
             loaded.path.clone(),
+            export_token.clone(),
         );
         tracing::info!(bind = %config.admin.bind, "admin panel listening");
         admin::router(admin_state)
@@ -289,6 +303,30 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
     let admin_listener = tokio::net::TcpListener::bind(config.admin.bind).await?;
     tracing::info!(bind = %config.server.bind, "fumox-server listening");
+
+    // The listeners are bound; the download still runs. Give it its
+    // budget, then look at the geo state: a profile that filters by
+    // country cannot serve anything without the country facts, and a
+    // GeoIP failure must not stay silent.
+    await_geo_within_budget(geo_download, config.geo.startup_download_budget()).await;
+    if config.geo.enabled && profiles_require_country(&pool).await? && !geo.state().has_country() {
+        anyhow::bail!(
+            "a profile filters by country, but no GeoLite2 City database is available \
+             (geo state: {}, directory: {}); put the database into the directory, \
+             point [geo].db_dir at it, or drop the country allowlist",
+            geo.state().as_str(),
+            config.geo.db_dir.display(),
+        );
+    }
+    // Fill the geo columns of proxies ingested before a database existed
+    // (background: never blocks startup), bounded like the geo download
+    // above by the configured startup budget. It runs after the download
+    // had its budget, so it sees the database that just landed.
+    tokio::spawn(geo_backfill::backfill_missing_geo_within_budget(
+        pool.clone(),
+        geo.clone(),
+        config.geo.startup_download_budget(),
+    ));
 
     // The public rate limiter also keys requests by peer address.
     let public_server = axum::serve(
@@ -362,12 +400,66 @@ async fn await_geo_within_budget(task: tokio::task::JoinHandle<()>, budget: Dura
         Ok(Err(err)) => {
             tracing::warn!(error = %err, "GeoLite2 download task failed")
         }
+        Err(_) if budget.is_zero() => {}
         Err(_) => tracing::warn!(
             budget_secs = budget.as_secs(),
             "GeoLite2 download still running at the startup budget; \
-             starting without it, the download continues in the background"
+             the listeners are already bound and the download continues in \
+             the background"
         ),
     }
+}
+
+/// Whether an enabled profile filters by country.
+///
+/// A country allowlist matches confirmed facts only: a proxy without a
+/// determined country stays out. Without the City database the
+/// subscription is empty, whatever the feed holds, so such a profile needs
+/// the databases to be there.
+async fn profiles_require_country(pool: &fumox_core::db::DbPool) -> anyhow::Result<bool> {
+    let profiles = fumox_core::repo::profiles::list(pool, true).await?;
+    Ok(profiles.iter().any(|profile| !profile.countries.is_empty()))
+}
+
+/// The configuration mistakes that change what the server accepts but
+/// are invisible until a request is refused. Each one is worth a line
+/// at startup: the operator reads the log once, the requests keep working.
+///
+/// - A non-empty `allowed_hosts` list turns the Host header into a gate:
+///   a request with any other Host is refused (400 on the admin panel,
+///   404 on the public listener).
+/// - `trust_proxy_ips` without `trust_proxy_header` trusts the proxy's
+///   *address* but reads none of its headers: the per-IP rate-limit key
+///   is the proxy's own address, so every client behind one proxy shares
+///   a single window.
+fn startup_warnings(config: &fumox_core::AppConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !config.admin.allowed_hosts.is_empty() {
+        warnings.push(format!(
+            "the admin panel now accepts only these Host values: {}",
+            config.admin.allowed_hosts.join(", ")
+        ));
+    }
+    if !config.server.allowed_hosts.is_empty() {
+        warnings.push(format!(
+            "the public listener now accepts only these Host values: {}",
+            config.server.allowed_hosts.join(", ")
+        ));
+    }
+    for (section, cidrs, header) in [
+        ("server", &config.server.trust_proxy_ips, config.server.trust_proxy_header),
+        ("admin", &config.admin.trust_proxy_ips, config.admin.trust_proxy_header),
+    ] {
+        if !cidrs.is_empty() && header == fumox_core::config::TrustedHeader::None {
+            warnings.push(format!(
+                "[{section}].trust_proxy_ips is set but [{section}].trust_proxy_header is \
+                 \"none\": no forwarding header is read, so every client behind the proxy shares \
+                 the proxy's own rate-limit window; set [{section}].trust_proxy_header to the \
+                 header the proxy writes"
+            ));
+        }
+    }
+    warnings
 }
 
 /// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM.
@@ -438,5 +530,118 @@ mod tests {
         await_geo_within_budget(task, Duration::from_secs(5)).await;
         // The task ran to its end rather than being abandoned.
         done_rx.await.unwrap();
+    }
+
+    /// A profile that filters by country needs the country facts: without
+    /// them the subscription is empty, so the startup refuses to run. A
+    /// profile without an allowlist does not need them.
+    #[tokio::test]
+    async fn a_country_allowlist_makes_the_profiles_require_geo() {
+        let dir = std::env::temp_dir().join(format!(
+            "fumox-profiles-require-geo-{}",
+            fumox_core::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+
+        assert!(
+            !profiles_require_country(&pool).await.unwrap(),
+            "an installation without profiles needs no geo"
+        );
+
+        let now = fumox_core::models::now_ts();
+        let mut profile = fumox_core::models::Profile {
+            id: "prof00000001".into(),
+            slug: None,
+            access_token: None,
+            name: "p".into(),
+            output_format: Default::default(),
+            pipeline: None,
+            countries: Vec::new(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        fumox_core::repo::profiles::create(&pool, &profile)
+            .await
+            .unwrap();
+        assert!(
+            !profiles_require_country(&pool).await.unwrap(),
+            "a profile without an allowlist needs no geo"
+        );
+
+        profile.countries = vec!["US".into()];
+        fumox_core::repo::profiles::update(&pool, &profile)
+            .await
+            .unwrap();
+        assert!(
+            profiles_require_country(&pool).await.unwrap(),
+            "a country allowlist needs the country facts"
+        );
+
+        // A disabled profile is not served, so it does not hold the
+        // startup hostage.
+        profile.enabled = false;
+        fumox_core::repo::profiles::update(&pool, &profile)
+            .await
+            .unwrap();
+        assert!(
+            !profiles_require_country(&pool).await.unwrap(),
+            "a disabled profile is not served"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A non-empty allowlist is a gate the operator cannot see from the
+    /// outside: until a request is refused, the panel looks the same as
+    /// without one. The startup names the accepted hosts.
+    #[test]
+    fn an_allowlist_is_named_at_startup() {
+        let mut config = fumox_core::AppConfig::default();
+        assert!(
+            startup_warnings(&config).is_empty(),
+            "the defaults gate nothing"
+        );
+
+        config.admin.allowed_hosts = vec!["panel.example.com".into()];
+        let warnings = startup_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("panel.example.com"), "{warnings:?}");
+        assert!(warnings[0].contains("admin panel"), "{warnings:?}");
+
+        config.server.allowed_hosts = vec!["public.example.com".into()];
+        let warnings = startup_warnings(&config);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[1].contains("public.example.com"), "{warnings:?}");
+    }
+
+    /// Trusted proxies without a declaration are a silent
+    /// misconfiguration: the proxy's address becomes the rate-limit key
+    /// of every client behind it.
+    #[test]
+    fn a_trusted_proxy_without_a_declared_header_is_named_at_startup() {
+        let mut config = fumox_core::AppConfig::default();
+        config.server.trust_proxy_ips = vec!["10.0.0.0/8".into()];
+        let warnings = startup_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("trust_proxy_header"), "{warnings:?}");
+
+        // With the declaration the warning is gone: the operator said
+        // which header the proxy writes.
+        config.server.trust_proxy_header = fumox_core::config::TrustedHeader::Xff;
+        assert!(startup_warnings(&config).is_empty());
+
+        // A trusted proxy with no allowlist of its own needs no
+        // declaration: nothing reads its headers.
+        config.server.trust_proxy_ips.clear();
+        config.server.trust_proxy_header = fumox_core::config::TrustedHeader::None;
+        assert!(startup_warnings(&config).is_empty());
     }
 }

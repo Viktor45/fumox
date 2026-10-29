@@ -59,6 +59,7 @@ jobs:
       - name: Script tests
         run: |
           bash scripts/tests/cleanup-ghcr.test.sh
+          bash scripts/tests/repair-geo-stamps.test.sh
           bash scripts/tests/revive-xhttp-proxies.test.sh
           bash scripts/tests/smoke-down.test.sh
           bash scripts/tests/smoke-up.test.sh

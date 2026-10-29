@@ -26,6 +26,11 @@
 
 <p class="muted small">{{ self.t_named("set.edit_intro", &[("path", self.editing_path_str())][..]) }}</p>
 
+{% match self.env_locked_hint() %}
+  {% when Some with (hint) %}<div class="hint">{{ hint }}</div>
+  {% when None %}
+{% endmatch %}
+
 <form method="post" action="/admin/settings/update">
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   {# Fingerprint of the file this form was rendered from: the submit is
@@ -49,26 +54,27 @@
     <label for="tab-shared" id="tab-shared-label" role="tab" aria-controls="pane-shared" aria-selected="false">{{ self.t("set.tab_shared") }}</label>
   </div>
 
+  <fieldset class="settings-panes"{{ self.panes_disabled() }}>
   <section id="pane-server" role="tabpanel" aria-labelledby="tab-server-label" class="tab-pane">
     <div class="panel">
       <h2>{{ self.t("set.ingest") }} <span class="badge neutral">server</span></h2>
       <div class="field">
         <label for="ingest-refresh">{{ self.t("set.refresh_check_limit") }}</label>
-        <input type="number" id="ingest-refresh" name="ingest.refresh_check_limit" min="{{ self.range_min("ingest.refresh_check_limit") }}" max="{{ self.range_max("ingest.refresh_check_limit") }}" value="{{ self.raw_value("ingest.refresh_check_limit") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="ingest-refresh" name="ingest.refresh_check_limit" min="{{ self.range_min("ingest.refresh_check_limit") }}" max="{{ self.range_max("ingest.refresh_check_limit") }}" value="{{ self.raw_value("ingest.refresh_check_limit") }}"{{ self.field_disabled("ingest.refresh_check_limit") }}>
         {% match self.range_text("ingest.refresh_check_limit") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("ingest.refresh_check_limit") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <span class="check-row">
-          <input type="hidden" name="ingest.drop_gate" value="off">
-          <input type="checkbox" name="ingest.drop_gate" value="on" id="ingest-drop" {% if self.bool_value("ingest.drop_gate") %}checked{% endif %}{{ self.fields_disabled() }}>
+          <input type="hidden" name="ingest.drop_gate" value="off"{{ self.field_disabled("ingest.drop_gate") }}>
+          <input type="checkbox" name="ingest.drop_gate" value="on" id="ingest-drop" {% if self.bool_value("ingest.drop_gate") %}checked{% endif %}{{ self.field_disabled("ingest.drop_gate") }}>
           <label for="ingest-drop">{{ self.t("set.drop_gate") }}</label>
         </span>
       </div>
       <div class="field">
         <span class="check-row">
-          <input type="hidden" name="ingest.removed_as_unknown" value="off">
-          <input type="checkbox" name="ingest.removed_as_unknown" value="on" id="ingest-removed" {% if self.bool_value("ingest.removed_as_unknown") %}checked{% endif %}{{ self.fields_disabled() }}>
+          <input type="hidden" name="ingest.removed_as_unknown" value="off"{{ self.field_disabled("ingest.removed_as_unknown") }}>
+          <input type="checkbox" name="ingest.removed_as_unknown" value="on" id="ingest-removed" {% if self.bool_value("ingest.removed_as_unknown") %}checked{% endif %}{{ self.field_disabled("ingest.removed_as_unknown") }}>
           <label for="ingest-removed">{{ self.t("set.removed_as_unknown") }}</label>
         </span>
       </div>
@@ -78,14 +84,14 @@
       <h2>{{ self.t("set.public_listener") }} <span class="badge neutral">server</span></h2>
       <div class="field">
         <label for="server-bind">{{ self.t("set.bind") }}</label>
-        <input type="text" id="server-bind" name="server.bind" placeholder="0.0.0.0:8080" value="{{ self.raw_value("server.bind") }}"{{ self.fields_disabled() }}>
+        <input type="text" id="server-bind" name="server.bind" placeholder="0.0.0.0:8080" value="{{ self.raw_value("server.bind") }}"{{ self.field_disabled("server.bind") }}>
         {% match self.error_for("server.bind") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label>{{ self.t("set.rate_limit") }}</label>
         <div class="inline-controls">
-          <input type="number" name="server.rate_limit.limit" min="{{ self.range_min("server.rate_limit.limit") }}" max="{{ self.range_max("server.rate_limit.limit") }}" value="{{ self.raw_value("server.rate_limit.limit") }}"{{ self.fields_disabled() }}>
-          <select name="server.rate_limit.unit"{{ self.fields_disabled() }}>
+          <input type="number" name="server.rate_limit.limit" min="{{ self.range_min("server.rate_limit.limit") }}" max="{{ self.range_max("server.rate_limit.limit") }}" value="{{ self.raw_value("server.rate_limit.limit") }}"{{ self.field_disabled("server.rate_limit.limit") }}>
+          <select name="server.rate_limit.unit"{{ self.field_disabled("server.rate_limit.unit") }}>
             <option value="sec" {% if self.raw_value("server.rate_limit.unit") == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
             <option value="min" {% if self.raw_value("server.rate_limit.unit") == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>
             <option value="hour" {% if self.raw_value("server.rate_limit.unit") == "hour" %}selected{% endif %}>{{ self.t("common.unit_hour") }}</option>
@@ -99,8 +105,8 @@
       <div class="field">
         <label>{{ self.t("set.auth_fail_limit") }}</label>
         <div class="inline-controls">
-          <input type="number" name="server.auth_fail_rate_limit.limit" min="{{ self.range_min("server.auth_fail_rate_limit.limit") }}" max="{{ self.range_max("server.auth_fail_rate_limit.limit") }}" value="{{ self.raw_value("server.auth_fail_rate_limit.limit") }}"{{ self.fields_disabled() }}>
-          <select name="server.auth_fail_rate_limit.unit"{{ self.fields_disabled() }}>
+          <input type="number" name="server.auth_fail_rate_limit.limit" min="{{ self.range_min("server.auth_fail_rate_limit.limit") }}" max="{{ self.range_max("server.auth_fail_rate_limit.limit") }}" value="{{ self.raw_value("server.auth_fail_rate_limit.limit") }}"{{ self.field_disabled("server.auth_fail_rate_limit.limit") }}>
+          <select name="server.auth_fail_rate_limit.unit"{{ self.field_disabled("server.auth_fail_rate_limit.unit") }}>
             <option value="sec" {% if self.raw_value("server.auth_fail_rate_limit.unit") == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
             <option value="min" {% if self.raw_value("server.auth_fail_rate_limit.unit") == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>
             <option value="hour" {% if self.raw_value("server.auth_fail_rate_limit.unit") == "hour" %}selected{% endif %}>{{ self.t("common.unit_hour") }}</option>
@@ -113,16 +119,26 @@
       </div>
       <div class="field">
         <label for="server-cidrs">{{ self.t("set.trust_proxy_ips") }}</label>
-        <textarea class="mono" id="server-cidrs" name="server.trust_proxy_ips" rows="3" placeholder="10.0.0.0/8&#10;192.168.0.0/16"{{ self.fields_disabled() }}>{{ self.raw_value("server.trust_proxy_ips") }}</textarea>
+        <textarea class="mono" id="server-cidrs" name="server.trust_proxy_ips" rows="3" placeholder="10.0.0.0/8&#10;192.168.0.0/16"{{ self.field_disabled("server.trust_proxy_ips") }}>{{ self.raw_value("server.trust_proxy_ips") }}</textarea>
         <div class="hint">{{ self.t("set.trust_proxy_ips_hint") }}</div>
       </div>
       <div class="field">
+        <label for="server-proxy-header">{{ self.t("set.trust_proxy_header") }}</label>
+        <select id="server-proxy-header" name="server.trust_proxy_header"{{ self.field_disabled("server.trust_proxy_header") }}>
+          <option value="none" {% if self.raw_value("server.trust_proxy_header") == "none" %}selected{% endif %}>none</option>
+          <option value="xff" {% if self.raw_value("server.trust_proxy_header") == "xff" %}selected{% endif %}>xff</option>
+          <option value="forwarded" {% if self.raw_value("server.trust_proxy_header") == "forwarded" %}selected{% endif %}>forwarded</option>
+          <option value="both" {% if self.raw_value("server.trust_proxy_header") == "both" %}selected{% endif %}>both</option>
+        </select>
+        <div class="hint">{{ self.t("set.trust_proxy_header_hint") }}</div>
+      </div>
+      <div class="field">
         <label for="server-hosts">{{ self.t("set.allowed_hosts") }}</label>
-        <textarea class="mono" id="server-hosts" name="server.allowed_hosts" rows="3" placeholder="example.com&#10;localhost"{{ self.fields_disabled() }}>{{ self.raw_value("server.allowed_hosts") }}</textarea>
+        <textarea class="mono" id="server-hosts" name="server.allowed_hosts" rows="3" placeholder="example.com&#10;localhost"{{ self.field_disabled("server.allowed_hosts") }}>{{ self.raw_value("server.allowed_hosts") }}</textarea>
       </div>
       <div class="field">
         <label for="server-export-rows">{{ self.t("set.export_max_rows") }}</label>
-        <input type="number" id="server-export-rows" name="server.export_max_rows" min="{{ self.range_min("server.export_max_rows") }}" max="{{ self.range_max("server.export_max_rows") }}" value="{{ self.raw_value("server.export_max_rows") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="server-export-rows" name="server.export_max_rows" min="{{ self.range_min("server.export_max_rows") }}" max="{{ self.range_max("server.export_max_rows") }}" value="{{ self.raw_value("server.export_max_rows") }}"{{ self.field_disabled("server.export_max_rows") }}>
         {% match self.range_text("server.export_max_rows") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("server.export_max_rows") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
@@ -132,18 +148,18 @@
       <h2>{{ self.t("set.database") }} <span class="badge neutral">server</span></h2>
       <div class="field">
         <label for="db-path">{{ self.t("set.db_path") }}</label>
-        <input type="text" id="db-path" name="database.path" value="{{ self.raw_value("database.path") }}"{{ self.fields_disabled() }}>
+        <input type="text" id="db-path" name="database.path" value="{{ self.raw_value("database.path") }}"{{ self.field_disabled("database.path") }}>
         {% match self.error_for("database.path") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="db-busy">{{ self.t("set.busy_timeout") }}</label>
-        <input type="number" id="db-busy" name="database.busy_timeout_ms" min="{{ self.range_min("database.busy_timeout_ms") }}" max="{{ self.range_max("database.busy_timeout_ms") }}" value="{{ self.raw_value("database.busy_timeout_ms") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="db-busy" name="database.busy_timeout_ms" min="{{ self.range_min("database.busy_timeout_ms") }}" max="{{ self.range_max("database.busy_timeout_ms") }}" value="{{ self.raw_value("database.busy_timeout_ms") }}"{{ self.field_disabled("database.busy_timeout_ms") }}>
         {% match self.range_text("database.busy_timeout_ms") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("database.busy_timeout_ms") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="db-max">{{ self.t("set.max_connections") }}</label>
-        <input type="number" id="db-max" name="database.max_connections" min="{{ self.range_min("database.max_connections") }}" max="{{ self.range_max("database.max_connections") }}" value="{{ self.raw_value("database.max_connections") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="db-max" name="database.max_connections" min="{{ self.range_min("database.max_connections") }}" max="{{ self.range_max("database.max_connections") }}" value="{{ self.raw_value("database.max_connections") }}"{{ self.field_disabled("database.max_connections") }}>
         {% match self.range_text("database.max_connections") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("database.max_connections") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
@@ -153,33 +169,40 @@
       <h2>{{ self.t("set.geo_panel") }} <span class="badge neutral">server</span></h2>
       <div class="field">
         <span class="check-row">
-          <input type="hidden" name="geo.enabled" value="off">
-          <input type="checkbox" name="geo.enabled" value="on" id="geo-enabled" {% if self.bool_value("geo.enabled") %}checked{% endif %}{{ self.fields_disabled() }}>
+          <input type="hidden" name="geo.enabled" value="off"{{ self.field_disabled("geo.enabled") }}>
+          <input type="checkbox" name="geo.enabled" value="on" id="geo-enabled" {% if self.bool_value("geo.enabled") %}checked{% endif %}{{ self.field_disabled("geo.enabled") }}>
           <label for="geo-enabled">{{ self.t("set.enabled") }}</label>
         </span>
       </div>
       <div class="field">
         <label for="geo-dbdir">{{ self.t("set.geo_db_dir") }}</label>
-        <input type="text" id="geo-dbdir" name="geo.db_dir" value="{{ self.raw_value("geo.db_dir") }}"{{ self.fields_disabled() }}>
+        <input type="text" id="geo-dbdir" name="geo.db_dir" value="{{ self.raw_value("geo.db_dir") }}"{{ self.field_disabled("geo.db_dir") }}>
         {% match self.error_for("geo.db_dir") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="geo-cache">{{ self.t("set.geo_cache") }}</label>
-        <input type="number" id="geo-cache" name="geo.cache_max_entries" min="{{ self.range_min("geo.cache_max_entries") }}" max="{{ self.range_max("geo.cache_max_entries") }}" value="{{ self.raw_value("geo.cache_max_entries") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="geo-cache" name="geo.cache_max_entries" min="{{ self.range_min("geo.cache_max_entries") }}" max="{{ self.range_max("geo.cache_max_entries") }}" value="{{ self.raw_value("geo.cache_max_entries") }}"{{ self.field_disabled("geo.cache_max_entries") }}>
         {% match self.range_text("geo.cache_max_entries") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("geo.cache_max_entries") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="geo-dns">{{ self.t("set.dns_timeout") }}</label>
-        <input type="number" id="geo-dns" name="geo.dns_timeout_secs" min="{{ self.range_min("geo.dns_timeout_secs") }}" max="{{ self.range_max("geo.dns_timeout_secs") }}" value="{{ self.raw_value("geo.dns_timeout_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="geo-dns" name="geo.dns_timeout_secs" min="{{ self.range_min("geo.dns_timeout_secs") }}" max="{{ self.range_max("geo.dns_timeout_secs") }}" value="{{ self.raw_value("geo.dns_timeout_secs") }}"{{ self.field_disabled("geo.dns_timeout_secs") }}>
         {% match self.range_text("geo.dns_timeout_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("geo.dns_timeout_secs") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="geo-startup-budget">{{ self.t("set.geo_startup_budget") }}</label>
-        <input type="number" id="geo-startup-budget" name="geo.startup_download_budget_secs" min="{{ self.range_min("geo.startup_download_budget_secs") }}" max="{{ self.range_max("geo.startup_download_budget_secs") }}" value="{{ self.raw_value("geo.startup_download_budget_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="geo-startup-budget" name="geo.startup_download_budget_secs" min="{{ self.range_min("geo.startup_download_budget_secs") }}" max="{{ self.range_max("geo.startup_download_budget_secs") }}" value="{{ self.raw_value("geo.startup_download_budget_secs") }}"{{ self.field_disabled("geo.startup_download_budget_secs") }}>
         {% match self.range_text("geo.startup_download_budget_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("geo.startup_download_budget_secs") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
+      <div class="field">
+        <span class="check-row">
+          <input type="hidden" name="geo.auto_download" value="off"{{ self.field_disabled("geo.auto_download") }}>
+          <input type="checkbox" name="geo.auto_download" value="on" id="geo-auto-download" {% if self.bool_value("geo.auto_download") %}checked{% endif %}{{ self.field_disabled("geo.auto_download") }}>
+          <label for="geo-auto-download">{{ self.t("set.geo_auto_download") }}</label>
+        </span>
       </div>
     </div>
 
@@ -187,7 +210,7 @@
       <h2>{{ self.t("set.network_panel") }} <span class="badge neutral">server</span></h2>
       <div class="field">
         <label for="network-dns">{{ self.t("set.network_dns_timeout") }}</label>
-        <input type="number" id="network-dns" name="network.dns_timeout_secs" min="{{ self.range_min("network.dns_timeout_secs") }}" max="{{ self.range_max("network.dns_timeout_secs") }}" value="{{ self.raw_value("network.dns_timeout_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="network-dns" name="network.dns_timeout_secs" min="{{ self.range_min("network.dns_timeout_secs") }}" max="{{ self.range_max("network.dns_timeout_secs") }}" value="{{ self.raw_value("network.dns_timeout_secs") }}"{{ self.field_disabled("network.dns_timeout_secs") }}>
         {% match self.range_text("network.dns_timeout_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("network.dns_timeout_secs") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
         <div class="hint">{{ self.t("set.network_dns_timeout_hint") }}</div>
@@ -198,14 +221,14 @@
       <h2>{{ self.t("set.admin_panel") }} <span class="badge neutral">server</span></h2>
       <div class="field">
         <span class="check-row">
-          <input type="hidden" name="admin.enabled" value="off">
-          <input type="checkbox" name="admin.enabled" value="on" id="admin-enabled" {% if self.bool_value("admin.enabled") %}checked{% endif %}{{ self.fields_disabled() }}>
+          <input type="hidden" name="admin.enabled" value="off"{{ self.field_disabled("admin.enabled") }}>
+          <input type="checkbox" name="admin.enabled" value="on" id="admin-enabled" {% if self.bool_value("admin.enabled") %}checked{% endif %}{{ self.field_disabled("admin.enabled") }}>
           <label for="admin-enabled">{{ self.t("set.enabled") }}</label>
         </span>
       </div>
       <div class="field">
         <label for="admin-bind">{{ self.t("set.bind") }}</label>
-        <input type="text" id="admin-bind" name="admin.bind" placeholder="127.0.0.1:8081" value="{{ self.raw_value("admin.bind") }}"{{ self.fields_disabled() }}>
+        <input type="text" id="admin-bind" name="admin.bind" placeholder="127.0.0.1:8081" value="{{ self.raw_value("admin.bind") }}"{{ self.field_disabled("admin.bind") }}>
         {% match self.error_for("admin.bind") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
@@ -214,28 +237,28 @@
            never rendered into the markup) and carries only what the
            operator typed on a failed-save replay. An empty submit keeps
            the current token. #}
-        <input type="password" id="admin-token" name="admin.token" autocomplete="off" value="{{ self.raw_value("admin.token") }}"{{ self.fields_disabled() }}>
+        <input type="password" id="admin-token" name="admin.token" autocomplete="off" value="{{ self.raw_value("admin.token") }}"{{ self.field_disabled("admin.token") }}>
         <div class="hint">{{ self.t("set.token_keep_hint") }}</div>
         <div class="hint">{{ self.t("set.edit_token_warning") }}</div>
         {% match self.error_for("admin.token") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="admin-ttl">{{ self.t("set.session_ttl") }}</label>
-        <input type="number" id="admin-ttl" name="admin.session_ttl_hours" min="{{ self.range_min("admin.session_ttl_hours") }}" max="{{ self.range_max("admin.session_ttl_hours") }}" value="{{ self.raw_value("admin.session_ttl_hours") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="admin-ttl" name="admin.session_ttl_hours" min="{{ self.range_min("admin.session_ttl_hours") }}" max="{{ self.range_max("admin.session_ttl_hours") }}" value="{{ self.raw_value("admin.session_ttl_hours") }}"{{ self.field_disabled("admin.session_ttl_hours") }}>
         {% match self.range_text("admin.session_ttl_hours") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <span class="check-row">
-          <input type="hidden" name="admin.allow_private_urls" value="off">
-          <input type="checkbox" name="admin.allow_private_urls" value="on" id="admin-priv" {% if self.bool_value("admin.allow_private_urls") %}checked{% endif %}{{ self.fields_disabled() }}>
+          <input type="hidden" name="admin.allow_private_urls" value="off"{{ self.field_disabled("admin.allow_private_urls") }}>
+          <input type="checkbox" name="admin.allow_private_urls" value="on" id="admin-priv" {% if self.bool_value("admin.allow_private_urls") %}checked{% endif %}{{ self.field_disabled("admin.allow_private_urls") }}>
           <label for="admin-priv">{{ self.t("set.allow_private_urls") }}</label>
         </span>
       </div>
       <div class="field">
         <label>{{ self.t("set.rate_limit") }}</label>
         <div class="inline-controls">
-          <input type="number" name="admin.rate_limit.limit" min="{{ self.range_min("admin.rate_limit.limit") }}" max="{{ self.range_max("admin.rate_limit.limit") }}" value="{{ self.raw_value("admin.rate_limit.limit") }}"{{ self.fields_disabled() }}>
-          <select name="admin.rate_limit.unit"{{ self.fields_disabled() }}>
+          <input type="number" name="admin.rate_limit.limit" min="{{ self.range_min("admin.rate_limit.limit") }}" max="{{ self.range_max("admin.rate_limit.limit") }}" value="{{ self.raw_value("admin.rate_limit.limit") }}"{{ self.field_disabled("admin.rate_limit.limit") }}>
+          <select name="admin.rate_limit.unit"{{ self.field_disabled("admin.rate_limit.unit") }}>
             <option value="sec" {% if self.raw_value("admin.rate_limit.unit") == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
             <option value="min" {% if self.raw_value("admin.rate_limit.unit") == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>
             <option value="hour" {% if self.raw_value("admin.rate_limit.unit") == "hour" %}selected{% endif %}>{{ self.t("common.unit_hour") }}</option>
@@ -249,8 +272,8 @@
       <div class="field">
         <label>{{ self.t("set.login_rate_limit") }}</label>
         <div class="inline-controls">
-          <input type="number" name="admin.login_rate_limit.limit" min="{{ self.range_min("admin.login_rate_limit.limit") }}" max="{{ self.range_max("admin.login_rate_limit.limit") }}" value="{{ self.raw_value("admin.login_rate_limit.limit") }}"{{ self.fields_disabled() }}>
-          <select name="admin.login_rate_limit.unit"{{ self.fields_disabled() }}>
+          <input type="number" name="admin.login_rate_limit.limit" min="{{ self.range_min("admin.login_rate_limit.limit") }}" max="{{ self.range_max("admin.login_rate_limit.limit") }}" value="{{ self.raw_value("admin.login_rate_limit.limit") }}"{{ self.field_disabled("admin.login_rate_limit.limit") }}>
+          <select name="admin.login_rate_limit.unit"{{ self.field_disabled("admin.login_rate_limit.unit") }}>
             <option value="sec" {% if self.raw_value("admin.login_rate_limit.unit") == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
             <option value="min" {% if self.raw_value("admin.login_rate_limit.unit") == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>
             <option value="hour" {% if self.raw_value("admin.login_rate_limit.unit") == "hour" %}selected{% endif %}>{{ self.t("common.unit_hour") }}</option>
@@ -263,22 +286,32 @@
       </div>
       <div class="field">
         <span class="check-row">
-          <input type="hidden" name="admin.secure_cookies" value="off">
-          <input type="checkbox" name="admin.secure_cookies" value="on" id="admin-secure" {% if self.bool_value("admin.secure_cookies") %}checked{% endif %}{{ self.fields_disabled() }}>
+          <input type="hidden" name="admin.secure_cookies" value="off"{{ self.field_disabled("admin.secure_cookies") }}>
+          <input type="checkbox" name="admin.secure_cookies" value="on" id="admin-secure" {% if self.bool_value("admin.secure_cookies") %}checked{% endif %}{{ self.field_disabled("admin.secure_cookies") }}>
           <label for="admin-secure">{{ self.t("set.secure_cookies") }}</label>
         </span>
       </div>
       <div class="field">
         <label for="admin-locales">{{ self.t("set.locales_dir") }}</label>
-        <input type="text" id="admin-locales" name="admin.locales_dir" value="{{ self.raw_value("admin.locales_dir") }}"{{ self.fields_disabled() }}>
+        <input type="text" id="admin-locales" name="admin.locales_dir" value="{{ self.raw_value("admin.locales_dir") }}"{{ self.field_disabled("admin.locales_dir") }}>
       </div>
       <div class="field">
         <label for="admin-cidrs">{{ self.t("set.trust_proxy_ips") }}</label>
-        <textarea class="mono" id="admin-cidrs" name="admin.trust_proxy_ips" rows="3"{{ self.fields_disabled() }}>{{ self.raw_value("admin.trust_proxy_ips") }}</textarea>
+        <textarea class="mono" id="admin-cidrs" name="admin.trust_proxy_ips" rows="3"{{ self.field_disabled("admin.trust_proxy_ips") }}>{{ self.raw_value("admin.trust_proxy_ips") }}</textarea>
+      </div>
+      <div class="field">
+        <label for="admin-proxy-header">{{ self.t("set.trust_proxy_header") }}</label>
+        <select id="admin-proxy-header" name="admin.trust_proxy_header"{{ self.field_disabled("admin.trust_proxy_header") }}>
+          <option value="none" {% if self.raw_value("admin.trust_proxy_header") == "none" %}selected{% endif %}>none</option>
+          <option value="xff" {% if self.raw_value("admin.trust_proxy_header") == "xff" %}selected{% endif %}>xff</option>
+          <option value="forwarded" {% if self.raw_value("admin.trust_proxy_header") == "forwarded" %}selected{% endif %}>forwarded</option>
+          <option value="both" {% if self.raw_value("admin.trust_proxy_header") == "both" %}selected{% endif %}>both</option>
+        </select>
+        <div class="hint">{{ self.t("set.trust_proxy_header_hint") }}</div>
       </div>
       <div class="field">
         <label for="admin-hosts">{{ self.t("set.allowed_hosts") }}</label>
-        <textarea class="mono" id="admin-hosts" name="admin.allowed_hosts" rows="3"{{ self.fields_disabled() }}>{{ self.raw_value("admin.allowed_hosts") }}</textarea>
+        <textarea class="mono" id="admin-hosts" name="admin.allowed_hosts" rows="3"{{ self.field_disabled("admin.allowed_hosts") }}>{{ self.raw_value("admin.allowed_hosts") }}</textarea>
       </div>
     </div>
   </section>
@@ -288,35 +321,35 @@
       <h2>{{ self.t("set.state_machine") }} <span class="badge neutral">probe</span></h2>
       <div class="field">
         <label for="probe-fail">{{ self.t("set.fail_limit") }}</label>
-        <input type="number" id="probe-fail" name="probe.fail_limit" min="{{ self.range_min("probe.fail_limit") }}" max="{{ self.range_max("probe.fail_limit") }}" value="{{ self.raw_value("probe.fail_limit") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-fail" name="probe.fail_limit" min="{{ self.range_min("probe.fail_limit") }}" max="{{ self.range_max("probe.fail_limit") }}" value="{{ self.raw_value("probe.fail_limit") }}"{{ self.field_disabled("probe.fail_limit") }}>
         {% match self.range_text("probe.fail_limit") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("probe.fail_limit") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-min">{{ self.t("set.second_chance_min") }}</label>
-        <input type="number" id="probe-min" name="probe.second_chance_min_hours" min="{{ self.range_min("probe.second_chance_min_hours") }}" max="{{ self.range_max("probe.second_chance_min_hours") }}" value="{{ self.raw_value("probe.second_chance_min_hours") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-min" name="probe.second_chance_min_hours" min="{{ self.range_min("probe.second_chance_min_hours") }}" max="{{ self.range_max("probe.second_chance_min_hours") }}" value="{{ self.raw_value("probe.second_chance_min_hours") }}"{{ self.field_disabled("probe.second_chance_min_hours") }}>
         {% match self.range_text("probe.second_chance_min_hours") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-spread">{{ self.t("set.second_chance_spread") }}</label>
-        <input type="number" id="probe-spread" name="probe.second_chance_spread_hours" min="{{ self.range_min("probe.second_chance_spread_hours") }}" max="{{ self.range_max("probe.second_chance_spread_hours") }}" value="{{ self.raw_value("probe.second_chance_spread_hours") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-spread" name="probe.second_chance_spread_hours" min="{{ self.range_min("probe.second_chance_spread_hours") }}" max="{{ self.range_max("probe.second_chance_spread_hours") }}" value="{{ self.raw_value("probe.second_chance_spread_hours") }}"{{ self.field_disabled("probe.second_chance_spread_hours") }}>
         {% match self.range_text("probe.second_chance_spread_hours") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-ladder">{{ self.t("set.ladder") }}</label>
-        <textarea class="mono" id="probe-ladder" name="probe.recheck_delays_secs" rows="4" placeholder="900&#10;1800&#10;3600"{{ self.fields_disabled() }}>{{ self.raw_value("probe.recheck_delays_secs") }}</textarea>
+        <textarea class="mono" id="probe-ladder" name="probe.recheck_delays_secs" rows="4" placeholder="900&#10;1800&#10;3600"{{ self.field_disabled("probe.recheck_delays_secs") }}>{{ self.raw_value("probe.recheck_delays_secs") }}</textarea>
         <div class="hint">{{ self.t("set.ladder_hint") }}</div>
         <div class="hint">{{ self.t_named("set.range_ladder", &[("steps", self.ladder_steps().to_string()), ("delay", self.ladder_max_delay().to_string())][..]) }}</div>
         {% match self.error_for("probe.recheck_delays_secs") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-queue">{{ self.t("set.queue_stale") }}</label>
-        <input type="number" id="probe-queue" name="probe.queue_stale_days" min="{{ self.range_min("probe.queue_stale_days") }}" max="{{ self.range_max("probe.queue_stale_days") }}" value="{{ self.raw_value("probe.queue_stale_days") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-queue" name="probe.queue_stale_days" min="{{ self.range_min("probe.queue_stale_days") }}" max="{{ self.range_max("probe.queue_stale_days") }}" value="{{ self.raw_value("probe.queue_stale_days") }}"{{ self.field_disabled("probe.queue_stale_days") }}>
         {% match self.range_text("probe.queue_stale_days") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-retention">{{ self.t("set.history_rotation") }}</label>
-        <input type="number" id="probe-retention" name="probe.retention_interval_secs" min="{{ self.range_min("probe.retention_interval_secs") }}" max="{{ self.range_max("probe.retention_interval_secs") }}" value="{{ self.raw_value("probe.retention_interval_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-retention" name="probe.retention_interval_secs" min="{{ self.range_min("probe.retention_interval_secs") }}" max="{{ self.range_max("probe.retention_interval_secs") }}" value="{{ self.raw_value("probe.retention_interval_secs") }}"{{ self.field_disabled("probe.retention_interval_secs") }}>
         {% match self.range_text("probe.retention_interval_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
     </div>
@@ -325,46 +358,46 @@
       <h2>{{ self.t("set.checking") }} <span class="badge neutral">probe</span></h2>
       <div class="field">
         <label for="probe-cycle">{{ self.t("set.cycle_period") }}</label>
-        <input type="number" id="probe-cycle" name="probe.cycle_interval_secs" min="{{ self.range_min("probe.cycle_interval_secs") }}" max="{{ self.range_max("probe.cycle_interval_secs") }}" value="{{ self.raw_value("probe.cycle_interval_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-cycle" name="probe.cycle_interval_secs" min="{{ self.range_min("probe.cycle_interval_secs") }}" max="{{ self.range_max("probe.cycle_interval_secs") }}" value="{{ self.raw_value("probe.cycle_interval_secs") }}"{{ self.field_disabled("probe.cycle_interval_secs") }}>
         {% match self.range_text("probe.cycle_interval_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-sample">{{ self.t("set.sample_per_cycle") }}</label>
-        <input type="number" id="probe-sample" name="probe.sample_size" min="{{ self.range_min("probe.sample_size") }}" max="{{ self.range_max("probe.sample_size") }}" value="{{ self.raw_value("probe.sample_size") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-sample" name="probe.sample_size" min="{{ self.range_min("probe.sample_size") }}" max="{{ self.range_max("probe.sample_size") }}" value="{{ self.raw_value("probe.sample_size") }}"{{ self.field_disabled("probe.sample_size") }}>
         {% match self.range_text("probe.sample_size") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-connect">{{ self.t("set.tcp_timeout") }}</label>
-        <input type="number" id="probe-connect" name="probe.connect_timeout_secs" min="{{ self.range_min("probe.connect_timeout_secs") }}" max="{{ self.range_max("probe.connect_timeout_secs") }}" value="{{ self.raw_value("probe.connect_timeout_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-connect" name="probe.connect_timeout_secs" min="{{ self.range_min("probe.connect_timeout_secs") }}" max="{{ self.range_max("probe.connect_timeout_secs") }}" value="{{ self.raw_value("probe.connect_timeout_secs") }}"{{ self.field_disabled("probe.connect_timeout_secs") }}>
         {% match self.range_text("probe.connect_timeout_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-tls">{{ self.t("set.tls_timeout") }}</label>
-        <input type="number" id="probe-tls" name="probe.tls_timeout_secs" min="{{ self.range_min("probe.tls_timeout_secs") }}" max="{{ self.range_max("probe.tls_timeout_secs") }}" value="{{ self.raw_value("probe.tls_timeout_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-tls" name="probe.tls_timeout_secs" min="{{ self.range_min("probe.tls_timeout_secs") }}" max="{{ self.range_max("probe.tls_timeout_secs") }}" value="{{ self.raw_value("probe.tls_timeout_secs") }}"{{ self.field_disabled("probe.tls_timeout_secs") }}>
         {% match self.range_text("probe.tls_timeout_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-conc">{{ self.t("set.concurrency") }}</label>
-        <input type="number" id="probe-conc" name="probe.concurrency" min="{{ self.range_min("probe.concurrency") }}" max="{{ self.range_max("probe.concurrency") }}" value="{{ self.raw_value("probe.concurrency") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-conc" name="probe.concurrency" min="{{ self.range_min("probe.concurrency") }}" max="{{ self.range_max("probe.concurrency") }}" value="{{ self.raw_value("probe.concurrency") }}"{{ self.field_disabled("probe.concurrency") }}>
         {% match self.range_text("probe.concurrency") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="probe-target-drain">{{ self.t("probe.backlog_target_drain") }}</label>
-        <input type="number" id="probe-target-drain" name="probe.backlog_target_drain_minutes" min="{{ self.range_min("probe.backlog_target_drain_minutes") }}" max="{{ self.range_max("probe.backlog_target_drain_minutes") }}" value="{{ self.raw_value("probe.backlog_target_drain_minutes") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-target-drain" name="probe.backlog_target_drain_minutes" min="{{ self.range_min("probe.backlog_target_drain_minutes") }}" max="{{ self.range_max("probe.backlog_target_drain_minutes") }}" value="{{ self.raw_value("probe.backlog_target_drain_minutes") }}"{{ self.field_disabled("probe.backlog_target_drain_minutes") }}>
         {% match self.range_text("probe.backlog_target_drain_minutes") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         <div class="hint">{{ self.t("probe.backlog_target_drain_hint") }}</div>
         {% match self.error_for("probe.backlog_target_drain_minutes") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <span class="check-row">
-          <input type="hidden" name="probe.allow_private_targets" value="off">
-          <input type="checkbox" name="probe.allow_private_targets" value="on" id="probe-private" {% if self.bool_value("probe.allow_private_targets") %}checked{% endif %}{{ self.fields_disabled() }}>
+          <input type="hidden" name="probe.allow_private_targets" value="off"{{ self.field_disabled("probe.allow_private_targets") }}>
+          <input type="checkbox" name="probe.allow_private_targets" value="on" id="probe-private" {% if self.bool_value("probe.allow_private_targets") %}checked{% endif %}{{ self.field_disabled("probe.allow_private_targets") }}>
           <label for="probe-private">{{ self.t("probe.allow_private_targets") }}</label>
         </span>
       </div>
       <div class="field">
         <label for="probe-heart">{{ self.t("set.heartbeat") }}</label>
-        <input type="number" id="probe-heart" name="probe.heartbeat_interval_secs" min="{{ self.range_min("probe.heartbeat_interval_secs") }}" max="{{ self.range_max("probe.heartbeat_interval_secs") }}" value="{{ self.raw_value("probe.heartbeat_interval_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="probe-heart" name="probe.heartbeat_interval_secs" min="{{ self.range_min("probe.heartbeat_interval_secs") }}" max="{{ self.range_max("probe.heartbeat_interval_secs") }}" value="{{ self.raw_value("probe.heartbeat_interval_secs") }}"{{ self.field_disabled("probe.heartbeat_interval_secs") }}>
         {% match self.range_text("probe.heartbeat_interval_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
     </div>
@@ -373,37 +406,37 @@
       <h2>{{ self.t("probe.meow_title") }} <span class="badge neutral">probe</span></h2>
       <div class="field">
         <label for="meow-addr">{{ self.t("set.meow_api_addr") }}</label>
-        <input type="text" id="meow-addr" name="meow.api_addr" placeholder="127.0.0.1:9090" value="{{ self.raw_value("meow.api_addr") }}"{{ self.fields_disabled() }}>
+        <input type="text" id="meow-addr" name="meow.api_addr" placeholder="127.0.0.1:9090" value="{{ self.raw_value("meow.api_addr") }}"{{ self.field_disabled("meow.api_addr") }}>
       </div>
       <div class="field">
         <label for="meow-cfg">{{ self.t("set.meow_config_path") }}</label>
-        <input type="text" id="meow-cfg" name="meow.config_path" value="{{ self.raw_value("meow.config_path") }}"{{ self.fields_disabled() }}>
+        <input type="text" id="meow-cfg" name="meow.config_path" value="{{ self.raw_value("meow.config_path") }}"{{ self.field_disabled("meow.config_path") }}>
       </div>
       <div class="field">
         <label for="meow-urls">{{ self.t("set.meow_test_url") }}</label>
-        <textarea class="mono" id="meow-urls" name="meow.test_url" rows="8"{{ self.fields_disabled() }}>{{ self.raw_value("meow.test_url") }}</textarea>
+        <textarea class="mono" id="meow-urls" name="meow.test_url" rows="8"{{ self.field_disabled("meow.test_url") }}>{{ self.raw_value("meow.test_url") }}</textarea>
         <div class="hint">{{ self.t("set.meow_test_url_hint") }}</div>
       </div>
       <div class="field">
         <label for="meow-timeout">{{ self.t("set.meow_timeout") }}</label>
-        <input type="number" id="meow-timeout" name="meow.timeout_secs" min="{{ self.range_min("meow.timeout_secs") }}" max="{{ self.range_max("meow.timeout_secs") }}" value="{{ self.raw_value("meow.timeout_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="meow-timeout" name="meow.timeout_secs" min="{{ self.range_min("meow.timeout_secs") }}" max="{{ self.range_max("meow.timeout_secs") }}" value="{{ self.raw_value("meow.timeout_secs") }}"{{ self.field_disabled("meow.timeout_secs") }}>
         {% match self.range_text("meow.timeout_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="meow-bi">{{ self.t("set.backoff_initial") }}</label>
-        <input type="number" id="meow-bi" name="meow.backoff_initial_secs" min="{{ self.range_min("meow.backoff_initial_secs") }}" max="{{ self.range_max("meow.backoff_initial_secs") }}" value="{{ self.raw_value("meow.backoff_initial_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="meow-bi" name="meow.backoff_initial_secs" min="{{ self.range_min("meow.backoff_initial_secs") }}" max="{{ self.range_max("meow.backoff_initial_secs") }}" value="{{ self.raw_value("meow.backoff_initial_secs") }}"{{ self.field_disabled("meow.backoff_initial_secs") }}>
         {% match self.range_text("meow.backoff_initial_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="meow-bm">{{ self.t("set.backoff_max") }}</label>
-        <input type="number" id="meow-bm" name="meow.backoff_max_secs" min="{{ self.range_min("meow.backoff_max_secs") }}" max="{{ self.range_max("meow.backoff_max_secs") }}" value="{{ self.raw_value("meow.backoff_max_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="meow-bm" name="meow.backoff_max_secs" min="{{ self.range_min("meow.backoff_max_secs") }}" max="{{ self.range_max("meow.backoff_max_secs") }}" value="{{ self.raw_value("meow.backoff_max_secs") }}"{{ self.field_disabled("meow.backoff_max_secs") }}>
         {% match self.range_text("meow.backoff_max_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("meow.backoff_max_secs") %}{% when Some with (msg) %}<div class="error-text">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <span class="check-row">
-          <input type="hidden" name="meow.ipv6" value="off">
-          <input type="checkbox" name="meow.ipv6" value="on" id="meow-ipv6" {% if self.bool_value("meow.ipv6") %}checked{% endif %}{{ self.fields_disabled() }}>
+          <input type="hidden" name="meow.ipv6" value="off"{{ self.field_disabled("meow.ipv6") }}>
+          <input type="checkbox" name="meow.ipv6" value="on" id="meow-ipv6" {% if self.bool_value("meow.ipv6") %}checked{% endif %}{{ self.field_disabled("meow.ipv6") }}>
           <label for="meow-ipv6">{{ self.t("set.meow_ipv6") }}</label>
         </span>
         <div class="hint">{{ self.t("set.meow_ipv6_hint") }}</div>
@@ -414,12 +447,12 @@
       <h2>{{ self.t("set.retention_title") }} <span class="badge neutral">probe</span></h2>
       <div class="field">
         <label for="ret-probe">{{ self.t("set.retention_probe") }}</label>
-        <input type="number" id="ret-probe" name="retention.probe_results_days" min="{{ self.range_min("retention.probe_results_days") }}" max="{{ self.range_max("retention.probe_results_days") }}" value="{{ self.raw_value("retention.probe_results_days") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="ret-probe" name="retention.probe_results_days" min="{{ self.range_min("retention.probe_results_days") }}" max="{{ self.range_max("retention.probe_results_days") }}" value="{{ self.raw_value("retention.probe_results_days") }}"{{ self.field_disabled("retention.probe_results_days") }}>
         {% match self.range_text("retention.probe_results_days") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="ret-fetch">{{ self.t("set.retention_fetch") }}</label>
-        <input type="number" id="ret-fetch" name="retention.fetch_log_days" min="{{ self.range_min("retention.fetch_log_days") }}" max="{{ self.range_max("retention.fetch_log_days") }}" value="{{ self.raw_value("retention.fetch_log_days") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="ret-fetch" name="retention.fetch_log_days" min="{{ self.range_min("retention.fetch_log_days") }}" max="{{ self.range_max("retention.fetch_log_days") }}" value="{{ self.raw_value("retention.fetch_log_days") }}"{{ self.field_disabled("retention.fetch_log_days") }}>
         {% match self.range_text("retention.fetch_log_days") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
     </div>
@@ -430,41 +463,41 @@
       <h2>{{ self.t("set.fetch") }} <span class="badge neutral">server</span></h2>
       <div class="field">
         <label for="fetch-connect">{{ self.t("set.fetch_connect") }}</label>
-        <input type="number" id="fetch-connect" name="fetch.connect_timeout_secs" min="{{ self.range_min("fetch.connect_timeout_secs") }}" max="{{ self.range_max("fetch.connect_timeout_secs") }}" value="{{ self.raw_value("fetch.connect_timeout_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="fetch-connect" name="fetch.connect_timeout_secs" min="{{ self.range_min("fetch.connect_timeout_secs") }}" max="{{ self.range_max("fetch.connect_timeout_secs") }}" value="{{ self.raw_value("fetch.connect_timeout_secs") }}"{{ self.field_disabled("fetch.connect_timeout_secs") }}>
         {% match self.range_text("fetch.connect_timeout_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="fetch-read">{{ self.t("set.fetch_read") }}</label>
-        <input type="number" id="fetch-read" name="fetch.read_timeout_secs" min="{{ self.range_min("fetch.read_timeout_secs") }}" max="{{ self.range_max("fetch.read_timeout_secs") }}" value="{{ self.raw_value("fetch.read_timeout_secs") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="fetch-read" name="fetch.read_timeout_secs" min="{{ self.range_min("fetch.read_timeout_secs") }}" max="{{ self.range_max("fetch.read_timeout_secs") }}" value="{{ self.raw_value("fetch.read_timeout_secs") }}"{{ self.field_disabled("fetch.read_timeout_secs") }}>
         {% match self.range_text("fetch.read_timeout_secs") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="fetch-bytes">{{ self.t("set.fetch_max_response") }}</label>
-        <input type="number" id="fetch-bytes" name="fetch.max_response_bytes" min="{{ self.range_min("fetch.max_response_bytes") }}" max="{{ self.range_max("fetch.max_response_bytes") }}" value="{{ self.raw_value("fetch.max_response_bytes") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="fetch-bytes" name="fetch.max_response_bytes" min="{{ self.range_min("fetch.max_response_bytes") }}" max="{{ self.range_max("fetch.max_response_bytes") }}" value="{{ self.raw_value("fetch.max_response_bytes") }}"{{ self.field_disabled("fetch.max_response_bytes") }}>
         {% match self.range_text("fetch.max_response_bytes") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="fetch-conc">{{ self.t("set.fetch_concurrency") }}</label>
-        <input type="number" id="fetch-conc" name="fetch.max_concurrency" min="{{ self.range_min("fetch.max_concurrency") }}" max="{{ self.range_max("fetch.max_concurrency") }}" value="{{ self.raw_value("fetch.max_concurrency") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="fetch-conc" name="fetch.max_concurrency" min="{{ self.range_min("fetch.max_concurrency") }}" max="{{ self.range_max("fetch.max_concurrency") }}" value="{{ self.raw_value("fetch.max_concurrency") }}"{{ self.field_disabled("fetch.max_concurrency") }}>
         {% match self.range_text("fetch.max_concurrency") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="fetch-retries">{{ self.t("set.fetch_retries") }}</label>
-        <input type="number" id="fetch-retries" name="fetch.max_retries" min="{{ self.range_min("fetch.max_retries") }}" max="{{ self.range_max("fetch.max_retries") }}" value="{{ self.raw_value("fetch.max_retries") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="fetch-retries" name="fetch.max_retries" min="{{ self.range_min("fetch.max_retries") }}" max="{{ self.range_max("fetch.max_retries") }}" value="{{ self.raw_value("fetch.max_retries") }}"{{ self.field_disabled("fetch.max_retries") }}>
         {% match self.range_text("fetch.max_retries") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="fetch-backoff">{{ self.t("set.fetch_backoff") }}</label>
-        <input type="number" id="fetch-backoff" name="fetch.retry_base_backoff_ms" min="{{ self.range_min("fetch.retry_base_backoff_ms") }}" max="{{ self.range_max("fetch.retry_base_backoff_ms") }}" value="{{ self.raw_value("fetch.retry_base_backoff_ms") }}"{{ self.fields_disabled() }}>
+        <input type="number" id="fetch-backoff" name="fetch.retry_base_backoff_ms" min="{{ self.range_min("fetch.retry_base_backoff_ms") }}" max="{{ self.range_max("fetch.retry_base_backoff_ms") }}" value="{{ self.raw_value("fetch.retry_base_backoff_ms") }}"{{ self.field_disabled("fetch.retry_base_backoff_ms") }}>
         {% match self.range_text("fetch.retry_base_backoff_ms") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
       </div>
       <div class="field">
         <label for="fetch-ua">{{ self.t("set.fetch_user_agent") }}</label>
-        <input type="text" id="fetch-ua" name="fetch.user_agent" value="{{ self.raw_value("fetch.user_agent") }}"{{ self.fields_disabled() }}>
+        <input type="text" id="fetch-ua" name="fetch.user_agent" value="{{ self.raw_value("fetch.user_agent") }}"{{ self.field_disabled("fetch.user_agent") }}>
       </div>
       <div class="field">
         <label for="fetch-ip">{{ self.t("set.fetch_ip_family") }}</label>
-        <select id="fetch-ip" name="fetch.ip_family"{{ self.fields_disabled() }}>
+        <select id="fetch-ip" name="fetch.ip_family"{{ self.field_disabled("fetch.ip_family") }}>
           <option value="any" {% if self.raw_value("fetch.ip_family") == "any" %}selected{% endif %}>any</option>
           <option value="ipv4" {% if self.raw_value("fetch.ip_family") == "ipv4" %}selected{% endif %}>ipv4</option>
           <option value="ipv6" {% if self.raw_value("fetch.ip_family") == "ipv6" %}selected{% endif %}>ipv6</option>
@@ -476,7 +509,7 @@
       <h2>{{ self.t("set.log_levels") }} <span class="badge neutral">server+probe</span></h2>
       <div class="field">
         <label for="log-server">{{ self.t("set.log_server") }}</label>
-        <select id="log-server" name="log.server"{{ self.fields_disabled() }}>
+        <select id="log-server" name="log.server"{{ self.field_disabled("log.server") }}>
           <option value="error" {% if self.raw_value("log.server") == "error" %}selected{% endif %}>error</option>
           <option value="warn" {% if self.raw_value("log.server") == "warn" %}selected{% endif %}>warn</option>
           <option value="info" {% if self.raw_value("log.server") == "info" %}selected{% endif %}>info</option>
@@ -486,7 +519,7 @@
       </div>
       <div class="field">
         <label for="log-probe">{{ self.t("set.log_probe") }}</label>
-        <select id="log-probe" name="log.probe"{{ self.fields_disabled() }}>
+        <select id="log-probe" name="log.probe"{{ self.field_disabled("log.probe") }}>
           <option value="error" {% if self.raw_value("log.probe") == "error" %}selected{% endif %}>error</option>
           <option value="warn" {% if self.raw_value("log.probe") == "warn" %}selected{% endif %}>warn</option>
           <option value="info" {% if self.raw_value("log.probe") == "info" %}selected{% endif %}>info</option>
@@ -496,6 +529,7 @@
       </div>
     </div>
   </section>
+  </fieldset>
 
   <div class="form-actions">
     <button class="btn primary" type="submit" {% if !state.config_writable %}disabled{% endif %}>{{ self.t("set.edit_save") }}</button>

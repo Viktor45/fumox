@@ -265,14 +265,28 @@ mod tests {
             "idx_fetch_source_time",
             "idx_fetch_time",
             "idx_proxies_updated_at",
+            "idx_proxies_geo_attempt",
+            "idx_proxies_last_t2_checked_at",
         ] {
             assert!(indexes.contains(&expected), "missing index {expected}");
         }
 
-        // Schema version is stamped into meta by db::migrate. Bumped to 11
-        // by migration 0011 (the t2_unverified probe kind).
+        // The denormalised T2 recency stamp is on the proxy row.
+        let columns: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('proxies')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let columns: Vec<&str> = columns.iter().map(|(name,)| name.as_str()).collect();
+        assert!(
+            columns.contains(&"last_t2_checked_at"),
+            "the proxy row must carry the T2 recency stamp"
+        );
+
+        // Schema version is stamped into meta by db::migrate. Bumped to 14
+        // by migration 0014 (the T2 recency stamp).
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("11"));
+        assert_eq!(version.as_deref(), Some("14"));
 
         // WAL is active on the connection.
         let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")
@@ -384,6 +398,118 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migration 0013 backfills the T2 block from the probe history.
+    ///
+    /// Migration 0007 added `last_t2_failed_at` empty, so every row that
+    /// existed then looked like a proxy that had never failed a tunnel
+    /// check — the T1 lane kept serving the proxies the probe had already
+    /// found untunnellable. The backfill reads the history: the newest T2
+    /// attempt decides, and only a failed one stamps the row.
+    #[tokio::test]
+    async fn migration_0013_backfills_the_t2_block_from_the_probe_history() {
+        use sqlx::migrate::Migrator;
+        static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+        let dir = std::env::temp_dir().join(format!("fumox-mig-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::DatabaseConfig {
+            path: dir.join("test.db"),
+            ..Default::default()
+        };
+        let pool = db::connect_pool(&cfg).await.unwrap();
+
+        // The pre-backfill schema, applied by hand so the backfill can be
+        // run against rows that already carry a history.
+        for migration in MIGRATOR.migrations.iter().filter(|m| m.version <= 12) {
+            sqlx::raw_sql(migration.sql.clone())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        for (fingerprint, host) in [
+            ("fp-failed", "failed.example.com"),
+            ("fp-recovered", "recovered.example.com"),
+            ("fp-unverified", "unverified.example.com"),
+            ("fp-never", "never.example.com"),
+        ] {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, host, port, status, created_at, updated_at)
+                 VALUES (?1, 'vless', ?2, 443, 'alive', 1, 1)",
+            )
+            .bind(fingerprint)
+            .bind(host)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let id_of = async |fp: &str| -> i64 {
+            sqlx::query_scalar("SELECT id FROM proxies WHERE fingerprint = ?1")
+                .bind(fp)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        // A failed T2, then a later successful one: the block was cleared
+        // by the success, so the backfill must not stamp it.
+        sqlx::query(
+            "INSERT INTO probe_results (proxy_id, checked_at, ok, probe_kind)
+             VALUES (?1, 1000, 0, 't2'), (?1, 2000, 1, 't2')",
+        )
+        .bind(id_of("fp-recovered").await)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A failed T2 and nothing since: the block belongs to it.
+        sqlx::query(
+            "INSERT INTO probe_results (proxy_id, checked_at, ok, probe_kind)
+             VALUES (?1, 1000, 0, 't2')",
+        )
+        .bind(id_of("fp-failed").await)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // An unverified attempt (the engine produced no verdict) counts as
+        // an attempt and blocks the row.
+        sqlx::query(
+            "INSERT INTO probe_results (proxy_id, checked_at, ok, probe_kind)
+             VALUES (?1, 1500, 0, 't2_unverified')",
+        )
+        .bind(id_of("fp-unverified").await)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let thirteenth = MIGRATOR
+            .migrations
+            .iter()
+            .find(|m| m.version == 13)
+            .expect("migration 0013 missing");
+        sqlx::raw_sql(thirteenth.sql.clone())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT fingerprint, last_t2_failed_at FROM proxies ORDER BY fingerprint",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let by_fp: std::collections::HashMap<String, Option<i64>> = rows.into_iter().collect();
+        assert_eq!(by_fp["fp-failed"], Some(1000));
+        assert_eq!(by_fp["fp-unverified"], Some(1500));
+        assert_eq!(
+            by_fp["fp-recovered"], None,
+            "a successful T2 clears the block, the backfill must not restore it"
+        );
+        assert_eq!(by_fp["fp-never"], None);
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);

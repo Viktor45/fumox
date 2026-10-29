@@ -14,10 +14,13 @@
 //!
 //! Host lookups run with the same bounded concurrency as the ingest path
 //! and the whole pass is bounded by a wall-clock budget, so a hopeless set
-//! cannot hammer the resolver. Rows the resolver cannot answer and rows
-//! the budget did not reach stay missing, retried by the next pass: the
-//! startup one ([`backfill_missing_geo_within_budget`]) and the periodic
-//! one the scheduler runs.
+//! cannot hammer the resolver. A row whose lookup failed is marked, and
+//! the next passes leave it alone until the retry window
+//! ([`proxies::GEO_RETRY_WINDOW_SECS`]) passed: a host no database knows
+//! must not take the budget away from the rows that were never tried.
+//! Rows the budget did not reach stay missing and are retried by the next
+//! pass: the startup one ([`backfill_missing_geo_within_budget`]) and the
+//! periodic one the scheduler runs.
 
 use fumox_core::db::DbPool;
 use fumox_core::geo::{GeoFactMask, GeoInfo, GeoResolver};
@@ -110,6 +113,11 @@ impl GeoLookup for GeoResolver {
 /// Walk every row missing a fact this installation can still fill, oldest
 /// id first: at most [`GEO_LOOKUP_CONCURRENCY`] lookups in flight, no
 /// lookups once `budget` has elapsed. Returns how many rows it filled.
+///
+/// A row whose lookup failed is marked (see [`proxies::mark_geo_attempt`])
+/// and left out of the next passes until the retry window passed: a
+/// hopeless host must not take the budget away from the rows that were
+/// never tried.
 async fn run_backfill<G: GeoLookup>(
     geo: &G,
     pool: &DbPool,
@@ -129,7 +137,9 @@ async fn run_backfill<G: GeoLookup>(
             );
             break;
         }
-        let rows = match proxies::list_missing_geo(pool, cursor, BATCH, mask).await {
+        // One row over the batch size: a short page no longer means "the
+        // table is exhausted", the retry window can leave holes in it.
+        let rows = match proxies::list_missing_geo(pool, cursor, BATCH + 1, mask, now()).await {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(error = %err, "geo backfill: cannot list rows");
@@ -139,6 +149,8 @@ async fn run_backfill<G: GeoLookup>(
         if rows.is_empty() {
             break;
         }
+        let has_more = rows.len() as i64 > BATCH;
+        let rows = &rows[..rows.len().min(BATCH as usize)];
         use futures_util::StreamExt;
         // `buffered` (not `buffer_unordered`) keeps the id order the
         // cursor pagination walks, holding at most `GEO_LOOKUP_CONCURRENCY`
@@ -148,11 +160,19 @@ async fn run_backfill<G: GeoLookup>(
             rows.iter()
                 .map(|(_, host)| async move {
                     if std::time::Instant::now() >= deadline {
-                        return None;
+                        return Lookup::Skipped;
                     }
-                    geo.resolve_host(host)
-                        .await
-                        .map(|info| GeoStamp::from_info(&info))
+                    match geo.resolve_host(host).await {
+                        None => Lookup::NoFacts,
+                        Some(info) => {
+                            let stamp = GeoStamp::from_info(&info);
+                            if stamp.is_empty() {
+                                Lookup::NoFacts
+                            } else {
+                                Lookup::Facts(stamp)
+                            }
+                        }
+                    }
                 })
                 .collect::<Vec<_>>(),
         )
@@ -161,23 +181,47 @@ async fn run_backfill<G: GeoLookup>(
         .await;
         for ((id, _), stamp) in rows.iter().zip(stamps) {
             cursor = (*id).max(cursor);
-            let Some(stamp) = stamp else {
-                continue; // unresolvable or past budget: stays NULL, retried next start
-            };
-            if stamp.is_empty() {
-                continue;
-            }
-            if let Err(err) = proxies::update_geo(pool, *id, &stamp).await {
-                tracing::warn!(proxy = id, error = %err, "geo backfill: update failed");
-            } else {
-                updated += 1;
+            match stamp {
+                // Past the budget: the row was not looked up, so it is not
+                // marked; it stays missing and the next pass tries it.
+                Lookup::Skipped => continue,
+                // The resolver answered, but it knows nothing about this
+                // address: remember the attempt so the next pass leaves the
+                // row alone for a while.
+                Lookup::NoFacts => {
+                    if let Err(err) = proxies::mark_geo_attempt(pool, *id, now()).await {
+                        tracing::warn!(proxy = id, error = %err, "geo backfill: cannot record the attempt");
+                    }
+                }
+                Lookup::Facts(stamp) => {
+                    if let Err(err) = proxies::update_geo(pool, *id, &stamp).await {
+                        tracing::warn!(proxy = id, error = %err, "geo backfill: update failed");
+                    } else {
+                        updated += 1;
+                    }
+                }
             }
         }
-        if (rows.len() as i64) < BATCH {
+        if !has_more {
             break;
         }
     }
     updated
+}
+
+/// What one lookup of a batch produced.
+enum Lookup {
+    /// The budget elapsed before the lookup ran.
+    Skipped,
+    /// The resolver knows nothing about this address.
+    NoFacts,
+    /// The resolver produced these facts.
+    Facts(GeoStamp),
+}
+
+/// The current time in unix seconds, the unit of the stored timestamps.
+fn now() -> i64 {
+    fumox_core::models::now_ts()
 }
 
 #[cfg(test)]
@@ -279,7 +323,7 @@ mod tests {
             &entries,
             &[],
             fumox_core::models::now_ts(),
-            false,
+            fumox_core::ingest::IngestPolicy::refresh(true, true),
         )
         .await
         .unwrap();
@@ -329,6 +373,36 @@ mod tests {
         }
     }
 
+    /// A resolver that knows the ASN but not the country: the City
+    /// database is silent for whole address blocks. The partial stamp must
+    /// fill the gap without erasing the country the row already stores.
+    struct AsnOnlyFactsGeo;
+
+    impl GeoLookup for AsnOnlyFactsGeo {
+        async fn resolve_host(&self, _host: &str) -> Option<Arc<GeoInfo>> {
+            Some(Arc::new(GeoInfo {
+                asn: Some(15169),
+                ..Default::default()
+            }))
+        }
+    }
+
+    /// A resolver that knows nothing: every host stays unknown. It counts
+    /// its calls, so a test can see that a marked row is not asked again.
+    struct NoFactsGeo {
+        calls: AtomicUsize,
+    }
+
+    impl GeoLookup for NoFactsGeo {
+        fn resolve_host(
+            &self,
+            _host: &str,
+        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            async { None }
+        }
+    }
+
     /// Rows ingested without geo (empty stamp slice, as an inactive resolver
     /// produces) start with NULL columns; the backfill fills them. Skipped
     /// without the mmdb file (CI runs without it).
@@ -350,7 +424,7 @@ mod tests {
             &entries,
             &[],
             fumox_core::models::now_ts(),
-            false,
+            fumox_core::ingest::IngestPolicy::refresh(true, true),
         )
         .await
         .unwrap();
@@ -370,6 +444,10 @@ mod tests {
     /// A row that carries a country but no ASN counted as filled under the
     /// old all-NULL criterion and was never walked again, so its ASN
     /// stayed NULL for good. It must get a second chance.
+    ///
+    /// The resolver answers with the ASN only: the stamp is partial, and it
+    /// must fill the gap without erasing the country the row already
+    /// stores.
     #[tokio::test]
     async fn backfill_fills_the_asn_of_a_row_that_already_has_a_country() {
         let pool = temp_pool().await;
@@ -388,11 +466,8 @@ mod tests {
         .unwrap();
         assert!(fetch_row(&pool, "198.51.3.0").await.geo_asn.is_none());
 
-        let geo = FakeGeo {
-            delay: Duration::from_millis(1),
-            stats: Arc::new(LookupStats::default()),
-        };
-        let updated = run_backfill(&geo, &pool, Duration::from_secs(60), BOTH_FACTS).await;
+        let updated =
+            run_backfill(&AsnOnlyFactsGeo, &pool, Duration::from_secs(60), BOTH_FACTS).await;
 
         assert_eq!(updated, 1);
         let filled = fetch_row(&pool, "198.51.3.0").await;
@@ -412,19 +487,6 @@ mod tests {
     /// install must not re-walk the table over a column nothing will fill.
     #[tokio::test]
     async fn a_fact_no_database_can_answer_is_not_walked() {
-        /// Stands in for an installation that opened `GeoLite2-ASN.mmdb`
-        /// only: it cannot answer a country at all.
-        struct AsnOnlyGeo;
-
-        impl GeoLookup for AsnOnlyGeo {
-            async fn resolve_host(&self, _host: &str) -> Option<Arc<GeoInfo>> {
-                Some(Arc::new(GeoInfo {
-                    asn: Some(15169),
-                    ..Default::default()
-                }))
-            }
-        }
-
         let pool = temp_pool().await;
         seed_missing_rows(&pool, 1, 4).await;
         let asn_only = GeoFactMask {
@@ -432,7 +494,8 @@ mod tests {
             asn: true,
         };
 
-        let updated = run_backfill(&AsnOnlyGeo, &pool, Duration::from_secs(60), asn_only).await;
+        let updated =
+            run_backfill(&AsnOnlyFactsGeo, &pool, Duration::from_secs(60), asn_only).await;
 
         assert_eq!(updated, 1);
         let row = fetch_row(&pool, "198.51.4.0").await;
@@ -465,7 +528,7 @@ mod tests {
             &entries,
             &[],
             fumox_core::models::now_ts(),
-            false,
+            fumox_core::ingest::IngestPolicy::refresh(true, true),
         )
         .await
         .unwrap();
@@ -535,5 +598,94 @@ mod tests {
             (400 - updated) as i64
         );
         assert!(elapsed < Duration::from_secs(10), "pass ran {elapsed:?}");
+    }
+
+    /// A table bigger than one batch is walked to the end: the pagination
+    /// must not stop at the first page.
+    #[tokio::test]
+    async fn a_backfill_walks_a_table_bigger_than_one_batch() {
+        let pool = temp_pool().await;
+        seed_missing_rows(&pool, 600, 7).await;
+        let geo = FakeGeo {
+            delay: Duration::ZERO,
+            stats: Arc::new(LookupStats::default()),
+        };
+
+        let updated = run_backfill(&geo, &pool, Duration::from_secs(60), BOTH_FACTS).await;
+
+        assert_eq!(updated, 600);
+        assert_eq!(
+            proxies::count_missing_geo(&pool, BOTH_FACTS).await.unwrap(),
+            0,
+            "every row must be filled, not only the first batch"
+        );
+    }
+
+    /// A table of rows nothing can answer must not make the pass spin: it
+    /// ends, and the rows it could not fill are marked, so the next pass
+    /// leaves them alone instead of taking the budget away from the rows
+    /// that were never tried.
+    #[tokio::test]
+    async fn a_backfill_of_hopeless_rows_terminates_and_marks_them() {
+        let pool = temp_pool().await;
+        seed_missing_rows(&pool, 500, 8).await;
+        let geo = NoFactsGeo {
+            calls: AtomicUsize::new(0),
+        };
+
+        let updated = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_backfill(&geo, &pool, Duration::from_secs(60), BOTH_FACTS),
+        )
+        .await
+        .expect("the backfill must not hang");
+        assert_eq!(updated, 0);
+        assert_eq!(geo.calls.load(Ordering::SeqCst), 500);
+
+        // The second pass leaves the marked rows alone: they do not take
+        // the budget away from the fresh rows.
+        let updated = run_backfill(&geo, &pool, Duration::from_secs(60), BOTH_FACTS).await;
+        assert_eq!(updated, 0);
+        assert_eq!(
+            geo.calls.load(Ordering::SeqCst),
+            500,
+            "a marked row must not be looked up again"
+        );
+
+        // The rows are still missing, the count does not hide the backlog.
+        assert_eq!(
+            proxies::count_missing_geo(&pool, BOTH_FACTS).await.unwrap(),
+            500
+        );
+    }
+
+    /// A hopeless row must not take the budget away from a fresh one: the
+    /// fresh row is filled even though the hopeless one sits in front of
+    /// it.
+    #[tokio::test]
+    async fn a_hopeless_row_does_not_block_the_rows_behind_it() {
+        let pool = temp_pool().await;
+        seed_missing_rows(&pool, 3, 9).await;
+        let hopeless = fetch_row(&pool, "198.51.9.0").await;
+        proxies::mark_geo_attempt(&pool, hopeless.id, now())
+            .await
+            .unwrap();
+
+        let geo = FakeGeo {
+            delay: Duration::ZERO,
+            stats: Arc::new(LookupStats::default()),
+        };
+        let updated = run_backfill(&geo, &pool, Duration::from_secs(60), BOTH_FACTS).await;
+
+        assert_eq!(updated, 2, "the rows behind the marked one must be filled");
+        assert!(fetch_row(&pool, "198.51.9.0").await.geo_country.is_none());
+        assert_eq!(
+            fetch_row(&pool, "198.51.9.1").await.geo_country.as_deref(),
+            Some("US")
+        );
+        assert_eq!(
+            fetch_row(&pool, "198.51.9.2").await.geo_country.as_deref(),
+            Some("US")
+        );
     }
 }

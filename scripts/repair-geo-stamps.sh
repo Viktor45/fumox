@@ -23,52 +23,173 @@
 # Usage:
 #   scripts/repair-geo-stamps.sh [path/to/fumox.db]
 #
+# Environment:
+#   FUMOX_GEO_REPAIR_BACKUP       path of the backup file (default:
+#                                 <database>.pre-geo-repair-<timestamp>)
+#   FUMOX_GEO_REPAIR_BATCH        rows per transaction (default: 500)
+#   FUMOX_ALLOW_RUNNING_SERVER=1  run even when a server process is visible
+#
+# STOP the server (and the probe) before running this script. The repair
+# clears the geo columns of every row, and a running server re-stamps them
+# from its own backfill while the sweep is still going: the two write the
+# same rows and the result depends on who wins the race. The script refuses
+# to run while it can see a local server process.
+#
+# After the script, RESTART the server — a restart, not a plain start. The
+# geo backfill runs at the start of the process, so a server that was never
+# stopped keeps the stamps it already had and nothing is re-resolved.
+#
 # Takes a backup first and refuses to touch a database that is not there.
-# The server (or just `fumox-server` for the backfill pass) must be running
-# afterwards: the re-resolution happens at its next start, in the background.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# The backup holds the whole database, credentials included: nothing this
+# script writes may be readable by anyone else.
+umask 077
+
 DB="${1:-fumox.db}"
+
+fail() {
+    echo "error: $*" >&2
+    exit 70
+}
 
 if [[ ! -f "$DB" ]]; then
     echo "error: no database at $DB" >&2
     exit 66
 fi
 
+# A symlink at the database path is refused: the operator asked for a
+# database, not for whatever the link points at.
+if [[ -L "$DB" ]]; then
+    echo "error: ${DB} is a symlink, refusing to follow it" >&2
+    exit 66
+fi
+
+# The server must not be running. A containerised server cannot be seen
+# from here, so the message names the compose services as well.
+server_is_running() {
+    command -v pgrep >/dev/null 2>&1 || return 1
+    pgrep -x fumox-server >/dev/null 2>&1 && return 0
+    pgrep -x fumox-probe >/dev/null 2>&1 && return 0
+    # A server started through cargo runs under the cargo process, whose
+    # command line carries the path of the binary.
+    pgrep -f 'fumox-server' >/dev/null 2>&1 && return 0
+    pgrep -f 'fumox-probe' >/dev/null 2>&1 && return 0
+    return 1
+}
+
+if [[ "${FUMOX_ALLOW_RUNNING_SERVER:-0}" != "1" ]] && server_is_running; then
+    echo >&2
+    echo "error: a fumox server or probe looks like it is running." >&2
+    echo "STOP it first — the repair and the running backfill would write the" >&2
+    echo "same rows. For the container deployment:" >&2
+    echo >&2
+    echo "  docker compose stop server probe" >&2
+    echo >&2
+    echo "and RESTART the server after the repair (a restart, not a start: the" >&2
+    echo "geo backfill runs at the start of the process)." >&2
+    exit 75
+fi
+
+# The path reaches a SQL string literal, so a quote inside it is doubled.
+# A control character would split the statement, so it is refused rather
+# than escaped.
+sql_literal() {
+    if [[ "$1" == *[[:cntrl:]]* ]]; then
+        echo "error: the path contains a control character: ${1}" >&2
+        exit 64
+    fi
+    local quoted="'"
+    printf "%s%s%s" "$quoted" "${1//\'/$quoted$quoted}" "$quoted"
+}
+
 STAMP="$(date +%Y%m%d-%H%M%S)"
-BACKUP="${DB}.pre-geo-repair-${STAMP}"
+# The backup may be pinned by the operator: a name that says what it is
+# for, or a directory of its own.
+BACKUP="${FUMOX_GEO_REPAIR_BACKUP:-${DB}.pre-geo-repair-${STAMP}}"
+
+# The backup goes next to the database, in the same directory, so a rename
+# stays on the same filesystem. A directory that others may write to is no
+# place for a copy of the credentials: the backup could be swapped for
+# another file between the check and the write.
+BACKUP_DIR="$(dirname "$BACKUP")"
+if [[ -d "$BACKUP_DIR" ]]; then
+    DIR_MODE="$(stat -f '%Lp' "$BACKUP_DIR" 2>/dev/null || stat -c '%a' "$BACKUP_DIR" 2>/dev/null || echo "")"
+    if [[ -n "$DIR_MODE" ]] && (( 0$DIR_MODE & 0022 )); then
+        echo "error: ${BACKUP_DIR} is writable by group or others (mode ${DIR_MODE})." >&2
+        echo "The backup holds the whole database; put it in a directory only" >&2
+        echo "the owner can write to (chmod 0700), and run the script again." >&2
+        exit 73
+    fi
+fi
+
+# `VACUUM INTO` writes the backup itself and refuses to overwrite an
+# existing file, so a stale backup or a symlink planted at the path stops
+# the run instead of being written through. `.backup` in a dot command
+# would have taken the path unescaped.
+if [[ -e "$BACKUP" || -L "$BACKUP" ]]; then
+    echo "error: ${BACKUP} already exists, refusing to overwrite it" >&2
+    exit 73
+fi
 
 echo "database: $DB"
 echo "backup:   $BACKUP"
 
-# WAL mode: the .db alone is not a consistent snapshot, copy the sidecars
-# too (or better, let sqlite produce the backup itself).
-sqlite3 "$DB" ".backup '${BACKUP}'"
+if ! sqlite3 "$DB" "VACUUM INTO $(sql_literal "$BACKUP")"; then
+    fail "the backup of ${DB} could not be written to ${BACKUP}; nothing was changed."
+fi
+# The backup carries the same rows as the database, so it gets the same
+# mode: 0600, never wider.
+chmod 600 "$BACKUP"
+
 for sidecar in "${DB}-wal" "${DB}-shm"; do
-    [[ -e "$sidecar" ]] && echo "note: ${sidecar} exists, the .backup above already checkpointed it"
+    [[ -e "$sidecar" ]] && echo "note: ${sidecar} exists, the backup above is a consistent snapshot of it"
 done
 
 STAMPED="$(sqlite3 "$DB" "SELECT COUNT(*) FROM proxies WHERE geo_asn IS NOT NULL OR geo_country IS NOT NULL")"
 echo "rows with a geo stamp before repair: ${STAMPED}"
 
-sqlite3 "$DB" <<'SQL'
-UPDATE proxies
+# The clearing runs in batches. One transaction over the whole table holds
+# the write lock for as long as it takes and makes the write-ahead log grow
+# to the size of the table; a batch of rows at a time releases the lock
+# between the batches.
+BATCH_SIZE="${FUMOX_GEO_REPAIR_BATCH:-500}"
+if ! [[ "$BATCH_SIZE" =~ ^[0-9]+$ ]] || [[ "$BATCH_SIZE" -lt 1 ]]; then
+    echo "error: FUMOX_GEO_REPAIR_BATCH must be a positive number, got '${BATCH_SIZE}'" >&2
+    exit 64
+fi
+
+MAX_ID="$(sqlite3 "$DB" "SELECT COALESCE(MAX(id), 0) FROM proxies")"
+CLEARED=0
+START=0
+while [[ "$START" -lt "$MAX_ID" ]]; do
+    END=$((START + BATCH_SIZE))
+    BATCH_CLEARED="$(sqlite3 "$DB" "UPDATE proxies
    SET geo_country = NULL, geo_city = NULL, geo_asn = NULL
- WHERE geo_asn IS NOT NULL OR geo_city IS NOT NULL OR geo_country IS NOT NULL;
-SQL
+ WHERE id > ${START} AND id <= ${END}
+   AND (geo_asn IS NOT NULL OR geo_city IS NOT NULL OR geo_country IS NOT NULL);
+SELECT changes();")"
+    CLEARED=$((CLEARED + BATCH_CLEARED))
+    START="$END"
+done
+echo "rows cleared: ${CLEARED}"
 
 LEFT="$(sqlite3 "$DB" "SELECT COUNT(*) FROM proxies WHERE geo_asn IS NOT NULL OR geo_country IS NOT NULL")"
 echo "rows with a geo stamp after repair:  ${LEFT}"
 
 cat <<EOF
 
-Done. Restart the server: the startup geo backfill re-resolves every row
-from its own host and writes the corrected country, city and ASN. It runs in
-the background in batches of 500, so the first seconds after the restart show
-rows without a stamp while the sweep works through them.
+Done. RESTART the server — a restart, not a plain start: the startup geo
+backfill re-resolves every row from its own host and writes the corrected
+country, city and ASN. It runs in the background in batches of 500, so the
+first seconds after the restart show rows without a stamp while the sweep
+works through them.
 
 To follow it, or to confirm it finished, watch for the backfill's own log
 line ("geo backfill complete", with the row count and elapsed time).
+
+To undo, put the backup back (stop the server first, copy it over the
+database and remove the -wal and -shm files next to it).
 EOF

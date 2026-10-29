@@ -120,6 +120,7 @@
         <tr><th>{{ self.t("set.geo_db_dir") }}</th><td class="mono small">{{ state.geo_config.db_dir.display() }}</td></tr>
         <tr><th>{{ self.t("set.geo_cache") }}</th><td>{{ state.geo_config.cache_max_entries }}</td></tr>
         <tr><th>{{ self.t("set.dns_timeout") }}</th><td>{{ state.geo_config.dns_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
+        <tr><th>{{ self.t("set.geo_auto_download") }}</th><td>{{ state.geo_config.auto_download }}</td></tr>
       </tbody>
     </table>
   </div>

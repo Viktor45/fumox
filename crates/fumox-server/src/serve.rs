@@ -69,6 +69,10 @@ pub struct AppState {
     /// for=…` are honored for the per-IP rate-limit key. Empty = never honor
     /// forwarded headers (any caller can otherwise spoof the key).
     pub trusted_cidrs: Vec<ipnet::IpNet>,
+    /// Which forwarding header the trusted proxy writes. Only the named
+    /// header is read; `None` honors none, so the peer address is the
+    /// client even when a trusted proxy is configured.
+    pub trusted_header: fumox_core::config::TrustedHeader,
     /// Hostnames / IPs allowed to reach the public listener. Empty = accept
     /// any host (today's behavior); setting this locks the alive-export
     /// endpoint to the operator's own hostname.
@@ -77,6 +81,10 @@ pub struct AppState {
     /// (`[server].export_max_rows`). The two links have no upstream cap of
     /// their own, so this is the only thing bounding one public request.
     pub export_max_rows: u32,
+    /// The capability token of the export links, kept in process memory
+    /// (the admin panel shares the instance, so a rotation reaches both
+    /// listeners at once).
+    pub export_token: crate::alive_export::TokenCache,
 }
 
 impl AppState {
@@ -85,14 +93,17 @@ impl AppState {
     /// startup wiring in `main` and the admin panel's in-process preview
     /// (`admin::handlers::profiles`) both go through it), so the two can
     /// never drift apart on how the listener is configured.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: DbPool,
         caches: Caches,
         geo: Arc<GeoResolver>,
         limits: PublicRateLimits,
         trusted_cidrs: Vec<ipnet::IpNet>,
+        trusted_header: fumox_core::config::TrustedHeader,
         allowed_hosts: Vec<String>,
         export_max_rows: u32,
+        export_token: crate::alive_export::TokenCache,
     ) -> Self {
         Self {
             pool,
@@ -100,8 +111,10 @@ impl AppState {
             geo,
             limits,
             trusted_cidrs,
+            trusted_header,
             allowed_hosts,
             export_max_rows,
+            export_token,
         }
     }
 }
@@ -175,11 +188,13 @@ pub fn router(state: AppState) -> Router {
 /// loop. The dedicated pool holds one connection and is only ever asked
 /// `SELECT 1`.
 pub fn public_app(state: AppState, health_pool: DbPool) -> Router {
+    let geo = state.geo.clone();
     router(state).route(
         "/healthz",
         get(move || {
             let pool = health_pool.clone();
-            async move { healthz(pool).await }
+            let geo = geo.clone();
+            async move { healthz(pool, geo).await }
         }),
     )
 }
@@ -196,13 +211,23 @@ pub fn public_app(state: AppState, health_pool: DbPool) -> Router {
 /// is what a restart is triggered by, so it must distinguish "the database
 /// is gone" from "the render pool is busy", and the busy case is this
 /// process's own load, not a fault worth restarting over.
-async fn healthz(pool: DbPool) -> Response {
+///
+/// The second line names the geo state: geo enrichment is optional, so a
+/// missing database is not a fault of the process, but the operator has to
+/// be able to tell "off", "no databases" and "degraded" apart without
+/// reading the log.
+async fn healthz(pool: DbPool, geo: Arc<GeoResolver>) -> Response {
     const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+    let geo_line = format!("geo: {}\n", geo.state().as_str());
     match tokio::time::timeout(ACQUIRE_TIMEOUT, sqlx::query("SELECT 1").fetch_one(&pool)).await {
-        Ok(Ok(_)) => (StatusCode::OK, "ok\n").into_response(),
+        Ok(Ok(_)) => (StatusCode::OK, format!("ok\n{geo_line}")).into_response(),
         Ok(Err(error)) => {
             tracing::error!(error = %error, "/healthz database check failed");
-            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable\n").into_response()
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("database unavailable\n{geo_line}"),
+            )
+                .into_response()
         }
         Err(_) => {
             tracing::warn!(
@@ -210,7 +235,11 @@ async fn healthz(pool: DbPool) -> Response {
                 "/healthz gave up waiting for a pool connection; \
                  reporting the instance busy rather than down"
             );
-            (StatusCode::SERVICE_UNAVAILABLE, "database busy\n").into_response()
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("database busy\n{geo_line}"),
+            )
+                .into_response()
         }
     }
 }
@@ -223,7 +252,13 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
     let Some(connect) = req.extensions().get::<ConnectInfo<SocketAddr>>().cloned() else {
         return next.run(req).await;
     };
-    let ip = client_key(connect.0, req.headers(), &state.trusted_cidrs).to_string();
+    let ip = client_key(
+        connect.0,
+        req.headers(),
+        &state.trusted_cidrs,
+        state.trusted_header,
+    )
+    .to_string();
     if !state.limits.all.allow(&ip).await {
         return error_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -818,6 +853,9 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         match source.error_class {
             None => {}
             Some(ErrorClass::Network) | Some(ErrorClass::HttpServer) => any_stale = true,
+            // The last payload could not be stored: what is served is
+            // older than the feed, exactly like an unreachable upstream.
+            Some(ErrorClass::Storage) => any_stale = true,
             Some(ErrorClass::ParseError) => any_parse_error = true,
             Some(ErrorClass::HttpClient) => unreachable!("handled above"),
         }
@@ -959,6 +997,11 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
     match source.error_class {
         None => {}
         Some(ErrorClass::Network) | Some(ErrorClass::HttpServer) => {
+            extra_headers.push(("X-Fumox-Stale".to_string(), "true".to_string()));
+        }
+        // The stored rows are older than the feed: the output is stale,
+        // the upstream is fine.
+        Some(ErrorClass::Storage) => {
             extra_headers.push(("X-Fumox-Stale".to_string(), "true".to_string()));
         }
         Some(ErrorClass::ParseError) => {
@@ -1238,8 +1281,10 @@ mod tests {
                 Arc::new(GeoResolver::new(&geo_cfg)),
                 limits,
                 Vec::new(),
+                fumox_core::config::TrustedHeader::None,
                 Vec::new(),
                 fumox_core::config::ServerConfig::default().export_max_rows,
+                crate::alive_export::TokenCache::new(),
             ),
             pool,
         )
@@ -1261,6 +1306,19 @@ mod tests {
             format!("{ip}:1").parse::<SocketAddr>().unwrap(),
         ));
         app.oneshot(request).await.unwrap().status()
+    }
+
+    /// The same request, but the answer body instead of the status.
+    async fn body_with_ip(app: Router, uri: &str, ip: &str) -> String {
+        let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            format!("{ip}:1").parse::<SocketAddr>().unwrap(),
+        ));
+        let response = app.oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     /// Requests without connect info (embedded runtimes) must pass through
@@ -1321,6 +1379,24 @@ mod tests {
         assert_eq!(
             get_with_ip(app, "/healthz", "10.0.0.1").await,
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// The answer names the geo state: geo enrichment is optional, but the
+    /// operator has to be able to tell "off", "no databases" and "degraded"
+    /// apart without reading the log.
+    #[tokio::test]
+    async fn healthz_names_the_geo_state() {
+        let (state, pool) = state_and_pool_with_limits(PublicRateLimits::unlimited()).await;
+        let app = public_app(state, pool);
+        let body = body_with_ip(app, "/healthz", "10.0.0.1").await;
+        assert!(
+            body.starts_with("ok\n"),
+            "the first line is the verdict: {body:?}"
+        );
+        assert!(
+            body.contains("geo: off"),
+            "the geo state must be named: {body:?}"
         );
     }
 
@@ -1525,11 +1601,16 @@ mod tests {
     /// claimed clients behind the same trusted peer get independent
     /// auth-failure windows, and a client-forged XFF prefix cannot open a
     /// fresh one.
+    ///
+    /// The operator declares the header the proxy writes; without that
+    /// declaration the claim is the client's own text and the peer is the
+    /// key.
     #[tokio::test]
     async fn public_rate_limit_uses_xff_ip_for_trusted_peer() {
         let (mut state, _pool) =
             state_and_pool_with_limits(PublicRateLimits::new(1_000_000, 2)).await;
         state.trusted_cidrs = vec!["2.2.2.2/32".parse().unwrap()];
+        state.trusted_header = fumox_core::config::TrustedHeader::Xff;
         let profile = make_profile(&state, "profXff000000", &[]).await;
         sqlx::query("UPDATE profiles SET access_token = 'secret' WHERE id = ?")
             .bind(&profile.id)
@@ -1600,9 +1681,7 @@ mod tests {
         // Seed the export token so the wrong-token branch below is the
         // comparison failure, not a missing `meta` row (both answer 404,
         // only the first is an auth failure).
-        let _export_token = crate::alive_export::ensure_token(&state.pool)
-            .await
-            .unwrap();
+        let _export_token = state.export_token.current(&state.pool).await.unwrap();
         let app = router(state);
 
         let marked = |response: Response| {
@@ -1766,7 +1845,7 @@ mod tests {
             .enumerate()
             .map(|(idx, source_id)| (source_id.to_string(), idx as i64))
             .collect();
-        profiles::set_sources(&state.pool, id, &composition)
+        profiles::replace_sources(&state.pool, id, &composition)
             .await
             .unwrap();
         profile
@@ -1780,7 +1859,7 @@ mod tests {
             entries,
             &[],
             fumox_core::models::now_ts(),
-            true,
+            fumox_core::ingest::IngestPolicy::from_drop_gate(false),
         )
         .await
         .unwrap();
@@ -2575,9 +2654,7 @@ mod tests {
             .await
             .unwrap();
 
-        let token = crate::alive_export::ensure_token(&state.pool)
-            .await
-            .unwrap();
+        let token = state.export_token.current(&state.pool).await.unwrap();
         let (status, _, body) = get(router(state.clone()), &format!("/export/alive/{token}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("h1.example.com"), "{body:?}");
@@ -2603,9 +2680,7 @@ mod tests {
         );
 
         // Rotating the token kills the old link immediately.
-        let fresh = crate::alive_export::rotate_token(&state.pool)
-            .await
-            .unwrap();
+        let fresh = state.export_token.rotate(&state.pool).await.unwrap();
         assert_ne!(fresh, token);
         let (status, _, _) = get(router(state.clone()), &format!("/export/alive/{token}")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2639,9 +2714,7 @@ mod tests {
             .await
             .unwrap();
 
-        let token = crate::alive_export::ensure_token(&state.pool)
-            .await
-            .unwrap();
+        let token = state.export_token.current(&state.pool).await.unwrap();
         let (status, _, body) = get(router(state.clone()), &format!("/export/ready/{token}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("export/ready"), "title block: {body:?}");
@@ -2660,9 +2733,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // Rotation kills both links, one secret, one rotation.
-        let fresh = crate::alive_export::rotate_token(&state.pool)
-            .await
-            .unwrap();
+        let fresh = state.export_token.rotate(&state.pool).await.unwrap();
         let (status, _, _) = get(router(state.clone()), &format!("/export/ready/{token}")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _, body) = get(router(state), &format!("/export/ready/{fresh}")).await;
@@ -2709,9 +2780,7 @@ mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
-        let token = crate::alive_export::ensure_token(&state.pool)
-            .await
-            .unwrap();
+        let token = state.export_token.current(&state.pool).await.unwrap();
 
         let app = router(state);
         for (uri, title, count) in [

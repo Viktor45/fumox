@@ -636,6 +636,7 @@ fn spawn_ingest(
         match outcome {
             ingest::IngestOutcome::Ok {
                 proxies_found,
+                dropped,
                 stats,
                 duration_ms,
             } => {
@@ -652,12 +653,14 @@ fn spawn_ingest(
                         "source_id": source_id,
                         "ok": true,
                         "proxies_found": proxies_found,
+                        "dropped": dropped,
                         "duration_ms": duration_ms,
                     }),
                 );
                 tracing::info!(
                     source = %source_id,
                     proxies_found,
+                    dropped,
                     inserted = stats.inserted,
                     updated = stats.updated,
                     removed = stats.removed,
@@ -704,6 +707,28 @@ fn spawn_ingest(
                     error = %message,
                     duration_ms,
                     "source parse failed"
+                );
+            }
+            ingest::IngestOutcome::StorageFailed {
+                message,
+                duration_ms,
+            } => {
+                // The feed answered, this process could not store the
+                // payload: the fault is on this side, the event says so.
+                events.publish(
+                    "fetch.failed",
+                    serde_json::json!({
+                        "source_id": source_id,
+                        "ok": false,
+                        "error_class": "storage",
+                        "duration_ms": duration_ms,
+                    }),
+                );
+                tracing::error!(
+                    source = %source_id,
+                    error = %message,
+                    duration_ms,
+                    "source payload could not be stored"
                 );
             }
         }

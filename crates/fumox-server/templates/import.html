@@ -18,24 +18,8 @@
 </div>
 {% endif %}
 
-{% match summary %}
-  {% when Some with (s) %}
-  <div class="panel">
-    <h2>{{ self.t("io.summary_title") }}</h2>
-    <p>{{ self.t("io.sources_created") }} <strong>{{ s.sources_created }}</strong></p>
-    <p>{{ self.t("io.profiles_created") }} <strong>{{ s.profiles_created }}</strong></p>
-    {% if !s.warnings.is_empty() %}
-    <h3>{{ self.t("io.warnings_title") }}</h3>
-    <ul>
-      {% for w in s.warnings %}
-      <li class="muted">{{ w }}</li>
-      {% endfor %}
-    </ul>
-    {% endif %}
-  </div>
-  {% when None %}
-{% endmatch %}
-
+{% match endpoints %}
+  {% when Some with (e) %}
 <div class="panel">
   <h2>{{ self.t("io.endpoints_title") }}</h2>
   <div class="hint">{{ self.t("io.endpoints_hint") }}</div>
@@ -52,15 +36,15 @@
       <tbody>
         <tr>
           <td>{{ self.t("io.alive_title") }}</td>
-          <td class="mono small"><a class="cell-link" href="{{ alive_url }}" title="{{ alive_url }}">{{ alive_url }}</a></td>
-          <td class="num">{{ alive_count }}</td>
-          <td><a class="btn small" href="{{ alive_url }}?download=1">{{ self.t("io.alive_download") }}</a></td>
+          <td class="mono small"><a class="cell-link" href="{{ e.alive_url }}" title="{{ e.alive_url }}">{{ e.alive_url }}</a></td>
+          <td class="num">{{ e.alive_count }}</td>
+          <td><a class="btn small" href="{{ e.alive_url }}?download=1">{{ self.t("io.alive_download") }}</a></td>
         </tr>
         <tr>
           <td>{{ self.t("io.ready_title") }}</td>
-          <td class="mono small"><a class="cell-link" href="{{ ready_url }}" title="{{ ready_url }}">{{ ready_url }}</a></td>
-          <td class="num">{{ ready_count }}</td>
-          <td><a class="btn small" href="{{ ready_url }}?download=1">{{ self.t("io.ready_download") }}</a></td>
+          <td class="mono small"><a class="cell-link" href="{{ e.ready_url }}" title="{{ e.ready_url }}">{{ e.ready_url }}</a></td>
+          <td class="num">{{ e.ready_count }}</td>
+          <td><a class="btn small" href="{{ e.ready_url }}?download=1">{{ self.t("io.ready_download") }}</a></td>
         </tr>
       </tbody>
     </table>
@@ -73,6 +57,12 @@
     <span class="hint">{{ self.t("io.rotate_hint") }}</span>
   </form>
 </div>
+  {% when None %}
+<div class="panel">
+  <h2>{{ self.t("io.endpoints_title") }}</h2>
+  <div class="hint">{{ self.t("io.endpoints_unavailable") }}</div>
+</div>
+{% endmatch %}
 
 <div class="panel">
   <h2>{{ self.t("io.config_title") }}</h2>
@@ -80,6 +70,7 @@
   <div class="form-actions">
     <a class="btn primary" href="/admin/export">{{ self.t("io.export_btn") }}</a>
   </div>
+  <div class="hint">{{ export_limit_hint }}</div>
 
   <h3>{{ self.t("io.import_title") }}</h3>
   <div class="hint">{{ self.t("io.import_hint") }}</div>
@@ -95,6 +86,7 @@
       <input type="file" id="io-file" name="file" accept=".json,application/json">
       <div class="hint">{{ self.t("io.file_hint") }}</div>
     </div>
+    <div class="hint">{{ limits_hint }}</div>
     <div class="form-actions">
       <button class="btn primary" type="submit">{{ self.t("io.submit") }}</button>
     </div>

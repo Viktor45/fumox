@@ -138,6 +138,28 @@ services:
       # …and set FUMOX_ADMIN__SECURE_COOKIES=true (the panel is HTTPS-only
       # behind the front). The server ports above can then be unpublished
       # entirely, nginx reaches both listeners over the compose network.
+      #
+      # The front needs three keys per listener, in ./config/app.toml (the
+      # file this stack mounts; the admin *Edit settings* page writes it
+      # too). The proxy's CIDR is the compose network it sits on:
+      #
+      #   [server]                         [admin]
+      #   trust_proxy_ips  = ["172.20.0.0/16"]   (the proxy's subnet)
+      #   trust_proxy_header = "xff"             (the family nginx writes:
+      #                                              X-Forwarded-For /
+      #                                              -Proto / -Host)
+      #   allowed_hosts    = ["fumox.example.com"]
+      #
+      # Without them every request shares the proxy's IP, so the per-IP
+      # rate limit becomes one budget for the whole fleet; the rendered
+      # links stay on http behind the TLS front; and the Host header is
+      # trusted as-is, which is what the allowlist is there to stop. The
+      # startup log names a trust_proxy_ips without a trust_proxy_header.
+      #
+      # The public hostname has to be on BOTH lists: the panel gates the
+      # request on [admin].allowed_hosts and builds the export link from
+      # the host you opened the panel on, while the public listener gates
+      # the link on [server].allowed_hosts.
     restart: unless-stopped
     networks:
       - default

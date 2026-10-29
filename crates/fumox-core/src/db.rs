@@ -58,9 +58,22 @@ pub async fn connect_probe_pool(cfg: &DatabaseConfig) -> crate::Result<SqlitePoo
     // lock is free, the migration succeeds.
     let mut attempt = 0;
     loop {
-        match migrate(&schema_pool).await {
+        let outcome = migrate_with(
+            &schema_pool,
+            ChecksumRepair::from_config(cfg.allow_checksum_repair),
+        )
+        .await;
+        match outcome {
             Ok(()) => break,
             Err(error) => {
+                // Only contention is worth waiting for. A checksum
+                // mismatch or a broken schema will fail the same way on
+                // the next attempt, and retrying it would hide the real
+                // reason behind a timeout.
+                if !error.is_busy() {
+                    drop(schema_pool);
+                    return Err(error);
+                }
                 attempt += 1;
                 if attempt >= 10 {
                     drop(schema_pool);
@@ -269,20 +282,60 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// What a checksum mismatch is allowed to do to the boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumRepair {
+    /// Stop the boot and name the version. The default.
+    ///
+    /// sqlx hashes the whole migration file, so a comment edit and a DDL
+    /// edit are indistinguishable from here, and a re-stamp hides a
+    /// schema that fell behind the files just as neatly as it hides a
+    /// harmless comment. The operator has to say which one it was.
+    Refuse,
+    /// Re-stamp the stored checksums from the files on disk and carry
+    /// on. Opt-in, for the operator who knows the edit was comment-only.
+    Allow,
+}
+
+impl ChecksumRepair {
+    /// The flag as the config carries it.
+    pub const fn from_config(allow: bool) -> Self {
+        if allow {
+            ChecksumRepair::Allow
+        } else {
+            ChecksumRepair::Refuse
+        }
+    }
+}
+
 /// Runs the sqlx migrations embedded in `fumox-core` and mirrors the applied
 /// schema version into the `meta` table (DATABASE, exploitation notes).
+///
+/// A checksum mismatch stops the boot: see [`migrate_with`] and
+/// [`ChecksumRepair`].
+pub async fn migrate(pool: &SqlitePool) -> crate::Result<()> {
+    migrate_with(pool, ChecksumRepair::Refuse).await
+}
+
+/// The migrations, with the checksum policy the caller chose.
 ///
 /// The pool has to be an unrestricted one: the probe's restricted
 /// connections refuse the schema changes a migration makes.
 /// [`connect_probe_pool`] applies the schema before it opens them.
 ///
+/// The migrations run under an exclusive lock (see [`MigrationLock`]), so
+/// two processes starting at the same moment cannot apply the same file
+/// twice: sqlx does not lock a SQLite database while it migrates.
+///
 /// `sqlx` rejects startup when a previously-applied migration file has been
 /// edited in place: the SHA-384 stored in `_sqlx_migrations.checksum` no
 /// longer matches the file. The intended discipline is to never edit an
-/// applied migration, every change belongs in a new file. Comment-only
-/// edits break this discipline for no gain, so this function catches the
-/// specific `VersionMismatch` variant and re-stamps every applied
-/// migration's checksum with the on-disk content.
+/// applied migration, every change belongs in a new file. A comment-only
+/// edit breaks that discipline for no gain, but the re-stamp that hides it
+/// also hides a DDL edit, so it is not done on its own: with
+/// [`ChecksumRepair::Refuse`] the boot stops and names the version, and
+/// with [`ChecksumRepair::Allow`] the operator has said that the edit was
+/// harmless.
 ///
 /// What the re-stamp does *not* do is apply anything: sqlx never re-runs
 /// an already-applied migration, and the SHA-384 covers the whole file, so
@@ -295,24 +348,71 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
 /// fact survives the log. Any other error (dirty state, missing migration,
 /// structural mismatch, real DDL failure) is surfaced to the caller
 /// untouched.
-pub async fn migrate(pool: &SqlitePool) -> crate::Result<()> {
+pub async fn migrate_with(pool: &SqlitePool, repair: ChecksumRepair) -> crate::Result<()> {
     let migrator: Migrator = sqlx::migrate!("./migrations");
-    let mut repaired: Vec<i64> = Vec::new();
-    if let Err(error) = migrator.run(pool).await {
-        if !matches!(error, MigrateError::VersionMismatch(_)) {
-            return Err(error.into());
+    let _lock = MigrationLock::acquire(pool).await?;
+
+    let mut original: Option<MigrateError> = None;
+    let mut busy_attempt = 0u32;
+    loop {
+        match migrator.run(pool).await {
+            Ok(()) => break,
+            Err(error) => {
+                if let MigrateError::VersionMismatch(version) = &error {
+                    let version = *version;
+                    if repair == ChecksumRepair::Refuse {
+                        return Err(checksum_mismatch_error(version));
+                    }
+                    // Remember the mismatch: a failure of the retry has to
+                    // name both, or the operator sees the symptom without
+                    // the cause.
+                    if original.is_none() {
+                        original = Some(MigrateError::VersionMismatch(version));
+                    }
+                    // `migrator.iter()` carries the canonical checksums the
+                    // embedded copy expects. Only applied versions are
+                    // touched, so the bookkeeping row exists for every
+                    // version we rewrite.
+                    let re_stamped = repair_migration_checksums(pool, &migrator).await?;
+                    if re_stamped.is_empty() {
+                        // Nothing was rewritten, so the retry below would
+                        // fail with the very same error. Report the
+                        // original mismatch instead of claiming a repair
+                        // that did not happen.
+                        return Err(original
+                            .take()
+                            .map(crate::Error::from)
+                            .unwrap_or_else(|| crate::Error::Database(String::new())));
+                    }
+                    // The breadcrumb and the error log go out *before* the
+                    // retry: a crash in the middle of it must still leave
+                    // the trace of what was re-stamped.
+                    record_migration_repair(pool, &re_stamped).await?;
+                    continue;
+                }
+                let converted: crate::Error = error.into();
+                // Contention is the only failure worth waiting for: the
+                // other writer finishes and the retry re-reads the applied
+                // list.
+                if converted.is_busy() {
+                    busy_attempt += 1;
+                    if busy_attempt <= MIGRATE_BUSY_ATTEMPTS {
+                        tokio::time::sleep(busy_backoff(busy_attempt)).await;
+                        continue;
+                    }
+                }
+                // A failure after a repair belongs to that repair: name
+                // both, or the operator sees the symptom without the
+                // cause.
+                if let Some(original) = original.take() {
+                    return Err(crate::Error::Database(format!(
+                        "the checksum repair did not make the migration succeed: {converted}; \
+                         original: {original}"
+                    )));
+                }
+                return Err(converted);
+            }
         }
-        // `migrator.iter()` carries the canonical checksums the embedded
-        // copy expects. Only applied versions are touched, so the
-        // bookkeeping row exists for every version we rewrite.
-        repaired = repair_migration_checksums(pool, &migrator).await?;
-        if repaired.is_empty() {
-            // Nothing was rewritten, so the retry below would fail with the
-            // very same error. Report the original mismatch instead of
-            // claiming a repair that did not happen.
-            return Err(error.into());
-        }
-        migrator.run(pool).await?;
     }
 
     let applied: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
@@ -337,11 +437,168 @@ pub async fn migrate(pool: &SqlitePool) -> crate::Result<()> {
         .await?;
     }
 
-    if !repaired.is_empty() {
-        record_migration_repair(pool, &repaired).await?;
-    }
-
     Ok(())
+}
+
+/// How many times a migration is retried while the database is busy.
+const MIGRATE_BUSY_ATTEMPTS: u32 = 10;
+
+/// The wait before the first busy retry; every further one doubles, up to
+/// the cap.
+const MIGRATE_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+/// The ceiling of the busy backoff.
+const MIGRATE_BUSY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The wait before the next attempt after a busy database.
+fn busy_backoff(attempt: u32) -> std::time::Duration {
+    let factor = 1u32 << attempt.min(5);
+    MIGRATE_BUSY_BACKOFF
+        .saturating_mul(factor)
+        .min(MIGRATE_BUSY_BACKOFF_MAX)
+}
+
+/// The error a refused checksum mismatch produces.
+///
+/// It names the version, says what a mismatch means, and gives the two
+/// ways out: the repair tool, or the opt-in flag.
+fn checksum_mismatch_error(version: i64) -> crate::Error {
+    crate::Error::Database(format!(
+        "applied migration {version} differs from the file — a new migration file is needed. \
+         sqlx: migration {version} was previously applied but has been modified. \
+         If the edit was comment-only, re-stamp it with \
+         `cargo run -p fumox-core --example repair_migration_checksums -- <database path>`, \
+         or start once with [database].allow_checksum_repair = true."
+    ))
+}
+
+/// The sidecar file that serialises the migrations between the processes
+/// that share the database.
+const MIGRATION_LOCK_SUFFIX: &str = "-migrate.lock";
+
+/// How many times the lock is retried before the migration gives up.
+const MIGRATION_LOCK_ATTEMPTS: u32 = 60;
+/// The wait between two attempts at the lock.
+const MIGRATION_LOCK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// An exclusive, advisory lock that serialises the migrations between the
+/// processes that share the database file.
+///
+/// sqlx does not lock a SQLite database while it migrates — its
+/// `Migrate::lock` is a no-op for SQLite — so the server and the probe
+/// starting at the same moment can read the applied-migration list at the
+/// same time and both try to apply the same file. One of them wins, the
+/// other gets SQLITE_BUSY or a duplicate-version error.
+///
+/// The lock is a `flock` on a sidecar file next to the database: it is
+/// advisory, so it serialises the migrators without getting in the way of
+/// the readers and writers of the same database. Closing the descriptor
+/// releases it, so a crashed process leaves no stale lock behind.
+struct MigrationLock {
+    /// Kept for its lifetime: the lock is released when the descriptor is
+    /// closed.
+    _file: std::fs::File,
+}
+
+impl MigrationLock {
+    /// Take the lock, waiting for the process that holds it to finish its
+    /// migration.
+    ///
+    /// `Ok(None)` means the lock is not available on this system — the
+    /// sidecar cannot be created, or the filesystem has no `flock` — and
+    /// the migration runs unlocked, which is how it behaved before the
+    /// lock existed. `Err` means another process is migrating and did not
+    /// finish within the budget.
+    async fn acquire(pool: &SqlitePool) -> crate::Result<Option<Self>> {
+        let file: Option<String> =
+            sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+                .fetch_one(pool)
+                .await
+                .ok();
+        let Some(file) = file.filter(|path| !path.is_empty()) else {
+            // An in-memory database has no file to lock, and no other
+            // process can reach it either.
+            return Ok(None);
+        };
+        let path = sidecar_path(std::path::Path::new(&file), MIGRATION_LOCK_SUFFIX);
+        for _attempt in 1..=MIGRATION_LOCK_ATTEMPTS {
+            match try_lock(&path) {
+                LockAttempt::Taken(handle) => {
+                    return Ok(Some(Self { _file: handle }));
+                }
+                LockAttempt::Contended => {
+                    tokio::time::sleep(MIGRATION_LOCK_BACKOFF).await;
+                }
+                LockAttempt::Unavailable(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "the migration lock is not available, migrating without it"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        Err(crate::Error::Database(format!(
+            "another process is migrating {}: the migration lock stayed busy for {} s",
+            file,
+            u64::from(MIGRATION_LOCK_ATTEMPTS) * MIGRATION_LOCK_BACKOFF.as_secs()
+        )))
+    }
+}
+
+/// The outcome of one attempt at the migration lock.
+enum LockAttempt {
+    /// The lock is held by this process.
+    Taken(std::fs::File),
+    /// Another process holds it; try again later.
+    Contended,
+    /// The lock cannot be taken on this system at all.
+    Unavailable(std::io::Error),
+}
+
+/// Take the exclusive lock on the sidecar, without waiting.
+#[cfg(unix)]
+fn try_lock(path: &std::path::Path) -> LockAttempt {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let handle = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        // A symlink at the lock path would redirect the lock to a file
+        // the operator did not choose.
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(handle) => handle,
+        Err(err) => return LockAttempt::Unavailable(err),
+    };
+    let rc = unsafe { libc::flock(handle.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return LockAttempt::Taken(handle);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        // Someone else holds the lock.
+        Some(libc::EWOULDBLOCK) => LockAttempt::Contended,
+        // Interrupted by a signal: try again.
+        Some(libc::EINTR) => LockAttempt::Contended,
+        // The filesystem has no advisory locking at all.
+        Some(libc::ENOLCK) | Some(libc::EOPNOTSUPP) => LockAttempt::Unavailable(err),
+        _ => LockAttempt::Unavailable(err),
+    }
+}
+
+/// Advisory locking is a Unix facility; elsewhere the migration runs
+/// unlocked.
+#[cfg(not(unix))]
+fn try_lock(_path: &std::path::Path) -> LockAttempt {
+    LockAttempt::Unavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "advisory file locking is not available on this platform",
+    ))
 }
 
 /// Persist the self-heal under `meta.migrations_repaired` and shout about
@@ -593,6 +850,7 @@ mod unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         let meta = std::fs::metadata(&path).unwrap();
@@ -614,6 +872,7 @@ mod unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let pool = connect_pool(&cfg).await.unwrap();
         // The file `pre_create_db_file` chmod'ed is the one the pool opened.
@@ -648,6 +907,7 @@ mod unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 0,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let err = connect_pool(&cfg).await.unwrap_err();
         assert!(
@@ -677,6 +937,7 @@ mod unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         // The chmod-confirmation step brought it back to 0600.
@@ -695,6 +956,7 @@ mod unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let pool = connect_pool(&cfg).await.unwrap();
 
@@ -748,6 +1010,7 @@ mod unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let err = connect_pool(&cfg).await.unwrap_err();
         assert!(
@@ -767,6 +1030,7 @@ mod unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Full,
+            allow_checksum_repair: false,
         };
         let pool = connect_pool(&cfg).await.unwrap();
         let mode: i64 = sqlx::query_scalar("PRAGMA synchronous")
@@ -802,6 +1066,7 @@ mod unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let err = connect_pool(&cfg).await.unwrap_err();
         // The Database wrapper for the chmod path is named "set 0600" in
@@ -844,6 +1109,7 @@ mod unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         let parent = dir.path().join("a/b/c");
@@ -882,6 +1148,7 @@ mod non_unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         assert!(
@@ -904,6 +1171,7 @@ mod non_unix_db_tests {
             busy_timeout_ms: 1000,
             max_connections: 1,
             synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
         };
         let _pool = connect_pool(&cfg).await.unwrap();
         assert!(

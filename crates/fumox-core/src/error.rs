@@ -10,8 +10,18 @@ pub enum Error {
     #[error("parse error: {0}")]
     Parse(String),
 
+    /// A database failure that is not the driver's: the file could not be
+    /// created or secured, or a repository precondition failed. There is
+    /// no driver error behind it to keep, only this text.
     #[error("database error: {0}")]
     Database(String),
+
+    /// A failure the driver reported. The original error is kept, so a
+    /// caller can classify it by the driver's variant — a locked database
+    /// is transient, a missing table is not — instead of by the text of
+    /// the message.
+    #[error("database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
 
     /// The row does not exist. Kept apart from [`Error::Database`] so a
     /// caller can answer "not found" instead of "the database failed".
@@ -22,9 +32,60 @@ pub enum Error {
     Migration(#[from] sqlx::migrate::MigrateError),
 }
 
-impl From<sqlx::Error> for Error {
-    fn from(err: sqlx::Error) -> Self {
-        Error::Database(err.to_string())
+impl Error {
+    /// The failure is transient contention over the database file: another
+    /// process holds the write lock, or the pool had no connection to
+    /// hand out.
+    ///
+    /// The classification reads the driver's variant and SQLite's result
+    /// code, never the message text: SQLite localizes that text, and it
+    /// has changed between releases ("database is locked" is not a
+    /// contract).
+    pub fn is_busy(&self) -> bool {
+        match self {
+            Error::Sqlx(err) => sqlx_error_is_busy(err),
+            Error::Migration(err) => migrate_error_is_busy(err),
+            _ => false,
+        }
+    }
+}
+
+/// SQLITE_BUSY: another connection holds the write lock.
+const SQLITE_BUSY: i64 = 5;
+/// SQLITE_LOCKED: another connection holds a lock on the table.
+const SQLITE_LOCKED: i64 = 6;
+
+/// Whether a SQLite result code means "contention, try again later".
+///
+/// The driver reports the *extended* result code, whose low byte carries
+/// the primary one: SQLITE_BUSY_SNAPSHOT (517) and SQLITE_BUSY_RECOVERY
+/// (261) are both SQLITE_BUSY (5).
+fn sqlite_code_is_busy(code: &str) -> bool {
+    code.trim()
+        .parse::<i64>()
+        .is_ok_and(|code| matches!(code & 0xff, SQLITE_BUSY | SQLITE_LOCKED))
+}
+
+/// Whether a driver error is contention rather than a real failure.
+fn sqlx_error_is_busy(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => {
+            db_err.code().is_some_and(|code| sqlite_code_is_busy(&code))
+        }
+        // The pool had no free connection: the database is busy even
+        // though the driver never got to say so.
+        sqlx::Error::PoolTimedOut => true,
+        _ => false,
+    }
+}
+
+/// The same question for a migration failure.
+fn migrate_error_is_busy(err: &sqlx::migrate::MigrateError) -> bool {
+    use sqlx::migrate::MigrateError;
+    match err {
+        MigrateError::Execute(err) => sqlx_error_is_busy(err),
+        MigrateError::ExecuteMigration(err, _) => sqlx_error_is_busy(err),
+        _ => false,
     }
 }
 

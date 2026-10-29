@@ -3,8 +3,9 @@
 //! preview, toggle / delete actions.
 
 use super::{
-    FormError, action_response, caps, is_htmx, mask_secret, not_found, pipeline_from_form,
-    row_error_response, server_error, validate_slug,
+    FormError, action_response, is_htmx, mask_secret, not_found, pipeline_from_form,
+    row_error_response, server_error, validate_countries, validate_name, validate_slug,
+    validate_token,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -381,10 +382,8 @@ async fn build_profile_from_form(
     let mut errors: Vec<(String, String)> = Vec::new();
 
     let name = get("name");
-    if name.is_empty() {
-        errors.push(("name".into(), lang.t("val.required").into()));
-    } else if name.chars().count() > 200 {
-        errors.push(("name".into(), lang.t("val.name_too_long").into()));
+    if let Err(message) = validate_name(&name, lang) {
+        errors.push(("name".into(), message));
     }
 
     let slug_raw = get("slug");
@@ -428,20 +427,9 @@ async fn build_profile_from_form(
     // endpoint, so it is URL-safe and bounded like every other field.
     if !unchanged
         && let Some(token) = access_token.as_ref()
-        && token.len() > caps::ACCESS_TOKEN
+        && let Err(message) = validate_token(token, lang)
     {
-        errors.push((
-            "access_token".into(),
-            lang.t("val.field_too_long")
-                .replace("{}", &caps::ACCESS_TOKEN.to_string()),
-        ));
-    } else if !unchanged
-        && let Some(token) = access_token.as_ref()
-        && !token
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
-    {
-        errors.push(("access_token".into(), lang.t("val.token_format").into()));
+        errors.push(("access_token".into(), message));
     }
 
     let format_raw = get("output_format");
@@ -461,32 +449,20 @@ async fn build_profile_from_form(
     // Country allowlist: comma-separated ISO 3166-1 alpha-2 codes; empty
     // means no filtering. Validated per code, normalized to uppercase.
     let countries_raw = get("countries");
-    let mut countries: Vec<String> = Vec::new();
-    for code in countries_raw.split(',') {
-        let code = code.trim();
-        if code.is_empty() {
-            continue;
+    let countries: Vec<String> = match validate_countries(
+        &countries_raw
+            .split(',')
+            .map(|code| code.trim().to_string())
+            .filter(|code| !code.is_empty())
+            .collect::<Vec<_>>(),
+        lang,
+    ) {
+        Ok(list) => list,
+        Err(message) => {
+            errors.push(("countries".into(), message));
+            Vec::new()
         }
-        let upper = code.to_ascii_uppercase();
-        if upper.len() != 2 || !upper.chars().all(|c| c.is_ascii_alphabetic()) {
-            errors.push((
-                "countries".into(),
-                lang.t("val.country_format").replace("{}", code),
-            ));
-            continue;
-        }
-        if !countries.contains(&upper) {
-            countries.push(upper);
-        }
-    }
-    // Country count cap.
-    if countries.len() > caps::COUNTRIES {
-        errors.push((
-            "countries".into(),
-            lang.t("val.too_many_countries")
-                .replace("{}", &caps::COUNTRIES.to_string()),
-        ));
-    }
+    };
 
     // Every selected source must exist (guards against stale form posts).
     let composition = composition_from_form(form);
@@ -611,7 +587,7 @@ pub async fn profile_create(
     if let Err(err) = profiles::create(&state.pool, &profile).await {
         return server_error(lang, &err);
     }
-    if let Err(err) = profiles::set_sources(&state.pool, &profile.id, &composition).await {
+    if let Err(err) = profiles::replace_sources(&state.pool, &profile.id, &composition).await {
         return server_error(lang, &err);
     }
     tracing::info!(profile = %profile.id, "profile created");
@@ -638,7 +614,7 @@ pub async fn profile_update(
     if let Err(err) = profiles::update(&state.pool, &profile).await {
         return row_error_response(lang, &err, "err.profile_not_found");
     }
-    if let Err(err) = profiles::set_sources(&state.pool, &profile.id, &composition).await {
+    if let Err(err) = profiles::replace_sources(&state.pool, &profile.id, &composition).await {
         return server_error(lang, &err);
     }
     // Saved means immediately effective.
@@ -717,8 +693,10 @@ pub async fn profile_detail(
         // rate-limit middleware; fresh counters here are never consulted.
         crate::serve::PublicRateLimits::unlimited(),
         Vec::new(),
+        fumox_core::config::TrustedHeader::None,
         Vec::new(),
         state.server().export_max_rows,
+        state.export_token.clone(),
     );
     let (preview, preview_note) =
         match crate::serve::preview_sub(&app_state, &profile, PREVIEW_LINES).await {
@@ -901,6 +879,7 @@ pub async fn profile_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::handlers::caps;
 
     /// Admin state on a throwaway migrated database: the form builder
     /// only touches the pool (slug/target lookups, stored token).

@@ -4,6 +4,7 @@
 //! canonicalization, one comparison.
 
 use axum::http::{HeaderMap, header};
+use fumox_core::config::TrustedHeader;
 use std::fmt;
 use std::net::SocketAddr;
 
@@ -96,10 +97,14 @@ pub fn validate_request_host(
     if allowed_hosts.is_empty() {
         return Ok(());
     }
-    let host = canonical_request_host(headers);
+    validate_canonical_host(&canonical_request_host(headers), allowed_hosts)
+}
+
+/// Compare one canonical host against the allowlist.
+fn validate_canonical_host(host: &str, allowed_hosts: &[String]) -> Result<(), HostRejected> {
     if host.is_empty() {
         return Err(HostRejected {
-            host,
+            host: host.to_string(),
             reason: RejectionReason::Missing,
         });
     }
@@ -107,50 +112,188 @@ pub fn validate_request_host(
         .iter()
         .map(|h| canonicalize_host_str(h))
         .collect();
-    if allowed_canonical.iter().any(|h| h == &host) {
+    if allowed_canonical.iter().any(|h| h == host) {
         Ok(())
     } else {
         Err(HostRejected {
-            host,
+            host: host.to_string(),
             reason: RejectionReason::NotAllowed,
         })
     }
 }
 
-/// A `Host` header that cannot be read as text, is blank, or does not
-/// canonicalize (a literal `@`, the userinfo separator) never becomes a URL
-/// host component. The serve link carries a capability token, so
-/// `name@evil.com` would send the operator (and anyone who clicks the
-/// link) to `http://name@evil.com/export/alive/{token}` with the token as
-/// the query of an attacker-controlled host. The canonicalizer is the same
-/// one the gate uses, so the two consumers can never disagree about what a
-/// Host means, and the check runs even with an empty allowlist, that is
-/// exactly the configuration the gate skips.
+/// The canonical host a trusted proxy names in `X-Forwarded-Host` or in the
+/// RFC 7239 `Forwarded: host=` element.
+///
+/// Only the header family the operator declared ([`TrustedHeader`]) is
+/// read: a client that reaches the panel directly can write these headers
+/// itself, and an undeclared family is text nobody vouched for. Empty when
+/// the declared family carries nothing usable.
+pub fn canonical_forwarded_host(headers: &HeaderMap, trusted_header: TrustedHeader) -> String {
+    if trusted_header.honors_xff()
+        && let Some(raw) = headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+    {
+        let host = canonicalize_host_str(raw);
+        if !host.is_empty() {
+            return host;
+        }
+    }
+    if trusted_header.honors_forwarded()
+        && let Some(host) = forwarded_host_element(headers)
+    {
+        return host;
+    }
+    String::new()
+}
+
+/// The `host=` element of an RFC 7239 `Forwarded` header, canonicalized.
+fn forwarded_host_element(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::FORWARDED)?.to_str().ok()?;
+    for element in raw.split(',') {
+        for pair in element.split(';') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if !key.trim().eq_ignore_ascii_case("host") {
+                continue;
+            }
+            let value = value.trim().trim_matches('"');
+            if value.is_empty() {
+                continue;
+            }
+            let host = canonicalize_host_str(value);
+            if !host.is_empty() {
+                return Some(host);
+            }
+        }
+    }
+    None
+}
+
+/// Gate the host a trusted proxy forwarded: the request is allowed when
+/// the proxy's own forwarded host is on the allowlist, even when the
+/// `Host` header it rewrote is not.
+pub fn validate_forwarded_host(
+    headers: &HeaderMap,
+    allowed_hosts: &[String],
+    trusted_header: TrustedHeader,
+) -> Result<(), HostRejected> {
+    if allowed_hosts.is_empty() {
+        return Ok(());
+    }
+    validate_canonical_host(&canonical_forwarded_host(headers, trusted_header), allowed_hosts)
+}
+
+/// True when the canonical host is a well-formed authority component: a
+/// DNS name (letters, digits, `-`, `.`), an IPv4 literal, or a bracketed
+/// IPv6 literal whose contents parse as an address.
+///
+/// Everything else is not a host: a path, a query, a fragment, a percent
+/// escape, a space or a backslash. Such a value must never reach a URL,
+/// and the serve link carries a capability token, so a host of
+/// `evil.com/#` would put the token behind an attacker-controlled
+/// authority.
+fn host_grammar_ok(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some(inside) = rest.strip_suffix(']') else {
+            return false;
+        };
+        return inside.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    if host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return host.parse::<std::net::Ipv4Addr>().is_ok();
+    }
+    host.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
+/// The host a serve link points at: the canonical name plus the port the
+/// request's `Host` header carried, if it spelled one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeLinkHost {
+    /// The canonical host, port-stripped, IPv6 brackets preserved.
+    pub host: String,
+    /// The port the `Host` header spelled, if any. The caller decides
+    /// whether it applies: the serve link points at the *public*
+    /// listener, whose port is the one in `[server].bind`.
+    pub port: Option<u16>,
+}
+
+/// A `Host` header that cannot be read as text, is blank, does not
+/// canonicalize (a literal `@`, the userinfo separator) or is not a
+/// well-formed host never becomes a URL host component. The serve link
+/// carries a capability token, so `name@evil.com` would send the operator
+/// (and anyone who clicks the link) to `http://name@evil.com/export/alive/{token}`
+/// with the token as the query of an attacker-controlled host. The
+/// canonicalizer is the same one the gate uses, so the two consumers can
+/// never disagree about what a Host means, and the check runs even with an
+/// empty allowlist, that is exactly the configuration the gate skips.
 fn serve_link_host(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::HOST).and_then(|v| v.to_str().ok())?;
     if raw.trim().is_empty() {
         return None;
     }
     let host = canonicalize_host_str(raw.trim());
-    (!host.is_empty()).then_some(host)
+    if host.is_empty() || !host_grammar_ok(&host) {
+        return None;
+    }
+    Some(host)
+}
+
+/// The port a `host[:port]` authority spells, IPv6-bracket aware. `None`
+/// when the authority carries no port or the port is not a number.
+fn authority_port(raw: &str) -> Option<u16> {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let after = &rest[end + 1..];
+        return after.strip_prefix(':').and_then(|p| p.parse().ok());
+    }
+    let (host, port) = raw.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') || port.is_empty() {
+        return None;
+    }
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    port.parse().ok()
+}
+
+/// The port the `Host` header spelled, if any.
+fn serve_link_port(headers: &HeaderMap) -> Option<u16> {
+    let raw = headers.get(header::HOST).and_then(|v| v.to_str().ok())?;
+    authority_port(raw)
 }
 
 /// Link-builder for the admin panel: lowercases the host and matches it
 /// against the allowlist, returning the canonical host (port-stripped,
-/// IPv6 brackets preserved when present) on success or `HostRejected` on
-/// mismatch.
+/// IPv6 brackets preserved when present) and the port the request carried
+/// on success, or `HostRejected` on mismatch.
 pub fn build_serve_link_host(
     bind: SocketAddr,
     headers: &HeaderMap,
     allowed_hosts: &[String],
-) -> Result<String, HostRejected> {
+) -> Result<ServeLinkHost, HostRejected> {
     validate_request_host(headers, allowed_hosts)?;
     if let Some(host) = serve_link_host(headers) {
-        return Ok(host);
+        return Ok(ServeLinkHost {
+            port: serve_link_port(headers),
+            host,
+        });
     }
     // No usable Host header: fall back to the bound IP (unspecified →
     // loopback).
-    Ok(fallback_host(bind))
+    Ok(ServeLinkHost {
+        host: fallback_host(bind),
+        port: None,
+    })
 }
 
 fn fallback_host(bind: SocketAddr) -> String {
@@ -218,14 +361,14 @@ mod tests {
         // `@` without a colon, the shape the gate's single-colon port strip
         // used to leave untouched.
         let out = build_serve_link_host(bind, &host("vpn.example.com@evil.com"), &[]).unwrap();
-        assert_eq!(out, "127.0.0.1", "{out}");
-        assert!(!out.contains('@'));
+        assert_eq!(out.host, "127.0.0.1", "{out:?}");
+        assert!(!out.host.contains('@'));
         // Same with a port on the attacker side.
         let out = build_serve_link_host(bind, &host("vpn.example.com:8080@evil.com"), &[]).unwrap();
-        assert!(!out.contains('@'), "{out}");
+        assert!(!out.host.contains('@'), "{out:?}");
         // An ordinary host still canonicalizes as before, allowlist or not.
         assert_eq!(
-            build_serve_link_host(bind, &host("VPN.EXAMPLE.COM:8081"), &[]).unwrap(),
+            build_serve_link_host(bind, &host("VPN.EXAMPLE.COM:8081"), &[]).unwrap().host,
             "vpn.example.com"
         );
     }
@@ -298,7 +441,50 @@ mod tests {
         // The port is stripped for the URL host component, the caller
         // appends the public port from `[server].bind`.
         let out = build_serve_link_host(bind, &host("vpn.example.com:8081"), &allowed).unwrap();
-        assert_eq!(out, "vpn.example.com");
+        assert_eq!(out.host, "vpn.example.com");
+        // The port the authority spelled is reported separately: behind a
+        // trusted proxy it is the public authority's port.
+        assert_eq!(out.port, Some(8081));
+    }
+
+    /// M-157: only a well-formed host reaches the URL. A host holding
+    /// a path, a query, a fragment, a percent escape, a space or a
+    /// backslash is not a host; the serve link carries a capability
+    /// token, so such a value must never end up in it.
+    #[test]
+    fn a_malformed_host_never_reaches_the_serve_link() {
+        let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        for raw in [
+            "evil.com/",
+            "evil.com?x=1",
+            "evil.com#fragment",
+            "evil.com%2f",
+            "evil.com name",
+            "evil\\com",
+            "evil.com:@x",
+            "[not-an-ip]",
+            "999.1.1.1",
+        ] {
+            let out = build_serve_link_host(bind, &host(raw), &[]).unwrap();
+            assert_eq!(
+                out.host, "127.0.0.1",
+                "{raw:?} must not reach the serve link: {out:?}"
+            );
+        }
+
+        // A well-formed host still builds the link.
+        assert_eq!(
+            build_serve_link_host(bind, &host("vpn.example.com"), &[])
+                .unwrap()
+                .host,
+            "vpn.example.com"
+        );
+        assert_eq!(
+            build_serve_link_host(bind, &host("[::1]:8080"), &[])
+                .unwrap()
+                .host,
+            "[::1]"
+        );
     }
 
     #[test]

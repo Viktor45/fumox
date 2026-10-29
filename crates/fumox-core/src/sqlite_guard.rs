@@ -92,6 +92,7 @@ const RULES: &[TableRule] = &[
             "ladder_at",
             "ladder_step",
             "last_t2_failed_at",
+            "last_t2_checked_at",
             "updated_at",
         ],
     },
@@ -268,6 +269,7 @@ mod tests {
             "ladder_at",
             "ladder_step",
             "last_t2_failed_at",
+            "last_t2_checked_at",
             "updated_at",
         ] {
             assert!(

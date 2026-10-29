@@ -864,6 +864,67 @@ pub fn create_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// Write `contents` to `path` through the same atomic path a save
+/// takes: a temporary file in the same directory, fsynced, then moved
+/// into place. The config file can carry `[admin].token`, so it must
+/// never exist world-readable, not even for the moment between the
+/// create and a later chmod: the mode is set at creation time.
+///
+/// An existing file is never overwritten. The check runs under the
+/// same advisory lock the editor takes, so a create cannot race the
+/// *Edit settings* form for the same path.
+///
+/// On non-Unix platforms the platform's ACL model governs and the mode
+/// is not applied.
+pub fn create_private_file_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let _lock = ConfigLock::acquire(path);
+    if path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} already exists", path.display()),
+        ));
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the config path has no file name",
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+
+    let mut tmp = None;
+    for _ in 0..TMP_NAME_ATTEMPTS {
+        let n = SAVE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(tmp_name(&file_name, std::process::id(), n));
+        match write_tmp_preserving_mode(path, &candidate, contents.as_bytes()) {
+            Ok(()) => {
+                tmp = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let Some(tmp) = tmp else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("no free temporary file name next to {}", path.display()),
+        ));
+    };
+
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        remove_tmp(&tmp);
+        return Err(err);
+    }
+    sync_parent_dir(parent);
+    Ok(())
+}
+
 /// The reference `config/app.toml` shipped in the repository. Embedded
 /// at compile time so the admin panel's *Create from defaults* button
 /// can bootstrap a fresh checkout without depending on the working
@@ -913,6 +974,55 @@ mod tests {
             std::env::temp_dir().join(format!("fumox-cfg-writer-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_created_config_is_private_and_never_overwrites() {
+        let dir = tmp_dir("create");
+        let path = dir.join("app.toml");
+
+        create_private_file_atomic(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[server]\nbind = \"0.0.0.0:8080\"\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "a fresh config carries the admin token and must not be readable by others"
+            );
+        }
+
+        // A second create must not overwrite what is there: the panel
+        // offers the button only for a missing file, and a create that
+        // clobbered an existing config would lose the operator's edits.
+        let err = create_private_file_atomic(&path, "[server]\nbind = \"0.0.0.0:1\"\n").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("0.0.0.0:8080"),
+            "the existing config must survive a refused create"
+        );
+
+        // No temporary file is left behind next to the config. The
+        // advisory lock file is not one: it is the lock, not a leftover.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "app.toml" && !name.ends_with(".lock"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the create must leave no temporary file behind: {leftovers:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

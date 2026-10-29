@@ -49,6 +49,7 @@ If you only have five minutes, read sections [1](#1-what-is-fumox),
     - [The status state machine](#the-status-state-machine)
   - [11. Geo enrichment](#11-geo-enrichment)
   - [12. Data, backups, retention](#12-data-backups-retention)
+    - [Repair and restore scripts](#repair-and-restore-scripts)
   - [13. Running in production – checklist](#13-running-in-production--checklist)
   - [14. Troubleshooting](#14-troubleshooting)
   - [15. Where to read more](#15-where-to-read-more)
@@ -214,13 +215,23 @@ Notes:
   (certificates mount into `/certs`, ACME challenges are served on port 80);
   wire it up as a compose service in front of `server`.
 
-> **Behind a reverse proxy, two config keys must be set** for both the
+> **Behind a reverse proxy, three config keys must be set** for both the
 > `/sub` clients and the admin panel to behave correctly:
 >
 > - `[server].trust_proxy_ips` / `[admin].trust_proxy_ips`: the proxy's
 >   CIDR (`["127.0.0.1/32"]` for nginx on the same host). Without this,
 >   the per-IP rate limit collapses to one budget because every request
 >   arrives from the proxy's IP.
+> - `[server].trust_proxy_header` / `[admin].trust_proxy_header`: the
+>   header family your proxy writes — `"xff"` for `X-Forwarded-For` /
+>   `X-Forwarded-Proto` / `X-Forwarded-Host`, `"forwarded"` for the
+>   RFC 7239 `Forwarded` header, `"both"` when the proxy sends both.
+>   The default `"none"` reads no forwarding header at all: such a
+>   header is text the client chose, so a client that forges one would
+>   otherwise pick its own rate-limit bucket and its own scheme hint.
+>   Set this to the family your proxy actually writes; with
+>   `trust_proxy_ips` set and this left at `"none"` the server says so
+>   in a startup warning.
 > - `[server].allowed_hosts` / `[admin].allowed_hosts`: your public
 >   hostname (`["fumox.example.com"]`). Without this, the `Host` header is
 >   trusted as-is: an attacker that can poison the `Host` reaching the
@@ -240,6 +251,13 @@ Notes:
 > the public listener answers it `404`: it does not serve that host.
 > Either reach the panel on the same hostname the public list allows,
 > or add `127.0.0.1` to `[server].allowed_hosts` as well.
+>
+> The allowlist is enforced at the edge of the admin listener: a request
+> whose `Host` is not on `[admin].allowed_hosts` is refused with `400`
+> on every panel route, the login screen included. Behind a trusted
+> proxy the forwarded host (`X-Forwarded-Host` or `Forwarded: host=`,
+> read only from the declared family) is accepted as well, so a proxy
+> that rewrites `Host` to its own upstream name still works.
 >
 > The admin panel also answers `403` (`err.cross_site`) to requests it
 > classifies as cross-site: `Sec-Fetch-Site: cross-site` (top-level
@@ -587,11 +605,11 @@ Built-in protections: CSRF tokens on every form, per-IP rate limiting
 | **Dashboard**       | Totals: sources (enabled/errored), profiles, proxies by status, 24h fetch success rate with the age of the last scheduler sweep, probe heartbeat, recent source errors; the per-source table lists unknown / alive / ready / quarantine / removed / total in status-machine order (the full fetch journal lives on the **Fetch log** screen) |
 | **Sources**         | Create/edit/enable/delete sources; *Refresh now*; per-source fetch log with error classes; the `/src/…` link                                                                                          |
 | **Profiles**        | Create/edit profiles: composition and order of sources, output format, pipeline overrides, access token, slug; output preview (first 50 lines)                                                        |
-| **Proxies**         | Filterable browser of all proxies (status, protocol, country, source, search by host/name); detail card with parameters, geo, lifecycle timestamps and probe history; *Reset status*; *Purge removed* |
+| **Proxies**         | Filterable browser of all proxies (status, protocol, country, source, search by host/name); the list pages with *First* / *Previous* / *Next*, so a deep page costs one seek instead of a walk over every row before it; detail card with parameters, geo, lifecycle timestamps and probe history; *Reset status*; *Purge removed* |
 | **Fetch log**       | Journal of every source fetch: time, status, bytes, proxies found, error class                                                                                                                        |
 | **Probe**           | Health-check daemon status: heartbeat, meow-rs status with the kernel's live RSS (from meow-rs `GET /memory`, refreshed whenever a T2 batch reloads the engine), quarantine queue with scheduled second chances, and the history rotation panel (when the last retention run happened, what it deleted, journal size now)                                                                                                 |
 | **Import / Export** | Backup and migration of the whole configuration (see below)                                                                                                                                           |
-| **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels: nearly every `config/app.toml` knob, and never the admin token. Two keys are file-only and have no field on the page: `[server].export_max_rows` and `[geo].startup_download_budget_secs`; the file values still apply, the panel just cannot show or edit them. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
+| **Settings**        | Overview of the effective config grouped by owning process: state machine, checking, ingestion, HTTP fetching, public listener, database, geo enrichment, admin panel, meow-rs, retention, log levels: nearly every `config/app.toml` knob, and never the admin token. Two keys are shown in the edit page but not in the overview: `[server].export_max_rows` and `[geo].startup_download_budget_secs`. The two maps `[geo].download_urls` and `[geo].sha256` are file-only: the panel shows neither and edits neither, the file values still apply. The overview links to a sister page, `/admin/settings/edit`, that round-trips `config/app.toml` in place (comments preserved) when the file is writable; the edit page is grouped by owning process (Server / Probe / Shared) via CSS-only tabs and a *Create from defaults* button bootstraps the file when it is missing. ENV overrides (`FUMOX_SECTION__KEY`) keep winning over file values at runtime |
 
 ### Times and timezones
 
@@ -617,8 +635,32 @@ that already know the token. *Import* recreates the objects with
 - a reference to a source missing from the file → dropped from the composition (warning);
 - one reference used by two *source rows* → rejected (the reference binds the rows together, so the file does not say which one a profile composition means);
 - a reference repeated twice inside one *profile's* source list → kept once (the first position wins);
+- a URL that does not resolve right now → imported with a warning (the
+  address is vetted again at every fetch, so a host that was briefly
+  unreachable is not a reason to refuse the file); a URL that resolves to a
+  private address → rejected, unless the deployment allows private URLs;
 - validation is all-or-nothing: any invalid object aborts the whole import
-  (`422` with a list of problems, nothing written).
+  (`422` with a list of problems, nothing written);
+- the write itself is one transaction: a failure half-way through leaves the
+  database exactly as it was.
+
+The import accepts at most **500 rows per table** (sources, profiles) and a
+document of at most **256 KiB**. Both numbers are shown next to the upload
+control, and the export button carries the same numbers next to it. A
+document past the size cap is refused with `422` before it is parsed, and so
+is a body that is not JSON or JSON without the `version` field.
+
+A successful import answers with a redirect back to this screen and a toast
+with the totals: how many sources and profiles were created and how many
+warnings the file produced. The warnings themselves are in the log, one line
+each.
+
+The export states its own limits too. A deployment with more than 500 sources
+or profiles, or with a configuration that serializes past 256 KiB, produces a
+file the import screen refuses; such a file carries an `import_limit` field
+naming the limit it exceeds, the server logs a warning about it, and the
+limits are shown next to the export button. The file stays complete: it is
+the import that refuses it.
 
 The same screen shows the two **public download links** in one table,
 together with the live proxy counts. Both links share the same random
@@ -639,8 +681,13 @@ Both links are snapshots, not live views, and are bounded twice:
   pool would otherwise turn one download into an unbounded read and an
   unbounded file. Raise the key when your tier is bigger. The cut takes
   the oldest rows (lowest ids) and the `nodes count` header reports how
-  many the body really carries, so a truncated download says so. The
-  live counts next to the links are **not** capped: they show the real
+  many the body really carries. A body that hit the cap says so itself:
+  the metadata block grows a `# truncated: showing 50000 of 81234 — raise
+  [server].export_max_rows` line stating the limit that was applied and
+  the key that lifts it (the tier itself is named by the `export/alive` or
+  `export/ready` title above it), and the server logs one warning per tier
+  per 30-second window so a silent cap does not go unnoticed. The live
+  counts next to the links are **not** capped: they show the real
   size of each tier, which is how you see that the export is smaller
   than the pool.
 - **Cached for 30 seconds.** A burst of downloads inside one window is
@@ -659,7 +706,14 @@ Because the two tiers do not overlap, a `ready` proxy appears only in
 
 `Download url_list` saves the body as a file; *Regenerate link*
 replaces the token if the link leaks (the old link stops working
-immediately, both endpoints rotate together).
+immediately, both endpoints rotate together). The token is held in the
+process memory of the running server and shared by the panel and the
+public listener, so a download costs no database read; the stored copy is
+the fallback that survives a restart.
+
+If the capability token or the counters cannot be read, the block with the
+two links is hidden and the reason is logged, instead of the whole screen
+turning into an error page. The import form stays usable either way.
 
 The import form takes the JSON either pasted into the textarea or via
 the file picker, which loads the chosen file into the same textarea;
@@ -720,16 +774,18 @@ tuned values that differ for some keys.
 | `rate_limit`           | `"300/min"`      | Per-IP ceiling for all public requests                                                                                                                                                                           |
 | `auth_fail_rate_limit` | `"30/min"`       | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets                                                                                                                      |
 | `trust_proxy_ips`      | `[]`             | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the per-IP rate-limit and admin URL scheme. Empty = never trust forwarded headers (direct-connection default). Set this when behind nginx |
+| `trust_proxy_header`   | `"none"`         | Which forwarding header the trusted proxy writes: `"none"` (read no forwarding header), `"xff"` (`X-Forwarded-For` / `-Proto` / `-Host`), `"forwarded"` (RFC 7239 `Forwarded`), `"both"`. Only the declared family is read, so a client that forges one cannot pick its own rate-limit bucket |
 | `allowed_hosts`        | `[]`             | Hostnames / IPs allowed to reach the public listener, including the `/export/alive/{token}` and `/export/ready/{token}` endpoints. Empty = accept any `Host` value. Set this when serving from a fixed domain name |
 | `export_max_rows`      | `50000`          | Row ceiling of one `/export/alive/{token}` / `/export/ready/{token}` body, applied as a `LIMIT` in the query behind them. These two links have no per-source or per-profile cap of their own, so this is what keeps one public download from reading and shipping the whole tier; raise it when your tier is bigger. The cut takes the lowest ids and the `nodes count` header reports what the body really carries, while the admin tier counts stay uncapped, so a truncated export is visible as smaller than the tier. `0` does not mean "unlimited": the value is clamped up to 1 row (a negative or zero `LIMIT` would otherwise read as unbounded in SQLite), so a body of `0` serves a single node. The body is cached for 30 s, so a status change can take up to 30 s to reach the link |
 
 ### `[database]` – SQLite
 
-| Key               | Default      | Meaning                                                                                 |
-| ----------------- | ------------ | --------------------------------------------------------------------------------------- |
-| `path`            | `"fumox.db"` | Database file path                                                                      |
-| `busy_timeout_ms` | `5000`       | Wait for locks instead of failing. Keep it set: server and probe write to the same file |
-| `max_connections` | `8`          | Pool size                                                                               |
+| Key                     | Default      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`                  | `"fumox.db"` | Database file path                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `busy_timeout_ms`       | `30000`      | Wait for locks instead of failing. Keep it set: server and probe write to the same file                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `max_connections`       | `8`          | Pool size                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `allow_checksum_repair` | `false`      | Re-stamp the checksum of an applied migration whose file changed after it was applied. Off by default: sqlx hashes the whole migration file, so a comment edit and a DDL edit look the same, and a silent re-stamp hides a schema that fell behind the files. With the flag off the server stops and names the version — re-stamp that one version with `cargo run -p fumox-core --example repair_migration_checksums -- <database path>`, or turn the flag on for a single run |
 
 ### `[fetch]` – source fetching
 
@@ -739,7 +795,7 @@ tuned values that differ for some keys.
 | `read_timeout_secs`     | `30`                | Response read timeout                                                                                                                                                                                                                      |
 | `max_response_bytes`    | `10485760` (10 MiB) | Response size cap (decompression-bomb guard)                                                                                                                                                                                               |
 | `max_concurrency`       | `4`                 | How many sources are fetched in parallel                                                                                                                                                                                                   |
-| `max_retries`           | `2`                 | Retries, only for recoverable errors (`network`, `http_server`)                                                                                                                                                                            |
+| `max_retries`           | `2`                 | Retries, only for recoverable errors (`network`, `http_server`). Capped at 16 however it is set, and the whole fetch (first attempt, retries and backoffs together) has a three-minute budget: a source that never recovers cannot hold a fetch slot forever |
 | `retry_base_backoff_ms` | `500`               | Exponential backoff base between retries                                                                                                                                                                                                   |
 | `user_agent`            | `"fumox/<version>"` | User-Agent header; per-source `headers` override it                                                                                                                                                                                        |
 | `ip_family`             | `any`               | Default IP family for fetching source URLs: `any` (dual-stack: first IPv4 wins, IPv6 fallback), `ipv4` or `ipv6`. A source without its own IP family inherits this; a set family is strict: no address of that family means a fetch error |
@@ -749,7 +805,7 @@ tuned values that differ for some keys.
 | Key                   | Default | Meaning                                                                                                                                                                                                       |
 | --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `refresh_check_limit` | `50`    | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables the queue)                                                                                                       |
-| `drop_gate`           | `false` | Drop-rules gate on the alive-linger. `true`: an alive proxy of a source with `drop` rules leaves on the next refresh once a rule catches it; `false`: every source lingers, the probe alone retires proxies |
+| `drop_gate`           | `true`  | Drop-rules gate on the alive-linger. `true` (the default): a source with `drop` rules detaches the proxies those rules would have discarded — an alive proxy caught by a rule leaves on the next refresh — while a source without drop rules keeps every proxy linked until the checks fail it; `false`: every source lingers, the probe alone retires proxies |
 | `removed_as_unknown`  | `false` | Revive a `removed` proxy the feed still carries: the row resets to the pristine `unknown` state (fail count and quarantine fields cleared) and walks the checks again, joining the priority queue. `false`: `removed` stays terminal: the only ways back are the admin "reset status" action (which only bites on a row the probe can still reach, see below) or «purge removed» plus a re-insert |
 
 ### `[geo]` – geo enrichment
@@ -761,7 +817,10 @@ tuned values that differ for some keys.
 | `db_dir`            | `"config"`  | Directory containing `GeoLite2-{City,ASN}.mmdb`. Under Docker Compose the shipped stack overrides this to `/shared/geo` (the `fumox-geo` volume) via `FUMOX_GEO__DB_DIR`, so `./config` on the host is **not** scanned for databases: put them in the `fumox-geo` volume, or unset the override. Env outranks the file, which is why editing `db_dir` in `config/app.toml` has no effect on the Compose stack |
 | `cache_max_entries` | `16384`     | Host→geo cache size; entries also expire after 6 hours, so a host whose DNS was down is retried without a restart |
 | `dns_timeout_secs`  | `5`         | DNS resolution timeout                                     |
-| `startup_download_budget_secs` | `60` | How long startup waits for the GeoLite2 download before it starts listening. Past the budget the download keeps running in the background (the file is installed by an atomic rename, so a half-written `.mmdb` is never visible) and this run serves without geo enrichment until the next start. `0` = do not wait at all |
+| `startup_download_budget_secs` | `60` | How long startup waits for the GeoLite2 download before it starts listening. Past the budget the download keeps running in the background (the file is installed by an atomic rename, so a half-written `.mmdb` is never visible) and this run serves without geo enrichment until the next start. `0` = do not wait at all. Capped at 300 s: a larger value in the file is clamped and named in a startup warning |
+| `auto_download`      | `true`      | Whether the GeoLite2 databases are downloaded at all. `false` = the operator provides the `.mmdb` files by hand (a MaxMind mirror, an internal copy, a read-only volume): Fumox never writes into `db_dir` and never waits for a download at startup. Editable in the admin panel |
+| `download_urls`      | the public P3TERX releases | Download mirrors: file name → URL (`GeoLite2-City.mmdb`, `GeoLite2-ASN.mmdb`). Point them at your own mirror or at MaxMind's without waiting for a release. File-only: the panel does not edit the map |
+| `sha256`             | empty       | Expected checksums: file name → SHA-256. A file whose checksum is listed here is installed only when the download matches it; a mismatch leaves the previous database in place. A file without a listed checksum is installed on the format check alone (an `.mmdb` with MaxMind metadata). File-only: the panel does not edit the map |
 
 ### `[network]` – name resolution
 
@@ -774,15 +833,16 @@ tuned values that differ for some keys.
 | Key                  | Default            | Meaning                                                                                                                                                                              |
 | -------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `enabled`            | `true`             | Master switch                                                                                                                                                                        |
-| `token`              | `"change-me"`      | Login secret. **Change it.** Empty value disables the panel (404); the default logs a warning at startup                                                                             |
+| `token`              | `""`               | Login secret. **Set it.** Empty value disables the panel (404), and so does the `change-me` placeholder; the panel stays off until an operator sets a real one (under Compose that is `FUMOX_ADMIN__TOKEN`)          |
 | `bind`               | `"127.0.0.1:8081"` | Admin listener address. Keep it on loopback; expose only via reverse proxy/SSH tunnel                                                                                                |
 | `session_ttl_hours`  | `168`              | Session cookie lifetime (7 days)                                                                                                                                                     |
-| `allow_private_urls` | `false`            | SSRF guard: when false, source URLs may not resolve to loopback, RFC1918, link-local or cloud-metadata addresses (checked at save *and* at every fetch)                            |
+| `allow_private_urls` | `false`            | SSRF guard: when false, source URLs may not resolve to loopback, RFC1918, link-local or cloud-metadata addresses (checked at save *and* at every fetch). The vetted address is the one that is connected to: the fetcher ignores the environment proxy configuration, and it does not follow a redirect on its own — every hop is vetted again |
 | `rate_limit`         | `"120/min"`        | Per-IP limit for admin routes                                                                                                                                                        |
 | `login_rate_limit`   | `"5/min"`          | Per-IP limit for the login form                                                                                                                                                      |
 | `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy. Plain-HTTP deployments must keep it `false`: browsers silently drop `Secure` cookies on `http://`, which looks like a successful login (`admin logged in` in logs) followed by a permanent redirect to `/admin/login`. Note the split default: `config/app.toml` ships `false`, but `docker-compose.yml` defaults `FUMOX_ADMIN__SECURE_COOKIES` to `true` (presuming an HTTPS front), so a plain-HTTP compose deployment must set it to `false` in `.env` (env wins over the file). |
 | `trust_proxy_ips`    | `[]`               | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the admin per-IP rate-limit and rendered URL scheme. Empty = never trust forwarded headers                   |
-| `allowed_hosts`      | `[]`               | Hostnames / IPs allowed to reach the admin listener. Empty = accept any `Host` value. Set this when serving the admin from a fixed domain name (e.g. reverse-proxied to `fumox.local`) |
+| `trust_proxy_header` | `"none"`           | Which forwarding header the trusted proxy writes: `"none"` (read no forwarding header), `"xff"` (`X-Forwarded-For` / `-Proto` / `-Host`), `"forwarded"` (RFC 7239 `Forwarded`), `"both"`. Only the declared family is read |
+| `allowed_hosts`      | `[]`               | Hostnames / IPs allowed to reach the admin listener. A request whose `Host` is not on the list is refused with `400` on every panel route. Empty = accept any `Host` value. Set this when serving the admin from a fixed domain name (e.g. reverse-proxied to `fumox.local`) |
 | `locales_dir`        | `"locales"`        | Directory with UI translation catalogs (`<code>.toml`)                                                                                                                               |
 
 ### `[probe]` – health-check daemon
@@ -1050,8 +1110,9 @@ The rules in plain language:
   decides when it leaves. The exception is a source with `drop` rules
   **when** `[ingest].drop_gate = true` in the config (then a rule added
   later retires the already-stored rows on the next refresh; with the
-  default `false` every source lingers, and drop rules only stop new
-  matches). Deleting a source from the admin panel never lingers.
+  default `true` that is what happens unless the key is set to `false`,
+  and drop rules only stop new matches in the meantime). Deleting a
+  source from the admin panel never lingers.
 
 **State machine configuration parameters.** All of them live in
 `config/app.toml` (or are overridden via `FUMOX_*` variables) and apply after
@@ -1072,7 +1133,7 @@ panel's *Settings* page.
 | `[probe].queue_stale_days`           | `7`                 | Lifetime of priority-queue entries (first check of new proxies)                                                                                     |
 | `[probe].allow_private_targets`      | `false`             | When `false`, the probe refuses to connect to loopback / link-local / RFC1918 / ULA addresses. This protects against SSRF if an attacker publishes a proxy list pointing at cloud metadata (`169.254.169.254`) or a private subnet. Blocked attempts are journaled as `probe_results.error = "blocked by the private-address policy: <reason>"` so the T2 recency queue advances past them |
 | `[ingest].refresh_check_limit`       | `50`                | Newly inserted unknown proxies per source refresh queued for priority checking (`0` disables). The key used to live in `[probe]`; the old name is still accepted for one release (its value is carried over, and the startup log names the key to rename) |
-| `[ingest].drop_gate`                 | `false`             | Whether `drop` rules unlink a live "lingerer" on the very next refresh                                                                              |
+| `[ingest].drop_gate`                 | `true`              | Whether `drop` rules unlink a live "lingerer" on the very next refresh                                                                              |
 | `[ingest].removed_as_unknown`        | `false`             | Revive a `removed` proxy the feed still carries: reset to pristine `unknown` and re-check                                                           |
 | `[meow].timeout_secs`                | `10`                | Per-check T2 delay-test timeout                                                                                                                     |
 | `[meow].backoff_initial_secs`        | `60`                | Initial T2 backoff while meow-rs is unavailable                                                                                                     |
@@ -1105,18 +1166,31 @@ environment variables keep winning over file values at runtime per the
 existing figment merge, so a transient ENV override is still the right
 tool for one-off adjustments.
 
+The form shows the **file's** values, not the running ones: the panel
+writes the file, so the file is what you have to see. A setting the
+environment overrides (`FUMOX_SECTION__KEY`) renders read-only, is
+listed above the form, and is left out of the write — the env layer
+wins over the file, so a value written there would never take effect.
+Unset the variable to make the field editable again. A save that touched
+such a setting says so in the toast instead of claiming success; a save
+that touched an environment-overridden `[admin].token` is reported as an
+error, because the panel keeps running under the environment's token.
+
 Rotating `[admin].token` or flipping `[admin].secure_cookies` invalidates
 every active session on the next request; the panel reads the new value
 on startup, so cookies signed under the old token stop verifying and
 existing users get signed out without notice. Plan such changes for a
-quiet window, and warn anyone who is logged in.
+quiet window, and warn anyone who is logged in. A token rotation through
+the panel ends the other sessions too, and only a rotation: a save that
+touches anything else leaves your own session alone.
 
 The editor is intentionally narrow on safety:
 
 - When `config/app.toml` is missing, **Edit** is hidden and **Create from
   defaults** takes its place; the button writes a copy of the shipped
   reference config so the server has something parseable to start with on
-  next restart. The editor opens on the new file.
+  next restart. The editor opens on the new file. The button never
+  overwrites an existing file.
 - When the existing file is **not writable** (read-only filesystem,
   missing parent directory, owner mismatch), the editor renders but
   every control is disabled and a red banner explains the cause; the
@@ -1126,12 +1200,29 @@ The editor is intentionally narrow on safety:
   red field messages (`422`); nothing is written until every field is
   valid. `bind` changes are checked with `SocketAddr::from_str`, the
   recheck ladder is parsed as `Vec<i64>`, rate limits as `<N>/<unit>`.
+- A rate limit whose pair arrived half-filled (the number without the
+  unit, or the unit without the number) is refused with a field error:
+  the missing half is taken from the file for the check, and nothing is
+  written.
+- A checkbox the browser did not post leaves its setting alone. The
+  form posts a hidden `value="off"` next to every checkbox, so an
+  unchecked box is an explicit "off" — but a field that never arrived
+  is not a value anybody chose.
+- The config the panel would write is checked against the loader
+  before it reaches the disk. A file the binaries refuse aborts both of
+  them at the next start, so the save is refused with the reason on the
+  page and the file on disk stays byte-identical.
 - The admin token field is a plain input; sending the empty string
   keeps the current token (used by the encrypted digest over the
   session cookie) so the panel never silently disables itself.
   Changing the token invalidates every active session the next request.
 - The legacy `[geo].db` field is rendered disabled with a hint; it is
   kept for parse compatibility and can no longer affect resolution.
+
+If the config file cannot be read at all (a broken TOML, a section the
+loader does not know), the editor says so in a banner and renders the
+running values, which are not the file's: the values below the banner
+are the ones in force, not the ones on disk.
 
 The write path is atomic: the editor writes to `<path>.tmp.<pid>` and
 `rename`s over the original; on filesystems that refuse cross-link
@@ -1279,9 +1370,27 @@ everything else keeps working. MaxMind updates their databases weekly.
 Fumox fetches the databases itself: at startup the server checks
 `[geo].db_dir` and downloads any GeoLite2 database that is missing, broken
 or older than a month from a public release mirror. It waits at most
-`[geo].startup_download_budget_secs` (60 s) for that to finish before it
-starts serving; a slower mirror does not keep the service down: the
-download carries on in the background and takes effect on the next start.
+`[geo].startup_download_budget_secs` (60 s, capped at 300 s) for that to
+finish before it starts serving; a slower mirror does not keep the service
+down: the download carries on in the background and takes effect on the next
+start. Set `[geo].auto_download = false` to switch the download off entirely
+and provide the files yourself.
+
+The download is verified before it is installed: a file whose SHA-256 is
+listed in `[geo].sha256` is installed only when the download matches it, and
+a mismatch leaves the previous database in place. A file without a listed
+checksum is checked for the MaxMind metadata instead — a valid database from
+another provider is kept, only a corrupt file or an HTML error page is
+refused.
+
+**Health.** `/healthz` answers with two lines: the first says whether the
+process and the database answer, the second names the geo state
+(`geo: off | no databases | degraded | ready`). `degraded` means a database
+is open but not the one carrying the country (the ASN database alone), so
+the names carry an AS number and no country. A profile with a country
+allowlist is the one hard dependency on geo: with geo enabled, such a
+profile and no City database aborts the start with a message naming the
+state and the directory.
 
 **Name templates.** The `geo.template` pipeline setting (default
 `"{flag} {country} · {name}"`) supports these placeholders; all of them
@@ -1300,7 +1409,14 @@ A placeholder with no data behind it collapses to nothing: extra whitespace
 and dangling separators are cleaned up, so `"{flag} {country} {city} · {name}"`
 still looks right when the city is unknown. The name is left completely
 untouched only when there is no geo data at all. DNS and geo lookups are
-cached (hosts repeat a lot).
+cached (hosts repeat a lot): a name that did not resolve is cached for ten
+minutes only, a host the databases do not know for the same six hours as a
+known one.
+
+An unknown placeholder is refused where the template is saved: the panel and
+the config loader both reject it, so a typo cannot turn into a literal
+`{foo}` in every proxy name. A template without `{name}` gets the original
+name appended, and an empty template renders the name alone.
 
 **Stored geo facts.** The country, city and ASN resolved for each proxy are
 persisted to the database at ingest time (and a background pass at startup
@@ -1309,7 +1425,10 @@ what feeds the admin panel: the country filter in the *Proxies* list and the
 *Geography* block of the proxy card show stored facts, so they populate after
 the next source refresh or server restart, even if no subscription has been
 requested yet. A fresh lookup that returns nothing never erases facts already
-stored.
+stored. A host whose lookup failed is marked and left alone for six hours
+before the background pass tries it again, so the hosts that cannot be
+resolved cannot take the pass's budget away from the rows that were never
+tried.
 
 ## 12. Data, backups, retention
 
@@ -1331,10 +1450,47 @@ stored.
 - **Timestamps** everywhere are Unix epoch seconds, UTC; the admin panel
   displays them in your browser's timezone (see *Times and timezones*).
 
+### Repair and restore scripts
+
+Three operator tools come with the repository. All of them take a backup
+first, and all of them refuse to write over something they do not
+understand.
+
+- **`scripts/revive-xhttp-proxies.sh --restore <backup> [db]`** puts a backup
+  back over the database. It refuses a missing path (`exit 66`), an empty,
+  damaged (`PRAGMA integrity_check`), foreign-schema or symlinked backup
+  (`exit 67`), and it refuses to run while another process still has the
+  database open (`exit 75`) unless `FUMOX_REVIVE_CONFIRM_STOPPED=1` says
+  the daemon is really stopped. The copy is staged next to the database and
+  renamed into place, its size is compared with the backup afterwards, and
+  a short copy is rolled back to the snapshot the script took first. The
+  snapshot path and a ready-made rollback command are printed if anything
+  fails.
+- **`scripts/repair-geo-stamps.sh [db]`** clears the `geo_*` columns so the
+  startup backfill resolves them again from each row's own host. **Stop
+  the server (and the probe) before running it, and restart the server
+  afterwards** — a restart, not a plain start, because the backfill runs at
+  the start of the process. The script refuses to run while a server or a
+  probe process is visible.
+- **`cargo run -p fumox-core --example repair_migration_checksums -- <db>`**
+  re-stamps the checksum of an applied migration whose file changed after
+  it was applied. It refuses a dirty (failed) migration and a version that
+  was never applied, and it fails when the write-ahead log cannot be
+  checkpointed. The alternative is `[database].allow_checksum_repair = true`
+  for a single run.
+
+The migrations of the server and the probe are serialised by a lock file
+next to the database (`fumox.db-migrate.lock`): started at the same moment,
+the two processes would otherwise try to apply the same migration twice.
+The lock is advisory and released when the process exits, so the file is
+safe to leave in place.
+
 ## 13. Running in production – checklist
 
-- [ ] Strong `[admin].token` set (the shipped `change-me` is a placeholder and
-      logs a warning at startup); `secure_cookies = true` when behind HTTPS.
+- [ ] Strong `[admin].token` set (the shipped default is empty, and the panel
+      stays off — 404 — until a real token is configured; under Compose
+      `FUMOX_ADMIN__TOKEN` is mandatory); `secure_cookies = true` when behind
+      HTTPS.
 - [ ] Admin listener stays on loopback; external access only through a TLS
       reverse proxy or SSH tunnel.
 - [ ] **Behind a reverse proxy:** set `[server].trust_proxy_ips` and
@@ -1343,6 +1499,13 @@ stored.
       subnet for an off-host reverse proxy). Without it, every request
       shares the proxy's IP and the per-IP rate limit collapses to a
       single budget for the whole fleet.
+- [ ] **Behind a reverse proxy:** set `[server].trust_proxy_header` and
+      `[admin].trust_proxy_header` to the header family the proxy
+      writes (`"xff"`, `"forwarded"` or `"both"`). The default `"none"`
+      reads no forwarding header at all, so the per-IP rate limit keys
+      on the proxy's IP and the rendered scheme stays `http` even behind
+      a TLS-terminating proxy. The startup log names this
+      misconfiguration.
 - [ ] **Behind a reverse proxy:** set `[server].allowed_hosts` and
       `[admin].allowed_hosts` to the hostname the proxy serves (e.g.
       `["fumox.example.com"]`). Without it, the `Host` header is
@@ -1419,12 +1582,17 @@ WantedBy=multi-user.target
 | Subscription is empty with `X-Fumox-Warning: all-proxies-quarantined` | Every proxy failed its checks. Look at the *Probe* page and the proxies' history; check `[meow].test_url` reachability.                            |
 | `X-Fumox-Stale: true` header                                          | Some sources are temporarily unreachable; last good data is being served. The fetch log shows which sources and why (`error_class`).               |
 | Source shows `parse_error`                                            | The source returned HTTP 200 but unparseable content (anti-bot page, CDN stub, format change). The last good snapshot is served meanwhile.         |
+| Source shows `storage`                                               | The feed answered with HTTP 200, but this process could not store the result: the database refused the write. It is a fault on this side, not the upstream's. |
 | Source won't save: "private URL" error                                | The URL resolves to a loopback/private address and `allow_private_urls` is false. That's the SSRF guard working.                                   |
-| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`. Under Compose the directory is `/shared/geo`, not `./config`, see [section 11](#11-geo-enrichment). |
+| No country flags in names                                             | GeoLite2 `.mmdb` file missing from `[geo].db_dir` or `[geo].enabled = false`. Under Compose the directory is `/shared/geo`, not `./config`, see [section 11](#11-geo-enrichment). The second line of `/healthz` names the state (`geo: off \| no databases \| degraded \| ready`). |
 | *Import / Export*, *Sources* or *Profiles*: export link 404s         | The link is built from the panel's host; the public listener answers `404` for a host it does not serve. Add it to `[server].allowed_hosts`.     |
 | GeoLite2 file placed in `./config` is ignored                          | The Compose stack sets `FUMOX_GEO__DB_DIR=/shared/geo`, and the environment outranks `config/app.toml`. Use the `fumox-geo` volume, or remove the override and set `[geo].db_dir`. |
 | T2 checks never run, probe logs mention meow backoff                  | meow-rs is down or `[meow].api_addr` is wrong. In Docker, it must be `meow:9090`; the config path must be the shared volume (`/shared/meow.yaml`). |
-| `SQLITE_BUSY` errors in logs                                          | `busy_timeout_ms` was removed or set too low while two processes write to the DB. Restore the default (5000).                                      |
+| `SQLITE_BUSY` errors in logs                                          | `busy_timeout_ms` was removed or set too low while two processes write to the DB. Restore the default (30000).                                     |
+| Server stops at boot: "applied migration N differs from the file"    | A migration file changed after it had been applied. Re-stamp that version with `cargo run -p fumox-core --example repair_migration_checksums -- <db path>`, or start once with `[database].allow_checksum_repair = true`. |
+| `scripts/revive-xhttp-proxies.sh --restore` exits 75                 | Something still has the database open. Stop the daemon (`docker compose stop server probe`) and re-run; `FUMOX_REVIVE_CONFIRM_STOPPED=1` overrides the check when you know it is stopped. |
+| `scripts/revive-xhttp-proxies.sh --restore` exits 67                 | The backup is empty, damaged, or is not a Fumox database. Nothing was touched: pick another backup.                                            |
+| Country / ASN on old rows is wrong                                   | Rows ingested before 2026-10-02 carry a neighbour's geo stamps. Run `scripts/repair-geo-stamps.sh` with the server stopped, then restart the server. |
 | Build fails: `sqlite3.h: No such file`                                | Install the system SQLite dev package (`libsqlite3-dev` on Debian/Ubuntu).                                                                         |
 | Compose refuses to start: "set FUMOX_ADMIN__TOKEN"                    | Create `.env` from `.env.example` and set the token.                                                                                               |
 

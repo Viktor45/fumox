@@ -344,6 +344,30 @@ normalises the `Host` header (the default ports are dropped, a non-default
 port is kept, and a Host that is not a plain hostname is replaced by the
 canonical name), so a crafted Host cannot end up in a generated link.
 
+The front writes the `X-Forwarded-*` family, so the server side has to be
+told which header family to believe and which addresses may write it.
+Without these three keys per listener the per-IP rate limit counts the
+front's own IP (one budget for the whole fleet), the links stay on `http`
+behind the TLS front, and the `Host` header is trusted as-is:
+
+```toml
+[server]
+trust_proxy_ips   = ["172.20.0.0/16"]   # the subnet the front sits on
+trust_proxy_header = "xff"              # the family nginx writes
+allowed_hosts     = ["fumox.example.com"]
+
+[admin]
+trust_proxy_ips   = ["172.20.0.0/16"]
+trust_proxy_header = "xff"
+allowed_hosts     = ["fumox.example.com"]
+```
+
+The canonical name has to be on both lists: the panel gates the request
+on `[admin].allowed_hosts` and builds the export link from the host the
+panel was opened on, while the public listener gates the link on
+`[server].allowed_hosts`. The startup log names a `trust_proxy_ips`
+without a `trust_proxy_header`.
+
 ## Differences from docker compose
 
 - `FUMOX_MEOW__API_ADDR: meow:9090` → `127.0.0.1:9090`: a pod shares one

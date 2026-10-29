@@ -10,7 +10,10 @@
 //!
 //! Reconciliation keeps alive-linger links for sources without `drop`
 //! rules: a probe-verified proxy missing from the feed stays
-//! linked until the probe itself retires it.
+//! linked until the probe itself retires it. A source that *does* carry
+//! drop rules behaves differently: with `[ingest].drop_gate` on (the
+//! default) its rules detach the proxies they would have discarded, so a
+//! rule added later cannot be held off by still-alive rows.
 
 use crate::cache::Caches;
 use crate::fetcher::{FetchFailure, FetchedPayload, Fetcher};
@@ -24,7 +27,14 @@ use fumox_core::repo::{fetch_log, probe, proxies, sources};
 pub enum IngestOutcome {
     /// Fetched and reconciled successfully.
     Ok {
+        /// The proxies stored from this payload: what the journal and the
+        /// admin panel report as `proxies_found`.
         proxies_found: usize,
+        /// The proxies the source's own filters discarded (protocol
+        /// allowlist and pipeline `drop` rules). Together with
+        /// `proxies_found` this is the recognized count: found = dropped +
+        /// kept.
+        dropped: usize,
         stats: proxies::ReconciliationStats,
         /// Wall-clock duration of the fetch attempt in milliseconds,
         /// retries and their backoff included; `None` when no fetch
@@ -44,6 +54,13 @@ pub enum IngestOutcome {
         /// Duration of the fetch that produced the payload.
         duration_ms: i64,
     },
+    /// The payload was fetched and parsed, but the database refused to
+    /// store it (already journaled under its own error class).
+    StorageFailed {
+        message: String,
+        /// Duration of the fetch that produced the payload.
+        duration_ms: i64,
+    },
 }
 
 /// Fixed ingest settings from the config, everything not per-source.
@@ -54,7 +71,9 @@ pub struct IngestSettings {
     /// the queue).
     pub refresh_check_limit: u32,
     /// `[ingest].drop_gate`: whether pipeline `drop` rules switch off the
-    /// alive-linger link policy for their source (see `reconcile_source`).
+    /// alive-linger link policy for their source (see
+    /// [`fumox_core::ingest::IngestPolicy`]). On by default: a source whose
+    /// rules would discard a proxy must not keep it linked.
     pub drop_gate: bool,
     /// `[ingest].removed_as_unknown`: whether a `removed` proxy the feed
     /// still carries is revived to `unknown` (via `proxies::revive_removed`)
@@ -109,6 +128,7 @@ pub async fn ingest_source(
         tracing::debug!(source = %source.id, "raw snapshot still fresh; skipping fetch");
         return IngestOutcome::Ok {
             proxies_found: 0,
+            dropped: 0,
             stats: proxies::ReconciliationStats::default(),
             duration_ms: None,
         };
@@ -133,7 +153,7 @@ pub async fn ingest_source(
         Ok(payload) => payload,
         Err(failure) => {
             let duration_ms = elapsed_ms(fetch_started);
-            journal_failure(pool, source, &failure, None, now, duration_ms).await;
+            journal_failure(pool, source, &failure, now, duration_ms).await;
             return IngestOutcome::FetchFailed {
                 failure,
                 duration_ms,
@@ -152,7 +172,12 @@ pub async fn ingest_source(
     match parse_payload(source, &payload) {
         Ok(filtered) => {
             let recognised = filtered.recognized;
-            let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
+            // The protocol allowlist already threw away part of the
+            // payload; the pipeline drop rules throw away more below.
+            // Both are counted, so the report adds up: recognized =
+            // dropped + kept.
+            let dropped_by_allowlist = recognised.saturating_sub(filtered.entries.len());
+            let geo_stamps = resolve_geo_stamps(geo, &filtered.entries, None).await;
             // Drop rules (including ASN-targeted ones) run after ASN
             // resolution, see [`apply_drop_rules`]. They run before the
             // `removed_as_unknown` revival handoff so the revived set is
@@ -169,19 +194,22 @@ pub async fn ingest_source(
                         };
                     }
                 };
-            let found = entries_after_drop.len(); // Alive-linger. `[ingest].drop_gate` decides whether
-            // a source's drop rules disable it: gated (true), a rule added
-            // later reaches the already-stored rows on the very next
-            // refresh; ungated (false, the default), the probe alone
-            // retires live proxies, drop rules only stop new matches.
-            let keep_alive_linger = !(settings.drop_gate && filtered.has_drop_rules);
+            let dropped = dropped_by_allowlist + dropped_by_pipeline;
+            let found = entries_after_drop.len();
+            // Alive-linger. `[ingest].drop_gate` decides whether a
+            // source's drop rules disable it, see
+            // [`fumox_core::ingest::IngestPolicy`].
+            let policy = fumox_core::ingest::IngestPolicy::refresh(
+                settings.drop_gate,
+                filtered.has_drop_rules,
+            );
             match proxies::reconcile_source(
                 pool,
                 &source.id,
                 &entries_after_drop,
                 &geo_after_drop,
                 now,
-                keep_alive_linger,
+                policy,
             )
             .await
             {
@@ -190,14 +218,14 @@ pub async fn ingest_source(
                     // `journal_success` stamps `last_fetched_at`, the
                     // freshness marker the TTL short-circuit checks before
                     // the next re-fetch.
-                    journal_success(pool, source, &payload, recognised, now, duration_ms).await;
-                    if dropped_by_pipeline > 0 {
+                    journal_success(pool, source, &payload, found, now, duration_ms).await;
+                    if dropped > 0 {
                         tracing::info!(
                             source = %source.id,
                             recognised,
-                            dropped = dropped_by_pipeline,
+                            dropped,
                             kept = found,
-                            "pipeline drop rules discarded entries before reconcile"
+                            "the source's own filters discarded entries before reconcile"
                         );
                     }
                     // `[ingest].removed_as_unknown`: a removed proxy the feed
@@ -221,27 +249,25 @@ pub async fn ingest_source(
                     enqueue_probe_requests(pool, &queue_ids, settings.refresh_check_limit, now)
                         .await;
                     IngestOutcome::Ok {
-                        proxies_found: recognised,
+                        proxies_found: found,
+                        dropped,
                         stats,
                         duration_ms: Some(duration_ms),
                     }
                 }
                 Err(err) => {
-                    // Database failure during reconciliation, treat as a
-                    // server-side (recoverable) problem.
-                    let failure = FetchFailure::HttpServer { status: 500 };
+                    // The payload was fetched and parsed, but this
+                    // process could not store it. That is not an upstream
+                    // failure: the feed answered with HTTP 200, and
+                    // reporting it as a fetch error would send the
+                    // operator looking at the wrong side. It gets its own
+                    // error class and the real status of the response.
+                    let message = err.to_string();
                     tracing::error!(error = %err, source = %source.id, "reconciliation failed");
-                    journal_failure(
-                        pool,
-                        source,
-                        &failure,
-                        Some(&err.to_string()),
-                        now,
-                        duration_ms,
-                    )
-                    .await;
-                    IngestOutcome::FetchFailed {
-                        failure,
+                    journal_storage_failure(pool, source, &payload, &message, now, duration_ms)
+                        .await;
+                    IngestOutcome::StorageFailed {
+                        message,
                         duration_ms,
                     }
                 }
@@ -308,17 +334,25 @@ pub async fn dry_run_source(
             // (and any future geo-aware rules) get a fair preview; the
             // resolver is async-and-cached so a re-fetch in dry-run adds
             // at most one round-trip per unseen host.
-            let geo_stamps = resolve_geo_stamps(geo, &filtered.entries).await;
-            let (kept_entries, _, dropped) =
-                match apply_drop_rules(source, filtered.entries, &geo_stamps) {
-                    Ok(triple) => triple,
-                    Err(message) => {
-                        return DryRunOutcome::ParseFailed {
-                            http_status: payload.http_status,
-                            message,
-                        };
-                    }
-                };
+            let recognized = filtered.recognized;
+            let geo_stamps =
+                resolve_geo_stamps(geo, &filtered.entries, Some(DRY_RUN_GEO_LIMIT)).await;
+            let (kept_entries, _, _) = match apply_drop_rules(source, filtered.entries, &geo_stamps)
+            {
+                Ok(triple) => triple,
+                Err(message) => {
+                    return DryRunOutcome::ParseFailed {
+                        http_status: payload.http_status,
+                        message,
+                    };
+                }
+            };
+            // The protocol allowlist threw away part of the payload before
+            // the drop rules ran, and the rules threw away more. Both
+            // belong to the report: `dropped` is what the source's own
+            // filters discarded, so recognised = dropped + kept holds here
+            // exactly as it does in the real run.
+            let dropped = recognized.saturating_sub(kept_entries.len());
             let sample = kept_entries
                 .iter()
                 .take(10)
@@ -336,7 +370,7 @@ pub async fn dry_run_source(
             DryRunOutcome::Ok {
                 http_status: payload.http_status,
                 bytes: payload.bytes,
-                proxies_found: filtered.recognized,
+                proxies_found: recognized,
                 dropped,
                 sample,
             }
@@ -374,6 +408,22 @@ async fn enqueue_probe_requests(pool: &DbPool, ids: &[i64], limit: u32, now: i64
 /// the cap keeps a large feed from fanning out into thousands of sockets.
 const GEO_LOOKUP_CONCURRENCY: usize = 32;
 
+/// Hard cap on the unique hosts one pass resolves. A feed with thousands
+/// of distinct hosts would otherwise cost thousands of DNS round-trips
+/// per pass; the hosts beyond the cap keep the geo facts already stored.
+const GEO_HOST_BUDGET: usize = 256;
+
+/// Wall-clock ceiling for the geo batch of one pass. Every unseen host
+/// can cost up to `[geo].dns_timeout`, so the batch is bounded in time
+/// as well as in size: on expiry the pass continues with "keep what is
+/// stored" instead of blocking the ingest.
+const GEO_PASS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many records the admin dry run resolves geo facts for. A dry run
+/// is a preview, not a pass: resolving every host of a large feed would
+/// make the button slow without telling the operator anything more.
+const DRY_RUN_GEO_LIMIT: usize = 64;
+
 /// The two [`GeoResolver`] calls [`resolve_geo_stamps`] makes. The real
 /// resolver implements it as-is; the seam exists so the lookup *shape*
 /// (concurrent, capped, input-ordered) can be observed without a MaxMind
@@ -402,33 +452,82 @@ impl GeoLookup for GeoResolver {
     }
 }
 
-/// Resolve geo facts for every parsed entry; the returned vector stays
+/// Resolve geo facts for the parsed entries; the returned vector stays
 /// index-aligned with `entries`. With an inactive resolver (geo disabled
 /// or database missing) every stamp is `None`, which the upsert treats as
 /// "keep what is stored".
+///
+/// The pass is bounded twice over: only the unique hosts are looked up
+/// (a feed repeats the same host many times over) and at most
+/// [`GEO_HOST_BUDGET`] of them, and the whole batch is wrapped in
+/// [`GEO_PASS_TIMEOUT`]. Both bounds end the same way — the entries
+/// without facts keep what the database already stores — so a feed full
+/// of dead hosts slows the pass down but never breaks it.
+///
+/// `limit` restricts the lookup to the first records of the pass (the
+/// dry run passes one); the records beyond it keep "no facts".
 async fn resolve_geo_stamps<G: GeoLookup>(
     geo: &G,
     entries: &[ProxyEntry],
+    limit: Option<usize>,
 ) -> Vec<Option<proxies::GeoStamp>> {
     if !geo.is_active() {
         return Vec::new();
     }
+    let window = limit.map_or(entries.len(), |limit| limit.min(entries.len()));
+    let window = &entries[..window];
+
+    let mut hosts: Vec<&str> = Vec::new();
+    for entry in window {
+        if !hosts.contains(&entry.host.as_str()) {
+            hosts.push(&entry.host);
+        }
+    }
+    if hosts.len() > GEO_HOST_BUDGET {
+        tracing::warn!(
+            hosts = hosts.len(),
+            budget = GEO_HOST_BUDGET,
+            "geo lookup budget of this pass exhausted; the remaining hosts keep their stored facts"
+        );
+        hosts.truncate(GEO_HOST_BUDGET);
+    }
+
     use futures_util::StreamExt;
     // `buffered` (not `buffer_unordered`) keeps the input order, which the
     // drop rules and the reconcile upsert both rely on, while holding at
     // most `GEO_LOOKUP_CONCURRENCY` lookups in flight.
-    futures_util::stream::iter(
-        entries
-            .iter()
-            .map(|entry| geo.resolve_host(&entry.host))
+    let lookups = hosts
+        .iter()
+        .map(|host| geo.resolve_host(host))
+        .collect::<Vec<_>>();
+    let resolved = match tokio::time::timeout(
+        GEO_PASS_TIMEOUT,
+        futures_util::stream::iter(lookups)
+            .buffered(GEO_LOOKUP_CONCURRENCY)
             .collect::<Vec<_>>(),
     )
-    .buffered(GEO_LOOKUP_CONCURRENCY)
-    .collect::<Vec<_>>()
     .await
-    .into_iter()
-    .map(|info| info.map(|info| proxies::GeoStamp::from_info(&info)))
-    .collect()
+    {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = GEO_PASS_TIMEOUT.as_secs(),
+                "geo resolution exceeded the budget of this pass; the pass continues with the stored facts"
+            );
+            return vec![None; entries.len()];
+        }
+    };
+
+    let by_host: std::collections::HashMap<&str, Option<proxies::GeoStamp>> = hosts
+        .iter()
+        .copied()
+        .zip(resolved)
+        .map(|(host, info)| (host, info.map(|info| proxies::GeoStamp::from_info(&info))))
+        .collect();
+    entries
+        .iter()
+        .map(|entry| by_host.get(entry.host.as_str()).cloned().flatten())
+        .collect()
 }
 
 /// What [`parse_payload`] produced: the entries that survived the
@@ -569,12 +668,10 @@ async fn journal_failure(
     pool: &DbPool,
     source: &Source,
     failure: &FetchFailure,
-    override_message: Option<&str>,
     now: i64,
     duration_ms: i64,
 ) {
-    let failure_text = failure.to_string();
-    let message = override_message.unwrap_or(&failure_text);
+    let message = failure.to_string();
     let class = failure.error_class();
     let log = fetch_log::FetchLogEntry {
         source_id: &source.id,
@@ -583,6 +680,48 @@ async fn journal_failure(
         http_status: failure.http_status().map(i64::from),
         bytes: None,
         proxies_found: None,
+        error: Some(&message),
+        error_class: Some(class),
+    };
+    if let Err(err) = fetch_log::insert_timed(pool, &log, Some(duration_ms)).await {
+        tracing::error!(error = %err, "failed to write fetch_log");
+    }
+    if let Err(err) = sources::record_fetch_outcome(
+        pool,
+        &source.id,
+        &sources::FetchOutcome::Failure {
+            at: now,
+            error: &message,
+            class,
+        },
+    )
+    .await
+    {
+        tracing::error!(error = %err, "failed to update source after failure");
+    }
+}
+
+/// Journal a payload that could not be stored.
+///
+/// The response was fine (its real status is written, not a substituted
+/// 500) and the error class says the failure was this process's: an
+/// operator reading `storage` looks at the database, not at the feed.
+async fn journal_storage_failure(
+    pool: &DbPool,
+    source: &Source,
+    payload: &FetchedPayload,
+    message: &str,
+    now: i64,
+    duration_ms: i64,
+) {
+    let class = fumox_core::models::ErrorClass::Storage;
+    let log = fetch_log::FetchLogEntry {
+        source_id: &source.id,
+        fetched_at: now,
+        ok: false,
+        http_status: Some(payload.http_status as i64),
+        bytes: Some(payload.bytes as i64),
+        proxies_found: Some(0),
         error: Some(message),
         error_class: Some(class),
     };
@@ -684,6 +823,17 @@ mod tests {
     /// policy is switched off so the loopback test server is reachable.
     /// The counter tracks how many requests reached the upstream.
     async fn ingest_env(body: &'static str) -> (DbPool, Caches, Fetcher, Source, Arc<AtomicUsize>) {
+        ingest_env_with_bodies(vec![body]).await
+    }
+
+    /// The same, but the upstream answers with a different body per
+    /// request: the first request gets `bodies[0]`, the second `bodies[1]`,
+    /// and a request beyond the list gets the last body again. A second
+    /// ingest of the same source needs a second, different feed.
+    async fn ingest_env_with_bodies(
+        bodies: Vec<&'static str>,
+    ) -> (DbPool, Caches, Fetcher, Source, Arc<AtomicUsize>) {
+        assert!(!bodies.is_empty(), "the upstream needs at least one body");
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -691,7 +841,10 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             while let Ok((mut sock, _)) = listener.accept().await {
-                counted.fetch_add(1, Ordering::SeqCst);
+                // The counter doubles as the index of the body this
+                // request is answered with: the requests are sequential.
+                let index = counted.fetch_add(1, Ordering::SeqCst);
+                let body = bodies[index.min(bodies.len() - 1)];
                 // Read the request out before answering, like a real HTTP
                 // server. Closing a socket that still holds unread client
                 // bytes makes the kernel send RST, which can clobber the
@@ -751,6 +904,14 @@ mod tests {
             refresh_check_limit: 0,
             drop_gate: false,
             removed_as_unknown: false,
+        }
+    }
+
+    /// The same settings with the alive-linger gate at the given position.
+    fn settings_with_drop_gate(drop_gate: bool) -> IngestSettings {
+        IngestSettings {
+            drop_gate,
+            ..settings()
         }
     }
 
@@ -969,7 +1130,7 @@ mod tests {
             in_flight: Arc::clone(&in_flight),
             peak: Arc::clone(&peak),
         };
-        let stamps = resolve_geo_stamps(&geo, &entries).await;
+        let stamps = resolve_geo_stamps(&geo, &entries, None).await;
 
         // Order: the stamp for entry i still carries entry i's host.
         assert_eq!(stamps.len(), ENTRIES);
@@ -1031,6 +1192,195 @@ mod tests {
                 }))
             }
         }
+    }
+
+    /// A resolver that remembers which hosts it was asked about.
+    struct RecordingGeo {
+        asked: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl GeoLookup for RecordingGeo {
+        fn is_active(&self) -> bool {
+            true
+        }
+
+        fn resolve_host(
+            &self,
+            host: &str,
+        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+            let asked = Arc::clone(&self.asked);
+            let host = host.to_string();
+            async move {
+                asked.lock().unwrap().push(host.clone());
+                Some(Arc::new(GeoInfo {
+                    ip: host.clone(),
+                    country_code: Some(host),
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+
+    fn entry_with_host(host: &str) -> ProxyEntry {
+        ProxyEntry {
+            scheme: Scheme::Vless,
+            name: host.to_string(),
+            host: host.to_string(),
+            port: 443,
+            credential: "uuid".into(),
+            params: Vec::new(),
+            raw_path: String::new(),
+            raw_line: String::new(),
+        }
+    }
+
+    /// The per-pass budget starts with the unique hosts: a feed that lists
+    /// the same host over and over costs one lookup, not one per line.
+    #[tokio::test]
+    async fn only_the_unique_hosts_of_a_pass_are_looked_up() {
+        let entries: Vec<ProxyEntry> = (0..10)
+            .map(|i| entry_with_host(&format!("host-{}.invalid", i % 3)))
+            .collect();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let geo = RecordingGeo {
+            asked: Arc::clone(&asked),
+        };
+        let stamps = resolve_geo_stamps(&geo, &entries, None).await;
+
+        assert_eq!(stamps.len(), entries.len(), "stamps stay aligned");
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 3, "one lookup per unique host: {asked:?}");
+        for host in ["host-0.invalid", "host-1.invalid", "host-2.invalid"] {
+            assert_eq!(
+                asked.iter().filter(|h| *h == host).count(),
+                1,
+                "{host} was looked up more than once"
+            );
+        }
+    }
+
+    /// The budget is hard: a feed with thousands of distinct hosts cannot
+    /// fan out into thousands of DNS round-trips. The hosts beyond the
+    /// budget keep the facts already stored (no stamp).
+    #[tokio::test]
+    async fn the_host_budget_of_a_pass_is_capped() {
+        let entries: Vec<ProxyEntry> = (0..GEO_HOST_BUDGET + 10)
+            .map(|i| entry_with_host(&format!("host-{i}.invalid")))
+            .collect();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let geo = RecordingGeo {
+            asked: Arc::clone(&asked),
+        };
+        let stamps = resolve_geo_stamps(&geo, &entries, None).await;
+
+        assert_eq!(stamps.len(), entries.len(), "stamps stay aligned");
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            GEO_HOST_BUDGET,
+            "the budget bounds the lookups of one pass"
+        );
+        assert!(
+            stamps[0].is_some(),
+            "the hosts within the budget are resolved"
+        );
+        assert!(
+            stamps[entries.len() - 1].is_none(),
+            "the hosts beyond the budget keep their stored facts"
+        );
+    }
+
+    /// The dry-run report adds up: recognised = dropped + kept, with the
+    /// protocol allowlist counted among the dropped.
+    #[tokio::test]
+    async fn the_dry_run_report_adds_up() {
+        let body = "vless://uuid@1.2.3.4:443#keep\n\
+                    vless://uuid@1.2.3.5:443#drop-me\n\
+                    trojan://pw@1.2.3.6:443#other-protocol\n";
+        let (_pool, _caches, fetcher, mut source, _requests) = ingest_env(body).await;
+        source.protocols = Some(vec![fumox_core::models::Scheme::Vless]);
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "drop": [{ "match": "drop-me", "target": "name" }]
+        }));
+
+        let outcome = dry_run_source(&fetcher, &inactive_geo(), &source).await;
+        let DryRunOutcome::Ok {
+            proxies_found,
+            dropped,
+            sample,
+            ..
+        } = outcome
+        else {
+            panic!("expected a successful dry run, got {outcome:?}");
+        };
+        assert_eq!(proxies_found, 3, "all three lines are recognized");
+        assert_eq!(
+            dropped, 2,
+            "the allowlist and the drop rule discarded one line each"
+        );
+        assert_eq!(proxies_found - dropped, 1, "found = dropped + kept");
+        assert_eq!(sample.len(), 1, "only the survivor is previewed");
+    }
+
+    /// A payload that cannot be stored is not an upstream failure: the
+    /// journal keeps the real status of the response and the error class
+    /// points the operator at the database, not at the feed.
+    #[tokio::test]
+    async fn a_storage_failure_is_journaled_as_a_storage_error() {
+        let (pool, _caches, _fetcher, source, _requests) =
+            ingest_env("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
+        let payload = FetchedPayload {
+            http_status: 200,
+            bytes: 12,
+            body: b"vless://x".to_vec(),
+        };
+        journal_storage_failure(&pool, &source, &payload, "the disk is on fire", 1, 5).await;
+
+        let rows = fetch_log::recent_for_source(&pool, &source.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ok, 0);
+        assert_eq!(
+            rows[0].error_class.as_deref(),
+            Some("storage"),
+            "the class says the fault was this process's"
+        );
+        assert_eq!(
+            rows[0].http_status,
+            Some(200),
+            "the real status of the response, not a substituted 500"
+        );
+
+        let stored = sources::get(&pool, &source.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.error_class,
+            Some(fumox_core::models::ErrorClass::Storage)
+        );
+    }
+
+    /// The same fault seen from the ingest path: a database that refuses
+    /// the reconcile is reported as a storage failure, not as a fetch or
+    /// parse failure. The feed answered with HTTP 200.
+    #[tokio::test]
+    async fn a_closed_database_is_a_storage_failure() {
+        let (pool, caches, fetcher, source, _requests) =
+            ingest_env("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
+        pool.close().await;
+        let outcome = ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &inactive_geo(),
+            settings(),
+            &source,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, IngestOutcome::StorageFailed { .. }),
+            "got {outcome:?}"
+        );
     }
 
     #[test]
@@ -1209,55 +1559,172 @@ mod tests {
 
     #[test]
     fn drop_rules_gate_off_the_alive_linger() {
-        // + `[ingest].drop_gate`: the linger decision is
-        // `!(drop_gate && has_drop_rules)`, has_drop_rules alone never
-        // disables linger when the config leaves the gate off (the
-        // default: the probe alone retires live proxies, drop rules only
-        // stop new matches).
-        let body = "vless://uuid@h.example.com:443#keep\n";
-        let linger =
-            |drop_gate: bool, filtered: &FilteredPayload| !(drop_gate && filtered.has_drop_rules);
-
-        // A drop section (even one that matches nothing) switches the gate…
-        let mut source = source_with(Encoding::Auto, None);
-        source.pipeline = Some(serde_json::json!({
-            "version": 1,
-            "drop": [{ "match": "^zzz-nonexistent$" }]
-        }));
-        let filtered = parse_payload(&source, &payload(body)).unwrap();
-        assert!(filtered.has_drop_rules);
+        // `[ingest].drop_gate` decides the linger, the drop section of the
+        // source's pipeline decides whether it applies: with the gate on
+        // (the default) a source with drop rules lets them detach live
+        // proxies, with the gate off everyone lingers and only the probe
+        // retires a proxy.
+        use fumox_core::ingest::IngestPolicy;
         assert!(
-            !linger(true, &filtered),
-            "gated: alive leaves on next refresh"
+            !IngestPolicy::refresh(true, true).keep_alive_linger(),
+            "gated: alive leaves on the next refresh"
         );
-        assert!(linger(false, &filtered), "gate off: everyone lingers");
+        assert!(
+            IngestPolicy::refresh(false, true).keep_alive_linger(),
+            "gate off: everyone lingers"
+        );
+        assert!(
+            IngestPolicy::refresh(true, false).keep_alive_linger(),
+            "no drop rules: linger"
+        );
+        assert!(
+            IngestPolicy::refresh(false, false).keep_alive_linger(),
+            "no drop rules: linger"
+        );
 
-        // …an empty drop section does not (it resets a profile override,
-        // not the source's own linger)…
+        // The gate follows the source's own drop section: an empty drop
+        // section (it resets a profile override, not the source's own
+        // linger) does not switch it off…
+        let mut source = source_with(Encoding::Auto, None);
         source.pipeline = Some(serde_json::json!({
             "version": 1,
             "drop": []
         }));
-        let filtered = parse_payload(&source, &payload(body)).unwrap();
-        assert!(!filtered.has_drop_rules);
-        assert!(linger(true, &filtered));
-        assert!(linger(false, &filtered));
-
-        // …and neither does no pipeline or a pipeline without drop.
-        source.pipeline = None;
         assert!(
-            !parse_payload(&source, &payload(body))
+            !parse_payload(&source, &payload("vless://uuid@h:443#A\n"))
                 .unwrap()
                 .has_drop_rules
         );
+
+        // …a drop section that matches nothing still does (the rules are
+        // there, they simply did not fire this time)…
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "drop": [{ "match": "^zzz-nonexistent$" }]
+        }));
+        assert!(
+            parse_payload(&source, &payload("vless://uuid@h:443#A\n"))
+                .unwrap()
+                .has_drop_rules
+        );
+
+        // …and neither a pipeline without drop nor no pipeline at all does.
         source.pipeline = Some(serde_json::json!({
             "version": 1,
             "rename": [{ "match": "a", "replace": "b" }]
         }));
         assert!(
-            !parse_payload(&source, &payload(body))
+            !parse_payload(&source, &payload("vless://uuid@h:443#A\n"))
                 .unwrap()
                 .has_drop_rules
+        );
+        source.pipeline = None;
+        assert!(
+            !parse_payload(&source, &payload("vless://uuid@h:443#A\n"))
+                .unwrap()
+                .has_drop_rules
+        );
+    }
+
+    /// The two ingests the alive-linger gate is about: the first feed
+    /// carries the proxy, the second one does not any more. Returns the
+    /// proxy's status and the number of its source links afterwards.
+    ///
+    /// The link of the first pass is aged before the second pass: the
+    /// reconcile judges staleness with `seen_at < now` and both passes run
+    /// inside the same wall-clock second, which would leave the link
+    /// looking fresh.
+    async fn vanished_proxy_after_two_ingests(drop_gate: bool) -> (String, usize) {
+        let (pool, caches, fetcher, mut source, _requests) = ingest_env_with_bodies(vec![
+            "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n",
+            "vless://22222222-2222-2222-2222-222222222222@5.6.7.8:443#B\n",
+        ])
+        .await;
+        // The source carries a drop rule that matches nothing: the rules
+        // are there (the gate applies), they simply do not fire.
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "drop": [{ "match": "^zzz-nonexistent$", "target": "name" }]
+        }));
+        sources::update(&pool, &source).await.unwrap();
+
+        let settings = settings_with_drop_gate(drop_gate);
+        let first = ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &inactive_geo(),
+            settings,
+            &source,
+            false,
+        )
+        .await;
+        assert!(matches!(first, IngestOutcome::Ok { .. }), "got {first:?}");
+
+        let id: i64 = sqlx::query_scalar("SELECT id FROM proxies WHERE host = '1.2.3.4'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            proxies::links_for_proxy(&pool, id).await.unwrap().len(),
+            1,
+            "the first pass links the stored proxy to its source"
+        );
+
+        sqlx::query("UPDATE proxy_source_links SET seen_at = seen_at - 5")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The second pass is forced: the first one stamped the source row
+        // as fresh, and the admin *Refresh now* bypasses that stamp.
+        let second = ingest_source(
+            &pool,
+            &fetcher,
+            &caches,
+            &inactive_geo(),
+            settings,
+            &source,
+            true,
+        )
+        .await;
+        assert!(matches!(second, IngestOutcome::Ok { .. }), "got {second:?}");
+
+        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
+        let links = proxies::links_for_proxy(&pool, id).await.unwrap().len();
+        (row.status, links)
+    }
+
+    /// The gate, end to end through the ingest path: with the gate on and
+    /// a source that carries drop rules, a proxy that left the feed is
+    /// detached from the source and retired by the same pass.
+    #[tokio::test]
+    async fn a_vanished_proxy_is_detached_and_retired_with_the_gate_on() {
+        let (status, links) = vanished_proxy_after_two_ingests(true).await;
+        assert_eq!(
+            links, 0,
+            "the proxy left the feed: its link to the source is gone"
+        );
+        assert_eq!(
+            status, "removed",
+            "the rules of the source may reach the rows it already stored"
+        );
+    }
+
+    /// The other half of the same gate: with the gate off, only the probe
+    /// retires a proxy. One that vanished from the feed keeps its link and
+    /// its `unknown` status, so the upstream's churn cannot end a node
+    /// that has not failed.
+    #[tokio::test]
+    async fn a_vanished_proxy_lingers_with_the_gate_off() {
+        let (status, links) = vanished_proxy_after_two_ingests(false).await;
+        assert_eq!(
+            links, 1,
+            "the gate is off: the proxy keeps its link to the source"
+        );
+        assert_eq!(
+            status, "unknown",
+            "the gate is off: only the probe's own verdict may retire it"
         );
     }
 }

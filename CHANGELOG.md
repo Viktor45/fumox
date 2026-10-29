@@ -16,6 +16,30 @@ Changes in the working tree, not yet on a published image.
 
 ### Added
 
+- `[database].allow_checksum_repair` (default `false`): the opt-in that
+  lets the boot re-stamp an applied migration whose file changed since it
+  was applied. Off by default, and the refusal is explicit: a mismatch
+  stops the start and names the version, the reason and the two ways out
+  (ship a new migration file, or start once with the flag set). The
+  repair writes the versions it touched under `meta.migrations_repaired`
+  before it retries, so the fact survives the boot log, and a repair that
+  rewrote nothing re-raises the original mismatch instead of claiming a
+  repair that did not happen.
+- The migrations run under an inter-process lock now (a `flock` sidecar
+  next to the database, mode 0600, symlink-proof). sqlx does not lock a
+  SQLite database while it migrates it, so two processes that started at
+  once read the same applied list and raced. The second one waits now,
+  re-reads the list and continues. A busy database is retried with a
+  backoff instead of failing the start.
+- `FUMOX_REVIVE_CONFIRM_STOPPED=1`: the explicit confirmation for a
+  restore over a database that still looks busy. The restore refuses by
+  default; the variable says "the daemon really is stopped, go ahead".
+- An integration test for `scripts/repair-geo-stamps.sh`
+  (`scripts/tests/repair-geo-stamps.test.sh`): it drives the repair
+  against a scratch database and asserts on the refusals (a missing
+  database, a symlinked one, a directory others may write to, a running
+  server), on the backup it leaves behind and on the batched clearing.
+  Needs nothing but bash and the sqlite3 CLI.
 - The probe cycle summary reports the wall-clock cost of the cycle and
   of every stage, the depth of the priority queue before and after the
   cycle, how many checks each group of lanes may still run, and how
@@ -129,6 +153,25 @@ Changes in the working tree, not yet on a published image.
   without a controller secret, the controller must reject a request
   that carries no `Authorization` header (or a wrong one), and it must
   answer the request that presents the secret.
+
+- The GeoLite2 channel is an operator decision now, not a baked-in URL:
+  `[geo].auto_download` (default `true`), `[geo].download_urls` and
+  `[geo].sha256`. `auto_download = false` keeps the "the files are
+  provided by hand" model (a MaxMind mirror, an internal copy, a
+  read-only volume): fumox then never writes into `db_dir` and never
+  waits for a download at startup. `download_urls` maps a file name to
+  the mirror it is fetched from, `sha256` maps a file name to the
+  checksum the download has to match. The toggle is in the admin panel
+  and in `config/app.toml`.
+- `/healthz` names the geo state on a second line
+  (`geo: off | no databases | degraded | ready`). The first line says
+  that the process and the database answer; the second says whether
+  the country facts are there, which is the difference between a
+  deployment that enriches its names and one that does not.
+- The GeoLite2 databases are opened once per process and shared by the
+  pipeline, the admin panel and the backfill instead of being read per
+  request, and a database that arrives after the startup is picked up
+  without a restart.
 
 ### Changed
 
@@ -274,8 +317,267 @@ Changes in the working tree, not yet on a published image.
   can write to `/tmp` and the kernel can render its config in
   `/run/meow` without the whole filesystem becoming writable.
 
+- `[ingest].drop_gate` defaults to `true` now. **Migration:** a
+  deployment that relied on the old default (every source lingers,
+  only the probe retires a proxy) keeps that behaviour only if it sets
+  `drop_gate = false` explicitly. Under the new default a source with
+  `drop` rules detaches the proxies those rules would have discarded on
+  the next refresh; a source without drop rules is unaffected either
+  way.
+- The startup download budget of the GeoLite2 databases is capped at
+  300 seconds (`[geo].startup_download_budget_secs`). A larger value
+  in the file is clamped and named in a startup warning, so a
+  hand-edited config cannot hold the boot hostage.
+- The GeoLite2 download does not block the listener bind any more: it
+  runs in its own task, the listeners bind as soon as the budget is
+  spent, and the file lands later by an atomic rename. A country
+  allowlist on a profile is the one hard dependency: with geo enabled,
+  such a profile and no City database aborts the start with a message
+  naming the state and the directory.
+- A payload that parsed but could not be stored is journaled under its
+  own error class (`storage`) and keeps the real HTTP status of the
+  response, instead of being reported as an upstream failure with a
+  substituted 500.
+- The ingest report adds up. `proxies_found` is what was stored,
+  `dropped` is what the source's own filters discarded (the protocol
+  allowlist and the `drop` rules), and `found = dropped + kept` holds
+  in the real run as well as in the dry run.
+- The geo lookup tells the three outcomes apart: a name that did not
+  resolve (cached for ten minutes only), an address no database knows
+  (a fact about the host, cached like every other verdict) and a
+  database read that failed (a fault of this process). Each has its
+  own counter and its own rate-limited log line. The DNS step goes
+  through the shared resolver, so the geo lookup runs under the same
+  concurrency cap as the rest of the process and the address it looks
+  up is the one the dial path would pick.
+- The *Proxies* browser pages with a cursor instead of a page number. A
+  page number asks the database to skip every row of the pages before
+  it, so a deep page walked the whole table and a row written between
+  two requests shifted the rows under the reader. The page resumes from
+  the sort key of the last row it showed now, so the database seeks
+  straight to it, and the panel offers *First* / *Previous* / *Next*
+  instead of a strip of page numbers. The filters and the sort stay with
+  the link, the cursor travels as one opaque token (a display name may
+  hold any character), and each of the three sorts (by update, by
+  latency, by name) pages on its own key. **Migration:** the `page`
+  parameter of `/admin/proxies` is ignored now — a bookmark that
+  carries it shows the first page — while the *Fetch log* and the
+  *Sources* screen keep their page numbers.
+- A truncated export says so in its own body. `/export/alive/{token}`
+  and `/export/ready/{token}` ship at most
+  `[server].export_max_rows` rows (50 000 by default), and the body
+  carried the count of what it holds but not the size of the tier it
+  came from: a download that carried 50 000 rows looked exactly like a
+  download of a tier of 50 000. The header now names both —
+  `# truncated: showing 50000 of 81234 — raise [server].export_max_rows`
+  — so the file states what it left out, and the render warns once per
+  window that it was capped. A body that carries the whole tier says
+  nothing about a truncation that did not happen.
+- The export capability token is kept in process memory. The public
+  export links read it from the `meta` table on every request, so a
+  download cost a database read before it cost anything else. The token
+  is read once at startup and kept in memory, and the admin panel and
+  the public listener share the copy, so a rotation from the panel
+  reaches both at once. `meta` stays the source of truth: the token
+  survives a restart and is what a restore brings back.
+- A source fetch has a wall-clock budget now (three minutes). The first
+  attempt, every retry and every backoff sleep share it, and a backoff
+  that would run past the budget is not slept through: the fetch ends
+  with the cause of the failure and the note that the budget ran out.
+  Until now a source that kept answering `503` held a concurrency
+  permit and the source's in-flight mark for the sum of every backoff —
+  sixteen retries from the shipped 500 ms base are ~33 s of pure sleep,
+  and every attempt adds a connect and a read timeout on top. Guarded by
+  `a_fetch_is_bounded_by_its_wall_clock_budget`.
+- A refused request says why it was refused. A client error carries a
+  reason beside the status code, and the text reaches `fetch_log.error`
+  and the source's `last_error`. A chain that lost the source headers on
+  the way (a redirect left the configured origin) now reports
+  `client error: HTTP 403: headers withheld: redirect left the
+  configured origin` instead of a bare `403`, which was
+  indistinguishable from a refusal by the target itself. This is
+  deliberate: the reason is part of the stored error text. Guarded by
+  `a_refused_redirect_states_that_the_headers_were_withheld`.
+- The forwarding headers are read only when the operator names the family
+  the trusted proxy writes. `[server].trust_proxy_header` and
+  `[admin].trust_proxy_header` (default `"none"`; the values `"none"`,
+  `"xff"`, `"forwarded"` and `"both"`) declare it: `none` honors no
+  header at all and the peer address is the client, `xff` reads
+  `X-Forwarded-For` (and the `X-Forwarded-Host` / `X-Forwarded-Proto`
+  beside it), `forwarded` reads the RFC 7239 `Forwarded` header, `both`
+  reads the two and honors them only when they agree: the same address in
+  both, or one header that names nobody while the other names the client.
+  A trusted proxy's address used to be enough: the header was read
+  because the peer was on the trust list, so a client that reached the
+  panel through a pass-through proxy had its own text confirmed by the
+  proxy's copy of it.
+  **Migration:** a deployment behind a reverse proxy names the family the
+  proxy writes (`trust_proxy_header = "xff"` for nginx's
+  `$proxy_add_x_forwarded_for`) on every listener that sits behind it.
+  Without the declaration the per-IP rate limit counts the proxy's own
+  address (one budget for the whole fleet), the scheme hint is ignored
+  (the links stay on `http` behind a TLS front) and the forwarded host is
+  not believed. A `trust_proxy_ips` without a `trust_proxy_header` is
+  named in a startup warning.
+- The session cookie carries the version of its format now
+  (`v2.{expires}.{mac}`). The format of the previous build
+  (`{expires}.{mac}`, the MAC over the same epoch-mixed key) is still
+  accepted, so the upgrade costs no re-login, and the version tag is
+  covered by the MAC, so the two formats cannot be mistaken for each
+  other. A cookie minted before the revocation epoch existed (a MAC over
+  the bare session key) is refused on purpose: it matches no epoch, and
+  honoring it would hand a copied cookie back the lifetime the epoch
+  exists to cut short.
+- The session cookie is scoped to the panel. It is issued and cleared with
+  `Path=/admin` instead of `Path=/`, so the browser does not hand the
+  panel's session to the public listener and a public route never sees
+  it. `HttpOnly`, `SameSite=Lax` and the `Secure` flag
+  (`[admin].secure_cookies`) are unchanged.
+- The login window counts the failed attempts only. A successful login
+  gives its slot back, so the operator's own sign-in never eats the
+  brute-force budget of the address the panel is reached on, and it does
+  not reset the window either: the failures that filled it stay counted,
+  so a correct guess between two wrong ones does not hand an attacker a
+  fresh window.
+
 ### Fixed
 
+- The client states that it ignores the environment proxy configuration.
+  The address that was vetted and the address that is connected to have
+  to be the same one: a proxy in between would make the SSRF check
+  describe a path the request does not take, and the pinned address
+  would describe only the hop *to* the proxy. The client is built with
+  `no_proxy()` now, so the guarantee does not rest on which reqwest
+  features the build happens to enable. Guarded by
+  `the_client_ignores_the_environment_proxy_configuration`.
+- The redaction of a source URL missed the credential-bearing query
+  names the feeds use in the wild. `sig` (a signature, `X-Amz-Signature`),
+  `session` (`jsessionid`) and `credential` are masked now, beside the
+  stems that were already there (`token`, `key`, `auth`, `secret`,
+  `pass`). A masked harmless value costs a diagnostic; an unmasked
+  credential costs a secret in the journal and in every log shipper
+  downstream of it. Guarded by
+  `credential_bearing_query_names_are_masked`.
+- The error text of a failed fetch could carry the credentials of the
+  source URL. The redaction replaced the URL inside the message, but
+  reqwest does not always print the URL exactly as the process built it,
+  and a substitution that missed left the raw userinfo in the text. The
+  tail of the message is replaced now, so the credentials cannot survive
+  a spelling difference. Guarded by
+  `a_failing_fetch_does_not_leak_the_source_credentials`.
+- The size cap counts the bytes *after* decompression, and that is now
+  proven: a 161-byte gzip body that expands to 128 KiB is refused under a
+  64 KiB cap. Guarded by `a_gzip_body_is_capped_after_decompression`.
+- The retry ceiling is applied, not only documented: a configuration that
+  asks for more retries than the process supports (the admin form bounds
+  the field, the config file and the `FUMOX_*` env layer do not) is
+  capped at sixteen, and the wire sees seventeen attempts at most.
+  Guarded by `the_retry_count_is_capped_at_the_supported_ceiling` and
+  `an_oversized_retry_count_stops_at_the_ceiling`.
+- Every redirect hop is vetted again, and that is now proven: the
+  resolution and vetting layer is a seam now, so a test can hand it a
+  public first host and a private target and watch the second hop be
+  refused there. Guarded by `every_redirect_hop_is_vetted_again`.
+
+- The rendered-subscription cache was bounded by entry count, not by
+  memory. One rendered body is megabytes, so a ceiling of ten thousand
+  entries was a multi-gigabyte ceiling in practice. The limit is a byte
+  budget now (64 MiB) and every entry is charged its body plus a fixed
+  overhead, so the entry count is bounded too. Guarded by
+  `the_cache_is_bounded_by_bytes` and
+  `an_entry_costs_its_body_plus_an_overhead`.
+- The invalidation counter of a cache key could be evicted together with
+  the entry it guards. The counter said which renderings were
+  superseded by an invalidation; a counter the cache had dropped said
+  "never invalidated", and a render that had started before the change
+  could store its pre-change rows as fresh for a whole TTL. The
+  counters live outside the evictable cache now, in a map bounded by
+  the number of keys the process ever used. Guarded by
+  `a_generation_outlives_the_entry_it_guards`.
+- An invalidation of one source scanned the whole cache for the
+  renderings that carried it. The renderings now record the sources
+  they were built from, and the invalidation goes straight to them.
+  Guarded by `the_reverse_index_names_the_keys_of_a_source` and
+  `an_invalidation_reaches_the_keys_the_index_names`.
+- A host that came back after its own quiet window could warn past the
+  budget of the log window. The budget stopped a flood of *new* hosts
+  from mirroring itself into the log, but a host that returned after an
+  hour warned again whatever the budget said, so a scan that kept its
+  hosts could fill the window with warnings. A returning host spends
+  the budget like any other now, and a host the window could not warn
+  about is named in the rollover summary. Guarded by
+  `a_returning_host_does_not_bypass_the_window_budget`.
+- A download that waited behind the leader of an export render and gave
+  up after the deadline said nothing. The leader was stuck, the waiter
+  rendered the body on its own, and the log showed neither. The timeout
+  is now a warning naming the tier.
+- Rows that could not be turned into an entry were skipped one warning
+  at a time. A tier of thousands of corrupt rows wrote thousands of
+  warnings into the log, and the warnings drowned the render that
+  reported them. The render now skips them and says so in one line,
+  with the count and the first few row ids.
+
+- The restore of `scripts/revive-xhttp-proxies.sh` replaced the database
+  while the daemon could still be writing to it, and the copy was a plain
+  `cp` over the live file. The restore now checks the backup before it
+  touches anything (an empty file, one that fails `integrity_check`, one
+  that does not carry the Fumox schema and one behind a symlink are all
+  refused), takes the exclusive lock and holds it for the whole copy,
+  stages the copy in the database's own directory, verifies it and renames
+  it into place, compares the size of the file that took the name against
+  the backup and rolls back to the snapshot when the copy came out short.
+  The write-ahead log of the replaced file is removed only after the copy
+  is confirmed. Any abort prints the snapshot's path and a ready-made
+  rollback command.
+- The restore could not tell that something still had the database open.
+  The old probe asked for the exclusive lock, which a reader in WAL mode
+  does not block, so a live daemon went unnoticed. The probe now checks
+  the journal mode and treats a write-ahead log that survives the probe as
+  a connection that is still there, and the refusal names the way to say
+  "the daemon really is stopped" (`FUMOX_REVIVE_CONFIRM_STOPPED=1`).
+- The census of the same script read a locked database as an empty one
+  and answered "Nothing to revive." with exit 0. A locked database is now
+  reported as the lock it is (exit 75), and any other read failure is
+  reported as such instead of being read as an empty database.
+- The selection of the same script matched rows whose `params` is not
+  JSON, and `json_extract` raises on malformed JSON. The selection is
+  restricted to valid JSON now, and the malformed rows cannot reach the
+  extraction.
+- The adoption target was picked by row order, so a source whose id
+  matched the argument by slug could win over the one that matched by id.
+  The order is explicit now (id, then slug, then name), and the id of
+  the *ranked* path is checked against the plain-nanoid shape before it
+  reaches a SQL literal, like the explicit path already did. A source
+  whose id is not a plain nanoid is skipped rather than adopted.
+- The backup of the same script was written through the `.backup` dot
+  command with the path interpolated into it, so a quote in the path
+  changed the command. The backup is written by `VACUUM INTO` with the
+  path as a quoted literal now, and an existing file at the path stops
+  the run instead of being written through.
+- The flags `--adopt-source` and `--no-adopt` were silently ignored
+  without `--include-unlinked`, so an operator could believe a target had
+  been chosen when none had. They are refused now (exit 64), and the
+  usage block says so.
+- `scripts/repair-geo-stamps.sh` wrote its backup through a dot command
+  with the path interpolated into it, kept the whole table under the write
+  lock, ran against a live server, and told the operator to start the
+  server afterwards when it needed a restart. The backup is written by
+  `VACUUM INTO` (which refuses to overwrite), the columns are cleared in
+  batches, a running server is refused (exit 75, `FUMOX_ALLOW_RUNNING_SERVER=1`
+  overrides it), and the header says STOP before and RESTART after.
+- The migration-repair tool re-stamped rows of a migration that never
+  ran, and of a migration that failed halfway: both leave the schema
+  behind the files while the bookkeeping says the opposite. It refuses a
+  dirty migration ("migration N is in a failed/dirty state") and a
+  migration that was never applied ("not applied successfully"), and it
+  reports a write-ahead log it could not checkpoint instead of leaving
+  the copy in pieces.
+- The T2 block flag of a proxy that had been failing before the flag
+  existed stayed NULL, which reads as "no recent T2 failure" and lets the
+  T1 lane check a proxy the tunnel lane had already condemned. Migration
+  `0013` backfills it from the probe history. A NULL flag now means "no
+  T2 attempt yet", "the last attempt succeeded" or "no check since the
+  migration", and the comment in the migration says so.
 - One failing lane cancelled the whole cycle. A lane that raised an
   error ended the cycle, so a single failing write left the fleet
   unprobed until the next cycle. The lanes are isolated now: the
@@ -1471,8 +1773,169 @@ Changes in the working tree, not yet on a published image.
   the periodic backfill — so a recovered host is picked up without a
   restart.
 
+- A failed geo lookup no longer eats the backfill budget of the fresh
+  rows. A row whose host did not answer is marked (migration `0012`,
+  the `geo_attempts` / `last_geo_attempt_at` columns) and left alone
+  for six hours, so the hopeless hosts cannot starve the rows that were
+  never tried; a row that gets its facts clears the mark.
+- The geo backfill walks the whole backlog. A short page no longer ends
+  the pass, and a budget that runs out before a lookup leaves the row
+  unmarked (so it is tried again) instead of writing it off.
+- The GeoLite2 download is verified before it is installed. A file whose
+  SHA-256 is listed in `[geo].sha256` is installed only when the
+  download matches it, and a mismatch leaves the previous database in
+  place. A valid database from another provider is kept (the provider
+  marker is an info line, not an error), and only a file without
+  MaxMind metadata (a corrupt download, an HTML error page) is
+  refused. The temporary file gets a unique name and is created
+  exclusively, and the orphaned `GeoLite2-*.mmdb.*.tmp` files of a dead
+  process are cleaned up at the start of a pass.
+- A geo template with an unknown placeholder is refused where the
+  template is saved (the admin panel and the config loader), instead
+  of rendering a literal `{foo}` into every proxy name. A template
+  without `{name}` gets the original name appended, and an empty
+  template renders the name alone.
+- The country of a proxy is the country MaxMind has a record for, or
+  the registered country when there is none; a record that carries
+  only a city is kept instead of thrown away.
+- The T2 batch asked the probe journal for the newest entry of every
+  candidate, so the batch that picks the least recently checked rows
+  seeked into the largest table once per candidate. The stamp is
+  denormalised onto the proxy row now (`last_t2_checked_at`, migration
+  `0014`) and refreshed whenever a T2 attempt is journaled, so the
+  queue is an index scan over the proxy table. The stamp is permanent:
+  a rotated journal cannot push a proxy back into the "never checked"
+  tier, which the lookup over the journal could do. Guarded by
+  `the_t2_recency_stamp_follows_the_journal` and
+  `the_t2_recency_stamp_survives_the_history_sweep`.
+- The settings form shows the file, not the environment. The panel
+  writes the file, so the values on the page are the file's own now
+  (the file is parsed over the defaults, without the `FUMOX_*` layer
+  that shadows it). A setting the environment overrides renders
+  read-only and is left out of the write: the env layer wins over the
+  file, so a value written there would never take effect and the
+  operator would be shown a change that does not happen. The page says
+  which settings are locked and why. Guarded by
+  `the_form_shows_the_file_and_not_the_environment`,
+  `an_env_locked_field_is_not_written_back`,
+  `an_env_lock_covers_the_halves_of_a_rate_limit_pair` and
+  `an_env_locked_field_renders_read_only_with_a_reason`.
+- A checkbox the browser did not post no longer resets its setting.
+  Every boolean on the edit form is a checkbox plus a hidden
+  `value="off"` input, so a field that did not arrive (a disabled
+  control, a pane the operator never reached) was written as `false`
+  — a value nobody chose, applied to a setting nobody touched. The
+  key is handled only when the form carried it. Guarded by
+  `a_bool_the_form_did_not_carry_is_not_reset`.
+- A rate limit whose pair reached the panel half-filled is refused
+  instead of guessed. A form that lost one half of the pair (a
+  browser that dropped the field, a hand-written request) is not a
+  form the operator meant to send: the missing half is taken from the
+  file for the check, the submit is refused with a field error, and
+  the file is left byte-identical. Guarded by
+  `a_partial_rate_limit_pair_is_refused_and_the_file_stays_untouched`
+  and
+  `a_partial_rate_limit_pair_without_the_limit_is_refused`.
+- The admin token rotation is decided by the document, not by the
+  submitted field. The panel compared the token of the running
+  configuration with the one the form carried, so every save that
+  did not touch the token ended the session that performed it. The
+  comparison is between the token of the file before the write and the
+  one after it now, so only an actual rotation revokes the sessions.
+  A token the environment overrides is not a rotation at all: the
+  panel runs under the environment's token whatever the file says, so
+  the toast says so instead of claiming a success. Guarded by
+  `a_save_the_environment_overrules_is_not_reported_as_a_success`.
+- The settings save runs on the blocking pool. The load, the
+  validation and the write are synchronous file work, and they held
+  the async runtime while they ran, so a slow disk stalled the whole
+  server. The *Create from defaults* button writes through the same
+  atomic path a save takes (a temporary file in the same directory,
+  fsynced, then renamed), and it refuses to overwrite a file that is
+  already there. Guarded by
+  `the_create_from_defaults_button_creates_a_missing_config_only`,
+  `the_create_from_defaults_button_writes_the_reference_copy` and
+  `the_create_from_defaults_button_refuses_a_read_only_directory`.
+- A config the loader refuses is no longer written. The panel writes
+  the file both binaries read at startup, and a file they refuse
+  aborts both of them; the save is refused now, with the reason on the
+  page, and the file stays byte-identical. The edit page also explains
+  a config it could not read: the values below it are the running
+  ones, not the file's, and an operator who does not know that would
+  believe they edited the file. Guarded by
+  `a_config_the_loader_refuses_is_not_written` and
+  `the_edit_page_explains_a_config_it_could_not_read`.
+- A logout that could not revoke the sessions says so. The epoch bump can
+  fail (the database is locked, the row is gone), and the old answer was a
+  plain redirect to the login screen: the browser's cookie was cleared,
+  but a copy of it kept working until its TTL, and the operator had no
+  way to learn that. The logout now redirects to `/admin/login?revoked=0`
+  and the login screen carries a banner that names the failure, so the
+  revocation can be repeated or the token changed.
+- A database error while reading the session epoch is refused, not
+  treated as an epoch of zero. Zero is the epoch of a world before the
+  first bump: a cookie minted back then would verify again, which is
+  exactly what the epoch exists to prevent, and a value that is not a
+  number is the same case (the row was written by something else and its
+  meaning is unknown). Both answer `503` now instead of letting the
+  session through.
+- A malformed `Host` never reaches the serve link. The link builder
+  canonicalised the header and then checked nothing else, so a host like
+  `evil.com/`, `evil.com?x=1`, `evil.com#fragment`, `evil.com%2f`,
+  `evil.com name`, `evil\com` or `evil.com:@x` ended up as the authority
+  of a URL that carries the export token. The canonical form is checked
+  against the host grammar now (a DNS name, an IPv4 literal, a bracketed
+  IPv6 literal), and anything else falls back to the bound address.
+- The serve link keeps the port the request came in on. The port of the
+  `Host` header was dropped and the port of `[server].bind` was used
+  instead, so a panel reached on a published port (a NAT mapping, a
+  reverse proxy on 8443) offered a link to a port nothing listens on.
+  Behind a trusted proxy the port of the request is the public authority
+  and is used; without one the bound port stays.
+- The forwarding headers are read as one header. A repeated
+  `X-Forwarded-For` (or `Forwarded`) is one field with the values joined
+  by commas, per RFC 7230; only the first value was read, so the entries
+  a proxy appended after it were dropped without a word.
+- The per-IP window exempts the static path only. Every `HEAD` request
+  was exempt from the window, so the paths that matter (the login, the
+  panel actions) had a free window on a method an attacker picks at will.
+  A `HEAD` on `/admin/static/*` stays exempt (it is the same path check
+  the CSS fetch was), every other `HEAD` counts like the `GET` it stands
+  for.
+- The import writes in one transaction. The sources were written one by
+  one and the profiles after them, each on its own, so a failure
+  half-way through (a write error, a constraint the file slipped past)
+  left the sources already in the database and no profiles: a
+  configuration that was half imported and looked whole. The whole
+  write phase runs in a single transaction now, so a failure leaves the
+  database exactly as it was.
+- The import no longer refuses a file because a name did not resolve.
+  Every imported URL was resolved inside the request, and a timeout or
+  a SERVFAIL counted as a hard error, so a source whose host was
+  briefly unreachable could not be imported at all. A resolution
+  failure that says nothing about the target is a warning now (the URL
+  is vetted again at fetch time, on every request); only a policy
+  violation (a private address) stays fatal. The name-resolution
+  window is bounded as a whole now, not only per URL: at most 25 URLs
+  are resolved per import and the window has a deadline of its own, so
+  a file full of dead hosts cannot hold the request open.
+- The import rejects a document that is not a document. A body that is
+  not JSON, or JSON without the `version` field, ended in an error page
+  carrying the raw parser message. Both are refused with `422` and a
+  localized message now, and nothing is written. A document past the
+  256 KiB cap is refused the same way, before it is parsed at all.
+
 ### Security
 
+- The backups the repair scripts write hold the whole database, the
+  credentials included. They are created under `umask 077` with mode
+  0600 now, a backup path that already exists is refused instead of
+  overwritten, and a backup in a directory others may write to is refused
+  as well: the file could be swapped for another one between the check
+  and the write.
+- The repair scripts follow a symlink at the database or the backup path.
+  A symlink is refused now: the operator asked for a database, not for
+  whatever the link points at.
 - The settings editor re-enabled toggles on a failed save. Every
   boolean on the edit form is a checkbox plus a hidden `value="off"`
   input, and the failed-save replay rendered those hidden inputs
@@ -1599,6 +2062,27 @@ Changes in the working tree, not yet on a published image.
   value instead of the `change-me` placeholder, and the env files are
   installed with mode 600 so the secret is never briefly readable by
   another user.
+- The session and CSRF keys follow the token as it stands. Both were
+  derived from `[admin].token` once at startup, so a token rotated
+  through the settings screen did not change the effective key: the
+  cookie of the old token kept verifying until the next restart. The keys
+  are derived per request from the live token now (one SHA-256, next to
+  the indexed read of the revocation epoch every authenticated request
+  does), so a rotation ends the sessions of every browser at once.
+- The admin host allowlist is one rule for the whole panel. A request
+  whose `Host` is not on `[admin].allowed_hosts` is refused with `400`
+  before it reaches the rate limiter, the authentication gate or any
+  handler, on every route (`/admin`, `/admin/sources`, `/admin/import`,
+  `/admin/settings`, …), and the same host is what the serve links are
+  built from. A request that arrived through a proxy in the operator's
+  trust list is also judged by the host that proxy forwarded
+  (`X-Forwarded-Host`, or the `Forwarded: host=` element), so a front
+  that rewrites `Host` to its own upstream name does not lock the
+  operator out of the panel they allowlisted. The forwarded host is read
+  only from a trusted peer and only from the header family the operator
+  declared. The startup log names the accepted hosts, and a non-empty
+  allowlist is a breaking change for a deployment that relied on every
+  host being served.
 
 ### Docs
 
@@ -1774,6 +2258,16 @@ Changes in the working tree, not yet on a published image.
   `.env.example` and `docker/README.md`. All are rewritten to colons,
   commas or parentheses; facts and anchors unchanged. Russian dash
   usage follows the standing owner decision and was not touched.
+- The guides and the container examples describe what a reverse proxy in
+  front of the server needs. Three keys per listener decide it:
+  `trust_proxy_ips` (the addresses that may speak for a client),
+  `trust_proxy_header` (the header family that proxy writes) and
+  `allowed_hosts` (the names the deployment serves). The user guide
+  (both languages), the compose file, the nginx template and the podman
+  guide spell out each of them and what breaks without it: the per-IP
+  limit counting the front's own address (one budget for the whole
+  fleet), the links staying on `http` behind a TLS front, and the `Host`
+  header being taken as it comes.
 
 ### Changed
 
@@ -1869,6 +2363,38 @@ Changes in the working tree, not yet on a published image.
   `Cargo.toml`'s `rust-version` stays a floor, not a lock: CI builds
   on current stable, and 1.98 is the oldest toolchain the workspace
   must keep building on.
+- The import answers with a redirect and a toast instead of a summary
+  page. A successful import ends on `/admin/import` with the totals in
+  the flash message (how many sources and profiles were created, and
+  how many warnings the file produced), the way the other admin
+  actions report themselves. Every warning is logged as it happens,
+  one line each, so a file with a dozen slug collisions does not turn
+  the screen into a wall of text.
+- The import page states the limits it enforces. At most 500 rows per
+  table and a document of at most 256 KiB are accepted, and both
+  numbers are shown next to the upload control and next to the export
+  button. The document cap is smaller than the transport limit on
+  purpose: the payload travels urlencoded, where every byte may cost
+  three, so 256 KiB of JSON still fits the 1 MiB the panel accepts.
+- The export says when its own file cannot be imported back. A
+  deployment with more than 500 sources or profiles, or with a
+  configuration that serializes past 256 KiB, produced a file the
+  import screen refused. The export names the limit it exceeds in the
+  file itself (an `import_limit` field), logs a warning about it and
+  shows the limits next to the export button, so the operator learns
+  it at the download and not at the upload.
+- The alive/ready export links on the import screen degrade instead of
+  failing. A counter or a capability token that could not be read
+  replaced the whole page with an error page, losing the import form
+  itself. The block is hidden now and the reason goes to the log, so
+  the screen stays usable.
+- The import vets the URLs of the file with the policy of the
+  deployment. The private-address rule was hard-coded, so a deployment
+  that deliberately allows private URLs (isolated infrastructure) could
+  not import a source pointing at one, and one that does not allow
+  them got the check on a different code path than the source form.
+  The import follows `[admin].allow_private_urls` now, like the form
+  does.
 
 ## 2026-09-23 · sha-b72b03f
 

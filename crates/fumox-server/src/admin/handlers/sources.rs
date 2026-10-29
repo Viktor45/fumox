@@ -5,7 +5,7 @@
 use super::{
     FormError, FormMap, action_response, caps, flash_redirect, fmt_bytes, is_htmx, mask_secret,
     not_found, page_offset, pagination_pages, pipeline_from_form, row_error_response, server_error,
-    validate_slug,
+    validate_header_map, validate_name, validate_slug, validate_tags, validate_ttl,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -354,10 +354,8 @@ async fn build_source_from_form(
     let mut errors: Vec<(String, String)> = Vec::new();
 
     let name = get("name");
-    if name.is_empty() {
-        errors.push(("name".into(), lang.t("val.required").into()));
-    } else if name.chars().count() > 200 {
-        errors.push(("name".into(), lang.t("val.name_too_long").into()));
+    if let Err(message) = validate_name(&name, lang) {
+        errors.push(("name".into(), message));
     }
 
     let slug_raw = get("slug");
@@ -394,7 +392,7 @@ async fn build_source_from_form(
             lang.t("val.field_too_long")
                 .replace("{}", &caps::URL.to_string()),
         ));
-    } else if let Err(issue) = fetcher::vet_url(
+    } else if let Err(issue) = fetcher::vet_url_with_policy(
         &url,
         state.admin().allow_private_urls,
         ip_family.unwrap_or_else(|| state.fetcher.default_family()),
@@ -449,9 +447,15 @@ async fn build_source_from_form(
     };
 
     let ttl_raw = get("cache_ttl_seconds");
-    let cache_ttl_seconds: i64 = match ttl_raw.parse() {
-        Ok(ttl) if (60..=86_400).contains(&ttl) => ttl,
-        _ => {
+    let cache_ttl_seconds: i64 = match ttl_raw.parse::<i64>() {
+        Ok(ttl) => match validate_ttl(ttl, lang) {
+            Ok(()) => ttl,
+            Err(message) => {
+                errors.push(("cache_ttl_seconds".into(), message));
+                3600
+            }
+        },
+        Err(_) => {
             errors.push(("cache_ttl_seconds".into(), lang.t("val.ttl_range").into()));
             3600
         }
@@ -466,19 +470,8 @@ async fn build_source_from_form(
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect();
-        if list.len() > caps::TAGS {
-            errors.push((
-                "tags".into(),
-                lang.t("val.too_many_tags")
-                    .replace("{}", &caps::TAGS.to_string()),
-            ));
-        }
-        if list.iter().any(|t| t.len() > caps::TAG_BYTES) {
-            errors.push((
-                "tags".into(),
-                lang.t("val.field_too_long")
-                    .replace("{}", &caps::TAG_BYTES.to_string()),
-            ));
+        if let Err(message) = validate_tags(&list, lang) {
+            errors.push(("tags".into(), message));
         }
         Some(list)
     };
@@ -489,28 +482,6 @@ async fn build_source_from_form(
     let headers_raw = get("headers");
     let mut headers_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    // Header caps: the whole map is replayed on
-    // every fetch of the source, so it is bounded like every other field.
-    let non_empty_lines = headers_raw.lines().filter(|l| !l.trim().is_empty()).count();
-    if non_empty_lines > caps::HEADER_LINES {
-        errors.push((
-            "headers".into(),
-            lang.t("val.too_many_headers")
-                .replace("{}", &caps::HEADER_LINES.to_string()),
-        ));
-    }
-    let headers_bytes: usize = headers_raw
-        .lines()
-        .map(|l| l.trim().len())
-        .filter(|len| *len > 0)
-        .sum();
-    if headers_bytes > caps::HEADER_BYTES {
-        errors.push((
-            "headers".into(),
-            lang.t("val.headers_too_long")
-                .replace("{}", &caps::HEADER_BYTES.to_string()),
-        ));
-    }
     for line in headers_raw.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -529,18 +500,14 @@ async fn build_source_from_form(
             continue;
         }
         let value = value.trim().to_string();
-        // Reject names/values the HTTP layer would refuse, so a bad line
-        // fails the form now instead of every future fetch.
-        if axum::http::HeaderName::try_from(key.as_str()).is_err()
-            || axum::http::HeaderValue::try_from(value.as_str()).is_err()
-        {
-            errors.push((
-                "headers".into(),
-                lang.t("val.header_invalid").replace("{}", line),
-            ));
-            continue;
-        }
         headers_map.insert(key, value);
+    }
+    // The caps and the header syntax are the shared rules: the whole map
+    // is replayed on every fetch of the source, so it is bounded like
+    // every other field, and a name/value the HTTP layer would refuse
+    // fails the form now instead of every future fetch.
+    if let Err(message) = validate_header_map(&headers_map, lang) {
+        errors.push(("headers".into(), message));
     }
 
     // Pipeline: in builder mode the JSON is generated from the widget
@@ -1197,17 +1164,23 @@ pub async fn source_delete(
     // priority queue is the only authority on a not-yet-checked one.
     // With `drop_gate = true` the strict policy applies and every
     // orphan retires.
-    let protected: &[&str] = if state.ingest().drop_gate {
-        &[]
-    } else {
-        &["ready", "unknown"]
-    };
+    let protected = fumox_core::ingest::IngestPolicy::from_drop_gate(state.ingest().drop_gate)
+        .protected_statuses();
     match proxies::mark_orphans_removed(&state.pool, protected).await {
-        Ok(orphans) if orphans > 0 => {
-            tracing::info!(orphans, "orphaned proxies marked removed");
+        Ok(sweep) => {
+            if sweep.retired > 0 {
+                tracing::info!(retired = sweep.retired, "orphaned proxies marked removed");
+            }
+            if sweep.protected > 0 {
+                // The rows the sweep left alone on purpose: they have no
+                // source link any more, so no probe lane can reach them.
+                tracing::info!(
+                    protected = sweep.protected,
+                    "orphaned proxies left detached by the protected statuses"
+                );
+            }
         }
         Err(err) => tracing::error!(error = %err, "failed to mark orphans removed"),
-        _ => {}
     }
     // The row is gone; the rendered outputs that still name it go here.
     state.caches.invalidate_processed_for_source(&id).await;

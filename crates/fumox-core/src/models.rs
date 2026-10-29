@@ -217,6 +217,11 @@ pub enum ErrorClass {
     HttpServer,
     HttpClient,
     ParseError,
+    /// The fetch succeeded, but the payload could not be stored: the
+    /// database rejected the write. Unlike the other classes this one
+    /// says nothing about the upstream — the feed was fine and this
+    /// process failed — so it must not be reported as a fetch error.
+    Storage,
 }
 
 impl ErrorClass {
@@ -226,6 +231,7 @@ impl ErrorClass {
             ErrorClass::HttpServer => "http_server",
             ErrorClass::HttpClient => "http_client",
             ErrorClass::ParseError => "parse_error",
+            ErrorClass::Storage => "storage",
         }
     }
 }
@@ -245,6 +251,7 @@ impl FromStr for ErrorClass {
             "http_server" => ErrorClass::HttpServer,
             "http_client" => ErrorClass::HttpClient,
             "parse_error" => ErrorClass::ParseError,
+            "storage" => ErrorClass::Storage,
             other => {
                 return Err(crate::Error::Parse(format!(
                     "unknown error class: {other:?}"

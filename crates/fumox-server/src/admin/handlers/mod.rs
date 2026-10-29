@@ -819,6 +819,12 @@ pub mod caps {
     pub const URL: usize = 2048;
     /// Stored pipeline JSON, in bytes.
     pub const PIPELINE_BYTES: usize = 64 * 1024;
+    /// Source/profile display name, in characters.
+    pub const NAME_MAX: usize = 200;
+    /// Shortest cache TTL a source may carry, in seconds.
+    pub const TTL_MIN: i64 = 60;
+    /// Longest cache TTL a source may carry, in seconds.
+    pub const TTL_MAX: i64 = 86_400;
     /// One profile access token.
     pub const ACCESS_TOKEN: usize = 128;
     /// Minimum length for an access token accepted from an *import file*
@@ -837,9 +843,21 @@ pub mod caps {
     pub const HEADER_BYTES: usize = 8 * 1024;
     /// Sources or profiles accepted by one import request.
     pub const IMPORT_ROWS: usize = 500;
+    /// Size of one import document (the JSON payload), in bytes.
+    ///
+    /// The payload travels inside a urlencoded form, where every byte may
+    /// cost three (`"` → `%22`), so the 1 MiB transport limit still holds
+    /// for the largest accepted document (256 KiB → 768 KiB encoded).
+    pub const IMPORT_BODY_BYTES: usize = 256 * 1024;
     /// URLs DNS-vetted per import request; the rest are re-vetted at fetch
     /// time (the fetch path re-vets every request anyway).
     pub const IMPORT_DNS_VET: usize = 25;
+    /// Overall deadline of the DNS-vetting window of one import.
+    ///
+    /// The per-URL timeout alone does not bound the window: 25 lookups of
+    /// the per-URL timeout each add up. This caps the total time the
+    /// request may spend on name resolution.
+    pub const IMPORT_DNS_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 }
 
 /// Slug rules shared by the source and profile forms and the import
@@ -891,8 +909,8 @@ where
     if slug_raw.is_empty() {
         return None;
     }
-    if !SLUG_RE.is_match(slug_raw) {
-        errors.push(("slug".into(), lang.t("val.slug_format").into()));
+    if let Err(message) = validate_slug_format(slug_raw, lang) {
+        errors.push(("slug".into(), message));
         return Some(slug_raw.to_string());
     }
     if let Ok(Some(other)) = lookup.await
@@ -901,6 +919,142 @@ where
         errors.push(("slug".into(), lang.t("val.slug_taken").into()));
     }
     Some(slug_raw.to_string())
+}
+
+/// Shared field validators.
+///
+/// The source form, the profile form and the import path enforce the
+/// same rules, so a configuration file cannot plant an object the form
+/// would refuse (and the other way round). Each validator answers with
+/// the localized message: the form attaches it to its field, the import
+/// prefixes it with the offending row.
+///
+/// Validate a display name: not empty, at most [`caps::NAME_MAX`]
+/// characters.
+pub(super) fn validate_name(name: &str, lang: &Lang) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(lang.t("val.required").into());
+    }
+    if trimmed.chars().count() > caps::NAME_MAX {
+        return Err(lang.t("val.field_too_long").replace("{}", &caps::NAME_MAX.to_string()));
+    }
+    Ok(())
+}
+
+/// Validate a cache TTL: within [`caps::TTL_MIN`]..=[`caps::TTL_MAX`].
+pub(super) fn validate_ttl(seconds: i64, lang: &Lang) -> Result<(), String> {
+    if (caps::TTL_MIN..=caps::TTL_MAX).contains(&seconds) {
+        Ok(())
+    } else {
+        Err(lang.t("val.ttl_range").into())
+    }
+}
+
+/// Validate a slug's format (the uniqueness check is per table and stays
+/// with the caller).
+pub(super) fn validate_slug_format(slug: &str, lang: &Lang) -> Result<(), String> {
+    if SLUG_RE.is_match(slug) {
+        Ok(())
+    } else {
+        Err(lang.t("val.slug_format").into())
+    }
+}
+
+/// Validate an access token: at most [`caps::ACCESS_TOKEN`] bytes and
+/// only the unreserved ASCII the serve link embeds unescaped.
+pub(super) fn validate_token(token: &str, lang: &Lang) -> Result<(), String> {
+    if token.len() > caps::ACCESS_TOKEN {
+        return Err(
+            lang.t("val.field_too_long")
+                .replace("{}", &caps::ACCESS_TOKEN.to_string()),
+        );
+    }
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+    {
+        return Err(lang.t("val.token_format").into());
+    }
+    Ok(())
+}
+
+/// Validate a tag list: at most [`caps::TAGS`] tags, each at most
+/// [`caps::TAG_BYTES`] bytes.
+pub(super) fn validate_tags(tags: &[String], lang: &Lang) -> Result<(), String> {
+    if tags.len() > caps::TAGS {
+        return Err(
+            lang.t("val.too_many_tags")
+                .replace("{}", &caps::TAGS.to_string()),
+        );
+    }
+    if tags.iter().any(|tag| tag.len() > caps::TAG_BYTES) {
+        return Err(
+            lang.t("val.field_too_long")
+                .replace("{}", &caps::TAG_BYTES.to_string()),
+        );
+    }
+    Ok(())
+}
+
+/// Validate a header map: at most [`caps::HEADER_LINES`] entries, at most
+/// [`caps::HEADER_BYTES`] bytes in total, and every name/value the HTTP
+/// layer would accept.
+pub(super) fn validate_header_map(
+    headers: &std::collections::BTreeMap<String, String>,
+    lang: &Lang,
+) -> Result<(), String> {
+    if headers.len() > caps::HEADER_LINES {
+        return Err(
+            lang.t("val.too_many_headers")
+                .replace("{}", &caps::HEADER_LINES.to_string()),
+        );
+    }
+    let total: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total > caps::HEADER_BYTES {
+        return Err(
+            lang.t("val.headers_too_long")
+                .replace("{}", &caps::HEADER_BYTES.to_string()),
+        );
+    }
+    for (key, value) in headers {
+        if axum::http::HeaderName::try_from(key.as_str()).is_err()
+            || axum::http::HeaderValue::try_from(value.as_str()).is_err()
+        {
+            return Err(lang.t("val.header_invalid").replace("{}", key));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a country allowlist and return it normalized (uppercase,
+/// without repeats): at most [`caps::COUNTRIES`] codes, each two ASCII
+/// letters.
+pub(super) fn validate_countries(
+    countries: &[String],
+    lang: &Lang,
+) -> Result<Vec<String>, String> {
+    let mut normalized: Vec<String> = Vec::with_capacity(countries.len());
+    for code in countries {
+        let code = code.trim();
+        if code.is_empty() {
+            continue;
+        }
+        let upper = code.to_ascii_uppercase();
+        if upper.len() != 2 || !upper.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Err(lang.t("val.country_format").replace("{}", code));
+        }
+        if !normalized.contains(&upper) {
+            normalized.push(upper);
+        }
+    }
+    if normalized.len() > caps::COUNTRIES {
+        return Err(
+            lang.t("val.too_many_countries")
+                .replace("{}", &caps::COUNTRIES.to_string()),
+        );
+    }
+    Ok(normalized)
 }
 
 /// Compact size of a pipeline document, the measure both form builders

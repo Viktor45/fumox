@@ -207,11 +207,19 @@ struct SettingsEditTemplate {
     /// carries it back, and a file that changed in the meantime is
     /// refused instead of being overwritten by the stale form.
     fingerprint: String,
+    /// Dotted config paths the environment overrides. A locked field is
+    /// rendered read-only and is left out of the write: the env layer
+    /// wins over the file, so a value written here would be inert.
+    env_locked: Vec<String>,
 }
 
 #[derive(Clone)]
 enum Banner {
     Unwritable(String),
+    /// The config file could not be read. The form falls back to the
+    /// running configuration, which is not what the panel writes, so
+    /// the operator is told why the values below are not the file's.
+    LoadFailed(String, String),
 }
 
 impl SettingsEditTemplate {
@@ -264,29 +272,69 @@ impl SettingsEditTemplate {
     }
 
     fn banner_html(&self) -> Option<String> {
-        let Banner::Unwritable(path) = self.banner.as_ref()?;
-        Some(
-            self.lang
-                .t_named("set.edit_unwritable", &[("path", path.clone())]),
-        )
+        match self.banner.as_ref()? {
+            Banner::Unwritable(path) => Some(
+                self.lang
+                    .t_named("set.edit_unwritable", &[("path", path.clone())]),
+            ),
+            Banner::LoadFailed(path, reason) => Some(self.lang.t_named(
+                "set.edit_load_failed",
+                &[("path", path.clone()), ("reason", reason.clone())],
+            )),
+        }
     }
 
-    /// `disabled` attribute carried by every visible control on the
-    /// form when the config file is not writable. USERGUIDE promises
-    /// "every control is disabled" for a read-only deployment; the save
-    /// path refuses the POST anyway (`settings_edit_unwritable`), so
-    /// the form must not invite edits it cannot keep. The hidden
-    /// `value="off"` inputs and the CSS-only tab radios stay enabled:
-    /// they carry no setting (the hidden pair only mirrors its
-    /// checkbox) or are navigation, and a disabled radio would freeze
-    /// the pane view instead of just the edits.
-    fn fields_disabled(&self) -> &'static str {
+    /// `disabled` attribute for the control of `field`.
+    ///
+    /// A field the environment overrides is disabled on its own: the env
+    /// layer wins over the file, so a value written here would never
+    /// take effect and the operator would be shown a change that does
+    /// not happen. The read-only deployment (the config file is not
+    /// writable) is gated in one place instead, by the `<fieldset
+    /// disabled>` around the panes.
+    fn field_disabled(&self, field: &str) -> &'static str {
+        if is_env_locked(field, &self.env_locked) {
+            " disabled"
+        } else {
+            ""
+        }
+    }
+
+    /// `disabled` attribute for the read-only deployment: the whole
+    /// form is wrapped in a `<fieldset disabled>` instead of carrying
+    /// the attribute on every control.
+    fn panes_disabled(&self) -> &'static str {
         if self.state.config_writable {
             ""
         } else {
             " disabled"
         }
     }
+
+    /// The fields the environment overrides, listed once above the form.
+    /// Without the list the disabled controls look like a bug rather
+    /// than a deliberate lock.
+    fn env_locked_hint(&self) -> Option<String> {
+        if self.env_locked.is_empty() {
+            return None;
+        }
+        Some(self.lang.t_named(
+            "set.env_locked_hint",
+            &[("fields", self.env_locked.join(", "))],
+        ))
+    }
+}
+
+/// Whether the environment overrides `field`.
+///
+/// The lock is on the config path (`server.rate_limit`), while the form
+/// carries the halves of the pair (`server.rate_limit.limit`,
+/// `server.rate_limit.unit`), so a lock on a path covers every form
+/// field below it.
+fn is_env_locked(field: &str, locked: &[String]) -> bool {
+    locked
+        .iter()
+        .any(|path| path == field || field.starts_with(&format!("{path}.")))
 }
 
 impl_i18n!(SettingsEditTemplate, errors);
@@ -339,6 +387,10 @@ const LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace"];
 /// [`LOG_LEVELS`], the strings are also what [`ip_family_str`] renders.
 const IP_FAMILIES: &[&str] = &["any", "ipv4", "ipv6"];
 
+/// The closed set `TrustedHeader` deserializes; the strings are what
+/// `TrustedHeader::as_str` renders.
+const TRUSTED_HEADERS: &[&str] = &["none", "xff", "forwarded", "both"];
+
 static SETTINGS: &[Setting] = &[
     // --- server ---
     Setting {
@@ -354,6 +406,15 @@ static SETTINGS: &[Setting] = &[
             raw.insert(key.into(), c.server.trust_proxy_ips.join("\n"));
         },
         apply: |raw, key, cfg, lang, errors| cidr_list(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "server.trust_proxy_header",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.server.trust_proxy_header.as_str().into());
+        },
+        apply: |raw, key, cfg, lang, errors| {
+            enum_field(raw, key, cfg, TRUSTED_HEADERS, lang, errors)
+        },
     },
     Setting {
         key: "server.allowed_hosts",
@@ -516,6 +577,13 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
     },
+    Setting {
+        key: "geo.auto_download",
+        render: |c, key, raw| {
+            raw.insert(key.into(), bool_to_raw(c.geo.auto_download));
+        },
+        apply: |raw, key, cfg, _lang, errors| bool_field(raw, key, cfg, errors),
+    },
     // --- network ---
     Setting {
         key: "network.dns_timeout_secs",
@@ -595,6 +663,15 @@ static SETTINGS: &[Setting] = &[
             raw.insert(key.into(), c.admin.trust_proxy_ips.join("\n"));
         },
         apply: |raw, key, cfg, lang, errors| cidr_list(raw, key, cfg, lang, errors),
+    },
+    Setting {
+        key: "admin.trust_proxy_header",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.admin.trust_proxy_header.as_str().into());
+        },
+        apply: |raw, key, cfg, lang, errors| {
+            enum_field(raw, key, cfg, TRUSTED_HEADERS, lang, errors)
+        },
     },
     Setting {
         key: "admin.allowed_hosts",
@@ -852,25 +929,135 @@ fn ip_family_str(f: IpFamily) -> &'static str {
     }
 }
 
+/// The values the form shows: what the file on disk says, without the
+/// environment layer.
+///
+/// The panel writes the file, so the operator has to see the file's own
+/// values; the environment is layered on top of it (and wins), and the
+/// fields it overrides are rendered read-only and left out of the
+/// write.
+///
+/// `Ok(None)` means the file does not exist yet. `Err` names the
+/// reason it could not be read.
+fn raw_from_file(path: &Path) -> Result<Option<HashMap<String, String>>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    let config = fumox_core::config::parse_document(&text).map_err(|err| err.to_string())?;
+    Ok(Some(raw_from_config(&config)))
+}
+
+/// The outcome of the load/validate/save cycle of the settings form.
+enum SaveOutcome {
+    /// The document was written.
+    Saved {
+        path: String,
+        /// The admin token the document carried before the write.
+        previous_token: String,
+        /// The admin token the document carries after the write.
+        new_token: String,
+    },
+    /// The submitted values did not validate; nothing was written.
+    Invalid(Vec<(String, String)>),
+    /// The document the panel would write is one the binaries refuse
+    /// to load. Nothing was written.
+    InvalidDocument(String),
+    /// The document could not be read.
+    LoadError(String),
+    /// The document could not be written.
+    WriteError(String),
+    /// The file changed under the form.
+    Conflict,
+}
+
+/// Load the document, apply the submitted values and write the result
+/// back.
+///
+/// The whole cycle is synchronous file work: it parses the document and
+/// holds the config lock for the read-modify-write. It runs on the
+/// blocking pool, so a slow disk cannot stall the async runtime.
+fn save_settings(
+    target: PathBuf,
+    raw: HashMap<String, String>,
+    lang: Lang,
+    env_locked: Vec<String>,
+) -> SaveOutcome {
+    let mut cfg = match EditableConfig::load(&target) {
+        Ok(cfg) => cfg,
+        Err(err) => return SaveOutcome::LoadError(err.to_string()),
+    };
+
+    let previous_token = cfg
+        .get("admin.token")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let mut errors: Vec<(String, String)> = Vec::new();
+    apply_all(&raw, &mut cfg, &lang, &mut errors, &env_locked);
+    if !errors.is_empty() {
+        return SaveOutcome::Invalid(errors);
+    }
+
+    let new_token = cfg
+        .get("admin.token")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if let Err(err) = cfg.save() {
+        return match err {
+            ConfigWriteError::Conflict { .. } => SaveOutcome::Conflict,
+            // The document the panel would write is one the binaries
+            // refuse to load. That is the operator's file, not a
+            // server fault, and it has to be shown as such.
+            ConfigWriteError::InvalidDocument { .. } => {
+                SaveOutcome::InvalidDocument(err.to_string())
+            }
+            other => SaveOutcome::WriteError(other.to_string()),
+        };
+    }
+
+    SaveOutcome::Saved {
+        path: target.display().to_string(),
+        previous_token,
+        new_token,
+    }
+}
+
 pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
 
-    // Reload the file on every GET so the form reflects the last save
-    // (the in-memory `state.config` is frozen at startup and would lag
-    // behind every admin write). ENV overrides still win, `AppConfig::load`
-    // merges them on top of the file.
+    // The form is the view of the FILE, not of the running
+    // configuration: the panel writes the file, so the operator has to
+    // see what the file says. The environment is layered on top of it
+    // (and wins), and the fields it overrides are rendered read-only
+    // and left out of the write.
     let target = editing_target(&state);
-    let raw = match fumox_core::config::load(Some(&target)) {
-        Ok(loaded) => raw_from_config(&loaded.config),
-        // The unwritable / load-error fallback: the file on disk is not
-        // an option, so the form renders the live in-memory view instead.
-        Err(_) => raw_from_config(&state.live()),
+    let env_locked = fumox_core::config::env_overridden_paths();
+    let (raw, load_error) = match raw_from_file(&target) {
+        Ok(Some(raw)) => (raw, None),
+        // No file yet: the operator creates it from the defaults.
+        Ok(None) => (raw_from_config(&state.live()), None),
+        // The file is there but cannot be read: the live view is the
+        // only thing left to show, and the operator is told why the
+        // values below are not the file's.
+        Err(reason) => {
+            tracing::warn!(
+                error = %reason,
+                path = %target.display(),
+                "config load for edit page failed, rendering live view"
+            );
+            (raw_from_config(&state.live()), Some(reason))
+        }
     };
 
     let banner = if !state.config_writable {
         Some(Banner::Unwritable(target.display().to_string()))
     } else {
-        None
+        load_error.map(|reason| Banner::LoadFailed(target.display().to_string(), reason))
     };
     let template = SettingsEditTemplate {
         langs: state.locales.choices().to_vec(),
@@ -883,6 +1070,7 @@ pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) 
         errors: Vec::new(),
         banner,
         fingerprint: fingerprint(&target),
+        env_locked,
     };
     render_html(template.lang.clone(), &template, StatusCode::OK)
 }
@@ -898,6 +1086,10 @@ pub async fn settings_update(
 
     let lang = state.locales.lang_from_headers(&headers);
     let raw: HashMap<String, String> = form.into_iter().collect();
+
+    // The fields the environment overrides. The env layer wins over the
+    // file, so they are left out of the write and rendered read-only.
+    let env_locked = fumox_core::config::env_overridden_paths();
 
     // Optimistic concurrency: the form carries the fingerprint of the
     // file it was rendered from. A file that changed since (a hand edit
@@ -919,18 +1111,34 @@ pub async fn settings_update(
     // Build a fresh `EditableConfig` so we can fail-and-replay the form
     // before touching disk. The validator only reads `raw` and the
     // language catalog, no side effects. The editor holds the
-    // process-wide config lock, so it is confined to this block: its
+    // process-wide config lock, so it is confined to this cycle: its
     // guard must not ride across the awaits below.
-    let path = {
-        let mut cfg = match EditableConfig::load(&target) {
-            Ok(c) => c,
-            Err(err) => return settings_edit_load_error(&state, &headers, err.to_string()),
-        };
+    //
+    // The whole cycle is synchronous file work and runs on the blocking
+    // pool, so a slow disk cannot stall the async runtime.
+    let outcome = match tokio::task::spawn_blocking({
+        let target = target.clone();
+        let raw = raw.clone();
+        let lang = lang.clone();
+        let env_locked = env_locked.clone();
+        move || save_settings(target, raw, lang, env_locked)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::error!(error = %err, "the settings save task failed");
+            return settings_edit_load_error(&state, &headers, err.to_string());
+        }
+    };
 
-        let mut errors: Vec<(String, String)> = Vec::new();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
-
-        if !errors.is_empty() {
+    let (path, previous_token, new_token) = match outcome {
+        SaveOutcome::Saved {
+            path,
+            previous_token,
+            new_token,
+        } => (path, previous_token, new_token),
+        SaveOutcome::Invalid(errors) => {
             let template = SettingsEditTemplate {
                 langs: state.locales.choices().to_vec(),
                 theme: theme::from_headers(&headers),
@@ -942,6 +1150,7 @@ pub async fn settings_update(
                 errors,
                 banner: None,
                 fingerprint: fingerprint(&target),
+                env_locked,
             };
             return render_html(
                 template.lang.clone(),
@@ -949,22 +1158,39 @@ pub async fn settings_update(
                 StatusCode::UNPROCESSABLE_ENTITY,
             );
         }
-
-        // Persist atomically. On a backend that rejects `rename` (NFS / SMB),
-        // `save()` falls back to a direct write with a tracing warning.
-        if let Err(err) = cfg.save() {
-            // The file changed between the load above and the write: the
-            // document in hand is a snapshot of a file that no longer
-            // exists. Refuse it like the stale-form case, so the other
-            // change survives.
-            if matches!(err, ConfigWriteError::Conflict { .. }) {
-                tracing::warn!(
-                    path = %cfg.path().display(),
-                    "settings save refused: the config file changed during the save"
-                );
-                return settings_edit_conflict(&state, &headers);
-            }
-            tracing::error!(error = %err, path = %cfg.path().display(), "failed to save settings");
+        SaveOutcome::InvalidDocument(message) => {
+            // The file on disk is one the binaries would refuse, so the
+            // panel did not write over it. The operator has to see the
+            // reason, otherwise the refusal is a mystery.
+            tracing::warn!(
+                error = %message,
+                path = %target.display(),
+                "settings save refused: the resulting config would not load"
+            );
+            let template = SettingsEditTemplate {
+                langs: state.locales.choices().to_vec(),
+                theme: theme::from_headers(&headers),
+                lang: lang.clone(),
+                active: "settings",
+                csrf: state.csrf_for(&headers),
+                state: state.clone(),
+                raw,
+                errors: vec![(String::new(), message)],
+                banner: None,
+                fingerprint: fingerprint(&target),
+                env_locked,
+            };
+            return render_html(
+                template.lang.clone(),
+                &template,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            );
+        }
+        SaveOutcome::LoadError(message) => {
+            return settings_edit_load_error(&state, &headers, message);
+        }
+        SaveOutcome::WriteError(message) => {
+            tracing::error!(error = %message, path = %target.display(), "failed to save settings");
             let template = SettingsEditTemplate {
                 langs: state.locales.choices().to_vec(),
                 theme: theme::from_headers(&headers),
@@ -975,10 +1201,11 @@ pub async fn settings_update(
                 raw,
                 errors: vec![(
                     "".into(),
-                    lang.t_args("err.internal", &[format!("save: {err}")]),
+                    lang.t_args("err.internal", &[format!("save: {message}")]),
                 )],
                 banner: None,
                 fingerprint: fingerprint(&target),
+                env_locked,
             };
             return render_html(
                 template.lang.clone(),
@@ -986,8 +1213,17 @@ pub async fn settings_update(
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
         }
-
-        cfg.path().display().to_string()
+        SaveOutcome::Conflict => {
+            // The file changed between the load and the write: the
+            // document in hand is a snapshot of a file that no longer
+            // exists. Refuse it like the stale-form case, so the other
+            // change survives.
+            tracing::warn!(
+                path = %target.display(),
+                "settings save refused: the config file changed during the save"
+            );
+            return settings_edit_conflict(&state, &headers);
+        }
     };
 
     tracing::info!(path = %path, "settings saved");
@@ -996,20 +1232,25 @@ pub async fn settings_update(
     // minted under the old token: the session key is derived from the
     // token at startup and stays frozen (`AdminState::session_key`), so
     // without an epoch bump a stolen cookie keeps authenticating until
-    // the next restart. The comparison runs before `refresh_live_config`
-    // swaps the new token into the live config, and only on an actual
-    // change: an unconditional bump would log out the very session
-    // performing an unrelated save. An empty submit is NOT a change:
-    // `token_field` reads it as "keep the current token", so treating
-    // it as a rotation would log the operator out of every unrelated
-    // save (the field renders empty and untouched fields submit empty).
-    let submitted_token = raw
-        .get("admin.token")
-        .map(String::as_str)
-        .unwrap_or_default()
-        .trim();
-    if !submitted_token.is_empty() && submitted_token != state.admin().token {
-        crate::admin::auth::revoke_all_sessions(&state.pool).await;
+    // the next restart.
+    //
+    // The comparison is between the token of the document before the
+    // write and the one after it, so only an actual change counts: an
+    // unconditional bump would log out the very session performing an
+    // unrelated save. An empty submit is NOT a change: `token_field`
+    // reads it as "keep the current token", so treating it as a
+    // rotation would log the operator out of every unrelated save (the
+    // field renders empty and untouched fields submit empty).
+    //
+    // A token the environment overrides is not a rotation at all: the
+    // file's value is inert, the running server keeps the environment's
+    // token, and the sessions that token minted stay valid.
+    let token_locked = env_locked.iter().any(|path| path == "admin.token");
+    if !token_locked && !new_token.is_empty() && new_token != previous_token {
+        tracing::info!("admin token rotated; all admin sessions revoked");
+        if !crate::admin::auth::revoke_all_sessions(&state.pool).await {
+            tracing::warn!("the session revocation did not persist; cookies minted under the old token stay valid");
+        }
     }
 
     // Refresh the figment-merged in-memory view so the next request to
@@ -1022,11 +1263,45 @@ pub async fn settings_update(
         return settings_refresh_failed(&lang, &headers, &path, &err);
     }
 
-    let toast = lang.t_named("set.edit_saved_toast", &[("path", path)]);
+    // The toast says what actually happened. A save that the
+    // environment overrules is not a plain success: the operator has to
+    // learn that the value they changed is not the one in force.
+    let (toast, level) = save_toast(&lang, &path, &env_locked);
     if headers.get("HX-Request").is_some() {
-        return htmx_redirect_with_toast("/admin/settings", &toast, "ok");
+        return htmx_redirect_with_toast("/admin/settings", &toast, level);
     }
-    super::flash_redirect("/admin/settings", &toast, "ok")
+    super::flash_redirect("/admin/settings", &toast, level)
+}
+
+/// The toast a finished save answers with, and its level.
+///
+/// A plain success claims that the values the operator just wrote are
+/// the ones in force. The environment sits above the file and wins, so
+/// a save that touched an overridden setting did not put that value in
+/// force — the toast has to say so instead of claiming a success.
+fn save_toast(lang: &Lang, path: &str, env_locked: &[String]) -> (String, &'static str) {
+    if env_locked.iter().any(|locked| locked == "admin.token") {
+        return (
+            lang.t_named("set.edit_token_env_override", &[("path", path.to_string())]),
+            "error",
+        );
+    }
+    if !env_locked.is_empty() {
+        return (
+            lang.t_named(
+                "set.edit_env_locked_toast",
+                &[
+                    ("path", path.to_string()),
+                    ("fields", env_locked.join(", ")),
+                ],
+            ),
+            "ok",
+        );
+    }
+    (
+        lang.t_named("set.edit_saved_toast", &[("path", path.to_string())]),
+        "ok",
+    )
 }
 
 /// The save reached the disk, but the running view could not be
@@ -1075,9 +1350,9 @@ fn htmx_redirect_with_toast(redirect_to: &str, toast: &str, level: &str) -> Resp
 fn settings_edit_conflict(state: &AdminState, headers: &HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(headers);
     let target = editing_target(state);
-    let raw = match fumox_core::config::load(Some(&target)) {
-        Ok(loaded) => raw_from_config(&loaded.config),
-        Err(_) => raw_from_config(&state.live()),
+    let raw = match raw_from_file(&target) {
+        Ok(Some(raw)) => raw,
+        Ok(None) | Err(_) => raw_from_config(&state.live()),
     };
     let template = SettingsEditTemplate {
         langs: state.locales.choices().to_vec(),
@@ -1090,6 +1365,7 @@ fn settings_edit_conflict(state: &AdminState, headers: &HeaderMap) -> Response {
         errors: vec![("".into(), lang.t("err.config_conflict").to_string())],
         banner: None,
         fingerprint: fingerprint(&target),
+        env_locked: fumox_core::config::env_overridden_paths(),
     };
     render_html(template.lang.clone(), &template, StatusCode::CONFLICT)
 }
@@ -1109,6 +1385,7 @@ fn settings_edit_unwritable(state: &AdminState, headers: &HeaderMap) -> Response
             editing_target(state).display().to_string(),
         )),
         fingerprint: fingerprint(&editing_target(state)),
+        env_locked: fumox_core::config::env_overridden_paths(),
     };
     render_html(
         template.lang.clone(),
@@ -1131,6 +1408,7 @@ fn settings_edit_load_error(state: &AdminState, headers: &HeaderMap, message: St
         errors: vec![("".into(), format!("{internal}: {message}"))],
         banner: None,
         fingerprint: fingerprint(&editing_target(state)),
+        env_locked: fumox_core::config::env_overridden_paths(),
     };
     render_html(
         template.lang.clone(),
@@ -1154,12 +1432,31 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
         return settings_edit_unwritable(&state, &headers);
     }
 
-    if let Err(err) = fumox_core::config_writer::create_private_file(
-        &target,
-        fumox_core::config_writer::REFERENCE_CONFIG,
-    ) {
-        tracing::error!(error = %err, path = %target.display(), "failed to write reference config");
-        return settings_edit_load_error(&state, &headers, err.to_string());
+    // The file is written through the same atomic path a save takes: a
+    // temporary file in the same directory, fsynced, then moved into
+    // place. A create that dies half-way leaves no half-written config
+    // behind for the next start to refuse.
+    let created = tokio::task::spawn_blocking({
+        let target = target.clone();
+        move || {
+            fumox_core::config_writer::create_private_file_atomic(
+                &target,
+                fumox_core::config_writer::REFERENCE_CONFIG,
+            )
+        }
+    })
+    .await;
+
+    match created {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, path = %target.display(), "failed to write reference config");
+            return settings_edit_load_error(&state, &headers, err.to_string());
+        }
+        Err(err) => {
+            tracing::error!(error = %err, path = %target.display(), "failed to write reference config");
+            return settings_edit_load_error(&state, &headers, err.to_string());
+        }
     }
 
     // The file was just materialised from the embedded reference copy;
@@ -1192,13 +1489,21 @@ fn redirect_after_create(toast: String) -> Response {
 /// Each field is parsed in isolation, errors accumulate without
 /// short-circuiting so the operator sees every problem on a single
 /// submit.
+///
+/// A field the environment overrides is left alone: the env layer wins
+/// over the file, so a value written here would never take effect and
+/// the operator would be shown a change that does not happen.
 fn apply_all(
     raw: &HashMap<String, String>,
     cfg: &mut EditableConfig,
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
+    env_locked: &[String],
 ) {
     for setting in SETTINGS {
+        if is_env_locked(setting.key, env_locked) {
+            continue;
+        }
         (setting.apply)(raw, setting.key, cfg, lang, errors);
     }
 
@@ -1209,6 +1514,13 @@ fn apply_all(
     let min = raw
         .get("meow.backoff_initial_secs")
         .and_then(|s| s.parse::<u64>().ok());
+    // A locked side of the pair carries the environment's value, not
+    // the file's, so the two halves are not comparable here.
+    if is_env_locked("meow.backoff_max_secs", env_locked)
+        || is_env_locked("meow.backoff_initial_secs", env_locked)
+    {
+        return;
+    }
     if let (Some(min), Some(max)) = (min, max)
         && max < min
     {
@@ -1439,9 +1751,13 @@ fn bool_field(
     cfg: &mut EditableConfig,
     errors: &mut Vec<(String, String)>,
 ) {
-    // Booleans default to `false` when the checkbox was absent, the
-    // browser drops unchecked checkboxes from the form submission.
-    let v = raw_get(raw, field).unwrap_or("");
+    // The key is handled only when the form carried it. A checkbox the
+    // browser did not post (a disabled one, a field the operator never
+    // reached) must not reset the setting: writing `false` for it would
+    // change a value nobody touched. The form posts the hidden
+    // `value="off"` pair next to every checkbox, so an unchecked box
+    // still arrives as an explicit "off".
+    let Some(v) = raw_get(raw, field) else { return };
     let Some(b) = parse_bool_literal(v) else {
         errors.push((field.into(), format!("unexpected bool literal: {v}")));
         return;
@@ -1668,6 +1984,49 @@ fn i64_list_field(
     set_field(cfg, field, item::i64_array(parsed), errors);
 }
 
+/// The stored rate limit as text (`120/min`, or a bare `120`).
+///
+/// The document keeps the pair in one value while the form edits the
+/// two halves separately, so a half that did not come in is read back
+/// from here.
+fn stored_rate_limit_text(cfg: &EditableConfig, prefix: &str) -> Option<String> {
+    let item = cfg.get(prefix)?;
+    if let Some(text) = item.as_str() {
+        return Some(text.trim().to_string());
+    }
+    item.as_integer().map(|n| n.to_string())
+}
+
+/// The unit half of a stored rate limit, in the vocabulary the form
+/// uses (`sec`, `min`, `hour`, `day`).
+fn stored_rate_unit(cfg: &EditableConfig, prefix: &str) -> Option<String> {
+    let text = stored_rate_limit_text(cfg, prefix)?;
+    let (_, unit) = text.split_once('/')?;
+    form_unit(unit).map(str::to_string)
+}
+
+/// The limit half of a stored rate limit.
+fn stored_rate_limit(cfg: &EditableConfig, prefix: &str) -> Option<String> {
+    let text = stored_rate_limit_text(cfg, prefix)?;
+    let limit = match text.split_once('/') {
+        Some((limit, _)) => limit,
+        None => text.as_str(),
+    };
+    Some(limit.trim().to_string())
+}
+
+/// The form's unit vocabulary, in the reading the config parser gives
+/// the same unit.
+fn form_unit(unit: &str) -> Option<&'static str> {
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "s" | "sec" | "second" => Some("sec"),
+        "m" | "min" | "minute" => Some("min"),
+        "h" | "hour" => Some("hour"),
+        "d" | "day" => Some("day"),
+        _ => None,
+    }
+}
+
 fn rate_limit(
     raw: &HashMap<String, String>,
     prefix: &str,
@@ -1677,12 +2036,35 @@ fn rate_limit(
 ) {
     // Both halves of the pair must be present, leaving one out means
     // the form was incomplete.
-    let Some(limit_str) = raw_get(raw, &format!("{prefix}.limit")) else {
-        return;
+    let limit_raw = raw_get(raw, &format!("{prefix}.limit")).map(str::to_string);
+    let unit_raw = raw_get(raw, &format!("{prefix}.unit")).map(str::to_string);
+    let (limit_raw, unit_raw) = match (limit_raw, unit_raw) {
+        (None, None) => return,
+        (Some(limit), None) => {
+            // The unit half did not come in. The document supplies it,
+            // so the limit is still checked against the pair it would
+            // form, and the submit is then refused: a form that lost
+            // half of a pair is not a form the operator meant to send.
+            let stored = stored_rate_unit(cfg, prefix);
+            errors.push((
+                format!("{prefix}.unit"),
+                lang.t("val.pair_incomplete").into(),
+            ));
+            (Some(limit), stored)
+        }
+        (None, Some(unit)) => {
+            let stored = stored_rate_limit(cfg, prefix);
+            errors.push((
+                format!("{prefix}.limit"),
+                lang.t("val.pair_incomplete").into(),
+            ));
+            (stored, Some(unit))
+        }
+        both => both,
     };
-    let Some(unit_str) = raw_get(raw, &format!("{prefix}.unit")) else {
-        return;
-    };
+
+    let limit_str = limit_raw.as_deref().unwrap_or_default();
+    let unit_str = unit_raw.as_deref().unwrap_or_default();
 
     let limit: u32 = match limit_str.trim().parse() {
         Ok(n) => n,
@@ -1788,7 +2170,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         let serialized = cfg.doc().to_string();
@@ -1809,7 +2191,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert_eq!(
             collect_field(&errors, "server.bind"),
@@ -1831,7 +2213,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(
             collect_field(&errors, "probe.fail_limit").is_some(),
@@ -1851,7 +2233,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(collect_field(&errors, "fetch.ip_family").is_some());
         std::fs::remove_dir_all(&dir).ok();
@@ -1877,7 +2259,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(
             collect_field(&errors, "server.bind").is_some(),
@@ -1908,7 +2290,7 @@ mod tests {
             let lang = test_lang();
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
-            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
             assert!(
                 errors.is_empty(),
                 "save produced errors for {family:?}: {errors:?}"
@@ -1943,7 +2325,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(
             collect_field(&errors, "meow.backoff_max_secs").is_some(),
@@ -1978,17 +2360,21 @@ mod tests {
 
         let mut raw = HashMap::new();
         raw.insert("ingest.drop_gate".into(), "on".into());
-        // `removed_as_unknown` is absent → false.
+        // `removed_as_unknown` is absent: a checkbox the browser did
+        // not post must not reset the setting.
 
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(errors.is_empty());
         let serialized = cfg.doc().to_string();
         assert!(serialized.contains("drop_gate = true"));
-        assert!(serialized.contains("removed_as_unknown = false"));
+        assert!(
+            !serialized.contains("removed_as_unknown"),
+            "a checkbox the form did not carry must not be written: {serialized}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2016,7 +2402,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(errors.is_empty());
         let serialized = cfg.doc().to_string();
@@ -2053,7 +2439,7 @@ mod tests {
         let save = |raw: &HashMap<String, String>| -> Vec<(String, String)> {
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
-            apply_all(raw, &mut cfg, &lang, &mut errors);
+            apply_all(raw, &mut cfg, &lang, &mut errors, &[]);
             if errors.is_empty() {
                 cfg.save().unwrap();
             }
@@ -2160,7 +2546,7 @@ mod tests {
         let raw = raw_from_config(&AppConfig::default());
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(errors.is_empty(), "defaults must validate: {errors:?}");
         std::fs::remove_dir_all(&dir).ok();
@@ -2368,7 +2754,7 @@ mod tests {
             raw.insert("server.rate_limit.unit".into(), "min".into());
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
-            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
             assert_eq!(
                 collect_field(&errors, "server.rate_limit.limit").is_some(),
@@ -2458,7 +2844,7 @@ mod tests {
             let lang = test_lang();
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
-            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
             assert!(
                 collect_field(&errors, field).is_some(),
@@ -2495,7 +2881,7 @@ mod tests {
 
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
-            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
             assert!(errors.is_empty(), "{level:?} must be accepted: {errors:?}");
             cfg.save().unwrap();
 
@@ -2527,7 +2913,7 @@ mod tests {
 
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
-            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
             assert_eq!(
                 collect_field(&errors, "fetch.max_response_bytes").is_some(),
@@ -2576,7 +2962,7 @@ mod tests {
 
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
-            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
             let message = collect_field(&errors, field).unwrap_or_else(|| {
                 panic!("unparsable CIDRs in {field} must be refused, got {errors:?}")
@@ -2615,7 +3001,7 @@ mod tests {
 
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
         assert!(
             errors.is_empty(),
             "valid CIDR lists must be accepted: {errors:?}"
@@ -2663,7 +3049,7 @@ mod tests {
         raw.insert("admin.token".into(), "change-me".into());
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert_eq!(
             errors.len(),
@@ -2711,7 +3097,7 @@ mod tests {
             raw.insert("admin.token".into(), submitted.into());
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
-            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
             assert!(
                 errors.is_empty(),
                 "an empty token submit must keep the current token, not error: {errors:?}"
@@ -2726,7 +3112,7 @@ mod tests {
         raw.insert("admin.token".into(), "  rotated-secret  ".into());
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
         assert!(errors.is_empty(), "{errors:?}");
         cfg.save().unwrap();
         let loaded = load_config(Some(&path)).expect("the rotated token must load");
@@ -2754,7 +3140,9 @@ mod tests {
         let token = state.admin().token;
         assert!(!token.is_empty(), "the fixture needs a non-empty token");
 
-        // Not writable: every control disabled, token still absent.
+        // Not writable: the panes are wrapped in a disabled fieldset,
+        // the submit button is disabled on its own, the token is still
+        // absent.
         state.config_writable = false;
         let template = SettingsEditTemplate {
             langs: Vec::new(),
@@ -2767,16 +3155,20 @@ mod tests {
             errors: Vec::new(),
             banner: Some(Banner::Unwritable("/unwritable/app.toml".into())),
             fingerprint: String::new(),
+            env_locked: Vec::new(),
         };
         let html = template.render().unwrap();
         assert!(
             !html.contains(&token),
             "the live admin token must never appear in the edit form markup"
         );
-        let disabled = html.matches(" disabled").count();
         assert!(
-            disabled >= 60,
-            "every control must be disabled when the config is not writable, got {disabled}"
+            html.contains("<fieldset class=\"settings-panes\" disabled>"),
+            "a read-only config must disable the whole form: {html}"
+        );
+        assert!(
+            html.contains("<button class=\"btn primary\" type=\"submit\" disabled>"),
+            "a read-only config must disable the submit button: {html}"
         );
 
         // Writable: nothing disabled, token still absent.
@@ -2792,6 +3184,7 @@ mod tests {
             errors: Vec::new(),
             banner: None,
             fingerprint: String::new(),
+            env_locked: Vec::new(),
         };
         let html = template.render().unwrap();
         assert!(
@@ -2864,7 +3257,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert_eq!(
             collect_field(&errors, "meow.test_url"),
@@ -2905,7 +3298,7 @@ mod tests {
             let lang = test_lang();
             let mut errors = Vec::new();
             let mut cfg = EditableConfig::load(&path).unwrap();
-            apply_all(&raw, &mut cfg, &lang, &mut errors);
+            apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
             let message = collect_field(&errors, "meow.test_url").unwrap_or_default();
             assert!(
@@ -2933,7 +3326,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         let message = collect_field(&errors, "meow.test_url").unwrap_or_default();
         assert!(
@@ -2958,7 +3351,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert!(
@@ -2984,7 +3377,7 @@ mod tests {
         let lang = test_lang();
         let mut errors = Vec::new();
         let mut cfg = EditableConfig::load(&path).unwrap();
-        apply_all(&raw, &mut cfg, &lang, &mut errors);
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
 
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         let serialized = cfg.doc().to_string();
@@ -3039,6 +3432,275 @@ mod tests {
         assert!(
             message.contains("is not a valid URL"),
             "the message must carry the reason: {message}"
+        );
+    }
+
+    /// A field the environment overrides cannot be changed through the
+    /// file: the env layer wins, so a value written here would be inert
+    /// and the operator would be shown a change that does not happen.
+    #[test]
+    fn an_env_locked_field_is_not_written_back() {
+        let dir = temp_dir("env-locked");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[ingest]\ndrop_gate = false\n").unwrap();
+
+        let raw = HashMap::from([("ingest.drop_gate".to_string(), "on".to_string())]);
+        let lang = test_lang();
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(
+            &raw,
+            &mut cfg,
+            &lang,
+            &mut errors,
+            &["ingest.drop_gate".to_string()],
+        );
+
+        assert!(errors.is_empty(), "a locked field is not an error: {errors:?}");
+        assert!(
+            cfg.doc().to_string().contains("drop_gate = false"),
+            "the locked field must keep the file's value"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The lock is on the config path, while the form carries the
+    /// halves of the rate-limit pair. A lock on the path must cover
+    /// both halves, or the operator could write the half the
+    /// environment does not shadow.
+    #[test]
+    fn an_env_lock_covers_the_halves_of_a_rate_limit_pair() {
+        let locked = vec!["server.rate_limit".to_string()];
+        assert!(is_env_locked("server.rate_limit", &locked));
+        assert!(is_env_locked("server.rate_limit.limit", &locked));
+        assert!(is_env_locked("server.rate_limit.unit", &locked));
+        assert!(!is_env_locked("server.auth_fail_rate_limit", &locked));
+        assert!(!is_env_locked("ingest.drop_gate", &locked));
+    }
+
+    /// A form that lost half of a rate-limit pair is not a form the
+    /// operator meant to send: the submit is refused and the file is
+    /// left byte-identical.
+    #[test]
+    fn a_partial_rate_limit_pair_is_refused_and_the_file_stays_untouched() {
+        let dir = temp_dir("half-pair");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[server]\nrate_limit = \"120/min\"\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let raw = HashMap::from([(
+            "server.rate_limit.limit".to_string(),
+            "60".to_string(),
+        )]);
+        let outcome = save_settings(
+            path.clone(),
+            raw,
+            test_lang(),
+            Vec::new(),
+        );
+
+        let SaveOutcome::Invalid(errors) = outcome else {
+            panic!("a half-filled pair must be refused");
+        };
+        assert!(
+            collect_field(&errors, "server.rate_limit.unit").is_some(),
+            "the missing half must carry the error: {errors:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused save must leave the file byte-identical"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same, with the other half of the pair missing.
+    #[test]
+    fn a_partial_rate_limit_pair_without_the_limit_is_refused() {
+        let dir = temp_dir("half-pair-unit");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[server]\nrate_limit = \"120/min\"\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let raw = HashMap::from([(
+            "server.rate_limit.unit".to_string(),
+            "min".to_string(),
+        )]);
+        let outcome = save_settings(path.clone(), raw, test_lang(), Vec::new());
+
+        let SaveOutcome::Invalid(errors) = outcome else {
+            panic!("a half-filled pair must be refused");
+        };
+        assert!(
+            collect_field(&errors, "server.rate_limit.limit").is_some(),
+            "the missing half must carry the error: {errors:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused save must leave the file byte-identical"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A checkbox the browser did not post must not reset the setting:
+    /// writing `false` for it would change a value nobody touched.
+    #[test]
+    fn a_bool_the_form_did_not_carry_is_not_reset() {
+        let dir = temp_dir("bool-absent");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[ingest]\ndrop_gate = true\n").unwrap();
+
+        let raw = HashMap::from([(
+            "probe.fail_limit".to_string(),
+            "5".to_string(),
+        )]);
+        let lang = test_lang();
+        let mut errors = Vec::new();
+        let mut cfg = EditableConfig::load(&path).unwrap();
+        apply_all(&raw, &mut cfg, &lang, &mut errors, &[]);
+
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(
+            cfg.doc().to_string().contains("drop_gate = true"),
+            "a checkbox that was not posted must keep its value"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The form is the view of the FILE: the panel writes the file, so
+    /// the operator has to see what the file says, not what the
+    /// environment layered on top of it.
+    #[test]
+    fn the_form_shows_the_file_and_not_the_environment() {
+        let dir = temp_dir("file-view");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "[ingest]\ndrop_gate = true\n").unwrap();
+
+        let raw = raw_from_file(&path).unwrap().expect("the file is there");
+        assert_eq!(
+            raw.get("ingest.drop_gate").map(String::as_str),
+            Some("on"),
+            "the form must show the file's own value"
+        );
+
+        // A missing file is not an error: the operator creates it from
+        // the defaults.
+        let missing = dir.join("absent.toml");
+        assert!(
+            raw_from_file(&missing).unwrap().is_none(),
+            "a missing file must not be an error"
+        );
+
+        // A file that cannot be parsed names the reason.
+        let broken = dir.join("broken.toml");
+        std::fs::write(&broken, "[ingest\ndrop_gate = true\n").unwrap();
+        assert!(
+            raw_from_file(&broken).is_err(),
+            "a broken file must report the reason"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A save the environment overrules must not claim a plain success:
+    /// the operator has to learn that the value they changed is not the
+    /// one in force.
+    #[test]
+    fn a_save_the_environment_overrules_is_not_reported_as_a_success() {
+        let lang = test_lang();
+
+        let (message, level) = save_toast(&lang, "/etc/fumox/app.toml", &[]);
+        assert_eq!(level, "ok");
+        assert!(
+            message.contains("/etc/fumox/app.toml"),
+            "the message must name the file: {message}"
+        );
+
+        let (message, level) = save_toast(
+            &lang,
+            "/etc/fumox/app.toml",
+            &["ingest.drop_gate".to_string()],
+        );
+        assert_eq!(level, "ok");
+        assert!(
+            message.contains("ingest.drop_gate"),
+            "the message must name the overridden setting: {message}"
+        );
+
+        // The token is the sharpest case: the panel runs under the
+        // environment's token whatever the file says, so a green toast
+        // would claim a rotation that did not happen.
+        let (message, level) = save_toast(
+            &lang,
+            "/etc/fumox/app.toml",
+            &["admin.token".to_string()],
+        );
+        assert_eq!(level, "error");
+        assert!(
+            message.contains("admin.token") || message.contains("FUMOX_ADMIN__TOKEN"),
+            "the message must name the token override: {message}"
+        );
+    }
+
+    /// A field the environment overrides must be rendered read-only,
+    /// and the operator must be told why: a disabled control without a
+    /// reason reads as a bug.
+    #[tokio::test]
+    async fn an_env_locked_field_renders_read_only_with_a_reason() {
+        let admin = AdminConfig {
+            token: "live-secret".into(),
+            ..AdminConfig::default()
+        };
+        let (_dir, mut state) =
+            crate::admin::test_admin_state(admin, ServerConfig::default()).await;
+        state.config_writable = true;
+
+        let template = SettingsEditTemplate {
+            langs: Vec::new(),
+            theme: theme::from_headers(&HeaderMap::new()),
+            lang: test_lang(),
+            active: "settings",
+            csrf: String::new(),
+            state: state.clone(),
+            raw: raw_from_config(&state.live()),
+            errors: Vec::new(),
+            banner: None,
+            fingerprint: String::new(),
+            env_locked: vec!["ingest.drop_gate".to_string()],
+        };
+        let html = template.render().unwrap();
+
+        // The control of the locked field carries the attribute, and
+        // the hidden mirror next to it does too: a mirror that stayed
+        // enabled would post the field and defeat the lock.
+        assert!(
+            html.contains(r#"<input type="checkbox" name="ingest.drop_gate" value="on" id="ingest-drop" checked disabled>"#),
+            "the locked checkbox must be disabled: {html}"
+        );
+        assert!(
+            html.contains(r#"<input type="hidden" name="ingest.drop_gate" value="off" disabled>"#),
+            "the hidden mirror of the locked checkbox must be disabled: {html}"
+        );
+        // A field that is not locked stays editable.
+        assert!(
+            html.contains(r#"<input type="checkbox" name="ingest.removed_as_unknown" value="on" id="ingest-removed" >"#)
+                || html.contains(r#"name="ingest.removed_as_unknown" value="on" id="ingest-removed""#),
+            "an unlocked field must stay editable: {html}"
+        );
+        // The reason is on the page.
+        let lang = test_lang();
+        let hint = lang.t_named(
+            "set.env_locked_hint",
+            &[("fields", "ingest.drop_gate".to_string())],
+        );
+        assert!(
+            html.contains(&hint),
+            "the page must name the locked field: {html:.400}"
         );
     }
 }

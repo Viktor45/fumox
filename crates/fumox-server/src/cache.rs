@@ -7,6 +7,12 @@
 //! own `fresh_until`; a stale entry is still served
 //! (stale-while-revalidate) while a background re-render is scheduled.
 //!
+//! The layer is bounded by *bytes*, not by entry count: one rendered
+//! subscription is megabytes, so a count-based ceiling of ten thousand
+//! entries is a multi-gigabyte ceiling in practice. The weigher charges
+//! every entry its body plus a fixed overhead, so the entry count is
+//! bounded too.
+//!
 //! Freshness of the *underlying data* is not cached at all: it is derived
 //! from `sources.last_fetched_at`, the same row the ingest's TTL
 //! short-circuit reads (see `ingest::ingest_source`), so the fact "when was
@@ -27,17 +33,38 @@
 //! invalidated it. A key with no entry yet (the inline path) is registered
 //! with the cache layer for the duration of its render precisely so that
 //! invalidations can see it.
+//!
+//! The generations live outside the evictable cache, in a plain map that
+//! is never pruned: a generation that the cache dropped would let a render
+//! claimed before the invalidation store its pre-change rows as fresh. The
+//! map is bounded by the number of distinct keys the process ever used
+//! (one per profile and per source), not by the cache's capacity.
+//!
+//! Which keys a source touches is answered by a reverse index, not by a
+//! scan over the whole cache: the index names the keys a rendering was
+//! built from, so an invalidation touches exactly those.
 
 use axum::body::Bytes;
 use moka::future::Cache;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 
 /// Safety net so abandoned entries eventually leave the caches even without
 /// explicit invalidation (e.g. a deleted source).
 const ENTRY_IDLE_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Memory ceiling of the processed layer, in bytes. One rendered
+/// subscription body is megabytes, so the ceiling has to be a byte
+/// budget: an entry count would bound nothing.
+const PROCESSED_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes every entry is charged on top of its body: the key, the extra
+/// headers, the source list and the cache bookkeeping. Without it a cache
+/// full of tiny bodies would weigh almost nothing and the entry count
+/// would be unbounded.
+const ENTRY_OVERHEAD_BYTES: u32 = 512;
 
 /// Rendered subscription output (layer 2).
 #[derive(Debug)]
@@ -68,8 +95,14 @@ impl Rendered {
 pub struct Caches {
     processed: Cache<String, Arc<Rendered>>,
     /// Invalidation counter per processed key, bumped on every invalidation
-    /// of that key. Bounded exactly like the processed layer it guards.
-    generations: Cache<String, u64>,
+    /// of that key. Deliberately outside the evictable cache: a generation
+    /// the cache dropped would let a render claimed before the invalidation
+    /// store its pre-change rows as fresh.
+    generations: Arc<StdMutex<HashMap<String, u64>>>,
+    /// Which sources a processed key was rendered from, and the other way
+    /// round. The index answers an invalidation without a scan over the
+    /// whole cache.
+    index: Arc<StdMutex<SourceIndex>>,
     /// Processed keys currently being revalidated in the background, keeps
     /// concurrent stale requests from spawning duplicate re-renders.
     revalidating: Arc<Mutex<HashSet<String>>>,
@@ -82,8 +115,53 @@ pub struct Caches {
     /// keeps that supersession narrow: an ingest of a source this render
     /// cannot touch must not refuse its put.
     inline_rendering: Arc<Mutex<HashMap<String, InlineRenderState>>>,
-    /// Serializes the read-modify-write in [`Caches::bump_generation`].
-    bump_lock: Arc<Mutex<()>>,
+}
+
+/// Which processed key holds which sources, and the other way round.
+///
+/// The index is a record of what was rendered, not of what is cached: a
+/// key that was invalidated (or evicted by the cache's byte budget) stays
+/// in it. Invalidating a key that is no longer cached is a no-op, and
+/// dropping the record on the way out would race with a render that
+/// stores the same key right afterwards.
+#[derive(Default)]
+struct SourceIndex {
+    /// source id -> the processed keys rendered from it.
+    by_source: HashMap<String, HashSet<String>>,
+    /// processed key -> the sources it was rendered from.
+    by_key: HashMap<String, Vec<String>>,
+}
+
+impl SourceIndex {
+    /// Record that `key` was rendered from `sources`.
+    fn add(&mut self, key: &str, sources: &[String]) {
+        if sources.is_empty() {
+            return;
+        }
+        for source in sources {
+            self.by_source
+                .entry(source.clone())
+                .or_default()
+                .insert(key.to_string());
+        }
+        self.by_key.insert(key.to_string(), sources.to_vec());
+    }
+
+    /// The processed keys rendered from `source`.
+    fn keys_for_source(&self, source: &str) -> Vec<String> {
+        self.by_source
+            .get(source)
+            .map(|keys| keys.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Bytes one cache entry costs: its body plus the per-entry overhead.
+fn entry_weight(key: &str, rendered: &Rendered) -> u32 {
+    let body = u32::try_from(rendered.body.len()).unwrap_or(u32::MAX);
+    let key = u32::try_from(key.len()).unwrap_or(u32::MAX);
+    body.saturating_add(key)
+        .saturating_add(ENTRY_OVERHEAD_BYTES)
 }
 
 /// One in-flight inline (cache-miss) render.
@@ -128,16 +206,14 @@ impl Caches {
     pub fn new() -> Self {
         Self {
             processed: Cache::builder()
-                .max_capacity(10_000)
+                .max_capacity(PROCESSED_CACHE_BYTES)
+                .weigher(|key: &String, value: &Arc<Rendered>| entry_weight(key, value))
                 .time_to_idle(ENTRY_IDLE_LIMIT)
                 .build(),
-            generations: Cache::builder()
-                .max_capacity(10_000)
-                .time_to_idle(ENTRY_IDLE_LIMIT)
-                .build(),
+            generations: Arc::new(StdMutex::new(HashMap::new())),
+            index: Arc::new(StdMutex::new(SourceIndex::default())),
             revalidating: Arc::new(Mutex::new(HashSet::new())),
             inline_rendering: Arc::new(Mutex::new(HashMap::new())),
-            bump_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -147,8 +223,18 @@ impl Caches {
 
     pub async fn processed_put(&self, key: &str, rendered: Rendered) -> Arc<Rendered> {
         let arc = Arc::new(rendered);
-        self.processed.insert(key.to_string(), arc.clone()).await;
+        self.store(key, arc.clone()).await;
         arc
+    }
+
+    /// Put a rendering into the cache and record the sources it was built
+    /// from, so an invalidation of one of them finds the key.
+    async fn store(&self, key: &str, rendered: Arc<Rendered>) {
+        self.processed.insert(key.to_string(), rendered.clone()).await;
+        self.index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .add(key, &rendered.source_ids);
     }
 
     /// Store the result of a render that was claimed under `generation` (the
@@ -168,11 +254,11 @@ impl Caches {
         rendered: Arc<Rendered>,
         generation: u64,
     ) -> Option<Arc<Rendered>> {
-        if self.generation(key).await != generation {
+        if self.generation(key) != generation {
             return None;
         }
-        self.processed.insert(key.to_string(), rendered).await;
-        if self.generation(key).await != generation {
+        self.store(key, rendered).await;
+        if self.generation(key) != generation {
             // An invalidation landed between the check and the insert and
             // therefore did not see this entry; drop it by hand.
             self.processed_invalidate(key).await;
@@ -184,28 +270,35 @@ impl Caches {
     /// Drop a rendered output and bump its generation, so a render still
     /// in flight for it cannot store behind the invalidation.
     pub async fn processed_invalidate(&self, key: &str) {
-        self.bump_generation(key).await;
+        self.bump_generation(key);
         self.processed.invalidate(&key.to_string()).await;
     }
 
     /// Current invalidation generation of a processed key; 0 = never
     /// invalidated.
-    async fn generation(&self, key: &str) -> u64 {
-        self.generations.get(&key.to_string()).await.unwrap_or(0)
+    fn generation(&self, key: &str) -> u64 {
+        self.generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Mark every rendering of `key` produced up to now as superseded.
     ///
-    /// The read-modify-write runs under a lock: two invalidations of the
-    /// same key (two sources feeding one profile, ingesting at once) would
-    /// otherwise read the same generation and both write G+1, losing a
-    /// bump and letting a render claimed in between store pre-change rows
-    /// as fresh.
-    async fn bump_generation(&self, key: &str) {
-        let _serialized = self.bump_lock.lock().await;
-        let key = key.to_string();
-        let next = self.generation(&key).await + 1;
-        self.generations.insert(key, next).await;
+    /// The read-modify-write runs under the map's own lock: two
+    /// invalidations of the same key (two sources feeding one profile,
+    /// ingesting at once) would otherwise read the same generation and
+    /// both write G+1, losing a bump and letting a render claimed in
+    /// between store pre-change rows as fresh.
+    fn bump_generation(&self, key: &str) {
+        let mut generations = self
+            .generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = generations.entry(key.to_string()).or_insert(0);
+        *generation += 1;
     }
 
     /// Every rendered output that contains `source_id` is stale: dropped
@@ -216,14 +309,15 @@ impl Caches {
     /// processed TTL. `sources.last_fetched_at`, the freshness marker of
     /// the underlying data, is of course untouched.
     pub async fn invalidate_processed_for_source(&self, source_id: &str) {
-        let mut affected: Vec<String> = self
-            .processed
-            .iter()
-            .filter(|(_, rendered)| rendered.source_ids.iter().any(|id| id == source_id))
-            .map(|(key, _)| (*key).clone())
-            .collect();
+        // The index names the keys a rendering of this source produced,
+        // so no scan over the whole cache is needed.
+        let mut affected = self
+            .index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys_for_source(source_id);
         // A key with no entry yet, an inline (cache-miss) render of it
-        // running right now, is invisible to the iteration above. Its
+        // running right now, is invisible to the index. Its
         // rendering is still computed from the pre-ingest rows, so its
         // generation has to move too or the put would land behind this
         // invalidation (see [`Caches::processed_put_guarded`]). Only renders
@@ -238,7 +332,7 @@ impl Caches {
         );
         drop(inline);
         for key in affected {
-            self.bump_generation(&key).await;
+            self.bump_generation(&key);
             self.processed.invalidate(&key).await;
         }
     }
@@ -264,7 +358,7 @@ impl Caches {
         }
         // Read the generation before the caller starts the render, so any
         // invalidation from here on is visible to the put.
-        let generation = self.generation(key).await;
+        let generation = self.generation(key);
         Some(RevalidateGuard {
             revalidating: self.revalidating.clone(),
             key: key.to_string(),
@@ -313,7 +407,7 @@ impl Caches {
         InlineClaim::Leader(InlineRenderGuard {
             inline_rendering: self.inline_rendering.clone(),
             key: key.to_string(),
-            generation: self.generation(key).await,
+            generation: self.generation(key),
         })
     }
 }
@@ -624,7 +718,7 @@ mod tests {
             tasks.spawn(async move { caches.processed_invalidate("sub:race").await });
         }
         while tasks.join_next().await.is_some() {}
-        assert_eq!(caches.generation("sub:race").await, 64);
+        assert_eq!(caches.generation("sub:race"), 64);
     }
 
     /// A request that finds the claim taken must be handed a wake-up that
@@ -705,5 +799,82 @@ mod tests {
             .await;
         assert!(stored.is_some());
         assert!(caches.processed_get("sub:p1").await.is_some());
+    }
+
+    /// The layer is bounded by bytes, not by entry count: one rendered
+    /// subscription is megabytes, so a ceiling of ten thousand entries is
+    /// a multi-gigabyte ceiling in practice.
+    #[tokio::test]
+    async fn the_cache_is_bounded_by_bytes() {
+        let caches = Caches::new();
+        let now = fumox_core::models::now_ts();
+        let mut big = rendered(now + 60, &[]);
+        big.body = Bytes::from(vec![b'x'; 1024 * 1024]);
+        caches.processed_put("sub:big", big).await;
+        // The write buffer is applied on demand, so the counters are read
+        // after the maintenance pass.
+        caches.processed.run_pending_tasks().await;
+        assert_eq!(caches.processed.entry_count(), 1);
+        assert!(
+            caches.processed.weighted_size() >= 1024 * 1024,
+            "the cache must weigh the body, not count the entry: {}",
+            caches.processed.weighted_size()
+        );
+    }
+
+    /// Every entry is charged its body plus a fixed overhead, so a cache
+    /// full of empty bodies is bounded too.
+    #[test]
+    fn an_entry_costs_its_body_plus_an_overhead() {
+        let mut entry = rendered(0, &[]);
+        entry.body = Bytes::from(vec![b'x'; 4096]);
+        let weight = entry_weight("sub:p1", &entry);
+        assert!(weight >= 4096 + ENTRY_OVERHEAD_BYTES);
+        assert!(weight < 4096 + ENTRY_OVERHEAD_BYTES + 64);
+    }
+
+    /// The generation counter outlives the entry it guards: a generation
+    /// the cache dropped would let a render claimed before the
+    /// invalidation store its pre-change rows as fresh.
+    #[tokio::test]
+    async fn a_generation_outlives_the_entry_it_guards() {
+        let caches = Caches::new();
+        let now = fumox_core::models::now_ts();
+        caches
+            .processed_put("sub:p1", rendered(now + 60, &["s1"]))
+            .await;
+        caches.processed_invalidate("sub:p1").await;
+        assert!(caches.processed_get("sub:p1").await.is_none());
+        assert_eq!(caches.generation("sub:p1"), 1);
+    }
+
+    /// The reverse index names the keys a source was rendered from, so an
+    /// invalidation does not have to scan the whole cache.
+    #[test]
+    fn the_reverse_index_names_the_keys_of_a_source() {
+        let mut index = SourceIndex::default();
+        index.add("sub:p1", &["s1".to_string(), "s2".to_string()]);
+        index.add("sub:p2", &["s2".to_string()]);
+        let mut keys = index.keys_for_source("s2");
+        keys.sort();
+        assert_eq!(keys, vec!["sub:p1".to_string(), "sub:p2".to_string()]);
+        assert!(index.keys_for_source("s3").is_empty());
+    }
+
+    /// An invalidation reaches the keys the index names, and only those:
+    /// a rendering of another source survives.
+    #[tokio::test]
+    async fn an_invalidation_reaches_the_keys_the_index_names() {
+        let caches = Caches::new();
+        let now = fumox_core::models::now_ts();
+        caches
+            .processed_put("sub:p1", rendered(now + 60, &["s1"]))
+            .await;
+        caches
+            .processed_put("sub:p2", rendered(now + 60, &["s2"]))
+            .await;
+        caches.invalidate_processed_for_source("s1").await;
+        assert!(caches.processed_get("sub:p1").await.is_none());
+        assert!(caches.processed_get("sub:p2").await.is_some());
     }
 }

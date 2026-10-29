@@ -190,6 +190,46 @@ async fn the_probe_may_write_its_own_bookkeeping() {
         .await
         .expect("the probe drains the request queue");
 
+    // The T2 recency stamp is the probe's own bookkeeping on the proxy
+    // row: the journal write path keeps it up to date, so the recency
+    // batch can order by it without reading the history.
+    sqlx::query("UPDATE proxies SET last_t2_checked_at = 10 WHERE fingerprint = 'fp1'")
+        .execute(&probe)
+        .await
+        .expect("the probe stamps the T2 recency of a proxy");
+    let (stamp,): (Option<i64>,) =
+        sqlx::query_as("SELECT last_t2_checked_at FROM proxies WHERE fingerprint = 'fp1'")
+            .fetch_one(&probe)
+            .await
+            .unwrap();
+    assert_eq!(stamp, Some(10));
+
+    // The same holds for the production write path: journalling a T2
+    // attempt refreshes the stamp on the proxy row.
+    let (id,): (i64,) = sqlx::query_as("SELECT id FROM proxies WHERE fingerprint = 'fp1'")
+        .fetch_one(&probe)
+        .await
+        .unwrap();
+    fumox_core::repo::probe::insert(
+        &probe,
+        &fumox_core::repo::probe::ProbeResultEntry {
+            proxy_id: id,
+            checked_at: 20,
+            ok: true,
+            latency_ms: Some(30),
+            error: None,
+            probe_kind: fumox_core::repo::probe::T2_KIND,
+        },
+    )
+    .await
+    .expect("the probe journals its own tunnel checks");
+    let (stamp,): (Option<i64>,) =
+        sqlx::query_as("SELECT last_t2_checked_at FROM proxies WHERE fingerprint = 'fp1'")
+            .fetch_one(&probe)
+            .await
+            .unwrap();
+    assert_eq!(stamp, Some(20));
+
     drop(probe);
     drop(server);
     cleanup_files(&path);

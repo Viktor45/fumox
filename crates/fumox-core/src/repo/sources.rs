@@ -3,7 +3,7 @@
 use super::BindWhereFilter;
 use crate::db::DbPool;
 use crate::models::{ErrorClass, InputFormat, IpFamily, Scheme, Source};
-use sqlx::FromRow;
+use sqlx::{FromRow, Sqlite};
 use std::collections::HashMap;
 
 #[derive(FromRow)]
@@ -112,17 +112,25 @@ const COLUMNS: &str = "id, slug, name, url, enabled, encoding, input_format, pro
     last_fetched_at, last_error, error_class";
 
 /// Insert a new source. The caller assigns `id` (see [`crate::models::new_id`]).
-pub async fn create(pool: &DbPool, source: &Source) -> crate::Result<()> {
+///
+/// The row is written on the caller's executor: the pool, or the
+/// connection of an open transaction. A caller that has to write several
+/// rows together passes the transaction's connection, so the whole batch
+/// lands or none of it does.
+pub async fn create<'c, E>(executor: E, source: &Source) -> crate::Result<()>
+where
+    E: sqlx::Executor<'c, Database = Sqlite>,
+{
     // sqlx 0.9 SqlSafeStr: {COLUMNS} is a compile-time constant; all data
     // flows through .bind().
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO sources ({COLUMNS})
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )))
-    .bind(&source.id)
-    .bind(&source.slug)
-    .bind(&source.name)
-    .bind(&source.url)
+    .bind(source.id.clone())
+    .bind(source.slug.clone())
+    .bind(source.name.clone())
+    .bind(source.url.clone())
     .bind(source.enabled)
     .bind(source.encoding.as_str())
     .bind(source.input_format.map(InputFormat::as_str))
@@ -147,9 +155,9 @@ pub async fn create(pool: &DbPool, source: &Source) -> crate::Result<()> {
     .bind(source.created_at)
     .bind(source.updated_at)
     .bind(source.last_fetched_at)
-    .bind(&source.last_error)
+    .bind(source.last_error.clone())
     .bind(source.error_class.map(ErrorClass::as_str))
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -278,10 +286,16 @@ pub async fn get_by_slug(pool: &DbPool, slug: &str) -> crate::Result<Option<Sour
 }
 
 /// Resolve a `/src/{token}` path segment: slug first, then raw id.
+///
+/// The order is by the *match*, not by the NULL-ness of the slug: a
+/// source whose slug collides with another source's id must lose
+/// against the source that owns the slug, whatever the row order of the
+/// table happens to be.
 pub async fn resolve_token(pool: &DbPool, token: &str) -> crate::Result<Option<Source>> {
     let row: Option<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM sources WHERE slug = ? OR id = ? ORDER BY slug IS NULL LIMIT 1"
+        "SELECT {COLUMNS} FROM sources WHERE slug = ? OR id = ? ORDER BY (slug = ?) DESC LIMIT 1"
     )))
+    .bind(token)
     .bind(token)
     .bind(token)
     .fetch_optional(pool)

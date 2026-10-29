@@ -43,6 +43,11 @@
           <div class="flash error" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
+      {% match notice %}
+        {% when Some with (message) %}
+          <div class="flash warning" role="alert">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
       <form method="post" action="/admin/login" class="stack">
         <div class="field">
           <label for="token">{{ self.t("login.token_label") }}</label>

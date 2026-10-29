@@ -5,7 +5,7 @@
 
 use super::{
     QueryPairs, action_response, action_response_err, clamp_limit, flag_for, fmt_opt_ts_element,
-    fmt_ts_element, is_htmx, not_found, page_offset, pagination_pages, server_error,
+    fmt_ts_element, is_htmx, not_found, server_error,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -15,10 +15,13 @@ use askama::Template;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use fumox_core::models::{Scheme, now_ts};
 use fumox_core::repo::probe as probe_repo;
 use fumox_core::repo::proxies::{
-    self, CheckCoverage, ProxyLinkRow, ProxyListFilter, ProxyListOrder, ProxyListRow,
+    self, CheckCoverage, ProxyLinkRow, ProxyListCursor, ProxyListDirection, ProxyListFilter,
+    ProxyListOrder, ProxyListPage, ProxyListRow,
 };
 
 // List
@@ -36,8 +39,17 @@ struct ProxiesListTemplate {
     /// Count of `removed` rows (unfiltered); the purge dialog shows it so
     /// the destructive confirm does not hide its blast radius.
     removed_count: i64,
-    pages: Vec<(i64, bool)>,
-    per_page: i64,
+    /// Count of rows without a source link (unfiltered); no feed reaches
+    /// them and no probe lane can pick them up.
+    detached_count: i64,
+    /// Link to the first page of the list; `None` while the first page
+    /// is shown.
+    nav_first: Option<String>,
+    /// Link to the page before this one; `None` while the first page is
+    /// shown.
+    nav_prev: Option<String>,
+    /// Link to the page after this one; `None` on the last page.
+    nav_next: Option<String>,
     f_statuses: Vec<String>,
     f_scheme: String,
     f_country: String,
@@ -86,37 +98,6 @@ impl ProxiesListTemplate {
             || !self.f_coverage.is_empty()
     }
 
-    /// Preserve the current filters in pagination links.
-    fn query_suffix(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        for status in &self.f_statuses {
-            parts.push(format!("status={}", urlencoding(status)));
-        }
-        if !self.f_scheme.is_empty() {
-            parts.push(format!("scheme={}", urlencoding(&self.f_scheme)));
-        }
-        if !self.f_country.is_empty() {
-            parts.push(format!("country={}", urlencoding(&self.f_country)));
-        }
-        if !self.f_source.is_empty() {
-            parts.push(format!("source={}", urlencoding(&self.f_source)));
-        }
-        if !self.f_q.is_empty() {
-            parts.push(format!("q={}", urlencoding(&self.f_q)));
-        }
-        if !self.f_coverage.is_empty() {
-            parts.push(format!("coverage={}", urlencoding(&self.f_coverage)));
-        }
-        if !self.f_sort.is_empty() && self.f_sort != "updated" {
-            parts.push(format!("sort={}", urlencoding(&self.f_sort)));
-        }
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!("&{}", parts.join("&"))
-        }
-    }
-
     fn country_selected(&self, country: &str) -> bool {
         self.f_country == country
     }
@@ -147,6 +128,124 @@ impl_i18n!(ProxiesListTemplate);
 
 fn urlencoding(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+// Keyset cursor
+//
+// The browser pages with a cursor instead of a page number: the link to
+// the next page carries the sort key of the last row of the current
+// one, so the database seeks straight to it instead of walking over
+// every row the page skips. The cursor travels as one opaque token, so
+// a display name (which may hold any character) cannot break the query
+// string.
+
+/// The token of one cursor: `side|tag|id|value`, base64url-encoded.
+///
+/// The name is the last field, so a name that holds a `|` survives the
+/// split. The value of the latency tag is empty for an unmeasured row.
+fn encode_list_cursor(cursor: &ProxyListCursor, direction: ProxyListDirection) -> String {
+    let side = match direction {
+        ProxyListDirection::Forward => 'f',
+        ProxyListDirection::Backward => 'b',
+    };
+    let (tag, id, value) = match cursor {
+        ProxyListCursor::Updated { updated_at, id } => ('u', *id, updated_at.to_string()),
+        ProxyListCursor::Latency { latency_ms, id } => (
+            'l',
+            *id,
+            latency_ms.map(|ms| ms.to_string()).unwrap_or_default(),
+        ),
+        ProxyListCursor::Name { name, id } => ('n', *id, name.clone()),
+    };
+    URL_SAFE_NO_PAD.encode(format!("{side}|{tag}|{id}|{value}"))
+}
+
+/// The cursor a token carries, or `None` for a token this browser did
+/// not write. A damaged token is not an error: the list falls back to
+/// its first page.
+fn decode_list_cursor(token: &str) -> Option<(ProxyListCursor, ProxyListDirection)> {
+    let raw = URL_SAFE_NO_PAD.decode(token).ok()?;
+    let payload = String::from_utf8(raw).ok()?;
+    let mut parts = payload.splitn(4, '|');
+    let side = parts.next()?;
+    let tag = parts.next()?;
+    let id: i64 = parts.next()?.parse().ok()?;
+    let value = parts.next()?;
+    let direction = match side {
+        "f" => ProxyListDirection::Forward,
+        "b" => ProxyListDirection::Backward,
+        _ => return None,
+    };
+    let cursor = match tag {
+        "u" => ProxyListCursor::Updated {
+            updated_at: value.parse().ok()?,
+            id,
+        },
+        "l" => ProxyListCursor::Latency {
+            latency_ms: if value.is_empty() {
+                None
+            } else {
+                Some(value.parse().ok()?)
+            },
+            id,
+        },
+        "n" => ProxyListCursor::Name {
+            name: value.to_string(),
+            id,
+        },
+        _ => return None,
+    };
+    Some((cursor, direction))
+}
+
+/// The filter and sort parameters of the current view as a query-string
+/// suffix (empty when nothing narrows the list). The pagination links
+/// carry them, so a filtered list stays filtered while it is paged.
+fn list_query_suffix(filter: &ProxyListFilter, order: ProxyListOrder) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for status in &filter.statuses {
+        parts.push(format!("status={}", urlencoding(status)));
+    }
+    if !filter.scheme.is_empty() {
+        parts.push(format!("scheme={}", urlencoding(&filter.scheme)));
+    }
+    if !filter.country.is_empty() {
+        parts.push(format!("country={}", urlencoding(&filter.country)));
+    }
+    if !filter.source_id.is_empty() {
+        parts.push(format!("source={}", urlencoding(&filter.source_id)));
+    }
+    if !filter.query.is_empty() {
+        parts.push(format!("q={}", urlencoding(&filter.query)));
+    }
+    if let Some(bucket) = filter.coverage {
+        parts.push(format!("coverage={}", urlencoding(bucket.as_str())));
+    }
+    if order != ProxyListOrder::Updated {
+        parts.push(format!("sort={}", urlencoding(order.as_param())));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("&{}", parts.join("&"))
+    }
+}
+
+/// The link to one page of the browser: the cursor token of the page
+/// (absent for the first page) and the parameters of the current view.
+fn list_page_link(
+    suffix: &str,
+    per_page: i64,
+    cursor: Option<&ProxyListCursor>,
+    direction: ProxyListDirection,
+) -> String {
+    let mut link = format!("/admin/proxies?per_page={per_page}");
+    if let Some(cursor) = cursor {
+        // The base64url alphabet needs no escaping in a query string.
+        link.push_str(&format!("&cur={}", encode_list_cursor(cursor, direction)));
+    }
+    link.push_str(suffix);
+    link
 }
 
 pub async fn proxies_list(
@@ -183,11 +282,6 @@ pub async fn proxies_list(
     let f_coverage = coverage
         .map(|bucket| bucket.as_str().to_string())
         .unwrap_or_default();
-    let page: i64 = params
-        .get("page")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
-        .max(1);
     let per_page = clamp_limit(params.get("per_page").and_then(|v| v.parse().ok()));
 
     // The filter clause set lives once in the repo (`ProxyListFilter`):
@@ -203,6 +297,18 @@ pub async fn proxies_list(
     };
     let order = ProxyListOrder::from_param(&f_sort);
 
+    // The cursor of the requested page. A token of another sort is not a
+    // position in this one, so the list falls back to its first page
+    // instead of paging from a key that means nothing here.
+    let requested = params
+        .get("cur")
+        .and_then(|token| decode_list_cursor(token))
+        .filter(|(cursor, _)| order.accepts_cursor(cursor));
+    let page = requested.as_ref().map(|(cursor, direction)| ProxyListPage {
+        cursor: cursor.clone(),
+        direction: *direction,
+    });
+
     let total: i64 = match proxies::count_filtered(&state.pool, &filter).await {
         Ok(total) => total,
         Err(err) => return server_error(lang, &err),
@@ -215,18 +321,95 @@ pub async fn proxies_list(
         Err(err) => return server_error(lang, &err),
     };
 
-    let rows: Vec<ProxyListRow> = match proxies::list_filtered(
+    // Rows without a source link: no feed reaches them and no probe
+    // lane can pick them up. The panel names them, so the operator can
+    // see how much of the table is detached.
+    let detached_count: i64 = match proxies::count_detached(&state.pool).await {
+        Ok(count) => count,
+        Err(err) => return server_error(lang, &err),
+    };
+
+    // The side of the cursor the page takes: a page reached backwards
+    // holds the rows right before the cursor, a page reached forwards
+    // the rows right after it.
+    let backward = page
+        .as_ref()
+        .is_some_and(|page| page.direction == ProxyListDirection::Backward);
+
+    // One row more than the page holds: the extra row says whether a
+    // further page exists without a second count.
+    let mut rows: Vec<ProxyListRow> = match proxies::list_filtered(
         &state.pool,
         &filter,
         order,
-        per_page,
-        page_offset(page, per_page),
+        per_page + 1,
+        page.as_ref(),
     )
     .await
     {
         Ok(rows) => rows,
         Err(err) => return server_error(lang, &err),
     };
+    let has_more = rows.len() as i64 > per_page;
+    if backward && has_more {
+        // The rows closest to the cursor come last, so the over-fetched
+        // row is the farthest one: the page keeps the rows right before
+        // the cursor, and the extra row stays the proof that the table
+        // holds more of them.
+        rows.remove(0);
+    }
+    rows.truncate(per_page as usize);
+
+    // The neighbours of the page: a page reached forwards has a
+    // predecessor as soon as it is not the first one, a page reached
+    // backwards has a successor even when the table ends there.
+    let first_cursor = rows.first().map(|row| row.cursor(order));
+    let last_cursor = rows.last().map(|row| row.cursor(order));
+    let (prev, next) = if backward {
+        (
+            // Further back only when the table holds rows before this
+            // page.
+            if has_more {
+                first_cursor
+                    .as_ref()
+                    .map(|cursor| (cursor.clone(), ProxyListDirection::Backward))
+            } else {
+                None
+            },
+            // Forwards again: the rows after this page.
+            last_cursor
+                .as_ref()
+                .map(|cursor| (cursor.clone(), ProxyListDirection::Forward)),
+        )
+    } else {
+        (
+            if page.is_some() {
+                first_cursor
+                    .as_ref()
+                    .map(|cursor| (cursor.clone(), ProxyListDirection::Backward))
+            } else {
+                None
+            },
+            if has_more {
+                last_cursor
+                    .as_ref()
+                    .map(|cursor| (cursor.clone(), ProxyListDirection::Forward))
+            } else {
+                None
+            },
+        )
+    };
+
+    let suffix = list_query_suffix(&filter, order);
+    let nav_first = page
+        .is_some()
+        .then(|| list_page_link(&suffix, per_page, None, ProxyListDirection::Forward));
+    let nav_prev = prev
+        .as_ref()
+        .map(|(cursor, direction)| list_page_link(&suffix, per_page, Some(cursor), *direction));
+    let nav_next = next
+        .as_ref()
+        .map(|(cursor, direction)| list_page_link(&suffix, per_page, Some(cursor), *direction));
 
     let countries: Vec<String> = proxies::distinct_countries(&state.pool)
         .await
@@ -269,8 +452,10 @@ pub async fn proxies_list(
             rows,
             total,
             removed_count,
-            pages: pagination_pages(page, total, per_page),
-            per_page,
+            detached_count,
+            nav_first,
+            nav_prev,
+            nav_next,
             f_statuses,
             f_scheme,
             f_country,
@@ -550,21 +735,18 @@ bulk_cleanup_handler!(
     remove_unprobeable_unknown,
     "removed unprobeable unknown proxies"
 );
+bulk_cleanup_handler!(
+    proxies_remove_detached,
+    remove_detached,
+    "removed proxies without a source link"
+);
 
 /// Normalize an AS number typed into the cleanup form: accepts both
-/// `24940` and `AS24940`, returns the bare digits. `None` when the input
-/// is not a plain AS number (empty, non-digits, too long).
+/// `24940` and `AS24940`, returns the canonical `AS{n}` text the
+/// `geo_asn` column stores. `None` when the input is not a plain AS
+/// number (empty, non-digits, too long).
 fn normalize_asn(input: &str) -> Option<String> {
-    let trimmed = input.trim();
-    let digits = trimmed
-        .strip_prefix("AS")
-        .or_else(|| trimmed.strip_prefix("as"))
-        .unwrap_or(trimmed);
-    if !digits.is_empty() && digits.len() <= 10 && digits.bytes().all(|b| b.is_ascii_digit()) {
-        Some(digits.to_string())
-    } else {
-        None
-    }
+    fumox_core::geo::canonical_asn(input)
 }
 
 /// Move every `alive` proxy of one autonomous system into `removed`
@@ -695,13 +877,13 @@ macro_rules! bulk_revival_handler {
     ($name:ident, $repo_fn:ident, $log_msg:literal, $rows_key:literal) => {
         pub async fn $name(State(state): State<AdminState>, headers: HeaderMap) -> Response {
             let lang = state.locales.lang_from_headers(&headers);
-            let ids = match proxies::$repo_fn(&state.pool, now_ts()).await {
-                Ok(ids) => ids,
+            let outcome = match proxies::$repo_fn(&state.pool, now_ts()).await {
+                Ok(outcome) => outcome,
                 Err(err) => return server_error(lang, &err),
             };
-            let revived = ids.len();
+            let revived = outcome.revived;
             tracing::info!(revived, $log_msg);
-            enqueue_revived(&state, &ids).await;
+            enqueue_revived(&state, &outcome.ids).await;
             let fragment = format!(
                 "<span class=\"badge unknown\">{}</span>",
                 lang.t($rows_key).replace("{}", &revived.to_string())
@@ -719,10 +901,10 @@ macro_rules! bulk_revival_handler {
 }
 
 bulk_revival_handler!(
-    proxies_revive_removed_no_history,
-    revive_removed_without_probe_history,
-    "revived removed proxies without probe history",
-    "px.revive_no_history_rows"
+    proxies_revive_removed_never_checked,
+    revive_removed_never_checked,
+    "revived removed proxies that were never checked",
+    "px.revive_never_checked_rows"
 );
 bulk_revival_handler!(
     proxies_revive_quarantine,
@@ -755,13 +937,13 @@ pub async fn proxies_revive_removed_by_asn(
             lang.t("val.asn_format"),
         );
     };
-    let ids = match proxies::revive_removed_by_asn(&state.pool, &asn, now_ts()).await {
-        Ok(ids) => ids,
+    let outcome = match proxies::revive_removed_by_asn(&state.pool, &asn, now_ts()).await {
+        Ok(outcome) => outcome,
         Err(err) => return server_error(lang, &err),
     };
-    let revived = ids.len();
+    let revived = outcome.revived;
     tracing::info!(asn = %asn, revived, "revived removed proxies by ASN");
-    enqueue_revived(&state, &ids).await;
+    enqueue_revived(&state, &outcome.ids).await;
     let fragment = format!(
         "<span class=\"badge unknown\">{}</span>",
         lang.t("px.revive_asn_rows")
@@ -802,13 +984,13 @@ pub async fn proxies_revive_removed_by_country(
             &lang.t("val.country_format").replace("{}", &code),
         );
     }
-    let ids = match proxies::revive_removed_by_country(&state.pool, &code, now_ts()).await {
-        Ok(ids) => ids,
+    let outcome = match proxies::revive_removed_by_country(&state.pool, &code, now_ts()).await {
+        Ok(outcome) => outcome,
         Err(err) => return server_error(lang, &err),
     };
-    let revived = ids.len();
+    let revived = outcome.revived;
     tracing::info!(country = %code, revived, "revived removed proxies by country");
-    enqueue_revived(&state, &ids).await;
+    enqueue_revived(&state, &outcome.ids).await;
     let fragment = format!(
         "<span class=\"badge unknown\">{}</span>",
         lang.t("px.revive_country_rows")
@@ -931,6 +1113,128 @@ fn merge_geo_stamp(proxy: &mut proxies::ProxyRow, stamp: &proxies::GeoStamp) {
 mod tests {
     use super::*;
 
+    /// The cursor token is the whole contract between the browser and
+    /// the database: the sort key of the row a page resumes from and the
+    /// side of it the page takes.
+    #[test]
+    fn the_cursor_token_round_trips() {
+        let cursors = [
+            ProxyListCursor::Updated {
+                updated_at: 42,
+                id: 7,
+            },
+            ProxyListCursor::Latency {
+                latency_ms: Some(120),
+                id: 7,
+            },
+            // An unmeasured row has no latency to carry.
+            ProxyListCursor::Latency {
+                latency_ms: None,
+                id: 7,
+            },
+            // A name may hold anything, including the separator of the
+            // token's own payload.
+            ProxyListCursor::Name {
+                name: "node | 7: ru".into(),
+                id: 7,
+            },
+        ];
+        for cursor in cursors {
+            for direction in [ProxyListDirection::Forward, ProxyListDirection::Backward] {
+                let token = encode_list_cursor(&cursor, direction);
+                assert!(
+                    !token.contains(['|', '&', '=', ' ', '+', '/']),
+                    "the token must survive a query string: {token}"
+                );
+                assert_eq!(
+                    decode_list_cursor(&token),
+                    Some((cursor.clone(), direction)),
+                    "the token must decode back into its cursor"
+                );
+            }
+        }
+    }
+
+    /// A token this browser did not write is not a position in the
+    /// list: the list falls back to its first page instead of failing.
+    #[test]
+    fn a_damaged_cursor_token_is_refused() {
+        // Valid base64, but not a cursor payload.
+        for token in ["", "!!!", "Zm9v"] {
+            assert!(
+                decode_list_cursor(token).is_none(),
+                "{token} must not decode into a cursor"
+            );
+        }
+        // The id is not a number.
+        assert!(decode_list_cursor("f|u|x|1").is_none());
+        // The side and the tag are not known.
+        assert!(decode_list_cursor("x|u|1|1").is_none());
+        assert!(decode_list_cursor("f|q|1|1").is_none());
+        // The value is missing.
+        assert!(decode_list_cursor("f|u|1").is_none());
+    }
+
+    /// A cursor of another sort is not a position in this order: the
+    /// list falls back to its first page instead of paging from a key
+    /// that means nothing here.
+    #[test]
+    fn a_cursor_of_another_sort_is_not_a_position_here() {
+        let updated = ProxyListCursor::Updated {
+            updated_at: 1,
+            id: 2,
+        };
+        assert!(ProxyListOrder::Updated.accepts_cursor(&updated));
+        assert!(!ProxyListOrder::Latency.accepts_cursor(&updated));
+        assert!(!ProxyListOrder::Name.accepts_cursor(&updated));
+    }
+
+    /// The page links carry the cursor and the filters of the current
+    /// view, so a filtered list stays filtered while it is paged.
+    #[test]
+    fn the_page_links_carry_the_cursor_and_the_filters() {
+        let filter = ProxyListFilter {
+            statuses: vec!["alive".into()],
+            scheme: String::new(),
+            country: "DE".into(),
+            source_id: String::new(),
+            query: "node one".into(),
+            coverage: Some(CheckCoverage::T1Only),
+        };
+        let suffix = list_query_suffix(&filter, ProxyListOrder::Latency);
+        assert_eq!(
+            suffix, "&status=alive&country=DE&q=node%20one&coverage=t1%5Fonly&sort=latency",
+            "the filters and the sort travel with the link"
+        );
+
+        let cursor = ProxyListCursor::Latency {
+            latency_ms: Some(30),
+            id: 5,
+        };
+        let link = list_page_link(&suffix, 25, Some(&cursor), ProxyListDirection::Forward);
+        assert!(
+            link.starts_with("/admin/proxies?per_page=25&cur="),
+            "{link}"
+        );
+        assert!(link.ends_with(&suffix), "{link}");
+        let token = link
+            .split("cur=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .unwrap();
+        assert_eq!(
+            decode_list_cursor(token),
+            Some((cursor, ProxyListDirection::Forward)),
+            "the link must carry the cursor it was built from"
+        );
+
+        // The first page carries no cursor at all.
+        assert_eq!(
+            list_page_link(&suffix, 25, None, ProxyListDirection::Forward),
+            format!("/admin/proxies?per_page=25{suffix}")
+        );
+    }
+
     /// A card row as the database hands it over: the stored geo facts are
     /// whatever the ingest path resolved.
     fn card_row(country: Option<&str>, city: Option<&str>, asn: Option<&str>) -> proxies::ProxyRow {
@@ -949,6 +1253,8 @@ mod tests {
             geo_country: country.map(str::to_string),
             geo_city: city.map(str::to_string),
             geo_asn: asn.map(str::to_string),
+            geo_attempts: 0,
+            last_geo_attempt_at: None,
             resolved_ip: None,
             status: "unknown".into(),
             fail_count: 0,
@@ -1059,6 +1365,7 @@ mod tests {
             fetcher,
             config,
             fumox_core::config::ResolvedConfigPath::Missing,
+            crate::alive_export::TokenCache::new(),
         );
         state.geo_full = std::sync::Arc::new(fumox_core::geo::FullResolver::from_dir(
             &fumox_core::config::GeoConfig {
@@ -1155,6 +1462,7 @@ mod tests {
             fetcher,
             config,
             fumox_core::config::ResolvedConfigPath::Missing,
+            crate::alive_export::TokenCache::new(),
         )
     }
 
@@ -1199,11 +1507,16 @@ mod tests {
         // The exact pair of calls every revival handler makes: the repo
         // transition moves the row to `unknown` and returns its id, then
         // the hand-off enqueues it for priority probing.
-        let ids = proxies::revive_removed_by_country(&state.pool, "DE", now_ts())
+        let outcome = proxies::revive_removed_by_country(&state.pool, "DE", now_ts())
             .await
             .unwrap();
-        assert_eq!(ids, vec![id], "the revival must cover the removed row");
-        enqueue_revived(&state, &ids).await;
+        assert_eq!(
+            outcome.ids,
+            vec![id],
+            "the revival must cover the removed row"
+        );
+        assert_eq!(outcome.revived, 1, "one row was revived");
+        enqueue_revived(&state, &outcome.ids).await;
 
         let (queued,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM probe_requests WHERE proxy_id = ?")

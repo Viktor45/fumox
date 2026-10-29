@@ -558,6 +558,14 @@ impl CompiledPipeline {
                     args: Vec::new(),
                 });
             } else {
+                // An unknown placeholder is rendered verbatim, so the operator
+                // would see a literal brace in every proxy name.
+                for placeholder in fumox_core::geo::unknown_placeholders(&geo.template) {
+                    errors.push(PipelineIssue {
+                        key: "pipeline.unknown_placeholder",
+                        args: vec![placeholder],
+                    });
+                }
                 compiled.geo_template = geo.template;
             }
         }
@@ -1158,6 +1166,32 @@ mod tests {
             err.iter()
                 .any(|e| e.key == "pipeline.unknown_status" && e.args.contains(&"sleeping".into()))
         );
+    }
+
+    /// An unknown placeholder is rendered verbatim, so the operator would
+    /// see a literal brace in every proxy name: it is a field error.
+    #[test]
+    fn an_unknown_geo_placeholder_is_rejected() {
+        let err = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "geo": { "enabled": true, "template": "{flag} {country} {foo} {name}" }
+        })))
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.key == "pipeline.unknown_placeholder" && e.args.contains(&"foo".into())),
+            "{err:?}"
+        );
+    }
+
+    /// The known placeholders are accepted.
+    #[test]
+    fn the_known_geo_placeholders_are_accepted() {
+        CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "geo": { "enabled": true, "template": "{flag} {country} {city} {asn} {asn_org} {name}" }
+        })))
+        .unwrap();
     }
 
     #[test]

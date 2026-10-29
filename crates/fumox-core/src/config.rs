@@ -12,6 +12,7 @@
 //! CLI flag, the `FUMOX_CONFIG` environment variable, then the default
 //! `config/app.toml` resolved against the CWD.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -516,6 +517,36 @@ pub fn config_paths() -> Vec<String> {
     paths
 }
 
+/// The configuration paths the environment currently overrides.
+///
+/// The env layer wins over the file, so a setting named here cannot be
+/// changed through the config file: the environment keeps the value no
+/// matter what the file says. The admin panel uses the list to render
+/// those fields read-only and to leave them out of the write.
+///
+/// The paths are the dotted config keys (`admin.token`), the same
+/// shape [`config_paths`] returns. A `FUMOX_*` variable that names no
+/// config key is not reported: [`check_env_vars`] refuses the start
+/// instead.
+pub fn env_overridden_paths() -> Vec<String> {
+    let known = config_paths();
+    let mut overridden: Vec<String> = Vec::new();
+    for (name, _) in std::env::vars_os() {
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(ENV_PREFIX) || NON_CONFIG_ENV_VARS.contains(&name) {
+            continue;
+        }
+        let Some(path) = env_var_path(name) else {
+            continue;
+        };
+        if known.contains(&path) && !overridden.contains(&path) {
+            overridden.push(path);
+        }
+    }
+    overridden.sort();
+    overridden
+}
+
 /// Flatten a JSON value into dotted leaf paths (`admin.rate_limit`).
 /// Arrays count as one leaf so `meow.test_url` stays a single key.
 fn collect_paths(prefix: &str, value: &serde_json::Value, out: &mut Vec<String>) {
@@ -658,6 +689,51 @@ pub fn parse_document(text: &str) -> crate::Result<AppConfig> {
     config.validate()?;
     Ok(config)
 }
+/// Which forwarding header the trusted reverse proxy writes.
+///
+/// The declaration is the contract: a header the operator has not named
+/// is never honored, whoever sent it. Without the declaration a client
+/// picks its own rate-limit key: it sends `X-Forwarded-For: 9.9.9.9` and
+/// `Forwarded: for=9.9.9.9` beside a proxy that writes one header and
+/// passes the other through, and the pair agrees, so the forged address
+/// looks confirmed. `None` (the default) resolves every forwarded header
+/// to the peer address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustedHeader {
+    /// Honor no forwarding header: the peer address is the client.
+    #[default]
+    None,
+    /// Honor `X-Forwarded-For` only.
+    Xff,
+    /// Honor RFC 7239 `Forwarded` only.
+    Forwarded,
+    /// Honor both, and only when they name the same address.
+    Both,
+}
+
+impl TrustedHeader {
+    /// The name the configuration file and the settings form use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Xff => "xff",
+            Self::Forwarded => "forwarded",
+            Self::Both => "both",
+        }
+    }
+
+    /// True when the `X-Forwarded-*` headers are trusted.
+    pub fn honors_xff(self) -> bool {
+        matches!(self, Self::Xff | Self::Both)
+    }
+
+    /// True when the RFC 7239 `Forwarded` header is trusted.
+    pub fn honors_forwarded(self) -> bool {
+        matches!(self, Self::Forwarded | Self::Both)
+    }
+}
+
 /// Public HTTP listener serving `/sub/{id}` and `/src/{id}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -679,6 +755,11 @@ pub struct ServerConfig {
     /// key).
     #[serde(default = "defaults::trust_proxy_ips")]
     pub trust_proxy_ips: Vec<String>,
+    /// Which forwarding header the trusted proxy writes. Only the named
+    /// header is honored; `none` (the default) honors none, so the peer
+    /// address is the client even when `trust_proxy_ips` names a proxy.
+    #[serde(default)]
+    pub trust_proxy_header: TrustedHeader,
     /// Hostnames / IPs allowed to reach the public listener. Empty = accept
     /// any host (today's behavior); setting this locks the
     /// alive-export endpoint to the operator's own hostname.
@@ -703,6 +784,7 @@ impl Default for ServerConfig {
             rate_limit: defaults::public_rate_limit(),
             auth_fail_rate_limit: defaults::auth_fail_rate_limit(),
             trust_proxy_ips: defaults::trust_proxy_ips(),
+            trust_proxy_header: defaults::trust_proxy_header(),
             allowed_hosts: defaults::allowed_hosts(),
             export_max_rows: defaults::export_max_rows(),
         }
@@ -721,11 +803,11 @@ pub struct IngestConfig {
     #[serde(default = "defaults::refresh_check_limit")]
     pub refresh_check_limit: u32,
     /// Whether pipeline `drop` rules switch off the alive-linger link
-    /// policy for their source. `true`: an alive proxy of
+    /// policy for their source. `true` (the default): an alive proxy of
     /// a source with drop rules leaves on the next refresh after the rule
-    /// catches it. `false` (the default): the probe alone retires proxies ,
-    /// every source lingers, even ones with drop rules, so a rule added
-    /// later only stops new matches, never stored ones.
+    /// catches it. `false`: the probe alone retires proxies, every source
+    /// lingers, even ones with drop rules, so a rule added later only
+    /// stops new matches, never stored ones.
     #[serde(default = "defaults::drop_gate")]
     pub drop_gate: bool,
     /// Revive a `removed` proxy the feed still carries: on the next
@@ -780,6 +862,17 @@ pub struct DatabaseConfig {
     /// recommended mode for WAL.
     #[serde(default = "defaults::synchronous")]
     pub synchronous: SynchronousMode,
+    /// Whether a migration whose stored checksum no longer matches the
+    /// file on disk may be re-stamped in place at startup.
+    ///
+    /// Off by default. sqlx hashes the whole migration file, so a
+    /// comment edit and a DDL edit are indistinguishable from here, and a
+    /// silent re-stamp hides a schema that fell behind the files. With
+    /// the flag off the boot stops and names the version; the operator
+    /// then runs the `repair_migration_checksums` example, or turns the
+    /// flag on for that run.
+    #[serde(default = "defaults::allow_checksum_repair")]
+    pub allow_checksum_repair: bool,
 }
 
 impl Default for DatabaseConfig {
@@ -789,6 +882,7 @@ impl Default for DatabaseConfig {
             busy_timeout_ms: defaults::busy_timeout_ms(),
             max_connections: defaults::max_connections(),
             synchronous: defaults::synchronous(),
+            allow_checksum_repair: defaults::allow_checksum_repair(),
         }
     }
 }
@@ -876,6 +970,22 @@ pub struct GeoConfig {
     /// simply runs without geo enrichment until the next start.
     #[serde(default = "defaults::geo_startup_download_budget_secs")]
     pub startup_download_budget_secs: u64,
+    /// Whether the databases are downloaded at all. Off means the operator
+    /// provides the `.mmdb` files by hand (a MaxMind mirror, an internal
+    /// copy, a read-only volume) and fumox never writes into `db_dir`.
+    #[serde(default = "defaults::geo_auto_download")]
+    pub auto_download: bool,
+    /// Mirror URLs per database file name (`GeoLite2-City.mmdb` → URL).
+    /// The built-in values point at the public release assets; an operator
+    /// points them at another mirror by name, which is an operational
+    /// decision rather than a release.
+    #[serde(default = "defaults::geo_download_urls")]
+    pub download_urls: BTreeMap<String, String>,
+    /// Expected SHA-256 per database file name. A file whose checksum is
+    /// listed here is installed only when the download matches it; a file
+    /// without a listed checksum is installed on the format check alone.
+    #[serde(default)]
+    pub sha256: BTreeMap<String, String>,
 }
 
 /// Serde landing place for config keys the code no longer reads (the
@@ -899,6 +1009,9 @@ impl Default for GeoConfig {
             cache_max_entries: defaults::geo_cache_max_entries(),
             dns_timeout_secs: defaults::dns_timeout_secs(),
             startup_download_budget_secs: defaults::geo_startup_download_budget_secs(),
+            auto_download: defaults::geo_auto_download(),
+            download_urls: defaults::geo_download_urls(),
+            sha256: BTreeMap::new(),
         }
     }
 }
@@ -913,10 +1026,26 @@ impl GeoConfig {
 
     /// How long startup may block on the GeoLite2 download before the
     /// listeners bind without geo enrichment.
+    ///
+    /// Capped at [`MAX_STARTUP_DOWNLOAD_BUDGET_SECS`]: the budget is the
+    /// time the public surface is unavailable, and no mirror is worth five
+    /// minutes of that. A hand-edited config file above the cap is clamped
+    /// rather than rejected, so an existing installation still starts.
     pub fn startup_download_budget(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.startup_download_budget_secs)
+        std::time::Duration::from_secs(
+            self.startup_download_budget_secs
+                .min(MAX_STARTUP_DOWNLOAD_BUDGET_SECS),
+        )
     }
 }
+
+/// The upper bound of `[geo].startup_download_budget_secs`.
+///
+/// The budget is the time the public surface waits for the GeoLite2
+/// download. Five minutes is already far more than a mirror needs, and
+/// every second of it is a second in which the instance answers no
+/// request.
+pub const MAX_STARTUP_DOWNLOAD_BUDGET_SECS: u64 = 300;
 
 /// Settings of the address policy, the gate every untrusted host passes
 /// before it may be dialed.
@@ -1017,6 +1146,11 @@ pub struct AdminConfig {
     /// Empty = never honor forwarded headers.
     #[serde(default = "defaults::trust_proxy_ips")]
     pub trust_proxy_ips: Vec<String>,
+    /// Which forwarding header the trusted proxy writes. Only the named
+    /// header is honored; `none` (the default) honors none, so the peer
+    /// address is the client even when `trust_proxy_ips` names a proxy.
+    #[serde(default)]
+    pub trust_proxy_header: TrustedHeader,
     /// Hostnames / IPs allowed to reach the admin listener. Empty = accept
     /// any host (today's behavior).
     #[serde(default = "defaults::allowed_hosts")]
@@ -1036,6 +1170,7 @@ impl Default for AdminConfig {
             secure_cookies: false,
             locales_dir: defaults::admin_locales_dir(),
             trust_proxy_ips: defaults::trust_proxy_ips(),
+            trust_proxy_header: defaults::trust_proxy_header(),
             allowed_hosts: defaults::allowed_hosts(),
         }
     }
@@ -1590,7 +1725,10 @@ pub mod bounds {
         ("ingest.refresh_check_limit", Range::new(0, 10_000)),
         ("geo.cache_max_entries", Range::new(0, 10_000_000)),
         ("geo.dns_timeout_secs", Range::new(1, 60)),
-        ("geo.startup_download_budget_secs", Range::new(0, 3600)),
+        (
+            "geo.startup_download_budget_secs",
+            Range::new(0, super::MAX_STARTUP_DOWNLOAD_BUDGET_SECS),
+        ),
         // 0 = follow [geo].dns_timeout_secs.
         ("network.dns_timeout_secs", Range::new(0, 60)),
         ("admin.session_ttl_hours", Range::new(1, 24 * 365)),
@@ -1664,10 +1802,11 @@ mod defaults {
         "0.0.0.0:8080".parse().expect("valid socket address")
     }
 
-    /// Alive-linger for everyone by default, the probe is the sole owner
-    /// of a live proxy's lifecycle.
+    /// The drop gate is on by default: a source that carries drop rules
+    /// detaches the proxies those rules would have discarded. The probe
+    /// alone owns the lifecycle of the proxies no rule touches.
     pub const fn drop_gate() -> bool {
-        false
+        true
     }
     pub fn database_path() -> PathBuf {
         PathBuf::from("fumox.db")
@@ -1680,6 +1819,12 @@ mod defaults {
     }
     pub const fn synchronous() -> SynchronousMode {
         SynchronousMode::Normal
+    }
+    /// The checksum repair is opt-in: a re-stamp hides a DDL divergence
+    /// the same way it hides a comment edit, so the operator has to say
+    /// that the edit was harmless.
+    pub const fn allow_checksum_repair() -> bool {
+        false
     }
     pub const fn connect_timeout_secs() -> u64 {
         10
@@ -1722,6 +1867,25 @@ mod defaults {
     pub const fn geo_startup_download_budget_secs() -> u64 {
         60
     }
+    pub const fn geo_auto_download() -> bool {
+        true
+    }
+    /// The public release assets the databases are fetched from when the
+    /// operator names no mirror of their own.
+    pub fn geo_download_urls() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "GeoLite2-ASN.mmdb".to_string(),
+                "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb"
+                    .to_string(),
+            ),
+            (
+                "GeoLite2-City.mmdb".to_string(),
+                "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb"
+                    .to_string(),
+            ),
+        ])
+    }
     pub const fn admin_enabled() -> bool {
         true
     }
@@ -1754,6 +1918,11 @@ mod defaults {
     /// caller spoof the per-IP rate-limit key.
     pub fn trust_proxy_ips() -> Vec<String> {
         Vec::new()
+    }
+    /// No forwarding header is honored until the operator names one: a
+    /// header nobody declared is text the client chose.
+    pub const fn trust_proxy_header() -> TrustedHeader {
+        TrustedHeader::None
     }
     /// Empty by default, the Host header is accepted verbatim, matching the
     /// historical behavior. Operators behind a reverse proxy that rewrites
@@ -1913,9 +2082,10 @@ mod tests {
         assert_eq!(cfg.admin.token, "");
         assert!(!cfg.admin.is_active());
         assert!(cfg.admin.enabled);
-        // Ingest defaults: alive-linger for everyone (the drop gate is
-        // opt-in) and the priority-probe queue enabled.
-        assert!(!cfg.ingest.drop_gate);
+        // Ingest defaults: the drop gate is on (a source with drop rules
+        // detaches what its rules would have discarded) and the
+        // priority-probe queue is enabled.
+        assert!(cfg.ingest.drop_gate);
         assert_eq!(cfg.ingest.refresh_check_limit, 50);
     }
 
@@ -2877,6 +3047,28 @@ probe_results_days = 7
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The startup budget is capped: the public surface waits for it, and
+    /// no mirror is worth minutes of an unavailable instance. A value
+    /// above the cap (a hand-edited file) is clamped, not rejected: an
+    /// existing installation still starts.
+    #[test]
+    fn the_geo_startup_budget_is_capped() {
+        let cfg = GeoConfig {
+            startup_download_budget_secs: 3_600,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.startup_download_budget(),
+            std::time::Duration::from_secs(MAX_STARTUP_DOWNLOAD_BUDGET_SECS)
+        );
+        assert_eq!(
+            bounds::range_of("geo.startup_download_budget_secs")
+                .unwrap()
+                .max,
+            MAX_STARTUP_DOWNLOAD_BUDGET_SECS
+        );
+    }
+
     /// The alive/ready export row ceiling is a setting, like the geo
     /// startup budget above: an operator with a tier larger than the
     /// shipped 50 000 rows raises it in `config/app.toml` or via
@@ -3004,5 +3196,58 @@ probe_results_days = 7
             std::env::remove_var("FUMOX_SERVER__TRUST_PROXY_IPS");
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// The list of settings the environment overrides is what the admin
+    /// panel renders read-only: a field named here cannot be changed
+    /// through the file, because the env layer wins over it.
+    #[test]
+    fn the_env_overridden_paths_name_the_settings_the_environment_wins() {
+        let _guard = env_mutex().lock();
+
+        // SAFETY: every touch of FUMOX_* across the test suite is
+        // serialized by `env_mutex`; other threads read the variable only
+        // through the same lock.
+        unsafe {
+            std::env::set_var("FUMOX_INGEST__DROP_GATE", "true");
+            std::env::set_var("FUMOX_ADMIN__TOKEN", "env-token");
+            // A deployment variable, not a setting.
+            std::env::set_var("FUMOX_CONFIG_ACCESS", "rw");
+        }
+        let overridden = env_overridden_paths();
+        assert!(
+            overridden.contains(&"ingest.drop_gate".to_string()),
+            "the bool the env overrides must be listed: {overridden:?}"
+        );
+        assert!(
+            overridden.contains(&"admin.token".to_string()),
+            "the token the env overrides must be listed: {overridden:?}"
+        );
+        assert!(
+            !overridden.iter().any(|path| path.starts_with("config")),
+            "a deployment variable is not a setting: {overridden:?}"
+        );
+        // Sorted and free of duplicates: the panel renders the list as
+        // it stands, and a repeated entry would read as a mistake.
+        let mut sorted = overridden.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, overridden, "the list must be sorted and unique");
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var("FUMOX_INGEST__DROP_GATE");
+            std::env::remove_var("FUMOX_ADMIN__TOKEN");
+            std::env::remove_var("FUMOX_CONFIG_ACCESS");
+        }
+        let after = env_overridden_paths();
+        assert!(
+            !after.contains(&"ingest.drop_gate".to_string()),
+            "the list must empty out with the environment: {after:?}"
+        );
+        assert!(
+            !after.contains(&"admin.token".to_string()),
+            "the list must empty out with the environment: {after:?}"
+        );
     }
 }

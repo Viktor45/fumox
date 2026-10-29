@@ -174,6 +174,8 @@ mod tests {
             geo_country: None,
             geo_city: None,
             geo_asn: None,
+            geo_attempts: 0,
+            last_geo_attempt_at: None,
             resolved_ip: None,
             status: "alive".into(),
             fail_count: 0,

@@ -10,6 +10,14 @@
 #   FUMOX_SERVER_NAME       the canonical name  (default fumox.example.com)
 #
 # See nginx.conf for the compose / podman flavour notes.
+#
+# The front writes the X-Forwarded-* family (For, Proto), so the server
+# side needs [server].trust_proxy_ips (the CIDR of this container's
+# network) and [server].trust_proxy_header = "xff" (the family written
+# here) for both listeners, plus [server].allowed_hosts /
+# [admin].allowed_hosts with the canonical name above. Without them the
+# per-IP rate limit counts this proxy's IP, the links stay on http behind
+# the TLS front, and the Host header is trusted as-is.
 
 # The Host forwarded upstream and used as the target of the :80
 # redirect. The client's Host is normalised: the default ports (80/443)

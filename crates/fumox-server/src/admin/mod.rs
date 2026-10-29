@@ -25,7 +25,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use fumox_core::config::{
     AdminConfig, DatabaseConfig, FetchConfig, GeoConfig, IngestConfig, LogConfig, MeowConfig,
-    NetworkConfig, ProbeConfig, ResolvedConfigPath, RetentionConfig, ServerConfig,
+    NetworkConfig, ProbeConfig, ResolvedConfigPath, RetentionConfig, ServerConfig, TrustedHeader,
 };
 use fumox_core::config_writer::is_writable;
 use fumox_core::db::DbPool;
@@ -58,11 +58,6 @@ pub struct AdminState {
     /// purpose: the listener is already bound to this socket, a mid-run
     /// config change could not rebind it anyway.
     pub server_bind: SocketAddr,
-    /// HMAC key for session cookies, derived from the admin token so that
-    /// rotating the token revokes every existing session.
-    pub session_key: Vec<u8>,
-    /// HMAC key for CSRF tokens (independent from the session key).
-    pub csrf_key: Vec<u8>,
     /// Per-IP rate limiter for `POST /admin/login`.
     pub login_limiter: Arc<RateLimiter>,
     /// Per-IP rate limiter for the rest of `/admin/*`.
@@ -71,6 +66,10 @@ pub struct AdminState {
     /// for=…` are honored for the admin per-IP rate-limit key. Empty = never
     /// honor forwarded headers.
     pub trusted_cidrs: Vec<ipnet::IpNet>,
+    /// Which forwarding header the trusted proxy writes. Only the named
+    /// header is read; `None` honors none, so the peer address is the
+    /// client even when a trusted proxy is configured.
+    pub trusted_header: TrustedHeader,
     /// UI message catalogs, loaded once at startup from `[admin].locales_dir`
     /// with the shipped ru/en catalogs embedded as fallback.
     pub locales: Arc<i18n::Locales>,
@@ -93,6 +92,10 @@ pub struct AdminState {
     /// genuinely startup-frozen (the HMAC keys, the rate limiters,
     /// `server_bind`) are explicit fields above, not config reads.
     pub live_config: Arc<std::sync::RwLock<fumox_core::AppConfig>>,
+    /// The capability token of the export links, the same instance the
+    /// public listener holds: a rotation from this panel has to reach the
+    /// public endpoint in the same breath.
+    pub export_token: crate::alive_export::TokenCache,
 }
 
 impl AdminState {
@@ -109,9 +112,8 @@ impl AdminState {
         fetcher: Fetcher,
         config: fumox_core::AppConfig,
         config_path: ResolvedConfigPath,
+        export_token: crate::alive_export::TokenCache,
     ) -> Self {
-        let session_key = auth::derive_key(b"fumox-admin-session", &config.admin.token);
-        let csrf_key = auth::derive_key(b"fumox-admin-csrf", &config.admin.token);
         let login_limiter = Arc::new(RateLimiter::new(
             u64::from(config.admin.login_rate_limit.limit),
             config.admin.login_rate_limit.window,
@@ -146,15 +148,15 @@ impl AdminState {
             events,
             fetcher,
             server_bind: config.server.bind,
-            session_key,
-            csrf_key,
             login_limiter,
             admin_limiter,
             trusted_cidrs,
+            trusted_header: config.admin.trust_proxy_header,
             locales,
             config_path,
             config_writable,
             live_config: Arc::new(std::sync::RwLock::new(config)),
+            export_token,
         }
     }
 
@@ -178,6 +180,33 @@ impl AdminState {
     /// The live `[admin]` block (token, rate limits, TTL).
     pub fn admin(&self) -> AdminConfig {
         self.live().admin
+    }
+
+    /// The live admin token, read without cloning the whole config.
+    pub fn admin_token(&self) -> String {
+        self.live_config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admin
+            .token
+            .clone()
+    }
+
+    /// HMAC key for the session cookies, derived from the *live* token.
+    ///
+    /// Derived on every use instead of frozen at startup: a token rotated
+    /// through the settings screen must change the effective key at once,
+    /// not at the next restart. One SHA-256 is noise next to the indexed
+    /// read of the revocation epoch every authenticated request does.
+    pub fn session_key(&self) -> Vec<u8> {
+        auth::derive_key(b"fumox-admin-session", &self.admin_token())
+    }
+
+    /// HMAC key for the CSRF tokens, derived from the live token like
+    /// [`AdminState::session_key`] but with its own purpose tag, so the
+    /// two keys never coincide.
+    pub fn csrf_key(&self) -> Vec<u8> {
+        auth::derive_key(b"fumox-admin-csrf", &self.admin_token())
     }
 
     /// The live `[server]` block (public listener).
@@ -290,6 +319,7 @@ impl AdminState {
             peer,
             headers,
             &self.trusted_cidrs,
+            self.trusted_header,
             &self.admin().allowed_hosts,
         )
     }
@@ -302,7 +332,7 @@ impl AdminState {
     /// CSRF token for the current session cookie (empty when no session).
     fn csrf_for(&self, headers: &axum::http::HeaderMap) -> String {
         let session = auth::session_cookie_value(headers).unwrap_or_default();
-        auth::csrf_token(&self.csrf_key, &session)
+        auth::csrf_token(&self.csrf_key(), &session)
     }
 }
 
@@ -373,20 +403,43 @@ pub(crate) fn parse_trusted_cidrs(raw: &[String]) -> Vec<ipnet::IpNet> {
 /// three that render serve links, which answered 500 from
 /// `build_serve_link_host`: a host that reaches a handler is now always
 /// allowlisted.
+///
+/// A request that arrived through a proxy in the operator's trust list is
+/// also judged by the host that proxy forwarded (`X-Forwarded-Host` or the
+/// RFC 7239 `Forwarded: host=` element): such a proxy rewrites the `Host`
+/// header to its own upstream name, and the operator's allowlist names the
+/// host they reach the panel on. The forwarded host is read only from a
+/// trusted peer and only from the header family the operator declared
+/// ([`TrustedHeader`]) — a client that talks to the panel directly can
+/// write those headers itself.
 async fn enforce_allowed_hosts(
     State(state): State<AdminState>,
     req: Request,
     next: Next,
 ) -> Response {
-    if let Err(err) = host_gate::validate_request_host(req.headers(), &state.admin().allowed_hosts)
-    {
-        tracing::warn!(error = %err, path = %req.uri().path(), "admin request host rejected");
-        return (
-            StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            "request Host header is not allowed for the admin panel\n",
-        )
-            .into_response();
+    let allowed = state.admin().allowed_hosts;
+    if !allowed.is_empty() {
+        let peer = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|info| info.0);
+        let trusted_peer = peer.is_some_and(|peer| {
+            state.trusted_cidrs.iter().any(|net| net.contains(&peer.ip()))
+        });
+        let forwarded_ok = trusted_peer
+            && host_gate::validate_forwarded_host(req.headers(), &allowed, state.trusted_header)
+                .is_ok();
+        if let Err(err) = host_gate::validate_request_host(req.headers(), &allowed)
+            && !forwarded_ok
+        {
+            tracing::warn!(error = %err, path = %req.uri().path(), "admin request host rejected");
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "request Host header is not allowed for the admin panel\n",
+            )
+                .into_response();
+        }
     }
     next.run(req).await
 }
@@ -458,6 +511,10 @@ pub fn router(state: AdminState) -> axum::Router {
             "/proxies/remove-unprobeable",
             post(handlers::proxies_remove_unprobeable),
         )
+        .route(
+            "/proxies/remove-detached",
+            post(handlers::proxies_remove_detached),
+        )
         // Bulk revival: inverse of cleanup, moves rows back to `unknown`.
         // Literal segments must precede `/{id}` for the same reason.
         .route(
@@ -469,8 +526,8 @@ pub fn router(state: AdminState) -> axum::Router {
             post(handlers::proxies_revive_removed_by_asn),
         )
         .route(
-            "/proxies/revive-removed-no-history",
-            post(handlers::proxies_revive_removed_no_history),
+            "/proxies/revive-removed-never-checked",
+            post(handlers::proxies_revive_removed_never_checked),
         )
         .route(
             "/proxies/revive-quarantine",
@@ -601,20 +658,29 @@ fn serve_base(
     peer: SocketAddr,
     headers: &HeaderMap,
     trusted_cidrs: &[ipnet::IpNet],
+    trusted_header: TrustedHeader,
     allowed_hosts: &[String],
 ) -> Result<String, host_gate::HostRejected> {
-    let scheme = if request_is_https(peer, headers, trusted_cidrs) {
+    let scheme = if request_is_https(peer, headers, trusted_cidrs, trusted_header) {
         "https"
     } else {
         "http"
     };
-    let host = host_gate::build_serve_link_host(bind, headers, allowed_hosts)?;
-    let default_port =
-        (scheme == "http" && bind.port() == 80) || (scheme == "https" && bind.port() == 443);
+    let link = host_gate::build_serve_link_host(bind, headers, allowed_hosts)?;
+    // The link points at the *public* listener, so its port is the one in
+    // `[server].bind` — the port the request carried is the panel's own.
+    // Behind a trusted proxy it is the other way round: there the `Host`
+    // header is the public authority the operator reached, and the public
+    // endpoint answers on that very authority.
+    let port = match link.port {
+        Some(port) if trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) => port,
+        _ => bind.port(),
+    };
+    let default_port = (scheme == "http" && port == 80) || (scheme == "https" && port == 443);
     Ok(if default_port {
-        format!("{scheme}://{host}")
+        format!("{scheme}://{}", link.host)
     } else {
-        format!("{scheme}://{host}:{}", bind.port())
+        format!("{scheme}://{}:{}", link.host, port)
     })
 }
 
@@ -629,7 +695,15 @@ fn serve_base(
 /// decision and the rate-limit key agree on what "peer" means. Empty
 /// `trusted_cidrs` ⇒ never honor forwarded headers (the safe default the
 /// empty `[admin].trust_proxy_ips` config advertises).
-fn request_is_https(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> bool {
+///
+/// Only the header the operator declared ([`TrustedHeader`]) is read: a
+/// scheme hint from an undeclared header is text the client chose.
+fn request_is_https(
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    trusted_cidrs: &[ipnet::IpNet],
+    trusted_header: TrustedHeader,
+) -> bool {
     // 1. No trusted proxies configured ⇒ never honor forwarded headers.
     if trusted_cidrs.is_empty() {
         return false;
@@ -638,18 +712,24 @@ fn request_is_https(peer: SocketAddr, headers: &HeaderMap, trusted_cidrs: &[ipne
     if !trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) {
         return false;
     }
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|p| p.trim().eq_ignore_ascii_case("https")))
-        || headers
-            .get(header::FORWARDED)
+    // 3. The operator declared no forwarding header ⇒ no scheme hint.
+    if trusted_header == TrustedHeader::None {
+        return false;
+    }
+    (trusted_header.honors_xff()
+        && headers
+            .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.to_ascii_lowercase()
-                    .split([',', ';'])
-                    .any(|p| p.trim().trim_start_matches("proto=") == "https")
-            })
+            .is_some_and(|v| v.split(',').any(|p| p.trim().eq_ignore_ascii_case("https"))))
+        || (trusted_header.honors_forwarded()
+            && headers
+                .get(header::FORWARDED)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.to_ascii_lowercase()
+                        .split([',', ';'])
+                        .any(|p| p.trim().trim_start_matches("proto=") == "https")
+                }))
 }
 
 /// Keep ≥2 dispatchers permanently alive in tracing's global dispatcher
@@ -731,6 +811,7 @@ pub(crate) async fn test_admin_state(
             fetcher,
             config,
             ResolvedConfigPath::Missing,
+            crate::alive_export::TokenCache::new(),
         ),
     )
 }

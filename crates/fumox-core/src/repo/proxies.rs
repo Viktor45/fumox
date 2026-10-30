@@ -3246,7 +3246,10 @@ const REFINGERPRINT_BATCH: i64 = 500;
 /// Every row is recomputed from its stored fields, so its key is the key
 /// the ingest computes for the same node. Two rows that now describe the
 /// same node are merged: the one with the better lifecycle status
-/// survives, takes over the links of the other and the other is deleted.
+/// survives, takes over the links, the state it lacks and the probe
+/// history of the other, and the other is deleted. The node keeps its
+/// status, its latency and its probe history instead of starting over at
+/// `unknown`.
 ///
 /// The rows are walked in bounded batches, each in its own short
 /// transaction, so the write lock is never held over the whole table and
@@ -3387,8 +3390,40 @@ async fn recompute_batch(
     Ok(())
 }
 
+/// The state a merge moves from one row of a node to the other.
+///
+/// The fields are read from the row that goes away and written onto the
+/// row that stays, field by field: the survivor keeps its own value and
+/// the dropped row fills the gaps.
+#[derive(Debug, sqlx::FromRow)]
+struct MergeState {
+    latency_ms: Option<i64>,
+    last_checked_at: Option<i64>,
+    last_alive_at: Option<i64>,
+    quarantined_at: Option<i64>,
+    removed_at: Option<i64>,
+    ladder_at: Option<i64>,
+    ladder_step: i64,
+    last_t2_failed_at: Option<i64>,
+    last_t2_checked_at: Option<i64>,
+    fail_count: i64,
+    geo_country: Option<String>,
+    geo_city: Option<String>,
+    geo_asn: Option<String>,
+    resolved_ip: Option<String>,
+}
+
 /// Merge the `drop` row into the `keep` row: the dropped row's source
-/// links move over, the dropped row goes away.
+/// links move over, the state and the history of the node move with them,
+/// and the dropped row goes away.
+///
+/// The history belongs to the node, not to the row that happened to store
+/// it: two rows that describe one node share one journal, so the journal
+/// rows move to the survivor instead of being deleted with the row that
+/// held them. The state moves the same way — the survivor's own value
+/// wins and the dropped row fills the gaps — so a node that was probed
+/// before keeps its latency, its last check, its T2 stamps and its geo
+/// facts even when the row that carried them is the one that goes away.
 async fn merge_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     keep: i64,
@@ -3414,7 +3449,65 @@ async fn merge_rows(
         .bind(drop)
         .execute(&mut **tx)
         .await?;
-    // The row itself: its history goes with it.
+    // The journal of the node follows it: the history rows are re-pointed
+    // at the survivor, not deleted with the row that held them.
+    sqlx::query("UPDATE probe_results SET proxy_id = ? WHERE proxy_id = ?")
+        .bind(keep)
+        .bind(drop)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE speed_results SET proxy_id = ? WHERE proxy_id = ?")
+        .bind(keep)
+        .bind(drop)
+        .execute(&mut **tx)
+        .await?;
+    // The state the survivor does not have moves with the journal.
+    let state: MergeState = sqlx::query_as(
+        "SELECT latency_ms, last_checked_at, last_alive_at, quarantined_at,
+                removed_at, ladder_at, ladder_step, last_t2_failed_at,
+                last_t2_checked_at, fail_count, geo_country, geo_city,
+                geo_asn, resolved_ip
+         FROM proxies WHERE id = ?",
+    )
+    .bind(drop)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE proxies SET
+            latency_ms = COALESCE(latency_ms, ?),
+            last_checked_at = COALESCE(last_checked_at, ?),
+            last_alive_at = COALESCE(last_alive_at, ?),
+            quarantined_at = COALESCE(quarantined_at, ?),
+            removed_at = COALESCE(removed_at, ?),
+            ladder_at = COALESCE(ladder_at, ?),
+            ladder_step = CASE WHEN ladder_step = 0 THEN ? ELSE ladder_step END,
+            last_t2_failed_at = COALESCE(last_t2_failed_at, ?),
+            last_t2_checked_at = COALESCE(last_t2_checked_at, ?),
+            fail_count = CASE WHEN fail_count = 0 THEN ? ELSE fail_count END,
+            geo_country = COALESCE(geo_country, ?),
+            geo_city = COALESCE(geo_city, ?),
+            geo_asn = COALESCE(geo_asn, ?),
+            resolved_ip = COALESCE(resolved_ip, ?)
+         WHERE id = ?",
+    )
+    .bind(state.latency_ms)
+    .bind(state.last_checked_at)
+    .bind(state.last_alive_at)
+    .bind(state.quarantined_at)
+    .bind(state.removed_at)
+    .bind(state.ladder_at)
+    .bind(state.ladder_step)
+    .bind(state.last_t2_failed_at)
+    .bind(state.last_t2_checked_at)
+    .bind(state.fail_count)
+    .bind(state.geo_country)
+    .bind(state.geo_city)
+    .bind(state.geo_asn)
+    .bind(state.resolved_ip)
+    .bind(keep)
+    .execute(&mut **tx)
+    .await?;
+    // The row itself goes away.
     sqlx::query("DELETE FROM proxies WHERE id = ?")
         .bind(drop)
         .execute(&mut **tx)
@@ -3425,17 +3518,23 @@ async fn merge_rows(
 /// The lifecycle rank of a status: the row with the higher rank survives a
 /// merge of two rows that describe the same node.
 ///
-/// A node that was verified alive is worth more than one that never got a
-/// verdict, and one that never got a verdict is worth more than one the
-/// probe retired. The most recently alive row wins a tie, and the older
-/// row wins a tie beyond that, so the survivor keeps the history.
+/// A row the probe has judged is worth more than a row that never got a
+/// verdict: the judged row carries the state of the node, and a merge
+/// that preferred the unjudged row would throw that verdict away and
+/// hand the node back as a first-timer. A node the probe retired keeps
+/// its verdict across a merge; it comes back through the paths that
+/// exist for that (the ingest revives a retired node the feed still
+/// carries, the panel revives a retired population), not through a merge
+/// that happened to meet a fresh row. The most recently alive row wins a
+/// tie, and the older row wins a tie beyond that, so the survivor keeps
+/// the history.
 fn status_rank(status: &str, last_alive_at: Option<i64>) -> (i32, i64) {
     let rank = match status {
         "alive" => 5,
         "ready" => 4,
-        "unknown" => 3,
-        "quarantine" => 2,
-        "removed" => 1,
+        "quarantine" => 3,
+        "removed" => 2,
+        "unknown" => 1,
         _ => 0,
     };
     (rank, last_alive_at.unwrap_or(i64::MIN))

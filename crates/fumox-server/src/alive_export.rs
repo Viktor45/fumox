@@ -43,6 +43,10 @@
 //! the render, the serialization and the response body all grow with the
 //! whole tier on a public cacheable URL. The cap is applied in the SQL of
 //! the backing query and only after the host and token gates.
+//! A body the cap cut says so twice: the body carries a `# truncated:`
+//! line, and the response carries `X-Fumox-Export-Total` (the size of the
+//! tier) and `X-Fumox-Export-Truncated: true`, so a client that only has
+//! the headers still tells a full list from a truncated one.
 
 use crate::cache::{InlineClaim, Rendered};
 use crate::host_gate;
@@ -470,14 +474,22 @@ async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fu
 /// size is looked up in the same request and written into the body, so a
 /// download states what it left out instead of looking like a complete
 /// tier.
+///
+/// The same two facts travel as response headers, because a body that
+/// left the browser has no headers left: `X-Fumox-Export-Total` names the
+/// size of the tier and `X-Fumox-Export-Truncated: true` marks a body the
+/// cap cut. A client therefore tells a full list from a truncated one
+/// without parsing the `nodes count` comment.
 async fn render_tier(pool: &DbPool, tier: &str, limit: u32) -> Result<Rendered, fumox_core::Error> {
+    // The backing query clamps the limit to at least one row; the
+    // comparison below has to count with the same number.
+    let limit = limit.max(1);
     let rows: Vec<ProxyRow> = match tier {
         "ready" => proxies::list_ready(pool, limit).await?,
         _ => proxies::list_alive(pool, limit).await?,
     };
     let mut lines: Vec<String> = Vec::with_capacity(rows.len());
     let mut skipped: Vec<i64> = Vec::new();
-    let returned = rows.len();
     for row in rows {
         match row.to_entry() {
             Ok(entry) => lines.push(fumox_core::parsers::serialize(&entry)),
@@ -496,26 +508,27 @@ async fn render_tier(pool: &DbPool, tier: &str, limit: u32) -> Result<Rendered, 
         );
     }
     let mut header = serve::url_list_header_block(&format!("export/{tier}"), 1, lines.len());
-    // A body that holds exactly the cap may be truncated or may be the
-    // whole tier; the tier size tells the two apart.
-    if returned as u32 == limit {
-        let total = match tier {
-            "ready" => proxies::count_ready(pool).await?,
-            _ => proxies::count_alive(pool).await?,
-        };
-        if total > i64::from(limit) {
-            header.push_str(&format!(
-                "# truncated: showing {limit} of {total} — raise [server].export_max_rows\n"
-            ));
-            warn_truncation(tier, limit, total);
-        }
+    // The tier size is looked up in the same request: a body that holds
+    // exactly the cap may be truncated or may be the whole tier, and only
+    // the size tells the two apart.
+    let total = match tier {
+        "ready" => proxies::count_ready(pool).await?,
+        _ => proxies::count_alive(pool).await?,
+    };
+    let mut extra_headers = vec![("X-Fumox-Export-Total".to_string(), total.to_string())];
+    if total > i64::from(limit) {
+        header.push_str(&format!(
+            "# truncated: showing {limit} of {total} — raise [server].export_max_rows\n"
+        ));
+        extra_headers.push(("X-Fumox-Export-Truncated".to_string(), "true".to_string()));
+        warn_truncation(tier, limit, total);
     }
     let body = format!("{header}{}", lines.join("\n"));
     Ok(Rendered {
         status: 200,
         body: body.into_bytes().into(),
         content_type: "text/plain; charset=utf-8".to_string(),
-        extra_headers: Vec::new(),
+        extra_headers,
         fresh_until: fumox_core::models::now_ts() + EXPORT_TTL_SECS,
         // No source contributed to this rendering, so the per-source
         // invalidation must never touch the export entries.
@@ -949,6 +962,51 @@ mod tests {
         let body = String::from_utf8(capped.body.to_vec()).unwrap();
         assert!(body.contains("# truncated: showing 2 of 5"), "{body:?}");
         assert!(body.contains("[server].export_max_rows"), "{body:?}");
+    }
+
+    /// The same two facts travel as response headers: a body that left
+    /// the browser has no headers left, and a client must be able to tell
+    /// a full list from a truncated one without parsing the `nodes count`
+    /// comment.
+    #[tokio::test]
+    async fn a_truncated_export_marks_itself_in_the_headers() {
+        // Capped: the flag and the size of the tier travel with the body.
+        let (app, token, state) = app_with_token(Vec::new(), 2).await;
+        seed_alive_tier(&state.pool, "srcH0000000", 5).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/export/alive/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-fumox-export-truncated").unwrap(),
+            "true"
+        );
+        assert_eq!(response.headers().get("x-fumox-export-total").unwrap(), "5");
+
+        // The whole tier: no truncation flag, but the size is still there.
+        let (app, token, state) = app_with_token(Vec::new(), 500_000).await;
+        seed_alive_tier(&state.pool, "srcI0000000", 5).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/export/alive/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get("x-fumox-export-truncated").is_none(),
+            "a whole tier must not be marked as truncated"
+        );
+        assert_eq!(response.headers().get("x-fumox-export-total").unwrap(), "5");
     }
 
     /// Rows that cannot be rendered are skipped, and the render says so in

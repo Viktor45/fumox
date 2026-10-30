@@ -5068,6 +5068,178 @@ async fn the_recompute_is_idempotent() {
     assert_eq!(second.merged, 0);
 }
 
+/// The state and the history of a node belong to the node, not to the row
+/// that happened to store them. A merge used to delete the journal of the
+/// dropped row with the row itself, so a node that was probed for months
+/// lost its history when the ingest created a second row for it — and a
+/// node the probe had retired lost its verdict with it.
+#[tokio::test]
+async fn a_merge_moves_the_state_and_the_history_of_the_node() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcMergeState").await;
+    make_source(&pool, "srcMergeStateB").await;
+
+    // The old row: the node the probe had judged, with a latency, a
+    // failure count and a journal.
+    let old = insert_legacy_row(
+        &pool,
+        "old-row",
+        r#"{"sni":"a.example.com"}"#,
+        "quarantine",
+        "srcMergeState",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE proxies SET latency_ms = 120, fail_count = 3, last_alive_at = 42,
+                          last_t2_checked_at = 99
+         WHERE id = ?",
+    )
+    .bind(old)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, probe_kind)
+         VALUES (?, 100, 0, NULL, 't1')",
+    )
+    .bind(old)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The row the ingest created after the upgrade: the same node under
+    // the new key, never checked.
+    let fresh = insert_legacy_row(
+        &pool,
+        &canonical_key_of("a.example.com"),
+        r#"{"sni":"a.example.com"}"#,
+        "unknown",
+        "srcMergeStateB",
+    )
+    .await;
+
+    let stats = refingerprint(&pool).await.unwrap();
+    assert_eq!(stats.merged, 1);
+
+    let rows: Vec<ProxyRow> = sqlx::query_as("SELECT * FROM proxies")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let survivor = rows[0].id;
+    // The judged row survives: a fresh row that never got a verdict does
+    // not overrule the state the probe recorded.
+    assert_eq!(survivor, old);
+    assert_ne!(survivor, fresh);
+    assert_eq!(rows[0].status, "quarantine");
+    assert_eq!(rows[0].latency_ms, Some(120));
+    assert_eq!(rows[0].fail_count, 3);
+
+    // The journal moved with the node instead of being deleted.
+    let history: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT proxy_id, checked_at FROM probe_results ORDER BY checked_at")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(history, vec![(survivor, 100)]);
+
+    // Both sources are linked to the surviving row.
+    let links: Vec<(String,)> = sqlx::query_as(
+        "SELECT source_id FROM proxy_source_links WHERE proxy_id = ? ORDER BY source_id",
+    )
+    .bind(survivor)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        links,
+        vec![
+            ("srcMergeState".to_string(),),
+            ("srcMergeStateB".to_string(),)
+        ]
+    );
+}
+
+/// Two rows of one node carry one journal: the history of the node is the
+/// union of the two, and the state the surviving row lacks comes from the
+/// row that goes away. The two rows here are the two spellings of one
+/// node (the Clash `servername` and the URI `sni`), both written before
+/// the canonical form changed.
+#[tokio::test]
+async fn a_merge_fills_the_gaps_of_the_surviving_row() {
+    let (_dir, pool) = temp_pool().await;
+    make_source(&pool, "srcMergeGap").await;
+
+    let alive = insert_legacy_row(
+        &pool,
+        "old-alive",
+        r#"{"sni":"a.example.com"}"#,
+        "alive",
+        "srcMergeGap",
+    )
+    .await;
+    sqlx::query("UPDATE proxies SET latency_ms = 120 WHERE id = ?")
+        .bind(alive)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, probe_kind)
+         VALUES (?, 100, 1, 120, 't1')",
+    )
+    .bind(alive)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The same node under the other spelling: no verdict, no latency, but
+    // a geo fact and a journal of its own.
+    let other = insert_legacy_row(
+        &pool,
+        "old-other",
+        r#"{"servername":"a.example.com"}"#,
+        "unknown",
+        "srcMergeGap",
+    )
+    .await;
+    sqlx::query("UPDATE proxies SET geo_country = 'DE' WHERE id = ?")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO probe_results (proxy_id, checked_at, ok, latency_ms, probe_kind)
+         VALUES (?, 50, 0, NULL, 't1')",
+    )
+    .bind(other)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stats = refingerprint(&pool).await.unwrap();
+    assert_eq!(stats.merged, 1);
+
+    let rows: Vec<ProxyRow> = sqlx::query_as("SELECT * FROM proxies")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let survivor = rows[0].id;
+    assert_eq!(survivor, alive);
+    // The latency of the survivor is its own, the geo fact of the dropped
+    // row fills the gap it left.
+    assert_eq!(rows[0].latency_ms, Some(120));
+    assert_eq!(rows[0].geo_country.as_deref(), Some("DE"));
+
+    // Both journals belong to the node and end up on the survivor.
+    let history: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT proxy_id, checked_at FROM probe_results ORDER BY checked_at")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(history, vec![(survivor, 50), (survivor, 100)]);
+}
+
 #[tokio::test]
 async fn a_row_the_ingest_already_recomputed_is_not_duplicated() {
     let (_dir, pool) = temp_pool().await;

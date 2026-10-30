@@ -75,6 +75,22 @@ Changes in the working tree, not yet on a published image.
   image does not ship, so plugin-backed entries that used to fail T2
   now work. Fumox already rendered both correctly; only the engine
   gained the ability to honour them.
+  **Which engine, and how to check it:** these two need meow-rs
+  0.22.0 or newer. The version is supplied by the `MEOW_VERSION`
+  build argument of `docker/meow/Dockerfile`, which pins one concrete
+  release together with the two sha256 sums the upstream release
+  publishes (the build verifies the download against them and fails on
+  a mismatch); the `fumox-meow` wrapper image
+  (`ghcr.io/viktor45/fumox-meow`, pinned by digest in the compose
+  stack) carries exactly that release and is never rebuilt with a
+  floating "latest". The release inside a running container is one
+  command away: `docker compose exec meow meow -v` prints
+  `Meow Meta 0.27.0` for the release the current build pins
+  (`meow --version` prints the same number). **Warning:** an engine
+  older than 0.22.0 cannot check the entries listed above — the
+  `xhttp` transport does not exist for it and the SIP003 plugins have
+  no in-process implementation — so those proxies fail T2 and never
+  reach the `ready` tier even though Fumox renders them correctly.
 - `[meow].ipv6` (default `false`, matching meow-rs): rendered into
   the generated meow config. 0.22.0 made the key effective
   end-to-end: under `false` AAAA lookups are skipped and the direct
@@ -240,16 +256,34 @@ Changes in the working tree, not yet on a published image.
   `network`/`net`, `cipher`/`scy`) count once. The version is part of
   the pre-image, so a change of the canonical form changes every key:
   the stored rows are recomputed on the first start after the upgrade,
-  before the first ingest. A row that describes a node another row
-  already describes is merged into the one with the better lifecycle
-  status, its source links move over and the merged row is deleted, so
-  the node keeps its status, its latency and its probe history instead
-  of starting over at `unknown`. The server logs the version it stores
+  before the first ingest. **Upgrade:** the recompute rewrites the key
+  of every stored row and leaves the row itself alone, so a node keeps
+  its status, its latency, its geo facts and its probe history — the
+  new key is invisible to the panel and to the clients. A node the feed
+  advertised under two spellings lives in two rows before the upgrade;
+  the recompute merges them into one: the row the probe has judged
+  survives, the source links of both rows end up on it, the probe
+  history of both rows follows the node, and the state the surviving
+  row lacks is filled from the row that goes away. A node the probe had
+  retired keeps its verdict across a merge; it comes back through the
+  paths that exist for that (`[ingest].removed_as_unknown` revives a
+  retired node the feed still carries, the panel's *Revive* buttons
+  revive a retired population), not through the merge. After the
+  recompute no two rows describe the same node — the key is unique —
+  so the same node cannot be listed twice any more. What the operator
+  may still see is a node that *looks* twice because the feeds spell
+  it apart in a way that changes the connection (a different SNI, a
+  different transport); the canonical form counts those apart on
+  purpose. Such a row is removed like any other: mark it `removed` on
+  the *Proxies* screen and *Purge removed* deletes it from the
+  database. The server logs the version it stores
   at startup, with the number of rows it rewrote and merged. A
   downgrade to a build without the recompute leaves the rows under keys
   that build no longer produces, and the nodes are re-identified on the
   next ingest, so downgrading is not recommended. Guarded by
   `two_rows_that_describe_the_same_node_are_merged`,
+  `a_merge_moves_the_state_and_the_history_of_the_node`,
+  `a_merge_fills_the_gaps_of_the_surviving_row`,
   `the_recompute_is_idempotent` and
   `the_version_marker_gates_the_recompute`.
 - `[probe].refresh_check_limit` moved to `[ingest].refresh_check_limit`:
@@ -363,16 +397,22 @@ Changes in the working tree, not yet on a published image.
   parameter of `/admin/proxies` is ignored now — a bookmark that
   carries it shows the first page — while the *Fetch log* and the
   *Sources* screen keep their page numbers.
-- A truncated export says so in its own body. `/export/alive/{token}`
+- A truncated export says so twice. `/export/alive/{token}`
   and `/export/ready/{token}` ship at most
   `[server].export_max_rows` rows (50 000 by default), and the body
   carried the count of what it holds but not the size of the tier it
   came from: a download that carried 50 000 rows looked exactly like a
-  download of a tier of 50 000. The header now names both —
+  download of a tier of 50 000. The body names both now —
   `# truncated: showing 50000 of 81234 — raise [server].export_max_rows`
   — so the file states what it left out, and the render warns once per
-  window that it was capped. A body that carries the whole tier says
-  nothing about a truncation that did not happen.
+  window that it was capped. The response carries the same two facts, so
+  a client that holds nothing but the headers (a download, a proxy in
+  between) still tells a full list from a truncated one:
+  `X-Fumox-Export-Total` is the size of the tier and
+  `X-Fumox-Export-Truncated: true` marks a body the cap cut. A body
+  that carries the whole tier says nothing about a truncation that did
+  not happen. Guarded by
+  `a_truncated_export_marks_itself_in_the_headers`.
 - The export capability token is kept in process memory. The public
   export links read it from the `meta` table on every request, so a
   download cost a database read before it cost anything else. The token
@@ -418,7 +458,12 @@ Changes in the working tree, not yet on a published image.
   address (one budget for the whole fleet), the scheme hint is ignored
   (the links stay on `http` behind a TLS front) and the forwarded host is
   not believed. A `trust_proxy_ips` without a `trust_proxy_header` is
-  named in a startup warning.
+  named in a startup warning. A chain of several proxies in front of the
+  server has the same effect once every hop of it is in the trust list:
+  the header walk skips the trusted hops, finds no untrusted address
+  left and falls back to the address next to the server, so one
+  rate-limit key serves the whole fleet. Name every hop in
+  `trust_proxy_ips` and raise the limit that key shares.
 - The session cookie carries the version of its format now
   (`v2.{expires}.{mac}`). The format of the previous build
   (`{expires}.{mac}`, the MAC over the same epoch-mixed key) is still
@@ -494,8 +539,10 @@ Changes in the working tree, not yet on a published image.
   cap is a `LIMIT ?` in the backing query (`list_alive` /
   `list_ready`), not a post-read truncate, and it truncates the stable
   id order (lowest ids first), so two renders of the same tier agree.
-  The `nodes count` header reports what the body really carries, so a
-  truncated download documents itself; the admin badge (`count_alive` /
+  The `nodes count` header reports the actual number of lines the body
+  carries; the cut itself is marked by `X-Fumox-Export-Truncated` (and
+  the size of the tier by `X-Fumox-Export-Total`), not by the count;
+  the admin badge (`count_alive` /
   `count_ready`) stays uncapped on purpose, so the operator can still
   see that the export is smaller than the tier. The cap is applied
   after the host and token gates: a rejected request cannot tell a
@@ -747,6 +794,38 @@ Changes in the working tree, not yet on a published image.
   shows the seconds the refresh has been running and what it may cost
   (the wall-clock budget and the number of attempts), so a stalled
   refresh reads as stalled instead of as a spinner that never ends.
+- The settings screen says what a save actually puts in force. The file
+  is written and the in-memory view is refreshed, so the panel shows the
+  values that were just saved, but only some of them are in force for
+  the running processes:
+
+  - **on the next request**: `[admin].token` (the session and the CSRF
+    key are derived from it per request, so a rotation is enforced at
+    once and ends every session minted under the old token),
+    `[admin].session_ttl_hours` (the lifetime of a newly minted session)
+    and `[admin].secure_cookies` (the attribute of a newly minted
+    cookie; a cookie already in the browser keeps the attributes it was
+    given);
+  - **after a server restart**: `[server].bind`,
+    `[server].allowed_hosts`, `[server].trust_proxy_ips`,
+    `[server].trust_proxy_header`, `[server].export_max_rows`, the two
+    `[server]` rate limits, `[admin].bind`, `[admin].enabled`,
+    `[admin].rate_limit`, `[admin].login_rate_limit`,
+    `[admin].locales_dir`, `[admin].allowed_hosts`,
+    `[admin].trust_proxy_ips`, `[admin].trust_proxy_header`,
+    `[admin].allow_private_urls`, `[database].path`, `[log].server` and
+    every key of `[geo]`, `[fetch]`, `[ingest]` and `[retention]` — the
+    listeners, the connection pool, the tracing subscriber, the fetcher,
+    the scheduler and the retention windows are all built at startup and
+    keep the values they booted with;
+  - **after a probe restart**: every key of `[probe]` (the daemon reads
+    its own configuration), plus `[geo].startup_download_budget_secs`
+    (a startup budget) and `[meow].ipv6` (the generated meow-rs
+    configuration).
+
+  A restart does not end the admin sessions: the cookie carries its own
+  expiry and the revocation epoch lives in the database. What ends them
+  is a token rotation, or the logout button.
 
 ### Fixed
 
@@ -1182,7 +1261,10 @@ Changes in the working tree, not yet on a published image.
   failed its tunnel check re-entered the T1 rotation on a plain
   TCP/TLS verdict, the exact case the flag (migration 0007) exists
   to suppress. Only a T2 success does now, and `ready` is the T2
-  success tier.
+  success tier: after a failed T2 the proxy's T1 checks are skipped
+  until the next successful T2. The releases between the change that
+  introduced the flag and this fix did not hold that rule — see the
+  correction in the *2026-09-22* and *2026-09-21* entries.
 - A meow-rs outage was charged to the proxies it skipped. The
   journal-and-fail path ran the whole fail ladder for every due proxy
   when the engine was down at `ping`/`reload_config` or died
@@ -2687,13 +2769,29 @@ Changes in the working tree, not yet on a published image.
   guide, so it is now in the `.env` table too.
 - The reverse-proxy note told operators to set both
   `[server].allowed_hosts` and `[admin].allowed_hosts` "to the
-  hostname the proxy serves". The admin panel builds the links
-  behind *Import / Export*, *Sources* and *Profiles* against the
-  **public** list, so the shipped loopback quickstart
-  (`http://127.0.0.1:8081/admin`) plus a pinned public domain makes
-  exactly those three screens answer `500`. The note, both guides'
-  configuration tables and both troubleshooting sections now spell
-  out the second list to add.
+  hostname the proxy serves", and the note behind *Import / Export*,
+  *Sources* and *Profiles* still described the serve links as being
+  built against the **public** list — which was true then, and made
+  exactly those three screens answer `500` on the shipped loopback
+  quickstart (`http://127.0.0.1:8081/admin`) plus a pinned public
+  domain. The links are built from the **panel's own host** now — the
+  `Host` the request that reached the panel carried — with the public
+  port from `[server].bind`, and that host is validated against
+  `[admin].allowed_hosts`, the list the panel gate uses, so the
+  screens render. The two lists stay separate, and a split list has a
+  visible price: the link carries the admin host, so clicking it
+  lands on the public listener, which gates on
+  `[server].allowed_hosts` and answers `404` for a host that is not
+  on that list. The trade-off is deliberate — a panel host the public
+  list rejects would otherwise break the whole page instead of one
+  link. What an operator has to add is therefore: every host that
+  should reach the **public** endpoints (`/sub`, `/src`, `/export/*`)
+  in `[server].allowed_hosts`, every host that should reach the
+  **panel** in `[admin].allowed_hosts`, and — if the serve links are
+  to work when clicked — the panel host in both. The shipped
+  configuration leaves both lists empty, which admits every host. The
+  note, both guides' configuration tables and both troubleshooting
+  sections now spell this out.
 - The *Settings* page was described as rendering "every
   `config/app.toml` knob except the admin token" and "the complete
   effective config". Two keys have no rendered field:
@@ -2806,6 +2904,80 @@ Changes in the working tree, not yet on a published image.
   confirmation dialog focuses, and what the toggles announce. The export
   screen notes that rotating the token asks for confirmation on a page of
   its own.
+- Both user guides now describe the status tiers the way the code
+  computes them. `unknown`, `alive` and `ready` are the three live
+  verdicts, and the last two are tiers rather than fields: a proxy sits
+  in exactly one of them, a `ready` proxy was `alive` before its tunnel
+  check succeeded, and a failed tunnel check sends it back to `alive`.
+  `quarantine` and `removed` are the two states that keep a proxy out of
+  the output. The two export links follow the tiers exactly, so a
+  `ready` proxy appears in `/export/ready/{token}` and never in
+  `/export/alive/{token}`; `health.exclude_statuses` accepts all five
+  statuses, and the default still drops only the two retired ones, so
+  `/sub` can hand out a proxy nobody has checked yet. The Russian guide
+  carried the tier text only in English; both now carry the same
+  paragraph, and the misspelled "tier"/"тиер" wording is gone from
+  both.
+- The guides grew a *Source settings* subsection that tables the fields
+  of the source form (name, slug, URL, encoding, input format, IP
+  family, protocols, cache TTL, tags, headers) with the value format of
+  each, and states what the TTL really is: the source's scheduler
+  refresh period, not only a cache lifetime. The `[probe]` table grew
+  the two keys that section 10 used to describe on its own:
+  `allow_private_targets` (the SSRF guard the probe applies to
+  feed-supplied dial targets, default `false`) and
+  `backlog_target_drain_minutes` (the drain target the backlog banner
+  compares against, default `60`). Section 10 is now a pointer to the
+  configuration reference.
+- The `.env` table states what the admin token really does:
+  `docker-compose.yml` refuses to start without `FUMOX_ADMIN__TOKEN`,
+  while the binary's own default is `change-me`, which is not a
+  credential: the panel stays off until a real token is set, the admin
+  listener is then not started at all and `/admin` answers 404. An empty
+  token and `[admin].enabled = false` do the same. The quickstart's
+  command list names the variable as mandatory. Both guides also warn
+  that the plain-HTTP quickstart needs
+  `FUMOX_ADMIN__SECURE_COOKIES=false`, because Compose sets it to
+  `true` and the browser then drops the session cookie, and the
+  troubleshooting table names the two symptoms that produces: the
+  redirect loop after a successful login and the panel's `403`
+  (`err.cross_site`).
+- Both guides say plainly that meow-rs is not part of the image and has
+  to be started separately for the T2 checks: without it only the T1
+  checks run, and the `ready` tier and the T2 confirmation are absent.
+  The meow test URL got one source of truth as well: the default is the
+  single HTTPS endpoint `https://www.gstatic.com/generate_204` (the
+  seven-address rotation of one vendor is gone), the `.env` table points
+  at the configuration reference instead of implying a rotation, and the
+  reference states the accepted value formats (one URL, a TOML array or
+  a comma-separated list) and the fact that the probe draws one URL per
+  cycle.
+- The config-write guarantee is stated precisely now. The atomic
+  replacement holds on the successful `rename` path only; the fallback
+  that writes through the original inode is not atomic and can leave a
+  truncated file, so that path is called unsafe. The backlog worked
+  example is recomputed with the formula of section 10: a lane of 389
+  rows is `ceil(389/64) × 20 = 140 s` at `concurrency = 64` (980 s at
+  the current 8), which is still above the 60-second period.
+- Section 11 names where the GeoLite2 databases come from: the public
+  P3TERX release assets, which is why no MaxMind key is needed by
+  default. A MaxMind key is only required when the operator points
+  `[geo].download_urls` at MaxMind's own authenticated URLs. The
+  troubleshooting table grew a row for a failing download that names
+  the directory where a hand-placed `.mmdb` belongs.
+- The guides state the relative-path rule of the configuration file (a
+  relative path resolves against the working directory, so the systemd
+  unit pins `WorkingDirectory=/opt/fumox` and the guide recommends
+  absolute values), and section 12 grew a Compose subsection for the
+  database: the path inside the container (`/app/data/fumox.db` on the
+  `fumox-data` volume) and the WAL-safe backup from a one-shot container
+  that carries the `sqlite3` CLI, together with the warning that a copy
+  of the `.db` file taken while the WAL is active is not a backup. The
+  endpoint table also names, per endpoint, which source error class
+  speaks for the answer: on the aggregated `/sub` the class of **any**
+  member source speaks for the whole profile, while `/src` judges only
+  the class of its own source, and a `http_client` failure is answered
+  with the upstream status of the last fetch on both.
 
 ## 2026-09-23 · sha-b72b03f
 
@@ -2900,6 +3072,13 @@ Changes in the working tree, not yet on a published image.
   T2 recency selector is the only path back into the T1 rotation.
   A T1 failure (a closed TCP port) does not trigger the
   suppression because it is not a property of the tunnel.
+  **Correction:** the rule above is the intent of this change, but
+  the code did not hold it in this release: `check_succeeded` cleared
+  the T2 failure marker on *any* success, so a successful T1 lifted
+  the suppression as well and the skipping ended with the first T1
+  verdict. The fix lands in the *Unreleased* section ("A T1 success
+  lifted the T2 suppression flag"), where the rule is the current
+  behaviour.
 - Pipeline editor's row layout now follows the `target` selector
   live: changing `name` / `host` / `port` / `param` / `asn` in a
   drop or rename row fires an htmx round-trip that swaps the row
@@ -2997,6 +3176,13 @@ Changes in the working tree, not yet on a published image.
   path back into the T1 rotation. A T1 failure (a closed TCP
   port) does not trigger the suppression because it is not a
   property of the tunnel.
+  **Correction:** the rule above is the intent of this change, but
+  the code did not hold it in this release: `check_succeeded` cleared
+  the T2 failure marker on *any* success, so a successful T1 lifted
+  the suppression as well and the skipping ended with the first T1
+  verdict. The fix lands in the *Unreleased* section ("A T1 success
+  lifted the T2 suppression flag"), where the rule is the current
+  behaviour.
 
 ## 2026-09-20 · sha-47b8873
 

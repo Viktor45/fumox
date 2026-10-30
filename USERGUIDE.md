@@ -264,7 +264,7 @@ Useful `.env` variables (all except the token are optional):
 | `FUMOX_ADMIN__ALLOW_PRIVATE_URLS` | `false`                               | Allow source URLs pointing at private/loopback addresses (disables the SSRF guard). Local testing only.                                                          |
 | `FUMOX_ADMIN__SECURE_COOKIES`     | `true` (compose) / `false` (file)     | Add `; Secure` to the admin session cookie. The compose default `true` presumes an HTTPS front; set `false` in `.env` when the panel is opened over plain HTTP (`http://127.0.0.1:8081`), or every login silently fails. |
 | `FUMOX_CONFIG_ACCESS`             | `rw`                                  | Mount mode for `./config` in the **server** container. `rw` lets the admin *Edit settings* page save `app.toml`; `ro` mounts it read-only, which turns that page into a read-only view. The probe container is always `:ro`. |
-| `MEOW_VERSION`                    | `latest`                              | The meow-rs release for **local builds** of the wrapper image (`--build` mode; no effect when pulling). `latest` resolves the newest release via the GitHub API; a tag (e.g. `v0.22.0`) pins one. |
+| `MEOW_VERSION`                    | `v0.27.0`                             | The meow-rs release for **local builds** of the wrapper image (`--build` mode; no effect when pulling). An explicit tag is required: `latest` is refused, because a wrapper that moves to a new upstream release on its own makes the built image unverifiable. The two `MEOW_SHA256_*` variables carry the sums of the release archives and travel with it; the build refuses a download whose hash differs, and a release without its sums is not built at all. |
 
 Notes:
 
@@ -353,9 +353,15 @@ Notes:
   of its REST API (`GET /version`, `PUT /configs`, `GET /proxies/{name}/delay`),
   and that slice is unchanged across releases: 0.21.2 → 0.22.0 shipped an
   identical 26-route surface, identical delay parameters and identical
-  404/504/503 semantics, so an upgrade is a rebuild, not a code change. Set
-  `MEOW_VERSION=v0.22.0` in `.env` to pin one (leave it `latest` to track
-  upstream HEAD). Note that 0.22.0 replaced rustls with BoringSSL runtime-wide
+  404/504/503 semantics, so an upgrade is a rebuild, not a code change. A new
+  upstream release is picked up by editing three values together: the
+  `MEOW_VERSION` tag and the two `MEOW_SHA256_*` sums of the release
+  archives, in `.env` for a local build and in `docker/meow/Dockerfile` (plus
+  the workflow inputs) for the published image. `latest` is refused on both
+  paths: a wrapper that moves on its own makes the image unverifiable. The
+  running engine names itself: `docker compose exec meow meow -v` prints
+  `Meow Meta <version>`, `0.27.0` for the release the image pins today. Note
+  that 0.22.0 replaced rustls with BoringSSL runtime-wide
   and made `ipv6` effective end-to-end, see `[meow].ipv6` below.
 - **What the 0.22.0 upgrade buys T2 immediately**, with no Fumox change: the
   `xhttp` transport is now a real outbound (0.21.x had no XHTTP at all, so
@@ -432,12 +438,13 @@ shows the wiring.
 The meow-rs wrapper (`docker/meow/Dockerfile`) is on GHCR too,
 `ghcr.io/viktor45/fumox-meow`, but it is published **manually only**: the
 `docker-meow.yml` workflow never runs on push or tags; dispatch it from the
-Actions tab (the `meow_version` input: `latest`, the freshest release at
-build time, or a tag like `v0.22.0`). Resulting tags: the `meow_version`
+Actions tab (the `meow_version` input takes an explicit tag like `v0.27.0` —
+`latest` is refused — together with the two `meow_sha256_*` sums of the
+release archives). Resulting tags: the `meow_version`
 value, `main` and `sha-<short sha>`; the attestation is the same, per
 platform. The Option A stack already references this image: `docker compose
 up -d` pulls it, `--build` compiles the wrapper locally (the `.env`
-`MEOW_VERSION` variable picks the release in build mode only).
+`MEOW_VERSION` variable and the two sums pick the release in build mode only).
 
 ### Option C – Build from source
 

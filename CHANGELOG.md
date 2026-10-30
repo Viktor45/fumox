@@ -2965,6 +2965,15 @@ Changes in the working tree, not yet on a published image.
   `[geo].download_urls` at MaxMind's own authenticated URLs. The
   troubleshooting table grew a row for a failing download that names
   the directory where a hand-placed `.mmdb` belongs.
+- The guides still described the meow-rs release as a floating `latest`
+  that the build resolved through the GitHub API. The build resolves
+  nothing: `docker/meow/Dockerfile` pins `MEOW_VERSION` (currently
+  `v0.27.0`) together with the two sha256 sums of the release archives,
+  the build refuses a download whose hash differs, and `latest` is
+  refused outright, by the wrapper image and by the `docker-meow.yml`
+  workflow alike, which takes the tag and the two sums as its inputs.
+  Both guides say so now, and name the command that shows the running
+  engine's version (`docker compose exec meow meow -v`).
 - The guides state the relative-path rule of the configuration file (a
   relative path resolves against the working directory, so the systemd
   unit pins `WorkingDirectory=/opt/fumox` and the guide recommends

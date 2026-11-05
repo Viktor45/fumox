@@ -446,5 +446,28 @@ assert_output "$OUT" "still has"
 expect_eq "the held database was not touched" \
     "$(q_on "$HOLD_DB" 'SELECT status FROM proxies WHERE id = 1;')" "$HOLD_BEFORE"
 
+# ── relative paths resolve against the invocation directory ──────
+# The script cd's to the repository root before it parses the arguments,
+# so a relative db or backup path must be expanded against the caller's
+# cwd — a run from another directory must not silently open the
+# repository's own fumox.db.
+REL="$WORK/rel"
+mkdir -p "$REL"
+cp "$DB" "$REL/test.db"
+cp "$BACKUP" "$REL/backup.db"
+REL_ABS="$(cd "$REL" && pwd)"
+OUT="$(cd "$REL" && "$SCRIPT" --dry-run ./test.db 2>&1)" \
+    || fail "relative-path dry run failed:
+$OUT"
+assert_output "$OUT" "database: $REL_ABS/test\.db"
+assert_no_output "$OUT" "database: $ROOT"
+
+OUT="$(cd "$REL" && "$SCRIPT" --dry-run --restore ./backup.db ./test.db 2>&1)" \
+    || fail "relative-path restore dry run failed:
+$OUT"
+assert_output "$OUT" "database: $REL_ABS/test\.db"
+assert_output "$OUT" "backup:   $REL_ABS/backup\.db"
+assert_no_output "$OUT" "backup:   $ROOT"
+
 echo
 echo "revive-xhttp-proxies.sh: all checks passed"

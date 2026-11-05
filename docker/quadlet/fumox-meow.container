@@ -1,9 +1,13 @@
 # meow-rs, mihomo-compatible kernel the probe drives for T2 checks.
 # The image renders its config from the template at startup (the
-# entrypoint), the CMD is baked in. Prepare localhost/fumox-meow:local
-# before the first start: either pull+tag the GHCR image (see
-# docker/README.md) or
-#   podman build -t localhost/fumox-meow:local docker/meow
+# entrypoint), the CMD is baked in.
+#
+# The image is pinned by digest (the same manifest docker-compose.yml pins),
+# so a start cannot silently move to different bytes: a tag is a mutable
+# pointer and proves nothing about integrity. For local development and
+# building from source, edit this line to a locally built tag instead
+# (localhost/fumox-meow:local; podman build -t localhost/fumox-meow:local
+# docker/meow) — and back to a digest afterwards, see docker/README.md.
 #
 # The controller answers only to a caller that presents the secret from
 # FUMOX_MEOW__API_TOKEN (the entrypoint refuses to start without one),
@@ -14,7 +18,7 @@
 Description=meow-rs kernel for T2 checks (REST API 9090, pod-internal)
 
 [Container]
-Image=localhost/fumox-meow:local
+Image=ghcr.io/viktor45/fumox-meow@sha256:49e91fa751672db22916982ed4cb97423d7aaaa667cf4984e973f613f2406e7b
 ContainerName=fumox-meow
 Pod=fumox-worker.pod
 
@@ -39,8 +43,21 @@ Environment=FUMOX_MEOW_API_BIND=127.0.0.1:9090
 
 Volume=fumox-meow.volume:/shared/meow
 
+# Liveness: the external-controller (the one port the probe drives) must
+# answer on the pod loopback. A plain TCP connect via bash's /dev/tcp: the
+# image ships no curl, and the controller secret is checked per-request by
+# the kernel itself, not by the probe.
+HealthCmd=bash -c "exec 3<>/dev/tcp/127.0.0.1/9090"
+HealthInterval=10s
+HealthTimeout=4s
+HealthRetries=6
+HealthStartPeriod=5s
+
 [Service]
-Restart=on-failure
+# Same policy as the other units: restart unless the operator stopped it,
+# with a delay that throttles a crash loop.
+Restart=always
+RestartSec=5
 MemoryMax=256M
 CPUQuota=75%
 TasksMax=128

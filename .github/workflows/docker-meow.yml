@@ -10,7 +10,10 @@
 # MEOW_VERSION build arg of docker/meow/Dockerfile (and .env for local
 # builds). It MUST be an explicit versioned tag: `latest` is refused,
 # because a wrapper image that silently moves to a new upstream release
-# makes the published tag an unverifiable artefact. The input value
+# makes the published tag an unverifiable artefact. The trim + release-tag
+# regex live in scripts/validate-meow-version.sh, called by both jobs and
+# pinned by scripts/tests/validate-meow-version.test.sh, so build and merge
+# cannot drift apart on what they accept. The input value
 # (whitespace-trimmed) is also applied as an image tag, so a pinned build is
 # addressable as ghcr.io/viktor45/fumox-meow:v0.27.0.
 #
@@ -97,6 +100,9 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - name: Prepare
         env:
           MEOW_INPUT: ${{ inputs.meow_version }}
@@ -105,17 +111,10 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: |
           echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
-          MEOW_VERSION="${MEOW_INPUT//[[:space:]]/}"
-          # Whitespace is stripped above; anything else outside the release-
-          # tag alphabet is rejected before it can reach the download URL,
-          # the published tag list, or the image itself (supply-chain
-          # hygiene: the value is operator input, but fail fast anyway).
-          # `latest` is NOT a version: a wrapper image tagged `latest` is
-          # not a reproducible artefact.
-          if ! [[ "$MEOW_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::meow_version must be a tag like v0.27.0, got: $MEOW_VERSION" >&2
-            exit 1
-          fi
+          # The trim + release-tag regex live in one script shared with
+          # the merge job, so the two jobs cannot drift apart on what
+          # they accept (pinned by scripts/tests/validate-meow-version.test.sh).
+          MEOW_VERSION="$(scripts/validate-meow-version.sh "$MEOW_INPUT")"
           echo "MEOW_VERSION=${MEOW_VERSION}" >> "$GITHUB_ENV"
           # The checksums travel with the version: the build compares the
           # downloaded archive against them and fails on a mismatch, so a
@@ -130,9 +129,6 @@ jobs:
             fi
             echo "MEOW_SHA256_${arch}=${sum}" >> "$GITHUB_ENV"
           done
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Compute image name
         id: image
@@ -230,6 +226,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      # The meow_version validation is the same script the build job ran,
+      # so the merge job needs the repository too.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - name: Download digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -243,11 +244,7 @@ jobs:
         env:
           MEOW_INPUT: ${{ inputs.meow_version }}
         run: |
-          MEOW_VERSION="${MEOW_INPUT//[[:space:]]/}"
-          if ! [[ "$MEOW_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::meow_version must be a tag like v0.27.0, got: $MEOW_VERSION" >&2
-            exit 1
-          fi
+          MEOW_VERSION="$(scripts/validate-meow-version.sh "$MEOW_INPUT")"
           echo "MEOW_VERSION=${MEOW_VERSION}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
@@ -316,9 +313,64 @@ jobs:
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
-      - name: Inspect image
+      # The published tags are what an operator pulls: verify every tag
+      # the merge attached (from DOCKER_METADATA_OUTPUT_JSON, not only
+      # steps.meta.outputs.version) resolves to a two-platform linux
+      # index, and that every digest involved carries the provenance
+      # attestation the build/merge jobs pushed.
+      - name: Verify the published indexes
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          VERSION: ${{ steps.meta.outputs.version }}
+          INDEX_DIGEST: ${{ steps.manifest.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          set -euo pipefail
+          mapfile -t tags < <(jq -r '.tags[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          [ "${#tags[@]}" -gt 0 ] || { echo "::error::no tags to verify" >&2; exit 1; }
+          for tag in "${tags[@]}"; do
+            docker buildx imagetools inspect "$tag" --raw | jq -e '[.manifests[] | select(.platform.os=="linux" and (.platform.architecture=="amd64" or .platform.architecture=="arm64"))] | length == 2'
+          done
+          # The per-platform children are attested by the build job.
+          for f in /tmp/digests/*; do
+            [ -f "$f" ] || continue
+            gh attestation verify "oci://${IMAGE}@sha256:${f##*/}" -R "$GITHUB_REPOSITORY"
+          done
+          # The merged index is attested by this job.
+          gh attestation verify "oci://${IMAGE}@${INDEX_DIGEST}" -R "$GITHUB_REPOSITORY"
+
+      # The per-arch images this run pushed are untagged orphans when the
+      # merge failed or was cancelled: nobody can pull them by tag, and
+      # the retention script would keep them for the whole window. Delete
+      # the versions behind the digests in /tmp/digests so a failed run
+      # leaves nothing behind.
+      - name: Delete pushed per-arch images on failure
+        if: failure() || cancelled()
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pkg="${IMAGE##*/}"
+          [ -n "$pkg" ] || exit 0
+          # The packages API is scoped by owner type; the same detection
+          # scripts/cleanup-ghcr.sh does before every call.
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          api_root="/users"
+          if owner_type="$(gh api "/users/${owner}" --jq .type 2>/dev/null)"; then
+            case "$owner_type" in Organization) api_root="/orgs" ;; esac
+          elif gh api "/orgs/${owner}" --jq .type >/dev/null 2>&1; then
+            api_root="/orgs"
+          fi
+          for f in /tmp/digests/*; do
+            [ -f "$f" ] || continue
+            digest="sha256:${f##*/}"
+            # The digest is the version's `name` on the API side; one
+            # digest, one version id.
+            ids="$(gh api "${api_root}/${owner}/packages/container/${pkg}/versions?per_page=100" \
+              --jq ".[] | select(.name == \"${digest}\") | .id" 2>/dev/null || true)"
+            for id in $ids; do
+              echo "deleting ${pkg}@${digest} (version ${id})"
+              gh api -X DELETE "${api_root}/${owner}/packages/container/${pkg}/versions/${id}" \
+                2>/dev/null || echo "::warning::could not delete version ${id} of ${pkg}" >&2
+            done
+          done

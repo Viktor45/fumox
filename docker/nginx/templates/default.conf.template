@@ -127,6 +127,16 @@ server {
     # ---- public subscriptions (the public listener) ---------------------
     # /sub/{id}, /src/{slug}, /export/alive/{token} and /healthz.
     location / {
+        # The URIs here carry the export tokens: they are bearer
+        # credentials, and access_log masks them through $fumox_safe_uri
+        # (see nginx.conf). error_log has no format control — its [error]
+        # lines (upstream failures, oversized headers) embed the raw
+        # request line verbatim — so this location raises its level to
+        # crit: request-carrying error lines are dropped, while the admin
+        # locations below keep full diagnostics and genuine crit/emerg
+        # conditions still land in the error log.
+        error_log /var/log/nginx/error.log crit;
+
         set $fumox_public http://${FUMOX_UPSTREAM_PUBLIC};
         proxy_pass $fumox_public;
 

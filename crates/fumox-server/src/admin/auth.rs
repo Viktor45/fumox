@@ -1183,7 +1183,10 @@ mod tests {
         )
         .await;
         state.config_path = fumox_core::config::ResolvedConfigPath::Loaded(config_path);
-        state.config_writable = fumox_core::config_writer::is_writable(config_dir.path());
+        state.config_writable = matches!(
+            fumox_core::config_writer::is_writable(config_dir.path()),
+            Ok(fumox_core::config_writer::Writability::Writable)
+        );
         let app = crate::admin::router(state.clone());
 
         let response = app

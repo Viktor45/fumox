@@ -29,7 +29,7 @@ use fumox_core::config::{
     AdminConfig, DatabaseConfig, FetchConfig, GeoConfig, IngestConfig, LogConfig, MeowConfig,
     NetworkConfig, ProbeConfig, ResolvedConfigPath, RetentionConfig, ServerConfig, TrustedHeader,
 };
-use fumox_core::config_writer::is_writable;
+use fumox_core::config_writer::{Writability, is_writable};
 use fumox_core::db::DbPool;
 use fumox_core::geo::GeoResolver;
 use i18n::Lang;
@@ -153,10 +153,13 @@ impl AdminState {
         // we fall back to checking the default's parent directory so
         // the *Create from defaults* button can still be offered.
         let config_writable = match &config_path {
-            ResolvedConfigPath::Loaded(p) => is_writable(p),
-            ResolvedConfigPath::Missing => {
-                is_writable(std::path::Path::new(fumox_core::DEFAULT_CONFIG_PATH))
+            ResolvedConfigPath::Loaded(p) => {
+                matches!(is_writable(p), Ok(Writability::Writable))
             }
+            ResolvedConfigPath::Missing => matches!(
+                is_writable(std::path::Path::new(fumox_core::DEFAULT_CONFIG_PATH)),
+                Ok(Writability::Writable)
+            ),
         };
         Self {
             pool,

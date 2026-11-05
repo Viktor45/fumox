@@ -9,3 +9,25 @@ updates:
     directory: "/" # workflow files
     schedule:
       interval: "weekly"
+  # The workspace crates (fumox-core, fumox-server, fumox-probe) and
+  # Cargo.lock: one version-update PR per batch of related Rust
+  # dependencies.
+  - package-ecosystem: "cargo"
+    directory: "/" # the workspace root
+    schedule:
+      interval: "weekly"
+  # The Dockerfiles pin their base images by digest; Dependabot tracks the
+  # tags those pins were taken from and proposes a digest bump when the tag
+  # moves. One entry per Dockerfile (the docker ecosystem does not recurse).
+  - package-ecosystem: "docker"
+    directory: "/" # the root Dockerfile
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/docker/nginx"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/docker/meow"
+    schedule:
+      interval: "weekly"

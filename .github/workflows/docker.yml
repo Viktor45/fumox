@@ -41,6 +41,11 @@
 #     asserts that the server and the probe both reach the running state
 #     without a restart (scripts/kube-coldstart-smoke.sh).
 # The merge job waits for both, so a broken image is never published.
+# Before it goes green it also verifies what it published: the index is
+# a manifest list with exactly the two linux children, and every digest
+# involved (per-platform and the index itself) carries a provenance
+# attestation. On failure or cancellation it deletes the per-arch
+# versions it pushed, so a failed run leaves no untagged orphans.
 
 name: Docker
 
@@ -341,9 +346,60 @@ jobs:
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
-      - name: Inspect image
+      # The index must be a manifest list with exactly the two linux
+      # children (an amd64-only index or a stray architecture must fail
+      # the run), and every digest involved must carry the provenance
+      # attestation the build/merge jobs pushed.
+      - name: Verify the published index
         env:
           IMAGE: ${{ steps.image.outputs.name }}
           VERSION: ${{ steps.meta.outputs.version }}
+          INDEX_DIGEST: ${{ steps.manifest.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}" --raw | jq -e '[.manifests[] | select(.platform.os=="linux" and (.platform.architecture=="amd64" or .platform.architecture=="arm64"))] | length == 2'
+          # The per-platform children are attested by the build job.
+          for f in /tmp/digests/*; do
+            [ -f "$f" ] || continue
+            gh attestation verify "oci://${IMAGE}@sha256:${f##*/}" -R "$GITHUB_REPOSITORY"
+          done
+          # The merged index is attested by this job.
+          gh attestation verify "oci://${IMAGE}@${INDEX_DIGEST}" -R "$GITHUB_REPOSITORY"
+
+      # The per-arch images this run pushed are untagged orphans when the
+      # merge failed or was cancelled: nobody can pull them by tag, and
+      # the retention script would keep them for the whole window. Delete
+      # the versions behind the digests in /tmp/digests so a failed run
+      # leaves nothing behind.
+      - name: Delete pushed per-arch images on failure
+        if: failure() || cancelled()
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pkg="${IMAGE##*/}"
+          [ -n "$pkg" ] || exit 0
+          # The packages API is scoped by owner type; the same detection
+          # scripts/cleanup-ghcr.sh does before every call.
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          api_root="/users"
+          if owner_type="$(gh api "/users/${owner}" --jq .type 2>/dev/null)"; then
+            case "$owner_type" in Organization) api_root="/orgs" ;; esac
+          elif gh api "/orgs/${owner}" --jq .type >/dev/null 2>&1; then
+            api_root="/orgs"
+          fi
+          for f in /tmp/digests/*; do
+            [ -f "$f" ] || continue
+            digest="sha256:${f##*/}"
+            # The digest is the version's `name` on the API side; one
+            # digest, one version id.
+            ids="$(gh api "${api_root}/${owner}/packages/container/${pkg}/versions?per_page=100" \
+              --jq ".[] | select(.name == \"${digest}\") | .id" 2>/dev/null || true)"
+            for id in $ids; do
+              echo "deleting ${pkg}@${digest} (version ${id})"
+              gh api -X DELETE "${api_root}/${owner}/packages/container/${pkg}/versions/${id}" \
+                2>/dev/null || echo "::warning::could not delete version ${id} of ${pkg}" >&2
+            done
+          done

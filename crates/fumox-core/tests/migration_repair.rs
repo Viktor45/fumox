@@ -4,25 +4,9 @@
 
 use fumox_core::config::DatabaseConfig;
 use fumox_core::db;
+use fumox_core::tempdir_lite::TempDir;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-fn temp_db_path(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fumox-mig-repair-{label}-{nanos}.db"))
-}
-
-fn cleanup_files(path: &PathBuf) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(path.with_extension("db-wal"));
-    let _ = std::fs::remove_file(path.with_extension("db-shm"));
-    // The migration lock sidecar.
-    let _ = std::fs::remove_file(format!("{}-migrate.lock", path.display()));
-}
 
 /// The versions named by the `meta.migrations_repaired` breadcrumb.
 ///
@@ -80,7 +64,8 @@ fn expected_checksums() -> HashMap<i64, Vec<u8>> {
 /// therefore refuses and names the version; the operator decides.
 #[tokio::test]
 async fn migrate_refuses_a_checksum_mismatch_by_default() {
-    let path = temp_db_path("refuse-default");
+    let dir = TempDir::new("refuse-default");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -123,14 +108,14 @@ async fn migrate_refuses_a_checksum_mismatch_by_default() {
     );
 
     drop(pool);
-    cleanup_files(&path);
 }
 
 /// With the operator's opt-in the boot recovers on its own: the schema on
 /// disk is unchanged, only the bookkeeping column is rewritten.
 #[tokio::test]
 async fn migrate_recovers_from_a_checksum_mismatch_when_the_operator_opts_in() {
-    let path = temp_db_path("auto");
+    let dir = TempDir::new("auto");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -157,7 +142,6 @@ async fn migrate_recovers_from_a_checksum_mismatch_when_the_operator_opts_in() {
         .expect("migrate must stay clean after the repair");
 
     drop(pool);
-    cleanup_files(&path);
 }
 
 /// The flag travels from the configuration file to the migrator: the
@@ -175,7 +159,8 @@ async fn the_config_flag_decides_the_repair_policy() {
         db::ChecksumRepair::Allow
     );
 
-    let path = temp_db_path("flag");
+    let dir = TempDir::new("flag");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         allow_checksum_repair: true,
@@ -195,12 +180,12 @@ async fn the_config_flag_decides_the_repair_policy() {
     .expect("the configured opt-in must recover");
 
     drop(pool);
-    cleanup_files(&path);
 }
 
 #[tokio::test]
 async fn repair_migration_checksums_is_a_noop_on_clean_db() {
-    let path = temp_db_path("noop");
+    let dir = TempDir::new("noop");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -208,17 +193,13 @@ async fn repair_migration_checksums_is_a_noop_on_clean_db() {
     let pool = db::connect_pool(&cfg).await.unwrap();
     db::migrate(&pool).await.unwrap();
 
-    let migrator: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-    let re_stamped = db::repair_migration_checksums(&pool, &migrator)
-        .await
-        .unwrap();
+    let re_stamped = db::repair_migration_checksums(&pool).await.unwrap();
     assert!(
         re_stamped.is_empty(),
         "no rows should be touched when checksums already match: {re_stamped:?}"
     );
 
     drop(pool);
-    cleanup_files(&path);
 }
 
 /// The self-heal must leave a durable trace. sqlx hashes the whole
@@ -232,7 +213,8 @@ async fn repair_migration_checksums_is_a_noop_on_clean_db() {
 /// the text: a breadcrumb that named `11` would satisfy a check for `1`.
 #[tokio::test]
 async fn migrate_records_the_repaired_versions_in_meta() {
-    let path = temp_db_path("recorded");
+    let dir = TempDir::new("recorded");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -285,7 +267,6 @@ async fn migrate_records_the_repaired_versions_in_meta() {
     );
 
     drop(pool);
-    cleanup_files(&path);
 }
 
 /// A partial corruption names one version and one version only. The
@@ -293,7 +274,8 @@ async fn migrate_records_the_repaired_versions_in_meta() {
 /// actually changed.
 #[tokio::test]
 async fn migrate_records_only_the_versions_it_repaired() {
-    let path = temp_db_path("partial");
+    let dir = TempDir::new("partial");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -340,7 +322,6 @@ async fn migrate_records_only_the_versions_it_repaired() {
     }
 
     drop(pool);
-    cleanup_files(&path);
 }
 
 /// The repair is one-directional on purpose: a version the embedded set
@@ -350,7 +331,8 @@ async fn migrate_records_only_the_versions_it_repaired() {
 /// leaving `migrate()` to fail with `VersionMissing`.
 #[tokio::test]
 async fn repair_leaves_migrations_this_build_does_not_embed_alone() {
-    let path = temp_db_path("newer");
+    let dir = TempDir::new("newer");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -367,10 +349,7 @@ async fn repair_leaves_migrations_this_build_does_not_embed_alone() {
     .await
     .unwrap();
 
-    let migrator: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-    let re_stamped = db::repair_migration_checksums(&pool, &migrator)
-        .await
-        .unwrap();
+    let re_stamped = db::repair_migration_checksums(&pool).await.unwrap();
     assert!(
         re_stamped.is_empty(),
         "nothing in this build's set disagrees with the stored checksums: {re_stamped:?}"
@@ -387,7 +366,6 @@ async fn repair_leaves_migrations_this_build_does_not_embed_alone() {
     );
 
     drop(pool);
-    cleanup_files(&path);
 }
 
 #[tokio::test]
@@ -397,7 +375,8 @@ async fn migrate_propagates_non_mismatch_errors_untouched() {
     // it must not be turned into a repair. We assert the call simply
     // succeeds. The negative case (a dirty DB, a missing file) is
     // covered by sqlx's own tests, not duplicated here.
-    let path = temp_db_path("first_run");
+    let dir = TempDir::new("first_run");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -407,7 +386,6 @@ async fn migrate_propagates_non_mismatch_errors_untouched() {
         .await
         .expect("first-time migrate must succeed");
     drop(pool);
-    cleanup_files(&path);
 }
 
 /// The empty-repair re-raise arm: when `VersionMismatch` fires but the
@@ -423,7 +401,8 @@ async fn migrate_propagates_non_mismatch_errors_untouched() {
 /// concurrent-repair race this arm guards.
 #[tokio::test]
 async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
-    let path = temp_db_path("empty-repair");
+    let dir = TempDir::new("empty-repair");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -446,11 +425,20 @@ async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
     let err = db::migrate_with(&pool, db::ChecksumRepair::Allow)
         .await
         .expect_err("a mismatch the repair cannot rewrite must surface");
-    assert!(
-        err.to_string()
-            .contains("was previously applied but has been modified"),
-        "the original VersionMismatch must be re-raised, got: {err}"
-    );
+    // The variant, not the message text: sqlx's wording is not a
+    // contract, the variant is what a caller classifies on. The re-raise
+    // must name the very version whose stored row disagrees.
+    match err {
+        fumox_core::error::Error::Migration(sqlx::migrate::MigrateError::VersionMismatch(
+            mismatched,
+        )) => {
+            assert_eq!(
+                mismatched, version,
+                "the re-raised mismatch must name the version sqlx stopped at"
+            );
+        }
+        other => panic!("the original VersionMismatch must be re-raised, got: {other:?}"),
+    }
 
     // No repair was performed: the bad checksum survives and the durable
     // breadcrumb must not exist (nothing may claim a repair that did not
@@ -468,7 +456,6 @@ async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
     );
 
     drop(pool);
-    cleanup_files(&path);
 }
 
 /// A failed migration is a different failure than a checksum mismatch, and
@@ -481,7 +468,8 @@ async fn migrate_reraises_when_the_mismatch_cannot_be_repaired() {
 /// failure.
 #[tokio::test]
 async fn migrate_refuses_a_dirty_migration_without_repairing_it() {
-    let path = temp_db_path("dirty");
+    let dir = TempDir::new("dirty");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -522,7 +510,6 @@ async fn migrate_refuses_a_dirty_migration_without_repairing_it() {
     );
 
     drop(pool);
-    cleanup_files(&path);
 }
 
 /// Two processes that start at the same moment must not apply the same
@@ -536,7 +523,8 @@ async fn migrate_refuses_a_dirty_migration_without_repairing_it() {
 /// hash to, and the breadcrumb names no version twice.
 #[tokio::test]
 async fn two_pools_migrating_at_once_converge() {
-    let path = temp_db_path("concurrent");
+    let dir = TempDir::new("concurrent");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -555,13 +543,30 @@ async fn two_pools_migrating_at_once_converge() {
         db::migrate_with(&pool_b, db::ChecksumRepair::Allow),
     );
 
+    // Every applied checksum was corrupted, so a migrator that lost the
+    // race must surface sqlx's own mismatch — the variant, not the message
+    // text — naming one of the applied versions. Which version exactly
+    // depends on how far the winner got with its re-stamp when the loser
+    // re-read the table, so the assertion is on the set, not one value.
+    let applied: BTreeSet<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = 1")
+            .fetch_all(&pool_a)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
     for outcome in [&a, &b] {
-        if let Err(err) = outcome {
-            assert!(
-                err.to_string()
-                    .contains("was previously applied but has been modified"),
-                "a concurrent migrate must fail on the mismatch and nothing else, got: {err}"
-            );
+        match outcome {
+            Ok(()) => {}
+            Err(fumox_core::error::Error::Migration(
+                sqlx::migrate::MigrateError::VersionMismatch(mismatched),
+            )) => assert!(
+                applied.contains(mismatched),
+                "the mismatch must name an applied version, got {mismatched}"
+            ),
+            Err(other) => panic!(
+                "a concurrent migrate must fail on the mismatch and nothing else, got: {other:?}"
+            ),
         }
     }
     assert!(
@@ -599,33 +604,16 @@ async fn two_pools_migrating_at_once_converge() {
 
     drop(pool_a);
     drop(pool_b);
-    cleanup_files(&path);
 }
 
-/// The compiled `repair_migration_checksums` example, next to this test
-/// binary in `<target>/debug/examples/`. `cargo test` builds the workspace
-/// examples before running the integration tests; a targeted
-/// `cargo test --test migration_repair` does not, hence the explicit
-/// panic rather than a skip: a silently skipped refusal test is exactly
-/// the rot this one exists to prevent.
+/// The compiled `repair_migration_checksums` utility. It is a declared
+/// `[[bin]]` target of the crate: cargo builds bin targets before it
+/// compiles the integration tests and hands the path over at compile time
+/// (`CARGO_BIN_EXE_…`), so even a targeted
+/// `cargo test --test migration_repair` from a clean tree has the binary
+/// ready — no explicit `cargo build` of the tool, and no skip.
 fn repair_example_bin() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    // <target>/debug/deps/migration_repair-<hash> → <target>/debug
-    let profile_dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("deps/<profile> layout");
-    let bin = profile_dir.join("examples").join(format!(
-        "repair_migration_checksums{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    assert!(
-        bin.is_file(),
-        "the repair example is not built at {}; run \
-         `cargo build -p fumox-core --example repair_migration_checksums`",
-        bin.display()
-    );
-    bin
+    PathBuf::from(env!("CARGO_BIN_EXE_repair_migration_checksums"))
 }
 
 fn run_repair_tool(bin: &Path, db_path: &Path) -> std::process::Output {
@@ -649,7 +637,8 @@ fn run_repair_tool(bin: &Path, db_path: &Path) -> std::process::Output {
 #[tokio::test]
 async fn the_repair_tool_refuses_a_database_from_a_newer_build() {
     let bin = repair_example_bin();
-    let path = temp_db_path("refuse");
+    let dir = TempDir::new("refuse");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -704,7 +693,6 @@ async fn the_repair_tool_refuses_a_database_from_a_newer_build() {
         "a refused run must not re-stamp anything"
     );
     drop(pool);
-    cleanup_files(&path);
 }
 
 /// The other half of the pre-flight: a migration this build embeds but
@@ -714,7 +702,8 @@ async fn the_repair_tool_refuses_a_database_from_a_newer_build() {
 #[tokio::test]
 async fn the_repair_tool_refuses_a_database_with_an_unapplied_migration() {
     let bin = repair_example_bin();
-    let path = temp_db_path("unapplied");
+    let dir = TempDir::new("unapplied");
+    let path = dir.path().join("fumox.db");
     let cfg = DatabaseConfig {
         path: path.clone(),
         ..Default::default()
@@ -779,5 +768,88 @@ async fn the_repair_tool_refuses_a_database_with_an_unapplied_migration() {
     }
 
     drop(pool);
-    cleanup_files(&path);
+}
+
+/// The no-argument run: the default path is `DatabaseConfig::default().path`
+/// — a plain `fumox.db` — resolved against the process working directory.
+/// Started next to an existing, fully migrated database the tool must
+/// accept it and repair it in place, not seed a fresh database of its own.
+#[tokio::test]
+async fn the_repair_tool_accepts_the_default_database_next_to_the_working_directory() {
+    let bin = repair_example_bin();
+    let dir = TempDir::new("tool-default");
+    let path = dir.path().join("fumox.db");
+    let cfg = DatabaseConfig {
+        path: path.clone(),
+        ..Default::default()
+    };
+    let pool = db::connect_pool(&cfg).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+    drop(pool);
+
+    let out = std::process::Command::new(&bin)
+        .current_dir(dir.path())
+        .output()
+        .expect("the repair tool must be executable");
+    assert!(
+        out.status.success(),
+        "the tool must accept the default database: status {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("done:"),
+        "the tool must report the repair run, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Repaired the seeded database, not a fresh one: exactly one database
+    // file next to the working directory, still carrying the applied
+    // migrations a fresh database would not have.
+    let databases = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".db"))
+        .count();
+    assert_eq!(
+        databases, 1,
+        "the run must not create a second database file"
+    );
+    let pool = db::connect_pool(&cfg).await.unwrap();
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        applied > 0,
+        "the tool must have worked on the migrated database, not a fresh one"
+    );
+    drop(pool);
+}
+
+/// The missing-database refusal: a path nothing exists at must be rejected
+/// with a non-zero exit and the message the operator greps for — and the
+/// tool must not create the file it was told about.
+#[tokio::test]
+async fn the_repair_tool_refuses_a_missing_database_file() {
+    let bin = repair_example_bin();
+    let dir = TempDir::new("tool-missing");
+    let missing = dir.path().join("absent.db");
+
+    let out = run_repair_tool(&bin, &missing);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a missing database must be a non-zero exit, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("database file not found"),
+        "the message must name the missing database, got: {stderr}"
+    );
+    assert!(
+        !missing.exists(),
+        "the refusal must not create the database it was told about"
+    );
 }

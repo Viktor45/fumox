@@ -22,9 +22,10 @@ header = """
 
 Fumox ships as rolling image snapshots (`ghcr.io/viktor45/fumox:sha-<hash>`
 plus the moving `latest`); this changelog lists what each published batch
-of changes contains, newest first. Match the `sha-` tag of the image you
-pulled (`docker images`) to the hash in a section header, or just diff
-your pull date against the section dates.
+of changes contains, newest first in the published changelog; the git-cliff
+draft is oldest-first. Match the `sha-` tag of the image you pulled
+(`docker images`) to the hash in a section header, or just diff your pull
+date against the section dates.
 """
 body = """
 {% for commit in commits %}\
@@ -56,10 +57,15 @@ commit_parsers = [
     { message = "^docs", group = "Docs" },
     { message = "^manual", group = "Docs" },
     { message = "^upd", group = "Changed" },
-    # dependency bumps and merge noise never change the shipped image
-    { message = "^chore", group = "Internal", drop = true },
-    { message = "^Merge pull request", group = "Internal", drop = true },
+    # dependency bumps and merge noise never change the shipped image.
+    # dependabot speaks both languages: conventional (`build(deps): bump
+    # ...`) and plain (`Bump ... from ... to ...`); `filter_commits` below
+    # removes everything the parsers mark `skip`.
+    { message = "^(build|chore)\\(deps\\)", group = "Internal", skip = true },
+    { message = "^Bump .* from .* to ", group = "Internal", skip = true },
+    { message = "^chore", group = "Internal", skip = true },
+    { message = "^Merge pull request", group = "Internal", skip = true },
     { message = ".*", group = "Changed" },
 ]
-# Exclude commits that are dropped above.
+# Exclude the commits the parsers above skip.
 filter_commits = true

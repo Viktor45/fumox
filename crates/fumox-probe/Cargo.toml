@@ -28,3 +28,6 @@ libc = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 rcgen = { workspace = true }
+# `test-util` arms `tokio::time::pause()`/`advance()`: the T1/T2 timeout and
+# backoff tests run on a paused clock instead of waiting real seconds.
+tokio = { workspace = true, features = ["test-util"] }

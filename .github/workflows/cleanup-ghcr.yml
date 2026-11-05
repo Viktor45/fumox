@@ -33,7 +33,7 @@ on:
   workflow_dispatch:
     inputs:
       retention_days:
-        description: "Delete `sha-*`-only tags older than this many days (1-365)"
+        description: "Delete `sha-*`-only indexes and (when prune_untagged is enabled) untagged orphans older than this many days (1-365)"
         required: true
         default: "30"
         type: string

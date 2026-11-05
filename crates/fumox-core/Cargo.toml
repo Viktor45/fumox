@@ -6,6 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The migration-repair utility is a real binary target, not only an
+# example: integration tests run it through `CARGO_BIN_EXE_…`, and cargo
+# builds bin targets before it compiles the tests that reference them, so
+# a targeted `cargo test --test migration_repair` needs no prior build.
+[[bin]]
+name = "repair_migration_checksums"
+path = "examples/repair_migration_checksums.rs"
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -10,9 +10,12 @@ Dockerfile
 docker
 scripts
 
-# Local secrets and agent workspace notes
-.env
-.env.example
+# Local secrets: the whole .env* family stays out of the build context,
+# only the committed placeholder template .env.example may enter it. The
+# real values live in the deployment's own .env (compose) or env files /
+# secrets (quadlet, kube), never inside an image.
+.env*
+!.env.example
 .agents
 .zcode
 .mimosa
@@ -35,9 +38,14 @@ out
 docker-compose.yml
 cliff.toml
 
-# Local build artifacts and databases
+# Local build artifacts and databases. The sidecar patterns matter more
+# than the bare *.db: the ops scripts (scripts/revive-xhttp-proxies.sh,
+# scripts/repair-geo-stamps.sh) drop pre-migration snapshots next to the
+# database, and those carry the operator's data with it.
 target
 *.db
+*.db.*
+*.db.pre*
 *.db-wal
 *.db-shm
 
@@ -53,5 +61,6 @@ test*.txt
 # the admin panel's *Create from defaults* button, so it MUST be in the
 # build context (the runtime /app/config/app.toml at run time is a separate
 # file the operator owns).
+config/*.mmdb*
 config/*
 !config/app.toml

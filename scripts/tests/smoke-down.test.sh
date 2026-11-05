@@ -105,5 +105,64 @@ set -e
 [[ ! -s "$WORK/compose.args" ]] || fail "a refused project name still ran compose"
 note "a project name outside the allow-list is refused"
 
+# ── podman-compose and --remove-orphans ─────────────────────────
+# The standalone front-end grew the flag late; a version that does not
+# know it must not be handed it, or the whole down call is rejected and
+# the stand never goes away. The engine decision is driven through stubs:
+# docker's daemon is down, `podman compose` has no provider, so the run
+# falls through to podman-compose itself.
+STUB2="$WORK/bin-podman"
+mkdir -p "$STUB2"
+cat >"$STUB2/docker" <<'STUB'
+#!/bin/sh
+if [ "$1" = info ]; then
+    # the docker daemon is down: the podman engine is what answers
+    exit 1
+fi
+exit 0
+STUB
+cat >"$STUB2/podman" <<'STUB'
+#!/bin/sh
+if [ "$1" = info ]; then
+    exit 0
+fi
+# no compose provider configured for podman
+exit 1
+STUB
+cat >"$STUB2/podman-compose" <<'STUB'
+#!/bin/sh
+if [ "$1" = down ] && [ "$2" = --help ]; then
+    if [ "${STUB_RC_HELP:-full}" = "full" ]; then
+        printf 'Remove containers and temporary volumes\n  --remove-orphans    Remove orphaned containers\n'
+    fi
+    exit 0
+fi
+printf '%s\n' "$*" >>"${STUB_RC_ARGS:?}"
+exit 0
+STUB
+chmod +x "$STUB2/docker" "$STUB2/podman" "$STUB2/podman-compose"
+
+podman_down() { # podman_down <help variant> -> recorded compose arguments
+    : >"$WORK/podman-compose.args"
+    set +e
+    OUT="$(PATH="$STUB2:$PATH" STUB_RC_ARGS="$WORK/podman-compose.args" STUB_RC_HELP="$1" \
+        "$BASH_BIN" "$SCRIPT" 2>&1)"
+    CODE=$?
+    set -e
+    [[ "$CODE" -eq 0 ]] || fail "podman-compose ($1) run exited $CODE:
+$OUT"
+    cat "$WORK/podman-compose.args"
+}
+
+GOT="$(podman_down full)"
+[[ "$GOT" == "-p fumox-smoke down --remove-orphans" ]] \
+    || fail "a podman-compose that knows --remove-orphans got '$GOT', expected '-p fumox-smoke down --remove-orphans'"
+note "a podman-compose that knows --remove-orphans is handed it"
+
+GOT="$(podman_down none)"
+[[ "$GOT" == "-p fumox-smoke down" ]] \
+    || fail "an old podman-compose got '$GOT', expected '-p fumox-smoke down'"
+note "an old podman-compose is not handed --remove-orphans"
+
 echo
 echo "smoke-down.sh: all checks passed"

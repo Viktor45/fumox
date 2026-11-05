@@ -13,9 +13,9 @@
 # references would disappear and `docker pull` of `latest`/semver starts
 # failing with manifest-unknown (and `gh attestation verify` loses its
 # targets). So this script deletes ONLY:
-#   - versions whose tag list contains ONLY `sha-*` entries, older than
-#     RETENTION_DAYS (default 30), these are the merged indexes of past
-#     builds nobody consumes anymore;
+#   - versions whose tag list contains ONLY `sha-*`/`sha256-*` entries,
+#     older than RETENTION_DAYS (default 30), these are the merged indexes
+#     of past builds nobody consumes anymore;
 #   - untagged versions, ONLY when PRUNE_UNTAGGED is enabled AND the
 #     version's digest is not referenced by ANY kept tag's manifest list
 #     AND is not an attestation manifest (or the subject one vouches for)
@@ -63,8 +63,24 @@ if [ -z "$OWNER" ] || [ -z "$PACKAGES" ]; then
     exit 64
 fi
 if ! [[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || [ "$RETENTION_DAYS" -lt 1 ] || [ "$RETENTION_DAYS" -gt 365 ]; then
-    echo "::error::retention_days must be an integer in [1, 365], got: $RETENTION_DAYS" >&2
+    # The raw value stays out of the `::error::` line: a workflow command
+    # runs to the end of the line, and an unvalidated value must not carry
+    # one. It is printed quoted, on a plain line of its own, instead.
+    echo "::error::retention_days must be an integer in [1, 365]" >&2
+    printf 'retention_days as given: %q\n' "$RETENTION_DAYS" >&2
     exit 1
+fi
+
+# The cap on the manifest inspections per package (override with
+# FUMOX_GHCR_MAX_INSPECTS). Each one is a registry round-trip, bounded
+# below by the timeout but not free, so a package with thousands of
+# versions must not turn the prune pass into an afternoon on the registry.
+# Hitting the cap disables the untagged pruning for that package: an
+# incomplete protected set must not decide deletions.
+MAX_INSPECTS="${FUMOX_GHCR_MAX_INSPECTS:-200}"
+if ! [[ "$MAX_INSPECTS" =~ ^[0-9]+$ ]] || [ "$MAX_INSPECTS" -lt 1 ]; then
+    echo "error: FUMOX_GHCR_MAX_INSPECTS must be a positive integer, got: ${MAX_INSPECTS}" >&2
+    exit 64
 fi
 
 # GNU date on the runner, BSD date on macOS. The script is exercised
@@ -107,7 +123,7 @@ else
     echo "Deleting versions older than $RETENTION_DAYS days"
 fi
 if [ "$PRUNE_UNTAGGED" = "true" ]; then
-    echo "Untagged-orphan pruning is ENABLED (reference-checked against every kept tag)"
+    echo "Untagged-orphan pruning is ENABLED: untagged orphans older than the same $RETENTION_DAYS days are deleted too (reference-checked against every kept tag)"
 fi
 
 # The packages API is path-scoped: user-owned packages live under
@@ -172,9 +188,35 @@ version_tags() { # version_tags <tsv line>
     printf '%s' "$1" | cut -f4
 }
 
+# The deadline for one manifest inspection: a hung registry connection
+# must not wedge the whole cleanup, so every round-trip is bounded. The
+# total number of round-trips is bounded separately, by MAX_INSPECTS.
+INSPECT_TIMEOUT=60
+
+# `timeout` is not on macOS (there it is `gtimeout`, and coreutils may not
+# be installed at all), so the deadline is enforced with a background job —
+# the same approach scripts/smoke-down.sh takes.
+run_with_timeout() { # <seconds> <command...>
+    local secs="$1" pid waited
+    shift
+    "$@" &
+    pid=$!
+    waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge "$secs" ]; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    wait "$pid"
+}
+
 # The raw manifest of a digest, or nothing when it cannot be read.
 manifest_raw() { # manifest_raw <package> <digest>
-    docker buildx imagetools inspect "ghcr.io/${OWNER,,}/$1@$2" --raw 2>/dev/null || true
+    run_with_timeout "$INSPECT_TIMEOUT" docker buildx imagetools inspect "ghcr.io/${OWNER,,}/$1@$2" --raw 2>/dev/null || true
 }
 
 # The subject of an attestation manifest: the digest it vouches for.
@@ -193,6 +235,7 @@ process_package() { # process_package <package>
     local tsv
     local line
     local versions_file="$WORK/versions.$pkg"
+    local inspections=0
 
     echo
     echo "=== ${OWNER}/${pkg} ==="
@@ -296,19 +339,28 @@ process_package() { # process_package <package>
             IFS=','
             for tag in $tags; do
                 case "$tag" in
-                    "" | null | sha-*) ;;
+                    "" | null | sha-* | sha256-*) ;;
                     *) has_kept=true ;;
                 esac
             done
             IFS="$IFS_SAVE"
             if [ "$has_kept" = "true" ]; then
+                if [ "$inspections" -ge "$MAX_INSPECTS" ]; then
+                    # An incomplete protected set must not decide what an
+                    # untagged version is: the rest is kept, fail-closed.
+                    echo "  fail-closed: the inspection cap ($MAX_INSPECTS) is reached, untagged versions are KEPT for this package" >&2
+                    PRUNE_UNTAGGED=false
+                    break
+                fi
                 local ref="ghcr.io/${OWNER,,}/${pkg}:${tags%%,*}"
                 # The index's own digest ...
-                docker buildx imagetools inspect "$ref" --format '{{ .Manifest.Digest }}' 2>/dev/null \
+                run_with_timeout "$INSPECT_TIMEOUT" docker buildx imagetools inspect "$ref" --format '{{ .Manifest.Digest }}' 2>/dev/null \
                     >>"$REF_FILE" || true
+                inspections=$((inspections + 1))
                 # ... and the digests of the children it points at.
-                docker buildx imagetools inspect "$ref" --raw 2>/dev/null \
+                run_with_timeout "$INSPECT_TIMEOUT" docker buildx imagetools inspect "$ref" --raw 2>/dev/null \
                     | jq -r 'select(.manifests) | .manifests[].digest' 2>/dev/null >>"$REF_FILE" || true
+                inspections=$((inspections + 1))
                 protected=$((protected + 1))
             fi
         done <"$versions_file"
@@ -322,10 +374,16 @@ process_package() { # process_package <package>
         while IFS= read -r line; do
             [ -n "$line" ] || continue
             [ -z "$(version_tags "$line")" ] || continue
+            if [ "$inspections" -ge "$MAX_INSPECTS" ]; then
+                echo "  fail-closed: the inspection cap ($MAX_INSPECTS) is reached, untagged versions are KEPT for this package" >&2
+                PRUNE_UNTAGGED=false
+                break
+            fi
             local digest subject
             digest="$(version_digest "$line")"
             [ -n "$digest" ] || continue
             subject="$(attestation_subject "$pkg" "$digest")"
+            inspections=$((inspections + 1))
             if [ -n "$subject" ]; then
                 printf '%s\n' "$digest" >>"$REF_FILE"
                 printf '%s\n' "$subject" >>"$REF_FILE"
@@ -353,14 +411,16 @@ process_package() { # process_package <package>
 
         if [ -n "$tags" ]; then
             # Has at least one real tag. Keep if any non-sha-* tag is
-            # present (externally consumed via latest/main/semver).
+            # present (externally consumed via latest/main/semver); the
+            # sha256-<hex> spellings some registries emit are transient
+            # build tags too.
             local keep=false
             local IFS_SAVE="$IFS"
             IFS=','
             local tag
             for tag in $tags; do
                 case "$tag" in
-                    "" | null | sha-*) ;;
+                    "" | null | sha-* | sha256-*) ;;
                     *) keep=true ;;
                 esac
             done
@@ -374,7 +434,7 @@ process_package() { # process_package <package>
                 continue
             }
             if [ "$created_epoch" -ge "$CUTOFF" ]; then continue; fi
-            reason="sha-*-only, created_at=$created_at"
+            reason="sha-*/sha256-*-only, created_at=$created_at"
         else
             # Untagged: by default KEEP, it is a child/attestation of a
             # live index. The opt-in path deletes only orphans that

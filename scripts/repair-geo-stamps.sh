@@ -27,6 +27,7 @@
 #   FUMOX_GEO_REPAIR_BACKUP       path of the backup file (default:
 #                                 <database>.pre-geo-repair-<timestamp>)
 #   FUMOX_GEO_REPAIR_BATCH        rows per transaction (default: 500)
+#   FUMOX_SQLITE_BUSY_TIMEOUT_MS  busy timeout of the sqlite3 calls (30000)
 #   FUMOX_ALLOW_RUNNING_SERVER=1  run even when a server process is visible
 #
 # STOP the server (and the probe) before running this script. The repair
@@ -42,6 +43,12 @@
 # Takes a backup first and refuses to touch a database that is not there.
 set -euo pipefail
 
+# The directory the operator ran the script from. The cd below moves to the
+# repository root before the argument is read, so a relative database or
+# backup path has to be expanded against this one, not against the new
+# working directory.
+INVOCATION_PWD="$PWD"
+
 cd "$(dirname "$0")/.."
 
 # The backup holds the whole database, credentials included: nothing this
@@ -49,6 +56,12 @@ cd "$(dirname "$0")/.."
 umask 077
 
 DB="${1:-fumox.db}"
+# An explicitly given relative path belongs to the invocation directory
+# (captured above); the default stays relative to the repository root. A
+# leading ./ is folded away so the path does not grow a redundant segment.
+if [[ $# -ge 1 ]]; then
+    [[ "$DB" == /* ]] || DB="$INVOCATION_PWD/${DB#./}"
+fi
 
 fail() {
     echo "error: $*" >&2
@@ -109,6 +122,24 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # The backup may be pinned by the operator: a name that says what it is
 # for, or a directory of its own.
 BACKUP="${FUMOX_GEO_REPAIR_BACKUP:-${DB}.pre-geo-repair-${STAMP}}"
+# An explicitly pinned relative backup path belongs to the invocation
+# directory too (the default sits next to the database); a leading ./ is
+# folded away the same way.
+if [[ -n "${FUMOX_GEO_REPAIR_BACKUP:-}" ]]; then
+    [[ "$BACKUP" == /* ]] || BACKUP="$INVOCATION_PWD/${BACKUP#./}"
+fi
+
+# The paths are printed below and reach a SQL string literal further down:
+# a control character in either would split the printed line and the SQL
+# statement, so both are refused before anything is written or shown.
+if [[ "$DB" == *[[:cntrl:]]* ]]; then
+    echo "error: the database path contains a control character" >&2
+    exit 64
+fi
+if [[ "$BACKUP" == *[[:cntrl:]]* ]]; then
+    echo "error: the backup path contains a control character" >&2
+    exit 64
+fi
 
 # The backup goes next to the database, in the same directory, so a rename
 # stays on the same filesystem. A directory that others may write to is no
@@ -134,10 +165,18 @@ if [[ -e "$BACKUP" || -L "$BACKUP" ]]; then
     exit 73
 fi
 
-echo "database: $DB"
-echo "backup:   $BACKUP"
+# A server that slipped past the pgrep probe (a containerised one cannot
+# be seen from here) holds the database between the calls below. The
+# sqlite3 CLI defaults to a zero busy timeout, which would turn that into
+# an immediate "database is locked"; wait for the writer instead.
+BUSY_MS="${FUMOX_SQLITE_BUSY_TIMEOUT_MS:-30000}"
 
-if ! sqlite3 "$DB" "VACUUM INTO $(sql_literal "$BACKUP")"; then
+# %q, not a bare expansion: what the operator typed is echoed back, and a
+# path is data, not format or code.
+printf 'database: %q\n' "$DB"
+printf 'backup:   %q\n' "$BACKUP"
+
+if ! sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" "VACUUM INTO $(sql_literal "$BACKUP")"; then
     fail "the backup of ${DB} could not be written to ${BACKUP}; nothing was changed."
 fi
 # The backup carries the same rows as the database, so it gets the same
@@ -148,7 +187,7 @@ for sidecar in "${DB}-wal" "${DB}-shm"; do
     [[ -e "$sidecar" ]] && echo "note: ${sidecar} exists, the backup above is a consistent snapshot of it"
 done
 
-STAMPED="$(sqlite3 "$DB" "SELECT COUNT(*) FROM proxies WHERE geo_asn IS NOT NULL OR geo_country IS NOT NULL")"
+STAMPED="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" "SELECT COUNT(*) FROM proxies WHERE geo_asn IS NOT NULL OR geo_city IS NOT NULL OR geo_country IS NOT NULL")"
 echo "rows with a geo stamp before repair: ${STAMPED}"
 
 # The clearing runs in batches. One transaction over the whole table holds
@@ -161,12 +200,12 @@ if ! [[ "$BATCH_SIZE" =~ ^[0-9]+$ ]] || [[ "$BATCH_SIZE" -lt 1 ]]; then
     exit 64
 fi
 
-MAX_ID="$(sqlite3 "$DB" "SELECT COALESCE(MAX(id), 0) FROM proxies")"
+MAX_ID="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" "SELECT COALESCE(MAX(id), 0) FROM proxies")"
 CLEARED=0
 START=0
 while [[ "$START" -lt "$MAX_ID" ]]; do
     END=$((START + BATCH_SIZE))
-    BATCH_CLEARED="$(sqlite3 "$DB" "UPDATE proxies
+    BATCH_CLEARED="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" "UPDATE proxies
    SET geo_country = NULL, geo_city = NULL, geo_asn = NULL
  WHERE id > ${START} AND id <= ${END}
    AND (geo_asn IS NOT NULL OR geo_city IS NOT NULL OR geo_country IS NOT NULL);
@@ -176,7 +215,7 @@ SELECT changes();")"
 done
 echo "rows cleared: ${CLEARED}"
 
-LEFT="$(sqlite3 "$DB" "SELECT COUNT(*) FROM proxies WHERE geo_asn IS NOT NULL OR geo_country IS NOT NULL")"
+LEFT="$(sqlite3 -cmd ".timeout ${BUSY_MS}" "$DB" "SELECT COUNT(*) FROM proxies WHERE geo_asn IS NOT NULL OR geo_city IS NOT NULL OR geo_country IS NOT NULL")"
 echo "rows with a geo stamp after repair:  ${LEFT}"
 
 cat <<EOF

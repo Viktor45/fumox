@@ -805,7 +805,10 @@ mod tests {
     /// `check_delay_with_retry` absorbs the transient blip and returns
     /// `Ok`. Without the retry the caller would see `ServiceUnavailable`
     /// and abort the rest of the batch on the first failure.
-    #[tokio::test]
+    ///
+    /// The clock is paused: the backoff between the attempts is virtual,
+    /// auto-advanced the moment the runtime runs out of other work.
+    #[tokio::test(start_paused = true)]
     async fn check_delay_with_retry_recovers_from_transient_5xx() {
         let attempts: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let attempts_inner = attempts.clone();

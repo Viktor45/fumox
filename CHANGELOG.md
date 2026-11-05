@@ -2,9 +2,10 @@
 
 Fumox ships as rolling image snapshots (`ghcr.io/viktor45/fumox:sha-<hash>`
 plus the moving `latest`); this changelog lists what each published batch
-of changes contains, newest first. Match the `sha-` tag of the image you
-pulled (`docker images`) to the hash in a section header, or just diff
-your pull date against the section dates.
+of changes contains, newest first in the published changelog; the git-cliff
+draft is oldest-first. Match the `sha-` tag of the image you pulled
+(`docker images`) to the hash in a section header, or just diff your pull
+date against the section dates.
 
 The categories follow [Keep a Changelog](https://keepachangelog.com/);
 `Docs` covers the user guide and READMEs, `Internal` (dependency bumps,

@@ -15,6 +15,7 @@
 #
 # Environment:
 #   SMOKE_PROJECT      compose project name          (default: fumox-smoke)
+#   SMOKE_BIND         bind address for the stand    (default: 127.0.0.1)
 #   SMOKE_PUBLIC_PORT  host port for /sub, /src      (default: 18080)
 #   SMOKE_ADMIN_PORT   host port for the admin panel (default: 18081)
 #   FUMOX_ADMIN__TOKEN reuse this token instead of generating one
@@ -27,6 +28,30 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# The arguments are parsed before any environment probing, so --help and a
+# bad flag answer without docker, curl or a free port being needed.
+BUILD_FLAGS=(--build)
+SHOW_TOKEN=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-build) BUILD_FLAGS=() ;;
+        --show-token) SHOW_TOKEN=1 ;;
+        -h | --help)
+            # The header block: from the second line to the line before the
+            # first executable one, comment markers stripped. awk rather
+            # than sed because BSD sed has no address range with a nested
+            # delete-and-print, and macOS is where this runs.
+            awk 'NR == 1 { next } /^set -euo/ { exit }
+                 { sub(/^# ?/, ""); print }' "$0"
+            exit 0
+            ;;
+        *)
+            echo "usage: scripts/smoke-up.sh [--no-build] [--show-token]" >&2
+            exit 64
+            ;;
+    esac
+done
 
 SMOKE_PROJECT="${SMOKE_PROJECT:-fumox-smoke}"
 SMOKE_PUBLIC_PORT="${SMOKE_PUBLIC_PORT:-18080}"
@@ -79,6 +104,11 @@ case "${COMPOSE[0]}" in
 esac
 
 # --- pre-flight ----------------------------------------------------------------
+# The checks below are curl one-liners: a missing curl would otherwise
+# surface as a failed wait_for a minute into the bring-up, which reads like
+# a stand that did not come up rather than like a missing tool.
+command -v curl >/dev/null 2>&1 || { echo "error: curl is required by the smoke checks" >&2; exit 1; }
+
 # Check whether a TCP port on this host already has a listener. lsof is on
 # macOS and most Linux installs; parse /proc/net/tcp{,6} on bare Linux where
 # it's missing. Returns 0 if the port is busy, 1 if it's free (port_busy name
@@ -107,23 +137,12 @@ port_busy() {
 }
 for port in "$SMOKE_PUBLIC_PORT" "$SMOKE_ADMIN_PORT"; do
     if port_busy "$port"; then
-        echo "error: host port $port is already in use; free it or pick another via" >&2
-        echo "       SMOKE_PUBLIC_PORT / SMOKE_ADMIN_PORT" >&2
+        echo "error: host port $port is already in use, so the compose project" >&2
+        echo "       '$SMOKE_PROJECT' cannot come up. Free the port or pick another" >&2
+        echo "       via SMOKE_PUBLIC_PORT / SMOKE_ADMIN_PORT (bind address:" >&2
+        echo "       SMOKE_BIND, default 127.0.0.1)" >&2
         exit 1
     fi
-done
-
-BUILD_FLAGS=(--build)
-SHOW_TOKEN=0
-for arg in "$@"; do
-    case "$arg" in
-        --no-build) BUILD_FLAGS=() ;;
-        --show-token) SHOW_TOKEN=1 ;;
-        *)
-            echo "usage: scripts/smoke-up.sh [--no-build] [--show-token]" >&2
-            exit 64
-            ;;
-    esac
 done
 
 TOKEN_FILE=""
@@ -220,6 +239,16 @@ fi
 # "unset" for bash 3.2 (macOS), which would abort the script.
 "${COMPOSE[@]}" "${COMPOSE_FILES[@]}" -p "$SMOKE_PROJECT" up -d ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
 
+# From here the stand exists, so an unsuccessful exit must not leave it
+# behind: the trap tears the project down again (no -v, the volumes survive
+# a failed run, exactly what scripts/smoke-down.sh does by default). It is
+# disarmed once the checks have passed, further down.
+smoke_teardown_on_fail() {
+    echo ">> the smoke checks failed, tearing the stand down (volumes kept, project $SMOKE_PROJECT)" >&2
+    "${COMPOSE[@]}" "${COMPOSE_FILES[@]}" -p "$SMOKE_PROJECT" down --remove-orphans >&2 2>&1 || true
+}
+trap smoke_teardown_on_fail EXIT
+
 # --- wait for startup and run the checks ----------------------------------------
 wait_for() { # wait_for <what> <url> <expected_code> <timeout_s>
     local what="$1" url="$2" expected="$3" deadline=$((SECONDS + $4)) code
@@ -232,7 +261,14 @@ wait_for() { # wait_for <what> <url> <expected_code> <timeout_s>
         [ "$code" = "$expected" ] && return 0
         sleep 2
     done
-    echo "error: $what did not answer $expected within the deadline (last: ${code:-none})" >&2
+    # An empty code is not a 000: it means curl itself produced no answer at
+    # all, which is a different failure from the stand answering something
+    # else, and it needs a different diagnosis.
+    if [ -n "$code" ]; then
+        echo "error: $what did not answer $expected within the deadline (last HTTP code: $code)" >&2
+    else
+        echo "error: $what did not answer $expected within the deadline (curl produced no answer at all — is the tool there and the URL reachable?)" >&2
+    fi
     return 1
 }
 
@@ -295,6 +331,10 @@ echo ">> server, probe and meow are up"
 if "${COMPOSE[@]}" "${COMPOSE_FILES[@]}" -p "$SMOKE_PROJECT" logs probe 2>/dev/null | grep -qi "backoff"; then
     echo "WARNING: the probe logged a meow-rs backoff: T2 tunnel checks may be down"
 fi
+
+# The stand is up and verified: the exit trap would tear it down again, so
+# it is disarmed here and the stand stays for the operator.
+trap - EXIT
 
 echo
 echo "Smoke stand is up:"

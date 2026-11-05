@@ -72,6 +72,14 @@ assert_output() { # output pattern
 $1"
     note "output matches /$2/"
 }
+
+assert_no_output() { # output pattern
+    if grep -Eq "$2" <<<"$1"; then
+        fail "expected no output matching /$2/, got:
+$1"
+    fi
+    note "no output matches /$2/"
+}
 assert_output "$OUT" "no database at"
 
 # ── a symlinked database is refused ──────────────────────────────
@@ -206,6 +214,66 @@ CODE=$?
 set -e
 expect_eq "bad batch size exit code" "$CODE" "64"
 expect_eq "the table is still there" "$(q "$WORK/second.db" "SELECT COUNT(*) FROM proxies")" "3"
+
+# ── a row stamped with only a city is counted and cleared ────────
+# The counters and the clearing must agree on all three geo columns: a
+# row carrying only geo_city used to fall out of the count.
+CITY_DB="$WORK/city-only.db"
+sqlite3 -cmd ".timeout 5000" "$CITY_DB" <<'SQL'
+CREATE TABLE proxies (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    geo_country TEXT,
+    geo_city    TEXT,
+    geo_asn     INTEGER
+);
+INSERT INTO proxies (geo_city) VALUES ('Hamburg');
+SQL
+OUT="$("$SCRIPT" "$CITY_DB" 2>&1)" || fail "the city-only repair failed:
+$OUT"
+assert_output "$OUT" "rows with a geo stamp before repair: 1"
+assert_output "$OUT" "rows cleared: 1"
+assert_output "$OUT" "rows with a geo stamp after repair:  0"
+
+# ── a relative path resolves against the invocation directory ────
+# The script cd's to the repository root, but the path the operator types
+# is where they are standing: a run from another directory must touch that
+# directory's database, not the repository's own fumox.db.
+REL="$WORK/rel"
+mkdir -p "$REL"
+# The backup goes next to the relative database, and the script refuses a
+# backup directory others may write to.
+chmod 700 "$REL"
+make_db "$REL/test.db"
+# The cwd the script sees is cd's own, normalized (a doubled TMPDIR slash
+# collapses), so the expectation is built from the same view of the path.
+REL_ABS="$(cd "$REL" && pwd)"
+OUT="$(cd "$REL" && "$SCRIPT" ./test.db 2>&1)" || fail "the relative-path repair failed:
+$OUT"
+assert_output "$OUT" "database: $REL_ABS/test\.db"
+assert_output "$OUT" "rows cleared: 2"
+[[ -n "$(ls "$REL"/test.db.pre-geo-repair-* 2>/dev/null)" ]] \
+    || fail "the backup did not go next to the relative database"
+note "the relative backup went next to the relative database"
+
+# The same for a pinned relative backup path.
+make_db "$REL/second.db"
+OUT="$(cd "$REL" && FUMOX_GEO_REPAIR_BACKUP=./pinned-backup.db "$SCRIPT" ./second.db 2>&1)" \
+    || fail "the relative-backup repair failed:
+$OUT"
+[[ -f "$REL/pinned-backup.db" ]] \
+    || fail "the relative backup path did not resolve against the invocation directory"
+note "the pinned relative backup resolved against the invocation directory"
+
+# ── a control character in a path is refused before any output ───
+CTRL_DB="$WORK/$(printf 'bad\nname.db')"
+make_db "$CTRL_DB"
+set +e
+OUT="$("$SCRIPT" "$CTRL_DB" 2>&1)"
+CODE=$?
+set -e
+expect_eq "control character in database path exit code" "$CODE" "64"
+assert_output "$OUT" "control character"
+assert_no_output "$OUT" "^database:"
 
 echo
 echo "repair-geo-stamps.sh: all checks passed"

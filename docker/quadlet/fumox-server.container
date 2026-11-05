@@ -69,13 +69,25 @@ Environment=FUMOX_GEO__DB_DIR=/shared/geo
 # want config edits off, drop the `:rw` and the editor renders disabled
 # with the `set.edit_unwritable` banner. The directory must be writable
 # by the container user (uid 999), see docker/README.md.
-Volume=%h/fumox/config:/app/config:rw,Z
+Volume=%h/fumox/config:/app/config:rw,z
 Volume=fumox-data.volume:/app/data
 Volume=fumox-geo.volume:/shared/geo
 
+# Liveness: the binary probes its own /healthz (the runtime image ships no
+# curl or wget, see crates/fumox-server/src/main.rs --health-check) — the
+# same command the compose healthcheck runs.
+HealthCmd=fumox-server --health-check
+HealthInterval=5s
+HealthTimeout=4s
+HealthRetries=12
+HealthStartPeriod=10s
+
 [Service]
-# systemd equivalent of compose "restart: unless-stopped".
-Restart=on-failure
+# systemd equivalent of compose "restart: unless-stopped": both restart the
+# container whenever it is not the operator who stopped it; the delay
+# throttles a crash loop instead of letting systemd spin on it.
+Restart=always
+RestartSec=5
 # Resource limits: the server serves the public endpoints and the admin
 # panel, the probe and the kernel get smaller quotas (see
 # fumox-probe.container). These keys are plain systemd options, quadlet

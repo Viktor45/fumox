@@ -45,9 +45,12 @@ pub fn generate(
     root.insert(Value::String("socks-port".into()), num(0));
     root.insert(Value::String("allow-lan".into()), Value::Bool(false));
     root.insert(Value::String("mode".into()), Value::String("rule".into()));
+    // warning, not silent: a fully quiet kernel hides what a T2 batch died
+    // of (config rejects, listen failures) in the container log; the
+    // per-request chatter below warning stays off.
     root.insert(
         Value::String("log-level".into()),
-        Value::String("silent".into()),
+        Value::String("warning".into()),
     );
     // Emitted explicitly, never left to the engine default: meow-rs 0.22.0
     // made `ipv6` effective end-to-end, so an omitted key is a real

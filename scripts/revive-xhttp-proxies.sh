@@ -87,6 +87,12 @@
 # the pre-restore data after all.
 set -euo pipefail
 
+# The directory the operator ran the script from. The cd below moves to the
+# repository root before the arguments are parsed, so a relative db or
+# backup path on the command line has to be expanded against this one, not
+# against the new working directory.
+INVOCATION_PWD="$PWD"
+
 cd "$(dirname "$0")/.."
 
 # The backup holds the whole database, credentials included: nothing this
@@ -139,7 +145,22 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+# A relative path given on the command line is the operator's, resolved
+# against the directory the script was invoked from (captured above the
+# cd); the default below is the repository root's own fumox.db. Both are
+# made absolute — the restore hint prints the paths, and the printed
+# command must mean the same file whatever directory it is run from. A
+# leading ./ is folded away so the path does not grow a redundant segment.
+if [[ -n "$DB" ]]; then
+    [[ "$DB" == /* ]] || DB="$INVOCATION_PWD/${DB#./}"
+fi
 DB="${DB:-fumox.db}"
+if [[ "$DB" != /* ]]; then
+    DB="$PWD/$DB"
+fi
+if [[ -n "$RESTORE" ]]; then
+    [[ "$RESTORE" == /* ]] || RESTORE="$INVOCATION_PWD/${RESTORE#./}"
+fi
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
     echo "error: the sqlite3 CLI is not installed" >&2
@@ -975,6 +996,17 @@ SQLite replays a log that belongs to a different file, which reads as
 'database disk image is malformed' or, worse, restores nothing at all
 while reporting ok.
 
+The way to do that is this script's own restore, run after stopping the
+daemon:
+
+  scripts/revive-xhttp-proxies.sh --restore ${BACKUP} ${DB}
+
+It checks the backup before touching anything (integrity, schema),
+snapshots the database it is about to overwrite, holds the exclusive lock
+for the whole copy and verifies the result.
+
+The manual route below is the fallback, not the primary one:
+
   1. stop the daemon (docker compose stop server probe, or whatever runs it)
   2. rm -f ${DB}-wal ${DB}-shm
   3. cp ${BACKUP} ${DB}
@@ -982,16 +1014,19 @@ while reporting ok.
   5. start the daemon again
 
 Step 4 is the one that matters: a restore that skipped steps 1 and 2 can
-pass it while holding the wrong data.
+pass it while holding the wrong data. The bare cp does no snapshot of the
+database it overwrites and no verification of the backup.
 EOF
 }
 
 # The shorter advice for the aborts after the backup. Never a bare cp: the
 # header explains what the current -wal/-shm do to a restored file.
 undo_hint() {
-    echo "the backup ${BACKUP} is intact. To undo, stop the daemon, delete" >&2
-    echo "${DB}-wal and ${DB}-shm, copy the backup over ${DB}, and check it" >&2
-    echo "with 'PRAGMA integrity_check;'. A bare cp leaves the current" >&2
+    echo "the backup ${BACKUP} is intact. To undo, stop the daemon and run" >&2
+    echo "  scripts/revive-xhttp-proxies.sh --restore ${BACKUP} ${DB}" >&2
+    echo "which verifies the backup and snapshots what it overwrites. The" >&2
+    echo "manual route is a fallback, not the primary one: a bare cp does no" >&2
+    echo "snapshot and no backup verification, and it leaves the current" >&2
     echo "database's write-ahead log next to the restored file." >&2
 }
 
@@ -1128,8 +1163,10 @@ if [[ "${QUEUED}" -lt "${ENQUEUEABLE}" ]]; then
         echo "The cap (FUMOX_REFRESH_CHECK_LIMIT=${ENQUEUE_LIMIT}) held the rest back."
     fi
     echo "The ones left out are 'unknown' with a link, so the random T1 sample still"
-    echo "reaches them, just not at priority. Raise the cap and re-run to enqueue"
-    echo "more, or leave it: the next source refresh enqueues unknowns of its own."
+    echo "reaches them, just not at priority. Re-running this script will not enqueue"
+    echo "them — it selects rows that are still 'removed' — so either leave it (the"
+    echo "next source refresh enqueues unknowns of its own) or raise the cap before"
+    echo "a run that still sees them as 'removed'."
 fi
 
 cat <<EOF

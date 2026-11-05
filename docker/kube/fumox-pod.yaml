@@ -91,6 +91,32 @@ spec:
           hostPort: 8081
           hostIP: "127.0.0.1" # loopback-only admin, like the compose mapping
           protocol: TCP
+      # Liveness and readiness on the public listener's /healthz — the same
+      # endpoint the compose healthcheck drives. podman kube play executes
+      # both probe kinds (see podman-kube-play(1), supported fields).
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        initialDelaySeconds: 10
+        periodSeconds: 15
+        failureThreshold: 3
+      readinessProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        initialDelaySeconds: 10
+        periodSeconds: 15
+        failureThreshold: 3
+      # The same quotas the quadlet units pin (MemoryMax/CPUQuota/TasksMax)
+      # and compose sets (mem_limit/cpus/pids_limit).
+      resources:
+        requests:
+          memory: 512Mi
+          cpu: "1"
+        limits:
+          memory: 512Mi
+          cpu: "1"
       volumeMounts:
         # Writable on the server: the admin *Edit settings* page writes
         # /app/config/app.toml in place via the toml_edit-backed editor
@@ -167,6 +193,14 @@ spec:
           mountPath: /shared/meow
         - name: tmp
           mountPath: /tmp
+      # Smaller quota than the server, same as fumox-probe.container.
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "0.5"
+        limits:
+          memory: 256Mi
+          cpu: "0.5"
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
@@ -199,6 +233,15 @@ spec:
         # kernel's data directory live on RAM only.
         - name: meow-run
           mountPath: /run/meow
+      # Same quota as fumox-meow.container (the kernel only samples proxies
+      # for T2, the heavy work stays in the server quota).
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: "0.75"
+        limits:
+          memory: 256Mi
+          cpu: "0.75"
       securityContext:
         runAsNonRoot: true
         runAsUser: 998

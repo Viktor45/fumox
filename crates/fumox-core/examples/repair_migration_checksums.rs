@@ -31,21 +31,22 @@
 //! cargo run --example repair_migration_checksums -- /path/to/db.sqlite
 //! ```
 //!
-//! The path defaults to `./fumox.db` (the `DatabaseConfig::default()`
-//! location) when no argument is given.
+//! The path defaults to the `DatabaseConfig::default()` location
+//! (`fumox.db` in the working directory) when no argument is given.
 
 use std::error::Error;
 use std::path::PathBuf;
 
+use fumox_core::config::DatabaseConfig;
+use fumox_core::db;
 use sqlx::migrate::Migrator;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./fumox.db"));
+        .unwrap_or_else(|| DatabaseConfig::default().path);
     if !path.exists() {
         return Err(format!("database file not found: {}", path.display()).into());
     }
@@ -56,14 +57,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // compare against is exactly what we have here.
     let migrator: Migrator = sqlx::migrate!("./migrations");
 
-    let options = SqliteConnectOptions::new()
-        .filename(&path)
-        .create_if_missing(false)
-        .read_only(false);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await?;
+    // The pool comes from `db::connect_pool`, the same builder the server
+    // and the probe open their pools with: WAL, the configured busy
+    // timeout, the 0600 pre-create — a repair must not open the file with
+    // a weaker setup than the services do.
+    let pool = db::connect_pool(&DatabaseConfig {
+        path: path.clone(),
+        ..Default::default()
+    })
+    .await?;
 
     // Pre-flight: every embedded migration must already be applied (we are
     // re-stamping checksums, not applying anything new). A version mismatch
@@ -120,10 +122,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     // The UPDATE itself lives in `db::repair_migration_checksums` so the
-    // `success = 1 AND checksum != ?2` guards cannot drift from the copy
+    // guards (applied and successful rows only, checksums compared against
+    // this build's embedded set) cannot drift from the copy
     // `db::migrate()` uses: a row that already matches is left alone and
     // not reported as a repair.
-    let re_stamped = fumox_core::db::repair_migration_checksums(&pool, &migrator).await?;
+    let re_stamped = fumox_core::db::repair_migration_checksums(&pool).await?;
     let re_stamped_set: std::collections::HashSet<i64> = re_stamped.iter().copied().collect();
     for migration in migrator.iter() {
         if re_stamped_set.contains(&migration.version) {

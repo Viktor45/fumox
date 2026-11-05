@@ -84,8 +84,10 @@ services:
       # for plain-HTTP localhost access (browsers drop Secure cookies on
       # http://). config/app.toml ships this off; the compose default here is
       # true (ready for an HTTPS front), so a plain-HTTP stand must pin
-      # FUMOX_ADMIN__SECURE_COOKIES=false in .env.
-      FUMOX_ADMIN__SECURE_COOKIES: ${FUMOX_ADMIN__SECURE_COOKIES:-true}
+      # FUMOX_ADMIN__SECURE_COOKIES=false in .env. `${VAR-true}` without the
+      # colon: a default applies only when the variable is unset, an empty
+      # .env value passes through as-is instead of being masked by `true`.
+      FUMOX_ADMIN__SECURE_COOKIES: ${FUMOX_ADMIN__SECURE_COOKIES-true}
       FUMOX_GEO__DB_DIR: /shared/geo
       # SSRF guard: set true in .env only for trusted local test setups
       # (source URLs may then point at private/loopback addresses).
@@ -161,6 +163,18 @@ services:
       # the host you opened the panel on, while the public listener gates
       # the link on [server].allowed_hosts.
     restart: unless-stopped
+    # Rotating json-file logs: the public listener answers client pulls all
+    # day, unbounded logs would eat the host disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # The same quotas the quadlet units pin (MemoryMax/CPUQuota/TasksMax)
+    # and the kube manifest sets (resources).
+    mem_limit: 512m
+    cpus: "1.0"
+    pids_limit: 256
     networks:
       - default
 
@@ -179,8 +193,11 @@ services:
       # about whether the server had finished migrating the shared volume.
       server:
         condition: service_healthy
-      meow:                    # probe seeds the exchange volume
-        condition: service_started
+      # service_healthy, not service_started: the probe starts driving the
+      # controller as soon as its first T2 batch is due, so the kernel's
+      # REST API must already be listening (see the meow healthcheck below).
+      meow:
+        condition: service_healthy
     environment:
       FUMOX_CONFIG: ${FUMOX_CONFIG:-/app/config/app.toml}
       FUMOX_MEOW__API_ADDR: meow:9090
@@ -206,6 +223,15 @@ services:
       - fumox-data:/app/data
       - fumox-meow:/shared/meow
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # Same quotas as fumox-probe.container (MemoryMax/CPUQuota/TasksMax).
+    mem_limit: 256m
+    cpus: "0.5"
+    pids_limit: 128
     networks:
       # The default network carries the outbound traffic; the `meow` network
       # is the only path to the kernel's controller.
@@ -235,7 +261,27 @@ services:
       FUMOX_MEOW_API_BIND: 0.0.0.0:9090
     volumes:
       - fumox-meow:/shared/meow
+    # Readiness gate for the probe (condition: service_healthy above): the
+    # kernel's REST API must be listening before the probe drives it. The
+    # image ships no curl or wget, so the check is a plain TCP connect via
+    # bash's /dev/tcp (the controller secret is checked per-request by the
+    # kernel itself, not by the probe).
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9090"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # Same quotas as fumox-meow.container (MemoryMax/CPUQuota/TasksMax).
+    mem_limit: 256m
+    cpus: "0.75"
+    pids_limit: 128
     networks:
       # The kernel dials the proxies under test, so it needs the outbound
       # path the default network provides; the controller stays unpublished.

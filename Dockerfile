@@ -70,8 +70,11 @@
 # cache in CI (~7 min per architecture to recover). Bump it deliberately
 # when you want a toolchain update. `-slim-trixie` matches the runtime base
 # below (Debian 13) explicitly instead of relying on what the plain `-slim`
-# tag happens to alias to.
-ARG RUST_VERSION=1.98.1-slim-trixie
+# tag happens to alias to. The reference is additionally pinned by digest —
+# the multi-arch INDEX digest, so both CI architectures resolve to the same
+# bytes: a rebuild cannot silently pick up a rebuilt tag (bump the pin with
+# toolchain updates; Dependabot's docker ecosystem proposes the bump).
+ARG RUST_VERSION=1.98.1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7
 ARG BUILD_CACHE=layers
 ARG CARGO_CHEF_VERSION=v0.1.78
 
@@ -87,8 +90,19 @@ RUN case "${BUILD_CACHE}" in \
         layers|mounts) ;; \
         *) echo "invalid BUILD_CACHE='${BUILD_CACHE}': expected 'layers' or 'mounts'" >&2; exit 1 ;; \
     esac
+# The apt packages are pinned to exact versions (identical on linux/amd64
+# and linux/arm64, checked against this digest-pinned base), so a rebuild
+# compiles against the same system libraries the digest freezes. The mirror
+# is live: when Debian supersedes a pinned version with a security update,
+# the build fails loudly here — bump the pins deliberately, together with
+# the base digest above.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl libsqlite3-dev pkg-config xz-utils mold \
+        ca-certificates=20250419+deb13u1 \
+        curl=8.14.1-2+deb13u7 \
+        libsqlite3-dev=3.46.1-7+deb13u2 \
+        pkg-config=1.8.1-4 \
+        xz-utils=5.8.1-1+deb13u2 \
+        mold=2.37.1+dfsg-1 \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 ARG CARGO_CHEF_VERSION
@@ -166,10 +180,17 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/r
 FROM build-${BUILD_CACHE} AS builder
 
 # ---- Stage 4: minimal runtime -------------------------------------------------
-# trixie-slim matches the rust:1.98-slim (Debian 13) build-stage glibc.
-FROM debian:trixie-slim AS runtime
+# trixie-slim matches the rust:1.98-slim (Debian 13) build-stage glibc, and
+# is pinned by digest like the chef stage above (the multi-arch index, so
+# both CI architectures resolve to the same bytes). Bump the pin together
+# with security updates; the meow image's stages pin the same digest.
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS runtime
+# apt pins, same discipline as the chef stage above: a rebuild installs
+# exactly these runtime libraries, and a superseded pin fails loudly.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libsqlite3-0 tini \
+        ca-certificates=20250419+deb13u1 \
+        libsqlite3-0=3.46.1-7+deb13u2 \
+        tini=0.19.0-3+b8 \
     && rm -rf /var/lib/apt/lists/* \
     # The uid and the gid are pinned, not left to the allocator: the meow
     # image runs its user under the same gid (999) with another uid (998),

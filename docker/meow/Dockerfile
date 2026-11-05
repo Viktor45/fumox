@@ -29,6 +29,18 @@
 # (workflow_dispatch only) pushes ghcr.io/viktor45/fumox-meow, attested per
 # platform.
 #
+# Ready-to-use local build, with the current pin values from the ARG block
+# below (keep the three build args in sync with those ARGs when bumping the
+# release). The build context is THIS directory, docker/meow — the command
+# is meant to be run from the repository root:
+#
+#   docker build \
+#     --build-arg MEOW_VERSION=v0.27.0 \
+#     --build-arg MEOW_SHA256_AMD64=38343bc0832d36d97967296a5c7d488c0ba9509186b6a7a4deef5355ff45e2d3 \
+#     --build-arg MEOW_SHA256_ARM64=42f12dac9313a3c70bc4e8da7faca863a673d393d6e6f9274274a045d40f431b \
+#     -t fumox-meow \
+#     -f docker/meow/Dockerfile docker/meow
+#
 # Multi-arch: BuildKit supplies TARGETARCH (linux/amd64, linux/arm64).
 #
 # Base image: debian:trixie-slim, the same base as the fumox-server runtime
@@ -43,13 +55,21 @@ ARG MEOW_SHA256_AMD64=38343bc0832d36d97967296a5c7d488c0ba9509186b6a7a4deef5355ff
 ARG MEOW_SHA256_ARM64=42f12dac9313a3c70bc4e8da7faca863a673d393d6e6f9274274a045d40f431b
 
 # ---- Stage 1: fetch the release binary ---------------------------------------
-FROM debian:trixie-slim AS fetch
+# trixie-slim pinned by digest — the same multi-arch index the fumox image's
+# runtime stage pins, so the compose stack shares one distro snapshot. Bump
+# the pin deliberately, together with security updates.
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS fetch
 ARG MEOW_VERSION
 ARG MEOW_SHA256_AMD64
 ARG MEOW_SHA256_ARM64
 ARG TARGETARCH
+# apt pins, same discipline as the root Dockerfile: exact versions (identical
+# on linux/amd64 and linux/arm64), so a rebuild fetches the same helper
+# binaries; a superseded pin fails loudly instead of drifting.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl file \
+        ca-certificates=20250419+deb13u1 \
+        curl=8.14.1-2+deb13u7 \
+        file=1:5.46-5 \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
     # The target triple is part of the asset name: without it the download
@@ -90,9 +110,11 @@ RUN set -eux; \
     rm -rf "/tmp/${asset_name}" /tmp/meow-extract
 
 # ---- Stage 2: minimal runtime ------------------------------------------------
-FROM debian:trixie-slim AS runtime
+# Same pinned digest as the fetch stage above.
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates tini \
+        ca-certificates=20250419+deb13u1 \
+        tini=0.19.0-3+b8 \
     && rm -rf /var/lib/apt/lists/* \
     # The gid is shared with the fumox image (999), the uid is not: the
     # proxy kernel reads the generated config through the group and must

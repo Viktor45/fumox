@@ -12,6 +12,19 @@ A clear and concise description of the problem. For example: "I'm frustrated whe
 **Describe the solution you'd like**  
 A clear and concise description of what you want to happen.
 
+Expected load and limits (fill in what the feature must hold up under):
+- Number of sources/subscriptions and proxies:
+- Required refresh frequency (subscription fetches and probe runs):
+- Acceptable latency (request handling and probe rounds):
+- Acceptable CPU/RAM consumption:
+- Timeout and retry constraints:
+
+**Impact / Compatibility**  
+- Does it change the format of the served subscription? If yes, how:
+- Does it affect existing configurations or integrations (config keys, CLI flags, HTTP endpoints)? Which:
+- Is a migration required for current deployments? If yes, what does it involve:
+- The version you expect this to land in:
+
 **Describe alternatives you've considered**  
 A description of any alternative solutions or workarounds you've already tried or evaluated.
 

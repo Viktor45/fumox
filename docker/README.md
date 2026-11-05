@@ -20,9 +20,9 @@ the podman flavour).
 
 ## Preparation (both variants)
 
-Quadlet does not build images: the units reference the local names
-`localhost/fumox:local` and `localhost/fumox-meow:local`. Prepare them either
-way:
+Quadlet does not build images: the server unit references the local name
+`localhost/fumox:local`, and the meow unit pins the published GHCR image by
+digest (see its `Image=` line). Prepare them either way:
 
 **Option 1: pull the published GHCR images (fastest):**
 
@@ -36,10 +36,19 @@ podman tag ghcr.io/viktor45/fumox-meow:latest localhost/fumox-meow:local
 `ghcr.io/viktor45/fumox` is published by `.github/workflows/docker.yml` on
 `v*` tags and manual `workflow_dispatch` (see the in-file header for the
 current tag rules, so there is no automatic rebuild on push to `main`).
-`ghcr.io/viktor45/fumox-meow` is packaged manually by `docker-meow.yml`. To
-skip the retagging, edit the `Image=` lines of the units to the GHCR names
-directly, which is also where you pin a version (`ghcr.io/viktor45/fumox:0.2.0`)
-instead of `latest`.
+`ghcr.io/viktor45/fumox-meow` is packaged manually by `docker-meow.yml`.
+
+A tag — `latest`, `0.2.0`, `local` — is a mutable pointer: it guarantees
+nothing about which bytes a start actually runs, so it does not ensure
+integrity. That is why a unit that names GHCR directly pins the image by
+digest instead of by tag (`fumox-meow.container` carries
+`ghcr.io/viktor45/fumox-meow@sha256:…`, the same manifest
+docker-compose.yml pins), and why the `localhost/*:local` names above are
+for building and development only: before a real start, replace the tag
+with a digest — `podman pull ghcr.io/viktor45/fumox@sha256:<digest>`, with
+the digest taken from the release page or printed by
+`podman inspect --format '{{.Digest}}' ghcr.io/viktor45/fumox-meow:latest`
+after the pull.
 
 **Option 2: build from source** (from the repository root):
 
@@ -164,6 +173,18 @@ Check: `curl -s http://127.0.0.1:8080/healthz` → `ok`; admin panel at
 <http://127.0.0.1:8081/admin> (only loopback is published to the host, same
 as compose). Logs: `journalctl --user -u fumox-server -u fumox-probe -u fumox-meow -f`.
 
+A note on `network-online.target` (the pod units order themselves after
+it): in a user session that target usually has nothing behind it — the
+wait-online service of the network manager lives in the system manager,
+and user units are not ordered against system services. A pod can
+therefore start before the network is really up, and neither variant wires
+an explicit readiness gate for a first cycle. The daemons tolerate that
+window: binding the listeners needs no DNS, the probe retries the database
+and the kernel with its own backoff, and the kernel dials the proxies at
+runtime. If your host brings the network up late and the start must wait
+for it, order the units against the specific user-level network service
+your setup provides (there is none by default).
+
 ### The two pods, and what runs when
 
 `fumox.pod` holds the server alone; `fumox-worker.pod` holds the probe and
@@ -186,14 +207,14 @@ unit stays up.
 
 ### Editing `app.toml` from the admin panel
 
-`fumox-server.container` mounts the config directory as `:rw,Z`, so the
+`fumox-server.container` mounts the config directory as `:rw,z`, so the
 admin *Edit settings* page (`/admin/settings/edit`) writes
 `/app/config/app.toml` in place through the `toml_edit`-backed editor.
 Comments survive every save; ENV overrides (`FUMOX_SECTION__KEY`) keep
 winning per the figment merge; both server and probe must be restarted
 after a save. `fumox-probe.container` stays read-only: the probe only
 reads the file at startup and never writes it. If you prefer the editor
-off entirely, change the server mount to `:ro,Z`; the page will render
+off entirely, change the server mount to `:ro,z`; the page will render
 disabled with a red `set.edit_unwritable` banner explaining why.
 
 ## Variant B: `kube/`
@@ -233,6 +254,25 @@ On first start podman automatically backs the `fumox-data`, `fumox-geo` and
 port is declared with `hostIP: 127.0.0.1`; after start verify with
 `podman port fumox`; older podman releases (without `hostIP` support)
 publish 8081 on every interface, so close it with a firewall or upgrade.
+
+### Checks and logs
+
+```sh
+curl -s http://127.0.0.1:8080/healthz    # → ok (the public listener answers)
+podman ps -a                             # both pods and every container's state
+podman port fumox                        # published ports (8081 must be loopback-only)
+podman logs -f fumox                     # the server container
+podman logs -f fumox-worker-probe        # the probe (the kernel: fumox-worker-meow)
+journalctl --user -u fumox.service -f    # the systemd unit the .kube generates
+```
+
+A broken manifest is diagnosed without touching the running stack:
+`podman kube play --dry-run docker/kube/fumox-pod.yaml` reports YAML and
+schema errors, and after `systemctl --user stop fumox.service` the reset is
+`podman kube down docker/kube/fumox-pod.yaml` — the pods, their containers
+and the generated infra are removed, the next start begins from scratch
+(the PVC-backed volumes survive a `kube down`, the hostPath config is
+yours).
 
 ### Start order and the cold start
 
@@ -275,6 +315,16 @@ podman build -t localhost/fumox-nginx:local docker/nginx
 podman build --build-arg NGINX_FLAVOUR=podman \
   -t localhost/fumox-nginx:local docker/nginx
 ```
+
+One cost of the resolver + variable design, worth knowing before capacity
+planning: nginx pools upstream connections only for a statically configured
+`upstream` block, so with `proxy_pass` through a variable **keepalive is
+not used** — every proxied request opens a fresh TCP connection to the
+Fumox listener and closes it with the response. At the traffic this front
+is sized for (periodic subscription pulls, the admin panel) that is
+harmless; if you scale it up, raise `worker_connections` (each proxied
+request holds two connections, client + upstream) and watch the TIME_WAIT
+count on the Fumox side.
 
 Running it inside the server pod (quadlet) means the nginx container shares
 the pod's network namespace with the server, so the upstreams are the
@@ -390,9 +440,14 @@ without a `trust_proxy_header`.
 
   (the docker volume mountpoint may require root; on macOS/OrbStack the
   data lives inside the docker VM.)
-- `restart: unless-stopped` → `Restart=on-failure` in the `[Service]`
-  sections (systemd does not restart explicitly stopped units, the
-  semantics match).
+- `restart: unless-stopped` → `Restart=always` with `RestartSec=5` in the
+  `[Service]` sections. The two agree where it matters: both restart the
+  container whenever it is not the operator who stopped it, and neither
+  restarts a deliberate stop. The delay is the one addition: systemd
+  restarts a unit that dies in a loop at a steady pace, the fixed 5 s
+  throttle keeps a crash loop from spinning. (`Restart=on-failure` would
+  NOT be equivalent: systemd would then leave a unit that exited cleanly
+  — exit code 0 — down, while compose restarts it.)
 - The `FUMOX_ADMIN__TOKEN` secret is kept not in a `.env` next to the
   compose file but in `~/.config/fumox/fumox-admin.env` (variant A) or a
   `podman secret` (variant B).

@@ -32,7 +32,12 @@
 # nginx starts before the `server` container registers its DNS name and
 # survives its restarts. A plain upstream would abort on the first start.
 
-FROM nginx:stable-alpine
+# Base pinned by digest — the multi-arch INDEX digest, so both linux/amd64
+# and linux/arm64 resolve to it. A floating tag rebuilds the image on
+# whatever the registry serves that day; bump the pin deliberately (it
+# prints the digest) together with security updates, e.g. via Dependabot's
+# docker ecosystem (.github/dependabot.yml).
+FROM nginx:stable-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
 
 ARG NGINX_FLAVOUR=compose
 

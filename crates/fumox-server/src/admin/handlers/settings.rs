@@ -1476,7 +1476,10 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
         return redirect_after_create(lang.t("set.file_created_noop").to_string());
     }
 
-    if !fumox_core::config_writer::is_writable(target.parent().unwrap_or(Path::new("."))) {
+    if !matches!(
+        fumox_core::config_writer::is_writable(target.parent().unwrap_or(Path::new("."))),
+        Ok(fumox_core::config_writer::Writability::Writable)
+    ) {
         return settings_edit_unwritable(&state, &headers);
     }
 

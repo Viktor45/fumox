@@ -43,12 +43,28 @@ Environment=FUMOX_MEOW__CONFIG_PATH=/shared/meow/meow.yaml
 
 # Probe only reads app.toml at startup, never writes. Read-only mount means
 # a buggy probe can never mangle the config the server is also editing.
-Volume=%h/fumox/config:/app/config:ro,Z
+Volume=%h/fumox/config:/app/config:ro,z
 Volume=fumox-data.volume:/app/data
 Volume=fumox-meow.volume:/shared/meow
 
+# The probe has no listener of its own, so there is nothing to HTTP-probe;
+# what its work depends on is the kernel's controller answering on the pod
+# loopback (see FUMOX_MEOW__API_ADDR above). The health check is a plain
+# TCP connect (bash's /dev/tcp; the image ships no curl). It reports the
+# pod's kernel as unreachable — the probe itself keeps running through
+# meow outages (its own backoff), liveness of the process is systemd's
+# Restart=always below.
+HealthCmd=bash -c "exec 3<>/dev/tcp/127.0.0.1/9090"
+HealthInterval=10s
+HealthTimeout=4s
+HealthRetries=6
+HealthStartPeriod=15s
+
 [Service]
-Restart=on-failure
+# Same policy as the server unit: restart unless the operator stopped it,
+# with a delay that throttles a crash loop.
+Restart=always
+RestartSec=5
 # Smaller quota than the server: the probe only samples the proxy list.
 MemoryMax=256M
 CPUQuota=50%

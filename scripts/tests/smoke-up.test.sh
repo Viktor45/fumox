@@ -129,6 +129,13 @@ grep -qx "FUMOX_CONFIG_ACCESS=ro" "$WORK/compose.env" \
 $(cat "$WORK/compose.env")"
 note "the stand mounts the shared config read-only"
 
+# The teardown-on-failure trap must be disarmed by a passing run: a stand
+# that came up is the point of the exercise, not something to tear down.
+grep -q -- " down " "$WORK/compose.args" \
+    && fail "a successful bring-up must not tear the stand down:
+$(cat "$WORK/compose.args")"
+note "a successful bring-up leaves the stand up"
+
 # The kernel controller refuses to start without a secret, so the stand
 # must always hand one to compose.
 MEOW_TOKEN="$(grep -m1 '^FUMOX_MEOW__API_TOKEN=' "$WORK/compose.env" | cut -d= -f2-)"
@@ -174,6 +181,18 @@ note "the generated token is written to a 0600 file"
 run_up -- --bogus
 [ "$CODE" -eq 64 ] || fail "an unknown argument must exit 64, got $CODE"
 note "an unknown argument exits 64"
+
+# ── --help prints the header with the Environment block ─────────────
+# It must answer before any environment probing: no docker, curl or free
+# port is needed to read the usage.
+run_up -- --help
+[ "$CODE" -eq 0 ] || fail "--help must exit 0, got $CODE:
+$OUT"
+grep -q -- "--no-build" <<<"$OUT" || fail "--help must print the usage:
+$OUT"
+grep -q "SMOKE_BIND" <<<"$OUT" || fail "--help must document SMOKE_BIND:
+$OUT"
+note "--help prints the usage with the Environment block and exits 0"
 
 echo
 echo "smoke-up.sh: all checks passed"

@@ -2,8 +2,10 @@
 //!
 //! SQLite in WAL mode is the single shared source of truth between
 //! `fumox-server` and `fumox-probe`. Every connection enables WAL, foreign
-//! keys and `busy_timeout`, without the latter, concurrent upserts from two
-//! processes produce `SQLITE_BUSY` (DATABASE, exploitation notes).
+//! keys and `busy_timeout`; without the latter, concurrent upserts from two
+//! processes produce `SQLITE_BUSY`, because the busy timeout is what lets
+//! one writer wait out another process's open transaction instead of
+//! failing on it.
 
 use std::time::Duration;
 
@@ -104,10 +106,25 @@ async fn connect_pool_with(cfg: &DatabaseConfig, scope: WriteScope) -> crate::Re
                 .to_string(),
         ));
     }
-    pre_create_db_file(&cfg.path)?;
+    // Parent-directory creation, the pre-create of the file itself and the
+    // chmod are blocking syscalls; run them off the async worker thread.
+    // The 0600 mode has to be in place before SQLite opens the file: the
+    // `-wal` and `-shm` sidecars SQLite creates at open time inherit the
+    // database file's mode, so a permissive file would spawn permissive
+    // sidecars that no later chmod of the main file fixes.
+    let path = cfg.path.clone();
+    tokio::task::spawn_blocking(move || {
+        pre_create_db_file(&path)?;
+        restrict_file_permissions(&path)
+    })
+    .await
+    .map_err(|err| {
+        crate::Error::Database(format!("the database file preparation task failed: {err}"))
+    })??;
 
     // We pre-created the file on Unix (0o600, mode set atomically at
-    // create time). On non-Unix platforms we let sqlx create the file via
+    // create time, and an already-existing file restored right away). On
+    // non-Unix platforms we let sqlx create the file via
     // create_if_missing(true); the platform's ACL model governs the
     // resulting file.
     let create_if_missing: bool = {
@@ -151,20 +168,34 @@ async fn connect_pool_with(cfg: &DatabaseConfig, scope: WriteScope) -> crate::Re
         });
     }
     let pool = pool_options.connect_with(options).await?;
+    tracing::info!(
+        path = %cfg.path.display(),
+        max_connections = cfg.max_connections,
+        busy_timeout_ms = cfg.busy_timeout_ms,
+        journal_mode = "wal",
+        synchronous = ?cfg.synchronous,
+        "database pool opened"
+    );
 
-    restrict_file_permissions(&cfg.path)?;
     // WAL keeps the page cache and the write-ahead log in sidecar files
     // next to the database. They hold the same rows as the database
     // itself, so they get the same mode; SQLite creates them lazily, so
-    // they may not exist yet at this point.
-    restrict_sidecar_permissions(&cfg.path)?;
+    // they may not exist yet at this point. Like the preparation above,
+    // the stat/chmod loop is blocking work and stays off the worker
+    // thread.
+    let path = cfg.path.clone();
+    tokio::task::spawn_blocking(move || restrict_sidecar_permissions(&path))
+        .await
+        .map_err(|err| {
+            crate::Error::Database(format!("the database sidecar securing task failed: {err}"))
+        })??;
     Ok(pool)
 }
 
-/// On Unix only: ensure the parent directory exists and pre-create the
-/// database file with mode `0o600` via `create_new(true)` so a second
-/// process racing for the same file fails with `AlreadyExists` instead of
-/// inheriting a permissive umask.
+/// Ensure the parent directory exists — on every platform — and, on Unix,
+/// pre-create the database file with mode `0o600` via `create_new(true)` so
+/// a second process racing for the same file fails with `AlreadyExists`
+/// instead of inheriting a permissive umask.
 ///
 /// A directory this function creates is tightened to `0o700`: it holds the
 /// credentials. A directory that already existed keeps its mode — a
@@ -178,26 +209,28 @@ async fn connect_pool_with(cfg: &DatabaseConfig, scope: WriteScope) -> crate::Re
 /// not choose, and the `0600` mode would land on the symlink's target
 /// instead of on a file of our own.
 ///
-/// On non-Unix platforms this is a no-op; sqlx creates the file and the
-/// platform's ACL model governs.
+/// On non-Unix platforms only the parent directory is created; sqlx creates
+/// the file itself (`create_if_missing(true)`) and the platform's ACL model
+/// governs.
 fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io;
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::fs::PermissionsExt;
+    // A missing parent directory fails `sqlx` on every platform, and
+    // `create_dir_all` is the portable fix; only the mode bookkeeping
+    // around the directory and the file itself is Unix-specific below.
+    if let Some(parent) = path.parent().filter(|p| !p.exists()) {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            crate::Error::Database(format!(
+                "failed to create database parent dir for database.path={}: {err}",
+                path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
 
-        if let Some(parent) = path.parent().filter(|p| !p.exists()) {
             // `create_dir_all` applies the process umask to every directory
             // it creates, so the mode is set explicitly afterwards. The
             // directory holds the credentials: nobody else needs to enter
             // it.
-            std::fs::create_dir_all(parent).map_err(|err| {
-                crate::Error::Database(format!(
-                    "failed to create database parent dir {}: {err}",
-                    parent.display()
-                ))
-            })?;
             if let Ok(meta) = std::fs::metadata(parent) {
                 let mut perms = meta.permissions();
                 perms.set_mode(0o700);
@@ -214,23 +247,36 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
                     );
                 }
             }
-        } else if let Some(parent) = path.parent() {
-            // The directory already exists. If it is group- or
-            // world-readable, the credentials file inside it is one
-            // directory traversal away from anyone on the host, so say so
-            // loudly instead of only tightening the file mode.
-            if let Ok(meta) = std::fs::metadata(parent) {
-                let mode = meta.permissions().mode() & 0o777;
-                if mode & 0o077 != 0 {
-                    tracing::warn!(
-                        path = %parent.display(),
-                        mode = format!("{mode:04o}"),
-                        "database parent dir is readable by group or others; \
-                         chmod it to 0700 to keep the credentials private"
-                    );
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            if let Some(parent) = path.parent() {
+                // The directory already exists. If it is group- or
+                // world-readable, the credentials file inside it is one
+                // directory traversal away from anyone on the host, so say
+                // so loudly instead of only tightening the file mode.
+                if let Ok(meta) = std::fs::metadata(parent) {
+                    let mode = meta.permissions().mode() & 0o777;
+                    if mode & 0o077 != 0 {
+                        tracing::warn!(
+                            path = %parent.display(),
+                            mode = format!("{mode:04o}"),
+                            "database parent dir is readable by group or others; \
+                             chmod it to 0700 to keep the credentials private"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::io;
+        use std::os::unix::fs::OpenOptionsExt;
 
         // A symlink at the database path is refused: the operator asked
         // for a database, not for whatever the link points at.
@@ -264,20 +310,20 @@ fn pre_create_db_file(path: &std::path::Path) -> crate::Result<()> {
         match options.open(path) {
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                // Another process won the create race; the existing file
-                // has its mode set already.
+                // Another process won the create race, or the file simply
+                // already existed — its mode is not guaranteed. Restore
+                // 0600 right here, before SQLite opens the file, so the
+                // sidecars it creates at open time inherit the private
+                // mode.
+                restrict_file_permissions(path)?;
             }
             Err(err) => {
                 return Err(crate::Error::Database(format!(
-                    "failed to create database file {}: {err}",
+                    "failed to create database file at database.path={}: {err}",
                     path.display()
                 )));
             }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
     }
     Ok(())
 }
@@ -308,8 +354,18 @@ impl ChecksumRepair {
     }
 }
 
+/// The migrations embedded in this build, as a `&'static` handle. One
+/// instance: [`migrate_with`] runs it and the checksum repair
+/// ([`repair_migration_checksums`]) reads its checksums, so the two can
+/// never drift apart, and a caller outside the crate repairs against
+/// exactly the set this build would migrate with.
+pub fn embedded_migrator() -> &'static Migrator {
+    static EMBEDDED: std::sync::OnceLock<Migrator> = std::sync::OnceLock::new();
+    EMBEDDED.get_or_init(|| sqlx::migrate!("./migrations"))
+}
+
 /// Runs the sqlx migrations embedded in `fumox-core` and mirrors the applied
-/// schema version into the `meta` table (DATABASE, exploitation notes).
+/// schema version into the `meta` table's `schema_version` key.
 ///
 /// A checksum mismatch stops the boot: see [`migrate_with`] and
 /// [`ChecksumRepair`].
@@ -349,7 +405,7 @@ pub async fn migrate(pool: &SqlitePool) -> crate::Result<()> {
 /// structural mismatch, real DDL failure) is surfaced to the caller
 /// untouched.
 pub async fn migrate_with(pool: &SqlitePool, repair: ChecksumRepair) -> crate::Result<()> {
-    let migrator: Migrator = sqlx::migrate!("./migrations");
+    let migrator = embedded_migrator();
     let _lock = MigrationLock::acquire(pool).await?;
 
     let mut original: Option<MigrateError> = None;
@@ -370,10 +426,10 @@ pub async fn migrate_with(pool: &SqlitePool, repair: ChecksumRepair) -> crate::R
                         original = Some(MigrateError::VersionMismatch(version));
                     }
                     // `migrator.iter()` carries the canonical checksums the
-                    // embedded copy expects. Only applied versions are
+                    // embedded set expects. Only applied versions are
                     // touched, so the bookkeeping row exists for every
                     // version we rewrite.
-                    let re_stamped = repair_migration_checksums(pool, &migrator).await?;
+                    let re_stamped = repair_migration_checksums(pool).await?;
                     if re_stamped.is_empty() {
                         // Nothing was rewritten, so the retry below would
                         // fail with the very same error. Report the
@@ -436,6 +492,8 @@ pub async fn migrate_with(pool: &SqlitePool, repair: ChecksumRepair) -> crate::R
         .execute(pool)
         .await?;
     }
+
+    tracing::info!(schema_version = applied, "database schema is up to date");
 
     Ok(())
 }
@@ -602,9 +660,12 @@ fn try_lock(_path: &std::path::Path) -> LockAttempt {
 }
 
 /// Persist the self-heal under `meta.migrations_repaired` and shout about
-/// it. The `meta` row is the part that outlives the process: a boot log is
-/// usually long gone by the time an operator wonders why a column they see
-/// in a migration file is missing from the schema.
+/// it. Each repair is appended to the row's value
+/// (`versions=[…] at <unix time>; …`), so the row keeps the history of
+/// every repair this database saw, not only the latest one. The `meta` row
+/// is the part that outlives the process: a boot log is usually long gone
+/// by the time an operator wonders why a column they see in a migration
+/// file is missing from the schema.
 async fn record_migration_repair(pool: &SqlitePool, versions: &[i64]) -> crate::Result<()> {
     let list = versions
         .iter()
@@ -625,9 +686,11 @@ async fn record_migration_repair(pool: &SqlitePool, versions: &[i64]) -> crate::
     );
     // Best effort: a failure to write the breadcrumb must not turn a
     // recovered boot into a failed one, the log line above already fired.
+    // The value is appended to rather than replaced, so a second repair
+    // leaves both events visible in `meta`.
     let recorded = sqlx::query(
         "INSERT INTO meta (key, value) VALUES ('migrations_repaired', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+         ON CONFLICT(key) DO UPDATE SET value = meta.value || '; ' || excluded.value",
     )
     .bind(format!("versions=[{list}] at {since_unix}"))
     .execute(pool)
@@ -641,50 +704,74 @@ async fn record_migration_repair(pool: &SqlitePool, versions: &[i64]) -> crate::
     Ok(())
 }
 
-/// Re-stamp every applied migration's stored SHA-384 with the checksum
-/// the embedded `Migrator` derives from the current file content. Used by
-/// [`migrate`] to recover from a checksum mismatch (comment-only edits to
-/// already-applied migration files), and exposed as a standalone helper so
-/// tests, the `repair_migration_checksums` example and ops scripts can
-/// trigger the same repair without booting the full server, one
-/// implementation, so the guards below cannot drift from the tool's copy.
-/// Returns the list of versions whose checksums were actually rewritten:
-/// a version whose stored hash already matches is not reported, and a row
-/// this build's embedded set does not know about is never touched.
-pub async fn repair_migration_checksums(
-    pool: &SqlitePool,
-    migrator: &Migrator,
-) -> crate::Result<Vec<i64>> {
-    let applied_versions: Vec<i64> =
-        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = 1")
-            .fetch_all(pool)
+/// Re-stamp every applied migration's stored SHA-384 with the checksum the
+/// embedded migrator ([`embedded_migrator`]) derives from the current file
+/// content. Used by [`migrate_with`] to recover from a checksum mismatch
+/// (comment-only edits to already-applied migration files), and exposed as
+/// a standalone helper so tests, the `repair_migration_checksums` example
+/// and ops scripts can trigger the same repair without booting the full
+/// server — one implementation, so the guards below cannot drift from the
+/// tool's copy. The migrator is always this build's embedded one: a caller
+/// cannot hand in a different set and re-stamp against it.
+///
+/// The read of the stored checksums and the rewrite land in one
+/// transaction, carried by a single `UPDATE` with one `CASE` arm per
+/// version, so a repair cannot half-land — some rows re-stamped, others
+/// not. Returns the list of versions whose checksums were actually
+/// rewritten: a version whose stored hash already matches is not reported,
+/// and a row this build's embedded set does not know about is never
+/// touched.
+pub async fn repair_migration_checksums(pool: &SqlitePool) -> crate::Result<Vec<i64>> {
+    let mut tx = pool.begin().await?;
+    let stored: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations WHERE success = 1")
+            .fetch_all(&mut *tx)
             .await?;
-    let applied: std::collections::HashSet<i64> = applied_versions.iter().copied().collect();
-    let mut re_stamped = Vec::new();
-    for migration in migrator.iter() {
-        if !applied.contains(&migration.version) {
-            // Skip migrations the embedded set knows about that have not
-            // been applied yet, the next regular `migrate()` will run them
-            // and stamp their checksum at the end. Touching them here
-            // would race the migrator's own bookkeeping.
-            continue;
+    // Only applied versions are touched. A version the embedded set knows
+    // about that has not been applied yet is left alone — the next regular
+    // `migrate()` will run it and stamp its checksum at the end, and
+    // touching it here would race the migrator's own bookkeeping — and a
+    // version this set does not know about belongs to a newer build and is
+    // none of this repair's business.
+    let mismatches = embedded_migrator()
+        .iter()
+        .filter(|migration| {
+            stored.iter().any(|(version, checksum)| {
+                *version == migration.version && checksum.as_slice() != &*migration.checksum
+            })
+        })
+        .collect::<Vec<_>>();
+    let re_stamped: Vec<i64> = mismatches
+        .iter()
+        .map(|migration| migration.version)
+        .collect();
+    if !re_stamped.is_empty() {
+        // One `UPDATE` for the whole set: the `CASE` arms pick the checksum
+        // each version must carry, the `IN` list scopes the rewrite to the
+        // versions the read above found disagreeing.
+        let mut sql = String::from("UPDATE _sqlx_migrations SET checksum = CASE version");
+        for _ in &mismatches {
+            sql.push_str(" WHEN ? THEN ?");
         }
-        // `WHERE checksum != ?2` keeps the no-op path zero-cost on a clean
-        // DB, the row is rewritten exactly when the stored hash disagrees
-        // with the on-disk file.
-        let rows = sqlx::query(
-            "UPDATE _sqlx_migrations
-             SET checksum = ?2
-             WHERE version = ?1 AND success = 1 AND checksum != ?2",
-        )
-        .bind(migration.version)
-        .bind(&*migration.checksum)
-        .execute(pool)
-        .await?;
-        if rows.rows_affected() == 1 {
-            re_stamped.push(migration.version);
+        sql.push_str(" END WHERE success = 1 AND version IN (");
+        for index in 0..mismatches.len() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
         }
+        sql.push(')');
+        let mut update = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for migration in &mismatches {
+            update = update.bind(migration.version).bind(&*migration.checksum);
+        }
+        for migration in &mismatches {
+            update = update.bind(migration.version);
+        }
+        update.execute(&mut *tx).await?;
     }
+    tx.commit().await?;
+
     // Force the WAL log through so a second `migrate()` from the same
     // process sees the new values without a checkpoint race. Best-effort: a
     // concurrent reader can make the PASS checkpoint return busy, and the
@@ -700,32 +787,50 @@ pub async fn repair_migration_checksums(
         Ok(row) => {
             let busy: i64 = sqlx::Row::try_get(&row, 0).unwrap_or_default();
             if busy != 0 {
-                tracing::debug!("wal_checkpoint(PASS) after migration re-stamp was busy");
+                // A busy checkpoint leaves the re-stamp in the WAL — still
+                // visible to every reader — but an operator who copies only
+                // the database file would miss it, so say so loudly.
+                tracing::warn!("wal_checkpoint(PASS) after migration re-stamp was busy");
             }
         }
         Err(err) => {
-            tracing::debug!(error = %err, "wal_checkpoint(PASS) after migration re-stamp failed")
+            tracing::warn!(error = %err, "wal_checkpoint(PASS) after migration re-stamp failed")
         }
     }
     Ok(re_stamped)
 }
 
-/// Test-only switch: when set, the inner `set_permissions` call inside
-/// `restrict_file_permissions` short-circuits with a `PermissionDenied`
-/// error. The OS only denies chmod when the process lacks ownership of the
-/// file, a state tests cannot arrange portably, so this flag is the
-/// smallest indirection that exercises the chmod-fail branch. Guarded by a
+/// Test-only switch, and process-global state: when set, the inner
+/// `set_permissions` call inside `restrict_file_permissions` short-circuits
+/// with a `PermissionDenied` error. The OS only denies chmod when the
+/// process lacks ownership of the file, a state tests cannot arrange
+/// portably, so this flag is the smallest indirection that exercises the
+/// chmod-fail branch — and because every `connect_pool` call in this
+/// process reads it through `restrict_file_permissions`, a leaked `true`
+/// would fail unrelated tests; see [`chmod_test_mutex`]. Guarded by a
 /// `ChmodFailGuard` whose `Drop` resets it so a panic between `store(true)`
 /// and the assertion cannot leak into subsequent tests in the same process.
 #[cfg(all(test, unix))]
 static SIMULATE_CHMOD_FAIL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Serializes the chmod-fail test against the two existing chmod-touching
-/// tests. `SIMULATE_CHMOD_FAIL` is process-global, and `cargo test` runs
-/// `#[tokio::test]`s in parallel by default, without this mutex the
-/// `connect_pool_returns_err_when_chmod_fails` test would race the other
-/// two and leak a transient `true` into their `connect_pool` calls.
+/// Serializes all tests that call `connect_pool` against the chmod-fail
+/// simulation. `SIMULATE_CHMOD_FAIL` is process-global state, and every
+/// `connect_pool` call reads it inside `restrict_file_permissions`, while
+/// `cargo test` runs `#[tokio::test]`s in parallel by default: without this
+/// mutex, `connect_pool_returns_err_when_chmod_fails` could leak a
+/// transient `true` into any other test's `connect_pool` call. The tests
+/// that hold it are every `connect_pool`-calling test of `unix_db_tests`
+/// (`connect_pool_writes_file_with_mode_0600`,
+/// `connect_pool_opens_the_literal_path_without_uri_decoding`,
+/// `connect_pool_restores_0600_on_existing_file_with_wrong_mode`,
+/// `connect_pool_restores_0600_on_the_wal_sidecars`,
+/// `a_symlinked_database_path_is_refused`,
+/// `connect_pool_returns_err_when_chmod_fails`,
+/// `parent_dir_gets_mode_0700_when_created`) and of the platform-neutral
+/// `connect_pool_tests`. The flag itself exists only on unix test builds,
+/// so the mutex is `cfg(all(test, unix))` too: on other platforms
+/// `connect_pool` reads no shared state.
 #[cfg(all(test, unix))]
 fn chmod_test_mutex() -> &'static tokio::sync::Mutex<()> {
     static MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -735,6 +840,10 @@ fn chmod_test_mutex() -> &'static tokio::sync::Mutex<()> {
 /// Confirm the database file is `0600` on Unix; abort with a hard error if
 /// the chmod fails so the operator notices a misconfigured database
 /// directory instead of running with a world-readable credentials file.
+///
+/// A file found with a mode other than `0600` is reported at `warn` with
+/// the mode that was found (`previous_mode`), so a stray umask or a copy is
+/// visible in the boot log without failing the startup over it.
 ///
 /// The mode is set on the file the path resolves to, and the check that
 /// follows reads the mode back through the same inode the chmod touched:
@@ -753,6 +862,14 @@ fn restrict_file_permissions(path: &std::path::Path) -> crate::Result<()> {
                 path = path.display()
             ))
         })?;
+        let previous_mode = meta.permissions().mode() & 0o777;
+        if previous_mode != 0o600 {
+            tracing::warn!(
+                path = %path.display(),
+                previous_mode = format!("{previous_mode:04o}"),
+                "database file had permissive mode, restoring 0600"
+            );
+        }
         let mut perms = meta.permissions();
         perms.set_mode(0o600);
         #[cfg(all(test, unix))]
@@ -827,19 +944,156 @@ fn sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
-#[cfg(all(test, unix))]
-mod unix_db_tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
+/// Test-only helpers shared by every test module of this file:
+/// platform-specific and platform-neutral tests alike get their scratch
+/// dir from here, so there is one `fresh_db_path` and the platform modules
+/// carry only their platform's tests.
+#[cfg(test)]
+mod db_test_support {
+    use super::tempdir_lite;
     use std::path::PathBuf;
 
     /// Each test gets its own scratch dir; the database lives inside it so
     /// the parent-dir creation path is exercised too.
-    fn fresh_db_path(label: &str) -> (tempdir_lite::TempDir, PathBuf) {
+    pub(super) fn fresh_db_path(label: &str) -> (tempdir_lite::TempDir, PathBuf) {
         let dir = tempdir_lite::TempDir::new(label);
         let path = dir.path().join("fumox.db");
         (dir, path)
     }
+}
+
+#[cfg(test)]
+mod connect_pool_tests {
+    use super::db_test_support::fresh_db_path;
+    use super::*;
+
+    /// The connection options are contract, not decoration: a connection
+    /// from the pool must carry `foreign_keys` and the configured
+    /// `busy_timeout`, the two PRAGMAs every connection enables.
+    #[tokio::test]
+    async fn every_connection_carries_the_configured_pragmas() {
+        // On unix test builds every `connect_pool` call reads the
+        // process-global `SIMULATE_CHMOD_FAIL` flag, so hold the same
+        // mutex as the chmod tests do (see `chmod_test_mutex`).
+        #[cfg(unix)]
+        let _serial = chmod_test_mutex().lock().await;
+        let (_dir, path) = fresh_db_path("db-pragmas");
+        let cfg = DatabaseConfig {
+            path: path.clone(),
+            busy_timeout_ms: 1234,
+            max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
+        };
+        let pool = connect_pool(&cfg).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign_keys, 1,
+            "foreign keys must be enforced by every pooled connection"
+        );
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            busy_timeout, 1234,
+            "busy_timeout must be the configured database.busy_timeout_ms"
+        );
+    }
+
+    /// The database file is the shared source of truth: two pools opened
+    /// on the same path must both see each other's writes through WAL.
+    #[tokio::test]
+    async fn two_pools_on_one_file_see_each_others_writes() {
+        #[cfg(unix)]
+        let _serial = chmod_test_mutex().lock().await;
+        let (_dir, path) = fresh_db_path("db-two-pools");
+        let cfg = DatabaseConfig {
+            path: path.clone(),
+            busy_timeout_ms: 1000,
+            max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
+        };
+        let pool_a = connect_pool(&cfg).await.unwrap();
+        let pool_b = connect_pool(&cfg).await.unwrap();
+        sqlx::query("CREATE TABLE shared (id INTEGER PRIMARY KEY, value TEXT)")
+            .execute(&pool_a)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO shared (value) VALUES ('from-a')")
+            .execute(&pool_a)
+            .await
+            .unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM shared")
+            .fetch_one(&pool_b)
+            .await
+            .unwrap();
+        assert_eq!(
+            value, "from-a",
+            "the second pool must see the first pool's write"
+        );
+    }
+
+    /// A zero-sized pool is a config error, not a runtime condition: sqlx
+    /// accepts `max_connections(0)` and then fails every acquisition with
+    /// `PoolTimedOut` 30 s later, so without this guard a typo in
+    /// `[database]` costs the operator a 30 s startup stall and a
+    /// `PoolTimedOut` that never names the offending key.
+    #[tokio::test]
+    async fn connect_pool_rejects_zero_max_connections() {
+        let (_dir, path) = fresh_db_path("db-zero-conns");
+        let cfg = DatabaseConfig {
+            path: path.clone(),
+            busy_timeout_ms: 1000,
+            max_connections: 0,
+            synchronous: crate::config::SynchronousMode::Normal,
+            allow_checksum_repair: false,
+        };
+        let err = connect_pool(&cfg).await.unwrap_err();
+        assert!(
+            err.to_string().contains("max_connections"),
+            "expected the error to name database.max_connections, got: {err}"
+        );
+        // Rejected before the pool is built, so the file was never touched.
+        assert!(
+            !path.exists(),
+            "the config error must fire before pre_create_db_file"
+        );
+    }
+
+    /// The durability level is a deployment decision, so it comes from the
+    /// config and reaches SQLite.
+    #[tokio::test]
+    async fn the_synchronous_mode_comes_from_the_config() {
+        #[cfg(unix)]
+        let _serial = chmod_test_mutex().lock().await;
+        let (_dir, path) = fresh_db_path("db-synchronous");
+        let cfg = DatabaseConfig {
+            path: path.clone(),
+            busy_timeout_ms: 1000,
+            max_connections: 1,
+            synchronous: crate::config::SynchronousMode::Full,
+            allow_checksum_repair: false,
+        };
+        let pool = connect_pool(&cfg).await.unwrap();
+        let mode: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, 2, "FULL is reported as 2 by SQLite, got {mode}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_db_tests {
+    use super::db_test_support::fresh_db_path;
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn connect_pool_writes_file_with_mode_0600() {
@@ -894,33 +1148,10 @@ mod unix_db_tests {
         );
     }
 
-    /// A zero-sized pool is a config error, not a runtime condition: sqlx
-    /// accepts `max_connections(0)` and then fails every acquisition with
-    /// `PoolTimedOut` 30 s later, so without this guard a typo in
-    /// `[database]` costs the operator a 30 s startup stall and a
-    /// `PoolTimedOut` that never names the offending key.
-    #[tokio::test]
-    async fn connect_pool_rejects_zero_max_connections() {
-        let (_dir, path) = fresh_db_path("db-zero-conns");
-        let cfg = DatabaseConfig {
-            path: path.clone(),
-            busy_timeout_ms: 1000,
-            max_connections: 0,
-            synchronous: crate::config::SynchronousMode::Normal,
-            allow_checksum_repair: false,
-        };
-        let err = connect_pool(&cfg).await.unwrap_err();
-        assert!(
-            err.to_string().contains("max_connections"),
-            "expected the error to name database.max_connections, got: {err}"
-        );
-        // Rejected before the pool is built, so the file was never touched.
-        assert!(
-            !path.exists(),
-            "the config error must fire before pre_create_db_file"
-        );
-    }
-
+    /// An existing database file with a permissive mode is restored to
+    /// `0600` before SQLite opens it — so the `-wal`/`-shm` sidecars
+    /// SQLite creates at open time inherit the private mode — and the
+    /// restoration is logged at `warn` with the mode that was found.
     #[tokio::test]
     async fn connect_pool_restores_0600_on_existing_file_with_wrong_mode() {
         let _serial = chmod_test_mutex().lock().await;
@@ -932,6 +1163,50 @@ mod unix_db_tests {
         perms.set_mode(0o644);
         std::fs::set_permissions(&path, perms).unwrap();
 
+        // The restoration names the mode it found in a `warn!`. The
+        // production call site runs inside `spawn_blocking`, whose threads
+        // cannot see the thread-local test subscriber, so the call is
+        // repeated here on the test thread purely to capture the log line.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = std::sync::Arc::clone(&captured);
+        struct CapturedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CapturedWriter(std::sync::Arc::clone(&writer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            restrict_file_permissions(&path).unwrap();
+        });
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("had permissive mode"),
+            "the permissive-mode restoration must be logged at warn: {log}"
+        );
+        assert!(
+            log.contains("previous_mode=\"0644\""),
+            "the log line must carry the mode that was found: {log}"
+        );
+        assert!(
+            log.contains(path.to_str().unwrap()),
+            "the log line must name the database file: {log}"
+        );
+
+        // Put the permissive mode back: the pool must restore 0600 itself,
+        // before it opens the file.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+
         let cfg = DatabaseConfig {
             path: path.clone(),
             busy_timeout_ms: 1000,
@@ -939,10 +1214,30 @@ mod unix_db_tests {
             synchronous: crate::config::SynchronousMode::Normal,
             allow_checksum_repair: false,
         };
-        let _pool = connect_pool(&cfg).await.unwrap();
-        // The chmod-confirmation step brought it back to 0600.
+        let pool = connect_pool(&cfg).await.unwrap();
+        // The restore-before-open step brought it back to 0600.
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        // SQLite created the sidecars while the file was already private,
+        // so they carry the same mode.
+        sqlx::query("CREATE TABLE wal_probe (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sidecar_path(&path, suffix);
+            if !sidecar.exists() {
+                continue;
+            }
+            let mode = std::fs::metadata(&sidecar).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "{} must inherit the database's private mode",
+                sidecar.display()
+            );
+        }
     }
 
     /// The WAL sidecars hold the same rows as the database file, so they
@@ -1017,27 +1312,6 @@ mod unix_db_tests {
             err.to_string().contains("symlink"),
             "the error must name the reason: {err}"
         );
-    }
-
-    /// The durability level is a deployment decision, so it comes from the
-    /// config and reaches SQLite.
-    #[tokio::test]
-    async fn the_synchronous_mode_comes_from_the_config() {
-        let _serial = chmod_test_mutex().lock().await;
-        let (_dir, path) = fresh_db_path("db-synchronous");
-        let cfg = DatabaseConfig {
-            path: path.clone(),
-            busy_timeout_ms: 1000,
-            max_connections: 1,
-            synchronous: crate::config::SynchronousMode::Full,
-            allow_checksum_repair: false,
-        };
-        let pool = connect_pool(&cfg).await.unwrap();
-        let mode: i64 = sqlx::query_scalar("PRAGMA synchronous")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(mode, 2, "FULL is reported as 2 by SQLite, got {mode}");
     }
 
     /// Panic-safe RAII handle for `SIMULATE_CHMOD_FAIL`. The Drop resets the
@@ -1120,17 +1394,8 @@ mod unix_db_tests {
 
 #[cfg(all(test, not(unix)))]
 mod non_unix_db_tests {
+    use super::db_test_support::fresh_db_path;
     use super::*;
-    use std::path::PathBuf;
-
-    /// Fresh scratch dir per test, mirroring `unix_db_tests::fresh_db_path`
-    /// (the existing `tempdir_lite` helper is now compiled on every
-    /// platform).
-    fn fresh_db_path(label: &str) -> (tempdir_lite::TempDir, PathBuf) {
-        let dir = tempdir_lite::TempDir::new(label);
-        let path = dir.path().join("fumox.db");
-        (dir, path)
-    }
 
     /// Pins the platform split of `create_if_missing`: on non-Unix we ask
     /// sqlx to create the file, so a fresh non-existent path must produce
@@ -1204,7 +1469,24 @@ pub mod tempdir_lite {
         path: PathBuf,
     }
     impl TempDir {
+        /// Creates a fresh `fumox-test-<label>-<pid>-<n>` directory under
+        /// the system temp dir, first removing any leftover tree of the
+        /// same name, so the directory the caller gets back is empty.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `label` carries a character outside
+        /// `[A-Za-z0-9_-]`: the label becomes a path component, and a `..`
+        /// or a separator could name a directory outside the system temp
+        /// dir. Panics on an I/O error too — the directory cannot be
+        /// created, there is nothing the calling test could recover from.
         pub fn new(label: &str) -> Self {
+            assert!(
+                label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "tempdir label must match [A-Za-z0-9_-], got {label:?}",
+            );
             let unique = SEQ.fetch_add(1, Ordering::Relaxed);
             let base = std::env::temp_dir().join(format!(
                 "fumox-test-{label}-{}-{}",
@@ -1212,9 +1494,24 @@ pub mod tempdir_lite {
                 unique
             ));
             let _ = std::fs::remove_dir_all(&base);
-            std::fs::create_dir_all(&base).unwrap();
+            std::fs::create_dir_all(&base).expect("failed to create the test tempdir");
+            // The created path stays inside the system temp dir even when
+            // TMPDIR itself resolves through a symlink (/var ->
+            // /private/var on macOS): compare the canonical forms, the
+            // textual ones differ in that case.
+            if let (Ok(created), Ok(root)) = (
+                std::fs::canonicalize(&base),
+                std::fs::canonicalize(std::env::temp_dir()),
+            ) {
+                assert!(
+                    created.starts_with(&root),
+                    "tempdir escaped the system temp dir: {created:?} is not under {root:?}",
+                );
+            }
             Self { path: base }
         }
+        /// The path of the directory, valid only while `self` is alive:
+        /// `Drop` removes the whole tree under it.
         pub fn path(&self) -> &std::path::Path {
             &self.path
         }
@@ -1245,6 +1542,29 @@ mod tempdir_tests {
         assert!(
             !path.exists(),
             "the scoped tempdir must remove its tree on drop"
+        );
+    }
+
+    /// A label becomes a path component: `..` or a separator could name a
+    /// directory outside the system temp dir, so the label set is
+    /// restricted and anything outside it is rejected.
+    #[test]
+    #[should_panic(expected = "tempdir label")]
+    fn tempdir_rejects_a_label_with_dotdot() {
+        let _ = TempDir::new("..");
+    }
+
+    /// The directory lands inside the system temp dir even when TMPDIR
+    /// itself resolves through a symlink (/var -> /private/var on macOS):
+    /// the canonical created path must be under the canonical temp root.
+    #[test]
+    fn tempdir_lands_inside_the_system_temp_dir() {
+        let dir = TempDir::new("inside-temp");
+        let created = std::fs::canonicalize(dir.path()).unwrap();
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(
+            created.starts_with(&root),
+            "{created:?} must sit inside the system temp dir {root:?}"
         );
     }
 }

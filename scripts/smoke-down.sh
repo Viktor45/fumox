@@ -97,16 +97,40 @@ for engine in "${ENGINES[@]}"; do
             ;;
     esac
 
-    # An empty "${arr[@]}" is fatal under `set -u` on the stock macOS bash 3.2,
-    # which is what the default (no volume deletion) puts VOLUME_FLAGS in; the
-    # + guard expands to nothing there. COMPOSE is never empty here, but is
-    # guarded the same way.
-    if ${COMPOSE[@]+"${COMPOSE[@]}"} -p "$SMOKE_PROJECT" down --remove-orphans \
-        ${VOLUME_FLAGS[@]+"${VOLUME_FLAGS[@]}"}; then
+    # podman-compose (the standalone front-end) learned --remove-orphans
+    # late, and a version without it rejects the whole down call. The flag
+    # is probed rather than parsed out of a version string: `down --help`
+    # lists it when the front-end knows it and errors out when it does not.
+    DOWN_FLAGS=(--remove-orphans)
+    if [ "${COMPOSE[0]}" = "podman-compose" ] \
+        && ! podman-compose down --help 2>&1 | grep -q -- --remove-orphans; then
+        DOWN_FLAGS=()
+        echo ">> podman-compose: no --remove-orphans support, tearing down without it" >&2
+    fi
+
+    # The down call is bounded like the info call above: a hung daemon must
+    # not wedge the teardown, and a timeout (124) counts as a failed
+    # teardown so the next engine still gets its turn. An empty "${arr[@]}"
+    # is fatal under `set -u` on the stock macOS bash 3.2, which is what the
+    # default (no volume deletion) puts VOLUME_FLAGS in, and DOWN_FLAGS is
+    # in that same state when --remove-orphans is not supported; the + guard
+    # expands to nothing there. COMPOSE is never empty here, but is guarded
+    # the same way.
+    set +e
+    run_with_timeout 120 ${COMPOSE[@]+"${COMPOSE[@]}"} -p "$SMOKE_PROJECT" down \
+        ${DOWN_FLAGS[@]+"${DOWN_FLAGS[@]}"} \
+        ${VOLUME_FLAGS[@]+"${VOLUME_FLAGS[@]}"}
+    down_status=$?
+    set -e
+    if [ "$down_status" -eq 0 ]; then
         torn_down=true
         break
     fi
-    echo ">> $engine: the teardown failed, trying the next engine" >&2
+    if [ "$down_status" -eq 124 ]; then
+        echo ">> $engine: the teardown timed out, trying the next engine" >&2
+    else
+        echo ">> $engine: the teardown failed, trying the next engine" >&2
+    fi
 done
 
 if [ "$torn_down" != "true" ]; then

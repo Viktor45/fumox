@@ -85,8 +85,9 @@ allowed_hosts = []
 export_max_rows = 50000
 # Диапазон: N = 1..=1000000 запросов (форма), окно = sec | min | hour | day.
 # Голое целое без «/» тоже принимается и читается как «в минуту».
-# Per-IP limit for every public request (60 s window), a general ceiling
-# against scraping and floods.
+# Per-IP limit for every public request, a general ceiling against scraping
+# and floods. The window is determined by the value suffix ("300/min" is a
+# one-minute window).
 # Range: N = 1..=1000000 requests (form), window = sec | min | hour | day.
 # A bare integer is also accepted and reads as per-minute.
 rate_limit = "300/min"
@@ -98,9 +99,11 @@ auth_fail_rate_limit = "30/min"
 
 [database]
 # Путь к файлу SQLite, без диапазона: каталог должен существовать и быть
-# доступен на запись обоим процессам.
+# доступен на запись обоим процессам. Относительный путь разрешается от
+# рабочего каталога процесса (в контейнере — /app).
 # SQLite (WAL), the single source of truth. No range: the directory must
-# exist and be writable by both processes.
+# exist and be writable by both processes. A relative path resolves against
+# the process working directory (/app in the container).
 path = "fumox.db"
 # Диапазон: 100..=60000 мс (форма). Обязателен: пишут два процесса
 # (server и probe), без него второй не ждет занятую базу, а получает
@@ -248,14 +251,16 @@ removed_as_unknown = false
 # is writable.
 enabled = true
 # Каталог с файлами .mmdb, без диапазона: путь должен существовать.
-# «config», дефолт рядом с бинарником: удобно для dev-сборки и одиночного запуска.
+# Относительный путь разрешается от рабочего каталога процесса (в контейнере
+# — /app), поэтому «config» удобен для dev-сборки и одиночного запуска.
 # В проде задайте абсолютный путь к read-only тому с актуальными .mmdb
 # ВНИМАНИЕ: поставляемый стек Docker Compose переопределяет это на
 # /shared/geo (переменная FUMOX_GEO__DB_DIR), а окружение приоритетнее файла,
 # поэтому на этом стеке значение из файла не применяется: базы кладите в том
 # fumox-geo.
 # Directory holding the .mmdb files, no range: the path must exist.
-# "config" is the default next to the binary, convenient for dev.
+# A relative path resolves against the process working directory (/app in
+# the container), which is what makes "config" convenient for dev.
 # In prod set an absolute path to a read-only volume with fresh .mmdb
 # NOTE: the shipped Docker Compose stack overrides this to /shared/geo
 # (FUMOX_GEO__DB_DIR), and the environment outranks the file, so the value
@@ -378,13 +383,15 @@ rate_limit = "120/min"
 # form is the one thing being brute-forced.
 login_rate_limit = "5/min"
 # Каталог с переводами админки (<код>.toml), без диапазона: новый файл = новый
-# язык после рестарта. Язык берется из cookie lang, а не из Accept-Language;
-# кода без файла за ним не существует, отдается язык по умолчанию (ru, если
-# его каталог на месте, иначе первый в алфавитном порядке).
+# язык после рестарта. Относительный путь разрешается от рабочего каталога
+# процесса (в контейнере — /app). Язык берется из cookie lang, а не из
+# Accept-Language; кода без файла за ним не существует, отдается язык по
+# умолчанию (ru, если его каталог на месте, иначе первый в алфавитном порядке).
 # Directory of admin UI translation catalogs (<code>.toml), no range: a new
-# file adds a language after a restart. The language comes from the `lang`
-# cookie, not from Accept-Language; a code with no catalog behind it falls
-# back to the default (ru if present, else the first alphabetically).
+# file adds a language after a restart. A relative path resolves against the
+# process working directory (/app in the container). The language comes from
+# the `lang` cookie, not from Accept-Language; a code with no catalog behind
+# it falls back to the default (ru if present, else the first alphabetically).
 locales_dir = "locales"
 # Список CIDR произвольной длины; пусто = forwarded-заголовки игнорируются.
 # Reverse-proxy CIDRs for the admin per-IP rate-limit key. Empty = ignore

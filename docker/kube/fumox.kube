@@ -24,7 +24,10 @@ Yaml=fumox-pod.yaml
 KubeDownForce=true
 
 [Service]
-Restart=on-failure
+# Same policy as the quadlet .container units: restart unless the operator
+# stopped the unit, with a delay that throttles a crash loop.
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=default.target

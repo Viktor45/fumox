@@ -42,15 +42,33 @@ DROPPED = ["Internal"]
 # The date field of a draft line: the cliff template writes %Y-%m-%d.
 # Everything else is the draft's header, not a commit.
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The sha field: a full or abbreviated git object name, lowercase hex. A
+# header fragment that happens to carry three pipes must not reach the
+# section anchor (`## <date> · sha-<sha>`), where it would be printed as is.
+SHA = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def sanitize_message(message):
+    """Fold a commit subject onto one line and defuse Markdown syntax.
+
+    A subject with a raw newline or tab would split the bullet, so
+    whitespace runs collapse to one space. `[`, `]`, `(` and `)` are
+    backslash-escaped: a subject that carries `[text](url)` would
+    otherwise be read as a Markdown link by every renderer that
+    re-parses CHANGELOG.md.
+    """
+    message = re.sub(r"[\r\n\t ]+", " ", message).strip()
+    return re.sub(r"([\[\]()])", r"\\\1", message)
 
 
 def parse_draft(lines):
     """Yield (date, sha, category, message) for every draft line.
 
-    A line is a commit only when it has all four fields and a date that
-    looks like one. The header git-cliff writes above the draft has no
-    pipes at all, but a header line that happens to carry three of them
-    must not be mistaken for a commit.
+    A line is a commit only when it has all four fields, a date that
+    looks like one and a sha that is a git object name. The header
+    git-cliff writes above the draft has no pipes at all, but a header
+    line that happens to carry three of them must not be mistaken for a
+    commit.
     """
     for line in lines:
         line = line.rstrip("\r\n")
@@ -60,7 +78,9 @@ def parse_draft(lines):
         date, sha, category, message = parts
         if not DATE.match(date):
             continue
-        yield date, sha, category, message
+        if not SHA.match(sha):
+            continue
+        yield date, sha, category, sanitize_message(message)
 
 
 def main() -> None:
@@ -76,9 +96,13 @@ def main() -> None:
             unknown.setdefault(category, None)
         days.setdefault(date, []).append((sha, category, message))
 
-    for date, commits in days.items():
+    for date in sorted(days):
         # The image tag carries the sha of the LAST commit of the batch
-        # (docker/metadata-action tags the built ref).
+        # (docker/metadata-action tags the built ref). Within a day the
+        # draft arrives in commit order (git-cliff sorts oldest first), so
+        # the last entry is the anchor; only the days themselves are
+        # re-ordered here, so the sections do not depend on input order.
+        commits = days[date]
         anchor = commits[-1][0]
         print(f"## {date} · sha-{anchor}\n")
         by_cat: "OrderedDict[str, list[str]]" = OrderedDict()

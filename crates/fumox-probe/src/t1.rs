@@ -597,6 +597,25 @@ mod tests {
         port
     }
 
+    /// A TCP listener that accepts and stays silent: no read, no write and
+    /// no close, so a handshake cannot fail early and can only end at its
+    /// deadline.
+    async fn silent_listener() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Dropping the stream would close the connection and
+                    // fail the handshake with an EOF instead of a timeout.
+                    let _held = stream;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        port
+    }
+
     #[tokio::test]
     async fn tls_check_completes_the_handshake() {
         let (port, _seen) = tls_listener().await;
@@ -659,6 +678,32 @@ mod tests {
         assert!(
             error.starts_with("tls handshake failed"),
             "the failure must name the handshake, got {error}"
+        );
+    }
+
+    /// A handshake against a listener that never speaks runs into the
+    /// deadline. The clock is paused, so the two-second timeout is
+    /// virtual: the runtime advances it the moment nothing else is left
+    /// to do, and the test waits no real time.
+    #[tokio::test(start_paused = true)]
+    async fn tls_check_times_out_against_a_silent_listener() {
+        let port = silent_listener().await;
+        let result = run(
+            &Target {
+                host: "localhost",
+                server_name: None,
+                port,
+                kind: CheckKind::Tls,
+                vetted: &["127.0.0.1".parse().unwrap()],
+            },
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        let error = result.expect_err("a silent listener cannot complete a handshake");
+        assert!(
+            error.starts_with("tls handshake timed out"),
+            "the failure must be the deadline, got {error}"
         );
     }
 

@@ -23,19 +23,21 @@ impl TryFrom<ProfileRow> for Profile {
 
     fn try_from(row: ProfileRow) -> Result<Self, Self::Error> {
         Ok(Profile {
-            id: row.id,
+            // Cloned so the id can still name the row in the corrupt-JSON
+            // errors the field mappings below may raise.
+            id: row.id.clone(),
             slug: row.slug,
             access_token: row.access_token,
             name: row.name,
             output_format: row.output_format.parse()?,
             pipeline: row
                 .pipeline
-                .map(|text| super::text_to_json(&text, "profiles.pipeline"))
+                .map(|text| super::text_to_json(&text, "profiles.pipeline", &row.id))
                 .transpose()?,
             countries: row
                 .countries
                 .map(|text| {
-                    super::text_to_json(&text, "profiles.countries")
+                    super::text_to_json(&text, "profiles.countries", &row.id)
                         .and_then(|value| {
                             serde_json::from_value::<Vec<String>>(value).map_err(|e| {
                                 crate::Error::Parse(format!("corrupt profiles.countries JSON: {e}"))
@@ -45,6 +47,10 @@ impl TryFrom<ProfileRow> for Profile {
                 })
                 .transpose()?
                 .unwrap_or_default(),
+            // The geo-unknown flag lives in the model for now; the
+            // schema carries no column for it, so a row loads with the
+            // historical semantics.
+            include_unknown_country: false,
             enabled: row.enabled != 0,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -63,11 +69,15 @@ fn normalize_countries(list: Vec<String>) -> Vec<String> {
 }
 
 /// `Vec<String>` → stored TEXT: `None` when empty, else a JSON array.
+/// The list is normalized on the way in (trimmed, uppercased,
+/// blank- and duplicate-free), so the stored JSON is canonical; the
+/// read path normalizes too, as a guard for rows written before this.
 fn countries_to_text(list: &[String]) -> crate::Result<Option<String>> {
-    if list.is_empty() {
+    let norm = normalize_countries(list.to_vec());
+    if norm.is_empty() {
         return Ok(None);
     }
-    let value = serde_json::to_value(list)
+    let value = serde_json::to_value(&norm)
         .map_err(|e| crate::Error::Parse(format!("cannot serialize profiles.countries: {e}")))?;
     Ok(Some(super::json_to_text(&value)?))
 }
@@ -370,20 +380,31 @@ pub struct ProfileListRow {
     pub proxies_count: i64,
 }
 
-/// The admin profiles list, oldest profile first.
+/// The admin profiles list, newest profile first — the same order the
+/// sources screen uses.
+///
+/// Both counts come from one grouped pass each (a subquery per row used
+/// to re-run the ready-proxy join once per profile): the aggregates are
+/// computed once over the whole composition table and joined back, so
+/// the screen costs two grouped scans instead of `2 * profiles` joins.
 pub async fn list_with_counts(pool: &DbPool) -> crate::Result<Vec<ProfileListRow>> {
     let rows: Vec<ProfileListRow> = sqlx::query_as(
         "SELECT p.id, p.name, p.slug, p.output_format, p.enabled,
                 p.access_token IS NOT NULL AS protected,
-                (SELECT COUNT(*) FROM profile_sources ps WHERE ps.profile_id = p.id) AS sources_count,
-                (SELECT COUNT(DISTINCT px.id)
-                 FROM profile_sources ps
-                 JOIN proxy_source_links l ON l.source_id = ps.source_id
-                 JOIN proxies px ON px.id = l.proxy_id
-                 WHERE ps.profile_id = p.id
-                   AND px.status = 'ready') AS proxies_count
+                COALESCE(src.sources_count, 0) AS sources_count,
+                COALESCE(ready.proxies_count, 0) AS proxies_count
          FROM profiles p
-         ORDER BY p.created_at",
+         LEFT JOIN (SELECT profile_id, COUNT(*) AS sources_count
+                    FROM profile_sources GROUP BY profile_id) src
+                ON src.profile_id = p.id
+         LEFT JOIN (SELECT ps.profile_id, COUNT(DISTINCT px.id) AS proxies_count
+                    FROM profile_sources ps
+                    JOIN proxy_source_links l ON l.source_id = ps.source_id
+                    JOIN proxies px ON px.id = l.proxy_id
+                    WHERE px.status = 'ready'
+                    GROUP BY ps.profile_id) ready
+                ON ready.profile_id = p.id
+         ORDER BY p.created_at DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -457,6 +478,7 @@ mod tests {
             output_format: OutputFormat::Base64,
             pipeline: Some(serde_json::json!({"version": 1, "steps": []})),
             countries: Vec::new(),
+            include_unknown_country: false,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -509,6 +531,16 @@ mod tests {
                 .id,
             "prf1aaaaaaa"
         );
+        // The raw id resolves too; an unknown token resolves to nothing.
+        assert_eq!(
+            resolve_token(&pool, "prf1aaaaaaa")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "prf1aaaaaaa"
+        );
+        assert!(resolve_token(&pool, "nope").await.unwrap().is_none());
 
         profile.name = "Renamed".into();
         profile.output_format = OutputFormat::UriList;
@@ -591,6 +623,72 @@ mod tests {
         // Deleting the profile cascades to the composition.
         delete(&pool, "prf2bbbbbbb").await.unwrap();
         assert!(get_sources(&pool, "prf2bbbbbbb").await.unwrap().is_empty());
+    }
+
+    /// A composition naming a source that does not exist is refused, and
+    /// the failure leaves the stored composition untouched: the write runs
+    /// in one transaction, so a broken insert anywhere in the list rolls
+    /// the whole replacement back. A partially valid list fails the same
+    /// way — one bad source id must not wipe the members before it.
+    #[tokio::test]
+    async fn a_failing_composition_write_keeps_the_previous_members() {
+        let (_dir, pool) = temp_pool().await;
+        let profile = sample_profile("prf5eeeeeee");
+        create(&pool, &profile).await.unwrap();
+        for id in ["srcA0000000", "srcB0000000"] {
+            sources_repo::create(&pool, &sample_source(id))
+                .await
+                .unwrap();
+        }
+        replace_sources(
+            &pool,
+            "prf5eeeeeee",
+            &[("srcA0000000".into(), 0), ("srcB0000000".into(), 1)],
+        )
+        .await
+        .unwrap();
+        let stored = || async { get_sources(&pool, "prf5eeeeeee").await.unwrap() };
+        let before = stored().await;
+
+        // Full replacement with one unknown id: refused, nothing written.
+        assert!(
+            replace_sources(&pool, "prf5eeeeeee", &[("srcXzzzzzzzz".into(), 0)])
+                .await
+                .is_err()
+        );
+        assert_eq!(stored().await, before, "the refused write changes nothing");
+
+        // A partially valid list fails on the bad id and keeps the old
+        // members whole: the members inserted before the failure are rolled
+        // back with it.
+        assert!(
+            replace_sources(
+                &pool,
+                "prf5eeeeeee",
+                &[
+                    ("srcA0000000".into(), 0),
+                    ("srcXzzzzzzzz".into(), 1),
+                    ("srcB0000000".into(), 2),
+                ],
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            stored().await,
+            before,
+            "the failed partial replacement keeps the old composition"
+        );
+
+        // The same refusal through `upsert_with_sources`, the writer the
+        // admin form uses: the profile row and the composition roll back
+        // together.
+        assert!(
+            upsert_with_sources(&pool, &profile, &[("srcXzzzzzzzz".into(), 0)], false,)
+                .await
+                .is_err()
+        );
+        assert_eq!(stored().await, before);
     }
 
     /// Minimal proxies row for the admin list/card fixtures.

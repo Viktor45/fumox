@@ -4972,6 +4972,7 @@ async fn io_fixture(state: &AdminState) {
         output_format: fumox_core::models::OutputFormat::Clash,
         pipeline: None,
         countries: Vec::new(),
+        include_unknown_country: false,
         enabled: true,
         created_at: now,
         updated_at: now,
@@ -6216,9 +6217,13 @@ async fn fetch_journal_tables_keep_columns_single_line() {
             error_class: Some(fumox_core::models::ErrorClass::Network),
         },
     ] {
-        fumox_core::repo::fetch_log::insert(&pool, &entry)
-            .await
-            .unwrap();
+        fumox_core::repo::fetch_log::insert(
+            &pool,
+            &entry,
+            fumox_core::repo::fetch_log::FetchTiming::default(),
+        )
+        .await
+        .unwrap();
     }
 
     let app = router(state.clone());
@@ -6805,6 +6810,7 @@ async fn saving_a_profile_in_the_panel_refreshes_the_public_subscription() {
         output_format: fumox_core::models::OutputFormat::UriList,
         pipeline: None,
         countries: Vec::new(),
+        include_unknown_country: false,
         enabled: true,
         created_at: now,
         updated_at: now,

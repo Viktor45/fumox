@@ -114,7 +114,14 @@ impl FromStr for Scheme {
                 return Ok(*scheme);
             }
         }
-        Err(crate::Error::Parse(format!("unknown scheme: {s:?}")))
+        Err(crate::Error::Parse(format!(
+            "unknown scheme: {s:?} (expected one of: {})",
+            Scheme::all()
+                .iter()
+                .map(|scheme| scheme.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
     }
 }
 
@@ -149,6 +156,22 @@ impl Serialize for Scheme {
 /// `alive` by any failed T2 outcome. The tiers do not overlap, `alive`
 /// means T1-alive without a fresh successful T2, `ready` means alive plus
 /// the confirmed tunnel.
+///
+/// The other three tiers, and who moves a row into them:
+///
+/// - `unknown` — not checked yet: the state every freshly ingested row
+///   starts in (the probe daemon has no verdict on it), and the state the
+///   admin "reset status" action returns a row to.
+/// - `quarantine` — set by the probe daemon through the fail ladder
+///   (`apply_failed_check` in `crates/fumox-core/src/repo/proxies.rs`):
+///   after `[probe].fail_limit` consecutive failed checks, with the
+///   second chance scheduled at `quarantined_at + min + jitter`. The row
+///   waits there for the second chance and the recheck ladder.
+/// - `removed` — terminal: the end of the recheck ladder (the final
+///   recheck failed) or an admin removal (the `status = 'removed'`
+///   transitions in `crates/fumox-core/src/repo/proxies.rs`). A feed that
+///   still carries the proxy can revive it only when
+///   `[ingest].removed_as_unknown` is on, or the admin resets it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyStatus {
@@ -194,20 +217,24 @@ impl FromStr for ProxyStatus {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let status = match s {
-            "unknown" => ProxyStatus::Unknown,
-            "alive" => ProxyStatus::Alive,
-            "ready" => ProxyStatus::Ready,
-            "quarantine" => ProxyStatus::Quarantine,
-            "removed" => ProxyStatus::Removed,
-            other => {
-                return Err(crate::Error::Parse(format!(
-                    "unknown proxy status: {other:?}"
-                )));
+        for status in ProxyStatus::all() {
+            if status.as_str() == s {
+                return Ok(*status);
             }
-        };
-        Ok(status)
+        }
+        Err(crate::Error::Parse(format!(
+            "unknown proxy status: {s:?} (expected one of: {})",
+            wire_name_list(ProxyStatus::all(), |status| status.as_str())
+        )))
     }
+}
+
+/// The comma-separated wire names of an enum's `all()` list: the text the
+/// `FromStr` errors quote, so the operator sees which values are accepted
+/// without reading the source. One shared helper, so the six wire-name
+/// enums cannot drift into six different spellings of the same sentence.
+fn wire_name_list<T>(values: &[T], name: impl Fn(&T) -> &'static str) -> String {
+    values.iter().map(name).collect::<Vec<_>>().join(", ")
 }
 
 /// Fetch error classification (`sources.error_class`, `fetch_log.error_class`).
@@ -237,6 +264,18 @@ impl ErrorClass {
             ErrorClass::Storage => "storage",
         }
     }
+
+    /// Every class, the source for the `FromStr` error and the wire-name
+    /// round-trip test.
+    pub const fn all() -> &'static [ErrorClass] {
+        &[
+            ErrorClass::Network,
+            ErrorClass::HttpServer,
+            ErrorClass::HttpClient,
+            ErrorClass::ParseError,
+            ErrorClass::Storage,
+        ]
+    }
 }
 
 impl fmt::Display for ErrorClass {
@@ -249,19 +288,15 @@ impl FromStr for ErrorClass {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let class = match s {
-            "network" => ErrorClass::Network,
-            "http_server" => ErrorClass::HttpServer,
-            "http_client" => ErrorClass::HttpClient,
-            "parse_error" => ErrorClass::ParseError,
-            "storage" => ErrorClass::Storage,
-            other => {
-                return Err(crate::Error::Parse(format!(
-                    "unknown error class: {other:?}"
-                )));
+        for class in ErrorClass::all() {
+            if class.as_str() == s {
+                return Ok(*class);
             }
-        };
-        Ok(class)
+        }
+        Err(crate::Error::Parse(format!(
+            "unknown error class: {s:?} (expected one of: {})",
+            wire_name_list(ErrorClass::all(), |class| class.as_str())
+        )))
     }
 }
 
@@ -280,6 +315,12 @@ pub struct Param {
     /// serialization can emit the original bytes.
     pub value: String,
     pub known: bool,
+    /// The source wrote the pair without an `=` separator (`?k`, not
+    /// `?k=`), so serialization must emit the bare key again to keep the
+    /// byte-exact round-trip. Only the URI query parser sets it; every
+    /// other source leaves it `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bare: bool,
 }
 
 /// Certificate-verification toggle spellings seen across the wire formats:
@@ -295,6 +336,14 @@ pub const INSECURE_ALIASES: [&str; 4] = [
     "skip-cert-verify",
     "allow_insecure",
 ];
+
+/// The Shadowsocks cipher assumed when a source spells the password only:
+/// the ss credential is stored as `method:password`, so every producer of a
+/// colon-less credential (the Clash parser, the writers' fallback for rows
+/// predating the parse-time canonicalization) must name the same default,
+/// or the same node would serialize with two different ciphers and the
+/// fingerprint would not merge it with its explicit-cipher twin.
+pub const DEFAULT_SS_CIPHER: &str = "chacha20-ietf-poly1305";
 
 /// Whether `value` spells a truthy toggle (`1` / `true` / `yes` / `on`,
 /// trimmed and case-insensitive). The one vocabulary shared by every toggle
@@ -356,6 +405,15 @@ pub struct ProxyEntry {
     /// a secret too.
     #[serde(skip_serializing)]
     pub raw_line: String,
+    /// Cached canonical (URI-vocabulary) parameters of a structured entry,
+    /// computed once at parse time so a repeated `serialize` does not
+    /// re-parse the stored YAML blocks (`parsers::with_canonical_cache`).
+    /// `None` for URI-parsed entries (they keep their stored spellings) and
+    /// for records rebuilt from SQLite, where `parsers::canonical_uri_entry`
+    /// is the fallback. A transient cache: never serialized, and the
+    /// parameters it mirrors are not mutated after parsing.
+    #[serde(skip)]
+    pub canonical: Option<Vec<Param>>,
 }
 
 impl ProxyEntry {
@@ -486,21 +544,27 @@ impl IpFamily {
             IpFamily::Ipv6 => "ipv6",
         }
     }
+
+    /// Every family, the source for the `FromStr` error and the wire-name
+    /// round-trip test.
+    pub const fn all() -> &'static [IpFamily] {
+        &[IpFamily::Any, IpFamily::Ipv4, IpFamily::Ipv6]
+    }
 }
 
 impl FromStr for IpFamily {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let family = match s {
-            "any" => IpFamily::Any,
-            "ipv4" => IpFamily::Ipv4,
-            "ipv6" => IpFamily::Ipv6,
-            other => {
-                return Err(crate::Error::Parse(format!("unknown IP family: {other:?}")));
+        for family in IpFamily::all() {
+            if family.as_str() == s {
+                return Ok(*family);
             }
-        };
-        Ok(family)
+        }
+        Err(crate::Error::Parse(format!(
+            "unknown IP family: {s:?} (expected one of: {})",
+            wire_name_list(IpFamily::all(), |family| family.as_str())
+        )))
     }
 }
 
@@ -523,6 +587,15 @@ pub struct Profile {
     /// Empty = every country; while set, proxies with no determined country
     /// stay out, the filter passes confirmed geo facts only.
     pub countries: Vec<String>,
+    /// Whether proxies with no determined country stay in the subscription
+    /// while `countries` is set. `false` (the default) is the historical
+    /// semantics: the geo filter passes confirmed facts only, so a profile
+    /// pinned to a country serves nothing while geo enrichment is off and
+    /// every row of it looks silently gone. Setting the flag keeps those
+    /// rows in; the count of the geo-filtered-out rows is what the UI can
+    /// report (`X-Fumox-Skipped`) to explain an empty state.
+    #[serde(default)]
+    pub include_unknown_country: bool,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -546,21 +619,27 @@ impl Encoding {
             Encoding::Auto => "auto",
         }
     }
+
+    /// Every encoding, the source for the `FromStr` error and the
+    /// wire-name round-trip test.
+    pub const fn all() -> &'static [Encoding] {
+        &[Encoding::Plain, Encoding::Base64, Encoding::Auto]
+    }
 }
 
 impl FromStr for Encoding {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let enc = match s {
-            "plain" => Encoding::Plain,
-            "base64" => Encoding::Base64,
-            "auto" => Encoding::Auto,
-            other => {
-                return Err(crate::Error::Parse(format!("unknown encoding: {other:?}")));
+        for encoding in Encoding::all() {
+            if encoding.as_str() == s {
+                return Ok(*encoding);
             }
-        };
-        Ok(enc)
+        }
+        Err(crate::Error::Parse(format!(
+            "unknown encoding: {s:?} (expected one of: {})",
+            wire_name_list(Encoding::all(), |encoding| encoding.as_str())
+        )))
     }
 }
 
@@ -582,23 +661,31 @@ impl InputFormat {
             InputFormat::SingBoxJson => "sing_box_json",
         }
     }
+
+    /// Every input format, the source for the `FromStr` error and the
+    /// wire-name round-trip test.
+    pub const fn all() -> &'static [InputFormat] {
+        &[
+            InputFormat::UriList,
+            InputFormat::ClashYaml,
+            InputFormat::SingBoxJson,
+        ]
+    }
 }
 
 impl FromStr for InputFormat {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let fmt = match s {
-            "uri_list" => InputFormat::UriList,
-            "clash_yaml" => InputFormat::ClashYaml,
-            "sing_box_json" => InputFormat::SingBoxJson,
-            other => {
-                return Err(crate::Error::Parse(format!(
-                    "unknown input format: {other:?}"
-                )));
+        for format in InputFormat::all() {
+            if format.as_str() == s {
+                return Ok(*format);
             }
-        };
-        Ok(fmt)
+        }
+        Err(crate::Error::Parse(format!(
+            "unknown input format: {s:?} (expected one of: {})",
+            wire_name_list(InputFormat::all(), |format| format.as_str())
+        )))
     }
 }
 
@@ -622,24 +709,32 @@ impl OutputFormat {
             OutputFormat::SingBox => "sing_box",
         }
     }
+
+    /// Every output format, the source for the `FromStr` error and the
+    /// wire-name round-trip test.
+    pub const fn all() -> &'static [OutputFormat] {
+        &[
+            OutputFormat::UriList,
+            OutputFormat::Base64,
+            OutputFormat::Clash,
+            OutputFormat::SingBox,
+        ]
+    }
 }
 
 impl FromStr for OutputFormat {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let fmt = match s {
-            "uri_list" => OutputFormat::UriList,
-            "base64" => OutputFormat::Base64,
-            "clash" => OutputFormat::Clash,
-            "sing_box" => OutputFormat::SingBox,
-            other => {
-                return Err(crate::Error::Parse(format!(
-                    "unknown output format: {other:?}"
-                )));
+        for format in OutputFormat::all() {
+            if format.as_str() == s {
+                return Ok(*format);
             }
-        };
-        Ok(fmt)
+        }
+        Err(crate::Error::Parse(format!(
+            "unknown output format: {s:?} (expected one of: {})",
+            wire_name_list(OutputFormat::all(), |format| format.as_str())
+        )))
     }
 }
 
@@ -745,6 +840,7 @@ mod tests {
             params: Vec::new(),
             raw_path: "/ws".into(),
             raw_line: "vless://super-secret-uuid@h:443".into(),
+            canonical: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("super-secret-uuid"), "{json}");
@@ -786,6 +882,7 @@ mod tests {
             output_format: OutputFormat::UriList,
             pipeline: None,
             countries: Vec::new(),
+            include_unknown_country: false,
             enabled: true,
             created_at: 0,
             updated_at: 0,
@@ -816,17 +913,24 @@ mod tests {
             assert_eq!(name.parse::<ProxyStatus>().unwrap(), status);
         }
         // ALL carries every wire name exactly once (admin option lists
-        // derive from it).
+        // derive from it): the name set must equal the full variant list,
+        // and no name may repeat.
         let names: Vec<&str> = ProxyStatus::all().iter().map(|s| s.as_str()).collect();
-        for (_, name) in [
-            (ProxyStatus::Unknown, "unknown"),
-            (ProxyStatus::Alive, "alive"),
-            (ProxyStatus::Ready, "ready"),
-            (ProxyStatus::Quarantine, "quarantine"),
-            (ProxyStatus::Removed, "removed"),
-        ] {
-            assert!(names.contains(&name), "ALL must contain {name}");
-        }
+        let expected: Vec<&str> = vec!["unknown", "alive", "ready", "quarantine", "removed"];
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort_unstable();
+        assert_eq!(
+            sorted, expected_sorted,
+            "ALL must carry every status name, exactly the known set"
+        );
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "ALL must not repeat a status name: {names:?}"
+        );
     }
 
     #[test]
@@ -836,6 +940,7 @@ mod tests {
             (ErrorClass::HttpServer, "http_server"),
             (ErrorClass::HttpClient, "http_client"),
             (ErrorClass::ParseError, "parse_error"),
+            (ErrorClass::Storage, "storage"),
         ] {
             assert_eq!(class.as_str(), name);
             assert_eq!(name.parse::<ErrorClass>().unwrap(), class);
@@ -844,6 +949,79 @@ mod tests {
                 format!("\"{name}\"")
             );
         }
+    }
+
+    /// Every wire-name enum round-trips its canonical name through the
+    /// serde deserializer (the import/export files and the pipeline JSON
+    /// ride on it) and refuses an unknown value with an error that names
+    /// it. One parameterized pass over the five enums, so a renamed
+    /// variant or a dropped deserializer rule cannot slip through.
+    #[test]
+    fn wire_name_enums_round_trip_through_serde() {
+        fn check<T>(label: &str, values: &[T], name: impl Fn(&T) -> &'static str, unknown: &str)
+        where
+            T: serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            for value in values {
+                let wire = name(value);
+                let parsed: T = serde_json::from_str(&format!("\"{wire}\""))
+                    .unwrap_or_else(|err| panic!("{label}: {wire:?} must parse: {err}"));
+                assert_eq!(&parsed, value, "{label}: {wire:?} must round-trip");
+            }
+            let err = serde_json::from_str::<T>(&format!("\"{unknown}\""))
+                .expect_err("{label}: an unknown wire name must be refused");
+            assert!(
+                err.to_string().contains(unknown),
+                "{label}: the error must name the value: {err}"
+            );
+        }
+
+        check(
+            "ProxyStatus",
+            ProxyStatus::all(),
+            |s| s.as_str(),
+            "deployed",
+        );
+        check("IpFamily", IpFamily::all(), |f| f.as_str(), "ipv5");
+        check("Encoding", Encoding::all(), |e| e.as_str(), "gzip");
+        check("InputFormat", InputFormat::all(), |f| f.as_str(), "yaml");
+        check("OutputFormat", OutputFormat::all(), |f| f.as_str(), "json");
+    }
+
+    /// `include_unknown_country` is a documented Profile flag with the
+    /// historical semantics as its explicit default: a stored profile
+    /// without the key keeps geo-filtering unknowns out, and the flag
+    /// round-trips through the document formats.
+    #[test]
+    fn profile_include_unknown_country_defaults_false_and_parses() {
+        let base = "\
+id = \"p\"
+name = \"n\"
+output_format = \"uri_list\"
+countries = [\"DE\"]
+enabled = true
+created_at = 0
+updated_at = 0
+";
+        let profile: Profile = toml::from_str(base).expect("a profile document must parse");
+        assert!(
+            !profile.include_unknown_country,
+            "the default keeps unknown-country rows out"
+        );
+
+        let with_flag = base.replace(
+            "enabled = true",
+            "enabled = true\ninclude_unknown_country = true",
+        );
+        let profile: Profile = toml::from_str(&with_flag).expect("the flag must parse");
+        assert!(profile.include_unknown_country);
+
+        // The stored document carries the flag back out.
+        let json = serde_json::to_value(&profile).unwrap();
+        assert_eq!(
+            json["include_unknown_country"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]
@@ -870,6 +1048,7 @@ mod tests {
             params,
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         }
     }
 
@@ -880,11 +1059,13 @@ mod tests {
                 key: "headerType".into(),
                 value: "none".into(),
                 known: true,
+                bare: false,
             },
             Param {
                 key: "sni".into(),
                 value: "example.com".into(),
                 known: true,
+                bare: false,
             },
         ]);
         assert_eq!(entry.param("headerType"), Some("none"));
@@ -901,17 +1082,20 @@ mod tests {
                 key: "security".into(),
                 value: "reality".into(),
                 known: true,
+                bare: false,
             },
             Param {
                 key: "telegram".into(),
                 value: "@spam".into(),
                 known: false,
+                bare: false,
             },
             // Duplicate known key: first occurrence wins in the JSON view.
             Param {
                 key: "security".into(),
                 value: "tls".into(),
                 known: true,
+                bare: false,
             },
         ]);
         let known = entry.known_params_json();

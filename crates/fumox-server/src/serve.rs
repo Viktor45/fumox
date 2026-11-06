@@ -1979,9 +1979,11 @@ mod tests {
                 key: "security".to_string(),
                 value: "reality".to_string(),
                 known: true,
+                bare: false,
             }],
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         }
     }
 
@@ -2029,6 +2031,7 @@ mod tests {
             output_format: Default::default(),
             pipeline: None,
             countries: Vec::new(),
+            include_unknown_country: false,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -2469,6 +2472,7 @@ mod tests {
                 error: Some("Not Found"),
                 error_class: Some(ErrorClass::HttpClient),
             },
+            fetch_log::FetchTiming::default(),
         )
         .await
         .unwrap();
@@ -2540,6 +2544,7 @@ mod tests {
                 error: Some("Not Found"),
                 error_class: Some(ErrorClass::HttpClient),
             },
+            fetch_log::FetchTiming::default(),
         )
         .await
         .unwrap();
@@ -3347,6 +3352,7 @@ mod tests {
                     error: Some("Not Found"),
                     error_class: Some(ErrorClass::HttpClient),
                 },
+                fetch_log::FetchTiming::default(),
             )
             .await
             .unwrap();

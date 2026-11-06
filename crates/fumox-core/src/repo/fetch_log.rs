@@ -20,14 +20,17 @@ pub struct FetchLogRow {
     /// (retries and their backoff included); `None` for rows written
     /// without a measurement (older versions, test fixtures).
     pub duration_ms: Option<i64>,
+    /// How many HTTP attempts the fetch made (first try plus every
+    /// retry); `None` for rows written without a count (older versions,
+    /// test fixtures).
+    pub attempts: Option<i64>,
 }
 
 /// One fetch attempt to be journaled.
 ///
-/// Deliberately without a duration field: the measurement belongs to the
-/// call that made the attempt, so it travels through [`insert_timed`] as
-/// its own argument and callers without a measurement keep using
-/// [`insert`] unchanged.
+/// Deliberately without metric fields: a measurement belongs to the call
+/// that made the attempt, so it travels through [`FetchTiming`] and
+/// callers without one pass [`FetchTiming::default()`].
 #[derive(Debug, Clone)]
 pub struct FetchLogEntry<'a> {
     pub source_id: &'a str,
@@ -40,22 +43,34 @@ pub struct FetchLogEntry<'a> {
     pub error_class: Option<ErrorClass>,
 }
 
-pub async fn insert(pool: &DbPool, entry: &FetchLogEntry<'_>) -> crate::Result<()> {
-    insert_timed(pool, entry, None).await
+/// The optional per-attempt metrics of one journal row.
+///
+/// Deliberately all-defaulted: a caller spells out only the fields it
+/// has (`FetchTiming { duration_ms: Some(ms), ..Default::default() }`),
+/// and [`insert`] stays the one public writer of the table.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FetchTiming {
+    /// Measured wall-clock duration of the fetch attempt in milliseconds
+    /// (retries and their backoff included); `None` for rows written
+    /// without a measurement.
+    pub duration_ms: Option<i64>,
+    /// How many HTTP attempts the fetch made (first try plus every
+    /// retry); `None` when the caller does not know.
+    pub attempts: Option<i64>,
 }
 
-/// Journal one fetch attempt together with its measured duration in
-/// milliseconds (`fetch_log.duration_ms`).
-pub async fn insert_timed(
+/// Journal one fetch attempt with its optional metrics (`fetch_log.
+/// duration_ms`, `fetch_log.attempts`).
+pub async fn insert(
     pool: &DbPool,
     entry: &FetchLogEntry<'_>,
-    duration_ms: Option<i64>,
+    timing: FetchTiming,
 ) -> crate::Result<()> {
     sqlx::query(
         "INSERT INTO fetch_log
             (source_id, fetched_at, ok, http_status, bytes, proxies_found, error, error_class,
-             duration_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             duration_ms, attempts)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(entry.source_id)
     .bind(entry.fetched_at)
@@ -65,10 +80,22 @@ pub async fn insert_timed(
     .bind(entry.proxies_found)
     .bind(entry.error)
     .bind(entry.error_class.map(ErrorClass::as_str))
-    .bind(duration_ms)
+    .bind(timing.duration_ms)
+    .bind(timing.attempts)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// The newest-first journal ordering, shared by every read: fetched_at
+/// desc, then id desc so rows written in the same second keep their
+/// write order. `alias` qualifies the columns when the read joins
+/// another table (an unqualified `id` is ambiguous there).
+fn order_newest_first(alias: Option<&str>) -> String {
+    match alias {
+        Some(alias) => format!("ORDER BY {alias}.fetched_at DESC, {alias}.id DESC"),
+        None => "ORDER BY fetched_at DESC, id DESC".to_string(),
+    }
 }
 
 /// Most recent fetches of one source, newest first.
@@ -77,22 +104,18 @@ pub async fn recent_for_source(
     source_id: &str,
     limit: i64,
 ) -> crate::Result<Vec<FetchLogRow>> {
-    let rows = sqlx::query_as(
-        "SELECT * FROM fetch_log WHERE source_id = ? ORDER BY fetched_at DESC, id DESC LIMIT ?",
-    )
-    .bind(source_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+    list_for_source(pool, source_id, limit, 0).await
 }
 
 /// Global journal across all sources, newest first (admin screen).
 pub async fn recent_global(pool: &DbPool, limit: i64) -> crate::Result<Vec<FetchLogRow>> {
-    let rows = sqlx::query_as("SELECT * FROM fetch_log ORDER BY fetched_at DESC, id DESC LIMIT ?")
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+    // sqlx 0.9 SqlSafeStr: {order_newest_first} is a compile-time constant
+    // of this module; all data flows through .bind().
+    let sql = sqlx::AssertSqlSafe(format!(
+        "SELECT * FROM fetch_log {}",
+        order_newest_first(None)
+    ));
+    let rows = sqlx::query_as(sql).bind(limit).fetch_all(pool).await?;
     Ok(rows)
 }
 
@@ -119,7 +142,16 @@ pub struct FetchLogListRow {
     /// Measured fetch duration in milliseconds; `None` when the row was
     /// written without a measurement.
     pub duration_ms: Option<i64>,
+    /// How many HTTP attempts the fetch made; `None` when the row was
+    /// written without a count.
+    pub attempts: Option<i64>,
 }
+
+/// The projected columns of [`FetchLogListRow`], alias-qualified and
+/// shared by the one query that reads them (`list_page`): the SELECT
+/// list and the struct it feeds cannot drift apart.
+const LIST_COLUMNS: &str = "f.source_id, s.name AS source_name, f.fetched_at, f.ok,
+    f.http_status, f.bytes, f.proxies_found, f.error, f.error_class, f.duration_ms, f.attempts";
 
 /// Filter parameters of the global fetch journal ([`count_filtered`] /
 /// [`list_page`]). An empty string or `None` means "no constraint" for
@@ -129,7 +161,8 @@ pub struct FetchLogFilter {
     /// `Some(true)` = successful fetches only, `Some(false)` = failures
     /// only.
     pub ok: Option<bool>,
-    /// Exact error-class match (`network`, `http`, …).
+    /// Exact error-class match; the valid set is exactly the values
+    /// returned by `ErrorClass::as_str` (see `crate::models::ErrorClass`).
     pub error_class: String,
     /// Restrict the journal to one source.
     pub source_id: String,
@@ -139,6 +172,9 @@ impl FetchLogFilter {
     /// The WHERE fragment and bound values shared by [`count_filtered`]
     /// and [`list_page`]: the one place the journal's dynamic clause set
     /// is defined.
+    ///
+    /// Clauses must qualify columns with the `f` alias — `list_page`
+    /// joins `sources`, and an unqualified column becomes ambiguous.
     fn where_filter(&self) -> super::WhereFilter {
         let mut wf = super::WhereFilter::new();
         match self.ok {
@@ -178,13 +214,13 @@ pub async fn list_page(
 ) -> crate::Result<Vec<FetchLogListRow>> {
     let wf = filter.where_filter();
     let sql = format!(
-        "SELECT f.source_id, s.name AS source_name, f.fetched_at, f.ok,
-                f.http_status, f.bytes, f.proxies_found, f.error, f.error_class, f.duration_ms
+        "SELECT {LIST_COLUMNS}
          FROM fetch_log f LEFT JOIN sources s ON s.id = f.source_id
          {}
-         ORDER BY f.fetched_at DESC, f.id DESC
+         {}
          LIMIT ? OFFSET ?",
-        wf.sql()
+        wf.sql(),
+        order_newest_first(Some("f"))
     );
     let rows = sqlx::query_as::<_, FetchLogListRow>(sqlx::AssertSqlSafe(sql))
         .bind_where_filter(wf.values())
@@ -212,15 +248,19 @@ pub async fn list_for_source(
     limit: i64,
     offset: i64,
 ) -> crate::Result<Vec<FetchLogRow>> {
-    let rows: Vec<FetchLogRow> = sqlx::query_as(
+    // sqlx 0.9 SqlSafeStr: {order_newest_first} is a compile-time constant
+    // of this module; all data flows through .bind().
+    let sql = sqlx::AssertSqlSafe(format!(
         "SELECT * FROM fetch_log WHERE source_id = ?
-         ORDER BY fetched_at DESC, id DESC LIMIT ? OFFSET ?",
-    )
-    .bind(source_id)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool)
-    .await?;
+         {} LIMIT ? OFFSET ?",
+        order_newest_first(None)
+    ));
+    let rows: Vec<FetchLogRow> = sqlx::query_as(sql)
+        .bind(source_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
@@ -268,10 +308,7 @@ pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
 /// Total journal size. Reported on the probe page next to the rotation
 /// stamp: a fresh stamp on a table that keeps growing is still a leak.
 pub async fn count_all(pool: &DbPool) -> crate::Result<i64> {
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fetch_log")
-        .fetch_one(pool)
-        .await?;
-    Ok(count)
+    count_filtered(pool, &FetchLogFilter::default()).await
 }
 
 #[cfg(test)]
@@ -279,17 +316,23 @@ mod tests {
     use super::*;
     use crate::repo::tests::temp_pool;
 
+    /// The journal rows FK onto `sources`: one parent row per fixture.
+    async fn seed_source(pool: &DbPool, id: &str, name: &str) {
+        sqlx::query(
+            "INSERT INTO sources (id, name, url, created_at, updated_at)
+             VALUES (?, ?, 'https://e.x', 1, 1)",
+        )
+        .bind(id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn insert_and_query_journal() {
         let (_dir, pool) = temp_pool().await;
-        // fetch_log has an FK to sources; create the parent row first.
-        sqlx::query(
-            "INSERT INTO sources (id, name, url, created_at, updated_at)
-             VALUES ('srcA0000000', 's', 'https://e.x', 1, 1)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        seed_source(&pool, "srcA0000000", "s").await;
 
         insert(
             &pool,
@@ -303,6 +346,7 @@ mod tests {
                 error: None,
                 error_class: None,
             },
+            FetchTiming::default(),
         )
         .await
         .unwrap();
@@ -318,6 +362,7 @@ mod tests {
                 error: Some("timeout"),
                 error_class: Some(ErrorClass::Network),
             },
+            FetchTiming::default(),
         )
         .await
         .unwrap();
@@ -333,18 +378,13 @@ mod tests {
         assert_eq!(recent_global(&pool, 10).await.unwrap().len(), 1);
     }
 
-    /// The measured fetch duration round-trips through `insert_timed` into
-    /// the read-side rows; `insert` (no measurement) leaves the column NULL.
+    /// The measured fetch duration round-trips through `FetchTiming` into
+    /// the read-side rows; the defaulted timing leaves the metric columns
+    /// NULL.
     #[tokio::test]
     async fn duration_round_trips() {
         let (_dir, pool) = temp_pool().await;
-        sqlx::query(
-            "INSERT INTO sources (id, name, url, created_at, updated_at)
-             VALUES ('srcA0000000', 's', 'https://e.x', 1, 1)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        seed_source(&pool, "srcA0000000", "s").await;
 
         let entry = FetchLogEntry {
             source_id: "srcA0000000",
@@ -356,15 +396,26 @@ mod tests {
             error: None,
             error_class: None,
         };
-        insert(&pool, &entry).await.unwrap();
-        insert_timed(&pool, &entry, Some(1234)).await.unwrap();
+        insert(&pool, &entry, FetchTiming::default()).await.unwrap();
+        insert(
+            &pool,
+            &entry,
+            FetchTiming {
+                duration_ms: Some(1234),
+                attempts: Some(3),
+            },
+        )
+        .await
+        .unwrap();
 
         // Same fetched_at, so insertion order (id DESC) decides: the newest
         // row is the timed one.
         let rows = recent_for_source(&pool, "srcA0000000", 10).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].duration_ms, Some(1234));
+        assert_eq!(rows[0].attempts, Some(3));
         assert_eq!(rows[1].duration_ms, None);
+        assert_eq!(rows[1].attempts, None);
 
         let page = list_page(&pool, &FetchLogFilter::default(), 10, 0)
             .await
@@ -374,6 +425,41 @@ mod tests {
         assert_eq!(page[1].duration_ms, None);
     }
 
+    /// `recent_for_source` caps its answer at `limit` and returns the
+    /// newest rows: a source card that asks for two sees the two latest
+    /// attempts, not the two first ones.
+    #[tokio::test]
+    async fn recent_for_source_respects_the_limit() {
+        let (_dir, pool) = temp_pool().await;
+        seed_source(&pool, "srcA0000000", "s").await;
+        for at in [1000, 2000, 3000] {
+            insert(
+                &pool,
+                &FetchLogEntry {
+                    source_id: "srcA0000000",
+                    fetched_at: at,
+                    ok: true,
+                    http_status: Some(200),
+                    bytes: None,
+                    proxies_found: None,
+                    error: None,
+                    error_class: None,
+                },
+                FetchTiming::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = recent_for_source(&pool, "srcA0000000", 2).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+            vec![3000, 2000],
+            "the newest attempts come back, not the oldest"
+        );
+    }
+
     /// The admin journal screen: count and page apply the same filter
     /// clauses, the source join resolves display names, and the
     /// per-source pagination of the source card works.
@@ -381,15 +467,7 @@ mod tests {
     async fn admin_journal_filters_and_pagination() {
         let (_dir, pool) = temp_pool().await;
         for (id, name) in [("srcA0000000", "Alpha"), ("srcB0000000", "Beta")] {
-            sqlx::query(
-                "INSERT INTO sources (id, name, url, created_at, updated_at)
-                         VALUES (?, ?, 'https://e.x', 1, 1)",
-            )
-            .bind(id)
-            .bind(name)
-            .execute(&pool)
-            .await
-            .unwrap();
+            seed_source(&pool, id, name).await;
         }
         // (fetched_at, source, ok, error_class): four attempts.
         let rows = [

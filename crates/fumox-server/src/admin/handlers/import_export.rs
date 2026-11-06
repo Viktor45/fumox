@@ -124,6 +124,11 @@ struct ExportProfile {
     /// ISO 3166-1 alpha-2 allowlist; empty = no filtering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     countries: Vec<String>,
+    /// Whether rows without a determined country stay in while the
+    /// allowlist is set. `false` (the default) keeps the historical
+    /// semantics, so exports from before the flag read back unchanged.
+    #[serde(default)]
+    include_unknown_country: bool,
     #[serde(default)]
     enabled: bool,
     /// Member sources, referenced by their original id, in profile order.
@@ -244,6 +249,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
             output_format: p.output_format,
             pipeline: p.pipeline.clone(),
             countries: p.countries.clone(),
+            include_unknown_country: p.include_unknown_country,
             enabled: p.enabled,
             source_refs: ordered.into_iter().map(|(id, _)| id).collect(),
         });
@@ -1021,6 +1027,7 @@ async fn apply_import(
             // allowlist is compared against the uppercase country codes of
             // the proxies.
             countries: validate_countries(&p.countries, lang).unwrap_or_default(),
+            include_unknown_country: p.include_unknown_country,
             enabled: p.enabled,
             created_at: now,
             updated_at: now,
@@ -1094,6 +1101,7 @@ mod tests {
             output_format: OutputFormat::UriList,
             pipeline: None,
             countries: Vec::new(),
+            include_unknown_country: false,
             enabled: true,
             source_refs: source_refs.iter().map(|s| s.to_string()).collect(),
         }
@@ -1305,6 +1313,7 @@ mod tests {
             output_format: OutputFormat::UriList,
             pipeline: None,
             countries: Vec::new(),
+            include_unknown_country: false,
             enabled: true,
             created_at: now,
             updated_at: now,

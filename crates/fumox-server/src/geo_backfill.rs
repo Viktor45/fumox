@@ -298,6 +298,7 @@ mod tests {
             params: Vec::new(),
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         }
     }
 

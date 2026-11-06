@@ -1,0 +1,11 @@
+-- How many HTTP attempts one journal row's fetch made (first try plus
+-- every retry).
+--
+-- `duration_ms` covers the wall-clock cost of the whole fetch, retries
+-- and backoff included, but not the attempt count itself: a slow source
+-- and a source that was retried into slowness look the same there. The
+-- count travels next to the duration (`repo::fetch_log::FetchTiming`),
+-- so the admin journal can tell "one heavy attempt" from "many light
+-- ones"; NULL for rows written without a count (older versions, test
+-- fixtures).
+ALTER TABLE fetch_log ADD COLUMN attempts INTEGER;

@@ -610,6 +610,13 @@ static SETTINGS: &[Setting] = &[
         apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
     },
     Setting {
+        key: "geo.cache_ttl_secs",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.geo.cache_ttl_secs.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u64_field(raw, key, cfg, lang, errors),
+    },
+    Setting {
         key: "geo.dns_timeout_secs",
         render: |c, key, raw| {
             raw.insert(key.into(), c.geo.dns_timeout_secs.to_string());
@@ -1918,8 +1925,11 @@ fn url_list(
             Some(url::Host::Ipv6(addr)) => std::net::IpAddr::V6(addr),
             Some(url::Host::Domain(_)) | None => continue,
         };
-        if let Err(reason) = fumox_core::ssrf::check_ip(ip, false) {
-            errors.push((field.into(), lang.t_args("val.url_ssrf", &[reason])));
+        if let Err(reason) = fumox_core::ssrf::vet_addr(ip, false) {
+            errors.push((
+                field.into(),
+                lang.t_args("val.url_ssrf", &[reason.to_string()]),
+            ));
             return;
         }
     }

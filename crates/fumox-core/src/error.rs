@@ -197,4 +197,74 @@ mod tests {
             "the config error must name the key: {message}"
         );
     }
+
+    /// The classification itself is pinned: a figment error lands in the
+    /// [`Error::Config`] variant, and its Display keeps the prefix callers
+    /// can match on.
+    #[test]
+    fn a_figment_error_maps_to_the_config_variant() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Inner {
+            token: String,
+        }
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Outer {
+            admin: Inner,
+        }
+
+        let err =
+            figment::Figment::from(figment::providers::Toml::string("[admin]\ntoken = 12345\n"))
+                .extract::<Outer>()
+                .expect_err("a numeric token must not extract into a string field");
+        let error = Error::from(err);
+        assert!(matches!(error, Error::Config(_)));
+        assert!(error.to_string().starts_with("configuration error: "));
+    }
+
+    /// A driver error is kept as [`Error::Sqlx`] with the same
+    /// "database error:" prefix the non-driver [`Error::Database`] spells.
+    #[test]
+    fn a_driver_error_maps_to_the_sqlx_variant() {
+        let error = Error::from(sqlx::Error::RowNotFound);
+        assert!(matches!(error, Error::Sqlx(_)));
+        assert!(error.to_string().starts_with("database error: "));
+    }
+
+    /// Every variant's Display carries the prefix that classifies it in
+    /// logs and user-facing messages.
+    #[test]
+    fn every_variant_display_keeps_its_prefix() {
+        assert!(
+            Error::Config("x".into())
+                .to_string()
+                .starts_with("configuration error: ")
+        );
+        assert!(
+            Error::Parse("x".into())
+                .to_string()
+                .starts_with("parse error: ")
+        );
+        assert!(
+            Error::Database("x".into())
+                .to_string()
+                .starts_with("database error: ")
+        );
+        assert!(
+            Error::Sqlx(sqlx::Error::RowNotFound)
+                .to_string()
+                .starts_with("database error: ")
+        );
+        assert!(
+            Error::NotFound("x".into())
+                .to_string()
+                .starts_with("not found: ")
+        );
+        assert!(
+            Error::from(sqlx::migrate::MigrateError::VersionMissing(0))
+                .to_string()
+                .starts_with("database migration error: ")
+        );
+    }
 }

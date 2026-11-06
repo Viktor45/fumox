@@ -15,7 +15,8 @@
 //! the same spellings it folds, so the key describes the node the way the
 //! document is built.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::LazyLock;
 
 use serde_norway::Mapping;
 
@@ -58,20 +59,29 @@ pub fn list(entry: &ProxyEntry, key: &str) -> Option<Vec<String>> {
         && crate::parsers::reject_yaml_aliases(&raw).is_ok()
         && let Ok(serde_norway::Value::Sequence(seq)) = serde_norway::from_str(&raw)
     {
-        let list: Vec<String> = seq
-            .into_iter()
-            .map(|v| match v {
-                serde_norway::Value::String(s) => s,
-                other => serde_norway::to_string(&other)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string(),
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-        return (!list.is_empty()).then_some(list);
+        return strings_of_sequence(&seq);
     }
-    let list: Vec<String> = crate::parsers::uri::percent_decode(&raw)
+    strings_of_scalar(&raw)
+}
+
+/// The strings of a YAML sequence: string items only, trimmed, empties
+/// dropped. A non-string item is not scalarized into text — a number or a
+/// nested mapping in an `alpn` list is not a protocol name a client could
+/// speak — so it is dropped rather than stringified.
+fn strings_of_sequence(seq: &[serde_norway::Value]) -> Option<Vec<String>> {
+    let list: Vec<String> = seq
+        .iter()
+        .filter_map(serde_norway::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// A plain value as a list: percent-decoded, split on commas.
+fn strings_of_scalar(raw: &str) -> Option<Vec<String>> {
+    let list: Vec<String> = crate::parsers::uri::percent_decode(raw)
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -115,20 +125,15 @@ pub fn map_value(map: &Mapping, key: &str) -> Option<String> {
     None
 }
 
-/// List of strings inside a parsed YAML mapping.
+/// List of strings inside a parsed YAML mapping, sharing the [`list`]
+/// semantics: a sequence keeps its string items, a plain scalar splits on
+/// commas (`host: [a, b]` and `host: a,b` read the same).
 pub fn map_list(map: &Option<Mapping>, key: &str) -> Option<Vec<String>> {
-    let seq = map
-        .as_ref()?
-        .get(key)
-        .and_then(serde_norway::Value::as_sequence)?;
-    let list: Vec<String> = seq
-        .iter()
-        .filter_map(serde_norway::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    (!list.is_empty()).then_some(list)
+    match map.as_ref()?.get(key)? {
+        serde_norway::Value::String(raw) => strings_of_scalar(raw),
+        serde_norway::Value::Sequence(seq) => strings_of_sequence(seq),
+        _ => None,
+    }
 }
 
 /// The first string of a mapping field that is either a scalar or a
@@ -381,64 +386,67 @@ const BLOCK_FIELDS: &[(&str, &[(&str, &str)])] = &[
 /// different nodes onto one deduplication key (review WP-21, M-052/M-053):
 /// two nodes differing only in their `grpc-mode` shared one row and the
 /// upsert silently overwrote one with the other.
-const COSMETIC_PARAMS: &[&str] = &[
-    // display name and description
-    "name",
-    "remark",
-    "remarks",
-    "remark2",
-    "des",
-    "desc",
-    "descr",
-    "description",
-    "title",
-    "ps",
-    // grouping and advertising tags
-    "group",
-    "group-name",
-    "provider",
-    "proxy-provider",
-    "tag",
-    "tags",
-    "label",
-    "labels",
-    "category",
-    "channel",
-    "telegram",
-    "discord",
-    // bandwidth and traffic accounting
-    "up",
-    "down",
-    "upmbps",
-    "downmbps",
-    "uplink",
-    "downlink",
-    "bandwidth",
-    "traffic",
-    "total",
-    "used",
-    "upload",
-    "download",
-    "used-traffic",
-    "total-traffic",
-    // timestamps and expiry
-    "t",
-    "time",
-    "timestamp",
-    "expire",
-    "expiry",
-    "expires",
-    "expire-time",
-    "lastupdated",
-    "update",
-    "refresh",
-    "ttl",
-    "ttl-secs",
-];
+static COSMETIC_PARAMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    HashSet::from([
+        // display name and description
+        "name",
+        "remark",
+        "remarks",
+        "remark2",
+        "des",
+        "desc",
+        "descr",
+        "description",
+        "title",
+        "ps",
+        // grouping and advertising tags
+        "group",
+        "group-name",
+        "provider",
+        "proxy-provider",
+        "tag",
+        "tags",
+        "label",
+        "labels",
+        "category",
+        "channel",
+        "telegram",
+        "discord",
+        // bandwidth and traffic accounting
+        "up",
+        "down",
+        "upmbps",
+        "downmbps",
+        "uplink",
+        "downlink",
+        "bandwidth",
+        "traffic",
+        "total",
+        "used",
+        "upload",
+        "download",
+        "used-traffic",
+        "total-traffic",
+        // timestamps and expiry
+        "t",
+        "time",
+        "timestamp",
+        "expire",
+        "expiry",
+        "expires",
+        "expire-time",
+        "lastupdated",
+        "update",
+        "refresh",
+        "ttl",
+        "ttl-secs",
+    ])
+});
 
-/// Whether a canonical key names a cosmetic parameter.
+/// Whether a canonical key names a cosmetic parameter: one hash lookup on
+/// the key, no allocation.
 fn is_cosmetic(key: &str) -> bool {
-    COSMETIC_PARAMS.contains(&key)
+    COSMETIC_PARAMS.contains(key)
 }
 
 /// Map a parameter key onto the spelling the canonical form is keyed by.
@@ -452,7 +460,7 @@ fn is_cosmetic(key: &str) -> bool {
 /// form both call it `net`, while vless, trojan and the rest call it `type`.
 /// Folding it onto one spelling for every scheme would split the vmess forms
 /// from each other, so the target key depends on the scheme.
-pub fn canonical_key(scheme: Scheme, key: &str) -> String {
+pub fn canonical_key(scheme: Scheme, key: &str) -> &str {
     match key {
         "servername" => "sni",
         "network" if scheme == Scheme::Vmess => "net",
@@ -473,7 +481,6 @@ pub fn canonical_key(scheme: Scheme, key: &str) -> String {
         "alterid" if scheme == Scheme::Vmess => "aid",
         other => other,
     }
-    .to_string()
 }
 
 /// The canonical key of the transport parameter of a scheme: the vmess
@@ -552,7 +559,7 @@ pub fn canonical(entry: &ProxyEntry) -> Vec<(String, String)> {
         if key == transport {
             continue;
         }
-        if let Some((name, value)) = scalar_value(entry.scheme, &key, &param.value) {
+        if let Some((name, value)) = scalar_value(entry.scheme, key, &param.value) {
             candidates.push((name, source, value));
         }
     }
@@ -780,10 +787,12 @@ mod tests {
                     key: (*k).into(),
                     value: (*v).into(),
                     known: true,
+                    bare: false,
                 })
                 .collect(),
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         }
     }
 
@@ -915,6 +924,88 @@ mod tests {
         assert_eq!(
             canonical_map(&none),
             canonical_map(&entry(Scheme::Trojan, &[]))
+        );
+    }
+
+    /// The Clash spelling `ws-path` folds onto the URI `path`
+    /// ([`canonical_key`]), so the same node advertised once as Clash YAML
+    /// and once as a URI deduplicates together.
+    #[test]
+    fn a_clash_ws_path_and_a_uri_path_share_one_fingerprint() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     network: ws, ws-path: /ws}\n",
+        );
+        let mut clash = crate::parsers::clash::parse_payload(yaml).unwrap().entries[0].clone();
+        let crate::parsers::LineOutcome::Parsed(mut uri) =
+            crate::parsers::parse_line("vless://u@h.example.com:443?type=ws&path=/ws#a")
+        else {
+            panic!("expected a parsed vless entry");
+        };
+        clash.name = String::new();
+        uri.name = String::new();
+        assert_eq!(
+            crate::fingerprint::fingerprint(&clash),
+            crate::fingerprint::fingerprint(&uri)
+        );
+    }
+
+    /// The Clash spelling `grpc-service-name` folds onto the URI
+    /// `servicename` ([`canonical_key`]) the same way.
+    #[test]
+    fn a_clash_grpc_service_name_and_a_uri_servicename_share_one_fingerprint() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     network: grpc, grpc-service-name: g}\n",
+        );
+        let mut clash = crate::parsers::clash::parse_payload(yaml).unwrap().entries[0].clone();
+        let crate::parsers::LineOutcome::Parsed(mut uri) =
+            crate::parsers::parse_line("vless://u@h.example.com:443?type=grpc&servicename=g#a")
+        else {
+            panic!("expected a parsed vless entry");
+        };
+        clash.name = String::new();
+        uri.name = String::new();
+        assert_eq!(
+            crate::fingerprint::fingerprint(&clash),
+            crate::fingerprint::fingerprint(&uri)
+        );
+    }
+
+    /// The fold must not erase the value: two nodes differing only in a
+    /// Clash-spelled field are different nodes, and the upsert would
+    /// silently overwrite one with the other if they collapsed onto one
+    /// key.
+    #[test]
+    fn two_clash_nodes_differing_only_in_a_folded_field_do_not_collapse() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     network: ws, ws-path: /ws}\n",
+            "  - {name: b, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     network: ws, ws-path: /other}\n",
+        );
+        let parsed = crate::parsers::clash::parse_payload(yaml).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_ne!(
+            crate::fingerprint::fingerprint(&parsed.entries[0]),
+            crate::fingerprint::fingerprint(&parsed.entries[1])
+        );
+
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: a, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     network: grpc, grpc-service-name: g}\n",
+            "  - {name: b, type: vless, server: h.example.com, port: 443, uuid: u,",
+            "     network: grpc, grpc-service-name: g2}\n",
+        );
+        let parsed = crate::parsers::clash::parse_payload(yaml).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_ne!(
+            crate::fingerprint::fingerprint(&parsed.entries[0]),
+            crate::fingerprint::fingerprint(&parsed.entries[1])
         );
     }
 }

@@ -272,6 +272,7 @@
 "set.fetch_user_agent" = "User-Agent по умолчанию"
 "set.export_max_rows" = "Лимит строк в экспорте alive"
 "set.geo_cache" = "Записей кэша host→geo"
+"set.geo_cache_ttl" = "Время жизни кэша host→geo (секунды)"
 "set.geo_auto_download" = "Скачивать базы GeoLite2"
 "set.geo_db" = "Выбор базы (легаси)"
 "set.geo_db_dir" = "Каталог GeoLite2"

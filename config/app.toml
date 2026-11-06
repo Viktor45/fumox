@@ -276,6 +276,15 @@ db_dir = "config"
 # Entries are small (country/city/AS), a couple of MB total; raise this if
 # your feed holds noticeably more unique hosts.
 cache_max_entries = 16384
+# Диапазон: 1..=2592000 секунд (форма).
+# Сколько секунд хранится вердикт host→geo (и положительный, и «записи
+# нет»): по умолчанию шесть часов, как периодический geo-бэкфилл; записи
+# истекают, поэтому хост проверяется заново без перезапуска.
+# Range: 1..=2592000 seconds (form).
+# How long a host→geo verdict (a positive one and a no-record one alike)
+# stays cached: six hours by default, matching the periodic geo backfill's
+# cadence; entries expire, so a host is resolved again without a restart.
+cache_ttl_secs = 21600
 # Диапазон: 1..=60 секунд (форма).
 # Таймаут DNS-резолва на шаге обогащения.
 # Range: 1..=60 seconds (form).

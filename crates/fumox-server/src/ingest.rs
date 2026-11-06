@@ -563,8 +563,8 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     if parsed.entries.is_empty() {
         // HTTP 200 with zero recognized lines is parse_error.
         return Err(format!(
-            "no proxies recognized (discarded={}, unrecognized={}, clash_skipped={})",
-            parsed.discarded, parsed.unrecognized, parsed.clash_skipped
+            "no proxies recognized (discarded={}, unrecognized={}, skipped={})",
+            parsed.discarded, parsed.unrecognized, parsed.skipped
         ));
     }
     let recognized = parsed.entries.len();
@@ -650,7 +650,11 @@ async fn journal_success(
         error: None,
         error_class: None,
     };
-    if let Err(err) = fetch_log::insert_timed(pool, &log, Some(duration_ms)).await {
+    let timing = fetch_log::FetchTiming {
+        duration_ms: Some(duration_ms),
+        attempts: Some(i64::from(payload.attempts)),
+    };
+    if let Err(err) = fetch_log::insert(pool, &log, timing).await {
         tracing::error!(error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
@@ -683,7 +687,11 @@ async fn journal_failure(
         error: Some(&message),
         error_class: Some(class),
     };
-    if let Err(err) = fetch_log::insert_timed(pool, &log, Some(duration_ms)).await {
+    let timing = fetch_log::FetchTiming {
+        duration_ms: Some(duration_ms),
+        attempts: Some(i64::from(failure.attempts())),
+    };
+    if let Err(err) = fetch_log::insert(pool, &log, timing).await {
         tracing::error!(error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
@@ -725,7 +733,11 @@ async fn journal_storage_failure(
         error: Some(message),
         error_class: Some(class),
     };
-    if let Err(err) = fetch_log::insert_timed(pool, &log, Some(duration_ms)).await {
+    let timing = fetch_log::FetchTiming {
+        duration_ms: Some(duration_ms),
+        attempts: Some(i64::from(payload.attempts)),
+    };
+    if let Err(err) = fetch_log::insert(pool, &log, timing).await {
         tracing::error!(error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
@@ -761,7 +773,11 @@ async fn journal_parse_failure(
         error: Some(message),
         error_class: Some(fumox_core::models::ErrorClass::ParseError),
     };
-    if let Err(err) = fetch_log::insert_timed(pool, &log, Some(duration_ms)).await {
+    let timing = fetch_log::FetchTiming {
+        duration_ms: Some(duration_ms),
+        attempts: Some(i64::from(payload.attempts)),
+    };
+    if let Err(err) = fetch_log::insert(pool, &log, timing).await {
         tracing::error!(error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
@@ -815,6 +831,7 @@ mod tests {
             http_status: 200,
             bytes: body.len() as u64,
             body: body.as_bytes().to_vec(),
+            attempts: 1,
         }
     }
 
@@ -1121,6 +1138,7 @@ mod tests {
                 params: Vec::new(),
                 raw_path: String::new(),
                 raw_line: String::new(),
+                canonical: None,
             })
             .collect();
 
@@ -1231,6 +1249,7 @@ mod tests {
             params: Vec::new(),
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         }
     }
 
@@ -1333,6 +1352,7 @@ mod tests {
             http_status: 200,
             bytes: 12,
             body: b"vless://x".to_vec(),
+            attempts: 1,
         };
         journal_storage_failure(&pool, &source, &payload, "the disk is on fire", 1, 5).await;
 
@@ -1429,6 +1449,7 @@ mod tests {
             http_status: 200,
             bytes: 2,
             body: vec![0xff, 0xfe],
+            attempts: 1,
         };
         assert!(parse_payload(&source, &bad).is_err());
     }

@@ -71,6 +71,9 @@ pub struct FetchedPayload {
     pub http_status: u16,
     pub bytes: u64,
     pub body: Vec<u8>,
+    /// How many HTTP attempts produced the payload (first try plus every
+    /// retry), stamped by [`Fetcher::fetch`] once the loop is done.
+    pub attempts: u32,
 }
 
 /// Classified fetch failure, maps 1:1 onto the `error_class` vocabulary.
@@ -83,9 +86,13 @@ pub enum FetchFailure {
         /// fetcher does not speak). No attempt can change the outcome, so it
         /// is not retried; a real network fault is.
         permanent: bool,
+        /// How many HTTP attempts ended in this failure (first try plus
+        /// every retry), stamped by [`Fetcher::fetch`] once the loop is
+        /// done; the constructors default to 1 (one attempt, no retry).
+        attempts: u32,
     },
     #[error("server error: HTTP {status}")]
-    HttpServer { status: u16 },
+    HttpServer { status: u16, attempts: u32 },
     #[error("client error: HTTP {status}{}", detail(.reason.as_deref()))]
     HttpClient {
         status: u16,
@@ -94,9 +101,10 @@ pub enum FetchFailure {
         /// `sources.last_error`, so it is the only trace the operator has
         /// of a chain that lost its source headers on the way.
         reason: Option<String>,
+        attempts: u32,
     },
     #[error("response exceeds the {limit} byte cap")]
-    ResponseTooLarge { limit: u64 },
+    ResponseTooLarge { limit: u64, attempts: u32 },
 }
 
 /// Render the optional client-error cause as a display suffix.
@@ -113,6 +121,7 @@ impl FetchFailure {
         FetchFailure::HttpClient {
             status,
             reason: None,
+            attempts: 1,
         }
     }
 
@@ -123,6 +132,32 @@ impl FetchFailure {
         FetchFailure::HttpClient {
             status,
             reason: reason.map(str::to_string),
+            attempts: 1,
+        }
+    }
+
+    /// Stamp the attempt count of a finished fetch. The constructors
+    /// default to 1 (one attempt, no retry); the retry loop of
+    /// [`Fetcher::fetch`] knows the real count and writes it here before
+    /// returning the failure, so the journal row carries the number the
+    /// caller actually paid for.
+    fn set_attempts(&mut self, attempts: u32) {
+        match self {
+            FetchFailure::Network { attempts: n, .. }
+            | FetchFailure::HttpServer { attempts: n, .. }
+            | FetchFailure::HttpClient { attempts: n, .. }
+            | FetchFailure::ResponseTooLarge { attempts: n, .. } => *n = attempts,
+        }
+    }
+
+    /// How many HTTP attempts ended in this failure (first try plus every
+    /// retry).
+    pub fn attempts(&self) -> u32 {
+        match self {
+            FetchFailure::Network { attempts, .. }
+            | FetchFailure::HttpServer { attempts, .. }
+            | FetchFailure::HttpClient { attempts, .. }
+            | FetchFailure::ResponseTooLarge { attempts, .. } => *attempts,
         }
     }
 
@@ -156,7 +191,7 @@ impl FetchFailure {
     /// Upstream HTTP status, when there was one.
     pub fn http_status(&self) -> Option<u16> {
         match self {
-            FetchFailure::HttpServer { status } | FetchFailure::HttpClient { status, .. } => {
+            FetchFailure::HttpServer { status, .. } | FetchFailure::HttpClient { status, .. } => {
                 Some(*status)
             }
             _ => None,
@@ -364,8 +399,12 @@ impl Fetcher {
         let mut attempt = 0u32;
         loop {
             match self.fetch_once(url, headers, family, deadline).await {
-                Ok(payload) => return Ok(payload),
-                Err(failure) => {
+                Ok(mut payload) => {
+                    payload.attempts = attempt + 1;
+                    return Ok(payload);
+                }
+                Err(mut failure) => {
+                    failure.set_attempts(attempt + 1);
                     if attempt >= max_retries || !failure.is_recoverable() {
                         return Err(failure);
                     }
@@ -430,6 +469,7 @@ impl Fetcher {
                     &FetchFailure::Network {
                         message: "no time left in the fetch budget".to_string(),
                         permanent: false,
+                        attempts: 1,
                     },
                 ));
             }
@@ -439,6 +479,7 @@ impl Fetcher {
             let parsed = Url::parse(&current).map_err(|e| FetchFailure::Network {
                 message: format!("invalid URL: {e}"),
                 permanent: true,
+                attempts: 1,
             })?;
             match parsed.scheme() {
                 "http" | "https" => {}
@@ -446,6 +487,7 @@ impl Fetcher {
                     return Err(FetchFailure::Network {
                         message: format!("unsupported scheme: {other}"),
                         permanent: true,
+                        attempts: 1,
                     });
                 }
             }
@@ -456,6 +498,7 @@ impl Fetcher {
             let host = parsed.host_str().ok_or_else(|| FetchFailure::Network {
                 message: "URL has no host".to_string(),
                 permanent: true,
+                attempts: 1,
             })?;
             let pinned = self
                 .resolver
@@ -475,6 +518,7 @@ impl Fetcher {
                 .map_err(|e| FetchFailure::Network {
                     message: redacted_request_error(&e),
                     permanent: false,
+                    attempts: 1,
                 })?;
             let mut request = client.get(parsed.clone());
             let same_origin = configured_origin
@@ -495,6 +539,7 @@ impl Fetcher {
             let response = request.send().await.map_err(|e| FetchFailure::Network {
                 message: redacted_request_error(&e),
                 permanent: false,
+                attempts: 1,
             })?;
             let status = response.status().as_u16();
 
@@ -512,7 +557,10 @@ impl Fetcher {
             }
 
             if status >= 500 || status == 408 || status == 429 {
-                return Err(FetchFailure::HttpServer { status });
+                return Err(FetchFailure::HttpServer {
+                    status,
+                    attempts: 1,
+                });
             }
             if !(200..300).contains(&status) {
                 return Err(FetchFailure::http_client_why(status, withheld));
@@ -525,9 +573,10 @@ impl Fetcher {
             while let Some(chunk) = stream.chunk().await.map_err(|e| FetchFailure::Network {
                 message: redacted_request_error(&e),
                 permanent: false,
+                attempts: 1,
             })? {
                 if body.len() as u64 + chunk.len() as u64 > limit {
-                    return Err(FetchFailure::ResponseTooLarge { limit });
+                    return Err(FetchFailure::ResponseTooLarge { limit, attempts: 1 });
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -536,6 +585,7 @@ impl Fetcher {
                 http_status: status,
                 bytes,
                 body,
+                attempts: 1,
             });
         }
         // Redirect chain longer than MAX_REDIRECTS, a persistent server
@@ -554,6 +604,7 @@ fn budget_exhausted(budget: Duration, cause: &FetchFailure) -> FetchFailure {
             format_budget(budget)
         ),
         permanent: false,
+        attempts: 1,
     }
 }
 
@@ -810,22 +861,24 @@ pub async fn vet_url_with_policy(
         })
 }
 
-/// Vet a single IP address against the SSRF policy.
+/// Vet a single IP address against the SSRF policy. A decorated form of
+/// `fumox_core::ssrf::vet_addr`: the blocklist lives in `fumox-core` so
+/// the probe daemon applies the identical policy to its dial targets, the
+/// server only flattens the typed reason into a message.
 ///
-/// With `allow_private_urls = false` the following are rejected: loopback,
-/// RFC 1918 private space, link-local (incl. the `169.254.169.254` cloud
-/// metadata endpoint), CGNAT, unspecified, broadcast and benchmark ranges,
-/// plus their IPv6 equivalents and IPv4-mapped IPv6 addresses. The policy
-/// itself lives in `fumox-core` so the probe daemon applies the identical
-/// blocklist to its dial targets.
+/// With `allow_private = false` the rejected set is the one the core
+/// policy documents (loopback, RFC 1918, link-local incl. the cloud
+/// metadata endpoint, CGNAT, the reserved, benchmark and TEST-NET ranges,
+/// and every IPv6 transition form).
 pub fn check_ip(ip: IpAddr, allow_private: bool) -> Result<(), String> {
-    fumox_core::ssrf::check_ip(ip, allow_private)
+    fumox_core::ssrf::vet_addr(ip, allow_private)
+        .map(|_| ())
+        .map_err(|reason| reason.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 
     fn ip(s: &str) -> IpAddr {
@@ -849,56 +902,29 @@ mod tests {
         assert_eq!(fetcher.backoff_delay(0), Duration::from_secs(60));
     }
 
+    /// The server-side gate is a decorated form of the core policy: the
+    /// blocklist is not forked here, every verdict (and its class code)
+    /// comes from `fumox_core::ssrf`. The range coverage itself is pinned
+    /// by the core suite (`ssrf::tests`), not duplicated.
     #[test]
-    fn public_ips_are_allowed() {
-        for addr in [
-            "8.8.8.8",
-            "1.1.1.1",
-            "93.184.216.34",
-            "2606:4700:4700::1111",
-        ] {
-            assert!(check_ip(ip(addr), false).is_ok(), "{addr} must pass");
-        }
-    }
-
-    #[test]
-    fn private_ranges_are_blocked() {
+    fn check_ip_is_the_decorated_core_policy() {
         for addr in [
             "127.0.0.1",
-            "10.0.0.1",
-            "172.16.0.1",
-            "172.31.255.255",
-            "192.168.1.1",
             "169.254.169.254",
-            "169.254.1.1",
-            "0.0.0.0",
-            "100.64.0.1",
-            "100.127.255.255",
-            "198.18.0.1",
-            "192.0.0.1",
-            "255.255.255.255",
-            "::1",
-            "::",
-            "fe80::1",
-            "fd00::1",
-            "::ffff:127.0.0.1",
-            "::ffff:192.168.0.1",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
         ] {
-            assert!(check_ip(ip(addr), false).is_err(), "{addr} must be blocked");
+            assert_eq!(
+                check_ip(ip(addr), false).is_ok(),
+                fumox_core::ssrf::vet_addr(ip(addr), false).is_ok(),
+                "{addr} verdict must match the core policy"
+            );
         }
-    }
-
-    #[test]
-    fn allow_private_flag_disables_checks() {
+        // The allow flag is passed through unchanged.
         assert!(check_ip(ip("127.0.0.1"), true).is_ok());
-        assert!(check_ip(ip("169.254.169.254"), true).is_ok());
-    }
-
-    #[test]
-    fn cgnat_boundary_values() {
-        // 100.64.0.0/10 spans 100.64.0.0 – 100.127.255.255.
-        assert!(check_ip(ip("100.63.255.255"), false).is_ok());
-        assert!(check_ip(ip("100.128.0.0"), false).is_ok());
+        // The decorated message still names the refused range.
+        let reason = check_ip(ip("169.254.169.254"), false).unwrap_err();
+        assert!(reason.contains("link-local"), "{reason}");
     }
 
     #[test]
@@ -906,13 +932,18 @@ mod tests {
         assert_eq!(
             FetchFailure::Network {
                 message: "x".into(),
-                permanent: false
+                permanent: false,
+                attempts: 1,
             }
             .error_class(),
             ErrorClass::Network
         );
         assert_eq!(
-            FetchFailure::HttpServer { status: 503 }.error_class(),
+            FetchFailure::HttpServer {
+                status: 503,
+                attempts: 1
+            }
+            .error_class(),
             ErrorClass::HttpServer
         );
         assert_eq!(
@@ -920,27 +951,45 @@ mod tests {
             ErrorClass::HttpClient
         );
         assert_eq!(
-            FetchFailure::ResponseTooLarge { limit: 10 }.error_class(),
+            FetchFailure::ResponseTooLarge {
+                limit: 10,
+                attempts: 1
+            }
+            .error_class(),
             ErrorClass::HttpServer
         );
         // A body over the cap and a malformed URL fail identically on every
         // attempt, so neither is retried; a real network fault still is.
-        assert!(!FetchFailure::ResponseTooLarge { limit: 10 }.is_recoverable());
+        assert!(
+            !FetchFailure::ResponseTooLarge {
+                limit: 10,
+                attempts: 1
+            }
+            .is_recoverable()
+        );
         assert!(
             !FetchFailure::Network {
                 message: "x".into(),
-                permanent: true
+                permanent: true,
+                attempts: 1,
             }
             .is_recoverable()
         );
         assert!(
             FetchFailure::Network {
                 message: "x".into(),
-                permanent: false
+                permanent: false,
+                attempts: 1,
             }
             .is_recoverable()
         );
-        assert!(FetchFailure::HttpServer { status: 500 }.is_recoverable());
+        assert!(
+            FetchFailure::HttpServer {
+                status: 500,
+                attempts: 1
+            }
+            .is_recoverable()
+        );
         assert!(!FetchFailure::http_client(404).is_recoverable());
         assert_eq!(FetchFailure::http_client(404).http_status(), Some(404));
     }
@@ -952,14 +1001,6 @@ mod tests {
         assert!(validate_url("ftp://example.com").is_err());
         assert!(validate_url("not a url").is_err());
         assert!(validate_url(&format!("https://example.com/{}", "x".repeat(3000))).is_err());
-    }
-
-    #[test]
-    fn ipv4_helpers_covered_ranges() {
-        // Sanity on the std helpers we rely on.
-        assert!(Ipv4Addr::new(127, 0, 0, 1).is_loopback());
-        assert!(Ipv4Addr::new(169, 254, 169, 254).is_link_local());
-        assert!(Ipv6Addr::LOCALHOST.is_loopback());
     }
 
     #[test]
@@ -1320,12 +1361,15 @@ mod tests {
             .fetch(&format!("http://{addr}/sub"), &Default::default(), None)
             .await
             .unwrap_err();
-        assert!(matches!(err, FetchFailure::HttpServer { status: 503 }));
+        assert!(matches!(err, FetchFailure::HttpServer { status: 503, .. }));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             3,
             "max_retries = 2 means the initial attempt plus two retries"
         );
+        // The attempt count travels with the failure into the journal:
+        // three requests, not one.
+        assert_eq!(err.attempts(), 3);
 
         // 403 is not recoverable: exactly one attempt, no backoff sleep.
         let (addr, hits) = spawn_canned_listener(403).await;
@@ -1358,7 +1402,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            FetchFailure::ResponseTooLarge { limit: 1024 }
+            FetchFailure::ResponseTooLarge { limit: 1024, .. }
         ));
         assert_eq!(err.error_class(), ErrorClass::HttpServer);
         // The body is over the cap on every attempt, so it is not retried.
@@ -1481,7 +1525,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchFailure::ResponseTooLarge { limit: 65536 }),
+            matches!(err, FetchFailure::ResponseTooLarge { limit: 65536, .. }),
             "expected the decompressed body to hit the cap, got {err:?}"
         );
     }
@@ -1555,7 +1599,7 @@ mod tests {
             .unwrap_err();
         let text = err.to_string();
         match &err {
-            FetchFailure::HttpClient { status, reason } => {
+            FetchFailure::HttpClient { status, reason, .. } => {
                 assert_eq!(*status, 403);
                 assert_eq!(
                     reason.as_deref(),
@@ -1606,7 +1650,7 @@ mod tests {
             .fetch(&format!("http://{addr}/sub"), &Default::default(), None)
             .await
             .unwrap_err();
-        assert!(matches!(err, FetchFailure::HttpServer { status: 503 }));
+        assert!(matches!(err, FetchFailure::HttpServer { status: 503, .. }));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             (MAX_RETRIES + 1) as usize,

@@ -72,14 +72,19 @@ pub fn verify(presented: &str, stored_value: &str) -> bool {
 }
 
 /// Constant-time string equality.
+///
+/// The loop runs over the longer of the two inputs, treating the missing
+/// tail of the shorter one as zero bytes, so the duration does not leak
+/// where the inputs agree or how long a common prefix is; the length
+/// difference itself is folded into the final verdict instead of
+/// short-circuiting before the loop.
 pub fn ct_eq(a: &str, b: &str) -> bool {
     let (ab, bb) = (a.as_bytes(), b.as_bytes());
-    if ab.len() != bb.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in ab.iter().zip(bb) {
-        diff |= x ^ y;
+    let mut diff = ab.len() ^ bb.len();
+    for i in 0..ab.len().max(bb.len()) {
+        let x = ab.get(i).copied().unwrap_or(0);
+        let y = bb.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x != y);
     }
     diff == 0
 }
@@ -135,5 +140,15 @@ mod tests {
     #[test]
     fn a_hash_never_verifies_against_another_hash() {
         assert!(!verify("supersecret", &hash("other")));
+    }
+
+    /// The padded comparison must still reject everything unequal, both a
+    /// shared prefix with a longer tail and a differing byte.
+    #[test]
+    fn a_prefix_match_is_not_a_match() {
+        assert!(!ct_eq("supersecret", "supersecret2"));
+        assert!(!ct_eq("supersecret2", "supersecret"));
+        assert!(!ct_eq("supersecret", "superdsecret"));
+        assert!(ct_eq("supersecret", "supersecret"));
     }
 }

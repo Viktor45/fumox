@@ -27,6 +27,7 @@ pub mod ss;
 pub mod uri;
 pub mod vmess;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::models::{Encoding, InputFormat, Param, ProxyEntry, Scheme};
@@ -39,6 +40,70 @@ pub enum LineOutcome {
     Discarded,
     /// Unknown scheme or malformed line, counted and skipped.
     Unrecognized,
+}
+
+/// Machine-readable category of a single-line parse failure.
+///
+/// The message text of a parse error is for humans reading the log; the
+/// kind is what the skip counters and tests branch on without string
+/// matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    /// The transport payload (base64 blob, JSON) did not decode.
+    MalformedPayload,
+    /// A required field is absent.
+    MissingField,
+    /// A present field carries an unusable value (wrong type, out of range,
+    /// a line break).
+    InvalidField,
+    /// A size cap (parameters, bytes) is exceeded.
+    OverCap,
+}
+
+impl ParseErrorKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ParseErrorKind::MalformedPayload => "malformed-payload",
+            ParseErrorKind::MissingField => "missing-field",
+            ParseErrorKind::InvalidField => "invalid-field",
+            ParseErrorKind::OverCap => "over-cap",
+        }
+    }
+}
+
+/// A parse failure carrying its [`ParseErrorKind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub message: String,
+}
+
+impl ParseError {
+    pub fn new(kind: ParseErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// An error returned as a plain `String` (the parsers not converted to
+/// [`ParseError`] yet) folds into [`ParseErrorKind::InvalidField`], the
+/// dominant single-line failure class; the message stays the authoritative
+/// description.
+impl From<String> for ParseError {
+    fn from(message: String) -> Self {
+        Self {
+            kind: ParseErrorKind::InvalidField,
+            message,
+        }
+    }
 }
 
 /// Upper bound on the entries one payload may produce.
@@ -59,7 +124,7 @@ pub fn parse_line(line: &str) -> LineOutcome {
     // storage bomb, the caller's log-and-skip path drops it like any other
     // malformed line.
     if line.len() > uri::MAX_LINE_BYTES {
-        tracing::debug!(
+        tracing::warn!(
             bytes = line.len(),
             cap = uri::MAX_LINE_BYTES,
             "skipping oversized proxy line"
@@ -72,36 +137,70 @@ pub fn parse_line(line: &str) -> LineOutcome {
     };
     let scheme = scheme_raw.to_ascii_lowercase();
     match scheme.as_str() {
-        "vless" => parsed(uri::parse_with_spec(&uri::VLESS_SPEC, rest, line)),
-        "trojan" => parsed(uri::parse_with_spec(&uri::TROJAN_SPEC, rest, line)),
-        "hysteria2" | "hy2" => parsed(uri::parse_with_spec(&uri::HYSTERIA2_SPEC, rest, line)),
-        "tuic" => parsed(uri::parse_with_spec(&uri::TUIC_SPEC, rest, line)),
-        "mieru" => parsed(uri::parse_with_spec(&uri::MIERU_SPEC, rest, line)),
-        "socks5" => parsed(uri::parse_with_spec(&uri::SOCKS5_SPEC, rest, line)),
-        "snell" => parsed(uri::parse_with_spec(&uri::SNELL_SPEC, rest, line)),
-        "anytls" => parsed(uri::parse_with_spec(&uri::ANYTLS_SPEC, rest, line)),
-        "ss" => parsed(ss::parse(rest, line)),
-        "vmess" => parsed(vmess::parse(rest, line)),
+        "ss" => parsed("ss", line, ss::parse(rest, line).map_err(ParseError::from)),
+        "vmess" => parsed("vmess", line, vmess::parse(rest, line)),
         // happ:// is recognized and deliberately discarded (MVP decision).
         "happ" => LineOutcome::Discarded,
-        other => {
-            if let Some(transport) = other.strip_prefix("naive+") {
-                return parse_naive(transport, rest, line);
-            }
-            tracing::debug!(scheme = other, "unrecognized proxy scheme");
+        // `naive+<transport>`: the transport suffix is scheme identity, so
+        // it gets its own arm ahead of the registry lookup; the parser
+        // preserves it as the synthetic `naive_transport` parameter.
+        other if let Some(transport) = other.strip_prefix("naive+") => {
+            parse_naive(transport, rest, line)
+        }
+        other => match uri::spec_for(other) {
+            Some(spec) => parsed(
+                other,
+                line,
+                uri::parse_with_spec(spec, rest, line).map_err(ParseError::from),
+            ),
+            // The unknown-scheme log is per payload, see `parse_uri_list`.
+            None => LineOutcome::Unrecognized,
+        },
+    }
+}
+
+/// Wrap a parse result into a [`LineOutcome`], logging the skip with the
+/// context a malformed line needs to be findable in a feed: the scheme, the
+/// failure kind, the best-effort host and the first bytes of the line.
+fn parsed(scheme: &str, line: &str, result: Result<ProxyEntry, ParseError>) -> LineOutcome {
+    match result {
+        Ok(entry) => LineOutcome::Parsed(entry),
+        Err(error) => {
+            tracing::debug!(
+                scheme,
+                kind = error.kind.as_str(),
+                host = skip_host(line),
+                line = %truncate_utf8(line, 80),
+                error = %error.message,
+                "skipping malformed proxy line"
+            );
             LineOutcome::Unrecognized
         }
     }
 }
 
-fn parsed(result: Result<ProxyEntry, String>) -> LineOutcome {
-    match result {
-        Ok(entry) => LineOutcome::Parsed(entry),
-        Err(message) => {
-            tracing::debug!(error = %message, "skipping malformed proxy line");
-            LineOutcome::Unrecognized
-        }
+/// Cut `value` to at most `max` bytes without splitting a UTF-8 character:
+/// log fields built from feed-controlled text must stay bounded.
+pub(crate) fn truncate_utf8(value: &str, max: usize) -> &str {
+    let mut end = max.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
     }
+    &value[..end]
+}
+
+/// Best-effort `host:port` of a line that failed to parse, for the skip
+/// diagnostics. The real parse has already failed, so this only mirrors
+/// `split_uri`'s precedence and strips the scheme, the fragment/query, the
+/// userinfo and the path.
+fn skip_host(line: &str) -> &str {
+    let Some((_, rest)) = line.split_once("://") else {
+        return "";
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let rest = rest.rsplit_once('@').map(|(_, host)| host).unwrap_or(rest);
+    let rest = rest.split('/').next().unwrap_or(rest);
+    truncate_utf8(rest, 128)
 }
 
 /// Normalize a host to the shape the URI parser produces: the bare address.
@@ -151,6 +250,34 @@ pub(crate) fn check_field_size(field: &str, value: &str) -> Result<(), String> {
             uri::MAX_PARAM_BYTES,
             value.len()
         ));
+    }
+    Ok(())
+}
+
+/// Enforce the parameter caps on a structured-format entry: at most
+/// [`uri::MAX_QUERY_PARAMS`] parameters and [`uri::MAX_PARAM_BYTES`] per
+/// key and value, with the one message wording shared by every vector
+/// parser.
+///
+/// The vector formats (Clash YAML, vmess JSON, sing-box JSON) feed decoded
+/// text straight into the parameter list, bypassing [`uri::parse_query`],
+/// so the caps `parse_query` enforces for URI lines are checked here, per
+/// entry.
+pub(crate) fn validate_params(prefix: &str, params: &[Param]) -> Result<(), String> {
+    if params.len() > uri::MAX_QUERY_PARAMS {
+        return Err(format!(
+            "{prefix}: {} parameters, over the {} cap",
+            params.len(),
+            uri::MAX_QUERY_PARAMS
+        ));
+    }
+    for param in params {
+        if param.key.len() > uri::MAX_PARAM_BYTES || param.value.len() > uri::MAX_PARAM_BYTES {
+            return Err(format!(
+                "{prefix}: field over the {}-byte cap",
+                uri::MAX_PARAM_BYTES
+            ));
+        }
     }
     Ok(())
 }
@@ -336,14 +463,15 @@ fn is_block_scalar_header(prefix: &str, header: &str) -> bool {
 /// serializer can rebuild the exact prefix.
 fn parse_naive(transport: &str, rest: &str, line: &str) -> LineOutcome {
     if !matches!(transport, "https" | "quic") {
+        tracing::debug!(
+            transport,
+            "unrecognized naive transport (expected https or quic)"
+        );
         return LineOutcome::Unrecognized;
     }
     let mut entry = match uri::parse_with_spec(&uri::NAIVE_SPEC, rest, line) {
         Ok(entry) => entry,
-        Err(message) => {
-            tracing::debug!(error = %message, "skipping malformed naive line");
-            return LineOutcome::Unrecognized;
-        }
+        Err(message) => return parsed("naive", line, Err(ParseError::from(message))),
     };
     // Insert first so the serializer sees it deterministically.
     entry.params.insert(
@@ -352,6 +480,7 @@ fn parse_naive(transport: &str, rest: &str, line: &str) -> LineOutcome {
             key: uri::NAIVE_TRANSPORT_PARAM.to_string(),
             value: transport.to_string(),
             known: true,
+            bare: false,
         },
     );
     LineOutcome::Parsed(entry)
@@ -384,7 +513,18 @@ impl ProxyEntry {
 pub fn serialize(entry: &ProxyEntry) -> String {
     let translated;
     let entry = if entry.raw_line.is_empty() {
-        translated = canonical_uri_entry(entry);
+        // The canonical translation is computed once at parse time and
+        // cached on the entry (see `with_canonical_cache`); recomputing it
+        // per call would re-parse the stored YAML blocks (`ws-opts`,
+        // `reality-opts`, …) on every rendered line. Entries without the
+        // cache (records rebuilt from SQLite) take the fallback.
+        translated = match &entry.canonical {
+            Some(params) => ProxyEntry {
+                params: params.clone(),
+                ..entry.clone()
+            },
+            None => canonical_uri_entry(entry),
+        };
         &translated
     } else {
         entry
@@ -392,17 +532,15 @@ pub fn serialize(entry: &ProxyEntry) -> String {
     let sanitized = sanitize_for_output(entry);
     let entry = sanitized.as_ref().unwrap_or(entry);
     match entry.scheme {
-        Scheme::Vless => uri::serialize_with_spec(&uri::VLESS_SPEC, entry),
-        Scheme::Trojan => uri::serialize_with_spec(&uri::TROJAN_SPEC, entry),
-        Scheme::Hysteria2 => uri::serialize_with_spec(&uri::HYSTERIA2_SPEC, entry),
-        Scheme::Tuic => uri::serialize_with_spec(&uri::TUIC_SPEC, entry),
-        Scheme::Mieru => uri::serialize_with_spec(&uri::MIERU_SPEC, entry),
-        Scheme::Socks5 => uri::serialize_with_spec(&uri::SOCKS5_SPEC, entry),
-        Scheme::Snell => uri::serialize_with_spec(&uri::SNELL_SPEC, entry),
-        Scheme::AnyTls => uri::serialize_with_spec(&uri::ANYTLS_SPEC, entry),
         Scheme::Naive => serialize_naive(entry),
         Scheme::Ss => ss::serialize(entry),
         Scheme::Vmess => vmess::serialize(entry),
+        // The URI family shares one serializer; the spec comes from the
+        // registry, the same table `parse_line` reads.
+        other => uri::serialize_with_spec(
+            uri::spec_for(other.as_str()).expect("the registry covers every URI-family scheme"),
+            entry,
+        ),
     }
 }
 
@@ -451,6 +589,20 @@ fn canonical_uri_entry(entry: &ProxyEntry) -> ProxyEntry {
         }
     }
     out
+}
+
+/// Attach the canonical-parameter cache to a structured entry: the
+/// translation [`canonical_uri_entry`] would compute, done once at parse
+/// time so a repeated `serialize` does not re-parse the stored YAML blocks.
+/// The structured parsers call this on their output; entries the cache was
+/// never filled for (records rebuilt from SQLite) take the
+/// [`canonical_uri_entry`] fallback inside [`serialize`].
+pub(crate) fn with_canonical_cache(mut entry: ProxyEntry) -> ProxyEntry {
+    if entry.raw_line.is_empty() {
+        let canonical = canonical_uri_entry(&entry);
+        entry.canonical = Some(canonical.params);
+    }
+    entry
 }
 
 fn translate_uri_param(scheme: Scheme, param: &Param, out: &mut Vec<Param>) {
@@ -584,6 +736,7 @@ fn push(out: &mut Vec<Param>, key: &str, value: &str) {
             key: key.to_string(),
             value: value.to_string(),
             known: true,
+            bare: false,
         });
     }
 }
@@ -602,7 +755,10 @@ fn joined_alpn(value: &str) -> String {
         Some(serde_norway::Value::Sequence(items)) => {
             let items: Vec<String> = items.iter().filter_map(yaml_scalar).collect();
             if items.is_empty() {
-                value.to_string()
+                // An empty (or all-non-scalar) list has no URI spelling;
+                // the empty string makes `push` drop the parameter instead
+                // of emitting the raw YAML text.
+                String::new()
             } else {
                 items.join(",")
             }
@@ -677,7 +833,10 @@ fn sanitize_for_output(entry: &ProxyEntry) -> Option<ProxyEntry> {
         return None;
     }
     tracing::warn!(
-        host = %entry.host.replace(['\n', '\r'], "\\n"),
+        scheme = entry.scheme.as_str(),
+        name = %entry.name.replace(['\n', '\r'], "\\n"),
+        host = %truncate_utf8(&entry.host.replace(['\n', '\r'], "\\n"), 128),
+        port = entry.port,
         "proxy entry carries line breaks, sanitizing before output"
     );
     let strip = |value: &str| value.replace(['\n', '\r'], " ");
@@ -706,6 +865,9 @@ fn serialize_naive(entry: &ProxyEntry) -> String {
     format!("{prefix}{}", &generic[spec_prefix.len()..])
 }
 
+/// How many unrecognized-line samples [`ParsedSubscription`] keeps.
+const UNRECOGNIZED_SAMPLES: usize = 5;
+
 /// Aggregated result of parsing a whole subscription payload.
 #[derive(Debug, Default)]
 pub struct ParsedSubscription {
@@ -714,11 +876,16 @@ pub struct ParsedSubscription {
     pub discarded: usize,
     /// Unknown/malformed lines skipped.
     pub unrecognized: usize,
-    /// Clash items of unsupported types or malformed items, and the same
-    /// for sing-box/Xray outbounds.
-    pub clash_skipped: usize,
+    /// Structured-format (Clash YAML, sing-box/Xray JSON) items that
+    /// produced no entry: unsupported types, malformed items and any
+    /// further skip class the structured parsers report. The components
+    /// are logged once per payload by the structured parsers.
+    pub skipped: usize,
     /// The format the payload was detected (or pinned) as.
     pub format: InputFormat,
+    /// Up to [`UNRECOGNIZED_SAMPLES`] unrecognized lines, each truncated,
+    /// for the diagnostics of a payload that recognized nothing.
+    pub unrecognized_samples: Vec<String>,
 }
 
 /// Decode and parse a full subscription payload.
@@ -747,58 +914,96 @@ pub fn parse_subscription(
 /// Unwrap the transport encoding. `auto` base64-decodes only when the payload
 /// cannot already be a plain subscription (no `://` marker) and decodes to
 /// something that looks like one: a URI list, Clash YAML, or a JSON config
-/// (object or array, the v2rayN share format).
-fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<String> {
+/// (object or array, the v2rayN share format). The structured markers come
+/// from [`detect_structured_format`], the same function the format
+/// detection reads, so a wrapped payload with a structured marker decodes
+/// into the format that marker selects.
+fn decode_payload(payload: &str, encoding: Encoding) -> crate::Result<Cow<'_, str>> {
     match encoding {
-        Encoding::Plain => Ok(payload.to_string()),
-        Encoding::Base64 => decode_base64_text(payload).ok_or_else(|| {
-            crate::Error::Parse("payload is not valid base64 (pinned encoding)".to_string())
-        }),
+        Encoding::Plain => Ok(Cow::Borrowed(payload)),
+        Encoding::Base64 => decode_base64_text(payload)
+            .map(Cow::Owned)
+            .map_err(|reason| {
+                crate::Error::Parse(format!(
+                    "payload is not valid base64 ({reason}, {} bytes; pinned encoding)",
+                    payload.len()
+                ))
+            }),
         Encoding::Auto => {
             let trimmed = payload.trim();
             if !trimmed.is_empty()
                 && !trimmed.contains("://")
-                && let Some(decoded) = decode_base64_text(trimmed)
+                && let Ok(decoded) = decode_base64_text(trimmed)
             {
-                let head = decoded.trim_start();
-                if decoded.contains("://")
-                    || decoded.contains("proxies:")
-                    || head.starts_with('{')
-                    || head.starts_with('[')
-                {
-                    return Ok(decoded);
+                if decoded.contains("://") || detect_structured_format(&decoded).is_some() {
+                    return Ok(Cow::Owned(decoded));
                 }
+                // Decoded to text but nothing subscription-shaped inside:
+                // the source probably pinned the wrong encoding.
+                tracing::warn!(
+                    bytes = trimmed.len(),
+                    "payload looks base64-encoded but did not decode to a subscription; \
+                     try pinning the encoding"
+                );
             }
-            Ok(payload.to_string())
+            Ok(Cow::Borrowed(payload))
         }
     }
 }
 
-fn decode_base64_text(input: &str) -> Option<String> {
+/// Decode a base64 payload to text. The `Err` reason distinguishes why the
+/// payload was refused: `bad-base64` (not valid under either alphabet),
+/// `non-utf8` (binary garbage) or `empty` (nothing left after decoding).
+fn decode_base64_text(input: &str) -> Result<String, &'static str> {
     // Feeds wrap long payloads at 76 columns or pad them with blank lines;
     // base64 has no whitespace of its own, so interior whitespace (which
     // also breaks the length-modulo check) is stripped before decoding.
-    let bytes = ss::decode_b64_lenient(&input.split_whitespace().collect::<String>())?;
+    let compact = input.split_whitespace().collect::<String>();
+    let Some(bytes) = uri::decode_b64_lenient(&compact) else {
+        return Err(if compact.is_empty() {
+            "empty"
+        } else {
+            "bad-base64"
+        });
+    };
     // A subscription is text; reject binary garbage.
-    let text = String::from_utf8(bytes).ok()?;
-    (!text.trim().is_empty()).then_some(text)
+    let text = String::from_utf8(bytes).map_err(|_| "non-utf8")?;
+    if text.trim().is_empty() {
+        return Err("empty");
+    }
+    Ok(text)
+}
+
+/// The structured-format markers of a subscription payload: JSON (an object
+/// or the v2rayN share array) means sing-box, a `proxies:` key means Clash
+/// YAML. `None` leaves the payload to the URI-list parser.
+///
+/// The one shared marker set of [`decode_payload`] (the base64 gate must
+/// unwrap anything the detection below would recognize) and of
+/// [`detect_format`].
+fn detect_structured_format(text: &str) -> Option<InputFormat> {
+    // A leading UTF-8 BOM precedes the markers in the wild; both the base64
+    // gate of `decode_payload` and `detect_format` read this, so it is
+    // stripped once here.
+    let text = text.trim_start_matches('\u{feff}');
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return Some(InputFormat::SingBoxJson);
+    }
+    // CRLF needs no separate `\r\nproxies:` check: that spelling contains
+    // `\nproxies:` already.
+    let has_proxies_key = trimmed.starts_with("proxies:") || text.contains("\nproxies:");
+    if has_proxies_key {
+        return Some(InputFormat::ClashYaml);
+    }
+    None
 }
 
 /// Heuristic format detection: JSON (object or the v2rayN share array)
 /// means sing-box, a `proxies:` key means Clash YAML, everything else is
 /// treated as a URI list.
 fn detect_format(text: &str) -> InputFormat {
-    let trimmed = text.trim_start();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return InputFormat::SingBoxJson;
-    }
-    let has_proxies_key = trimmed.starts_with("proxies:")
-        || text.contains("\nproxies:")
-        || text.contains("\r\nproxies:");
-    if has_proxies_key {
-        return InputFormat::ClashYaml;
-    }
-    InputFormat::UriList
+    detect_structured_format(text).unwrap_or(InputFormat::UriList)
 }
 
 fn parse_uri_list(text: &str, format: InputFormat) -> crate::Result<ParsedSubscription> {
@@ -806,6 +1011,7 @@ fn parse_uri_list(text: &str, format: InputFormat) -> crate::Result<ParsedSubscr
         format,
         ..Default::default()
     };
+    let mut unknown_schemes: HashSet<String> = HashSet::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -820,7 +1026,24 @@ fn parse_uri_list(text: &str, format: InputFormat) -> crate::Result<ParsedSubscr
         match parse_line(line) {
             LineOutcome::Parsed(entry) => result.entries.push(entry),
             LineOutcome::Discarded => result.discarded += 1,
-            LineOutcome::Unrecognized => result.unrecognized += 1,
+            LineOutcome::Unrecognized => {
+                result.unrecognized += 1;
+                // Keep a few samples so a payload that recognizes nothing
+                // can be diagnosed from the aggregate result alone.
+                if result.unrecognized_samples.len() < UNRECOGNIZED_SAMPLES {
+                    result
+                        .unrecognized_samples
+                        .push(truncate_utf8(line, 80).to_string());
+                }
+                // One log per unknown scheme per payload, not once per
+                // line: a feed of ten thousand junk lines must not flood
+                // the log.
+                if let Some((scheme, _)) = line.split_once("://")
+                    && unknown_schemes.insert(scheme.to_ascii_lowercase())
+                {
+                    tracing::debug!(scheme, "unrecognized proxy scheme");
+                }
+            }
         }
     }
     Ok(result)
@@ -828,9 +1051,19 @@ fn parse_uri_list(text: &str, format: InputFormat) -> crate::Result<ParsedSubscr
 
 fn parse_clash_payload(text: &str) -> crate::Result<ParsedSubscription> {
     let clash_result = clash::parse_payload(text).map_err(crate::Error::Parse)?;
+    let skipped = clash_result.unsupported + clash_result.invalid + clash_result.skipped;
+    if skipped > 0 {
+        // The aggregate hides the components; name them once per payload.
+        tracing::warn!(
+            unsupported = clash_result.unsupported,
+            invalid = clash_result.invalid,
+            skipped = clash_result.skipped,
+            "clash payload: items produced no entry"
+        );
+    }
     Ok(ParsedSubscription {
         entries: clash_result.entries,
-        clash_skipped: clash_result.unsupported + clash_result.invalid + clash_result.skipped,
+        skipped,
         format: InputFormat::ClashYaml,
         ..Default::default()
     })
@@ -838,9 +1071,19 @@ fn parse_clash_payload(text: &str) -> crate::Result<ParsedSubscription> {
 
 fn parse_singbox_payload(text: &str) -> crate::Result<ParsedSubscription> {
     let result = singbox::parse_payload(text).map_err(crate::Error::Parse)?;
+    let skipped = result.unsupported + result.invalid + result.skipped;
+    if skipped > 0 {
+        // The aggregate hides the components; name them once per payload.
+        tracing::warn!(
+            unsupported = result.unsupported,
+            invalid = result.invalid,
+            skipped = result.skipped,
+            "sing-box payload: items produced no entry"
+        );
+    }
     Ok(ParsedSubscription {
         entries: result.entries,
-        clash_skipped: result.unsupported + result.invalid + result.skipped,
+        skipped,
         format: InputFormat::SingBoxJson,
         ..Default::default()
     })
@@ -1042,6 +1285,33 @@ mod tests {
         assert_eq!(back.param("servicename"), Some("svc"));
     }
 
+    /// `h2-opts` and `http-opts` flatten onto the URI scalars the same way
+    /// `ws-opts` does: the block text itself must never leak into the query.
+    #[test]
+    fn clash_h2_and_http_opts_flatten_onto_uri_params() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: h2, type: vless, server: h.example.com, port: 443, uuid: u, ",
+            "network: h2, h2-opts: {host: [a.com, b.com], path: /p}}\n",
+        );
+        let line = serialize(&clash_entries(yaml)[0]);
+        assert!(line.contains("type=h2"), "{line}");
+        assert!(line.contains("host=a.com,b.com"), "{line}");
+        assert!(line.contains("path=/p"), "{line}");
+        assert!(!line.contains("h2-opts"), "{line}");
+
+        let yaml = concat!(
+            "proxies:\n",
+            "  - {name: hp, type: vless, server: h.example.com, port: 443, uuid: u, ",
+            "network: http, http-opts: {path: /x, headers: {Host: hh}}}\n",
+        );
+        let line = serialize(&clash_entries(yaml)[0]);
+        assert!(line.contains("type=http"), "{line}");
+        assert!(line.contains("path=/x"), "{line}");
+        assert!(line.contains("host=hh"), "{line}");
+        assert!(!line.contains("http-opts"), "{line}");
+    }
+
     /// mihomo spells REALITY as `tls: true` + `reality-opts`; the URI
     /// vocabulary is `security=reality`. Flattening only the block while
     /// the `tls` boolean still emitted `security=tls` handed the client a
@@ -1147,7 +1417,7 @@ mod tests {
             "    password: \"pw\\nvless://SMUGGLED@3.3.3.3:443#pwn\"\n",
         ));
         assert!(smuggled.entries.is_empty());
-        assert_eq!(smuggled.clash_skipped, 1);
+        assert_eq!(smuggled.skipped, 1);
 
         // Host field.
         let bad_host = clash(concat!(
@@ -1159,7 +1429,7 @@ mod tests {
             "    password: pw\n",
         ));
         assert!(bad_host.entries.is_empty());
-        assert_eq!(bad_host.clash_skipped, 1);
+        assert_eq!(bad_host.skipped, 1);
 
         // vmess JSON carries the same risk through `add` and `id`.
         let json = r#"{"v":"2","ps":"x","add":"h.example.com","port":"443","id":"u\nvless://Y@8.8.8.8:443#inj"}"#;
@@ -1190,6 +1460,9 @@ mod tests {
             // libyaml scans `?*a` in flow context as an alias even without a
             // space, so a bomb hides behind a `?` from whitespace-only checks.
             "a: [?*a, ?*b]\n",
+            // `x: a |` is a plain scalar ending in `|`, not a block header;
+            // the alias-shaped line after it must still be caught.
+            "x: a |\n *b",
         ] {
             assert!(
                 reject_yaml_aliases(payload).is_err(),
@@ -1214,6 +1487,12 @@ mod tests {
             "- plain\n- list\n",
             "a: \"line1\n  line2 *b\"\n",
             "proxies:\n  - {name: n, type: trojan, server: h, port: 443, password: 'p*w'}\n",
+            // Block-scalar headers with an explicit indentation indicator, a
+            // sequence-entry header and a folded header with a comment: the
+            // content lines are literal text, alias-shaped or not.
+            "s: |2\n text *x",
+            "- |\n *a",
+            "s: >2- # c\n a *b",
         ] {
             assert!(
                 reject_yaml_aliases(payload).is_ok(),
@@ -1256,7 +1535,7 @@ mod tests {
     fn serialize_sanitizes_line_breaks_it_is_handed() {
         let entry = ProxyEntry {
             scheme: Scheme::Trojan,
-            name: "n".into(),
+            name: "n\n# forged".into(),
             host: "h.example.com\nvless://X@9.9.9.9:443#inj".into(),
             port: 443,
             credential: "pw\nsmuggled".into(),
@@ -1264,13 +1543,20 @@ mod tests {
                 key: "sni".into(),
                 value: "a\n# profile-title: FORGED".into(),
                 known: true,
+                bare: false,
             }],
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         };
         let line = serialize(&entry);
         assert_eq!(line.lines().count(), 1, "{line:?}");
         assert!(!line.contains('\n') && !line.contains('\r'));
+        // The name rode percent-encoded, so the forged `#` comment cannot
+        // split it off the line.
+        assert!(line.contains("%0A%23"), "{line}");
+        // A re-parse restores the original name.
+        assert_eq!(entry_for(&line).name, "n\n# forged");
     }
 
     #[test]
@@ -1283,6 +1569,34 @@ mod tests {
             parse_line("just some text"),
             LineOutcome::Unrecognized
         ));
+    }
+
+    /// Port 0 is not a dialable endpoint, so `vless://uuid@host:0` is
+    /// dropped at parse time: no record with it reaches the database, and a
+    /// subscription built from stored proxies — including the unknown-status
+    /// rows the default pipeline serves — can never carry it. The schema
+    /// CHECK (migration 0018) is the second gate behind this one.
+    #[test]
+    fn a_zero_port_uri_produces_no_entry() {
+        assert!(matches!(
+            parse_line("vless://uuid@host:0#name"),
+            LineOutcome::Unrecognized
+        ));
+        let result =
+            parse_subscription("vless://uuid@host:0#name\n", Encoding::Plain, None).unwrap();
+        assert_eq!(result.entries.len(), 0);
+    }
+
+    /// Scheme matching is on the lower-cased spelling: real feeds write
+    /// `VLESS://` and `Trojan://` just as often as the canonical form.
+    #[test]
+    fn mixed_case_scheme_spellings_parse() {
+        assert_eq!(entry_for("VLESS://u@h:1#n").scheme, Scheme::Vless);
+        assert_eq!(entry_for("Trojan://p@h:1#n").scheme, Scheme::Trojan);
+        assert_eq!(
+            entry_for("hysteria2://p@h:1?sni=h#n").scheme,
+            Scheme::Hysteria2
+        );
     }
 
     #[test]
@@ -1356,6 +1670,40 @@ mod tests {
         let result = parse_subscription(&wrapped, Encoding::Auto, None).unwrap();
         assert_eq!(result.format, InputFormat::SingBoxJson);
         assert_eq!(result.entries.len(), 1);
+    }
+
+    /// The structured markers live in one function read by both the base64
+    /// gate and the format detection: a base64-wrapped payload carrying the
+    /// `proxies:` marker decodes and parses as Clash, instead of falling
+    /// back to a URI-list parse that recognizes nothing.
+    #[test]
+    fn auto_detects_base64_wrapped_clash_yaml() {
+        use base64::Engine;
+        let inner = "proxies:\n  - {name: n, type: trojan, server: h, port: 443, password: p}\n";
+        let wrapped = base64::engine::general_purpose::STANDARD.encode(inner);
+        let result = parse_subscription(&wrapped, Encoding::Auto, None).unwrap();
+        assert_eq!(result.format, InputFormat::ClashYaml);
+        assert_eq!(result.entries.len(), 1);
+        // The pinned encoding takes the wrapped form too.
+        let result = parse_subscription(&wrapped, Encoding::Base64, None).unwrap();
+        assert_eq!(result.format, InputFormat::ClashYaml);
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    /// The aggregate result counts each skip kind separately: a recognized
+    /// entry, a deliberate discard and a junk line each land in their own
+    /// counter, and the junk line leaves a truncated sample behind.
+    #[test]
+    fn parse_subscription_counts_each_skip_kind() {
+        let payload = "vless://u@h:1#A\nhapp://x\ngarbage without a scheme\n";
+        let result = parse_subscription(payload, Encoding::Plain, None).unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.discarded, 1);
+        assert_eq!(result.unrecognized, 1);
+        assert_eq!(
+            result.unrecognized_samples,
+            vec!["garbage without a scheme"]
+        );
     }
 
     #[test]

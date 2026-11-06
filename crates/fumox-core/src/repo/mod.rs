@@ -66,6 +66,10 @@ impl WhereFilter {
     /// `IN ()` list is a syntax error, and the family builders only call
     /// this after their own emptiness guard.
     pub(crate) fn text_in(mut self, column: &str, values: &[String]) -> Self {
+        debug_assert!(
+            !values.is_empty(),
+            "WhereFilter::text_in requires a non-empty value list"
+        );
         let placeholders = vec!["?"; values.len()].join(", ");
         self.clauses.push(format!("{column} IN ({placeholders})"));
         self.values.extend(values.iter().cloned());
@@ -179,9 +183,24 @@ pub async fn meta_set(pool: &DbPool, key: &str, value: &str) -> crate::Result<()
 /// when absent, and return the new value. A single upsert, so two
 /// concurrent callers each observe their own bump: a `meta_get` +
 /// `meta_set` pair would race them onto the same value. A pre-existing
-/// non-integer value casts to 0 and self-heals from 1. Stored through the
-/// TEXT-affinity column, so `meta_get` still reads the number back as text.
+/// non-integer value casts to 0 and self-heals from 1 — the heal rewrites
+/// the stored text silently, so it is logged with the key and the value it
+/// replaced. Stored through the TEXT-affinity column, so `meta_get` still
+/// reads the number back as text.
 pub async fn meta_increment(pool: &DbPool, key: &str) -> crate::Result<i64> {
+    let previous: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    if let Some((previous,)) = previous
+        && previous.parse::<i64>().is_err()
+    {
+        tracing::warn!(
+            key,
+            previous_value = %previous,
+            "meta_increment: non-integer counter casts to 0 and self-heals from 1"
+        );
+    }
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO meta (key, value) VALUES (?, '1')
          ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
@@ -200,10 +219,19 @@ pub(crate) fn json_to_text(value: &serde_json::Value) -> crate::Result<String> {
         .map_err(|e| crate::Error::Parse(format!("cannot serialize JSON column: {e}")))
 }
 
-/// Parse a JSON column value.
-pub(crate) fn text_to_json(text: &str, column: &str) -> crate::Result<serde_json::Value> {
-    serde_json::from_str(text)
-        .map_err(|e| crate::Error::Parse(format!("corrupt JSON in column {column}: {e}")))
+/// Parse a JSON column value. `row_id` names the row the column was read
+/// from, so the error points at the broken row instead of just the broken
+/// column.
+pub(crate) fn text_to_json(
+    text: &str,
+    column: &str,
+    row_id: &str,
+) -> crate::Result<serde_json::Value> {
+    serde_json::from_str(text).map_err(|e| {
+        crate::Error::Parse(format!(
+            "corrupt JSON in column {column} of row {row_id}: {e}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -252,6 +280,64 @@ mod tests {
         );
     }
 
+    /// The upsert is the whole increment: 16 callers firing concurrently
+    /// observe 16 distinct values, so a lost update (two callers landing on
+    /// the same bump) is impossible by construction.
+    #[tokio::test]
+    async fn meta_increment_is_atomic_under_concurrent_callers() {
+        let (_dir, pool) = temp_pool().await;
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(
+                async move { meta_increment(&pool, "k").await },
+            ));
+        }
+        let mut values: Vec<i64> = Vec::new();
+        for handle in handles {
+            values.push(handle.await.unwrap().unwrap());
+        }
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            (1..=16).collect::<Vec<i64>>(),
+            "every caller must observe its own bump"
+        );
+    }
+
+    /// The `IN`-clause builder: one placeholder per element, values bound
+    /// in list order.
+    #[test]
+    fn where_filter_text_in_binds_every_element() {
+        let wf = WhereFilter::new().text_in("col", &["a".into(), "b".into()]);
+        assert_eq!(wf.sql(), " WHERE col IN (?, ?)");
+        assert_eq!(wf.values(), ["a".to_string(), "b".to_string()].as_slice());
+    }
+
+    /// The fragments accumulate in push order, both in the SQL text and in
+    /// the bound values.
+    #[test]
+    fn where_filter_keeps_the_push_order() {
+        let wf = WhereFilter::new()
+            .clause("s.enabled = 1")
+            .text("s.name = ?", "first")
+            .text_value("second");
+        assert_eq!(wf.sql(), " WHERE s.enabled = 1 AND s.name = ?");
+        assert_eq!(
+            wf.values(),
+            ["first".to_string(), "second".to_string()].as_slice()
+        );
+    }
+
+    /// A caller-supplied value never enters the SQL text: a value with
+    /// quotes travels through the bind, so it cannot change the clause.
+    #[test]
+    fn where_filter_value_with_quotes_stays_out_of_the_sql_text() {
+        let wf = WhereFilter::new().text("s.name = ?", "it's \"quoted\"");
+        assert_eq!(wf.sql(), " WHERE s.name = ?");
+        assert_eq!(wf.values(), ["it's \"quoted\"".to_string()].as_slice());
+    }
+
     #[tokio::test]
     async fn migrations_create_full_schema() {
         let (_dir, pool) = temp_pool().await;
@@ -262,6 +348,9 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
+        // Subset check: a migration adding a table/index must extend these
+        // lists — the version assert below is the only tripwire forcing an
+        // update here.
         let tables: Vec<&str> = tables.iter().map(|(name,)| name.as_str()).collect();
         for expected in [
             "sources",
@@ -302,6 +391,8 @@ mod tests {
             "idx_speed_proxy_time",
             "idx_fetch_source_time",
             "idx_fetch_time",
+            "idx_fetch_fail",
+            "idx_fetch_error_class",
             "idx_proxies_updated_at",
             "idx_proxies_geo_attempt",
             "idx_proxies_last_t2_checked_at",
@@ -321,10 +412,39 @@ mod tests {
             "the proxy row must carry the T2 recency stamp"
         );
 
-        // Schema version is stamped into meta by db::migrate. Bumped to 14
-        // by migration 0014 (the T2 recency stamp).
+        // Schema version is stamped into meta by db::migrate. Bumped to 18
+        // by migration 0018 (the proxies rebuild that installs the port
+        // range CHECK; 0017 added the fetch-log failure indexes before it).
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("14"));
+        assert_eq!(version.as_deref(), Some("18"));
+
+        // The fetch-attempt stamp of migration 0015 is on the source row.
+        let source_columns: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('sources')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let source_columns: Vec<&str> =
+            source_columns.iter().map(|(name,)| name.as_str()).collect();
+        assert!(
+            source_columns.contains(&"last_attempt_at"),
+            "the source row must carry the fetch-attempt stamp"
+        );
+
+        // The attempt count of migration 0016 is on the journal row.
+        let journal_columns: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('fetch_log')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let journal_columns: Vec<&str> = journal_columns
+            .iter()
+            .map(|(name,)| name.as_str())
+            .collect();
+        assert!(
+            journal_columns.contains(&"attempts"),
+            "the journal row must carry the attempt count"
+        );
 
         // WAL is active on the connection.
         let (journal_mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")
@@ -343,10 +463,9 @@ mod tests {
         use sqlx::migrate::Migrator;
         static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-        let dir = std::env::temp_dir().join(format!("fumox-mig-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::tempdir_lite::TempDir::new("fumox-mig");
         let cfg = crate::config::DatabaseConfig {
-            path: dir.join("test.db"),
+            path: dir.path().join("test.db"),
             ..Default::default()
         };
         let pool = db::connect_pool(&cfg).await.unwrap();
@@ -438,7 +557,160 @@ mod tests {
         );
 
         pool.close().await;
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migration 0018 rebuilds `proxies` with a port range CHECK and drops
+    /// the rows a pre-check database could carry with port = 0 (SQLite
+    /// cannot add a CHECK to an existing column, so the rebuild copies the
+    /// rows the CHECK accepts and leaves the junk behind). The children of
+    /// a dropped row go with it — the explicit deletes stand in for the
+    /// `ON DELETE CASCADE` the schema declares, which cannot fire while
+    /// foreign keys are off — and every valid row keeps its id and its
+    /// columns.
+    #[tokio::test]
+    async fn migration_0018_drops_port_zero_rows_and_installs_the_port_range_check() {
+        use sqlx::migrate::Migrator;
+        static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+        let dir = crate::tempdir_lite::TempDir::new("fumox-mig");
+        let cfg = crate::config::DatabaseConfig {
+            path: dir.path().join("test.db"),
+            ..Default::default()
+        };
+        let pool = db::connect_pool(&cfg).await.unwrap();
+
+        // The pre-check schema (0001..0017), applied by hand so the rebuild
+        // runs against rows and children that already exist.
+        for migration in MIGRATOR.migrations.iter().filter(|m| m.version <= 17) {
+            sqlx::raw_sql(migration.sql.clone())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        sqlx::query(
+            "INSERT INTO sources (id, name, url, created_at, updated_at)
+             VALUES ('src', 'src', 'https://example.com', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (fingerprint, port) in [("fp-keep", 443), ("fp-zero", 0)] {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, host, port, status, created_at, updated_at)
+                 VALUES (?1, 'vless', 'h.example.com', ?2, 'unknown', 1, 1)",
+            )
+            .bind(fingerprint)
+            .bind(port)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let id_of = async |fp: &str| -> i64 {
+            sqlx::query_scalar("SELECT id FROM proxies WHERE fingerprint = ?1")
+                .bind(fp)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        // Both rows carry a source link and a probe result: the kept row's
+        // children must survive the rebuild, the dropped row's must not.
+        let keep_id = id_of("fp-keep").await;
+        let zero_id = id_of("fp-zero").await;
+        assert_ne!(keep_id, zero_id, "the fixture rows must get distinct ids");
+        for id in [keep_id, zero_id] {
+            sqlx::query(
+                "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?1, 'src', 1)",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO probe_results (proxy_id, checked_at, ok, probe_kind)
+                 VALUES (?1, 1000, 1, 'tcp')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let eighteenth = MIGRATOR
+            .migrations
+            .iter()
+            .find(|m| m.version == 18)
+            .expect("migration 0018 missing");
+        sqlx::raw_sql(eighteenth.sql.clone())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The port-0 row is gone, the valid row survived with its columns.
+        let ports: Vec<i64> = sqlx::query_scalar("SELECT port FROM proxies ORDER BY port")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ports, vec![443]);
+        let (status, raw_path, ladder_step): (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT status, raw_path, ladder_step FROM proxies WHERE fingerprint = 'fp-keep'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "unknown");
+        assert_eq!(
+            raw_path, None,
+            "the rebuild must preserve the columns it copies"
+        );
+        assert_eq!(ladder_step, 0);
+
+        // The children of the dropped row are gone, the kept row's are intact.
+        for table in ["proxy_source_links", "probe_results"] {
+            let kept: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE proxy_id = ?1"
+            )))
+            .bind(keep_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(kept, 1, "{table} of the kept row must survive");
+            let dropped: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE proxy_id = ?1"
+            )))
+            .bind(zero_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(dropped, 0, "{table} of the dropped row must go with it");
+        }
+
+        // The CHECK is active on the rebuilt table: port 0 is refused, the
+        // boundary ports are not.
+        let err = sqlx::query(
+            "INSERT INTO proxies (fingerprint, scheme, host, port, status, created_at, updated_at)
+             VALUES ('fp-new0', 'vless', 'h.example.com', 0, 'unknown', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("proxies_port_range"),
+            "expected the port range CHECK to fire, got: {err}"
+        );
+        for (fingerprint, port) in [("fp-new1", 1), ("fp-newmax", 65535)] {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, host, port, status, created_at, updated_at)
+                 VALUES (?1, 'vless', 'h.example.com', ?2, 'unknown', 1, 1)",
+            )
+            .bind(fingerprint)
+            .bind(port)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        pool.close().await;
     }
 
     /// Migration 0013 backfills the T2 block from the probe history.
@@ -453,10 +725,9 @@ mod tests {
         use sqlx::migrate::Migrator;
         static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-        let dir = std::env::temp_dir().join(format!("fumox-mig-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::tempdir_lite::TempDir::new("fumox-mig");
         let cfg = crate::config::DatabaseConfig {
-            path: dir.join("test.db"),
+            path: dir.path().join("test.db"),
             ..Default::default()
         };
         let pool = db::connect_pool(&cfg).await.unwrap();
@@ -550,6 +821,5 @@ mod tests {
         assert_eq!(by_fp["fp-never"], None);
 
         pool.close().await;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

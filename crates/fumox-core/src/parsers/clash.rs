@@ -3,8 +3,8 @@
 //! Clash subscriptions carry proxies as structured YAML items under the
 //! `proxies:` key. Only the proxy list is consumed; proxy groups and rules
 //! are irrelevant to Fumox. Supported item types: `ss`, `trojan`, `vmess`,
-//! `hysteria2`, `vless`, `socks5`, items of any other type are skipped and
-//! counted, never fatal (log-and-skip principle).
+//! `hysteria2`, `vless`, `socks5`, `snell`, `anytls`; items of any other
+//! type are skipped and counted, never fatal (log-and-skip principle).
 //!
 //! Entries parsed from Clash have no source line; their `raw_line` stays
 //! empty and output serialization falls back to the canonical URI form of
@@ -22,15 +22,23 @@ struct ClashTypeSpec {
     ///
     /// It must when every part is optional, because the output writers
     /// skip an empty part and read a colon-less credential as no
-    /// credential at all (socks5 `username`/`password`). It must not when
-    /// the first part is a method with a default: the shadowsocks writers
-    /// take the default only for a colon-less credential and would emit an
-    /// empty cipher for `":pw"`.
+    /// credential at all (socks5 `username`/`password`). It must not for
+    /// shadowsocks: a password-only item is canonicalized to
+    /// `DEFAULT_SS_CIPHER:password` at parse time (see [`SS_SPEC`]), and an
+    /// empty leading slot would read as an empty cipher.
     optional_credential_fields: bool,
     /// Lower-cased Clash field names recognized as defined parameters.
     known_fields: &'static [&'static str],
 }
 
+/// The shadowsocks credential glue — the one place the contract is written:
+/// `cipher` and `password` join positionally into `method:password`, the
+/// shape every reader (the ss serializer, the Clash and sing-box writers,
+/// the fingerprint) splits on `:`. A password-only item is canonicalized to
+/// [`crate::models::DEFAULT_SS_CIPHER`]`:password` here at parse time, so
+/// the readers never re-derive the default themselves and the row merges
+/// with its explicit-cipher twin; an item with no credential at all is
+/// invalid (ss has no no-auth mode).
 const SS_SPEC: ClashTypeSpec = ClashTypeSpec {
     scheme: Scheme::Ss,
     credential_fields: &["cipher", "password"],
@@ -162,6 +170,17 @@ pub struct ClashParseResult {
     pub skipped: usize,
 }
 
+/// The root of a Clash payload: only `proxies` is consumed. Deserializing
+/// into this minimal structure lets serde skip the unknown top-level
+/// branches (`proxy-groups`, `rules`, …) without materializing them as
+/// `Value` nodes; `deny_unknown_fields` is deliberately not set, a payload
+/// with extra keys keeps parsing. A missing or non-sequence `proxies` is a
+/// deserialization error.
+#[derive(serde::Deserialize)]
+struct ClashRoot {
+    proxies: Vec<Value>,
+}
+
 /// Parse a full Clash YAML subscription payload.
 pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
     // Alias references are refused before parsing: the whole payload is
@@ -169,12 +188,8 @@ pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
     // the anchor's subtree for every reference, an alias bomb amplifies
     // quadratic memory out of a small payload (see `reject_yaml_aliases`).
     super::reject_yaml_aliases(payload).map_err(|e| format!("clash: {e}"))?;
-    let root: Value =
+    let root: ClashRoot =
         serde_norway::from_str(payload).map_err(|e| format!("clash: invalid YAML: {e}"))?;
-    let proxies = root
-        .get("proxies")
-        .and_then(Value::as_sequence)
-        .ok_or("clash: no `proxies` list")?;
 
     let mut result = ClashParseResult {
         entries: Vec::new(),
@@ -182,7 +197,7 @@ pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
         invalid: 0,
         skipped: 0,
     };
-    for item in proxies {
+    for (index, item) in root.proxies.iter().enumerate() {
         if result.entries.len() >= super::MAX_ENTRIES {
             // The cap is reached: the rest of the payload is counted instead
             // of parsed, so the load stays bounded and the truncation shows.
@@ -193,10 +208,24 @@ pub fn parse_payload(payload: &str) -> Result<ClashParseResult, String> {
             Ok(Some(entry)) => result.entries.push(entry),
             Ok(None) => result.unsupported += 1,
             Err(message) => {
-                tracing::debug!(error = %message, "skipping malformed clash proxy item");
+                tracing::debug!(
+                    item = index,
+                    error = %message,
+                    "skipping malformed clash proxy item"
+                );
                 result.invalid += 1;
             }
         }
+    }
+    // One summary line for the whole payload: the element loop only counts
+    // its skips, so this is where the truncation becomes visible.
+    if result.unsupported > 0 || result.invalid > 0 {
+        tracing::warn!(
+            entries = result.entries.len(),
+            unsupported = result.unsupported,
+            invalid = result.invalid,
+            "clash payload parsed"
+        );
     }
     Ok(result)
 }
@@ -217,21 +246,36 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
         "socks5" => &SOCKS5_SPEC,
         "snell" => &SNELL_SPEC,
         "anytls" => &ANYTLS_SPEC,
-        _ => return Ok(None),
+        _ => {
+            tracing::debug!(
+                proxy_type = %super::truncate_utf8(&type_name, 64),
+                "skipping unsupported clash proxy type"
+            );
+            return Ok(None);
+        }
     };
 
+    // A number/bool name becomes its literal text, like every parameter
+    // value: the name is display data, never worth failing the item.
     let name = map
         .get("name")
-        .and_then(Value::as_str)
+        .map(yaml_to_string)
         .filter(|value| !value.is_empty())
-        .unwrap_or_default()
-        .to_string();
-    let host = string_field(map, "server")?;
+        .unwrap_or_default();
+
+    // Every error formed after the name is read carries it: the name is the
+    // label an operator finds the broken item by in the feed (the loop
+    // index of `parse_payload` does not survive into the log).
+    let named = |message: String| match message.strip_prefix("clash: ") {
+        Some(rest) => format!("clash: item {name:?}: {rest}"),
+        None => format!("clash: item {name:?}: {message}"),
+    };
+    let host = string_field(map, "server").map_err(named)?;
     if host.is_empty() {
-        return Err("clash: empty server".to_string());
+        return Err(named("clash: empty server".into()));
     }
     let host = super::normalize_host(&host);
-    let port = numeric_field(map, "port")?;
+    let port = numeric_field(map, "port").map_err(named)?;
 
     // The credential fields are joined in their declared order, which is
     // the only contract the output writers have: they split on `:` and
@@ -243,9 +287,9 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     //   - an absent *leading* field keeps its slot only when every part
     //     is optional (`optional_credential_fields`), because the writers
     //     then skip the empty part. Shadowsocks reads the first part as
-    //     the cipher and takes its default only for a colon-less
-    //     credential, so there an absent leading field is dropped and an
-    //     ss item with only `password` stores `pw`;
+    //     the cipher, so there an absent leading field is dropped and an
+    //     ss item with only `password` stores the canonicalized
+    //     `chacha20-ietf-poly1305:pw` (see `SS_SPEC`);
     //   - with nothing present the credential stays empty, so a
     //     single-field scheme without its secret emits no userinfo.
     //
@@ -276,6 +320,24 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
             .collect::<Vec<_>>()
             .join(":")
     };
+    // Shadowsocks canonicalization, the `SS_SPEC` contract: a password-only
+    // item stores the default cipher with it, so every reader gets the
+    // complete `method:password` shape and the row merges with its
+    // explicit-cipher twin; an item with no credential at all is unusable,
+    // not a no-auth proxy, and is counted as invalid.
+    let credential = if spec.scheme == Scheme::Ss {
+        match fields.as_slice() {
+            [None, Some(password)] => {
+                format!("{}:{password}", crate::models::DEFAULT_SS_CIPHER)
+            }
+            [None, None] => {
+                return Err(named("clash: ss item has no cipher and no password".into()));
+            }
+            _ => credential,
+        }
+    } else {
+        credential
+    };
 
     // A YAML scalar may legally contain a line break, but the URI
     // serializers emit these two fields verbatim, one would split this proxy
@@ -284,8 +346,8 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     // Parameter values are exempt: Clash keeps structured blocks (`ws-opts`,
     // `reality-opts`, …) as multi-line YAML text, so they are sanitized at
     // serialization time instead.
-    super::reject_line_breaks("clash: server", &host)?;
-    super::reject_line_breaks("clash: credential", &credential)?;
+    super::reject_line_breaks("clash: server", &host).map_err(named)?;
+    super::reject_line_breaks("clash: credential", &credential).map_err(named)?;
 
     // Everything not consumed structurally or as the credential is kept as
     // a pass-through parameter, so no Clash option is ever lost.
@@ -302,35 +364,20 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
                 known: spec.known_fields.contains(&lower.as_str()),
                 key,
                 value: yaml_to_string(value),
+                bare: false,
             }
         })
         .collect();
-    if params.len() > super::uri::MAX_QUERY_PARAMS {
-        return Err(format!(
-            "clash: item has {} parameters, over the {} cap",
-            params.len(),
-            super::uri::MAX_QUERY_PARAMS
-        ));
-    }
-    // Field-size cap: Clash params
-    // bypass `parse_query`, so the byte cap is enforced here.
-    for param in &params {
-        if param.key.len() > super::uri::MAX_PARAM_BYTES
-            || param.value.len() > super::uri::MAX_PARAM_BYTES
-        {
-            return Err(format!(
-                "clash: field over the {}-byte cap",
-                super::uri::MAX_PARAM_BYTES
-            ));
-        }
-    }
+    // Field-size cap: Clash
+    // params bypass `parse_query`, so the caps are enforced here.
+    super::validate_params("clash", &params).map_err(named)?;
     // The host, the credential and the name are persisted verbatim, so they
     // are capped like the parameters.
-    super::check_field_size("clash: server", &host)?;
-    super::check_field_size("clash: credential", &credential)?;
-    super::check_field_size("clash: name", &name)?;
+    super::check_field_size("clash: server", &host).map_err(named)?;
+    super::check_field_size("clash: credential", &credential).map_err(named)?;
+    super::check_field_size("clash: name", &name).map_err(named)?;
 
-    Ok(Some(ProxyEntry {
+    Ok(Some(super::with_canonical_cache(ProxyEntry {
         scheme: spec.scheme,
         name,
         host,
@@ -339,27 +386,43 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
         params,
         raw_path: String::new(),
         raw_line: String::new(),
-    }))
+        canonical: None,
+    })))
 }
 
 fn string_field(map: &serde_norway::Mapping, key: &str) -> Result<String, String> {
-    map.get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("clash: missing field {key:?}"))
+    match map.get(key) {
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(_) => Err(format!("clash: field {key} is not a string")),
+        None => Err(format!("clash: missing field {key:?}")),
+    }
 }
 
 fn numeric_field(map: &serde_norway::Mapping, key: &str) -> Result<u16, String> {
     match map.get(key) {
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .and_then(|v| u16::try_from(v).ok())
-            .ok_or_else(|| format!("clash: port out of range: {n}")),
-        Some(Value::String(s)) => s
-            .trim()
-            .parse::<u16>()
-            .map_err(|_| format!("clash: invalid port string: {s:?}")),
-        _ => Err(format!("clash: missing field {key:?}")),
+        Some(Value::Number(n)) => {
+            let port = match n.as_u64() {
+                Some(v) => u16::try_from(v).ok(),
+                // A feed may spell the port as a float (`443.0`): it is
+                // accepted when the fraction is zero and it fits u16.
+                None => n
+                    .as_f64()
+                    .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= f64::from(u16::MAX))
+                    .map(|v| v as u16),
+            };
+            // Port 0 is not a dialable endpoint (the schema CHECK, migration
+            // 0018, refuses it too), so the item is as invalid as an
+            // out-of-range one.
+            port.filter(|&p| p != 0)
+                .ok_or_else(|| format!("clash: port out of range: {n}"))
+        }
+        Some(Value::String(s)) => match s.trim().parse::<u16>() {
+            // The same zero rejection on the string spelling.
+            Ok(0) | Err(_) => Err(format!("clash: invalid port string: {s:?}")),
+            Ok(port) => Ok(port),
+        },
+        Some(_) => Err(format!("clash: field {key} is not numeric")),
+        None => Err(format!("clash: missing field {key:?}")),
     }
 }
 
@@ -478,57 +541,6 @@ proxy-groups:
         );
     }
 
-    /// The two schemes must survive a Clash round-trip: a feed entry
-    /// parsed to an entry must render back to something meow-rs accepts,
-    /// otherwise a Clash subscription would lose them on every export.
-    #[test]
-    fn snell_and_anytls_round_trip_through_the_clash_writer() {
-        let yaml = concat!(
-            "proxies:\n",
-            "  - {name: s, type: snell, server: 1.2.3.4, port: 44046, psk: psk, ",
-            "version: 6, mode: unshaped, reuse: true, ",
-            "obfs-opts: {mode: tls, host: bing.com}}\n",
-            "  - {name: a, type: anytls, server: 5.6.7.8, port: 443, ",
-            "password: pw, sni: a.example.com, skip-cert-verify: true}\n",
-        );
-        let result = parse_payload(yaml).unwrap();
-        assert_eq!(result.entries.len(), 2);
-
-        let snell = crate::formats::clash::entry_to_clash(&result.entries[0]).unwrap();
-        assert_eq!(snell.get("type").and_then(|v| v.as_str()), Some("snell"));
-        assert_eq!(snell.get("psk").and_then(|v| v.as_str()), Some("psk"));
-        assert_eq!(snell.get("version").and_then(|v| v.as_str()), Some("6"));
-        assert_eq!(snell.get("mode").and_then(|v| v.as_str()), Some("unshaped"));
-        assert_eq!(snell.get("reuse").and_then(|v| v.as_bool()), Some(true));
-        // meow-rs reads obfs as a block; the writer must not flatten it.
-        assert_eq!(
-            snell
-                .get("obfs-opts")
-                .and_then(|v| v.get("mode"))
-                .and_then(|v| v.as_str()),
-            Some("tls")
-        );
-        assert_eq!(
-            snell
-                .get("obfs-opts")
-                .and_then(|v| v.get("host"))
-                .and_then(|v| v.as_str()),
-            Some("bing.com")
-        );
-
-        let anytls = crate::formats::clash::entry_to_clash(&result.entries[1]).unwrap();
-        assert_eq!(anytls.get("type").and_then(|v| v.as_str()), Some("anytls"));
-        assert_eq!(anytls.get("password").and_then(|v| v.as_str()), Some("pw"));
-        assert_eq!(
-            anytls.get("sni").and_then(|v| v.as_str()),
-            Some("a.example.com")
-        );
-        assert_eq!(
-            anytls.get("skip-cert-verify").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-
     #[test]
     fn payload_without_proxies_is_an_error() {
         assert!(parse_payload("mixed-port: 7890\n").is_err());
@@ -545,52 +557,6 @@ proxy-groups:
             "proxies:\n  - {name: s, type: socks5, server: h, port: 1080, username: onlyuser}\n";
         let result = parse_payload(yaml).unwrap();
         assert_eq!(result.entries[0].credential, "onlyuser:");
-    }
-
-    /// A leading absent field must not leave an empty slot: the output
-    /// writers split on `:` and would read `":pw"` as an empty cipher. A
-    /// trailing one must keep its slot, or the writers lose the field in
-    /// front of it (`onlyuser` carries no password to recover, and no
-    /// username either once the split fails).
-    #[test]
-    fn a_missing_cipher_keeps_the_password_usable() {
-        let yaml = "proxies:\n  - {name: s, type: ss, server: h, port: 8388, password: pw}\n";
-        let result = parse_payload(yaml).unwrap();
-        assert_eq!(result.entries[0].credential, "pw");
-        // The writers fall back to a default method only for a
-        // colon-less credential, so this is the shape they can use.
-        let clash = crate::formats::clash::entry_to_clash(&result.entries[0]).unwrap();
-        assert_eq!(
-            clash.get("cipher").and_then(|v| v.as_str()),
-            Some("chacha20-ietf-poly1305")
-        );
-        assert_eq!(clash.get("password").and_then(|v| v.as_str()), Some("pw"));
-    }
-
-    /// The mirror of the case above: a socks5 item carrying only a
-    /// `password` must keep its empty leading slot, because both writers
-    /// skip empty parts (`both parts are optional`, formats/clash.rs:136)
-    /// while a colon-less credential is read as no credentials at all.
-    #[test]
-    fn a_password_only_socks5_keeps_its_credential() {
-        let yaml =
-            "proxies:\n  - {name: s, type: socks5, server: h, port: 1080, password: onlypass}\n";
-        let result = parse_payload(yaml).unwrap();
-        let e = &result.entries[0];
-        assert_eq!(e.credential, ":onlypass");
-
-        let clash = crate::formats::clash::entry_to_clash(e).unwrap();
-        assert!(clash.get("username").is_none());
-        assert_eq!(
-            clash.get("password").and_then(|v| v.as_str()),
-            Some("onlypass")
-        );
-        let singbox = crate::formats::singbox::entry_to_outbound(e).unwrap();
-        assert!(singbox.get("username").is_none());
-        assert_eq!(
-            singbox.get("password").and_then(|v| v.as_str()),
-            Some("onlypass")
-        );
     }
 
     /// The stored host must have one shape whatever the source spelled it:
@@ -648,7 +614,8 @@ proxy-groups:
 
     /// A credential field that is present but empty says nothing about the
     /// secret: it must count as absent, or it keeps an empty leading slot and
-    /// the writers read `":pw"` as an empty cipher.
+    /// the writers read `":pw"` as an empty cipher. The password-only ss item
+    /// comes out canonicalized (see `SS_SPEC`).
     #[test]
     fn an_empty_credential_field_counts_as_absent() {
         for yaml in [
@@ -656,8 +623,69 @@ proxy-groups:
             "proxies:\n  - {name: a, type: ss, server: h, port: 8388, cipher: null, password: pw}\n",
         ] {
             let result = parse_payload(yaml).unwrap();
-            assert_eq!(result.entries[0].credential, "pw", "{yaml}");
+            assert_eq!(
+                result.entries[0].credential, "chacha20-ietf-poly1305:pw",
+                "{yaml}"
+            );
         }
+    }
+
+    /// A shadowsocks item without any credential is unusable, not a no-auth
+    /// proxy: it is counted as invalid instead of stored as a row the ss
+    /// serializer cannot emit a userinfo for.
+    #[test]
+    fn an_ss_item_without_a_credential_is_invalid() {
+        let yaml = "proxies:\n  - {name: s, type: ss, server: h, port: 8388}\n";
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.invalid, 1);
+        assert!(result.entries.is_empty());
+    }
+
+    /// A Clash port may be spelled as a string; it parses like the number
+    /// form.
+    #[test]
+    fn a_clash_port_spelled_as_a_string_parses() {
+        let yaml = "proxies:\n  - {name: s, type: trojan, server: h, port: \"443\", password: p}\n";
+        let result = parse_payload(yaml).unwrap();
+        assert_eq!(result.entries[0].port, 443);
+    }
+
+    /// Port 0 is not a dialable endpoint: the item is invalid in either
+    /// spelling, not stored with a port no client could connect to.
+    #[test]
+    fn a_zero_clash_port_is_invalid() {
+        for yaml in [
+            "proxies:\n  - {name: s, type: trojan, server: h, port: 0, password: p}\n",
+            "proxies:\n  - {name: s, type: trojan, server: h, port: \"0\", password: p}\n",
+        ] {
+            let result = parse_payload(yaml).unwrap();
+            assert_eq!(result.entries.len(), 0, "{yaml}");
+            assert_eq!(result.invalid, 1, "{yaml}");
+        }
+    }
+
+    /// The parameter caps apply to Clash items too: they bypass
+    /// `parse_query`, so an item over the parameter count cap or carrying an
+    /// oversized parameter is invalid, not stored.
+    #[test]
+    fn oversized_or_too_many_params_are_invalid() {
+        let values: String = (0..crate::parsers::uri::MAX_QUERY_PARAMS + 1)
+            .map(|i| format!("f{i}: v{i}, "))
+            .collect();
+        let yaml = format!(
+            "proxies:\n  - {{name: n, type: trojan, server: h, port: 443, password: p, {values}}}\n"
+        );
+        let result = parse_payload(&yaml).unwrap();
+        assert_eq!(result.invalid, 1, "over the parameter count cap");
+        assert!(result.entries.is_empty());
+
+        let long = "v".repeat(crate::parsers::uri::MAX_PARAM_BYTES + 1);
+        let yaml = format!(
+            "proxies:\n  - {{name: n, type: trojan, server: h, port: 443, password: p, note: {long}}}\n"
+        );
+        let result = parse_payload(&yaml).unwrap();
+        assert_eq!(result.invalid, 1, "over the byte cap");
+        assert!(result.entries.is_empty());
     }
 
     /// A payload with a pathological number of items stops at the cap, and

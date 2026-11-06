@@ -514,6 +514,13 @@ async fn build_profile_from_form(
             output_format,
             pipeline,
             countries,
+            // The form has no input for the geo-unknown flag yet; an edit
+            // keeps whatever the stored profile carries instead of
+            // silently resetting it.
+            include_unknown_country: stored
+                .as_ref()
+                .map(|p| p.include_unknown_country)
+                .unwrap_or(false),
             enabled: form.iter().any(|(k, _)| k == "enabled"),
             // `stored` is the row read above for the mask, so `created_at`
             // carries over without a second query.
@@ -988,6 +995,7 @@ mod tests {
             output_format: OutputFormat::UriList,
             pipeline: None,
             countries: Vec::new(),
+            include_unknown_country: false,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -1502,6 +1510,7 @@ mod tests {
             output_format: OutputFormat::UriList,
             pipeline: None,
             countries: Vec::new(),
+            include_unknown_country: false,
             enabled: true,
             created_at: now,
             updated_at: now,

@@ -803,6 +803,7 @@ mod tests {
             params: Vec::new(),
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         };
         fumox_core::repo::proxies::reconcile_source(
             &state.pool,
@@ -1028,18 +1029,20 @@ mod tests {
         fumox_core::db::migrate(&pool).await.unwrap();
         seed_alive_tier(&pool, "srcG0000000", 2).await;
         // Two rows that cannot be turned into an entry: an unknown scheme
-        // and a port that does not fit.
-        for (fingerprint, scheme, port) in [
-            ("fp-bad-1", "nosuchscheme", 443i64),
-            ("fp-bad-2", "vless", 70000),
+        // and params JSON the converter cannot decode. (An out-of-range
+        // port used to be the second class; the schema CHECK, migration
+        // 0018, makes such rows unstorable.)
+        for (fingerprint, scheme, params) in [
+            ("fp-bad-1", "nosuchscheme", None),
+            ("fp-bad-2", "vless", Some("{oops")),
         ] {
             sqlx::query(
-                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-                 VALUES (?1, ?2, 'n', 'bad.example.com', ?3, 'c', 'alive', 1, 1)",
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, params, status, created_at, updated_at)
+                 VALUES (?1, ?2, 'n', 'bad.example.com', 443, 'c', ?3, 'alive', 1, 1)",
             )
             .bind(fingerprint)
             .bind(scheme)
-            .bind(port)
+            .bind(params)
             .execute(&pool)
             .await
             .unwrap();

@@ -6,7 +6,7 @@
 //! before falling back to the random sample.
 
 use crate::db::DbPool;
-use crate::repo::proxies::{T1_EXCLUDED_SCHEMES, T1Candidate};
+use crate::repo::proxies::{T1_EXCLUDED_SCHEMES, T1Candidate, t1_lane_predicate};
 use sqlx::FromRow;
 
 /// `probe_results.probe_kind` of a tunnel check that produced a verdict:
@@ -63,6 +63,14 @@ pub mod meta {
     /// `meta` key of the server scheduler sweep stamp (unix seconds as
     /// plain text; deliberately not JSON, the reader only needs the age).
     pub const SERVER_CYCLE_KEY: &str = "server_cycle";
+    /// `meta` key of the earliest unix second at which the T2 lanes may
+    /// contact meow-rs again (plain text). The probe daemon mirrors its
+    /// in-memory backoff gate here, so a restart resumes the saved pause
+    /// instead of resetting it and hammering a still-down engine.
+    pub const MEOW_RETRY_AT_KEY: &str = "meow_retry_at";
+    /// `meta` key of the current meow-rs backoff length in seconds (plain
+    /// text), mirrored next to [`MEOW_RETRY_AT_KEY`].
+    pub const MEOW_BACKOFF_SECS_KEY: &str = "meow_backoff_secs";
 
     /// `probe_heartbeat`: the daemon's liveness stamp, upserted on every
     /// beat. `interval_secs` and `cycle_interval_secs` are the beat and
@@ -100,7 +108,10 @@ pub mod meta {
 
     /// `last_rotation`: one run of the probe daemon's retention loop,
     /// including runs that deleted nothing, so the age of `ts` is the
-    /// "retention is alive" signal.
+    /// "retention is alive" signal. A failed run carries `ok: false` with
+    /// the error text and keeps the `ts` of the last *successful* run: a
+    /// stale stamp then reads as "retention has not succeeded lately", not
+    /// as "retention ran and died silently".
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct LastRotation {
         pub ts: i64,
@@ -110,6 +121,19 @@ pub mod meta {
         pub fetch_log: u64,
         #[serde(default)]
         pub probe_requests: u64,
+        /// Whether the rotation ran to completion; a stamp written before
+        /// the field existed parses as successful.
+        #[serde(default = "default_rotation_ok")]
+        pub ok: bool,
+        /// The failure of a run that ended early, `None` on success.
+        #[serde(default)]
+        pub error: Option<String>,
+    }
+
+    /// Reader-side default for stamps that carry no `ok` field: they were
+    /// all written unconditionally, so they read as successful.
+    fn default_rotation_ok() -> bool {
+        true
     }
 
     #[cfg(test)]
@@ -151,6 +175,8 @@ pub mod meta {
 
         /// A stamp without the queue counter parses (the field was added
         /// later than the other two), and the full payload round-trips.
+        /// A stamp without the outcome pair reads as a successful run:
+        /// those were written unconditionally.
         #[test]
         fn last_rotation_parses_partial_and_round_trips() {
             let rot: LastRotation =
@@ -159,12 +185,16 @@ pub mod meta {
             assert_eq!(rot.probe_results, 3);
             assert_eq!(rot.fetch_log, 1);
             assert_eq!(rot.probe_requests, 0);
+            assert!(rot.ok, "a legacy stamp has no failure on record");
+            assert_eq!(rot.error, None);
 
             let full = LastRotation {
                 ts: 9,
                 probe_results: 3,
                 fetch_log: 1,
                 probe_requests: 2,
+                ok: false,
+                error: Some("probe_results: locked".to_string()),
             };
             let raw = serde_json::to_string(&full).unwrap();
             assert_eq!(serde_json::from_str::<LastRotation>(&raw).unwrap(), full);
@@ -211,10 +241,13 @@ pub struct ProbeResultEntry<'a> {
 /// whose tunnel check never ran. It never moves backwards, so a replayed
 /// or out-of-order batch cannot make a proxy look older than it is, and
 /// it stays NULL for a proxy that never had a T2 attempt.
-async fn stamp_last_t2_checked(
-    pool: &DbPool,
+async fn stamp_last_t2_checked<'e, E>(
+    executor: E,
     entries: &[ProbeResultEntry<'_>],
-) -> crate::Result<()> {
+) -> crate::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     // One stamp per proxy: the newest attempt of the batch wins.
     let mut newest: Vec<(i64, i64)> = Vec::new();
     for entry in entries {
@@ -247,11 +280,16 @@ async fn stamp_last_t2_checked(
     for (id, at) in &newest {
         query = query.bind(id).bind(at);
     }
-    query.execute(pool).await?;
+    query.execute(executor).await?;
     Ok(())
 }
 
 pub async fn insert(pool: &DbPool, entry: &ProbeResultEntry<'_>) -> crate::Result<()> {
+    // The journal row and the recency stamp land in one transaction: an
+    // insert that fails must not leave the stamp behind, and the stamp
+    // must not move the recency queue past an attempt that was never
+    // journaled.
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO probe_results
             (proxy_id, checked_at, ok, latency_ms, error, probe_kind)
@@ -263,9 +301,10 @@ pub async fn insert(pool: &DbPool, entry: &ProbeResultEntry<'_>) -> crate::Resul
     .bind(entry.latency_ms)
     .bind(entry.error)
     .bind(entry.probe_kind)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    stamp_last_t2_checked(pool, std::slice::from_ref(entry)).await?;
+    stamp_last_t2_checked(&mut *tx, std::slice::from_ref(entry)).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -278,9 +317,11 @@ const JOURNAL_CHUNK: usize = 100;
 ///
 /// A batch of failures used to write its rows one by one, and every row
 /// was its own round trip to the database. The batch is one statement
-/// now: the rows land together or not at all.
+/// now: the rows land together or not at all, and the recency stamp goes
+/// into the same transaction as the inserts.
 pub async fn insert_many(pool: &DbPool, entries: &[ProbeResultEntry<'_>]) -> crate::Result<u64> {
     let mut written = 0u64;
+    let mut tx = pool.begin().await?;
     for chunk in entries.chunks(JOURNAL_CHUNK) {
         let placeholders = vec!["(?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
         let sql = format!(
@@ -298,9 +339,10 @@ pub async fn insert_many(pool: &DbPool, entries: &[ProbeResultEntry<'_>]) -> cra
                 .bind(entry.error)
                 .bind(entry.probe_kind);
         }
-        written += query.execute(pool).await?.rows_affected();
+        written += query.execute(&mut *tx).await?.rows_affected();
     }
-    stamp_last_t2_checked(pool, entries).await?;
+    stamp_last_t2_checked(&mut *tx, entries).await?;
+    tx.commit().await?;
     Ok(written)
 }
 
@@ -444,11 +486,15 @@ pub async fn recent_for_proxy(
 /// Enqueue up to `limit` of `candidate_ids` for priority checking. Only
 /// T1-probeable schemes are accepted (unprobeable schemes would clog the
 /// queue forever); the row itself must still be `unknown` and still be
-/// linked to a source, the same predicate the drain applies, a row
+/// linked to a source — the same base predicate the drain applies (see
+/// [`t1_lane_predicate`]), minus the drain's T2-suppression guard: a row
 /// without a link is skipped by every T1 lane, so queueing it would only
-/// leave a request nothing will ever consume. Idempotent , an id already
-/// queued is left untouched (`INSERT OR IGNORE`). Returns the number of
-/// newly queued ids.
+/// leave a request nothing will ever consume. `now` is Unix time in
+/// seconds. Re-enqueueing an id that is already queued is not a
+/// duplicate row: the upsert refreshes its `requested_at`, so a caller
+/// that hands an id over twice raises the row's priority in the
+/// newest-first drain. Returns the number of ids enqueued, re-queued
+/// ones included.
 pub async fn enqueue_checks(
     pool: &DbPool,
     candidate_ids: &[i64],
@@ -466,8 +512,8 @@ pub async fn enqueue_checks(
     // oldest ids and never even look at the newest. Sort a copy descending
     // and chunk that, so the first chunk holds the highest ids; `dedup`
     // then also keeps a repeated id from being enqueued twice across the
-    // chunk boundary (`INSERT OR IGNORE` would swallow it anyway, the
-    // `remaining` accounting would not).
+    // chunk boundary (the `rows_affected` accounting counts it twice
+    // otherwise).
     let mut newest_first = candidate_ids.to_vec();
     newest_first.sort_unstable_by(|a, b| b.cmp(a));
     newest_first.dedup();
@@ -476,15 +522,14 @@ pub async fn enqueue_checks(
             break;
         }
         let placeholders = vec!["?"; chunk.len()].join(", ");
-        let excluded = vec!["?"; T1_EXCLUDED_SCHEMES.len()].join(", ");
         let sql = format!(
-            "INSERT OR IGNORE INTO probe_requests (proxy_id, requested_at)
+            "INSERT INTO probe_requests (proxy_id, requested_at)
              SELECT p.id, ? FROM proxies p
              WHERE p.id IN ({placeholders})
-               AND p.status = 'unknown'
-               AND p.scheme NOT IN ({excluded})
-               AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
-             ORDER BY p.id DESC LIMIT ?"
+               AND {}
+             ORDER BY p.id DESC LIMIT ?
+             ON CONFLICT(proxy_id) DO UPDATE SET requested_at = excluded.requested_at",
+            t1_lane_predicate("p.status = 'unknown'")
         );
         // sqlx 0.9 SqlSafeStr: the format! only expands `?` placeholder
         // lists, all data flows through .bind().
@@ -511,17 +556,15 @@ pub async fn enqueue_checks(
 /// selector is the only way back); everything else in the queue is
 /// skipped here and removed by [`purge_settled_checks`].
 pub async fn select_queued_checks(pool: &DbPool, limit: u32) -> crate::Result<Vec<T1Candidate>> {
-    let excluded = vec!["?"; T1_EXCLUDED_SCHEMES.len()].join(", ");
     let sql = format!(
         "SELECT q.proxy_id AS id, p.scheme, p.host, p.port, p.params
          FROM probe_requests q
          JOIN proxies p ON p.id = q.proxy_id
-         WHERE p.status = 'unknown'
-           AND p.scheme NOT IN ({excluded})
+         WHERE {}
            AND p.last_t2_failed_at IS NULL
-           AND EXISTS (SELECT 1 FROM proxy_source_links l WHERE l.proxy_id = p.id)
          ORDER BY q.requested_at DESC, q.proxy_id DESC
-         LIMIT ?"
+         LIMIT ?",
+        t1_lane_predicate("p.status = 'unknown'")
     );
     let mut query = sqlx::query_as::<_, T1Candidate>(sqlx::AssertSqlSafe(sql.as_str()));
     for scheme in T1_EXCLUDED_SCHEMES {
@@ -579,7 +622,7 @@ pub async fn purge_settled_checks(pool: &DbPool) -> crate::Result<u64> {
 }
 
 /// Drop queue entries older than the cutoff (retention for the case when
-/// the probe is offline for a long time.
+/// the probe is offline for a long time).
 pub async fn purge_requests_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
     let affected = sqlx::query("DELETE FROM probe_requests WHERE requested_at < ?")
         .bind(cutoff)
@@ -614,19 +657,13 @@ mod tests {
     #[tokio::test]
     async fn insert_and_purge_history() {
         let (_dir, pool) = temp_pool().await;
-        // probe_results has an FK to proxies; create a minimal row first.
-        sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, created_at, updated_at)
-             VALUES ('fp1', 'vless', 'n', 'h', 443, 'c', 1, 1)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        // probe_results has an FK to proxies; create the row first.
+        let id = insert_proxy(&pool, "fp1", "vless", "unknown", true).await;
 
         insert(
             &pool,
             &ProbeResultEntry {
-                proxy_id: 1,
+                proxy_id: id,
                 checked_at: 1000,
                 ok: true,
                 latency_ms: Some(42),
@@ -639,7 +676,7 @@ mod tests {
         insert(
             &pool,
             &ProbeResultEntry {
-                proxy_id: 1,
+                proxy_id: id,
                 checked_at: 2000,
                 ok: false,
                 latency_ms: None,
@@ -651,7 +688,8 @@ mod tests {
         .unwrap();
 
         let (count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = 1")
+            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ?")
+                .bind(id)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -659,7 +697,8 @@ mod tests {
 
         assert_eq!(purge_before(&pool, 1500).await.unwrap(), 1);
         let (count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = 1")
+            sqlx::query_as("SELECT COUNT(*) FROM probe_results WHERE proxy_id = ?")
+                .bind(id)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -1011,8 +1050,17 @@ mod tests {
             .unwrap();
         enqueue_checks(&pool, &[trojan], 10, 2000).await.unwrap();
 
-        // Idempotent: re-enqueueing does not duplicate.
-        assert_eq!(enqueue_checks(&pool, &[trojan], 10, 3000).await.unwrap(), 0);
+        // Re-enqueueing an already queued id does not duplicate the row;
+        // the upsert refreshes its `requested_at` (and counts as one
+        // enqueued id).
+        assert_eq!(enqueue_checks(&pool, &[trojan], 10, 3000).await.unwrap(), 1);
+        let (requested_at,): (i64,) =
+            sqlx::query_as("SELECT requested_at FROM probe_requests WHERE proxy_id = ?")
+                .bind(trojan)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(requested_at, 3000, "the re-enqueue refreshed the stamp");
 
         // A row without a source link is not queued at all: no T1 lane
         // would ever drain it, so the request would be dead weight in
@@ -1040,6 +1088,40 @@ mod tests {
         assert_eq!(claim_checks(&pool, &drained_ids).await.unwrap(), 2);
         let left = select_queued_checks(&pool, 10).await.unwrap();
         assert!(left.is_empty());
+    }
+
+    /// Re-enqueueing an already queued id raises its priority: the
+    /// upsert refreshes `requested_at`, and the drain (newest first)
+    /// moves the row back to the head. `INSERT OR IGNORE` used to keep
+    /// the old stamp, so a caller had no way to bump a waiting row.
+    #[tokio::test]
+    async fn re_enqueueing_bumps_the_queue_priority() {
+        let (_dir, pool) = temp_pool().await;
+        let old = insert_proxy(&pool, "fp-bump-old", "trojan", "unknown", true).await;
+        let fresh = insert_proxy(&pool, "fp-bump-new", "trojan", "unknown", true).await;
+
+        enqueue_checks(&pool, &[old], 10, 1_000).await.unwrap();
+        enqueue_checks(&pool, &[fresh], 10, 2_000).await.unwrap();
+        let drain = || async {
+            let drained: Vec<i64> = select_queued_checks(&pool, 10)
+                .await
+                .unwrap()
+                .iter()
+                .map(|c| c.id)
+                .collect();
+            drained
+        };
+        assert_eq!(drain().await, vec![fresh, old]);
+
+        // One row, not a duplicate: the re-enqueue refreshes the stamp
+        // and the order flips.
+        assert_eq!(enqueue_checks(&pool, &[old], 10, 3_000).await.unwrap(), 1);
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM probe_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "re-enqueueing must not duplicate");
+        assert_eq!(drain().await, vec![old, fresh]);
     }
 
     /// The priority lane carries the T2 suppression flag too:
@@ -1121,6 +1203,64 @@ mod tests {
             queued,
             ids[ids.len() - 50..].to_vec(),
             "the limit must be spent on the highest ids, not on the first chunk"
+        );
+    }
+
+    /// The caller's limit holds across the chunking, not only inside one
+    /// chunk: enqueueing 600 of 1200 candidates fills the first 500-id
+    /// chunk and spends the remaining 100 on the second one, so the queue
+    /// ends up holding exactly the 600 highest ids.
+    #[tokio::test]
+    async fn enqueue_spends_the_limit_across_both_chunks() {
+        let (_dir, pool) = temp_pool().await;
+        sqlx::query(
+            "INSERT OR IGNORE INTO sources (id, name, url, enabled, cache_ttl_seconds, created_at, updated_at)
+             VALUES ('srcA0000000', 's', 'https://example.com', 1, 3600, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // 1200 linked, `unknown`, T1-probeable candidates in one statement
+        // (a per-row helper would dominate the runtime of the test).
+        sqlx::query(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1200)
+             INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
+             SELECT 'fp-wide-' || x, 'trojan', 'n', 'h', 443, 'c', 'unknown', 1, 1 FROM cnt",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
+             SELECT id, 'srcA0000000', 1 FROM proxies",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM proxies ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1200);
+
+        assert_eq!(enqueue_checks(&pool, &ids, 600, 1_000).await.unwrap(), 600);
+        let queued: Vec<i64> =
+            sqlx::query_scalar("SELECT proxy_id FROM probe_requests ORDER BY proxy_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(queued.len(), 600);
+        assert_eq!(
+            queued,
+            ids[ids.len() - 600..].to_vec(),
+            "the 600 highest ids are queued: 500 from the first chunk, 100 from the second"
+        );
+        // The second chunk's share is exactly the band just below the
+        // first chunk's lowest id: the limit was spent there, not restarted.
+        assert_eq!(
+            queued.iter().take(100).copied().collect::<Vec<_>>(),
+            ids[600..700].to_vec()
         );
     }
 

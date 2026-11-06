@@ -185,7 +185,8 @@ enum Plan {
 /// Every vetted address is dialed at the same time and the first one that
 /// completes wins; the rest are cancelled. A TLS failure on one address
 /// does not stop the others: only when the whole list has failed does the
-/// check fail, with the error of the last attempt.
+/// check fail, with every dialled address and its own reason (the journal
+/// line is the operator's only window into why the node died).
 pub async fn run(
     target: &Target<'_>,
     connect_timeout: Duration,
@@ -212,14 +213,17 @@ pub async fn run(
         ));
     }
 
-    let mut last_error = "no vetted address to connect to".to_string();
+    let mut errors = Vec::new();
     while let Some(outcome) = attempts.next().await {
         match outcome {
             Ok(()) => return Ok(started.elapsed()),
-            Err(error) => last_error = error,
+            Err(error) => errors.push(error),
         }
     }
-    Err(last_error)
+    if errors.is_empty() {
+        return Err("no vetted address to connect to".to_string());
+    }
+    Err(errors.join("; "))
 }
 
 /// The name the handshake presents: the node's own SNI when it has one,
@@ -230,8 +234,10 @@ pub async fn run(
 /// to come from the node itself.
 fn server_name_of(target: &Target<'_>) -> Result<ServerName<'static>, String> {
     let name = target.server_name.unwrap_or(target.host);
+    // Debug formatting: the name is feed-controlled, and a control byte
+    // in it must not reach the journal (`probe_results.error`) verbatim.
     ServerName::try_from(name.to_string())
-        .map_err(|error| format!("invalid TLS server name {name}: {error}"))
+        .map_err(|error| format!("invalid TLS server name {name:?}: {error}"))
 }
 
 /// One dial attempt against a single vetted address: the TCP connect and,
@@ -246,10 +252,10 @@ async fn attempt(
     let addr = std::net::SocketAddr::new(ip, port);
     let stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return Err(format!("tcp connect failed: {error}")),
+        Ok(Err(error)) => return Err(format!("tcp connect failed for {addr}: {error}")),
         Err(_) => {
             return Err(format!(
-                "tcp connect timed out after {}s",
+                "tcp connect to {addr} timed out after {}s",
                 connect_timeout.as_secs()
             ));
         }
@@ -260,9 +266,9 @@ async fn attempt(
     let handshake = tls_connector().connect(server_name.clone(), stream);
     match tokio::time::timeout(tls_timeout, handshake).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(format!("tls handshake failed: {error}")),
+        Ok(Err(error)) => Err(format!("tls handshake failed for {addr}: {error}")),
         Err(_) => Err(format!(
-            "tls handshake timed out after {}s",
+            "tls handshake timed out for {addr} after {}s",
             tls_timeout.as_secs()
         )),
     }
@@ -289,10 +295,12 @@ mod tests {
                     key: (*key).to_string(),
                     value: (*value).to_string(),
                     known: true,
+                    bare: false,
                 })
                 .collect(),
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         }
     }
 
@@ -501,10 +509,18 @@ mod tests {
     #[tokio::test]
     async fn tcp_check_fails_on_closed_port() {
         // Bind and immediately drop to obtain a port that is (almost
-        // certainly) closed.
+        // certainly) closed, then verify the refusal: a port another
+        // test grabbed between the drop and the check would fail this
+        // test for the wrong reason.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "the port must refuse connections after the listener is dropped"
+        );
 
         let result = run(
             &Target {
@@ -707,6 +723,65 @@ mod tests {
         );
     }
 
+    /// A check that dialled several vetted addresses and failed on all of
+    /// them reports every dial target with its own reason: the journal
+    /// line is the operator's only window into why the node died, and a
+    /// lone last-error hid the rest.
+    #[tokio::test]
+    async fn the_failure_names_every_dialled_address() {
+        // One closed port, two loopback addresses: every attempt fails
+        // and the aggregate must carry both dial targets.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+        );
+
+        let result = run(
+            &Target {
+                host: "localhost",
+                server_name: None,
+                port,
+                kind: CheckKind::Tcp,
+                vetted: &["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()],
+            },
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        let error = result.expect_err("a closed port cannot be connected");
+        assert!(error.contains(&format!("127.0.0.1:{port}")), "{error}");
+        assert!(error.contains(&format!("127.0.0.2:{port}")), "{error}");
+    }
+
+    /// The host of a node is feed-controlled text: an error naming it
+    /// must carry it escaped, so a control byte (an ESC in a crafted
+    /// feed line, say) never reaches the journal verbatim.
+    #[tokio::test]
+    async fn the_server_name_error_escapes_control_characters() {
+        let result = run(
+            &Target {
+                host: "bad\x1bname",
+                server_name: None,
+                port: 443,
+                kind: CheckKind::Tls,
+                vetted: &["127.0.0.1".parse().unwrap()],
+            },
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        let error = result.expect_err("the name cannot be presented");
+        assert!(
+            !error.chars().any(|c| c.is_control()),
+            "the error must carry the name escaped: {error:?}"
+        );
+        assert!(error.contains("invalid TLS server name"), "{error}");
+    }
+
     /// An IP literal is not a certificate name: the handshake presents no
     /// SNI, but it must not fail because of it.
     #[tokio::test]
@@ -791,6 +866,85 @@ mod tests {
         assert!(
             result.is_ok(),
             "the second address must be tried after the first failed: {result:?}"
+        );
+    }
+
+    /// An empty vetted list has nothing to dial: the check fails with the
+    /// no-target reason instead of succeeding vacuously.
+    #[tokio::test]
+    async fn an_empty_vetted_list_fails_without_dialing() {
+        let result = run(
+            &Target {
+                host: "127.0.0.1",
+                server_name: None,
+                port: 1,
+                kind: CheckKind::Tcp,
+                vetted: &[],
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        let error = result.expect_err("there is no address to dial");
+        assert!(
+            error.contains("no vetted address to connect to"),
+            "the failure must name the missing dial target, got {error}"
+        );
+    }
+
+    /// A connect that never completes runs into its deadline. The
+    /// listener's accept queue is filled and left unaccepted, so the
+    /// kernel drops the dial's SYN: from the outside this is what a
+    /// firewalled host looks like (no refusal, no answer — a refused
+    /// port would fail the connect immediately with `connection refused`
+    /// and never reach the deadline). The clock is paused, so the
+    /// one-second timeout is virtual: the runtime advances it the moment
+    /// nothing else is left to do, and the test waits no real time.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_connect_runs_into_its_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Fill the accept queue: a connect completes while the queue has
+        // room and stops completing once it is full; the attempt that
+        // runs into its own short deadline is the proof the dial below
+        // cannot complete on its own. The held streams keep the queue
+        // full for the whole test.
+        let mut held = Vec::new();
+        let mut full = false;
+        for _ in 0..512 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+                Ok(stream) => held.push(stream),
+                Err(_) => {
+                    full = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            full,
+            "the accept queue must be full so the dial below cannot complete"
+        );
+
+        let result = run(
+            &Target {
+                host: "127.0.0.1",
+                server_name: None,
+                port: addr.port(),
+                kind: CheckKind::Tcp,
+                vetted: &["127.0.0.1".parse().unwrap()],
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        let error = result.expect_err("a hanging connect cannot succeed");
+        assert!(
+            error.contains("timed out"),
+            "the failure must be the connect deadline, got {error}"
+        );
+        assert!(
+            error.contains(&format!("127.0.0.1:{}", addr.port())),
+            "the failure must name the dial target, got {error}"
         );
     }
 }

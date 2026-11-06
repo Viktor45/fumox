@@ -27,6 +27,8 @@
 
 use crate::models::ProxyEntry;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+use std::net::IpAddr;
 
 /// The version of the fingerprint pre-image.
 ///
@@ -59,12 +61,28 @@ pub fn fingerprint(entry: &ProxyEntry) -> String {
     to_hex(&hasher.finalize())
 }
 
-/// Host normalization: lower-case, trailing dots stripped.
+/// Host normalization: URI decorations stripped, lower-case, trailing
+/// dots stripped, an IP literal in its canonical spelling.
 ///
 /// DNS names are case-insensitive and a trailing dot is the same zone, so
-/// `Example.COM.` and `example.com` must deduplicate.
+/// `Example.COM.` and `example.com` must deduplicate. An IPv6 literal
+/// loses the URI brackets and the `%zone` scope id through
+/// [`crate::ssrf::strip_host_decorations`] — neither parses as an
+/// address, so a bracketed host would otherwise never merge with its
+/// plain spelling — and a host that parses as an address is written back
+/// in `IpAddr`'s canonical form, so `2001:0DB8::0001` and `2001:db8::1`
+/// are one host. The normalization mirrors what the dial path does with
+/// the same string (`ssrf::parse_ip_literal`), so rows the fingerprint
+/// merges are rows the probe dials identically.
 pub fn normalize_host(host: &str) -> String {
-    host.to_ascii_lowercase().trim_end_matches('.').to_string()
+    let stripped = crate::ssrf::strip_host_decorations(host);
+    if let Ok(ip) = stripped.parse::<IpAddr>() {
+        return ip.to_string();
+    }
+    stripped
+        .to_ascii_lowercase()
+        .trim_end_matches('.')
+        .to_string()
 }
 
 /// Canonical form of the connection parameters: keys and values escaped,
@@ -100,16 +118,43 @@ fn escape(value: &str) -> String {
             b'=' => out.push_str("%3D"),
             b'|' => out.push_str("%7C"),
             0x21..=0x7e => out.push(byte as char),
-            _ => out.push_str(&format!("%{byte:02X}")),
+            // `String: fmt::Write` appends infallibly; the `Err` arm is
+            // unreachable for an owned buffer.
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
         }
     }
     out
 }
 
+/// The inverse of [`escape`]: every `%XX` escape decodes back into its
+/// byte. Test-only, kept next to `escape` so the pair cannot drift apart
+/// and the round-trip test stays honest.
+#[cfg(test)]
+fn unescape(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(hex) = bytes.get(i + 1..i + 3)
+            && let Ok(byte) = u8::from_str_radix(std::str::from_utf8(hex).unwrap_or(""), 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).expect("escape round-trips valid utf-8")
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        let _ = write!(out, "{b:02x}");
     }
     out
 }
@@ -129,6 +174,7 @@ mod tests {
             params,
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         }
     }
 
@@ -137,6 +183,7 @@ mod tests {
             key: key.to_string(),
             value: value.to_string(),
             known: true,
+            bare: false,
         }
     }
 
@@ -175,6 +222,60 @@ mod tests {
         let a = entry("n", "Example.COM.", vec![]);
         let b = entry("n", "example.com", vec![]);
         assert_eq!(fingerprint(&a), fingerprint(&b));
+    }
+
+    /// An IPv6 literal loses its URI brackets and its scope id, and an
+    /// address is written back in `IpAddr`'s canonical form, so the
+    /// spellings of one server deduplicate onto one row.
+    #[test]
+    fn ipv6_literal_hosts_normalize_to_the_canonical_address() {
+        assert_eq!(
+            normalize_host("[2606:4700:4700::1111]"),
+            "2606:4700:4700::1111"
+        );
+        assert_eq!(normalize_host("fe80::1%eth0"), "fe80::1");
+        assert_eq!(normalize_host("2001:0DB8::0001"), "2001:db8::1");
+        // The trailing dot and the case rules still hold for names.
+        assert_eq!(normalize_host("Example.COM."), "example.com");
+        assert_eq!(
+            normalize_host("[2606:4700:4700::1111]"),
+            normalize_host("2606:4700:4700::1111"),
+            "the bracketed and the plain spelling are one host"
+        );
+        let bracketed = entry("n", "[2606:4700:4700::1111]", vec![]);
+        let plain = entry("n", "2606:4700:4700::1111", vec![]);
+        assert_eq!(fingerprint(&bracketed), fingerprint(&plain));
+    }
+
+    /// The escape table: the separators and the out-of-printable-ASCII
+    /// bytes are rewritten, printable text passes through untouched, and
+    /// the transform is reversible — `unescape(escape(v)) == v` — so the
+    /// pre-image stays byte-comparable with the documented formula.
+    #[test]
+    fn escape_encodes_separators_control_and_non_ascii_bytes() {
+        assert_eq!(escape("%"), "%25");
+        assert_eq!(escape("&"), "%26");
+        assert_eq!(escape("="), "%3D");
+        assert_eq!(escape("|"), "%7C");
+        // Control and non-printable bytes, byte-wise.
+        assert_eq!(escape("\u{0}"), "%00");
+        assert_eq!(escape(" "), "%20");
+        assert_eq!(escape("\u{7f}"), "%7F");
+        // UTF-8 escapes bytewise: é is U+00E9 = C3 A9.
+        assert_eq!(escape("é"), "%C3%A9");
+        assert_eq!(escape("h.example.com"), "h.example.com");
+
+        for value in [
+            "",
+            "a|443",
+            "1&x=2%20",
+            "3e4d70e5-7ec9-48f9-a4e0-48c44c6063fd",
+            "\u{0}\u{1}\u{1f}\u{7f}",
+            "éü€",
+            "path=/ws?ed=2560&mode=raw",
+        ] {
+            assert_eq!(unescape(&escape(value)), value, "{value:?} must round-trip");
+        }
     }
 
     #[test]

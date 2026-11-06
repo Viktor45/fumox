@@ -15,14 +15,12 @@
 //! Xray-isms copied from vless templates; they are kept as unknown
 //! pass-through parameters so nothing is lost on re-serialization.
 
-use std::borrow::Cow;
-
 use crate::models::{ProxyEntry, Scheme};
 use base64::Engine;
 
 use super::uri::{
-    encode_fragment, host_for_output, parse_hostport, parse_query, percent_decode, serialize_query,
-    split_fragment, split_path, split_query,
+    decode_b64_lenient, encode_fragment, host_for_output, parse_hostport, parse_query,
+    percent_decode, serialize_query, split_fragment, split_path, split_query,
 };
 
 /// Parse the part of an ss line that follows `ss://`.
@@ -30,6 +28,10 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, String> {
     let (before_frag, fragment) = split_fragment(rest);
     let (before_query, query) = split_query(before_frag);
 
+    // The base64 alphabets (standard and URL-safe) contain no `@`, so an
+    // `@` before the query can only be a SIP002 userinfo separator; a
+    // legacy blob encodes the whole `method:password@host:port` and
+    // carries none.
     let (credential, host, port, raw_path) = if before_query.contains('@') {
         parse_sip002(before_query)?
     } else {
@@ -51,6 +53,7 @@ pub fn parse(rest: &str, raw_line: &str) -> Result<ProxyEntry, String> {
         params,
         raw_path,
         raw_line: raw_line.to_string(),
+        canonical: None,
     })
 }
 
@@ -113,15 +116,12 @@ fn parse_legacy(before_query: &str) -> Result<(String, String, u16, String), Str
 }
 
 /// Serialize back to the SIP002 form with unpadded standard base64, the
-/// dominant style in real feeds.
+/// dominant style in real feeds. The credential is stored complete
+/// (`method:password`): the Clash parser canonicalizes the default cipher
+/// at parse time (see `parsers::clash` `SS_SPEC`), so no defaulting happens
+/// here and the emitted line always re-parses to the stored credential.
 pub fn serialize(entry: &ProxyEntry) -> String {
-    // A Clash ss item without `cipher` stores a bare password; a colon-less
-    // SIP002 userinfo is unparsable, so default the method like the Clash writer.
-    let credential = match entry.credential.split_once(':') {
-        Some(_) => Cow::Borrowed(entry.credential.as_str()),
-        None => Cow::Owned(format!("chacha20-ietf-poly1305:{}", entry.credential)),
-    };
-    let blob = base64::engine::general_purpose::STANDARD_NO_PAD.encode(credential.as_bytes());
+    let blob = base64::engine::general_purpose::STANDARD_NO_PAD.encode(entry.credential.as_bytes());
     let mut out = String::with_capacity(96);
     out.push_str("ss://");
     out.push_str(&blob);
@@ -139,32 +139,6 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         out.push_str(&encode_fragment(&entry.name));
     }
     out
-}
-
-/// Lenient base64 decoder: accepts both standard and URL-safe alphabets,
-/// with or without padding. Returns `None` on invalid input.
-pub fn decode_b64_lenient(input: &str) -> Option<Vec<u8>> {
-    if input.is_empty() {
-        return None;
-    }
-    // Map the URL-safe alphabet onto the standard one.
-    let normalized: String = input
-        .chars()
-        .map(|c| match c {
-            '-' => '+',
-            '_' => '/',
-            c => c,
-        })
-        .collect();
-    let padded = match normalized.len() % 4 {
-        2 => format!("{normalized}=="),
-        3 => format!("{normalized}="),
-        0 => normalized,
-        _ => return None, // length % 4 == 1 is never valid base64
-    };
-    base64::engine::general_purpose::STANDARD
-        .decode(padded.as_bytes())
-        .ok()
 }
 
 #[cfg(test)]
@@ -231,6 +205,7 @@ mod tests {
         assert_eq!(first.host, second.host);
         assert_eq!(first.port, second.port);
         assert_eq!(first.credential, second.credential);
+        assert_eq!(first.raw_path, second.raw_path);
         assert_eq!(first.params, second.params);
     }
 
@@ -273,20 +248,22 @@ mod tests {
         assert!(parse(&line[5..], &line).is_err());
     }
 
-    /// A Clash ss item without `cipher` carries a colon-less credential;
-    /// the export defaults the method exactly like the Clash writer.
+    /// A Clash ss item without `cipher` is canonicalized at parse time: the
+    /// stored credential already carries the default method (see
+    /// `parsers::clash` `SS_SPEC`), so the export is a pure re-encoding and
+    /// the line re-parses to the identical credential.
     #[test]
-    fn clash_ss_without_cipher_defaults_the_method_on_export() {
+    fn clash_ss_without_cipher_is_canonicalized_at_parse_time() {
         let yaml =
             "proxies:\n  - {name: s, type: ss, server: h.example.com, port: 8388, password: pw}\n";
         let entry = &crate::parsers::clash::parse_payload(yaml).unwrap().entries[0];
-        assert_eq!(entry.credential, "pw");
+        assert_eq!(entry.credential, "chacha20-ietf-poly1305:pw");
 
         let line = serialize(entry);
         let back = parse(line.strip_prefix("ss://").unwrap(), &line).unwrap();
         assert_eq!(back.credential, "chacha20-ietf-poly1305:pw");
-        // The defaulted line is stable: the re-parse carries the method
-        // embedded, so a second serialization reproduces the same bytes.
+        // The canonical line is stable: a second serialization reproduces
+        // the same bytes.
         assert_eq!(serialize(&back), line);
     }
 }

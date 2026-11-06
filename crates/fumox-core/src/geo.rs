@@ -21,7 +21,8 @@
 //! an address no database knows is a fact about it, and a database read
 //! that failed is a fault of this process. A failed name resolution is
 //! cached separately and briefly ([`NEGATIVE_TTL`]), a resolved address
-//! without a record like any other verdict ([`CACHE_TTL`]). Entries expire,
+//! without a record like any other verdict (`[geo].cache_ttl_secs`).
+//! Entries expire,
 //! so a host that comes back is resolved without a restart.
 //!
 //! The `.mmdb` files are never committed. They are opened once per
@@ -151,11 +152,22 @@ pub fn unknown_placeholders(template: &str) -> Vec<String> {
 ///
 /// Placeholders: `{flag}`, `{country}`, `{city}`, `{asn}`, `{asn_org}`,
 /// `{name}`. The original name is returned unchanged only when there is no
-/// geo data at all (no country, no city, no ASN), a template with empty
-/// substitutions would only produce dangling separators. Individual missing
+/// geo data at all (no country, no city, no ASN). Individual missing
 /// values substitute as empty strings, and the result is then collapsed
 /// (whitespace runs → single space, trimmed), so `"{flag} {country} {city} ·
 /// {name}"` without a city still renders cleanly.
+///
+/// Two substitutions have a canonical spelling: `{asn}` renders the
+/// `AS{n}` text ([`asn_text`], the same form the `geo_asn` column
+/// stores), and `{country}` falls back to the ISO code when the database
+/// carries no English name for the block.
+///
+/// A pure-separator fragment (` · `, ` | `, the spaces around one)
+/// between two substitutions that both rendered empty is dropped, so an
+/// ASN-only record renders `{flag} {country} · {name}` as the plain name
+/// instead of `· Node-1`. A separator with rendered content on both sides
+/// survives: `{asn} {asn_org} · {name}` without an organization still
+/// reads `AS24940 · Node-1`.
 ///
 /// A template without `{name}` gets the original name appended: the name
 /// identifies the proxy in every output format, and a template that drops
@@ -169,29 +181,102 @@ pub fn apply_template(template: &str, geo: &GeoInfo, name: &str) -> String {
     if template.is_empty() {
         return name.to_string();
     }
-    let flag = geo
-        .country_code
-        .as_deref()
-        .and_then(flag_emoji)
-        .unwrap_or_default();
-    let country = geo
-        .country_name
-        .clone()
-        .or_else(|| geo.country_code.clone())
-        .unwrap_or_default();
-    let city = geo.city_name.as_deref().unwrap_or_default();
-    let asn_org = geo.asn_org.as_deref().unwrap_or_default();
-    let asn = geo.asn.map(asn_text).unwrap_or_default();
-    let mut rendered = template
-        .replace("{flag}", &flag)
-        .replace("{country}", &country)
-        .replace("{city}", city)
-        // {asn_org} before {asn}: the shorter placeholder is a prefix of it.
-        .replace("{asn_org}", asn_org)
-        .replace("{asn}", &asn)
-        .replace("{name}", name)
-        .to_string();
-    if !template.contains("{name}") {
+    let substitution = |key: &str| -> String {
+        match key {
+            "flag" => geo
+                .country_code
+                .as_deref()
+                .and_then(flag_emoji)
+                .unwrap_or_default(),
+            "country" => geo
+                .country_name
+                .clone()
+                .or_else(|| geo.country_code.clone())
+                .unwrap_or_default(),
+            "city" => geo.city_name.clone().unwrap_or_default(),
+            // {asn_org} before {asn}: the shorter placeholder is a prefix of it.
+            "asn" => geo.asn.map(asn_text).unwrap_or_default(),
+            "asn_org" => geo.asn_org.clone().unwrap_or_default(),
+            "name" => name.to_string(),
+            // A placeholder the renderer does not know stays verbatim, so
+            // the loader and the admin panel reject it instead of the
+            // operator finding a literal brace in every proxy name.
+            other => format!("{{{other}}}"),
+        }
+    };
+    // Split the template into literal fragments and resolved slots. The
+    // render pass needs the whole sequence to tell a separator whose
+    // neighbours both vanished from one that still joins two facts.
+    enum Segment {
+        Text(String),
+        Slot(String),
+    }
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut has_name = false;
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        if start > 0 {
+            segments.push(Segment::Text(rest[..start].to_string()));
+        }
+        let after = &rest[start + 1..];
+        match after.find('}') {
+            Some(end) => {
+                let key = after[..end].trim();
+                has_name |= key == "name";
+                segments.push(Segment::Slot(substitution(key)));
+                rest = &after[end + 1..];
+            }
+            // No closing brace: the rest is verbatim text, the same
+            // stray-brace case `unknown_placeholders` ignores.
+            None => {
+                segments.push(Segment::Text(format!("{{{}", after)));
+                rest = "";
+            }
+        }
+    }
+    if !rest.is_empty() {
+        segments.push(Segment::Text(rest.to_string()));
+    }
+    let renders_content = |segment: &Segment| match segment {
+        Segment::Text(text) => text.chars().any(|c| !c.is_whitespace()),
+        Segment::Slot(value) => !value.is_empty(),
+    };
+    // Suffix tables: whether anything renders after a position, and
+    // whether an empty slot still renders after it.
+    let mut content_after = vec![false; segments.len() + 1];
+    let mut empty_slot_after = vec![false; segments.len() + 1];
+    for i in (0..segments.len()).rev() {
+        content_after[i] = content_after[i + 1] || renders_content(&segments[i]);
+        empty_slot_after[i] = empty_slot_after[i + 1]
+            || matches!(&segments[i], Segment::Slot(value) if value.is_empty());
+    }
+    let mut rendered = String::new();
+    let mut empty_slot_before = false;
+    for (i, segment) in segments.iter().enumerate() {
+        match segment {
+            Segment::Slot(value) => {
+                empty_slot_before |= value.is_empty();
+                if !value.is_empty() {
+                    rendered.push_str(value);
+                }
+            }
+            Segment::Text(text) => {
+                // Dangling on the left: an empty slot preceded the
+                // fragment and nothing has rendered since. Dangling on
+                // the right: an empty slot follows and nothing renders
+                // beyond it. Either way a pure-separator fragment has
+                // nothing left to separate.
+                let dangling_before =
+                    empty_slot_before && !rendered.chars().any(|c| !c.is_whitespace());
+                let dangling_after = empty_slot_after[i + 1] && !content_after[i + 1];
+                let separator = !text.chars().any(char::is_alphabetic);
+                if !(separator && (dangling_before || dangling_after)) {
+                    rendered.push_str(text);
+                }
+            }
+        }
+    }
+    if !has_name {
         rendered.push(' ');
         rendered.push_str(name);
     }
@@ -307,6 +392,7 @@ impl Backends {
                 Err(err) => {
                     tracing::warn!(
                         file = kind.file_name(),
+                        dir = %dir.display(),
                         error = %err,
                         "GeoLite2 database unreadable; its facts are skipped"
                     );
@@ -381,21 +467,13 @@ impl GeoState {
     }
 }
 
-/// How long a host→geo verdict stays cached.
-///
-/// Without a lifetime the "unknown" answer for a host whose DNS failed
-/// once survives until the process restarts, and the ASN filters keep
-/// whatever they cannot name. Six hours matches the periodic geo
-/// backfill's cadence.
-const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
-
 /// How long a *failed name resolution* stays cached.
 ///
 /// A name that did not resolve says nothing about the host: the record
 /// may be published minutes later, and a dead name in a feed is common.
 /// The short lifetime keeps a host from being written off for hours, the
-/// long [`CACHE_TTL`] of the facts themselves is for verdicts that are
-/// facts.
+/// long `[geo].cache_ttl_secs` of the facts themselves (six hours by
+/// default) is for verdicts that are facts.
 const NEGATIVE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Window in which at most one line per outcome is logged.
@@ -472,10 +550,25 @@ pub enum GeoOutcome {
     /// The host resolved and the databases know the address.
     Facts(Arc<GeoInfo>),
     /// The host resolved, but no loaded database has a record for the
-    /// address (or the database read failed).
-    NoRecord,
+    /// address (or the database read failed). The address it resolved to
+    /// is kept so a caller can still record it (`proxies.resolved_ip`):
+    /// a no-record answer is a fact about the address, not a failure to
+    /// resolve it. `None` when the name resolved to no address the dial
+    /// path could use, or when the resolver is inactive.
+    NoRecord { ip: Option<String> },
     /// The host name did not resolve.
     DnsFailed(String),
+}
+
+/// The cached verdict of one host.
+#[derive(Clone)]
+enum Verdict {
+    /// The databases know the address.
+    Facts(Arc<GeoInfo>),
+    /// No loaded database knows the address. The address is kept so the
+    /// outcome of a fresh lookup can hand it to the caller even when the
+    /// verdict is served from the cache.
+    NoRecord { ip: Option<String> },
 }
 
 /// Host → geo resolver with an in-memory cache. Cheap to clone/share: the
@@ -487,9 +580,8 @@ pub struct GeoResolver {
     /// one copy, so a database that arrives after the startup (the
     /// downloader installs it) is picked up without a restart.
     db_dir: Option<std::path::PathBuf>,
-    /// Resolved facts per host. `None` is a cached verdict: the host
-    /// resolved, but no loaded database knows the address.
-    facts: Cache<String, Option<Arc<GeoInfo>>>,
+    /// Resolved verdicts per host.
+    facts: Cache<String, Verdict>,
     /// Names that did not resolve, with the reason. Kept apart from the
     /// facts because it expires much sooner ([`NEGATIVE_TTL`]).
     dns_failures: Cache<String, String>,
@@ -500,17 +592,29 @@ impl GeoResolver {
     /// Build a resolver from config. Every GeoLite2 database found in
     /// `[geo].db_dir` is opened and all of them contribute facts, a name
     /// template can mix `{country}`, `{city}` and `{asn}` freely. The
-    /// files that opened are named in one startup info line; a missing
-    /// kind gets its own warn (only while geo is enabled, its facts are
-    /// simply skipped). Returns a no-op resolver (with a warning logged)
-    /// when geo is disabled or no database file could be opened.
+    /// opened files are named in one startup info line; a kind that did
+    /// not open logs at debug while another database is open (a
+    /// deliberate ASN-only or City-only setup is supported), and the warn
+    /// — geo enrichment stays off until a database appears — is reserved
+    /// for the case where nothing opened at all. Geo disabled builds a
+    /// no-op resolver without any logging.
     pub fn new(cfg: &GeoConfig) -> Self {
-        Self::with_cache_ttl(cfg, CACHE_TTL)
+        Self::construct(cfg, Duration::from_secs(cfg.cache_ttl_secs), true)
     }
 
     /// [`Self::new`] with an explicit cache lifetime, so a test can watch an
     /// entry expire without waiting out the production TTL.
+    #[cfg(test)]
     fn with_cache_ttl(cfg: &GeoConfig, ttl: Duration) -> Self {
+        Self::construct(cfg, ttl, true)
+    }
+
+    /// The constructor body. `log_startup` silences the startup lines for
+    /// the admin panel's on-demand resolver ([`FullResolver::from_dir`]),
+    /// which opens the same databases without reporting on them: whether
+    /// geo applies is the caller's decision, read from [`Self::state`]
+    /// and [`Self::fact_mask`].
+    fn construct(cfg: &GeoConfig, ttl: Duration, log_startup: bool) -> Self {
         let facts = Cache::builder()
             .max_capacity(cfg.cache_max_entries)
             .time_to_live(ttl)
@@ -534,44 +638,45 @@ impl GeoResolver {
             dns_failures,
             dns_timeout,
         };
-        match resolver.backends() {
-            Some(backends) => {
-                let kinds = [
-                    (GeoDbKind::City, backends.city.is_some()),
-                    (GeoDbKind::Asn, backends.asn.is_some()),
-                ];
-                let opened: Vec<&str> = kinds
-                    .iter()
-                    .filter(|(_, loaded)| *loaded)
-                    .map(|(kind, _)| kind.file_name())
-                    .collect();
-                for (kind, loaded) in kinds {
-                    if !loaded {
-                        // Debug while another backend is open: a deliberate
-                        // ASN-only or City-only setup is a supported
-                        // configuration, and warning about it on every
-                        // start would drown the warning below, which is
-                        // the one that means geo is off.
-                        tracing::debug!(
-                            file = kind.file_name(),
-                            dir = %cfg.db_dir.display(),
-                            "GeoLite2 database missing; its facts are skipped"
-                        );
-                    }
-                }
-                tracing::info!(
-                    dir = %cfg.db_dir.display(),
-                    files = opened.join(", "),
-                    "geo enrichment enabled"
-                );
-            }
-            None => {
+        let Some(backends) = resolver.backends() else {
+            if log_startup {
                 tracing::warn!(
                     dir = %cfg.db_dir.display(),
                     "no GeoLite2 database could be opened yet; geo enrichment stays off \
                      until one appears"
                 );
             }
+            return resolver;
+        };
+        if log_startup {
+            let kinds = [
+                (GeoDbKind::City, backends.city.is_some()),
+                (GeoDbKind::Asn, backends.asn.is_some()),
+            ];
+            let opened: Vec<&str> = kinds
+                .iter()
+                .filter(|(_, loaded)| *loaded)
+                .map(|(kind, _)| kind.file_name())
+                .collect();
+            for (kind, loaded) in kinds {
+                if !loaded {
+                    // Debug while another backend is open: a deliberate
+                    // ASN-only or City-only setup is a supported
+                    // configuration, and warning about it on every
+                    // start would drown the warn above, which is
+                    // the one that means geo is off.
+                    tracing::debug!(
+                        file = kind.file_name(),
+                        dir = %cfg.db_dir.display(),
+                        "GeoLite2 database missing; its facts are skipped"
+                    );
+                }
+            }
+            tracing::info!(
+                dir = %cfg.db_dir.display(),
+                files = opened.join(", "),
+                "geo enrichment enabled"
+            );
         }
         resolver
     }
@@ -615,22 +720,27 @@ impl GeoResolver {
     pub async fn resolve(&self, host: &str) -> Option<Arc<GeoInfo>> {
         match self.resolve_detailed(host).await {
             GeoOutcome::Facts(info) => Some(info),
-            GeoOutcome::NoRecord | GeoOutcome::DnsFailed(_) => None,
+            GeoOutcome::NoRecord { .. } | GeoOutcome::DnsFailed(_) => None,
         }
     }
 
     /// [`Self::resolve`] with the outcome kept apart: a name that did not
     /// resolve and an address without a record are different facts about
-    /// the host and are counted separately.
+    /// the host and are counted separately. The no-record outcome carries
+    /// the address the host resolved to.
     pub async fn resolve_detailed(&self, host: &str) -> GeoOutcome {
         let Some(backends) = self.backends() else {
-            return GeoOutcome::NoRecord;
+            return GeoOutcome::NoRecord { ip: None };
         };
-        let key = host.to_ascii_lowercase();
-        if let Some(hit) = self.facts.get(&key).await {
-            return match hit {
-                Some(info) => GeoOutcome::Facts(info),
-                None => GeoOutcome::NoRecord,
+        // The cache key and the DNS query both see the normalized host:
+        // case and a trailing dot are the same name, and an IPv6 literal
+        // loses its URI brackets, so `[2001:db8::1]` is parsed as the
+        // address it is instead of being sent to the resolver as a name.
+        let key = crate::fingerprint::normalize_host(host);
+        if let Some(verdict) = self.facts.get(&key).await {
+            return match verdict {
+                Verdict::Facts(info) => GeoOutcome::Facts(info),
+                Verdict::NoRecord { ip } => GeoOutcome::NoRecord { ip },
             };
         }
         if let Some(reason) = self.dns_failures.get(&key).await {
@@ -640,7 +750,7 @@ impl GeoResolver {
         // concurrent callers wait for that one answer instead of starting
         // a DNS query each.
         let dns_failures = self.dns_failures.clone();
-        let host = host.to_string();
+        let host = key.clone();
         let cache_key = key.clone();
         let dns_timeout = self.dns_timeout;
         let value = self
@@ -650,8 +760,8 @@ impl GeoResolver {
             })
             .await;
         match value {
-            Some(info) => GeoOutcome::Facts(info),
-            None => {
+            Verdict::Facts(info) => GeoOutcome::Facts(info),
+            Verdict::NoRecord { ip } => {
                 // The attempt either hit "no record" (cached like any
                 // other verdict) or the name did not resolve (cached
                 // briefly and separately).
@@ -662,7 +772,7 @@ impl GeoResolver {
                     self.facts.invalidate(&key).await;
                     return GeoOutcome::DnsFailed(reason);
                 }
-                GeoOutcome::NoRecord
+                GeoOutcome::NoRecord { ip }
             }
         }
     }
@@ -675,13 +785,13 @@ async fn resolve_once(
     host: &str,
     key: &str,
     dns_timeout: Duration,
-) -> Option<Arc<GeoInfo>> {
+) -> Verdict {
     match resolve_uncached(backends, host, dns_timeout).await {
-        Resolved::Facts(info) => Some(Arc::new(info)),
-        Resolved::NoRecord => None,
+        Resolved::Facts(info) => Verdict::Facts(Arc::new(info)),
+        Resolved::NoRecord { ip } => Verdict::NoRecord { ip },
         Resolved::DnsFailed(reason) => {
             dns_failures.insert(key.to_string(), reason).await;
-            None
+            Verdict::NoRecord { ip: None }
         }
     }
 }
@@ -689,8 +799,12 @@ async fn resolve_once(
 /// What one uncached attempt produced.
 enum Resolved {
     Facts(GeoInfo),
-    /// The host resolved, no loaded database knows the address.
-    NoRecord,
+    /// The host resolved (or is a literal), but no loaded database knows
+    /// the address. The address is kept for the outcome; `None` when the
+    /// name resolved to no address the dial path could use.
+    NoRecord {
+        ip: Option<String>,
+    },
     /// The name did not resolve.
     DnsFailed(String),
 }
@@ -711,7 +825,7 @@ async fn resolve_uncached(backends: &Backends, host: &str, dns_timeout: Duration
                             "geo: the host name resolved to no address the dial path could use"
                         );
                     }
-                    return Resolved::NoRecord;
+                    return Resolved::NoRecord { ip: None };
                 }
             },
             Err(reason) => {
@@ -748,7 +862,9 @@ async fn resolve_uncached(backends: &Backends, host: &str, dns_timeout: Duration
         if NO_DATA_LOG.allow() {
             tracing::debug!(host = %host, ip = %ip, "geo: no database knows this address");
         }
-        return Resolved::NoRecord;
+        return Resolved::NoRecord {
+            ip: Some(ip.to_string()),
+        };
     }
     Resolved::Facts(info)
 }
@@ -768,11 +884,17 @@ impl FullResolver {
     /// enrichment is independent of the pipeline). Missing files are
     /// skipped silently: the caller decides what to report when nothing
     /// resolved.
+    ///
+    /// Constructed without the pipeline's startup logging: the admin path
+    /// opens the same databases without the "geo enrichment enabled" line
+    /// and without the missing-database warns, and reports its situation
+    /// through [`GeoState`](GeoResolver::state) and
+    /// [`GeoFactMask`](GeoResolver::fact_mask) instead.
     pub fn from_dir(cfg: &GeoConfig) -> Self {
         let mut cfg = cfg.clone();
         cfg.enabled = true;
         Self {
-            inner: GeoResolver::new(&cfg),
+            inner: GeoResolver::construct(&cfg, Duration::from_secs(cfg.cache_ttl_secs), false),
         }
     }
 
@@ -788,6 +910,14 @@ impl FullResolver {
     /// or no database knows the address.
     pub async fn resolve(&self, host: &str) -> Option<GeoInfo> {
         self.inner.resolve(host).await.map(|info| (*info).clone())
+    }
+
+    /// [`Self::resolve`] with the outcome kept apart: a name that did not
+    /// resolve and an address without a record are different facts, and
+    /// the no-record outcome carries the address the host resolved to,
+    /// which the caller can still record as `proxies.resolved_ip`.
+    pub async fn resolve_detailed(&self, host: &str) -> GeoOutcome {
+        self.inner.resolve_detailed(host).await
     }
 }
 
@@ -905,6 +1035,445 @@ mod tests {
             ..Default::default()
         });
         resolver.is_active().then_some(resolver)
+    }
+
+    /// Encodes a MaxMind DB control byte with its payload size. Types
+    /// above 7 (`uint64`, `array`, ...) are extended: the control byte
+    /// carries the type-0 marker and the next byte names the real type,
+    /// with the size in the five control bits unchanged. Plain types take
+    /// the one- or two-byte-extension forms for the sizes the control
+    /// byte cannot carry (the long ASN keys).
+    fn mmdb_header(out: &mut Vec<u8>, data_type: usize, size: usize) {
+        if data_type >= 8 {
+            assert!(size < 29, "the fixture extended data fits five bits");
+            out.push(size as u8);
+            out.push((data_type - 7) as u8);
+            return;
+        }
+        let prefix = (data_type << 5) as u8;
+        match size {
+            s if s < 29 => out.push(prefix | s as u8),
+            s if s < 285 => {
+                out.push(prefix | 29);
+                out.push((s - 29) as u8);
+            }
+            s => {
+                out.push(prefix | 30);
+                out.extend_from_slice(&u16::try_from(s - 285).unwrap().to_be_bytes());
+            }
+        }
+    }
+
+    /// A UTF-8 string datum.
+    fn mmdb_string(value: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        mmdb_header(&mut out, 2, value.len());
+        out.extend_from_slice(value.as_bytes());
+        out
+    }
+
+    /// A minimal big-endian unsigned datum (`uint16`/`uint32`/`uint64`
+    /// share the shape: control byte, byte count, the bytes themselves).
+    fn mmdb_uint(data_type: usize, value: u64) -> Vec<u8> {
+        let bytes = value.to_be_bytes();
+        let first = bytes
+            .iter()
+            .position(|b| *b != 0)
+            .unwrap_or(bytes.len() - 1);
+        let mut out = Vec::new();
+        mmdb_header(&mut out, data_type, bytes.len() - first);
+        out.extend_from_slice(&bytes[first..]);
+        out
+    }
+
+    /// A map datum from pre-encoded key/value pairs.
+    fn mmdb_map(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+        let mut out = Vec::new();
+        mmdb_header(&mut out, 7, entries.len());
+        for (key, value) in entries {
+            out.extend_from_slice(&key);
+            out.extend_from_slice(&value);
+        }
+        out
+    }
+
+    /// An array datum from pre-encoded items.
+    fn mmdb_array(items: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut out = Vec::new();
+        mmdb_header(&mut out, 11, items.len());
+        for item in items {
+            out.extend_from_slice(&item);
+        }
+        out
+    }
+
+    /// The City record of the fixture: Germany/Berlin for one /24.
+    fn city_record() -> Vec<u8> {
+        let names = |en: &str| mmdb_map(vec![(mmdb_string("en"), mmdb_string(en))]);
+        let country = |code: &str, name: &str| {
+            mmdb_map(vec![
+                (mmdb_string("iso_code"), mmdb_string(code)),
+                (mmdb_string("names"), names(name)),
+            ])
+        };
+        mmdb_map(vec![
+            (
+                mmdb_string("city"),
+                mmdb_map(vec![(mmdb_string("names"), names("Berlin"))]),
+            ),
+            (mmdb_string("country"), country("DE", "Germany")),
+            (mmdb_string("registered_country"), country("DE", "Germany")),
+        ])
+    }
+
+    /// The ASN record of the fixture: AS15169 Google LLC for one /24.
+    fn asn_record() -> Vec<u8> {
+        mmdb_map(vec![
+            (mmdb_string("autonomous_system_number"), mmdb_uint(6, 15169)),
+            (
+                mmdb_string("autonomous_system_organization"),
+                mmdb_string("Google LLC"),
+            ),
+        ])
+    }
+
+    /// The bytes of a minimal valid `.mmdb` that routes one /24 (the
+    /// first three octets of `prefix`) to one record. Every off-path
+    /// branch is the no-record terminal, so any other address looks up as
+    /// "not found" — the smallest file the real reader accepts, so the
+    /// resolver tests run without the (never-committed) GeoLite2 files.
+    fn fixture_mmdb(prefix: [u8; 3], record: &[u8], database_type: &str) -> Vec<u8> {
+        let record_24 = |value: u32| [(value >> 16) as u8, (value >> 8) as u8, value as u8];
+        // One node per prefix bit; search-tree records are 3 bytes
+        // (record_size 24), a node is 6.
+        let node_count: u32 = 24;
+        let mut tree = vec![0u8; node_count as usize * 6];
+        for node in 0..node_count {
+            let (left, right) = if node + 1 == node_count {
+                // The last node hands both host bits to the record: the
+                // /24 covers the remaining eight bits. The data pointer
+                // is node_count + 16 (the separator size) + offset 0.
+                let pointer = record_24(node_count + 16);
+                (pointer, pointer)
+            } else {
+                let child = record_24(node + 1);
+                let empty = record_24(node_count);
+                let bit = (prefix[node as usize / 8] >> (7 - node % 8)) & 1;
+                if bit == 0 {
+                    (child, empty)
+                } else {
+                    (empty, child)
+                }
+            };
+            let base = node as usize * 6;
+            tree[base..base + 3].copy_from_slice(&left);
+            tree[base + 3..base + 6].copy_from_slice(&right);
+        }
+        let mut out = tree;
+        // The separator between the search tree and the data section; the
+        // data pointers resolve against the offset after it.
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(record);
+        out.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        out.extend_from_slice(b"MaxMind.com");
+        out.extend_from_slice(&mmdb_map(vec![
+            (mmdb_string("binary_format_major_version"), mmdb_uint(5, 2)),
+            (mmdb_string("binary_format_minor_version"), mmdb_uint(5, 0)),
+            (mmdb_string("build_epoch"), mmdb_uint(9, 1_700_000_000)),
+            (mmdb_string("database_type"), mmdb_string(database_type)),
+            (
+                mmdb_string("description"),
+                mmdb_map(vec![(mmdb_string("en"), mmdb_string("fumox test fixture"))]),
+            ),
+            (mmdb_string("ip_version"), mmdb_uint(5, 4)),
+            (
+                mmdb_string("languages"),
+                mmdb_array(vec![mmdb_string("en")]),
+            ),
+            (
+                mmdb_string("node_count"),
+                mmdb_uint(6, u64::from(node_count)),
+            ),
+            (mmdb_string("record_size"), mmdb_uint(5, 24)),
+        ]));
+        out
+    }
+
+    /// Writes the fixture databases under their canonical names into a
+    /// fresh temp directory and returns it, so a resolver can be built on
+    /// them like on the real `db_dir`.
+    fn fixture_db_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "fumox-geo-fixture-{}-{tag}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        std::fs::write(
+            dir.join(GeoDbKind::City.file_name()),
+            fixture_mmdb([81, 19, 44], &city_record(), "GeoLite2-City"),
+        )
+        .expect("city fixture");
+        std::fs::write(
+            dir.join(GeoDbKind::Asn.file_name()),
+            fixture_mmdb([8, 8, 8], &asn_record(), "GeoLite2-ASN"),
+        )
+        .expect("asn fixture");
+        dir
+    }
+
+    /// The fixture builder produces databases the real reader accepts:
+    /// the records decode with exactly the facts the fixture wrote, and
+    /// addresses outside the fixture network have no record.
+    #[test]
+    fn lookup_city_and_lookup_asn_read_a_fixture_database() {
+        let city = Reader::from_source(fixture_mmdb([81, 19, 44], &city_record(), "GeoLite2-City"))
+            .expect("the fixture must be a valid database");
+        let record =
+            lookup_city(&city, "81.19.44.10".parse().unwrap()).expect("the /24 has a record");
+        assert_eq!(record.country_code.as_deref(), Some("DE"));
+        assert_eq!(record.country_name.as_deref(), Some("Germany"));
+        assert_eq!(record.city_name.as_deref(), Some("Berlin"));
+        assert!(
+            lookup_city(&city, "8.8.8.8".parse().unwrap()).is_none(),
+            "no record outside the fixture network"
+        );
+
+        let asn = Reader::from_source(fixture_mmdb([8, 8, 8], &asn_record(), "GeoLite2-ASN"))
+            .expect("the fixture must be a valid database");
+        let record = lookup_asn(&asn, "8.8.8.8".parse().unwrap()).expect("the /24 has a record");
+        assert_eq!(record.asn, Some(15169));
+        assert_eq!(record.asn_org.as_deref(), Some("Google LLC"));
+    }
+
+    /// `english_name` prefers English and falls back to any other
+    /// language, the behavior the merged name rendering relies on.
+    #[test]
+    fn english_name_prefers_english_then_any_language() {
+        use maxminddb::geoip2;
+        let names = geoip2::Names {
+            english: Some("Germany"),
+            ..Default::default()
+        };
+        assert_eq!(english_name(&names).as_deref(), Some("Germany"));
+        let names = geoip2::Names {
+            german: Some("Deutschland"),
+            ..Default::default()
+        };
+        assert_eq!(english_name(&names).as_deref(), Some("Deutschland"));
+        assert_eq!(english_name(&geoip2::Names::default()), None);
+    }
+
+    /// City and ASN facts merge into one verdict on the fixture
+    /// databases; a partial record (only one database knows the address)
+    /// still enriches.
+    #[tokio::test]
+    async fn the_fixture_resolver_merges_city_and_asn_facts() {
+        let resolver = GeoResolver::new(&GeoConfig {
+            enabled: true,
+            db_dir: fixture_db_dir("merge"),
+            ..Default::default()
+        });
+        let info = resolver
+            .resolve("81.19.44.10")
+            .await
+            .expect("the fixture address is known");
+        assert_eq!(info.ip, "81.19.44.10");
+        assert_eq!(info.country_code.as_deref(), Some("DE"));
+        assert_eq!(info.country_name.as_deref(), Some("Germany"));
+        assert_eq!(info.city_name.as_deref(), Some("Berlin"));
+        assert_eq!(info.asn, None, "81.19.44.x has no ASN record");
+
+        // The ASN-only address: partial facts, still enrichment.
+        let info = resolver
+            .resolve("8.8.8.8")
+            .await
+            .expect("the fixture address is known");
+        assert_eq!(info.asn, Some(15169));
+        assert_eq!(info.asn_org.as_deref(), Some("Google LLC"));
+        assert_eq!(info.country_code, None, "8.8.8.x has no City record");
+        assert!(info.has_facts(), "an ASN-only record is still enrichment");
+    }
+
+    /// A no-record answer is a fact about the address: the outcome keeps
+    /// the IP the host resolved to, so a caller can record it as
+    /// `proxies.resolved_ip` even when no database knows the address.
+    #[tokio::test]
+    async fn a_no_record_outcome_keeps_the_resolved_ip() {
+        let resolver = GeoResolver::new(&GeoConfig {
+            enabled: true,
+            db_dir: fixture_db_dir("norecord"),
+            ..Default::default()
+        });
+        // TEST-NET-1: a valid address the fixture databases do not know.
+        for attempt in 0..2 {
+            match resolver.resolve_detailed("192.0.2.1").await {
+                GeoOutcome::NoRecord { ip } => {
+                    assert_eq!(
+                        ip.as_deref(),
+                        Some("192.0.2.1"),
+                        "the resolved ip survives, attempt {attempt}"
+                    );
+                }
+                other => panic!("expected a no-record outcome, got {other:?}"),
+            }
+        }
+    }
+
+    /// The cache lifetime is the configured one: positives and negatives
+    /// expire alike, and an expired host is looked up again.
+    #[tokio::test]
+    async fn the_fixture_cache_expires_after_the_configured_ttl() {
+        let resolver = GeoResolver::with_cache_ttl(
+            &GeoConfig {
+                enabled: true,
+                db_dir: fixture_db_dir("ttl"),
+                ..Default::default()
+            },
+            Duration::from_millis(50),
+        );
+        resolver.resolve("81.19.44.10").await.expect("known");
+        resolver.resolve("192.0.2.1").await;
+        assert!(resolver.facts.get("81.19.44.10").await.is_some());
+        assert!(
+            resolver.dns_failures.get("192.0.2.1").await.is_none(),
+            "a no-record verdict is a fact, not a DNS failure"
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            resolver.facts.get("81.19.44.10").await.is_none(),
+            "the positive verdict expired"
+        );
+        assert!(
+            resolver.resolve("81.19.44.10").await.is_some(),
+            "an expired host is looked up again"
+        );
+    }
+
+    /// The cache key and the DNS query see the normalized host: case, a
+    /// trailing dot and the URI brackets of an IPv6 literal are the same
+    /// host, so both spellings share one verdict.
+    #[tokio::test]
+    async fn the_cache_key_and_the_dns_query_use_the_normalized_host() {
+        let resolver = GeoResolver::new(&GeoConfig {
+            enabled: true,
+            db_dir: fixture_db_dir("normalize"),
+            ..Default::default()
+        });
+        let first = resolver.resolve("81.19.44.10").await.expect("known");
+        let second = resolver
+            .resolve("81.19.44.10.")
+            .await
+            .expect("a trailing dot is the same zone");
+        assert_eq!(first, second, "one verdict for both spellings");
+        assert!(
+            resolver.dns_failures.get("81.19.44.10").await.is_none(),
+            "an address is never sent to the DNS resolver"
+        );
+        assert!(
+            resolver.dns_failures.get("81.19.44.10.").await.is_none(),
+            "the normalized spelling is the cached key, the raw one is not"
+        );
+    }
+
+    /// The admin panel's resolver constructs without the startup lines:
+    /// no "geo enrichment enabled", no missing-database warns. Whether
+    /// geo applies is the caller's decision, read from `state()` and
+    /// `fact_mask()`, not from log output.
+    #[test]
+    fn full_resolver_from_dir_constructs_without_startup_logging() {
+        #[derive(Clone, Default)]
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = |run: &dyn Fn()| {
+            let buffer = SharedBuf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(buffer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, run);
+            String::from_utf8(buffer.0.lock().unwrap().clone()).expect("log output is utf-8")
+        };
+
+        let cfg = GeoConfig {
+            enabled: true,
+            db_dir: fixture_db_dir("quiet"),
+            ..Default::default()
+        };
+        let quiet = capture(&|| {
+            let resolver = FullResolver::from_dir(&cfg);
+            assert!(resolver.is_active(), "the fixture databases loaded");
+        });
+        assert!(
+            !quiet.contains("geo enrichment enabled"),
+            "the admin path must stay quiet: {quiet}"
+        );
+        assert!(
+            !quiet.contains("GeoLite2"),
+            "no database warn on the admin path: {quiet}"
+        );
+
+        // The pipeline constructor still reports, proving the capture
+        // sees the line the quiet one must not print.
+        let loud = capture(&|| {
+            GeoResolver::new(&cfg);
+        });
+        assert!(
+            loud.contains("geo enrichment enabled"),
+            "the pipeline constructor reports the opened databases: {loud}"
+        );
+    }
+
+    /// Partial facts must not render a dangling separator: an ASN-only
+    /// record under `{flag} {country} · {name}` is the plain name, while
+    /// a record with the facts on both sides keeps the separator.
+    #[test]
+    fn a_partial_facts_template_renders_without_a_dangling_separator() {
+        let asn_only = GeoInfo {
+            ip: "8.8.8.8".into(),
+            asn: Some(15169),
+            asn_org: Some("Google LLC".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_template("{flag} {country} · {name}", &asn_only, "Node-1"),
+            "Node-1"
+        );
+        assert_eq!(
+            apply_template("{flag} {country} · {asn} {asn_org}", &asn_only, "Node-1"),
+            "AS15169 Google LLC Node-1"
+        );
+        // A trailing separator with nothing after it drops too.
+        assert_eq!(
+            apply_template("{name} · {country}", &asn_only, "Node-1"),
+            "Node-1"
+        );
+        // Content on both sides keeps the separator.
+        assert_eq!(
+            apply_template("{flag} {country} · {name}", &german_geo(), "Node-1"),
+            "🇩🇪 Germany · Node-1"
+        );
     }
 
     /// Positives and negatives expire alike: an "unknown" answer for a host
@@ -1281,7 +1850,7 @@ mod tests {
         // An address that resolves but that no database knows.
         let unknown = resolver.resolve_detailed("192.0.2.1").await;
         assert!(
-            matches!(unknown, GeoOutcome::NoRecord),
+            matches!(unknown, GeoOutcome::NoRecord { .. }),
             "an address without a record is no record, got {unknown:?}"
         );
     }
@@ -1366,11 +1935,10 @@ mod tests {
 
     /// Path to a GeoLite2 database if present in the workspace `config/`
     /// directory (the files are gitignored, so tests skip without them).
+    /// Built on [`workspace_db_dir`], the single source of the path.
     fn mmdb_path(kind: GeoDbKind) -> Option<std::path::PathBuf> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config")
-            .join(kind.file_name());
-        path.exists().then_some(path)
+        let path = workspace_db_dir()?.join(kind.file_name());
+        path.is_file().then_some(path)
     }
 
     /// A resolver over the workspace `config/` directory, active only when

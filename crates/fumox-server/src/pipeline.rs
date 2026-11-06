@@ -1075,11 +1075,15 @@ fn apply_rename_rule(entry: &mut ProxyEntry, rule: &CompiledRename) -> Rewrite {
         RenameTarget::Port => {
             let port = rewritten(&entry.port.to_string());
             match port.parse::<u16>() {
-                Ok(parsed) => {
+                // Port 0 is not a dialable endpoint: the parsers drop it and
+                // the schema CHECK (migration 0018) refuses the row at the
+                // upsert, so a rewrite that produced one is rejected like a
+                // junk value instead of failing the whole ingest batch.
+                Ok(parsed) if parsed != 0 => {
                     entry.port = parsed;
                     Rewrite::Applied
                 }
-                Err(_) => {
+                _ => {
                     tracing::trace!(
                         port = %port,
                         fingerprint = entry.fingerprint(),
@@ -1217,6 +1221,7 @@ mod tests {
                 params: Vec::new(),
                 raw_path: String::new(),
                 raw_line: String::new(),
+                canonical: None,
             },
             source_position: 0,
             status: ProxyStatus::Unknown,
@@ -1439,6 +1444,7 @@ mod tests {
                 params,
                 raw_path: String::new(),
                 raw_line: String::new(),
+                canonical: None,
             },
             source_position: 0,
             status: ProxyStatus::Unknown,
@@ -1469,6 +1475,7 @@ mod tests {
             params: Vec::new(),
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         }
     }
 
@@ -1685,11 +1692,13 @@ mod tests {
                     key: "fp".into(),
                     value: "chrome".into(),
                     known: true,
+                    bare: false,
                 },
                 Param {
                     key: "sni".into(),
                     value: "s.example.com".into(),
                     known: true,
+                    bare: false,
                 },
             ],
         )];
@@ -1719,11 +1728,13 @@ mod tests {
                     key: "path".into(),
                     value: "/ws".into(),
                     known: true,
+                    bare: false,
                 },
                 Param {
                     key: "PATH".into(),
                     value: "/other".into(),
                     known: true,
+                    bare: false,
                 },
             ],
         )];
@@ -1855,6 +1866,7 @@ mod tests {
                         key: "fp".into(),
                         value: "chrome".into(),
                         known: true,
+                        bare: false,
                     }, // param
                 ],
             ),
@@ -1867,6 +1879,7 @@ mod tests {
                         key: "fp".into(),
                         value: "firefox".into(),
                         known: true,
+                        bare: false,
                     }, // untouched
                 ],
             ),
@@ -1917,6 +1930,7 @@ mod tests {
                     key: "Path".into(),
                     value: "%2Fws".into(),
                     known: true,
+                    bare: false,
                 }],
             ),
             candidate_with_params(
@@ -1927,6 +1941,7 @@ mod tests {
                     key: "path".into(),
                     value: "%2Fother".into(),
                     known: true,
+                    bare: false,
                 }],
             ),
         ];
@@ -2253,7 +2268,9 @@ mod tests {
         let out = compiled.apply(candidates, &inactive_geo()).await;
         assert_eq!(out[0].entry.port, 443);
 
-        // Zero is a legal u16 port value and is allowed through.
+        // Zero is refused like any other unusable value: the parsers drop it
+        // and the schema CHECK (migration 0018) would reject the row at the
+        // upsert.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [{ "match": ".*", "replace": "0", "target": "port" }]
@@ -2261,7 +2278,7 @@ mod tests {
         .unwrap();
         let candidates = vec![candidate("n", Scheme::Vless, "h.example.com")];
         let out = compiled.apply(candidates, &inactive_geo()).await;
-        assert_eq!(out[0].entry.port, 0);
+        assert_eq!(out[0].entry.port, 443);
     }
 
     #[tokio::test]
@@ -2279,6 +2296,7 @@ mod tests {
                 key: "fp".into(),
                 value: "chrome".into(),
                 known: true,
+                bare: false,
             }],
         )];
         let out = compiled.apply(candidates, &inactive_geo()).await;
@@ -2515,6 +2533,7 @@ mod tests {
             key: "insecure".into(),
             value: "0".into(),
             known: true,
+            bare: false,
         });
         let out = compiled.apply(vec![c], &inactive_geo()).await;
         assert!(
@@ -2538,6 +2557,7 @@ mod tests {
             key: "insecure".into(),
             value: "1".into(),
             known: true,
+            bare: false,
         });
         let out = compiled.apply(vec![c], &inactive_geo()).await;
         assert!(out.is_empty(), "the stored row allows insecure TLS");
@@ -2609,6 +2629,7 @@ mod tests {
                 key: key.into(),
                 value: value.into(),
                 known: true,
+                bare: false,
             });
             let out = CompiledPipeline::from_json(None)
                 .unwrap()
@@ -2634,6 +2655,7 @@ mod tests {
                 key: key.into(),
                 value: "0".into(),
                 known: true,
+                bare: false,
             });
             let out = CompiledPipeline::from_json(None)
                 .unwrap()
@@ -2661,6 +2683,7 @@ mod tests {
             key: "allowInsecure".into(),
             value: "1".into(),
             known: true,
+            bare: false,
         });
         let out = CompiledPipeline::from_json(Some(&config))
             .unwrap()
@@ -2682,6 +2705,7 @@ mod tests {
             key: "insecure".into(),
             value: "1".into(),
             known: true,
+            bare: false,
         });
         let out = CompiledPipeline::from_json(Some(&legacy))
             .unwrap()

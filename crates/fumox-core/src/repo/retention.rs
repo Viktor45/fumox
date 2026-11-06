@@ -23,13 +23,17 @@ pub struct RetentionWindows {
 }
 
 /// What one sweep removed.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RetentionOutcome {
     /// Rows dropped from `fetch_log`.
     pub fetch_log: u64,
     /// Rows dropped from `probe_requests`: the settled ones and the stale
     /// ones together.
     pub probe_requests: u64,
+    /// The first failure of the sweep, if a purge errored: the callers
+    /// stamp it into `last_rotation`, so the panel can tell a failed
+    /// rotation from a quiet one.
+    pub error: Option<String>,
 }
 
 /// Cutoff timestamp for a window of `days`: the rows older than it go.
@@ -64,7 +68,10 @@ pub async fn sweep_shared_journals(
             outcome.fetch_log = deleted;
             tracing::info!(deleted, "rotated fetch_log");
         }
-        Err(error) => tracing::warn!(%error, "fetch_log rotation failed"),
+        Err(error) => {
+            tracing::warn!(%error, "fetch_log rotation failed");
+            outcome.error.get_or_insert(format!("fetch_log: {error}"));
+        }
     }
     // Priority-queue housekeeping: requests whose proxy already left
     // `unknown`, and stale leftovers from an offline probe.
@@ -74,7 +81,12 @@ pub async fn sweep_shared_journals(
             outcome.probe_requests += deleted;
             tracing::debug!(deleted, "dropped settled probe_requests");
         }
-        Err(error) => tracing::warn!(%error, "probe_requests cleanup failed"),
+        Err(error) => {
+            tracing::warn!(%error, "probe_requests cleanup failed");
+            outcome
+                .error
+                .get_or_insert(format!("probe_requests settled: {error}"));
+        }
     }
     match probe::purge_requests_before(pool, cutoff(now, windows.queue_stale_days)).await {
         Ok(0) => {}
@@ -82,7 +94,12 @@ pub async fn sweep_shared_journals(
             outcome.probe_requests += deleted;
             tracing::info!(deleted, "rotated stale probe_requests");
         }
-        Err(error) => tracing::warn!(%error, "probe_requests rotation failed"),
+        Err(error) => {
+            tracing::warn!(%error, "probe_requests rotation failed");
+            outcome
+                .error
+                .get_or_insert(format!("probe_requests stale: {error}"));
+        }
     }
     outcome
 }
@@ -132,6 +149,7 @@ mod tests {
                     error: None,
                     error_class: None,
                 },
+                crate::repo::fetch_log::FetchTiming::default(),
             )
             .await
             .unwrap();

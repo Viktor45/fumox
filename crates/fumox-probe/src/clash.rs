@@ -6,8 +6,7 @@
 //! unambiguously.
 
 use fumox_core::formats::clash::entry_to_clash_named;
-use fumox_core::models::{Param, ProxyEntry, Scheme};
-use fumox_core::repo::proxies::ProxyRow;
+use fumox_core::models::{Param, ProxyEntry, Scheme, is_insecure_param};
 use serde_norway::Value;
 
 /// Deterministic name of a proxy inside the generated config.
@@ -15,26 +14,63 @@ pub fn proxy_name(proxy_id: i64) -> String {
     format!("fumox-{proxy_id}")
 }
 
+/// One record of a T2 batch, the input of [`generate`]: the entry as the
+/// calling layer already parsed it from storage, the id the results map
+/// back to, and the vetted address the proxy dials when IP pinning is on
+/// (`None` keeps the entry's own host). The storage-row → entry conversion
+/// belongs to the calling layer, so this module only formats.
+pub struct BatchRow {
+    pub id: i64,
+    pub entry: ProxyEntry,
+    pub vetted: Option<std::net::IpAddr>,
+}
+
 /// Shorthand for integer YAML scalars.
 fn num(value: i64) -> Value {
     Value::Number(value.into())
 }
 
+/// The required credential field a scheme's entry must carry for the
+/// engine config, as a short problem description; `None` when the entry is
+/// complete. meow-rs (mihomo) refuses a config whose proxy carries no
+/// credential, and one such record used to void the whole batch at
+/// `PUT /configs`, so the caller rejects the record itself before the
+/// config is generated. `socks5` may run without a credential (an
+/// anonymous proxy is valid); only a one-sided `user:pass` is malformed.
+pub fn required_field_problem(entry: &ProxyEntry) -> Option<&'static str> {
+    let credential = entry.credential.trim();
+    match entry.scheme {
+        Scheme::Vless | Scheme::Vmess if credential.is_empty() => Some("missing uuid"),
+        Scheme::Trojan | Scheme::Hysteria2 | Scheme::Snell | Scheme::AnyTls
+            if credential.is_empty() =>
+        {
+            Some("missing password")
+        }
+        Scheme::Ss => match credential.split_once(':') {
+            Some((cipher, password)) if !cipher.is_empty() && !password.is_empty() => None,
+            _ => Some("missing cipher or password"),
+        },
+        Scheme::Socks5 => match credential.split_once(':') {
+            Some(("", _)) | Some((_, "")) => Some("missing username or password"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Generate the full Clash config for one T2 batch, returning the YAML plus
-/// the ids of the rows actually included in it.
+/// the ids of the records actually included in it.
 ///
-/// Certificate verification is not forced off: T2 carries the proxy's own
-/// credential through the tunnel, so only entries whose own params ask for
-/// it get skip-cert-verify.
-pub fn generate(
-    rows: &[ProxyRow],
-    pins: &std::collections::HashMap<String, std::net::IpAddr>,
-    ipv6: bool,
-) -> serde_norway::Result<(String, Vec<i64>)> {
+/// The insecure parameters travel in from an untrusted feed and are not
+/// carried into the T2 config: T2 carries the proxy's own credential
+/// through the tunnel, so the generator drops them before the mapping runs
+/// (see [`proxy_to_value`]) instead of tunnel-testing with verification
+/// off behind the operator's back.
+pub fn generate(rows: &[BatchRow], ipv6: bool) -> serde_norway::Result<(String, Vec<i64>)> {
     let mut included = Vec::new();
     let mut proxies = Vec::new();
     for row in rows {
-        if let Some(value) = proxy_to_value(row, pins) {
+        if let Some(value) = proxy_to_value(row) {
             included.push(row.id);
             proxies.push(value);
         }
@@ -60,7 +96,7 @@ pub fn generate(
     Ok((serde_norway::to_string(&Value::Mapping(root))?, included))
 }
 
-/// Map one DB row onto a Clash proxy definition; returns `None` for
+/// Map one batch record onto a Clash proxy definition; returns `None` for
 /// entries the core mapping cannot express (they are skipped, never
 /// fatal, log+skip policy).
 ///
@@ -68,26 +104,29 @@ pub fn generate(
 /// tunnel: a scheme it does not know has no mihomo counterpart, and the
 /// mapping says so by returning `None`. The probe keeps no second list.
 ///
-/// When `pins` contains an entry for the row's host, the entry is cloned with
-/// `host` replaced by the pinned IP literal before being serialized. This
-/// closes the vet/dial TOCTOU the same way T1 closes it: the proxy dials the
+/// When the record carries a vetted address, the entry is cloned with
+/// `host` replaced by that address before being serialized. This closes
+/// the vet/dial TOCTOU the same way T1 closes it: the proxy dials the
 /// vetted address, not whatever the OS resolver returns next. mihomo accepts
 /// an IP literal in `server`, and an IP is no certificate server name, so
 /// pinning also carries the proxy's own hostname into the scheme's
 /// server-name param (see [`carry_server_name`]): the entry's `sni` /
 /// `servername` when it has one, its pre-pin host when it does not, which is
-/// what keeps certificate verification (never forced off here, see
-/// [`generate`]) pointed at the right name while the hostname itself never
-/// enters the dial.
-fn proxy_to_value(
-    row: &ProxyRow,
-    pins: &std::collections::HashMap<String, std::net::IpAddr>,
-) -> Option<Value> {
-    let mut entry = row.to_entry().ok()?;
-    if let Some(ip) = pins.get(&row.host) {
-        carry_server_name(&mut entry, &row.host);
+/// what keeps certificate verification (its insecure toggle is dropped
+/// here, see [`generate`]) pointed at the right name while the hostname
+/// itself never enters the dial.
+fn proxy_to_value(row: &BatchRow) -> Option<Value> {
+    let mut entry = row.entry.clone();
+    if let Some(ip) = row.vetted {
+        let pre_pin_host = entry.host.clone();
+        carry_server_name(&mut entry, &pre_pin_host);
         entry.host = ip.to_string();
     }
+    // The insecure parameters (`is_insecure`'s aliases) come from the feed,
+    // not from the operator: dropping them keeps the shared mapping from
+    // rendering `skip-cert-verify` into the T2 config, so the tunnel check
+    // never verifies nothing just because the entry asked to.
+    entry.params.retain(|p| !is_insecure_param(p));
     entry_to_clash_named(&entry, &proxy_name(row.id))
 }
 
@@ -130,11 +169,24 @@ fn server_name_sources(scheme: Scheme) -> Option<(&'static str, &'static [&'stat
 /// `formats::clash` renders it: its own spelling, else the pre-pin host.
 /// A trojan/hysteria2 spelling only `servername` becomes `sni`, which the
 /// mapping would drop.
+///
+/// The name is only carried for entries that actually negotiate TLS: a
+/// carried `servername` is an SNI to the shared predicate, so pinning a
+/// plain-TCP vless/vmess would flip it to a TLS node (`tls: true`) and
+/// the T2 check would tunnel-test a plaintext proxy as TLS. The decision
+/// is [`fumox_core::params::wants_tls`], the same one `t1::check_kind`
+/// consults; trojan/hysteria2/anytls negotiate TLS unconditionally, and
+/// the schemes [`server_name_sources`] maps to `None` get no param.
 fn carry_server_name(entry: &mut ProxyEntry, pre_pin_host: &str) {
     let Some((key, sources)) = server_name_sources(entry.scheme) else {
         return;
     };
     if pre_pin_host.parse::<std::net::IpAddr>().is_ok() {
+        return;
+    }
+    if matches!(entry.scheme, Scheme::Vless | Scheme::Vmess)
+        && !fumox_core::params::wants_tls(entry, &fumox_core::params::Blocks::of(entry))
+    {
         return;
     }
     let name = sources
@@ -151,6 +203,7 @@ fn carry_server_name(entry: &mut ProxyEntry, pre_pin_host: &str) {
         key: key.to_string(),
         value: name,
         known: true,
+        bare: false,
     });
 }
 
@@ -159,39 +212,23 @@ mod tests {
     use super::*;
     use fumox_core::models::{Param, ProxyEntry, Scheme};
 
-    fn row_from_entry(id: i64, entry: ProxyEntry) -> ProxyRow {
-        let known = serde_json::to_string(&entry.known_params_json()).unwrap();
-        ProxyRow {
+    /// An unpinned batch record: the entry dials its own host.
+    fn record(id: i64, entry: ProxyEntry) -> BatchRow {
+        BatchRow {
             id,
-            fingerprint: format!("fp{id}"),
-            scheme: entry.scheme.as_str().to_string(),
-            name: entry.name.clone(),
-            host: entry.host.clone(),
-            port: i64::from(entry.port),
-            credential: entry.credential.clone(),
-            params: Some(known),
-            unknown_params: None,
-            raw_line: None,
-            raw_path: None,
-            last_t2_failed_at: None,
-            geo_country: None,
-            geo_city: None,
-            geo_asn: None,
-            geo_attempts: 0,
-            last_geo_attempt_at: None,
-            resolved_ip: None,
-            status: "alive".into(),
-            fail_count: 0,
-            last_checked_at: None,
-            last_alive_at: None,
-            quarantined_at: None,
-            ladder_at: None,
-            ladder_step: 0,
-            removed_at: None,
-            latency_ms: None,
-            speed_mbps: None,
-            created_at: 1,
-            updated_at: 1,
+            entry,
+            vetted: None,
+        }
+    }
+
+    /// A pinned batch record: the entry dials the vetted address instead of
+    /// its host, the way the calling layer pins a row whose host it has
+    /// resolved once per cycle.
+    fn pinned(id: i64, entry: ProxyEntry) -> BatchRow {
+        BatchRow {
+            id,
+            entry,
+            vetted: Some("203.0.113.10".parse().unwrap()),
         }
     }
 
@@ -212,17 +249,19 @@ mod tests {
                     key: (*k).into(),
                     value: (*v).into(),
                     known: true,
+                    bare: false,
                 })
                 .collect(),
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         }
     }
 
     #[test]
     fn generates_valid_yaml_with_expected_keys() {
         let rows = vec![
-            row_from_entry(
+            record(
                 1,
                 entry(
                     Scheme::Vless,
@@ -234,8 +273,8 @@ mod tests {
                     ],
                 ),
             ),
-            row_from_entry(2, entry(Scheme::Ss, "aes-256-gcm:secret", &[])),
-            row_from_entry(
+            record(2, entry(Scheme::Ss, "aes-256-gcm:secret", &[])),
+            record(
                 3,
                 entry(
                     Scheme::Trojan,
@@ -243,9 +282,9 @@ mod tests {
                     &[("sni", "t.example.com"), ("type", "ws"), ("path", "/ws")],
                 ),
             ),
-            row_from_entry(4, entry(Scheme::Hysteria2, "hy-pass", &[])),
-            row_from_entry(5, entry(Scheme::Socks5, "user:pw", &[])),
-            row_from_entry(
+            record(4, entry(Scheme::Hysteria2, "hy-pass", &[])),
+            record(5, entry(Scheme::Socks5, "user:pw", &[])),
+            record(
                 6,
                 entry(
                     Scheme::Vmess,
@@ -255,7 +294,7 @@ mod tests {
             ),
         ];
 
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
+        let (yaml, _) = generate(&rows, false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies.len(), 6);
@@ -312,8 +351,8 @@ mod tests {
         assert!(!fumox_core::formats::clash::is_supported(Scheme::Mieru));
         assert!(!fumox_core::formats::clash::is_supported(Scheme::Naive));
 
-        let rows = vec![row_from_entry(9, entry(Scheme::Tuic, "c", &[]))];
-        let (yaml, included) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
+        let rows = vec![record(9, entry(Scheme::Tuic, "c", &[]))];
+        let (yaml, included) = generate(&rows, false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert!(parsed["proxies"].as_sequence().unwrap().is_empty());
         assert!(
@@ -322,22 +361,112 @@ mod tests {
         );
     }
 
-    /// T2 tunnels carry the proxy credential, so certificate verification
-    /// follows the entry's own setting instead of being forced off.
+    /// The engine refuses a config whose proxy carries no credential, so
+    /// the validator must name the missing field per scheme — and let an
+    /// anonymous socks5 (a valid spelling) and a complete ss entry pass.
     #[test]
-    fn skip_cert_verify_follows_the_entry_and_is_never_forced() {
+    fn required_field_problem_names_the_missing_credential() {
+        assert_eq!(
+            required_field_problem(&entry(Scheme::Vless, "", &[])),
+            Some("missing uuid")
+        );
+        assert_eq!(
+            required_field_problem(&entry(Scheme::Vmess, "  ", &[])),
+            Some("missing uuid")
+        );
+        assert_eq!(
+            required_field_problem(&entry(Scheme::Trojan, "", &[])),
+            Some("missing password")
+        );
+        assert_eq!(
+            required_field_problem(&entry(Scheme::Hysteria2, "", &[])),
+            Some("missing password")
+        );
+        // ss carries `cipher:password`; either half missing is malformed.
+        assert_eq!(
+            required_field_problem(&entry(Scheme::Ss, "aes-256-gcm:pw", &[])),
+            None
+        );
+        assert_eq!(
+            required_field_problem(&entry(Scheme::Ss, ":pw", &[])),
+            Some("missing cipher or password")
+        );
+        assert_eq!(
+            required_field_problem(&entry(Scheme::Ss, "noseparator", &[])),
+            Some("missing cipher or password")
+        );
+        // An anonymous socks5 is a valid node; a one-sided pair is not.
+        assert_eq!(
+            required_field_problem(&entry(Scheme::Socks5, "", &[])),
+            None
+        );
+        assert_eq!(
+            required_field_problem(&entry(Scheme::Socks5, "user:", &[])),
+            Some("missing username or password")
+        );
+    }
+
+    /// AnyTLS and Snell have mapping arms, so both reach the engine config
+    /// and `included`; a pinned AnyTLS entry renders the `sni` meow's
+    /// anytls parser reads beside the pinned IP: the name the certificate
+    /// is verified against travels along while the dial goes to the
+    /// vetted address.
+    #[test]
+    fn anytls_and_snell_are_included_and_a_pinned_anytls_keeps_its_server_name() {
+        assert!(fumox_core::formats::clash::is_supported(Scheme::AnyTls));
+        assert!(fumox_core::formats::clash::is_supported(Scheme::Snell));
+
         let rows = vec![
-            row_from_entry(
+            pinned(1, entry(Scheme::AnyTls, "pw", &[])),
+            record(2, entry(Scheme::Snell, "psk", &[])),
+        ];
+        let (yaml, included) = generate(&rows, false).unwrap();
+        assert_eq!(included, vec![1, 2]);
+        let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+        let proxies = parsed["proxies"].as_sequence().unwrap();
+        assert_eq!(proxies.len(), 2);
+
+        let anytls = &proxies[0];
+        assert_eq!(anytls["type"].as_str(), Some("anytls"));
+        assert_eq!(
+            anytls["server"].as_str(),
+            Some("203.0.113.10"),
+            "the record dials the vetted address"
+        );
+        assert_eq!(
+            anytls["sni"].as_str(),
+            Some("h.example.com"),
+            "the pre-pin host must survive as the server name: {yaml}"
+        );
+
+        assert_eq!(proxies[1]["type"].as_str(), Some("snell"));
+        assert_eq!(proxies[1]["psk"].as_str(), Some("psk"));
+    }
+
+    /// The insecure parameters (`insecure`, `allowInsecure`,
+    /// `allow_insecure`, `skip-cert-verify`) ride in from an untrusted
+    /// feed: T2 must not tunnel-test with verification off just because
+    /// the entry asked to, so the generator drops them and the config
+    /// carries no `skip-cert-verify` key at all.
+    #[test]
+    fn skip_cert_verify_is_not_carried_from_the_entry_params() {
+        let rows = vec![
+            record(
                 1,
                 entry(Scheme::Trojan, "pass", &[("sni", "t.example.com")]),
             ),
-            row_from_entry(2, entry(Scheme::Trojan, "pass", &[("insecure", "1")])),
-            row_from_entry(
+            record(2, entry(Scheme::Trojan, "pass", &[("insecure", "1")])),
+            record(
                 3,
                 entry(Scheme::Trojan, "pass", &[("skip-cert-verify", "true")]),
             ),
+            record(
+                4,
+                entry(Scheme::Trojan, "pass", &[("allowInsecure", "true")]),
+            ),
+            record(5, entry(Scheme::Trojan, "pass", &[("allow_insecure", "1")])),
         ];
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
+        let (yaml, _) = generate(&rows, false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
 
@@ -345,8 +474,12 @@ mod tests {
             proxies[0].get("skip-cert-verify").is_none(),
             "verification must stay on for an entry that did not ask to skip it"
         );
-        assert_eq!(proxies[1]["skip-cert-verify"].as_bool(), Some(true));
-        assert_eq!(proxies[2]["skip-cert-verify"].as_bool(), Some(true));
+        for (index, proxy) in proxies.iter().enumerate() {
+            assert!(
+                proxy.get("skip-cert-verify").is_none(),
+                "row {index} must not carry the feed's insecure toggle: {yaml}"
+            );
+        }
     }
 
     /// Single-row batch + pin map mapping the row's host to a vetted IP:
@@ -356,7 +489,7 @@ mod tests {
     /// `server`).
     #[test]
     fn generates_yaml_with_pinned_ip_overrides_server() {
-        let rows = vec![row_from_entry(
+        let rows = vec![pinned(
             1,
             entry(
                 Scheme::Vless,
@@ -364,13 +497,8 @@ mod tests {
                 &[("security", "tls"), ("sni", "real.example.com")],
             ),
         )];
-        let mut pins = std::collections::HashMap::new();
-        pins.insert(
-            "h.example.com".to_string(),
-            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
-        );
 
-        let (yaml, included) = generate(&rows, &pins, false).unwrap();
+        let (yaml, included) = generate(&rows, false).unwrap();
         assert_eq!(included, vec![1]);
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
@@ -378,39 +506,34 @@ mod tests {
         assert_eq!(proxy["servername"].as_str(), Some("real.example.com"));
     }
 
-    /// Empty pin map → `server` keeps the original hostname verbatim,
+    /// No vetted address → `server` keeps the original hostname verbatim,
     /// matching today's behavior for any operator who hasn't enabled T2
     /// IP pinning via the vetted-address path.
     #[test]
     fn generates_yaml_with_empty_pin_keeps_original_host() {
-        let rows = vec![row_from_entry(
+        let rows = vec![record(
             1,
             entry(Scheme::Trojan, "pass", &[("sni", "t.example.com")]),
         )];
-        let (yaml, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
+        let (yaml, _) = generate(&rows, false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
         assert_eq!(proxy["server"].as_str(), Some("h.example.com"));
     }
 
-    /// Two rows sharing a hostname with one pin map entry → both YAML
-    /// entries use the pinned IP. This is the documented overwrite
-    /// semantic: the probe batch is already id-deduplicated upstream, so
-    /// two rows sharing a hostname is by definition the same operator
-    /// intent for the same vetted IP.
+    /// Two rows sharing a hostname → both YAML entries use the same vetted
+    /// address: the calling layer resolves one address per host per cycle,
+    /// and the probe batch is already id-deduplicated upstream, so two
+    /// rows sharing a hostname is by definition the same operator intent
+    /// for the same vetted IP.
     #[test]
     fn two_rows_same_host_use_the_same_pin() {
         let rows = vec![
-            row_from_entry(1, entry(Scheme::Vless, "uuid-1", &[])),
-            row_from_entry(2, entry(Scheme::Trojan, "pw", &[])),
+            pinned(1, entry(Scheme::Vless, "uuid-1", &[])),
+            pinned(2, entry(Scheme::Trojan, "pw", &[])),
         ];
-        let mut pins = std::collections::HashMap::new();
-        pins.insert(
-            "h.example.com".to_string(),
-            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
-        );
 
-        let (yaml, _) = generate(&rows, &pins, false).unwrap();
+        let (yaml, _) = generate(&rows, false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
         assert_eq!(proxies[0]["server"].as_str(), Some("203.0.113.10"));
@@ -426,18 +549,13 @@ mod tests {
     #[test]
     fn pinning_keeps_a_tls_server_name_for_a_bare_entry() {
         let rows = vec![
-            row_from_entry(1, entry(Scheme::Trojan, "pass", &[])),
-            row_from_entry(2, entry(Scheme::Vless, "uuid", &[("security", "tls")])),
-            row_from_entry(3, entry(Scheme::Vmess, "uuid", &[("security", "tls")])),
-            row_from_entry(4, entry(Scheme::Hysteria2, "pw", &[])),
+            pinned(1, entry(Scheme::Trojan, "pass", &[])),
+            pinned(2, entry(Scheme::Vless, "uuid", &[("security", "tls")])),
+            pinned(3, entry(Scheme::Vmess, "uuid", &[("security", "tls")])),
+            pinned(4, entry(Scheme::Hysteria2, "pw", &[])),
         ];
-        let mut pins = std::collections::HashMap::new();
-        pins.insert(
-            "h.example.com".to_string(),
-            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
-        );
 
-        let (yaml, included) = generate(&rows, &pins, false).unwrap();
+        let (yaml, included) = generate(&rows, false).unwrap();
         assert_eq!(included, vec![1, 2, 3, 4]);
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxies = parsed["proxies"].as_sequence().unwrap();
@@ -504,21 +622,19 @@ mod tests {
             (Scheme::Trojan, vec![("sni", "sni.example.com")], "sni"),
         ];
 
-        let rows: Vec<ProxyRow> = cases
+        let plain: Vec<BatchRow> = cases
             .iter()
             .enumerate()
-            .map(|(i, (scheme, params, _))| {
-                row_from_entry(i as i64 + 1, entry(*scheme, "c", params))
-            })
+            .map(|(i, (scheme, params, _))| record(i as i64 + 1, entry(*scheme, "c", params)))
             .collect();
-        let mut pins = std::collections::HashMap::new();
-        pins.insert(
-            "h.example.com".to_string(),
-            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
-        );
+        let pinned_rows: Vec<BatchRow> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (scheme, params, _))| pinned(i as i64 + 1, entry(*scheme, "c", params)))
+            .collect();
 
-        let (plain, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
-        let (pinned, _) = generate(&rows, &pins, false).unwrap();
+        let (plain, _) = generate(&plain, false).unwrap();
+        let (pinned, _) = generate(&pinned_rows, false).unwrap();
         let plain: serde_norway::Value = serde_norway::from_str(&plain).unwrap();
         let pinned: serde_norway::Value = serde_norway::from_str(&pinned).unwrap();
         let plain = plain["proxies"].as_sequence().unwrap();
@@ -551,12 +667,12 @@ mod tests {
     /// This is the exception [`carry_server_name`] documents.
     #[test]
     fn pinning_supplies_a_sni_the_mapping_would_drop() {
-        let rows = vec![
-            row_from_entry(
+        let plain = vec![
+            record(
                 1,
                 entry(Scheme::Trojan, "pass", &[("servername", "cdn.example.com")]),
             ),
-            row_from_entry(
+            record(
                 2,
                 entry(
                     Scheme::Hysteria2,
@@ -565,14 +681,23 @@ mod tests {
                 ),
             ),
         ];
-        let mut pins = std::collections::HashMap::new();
-        pins.insert(
-            "h.example.com".to_string(),
-            "203.0.113.10".parse::<std::net::IpAddr>().unwrap(),
-        );
+        let pinned_rows = vec![
+            pinned(
+                1,
+                entry(Scheme::Trojan, "pass", &[("servername", "cdn.example.com")]),
+            ),
+            pinned(
+                2,
+                entry(
+                    Scheme::Hysteria2,
+                    "pw",
+                    &[("servername", "cdn.example.com")],
+                ),
+            ),
+        ];
 
-        let (plain, _) = generate(&rows, &std::collections::HashMap::new(), false).unwrap();
-        let (pinned, _) = generate(&rows, &pins, false).unwrap();
+        let (plain, _) = generate(&plain, false).unwrap();
+        let (pinned, _) = generate(&pinned_rows, false).unwrap();
         let plain: serde_norway::Value = serde_norway::from_str(&plain).unwrap();
         let pinned: serde_norway::Value = serde_norway::from_str(&pinned).unwrap();
         let plain = plain["proxies"].as_sequence().unwrap();
@@ -594,16 +719,64 @@ mod tests {
     /// serialized exactly as it was.
     #[test]
     fn pinning_an_ip_literal_host_does_not_invent_a_server_name() {
-        let mut row = row_from_entry(1, entry(Scheme::Trojan, "pass", &[]));
-        row.host = "203.0.113.10".into();
-        let mut pins = std::collections::HashMap::new();
-        pins.insert("203.0.113.10".to_string(), "203.0.113.10".parse().unwrap());
+        let mut ip_entry = entry(Scheme::Trojan, "pass", &[]);
+        ip_entry.host = "203.0.113.10".into();
+        let rows = vec![pinned(1, ip_entry)];
 
-        let (yaml, _) = generate(&[row], &pins, false).unwrap();
+        let (yaml, _) = generate(&rows, false).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         let proxy = &parsed["proxies"].as_sequence().unwrap()[0];
         assert_eq!(proxy["server"].as_str(), Some("203.0.113.10"));
         assert!(proxy.get("sni").is_none(), "{yaml}");
+    }
+
+    /// A pinned entry that does not negotiate TLS must not grow a server
+    /// name: a carried `servername` is an SNI to the shared predicate, so
+    /// the pin would flip a plain-TCP vless/vmess to a TLS node and the
+    /// T2 check would tunnel-test a plaintext proxy as TLS. The decision
+    /// is `params::wants_tls`, the same one `t1::check_kind` asks; an
+    /// entry that really negotiates TLS keeps its `servername`.
+    #[test]
+    fn pinning_a_plain_tcp_entry_does_not_invent_a_server_name() {
+        let rows = vec![
+            pinned(1, entry(Scheme::Vless, "uuid", &[("security", "none")])),
+            pinned(2, entry(Scheme::Vless, "uuid", &[])),
+            pinned(3, entry(Scheme::Vmess, "uuid", &[("tls", "false")])),
+            pinned(
+                4,
+                entry(
+                    Scheme::Vless,
+                    "uuid",
+                    &[("security", "tls"), ("sni", "s.example.com")],
+                ),
+            ),
+        ];
+
+        let (yaml, _) = generate(&rows, false).unwrap();
+        let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+        let proxies = parsed["proxies"].as_sequence().unwrap();
+        for (index, proxy) in proxies.iter().enumerate().take(3) {
+            assert_eq!(
+                proxy["server"].as_str(),
+                Some("203.0.113.10"),
+                "row {index} is pinned"
+            );
+            assert_eq!(
+                proxy.get("tls"),
+                None,
+                "row {index} must stay plain TCP: {yaml}"
+            );
+            assert!(
+                proxy.get("servername").is_none() && proxy.get("sni").is_none(),
+                "row {index} must not grow a server name: {yaml}"
+            );
+        }
+        assert_eq!(proxies[3]["tls"].as_bool(), Some(true));
+        assert_eq!(
+            proxies[3]["servername"].as_str(),
+            Some("s.example.com"),
+            "a TLS entry keeps its server name: {yaml}"
+        );
     }
 
     /// `ipv6` rides into the rendered config: meow-rs 0.22.0 made the key
@@ -611,11 +784,10 @@ mod tests {
     /// "IPv4 only" no matter what `[meow].ipv6` says.
     #[test]
     fn ipv6_flag_is_rendered_explicitly() {
-        let rows = vec![row_from_entry(7, entry(Scheme::Vless, "uuid-7", &[]))];
-        let pins = std::collections::HashMap::new();
+        let rows = vec![record(7, entry(Scheme::Vless, "uuid-7", &[]))];
 
-        let (off, _) = generate(&rows, &pins, false).unwrap();
-        let (on, _) = generate(&rows, &pins, true).unwrap();
+        let (off, _) = generate(&rows, false).unwrap();
+        let (on, _) = generate(&rows, true).unwrap();
         let off: serde_norway::Value = serde_norway::from_str(&off).unwrap();
         let on: serde_norway::Value = serde_norway::from_str(&on).unwrap();
 

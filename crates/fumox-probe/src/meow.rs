@@ -1,9 +1,11 @@
 //! meow-rs REST client for T2 checks.
 //!
-//! meow-rs runs as a separate system service; the probe only reloads its
-//! config (`PUT /configs`) and asks for per-proxy delay measurements
-//! (`GET /proxies/{name}/delay`). Unavailability is reported, never fatal:
-//! the daemon skips T2 with backoff and keeps running T1.
+//! meow-rs runs as a separate system service; the probe talks to its REST
+//! API at four endpoints: `GET /version` (liveness), `PUT /configs` (hot
+//! reload of the generated Clash YAML), `GET /proxies/{name}/delay` (the
+//! tunnel check itself) and `GET /memory` (the kernel's RSS feed for the
+//! admin card). Unavailability is reported, never fatal: the daemon skips
+//! T2 with backoff and keeps running T1.
 //!
 //! The client draws one line and keeps it: a *verdict about the proxy*
 //! (`ProxyFailed`) may be charged to the proxy's fail budget, a *fault of
@@ -82,6 +84,14 @@ enum ControllerScope {
 /// token (see [`MeowClient::new`]).
 fn vet_api_addr(addr: &str) -> Result<(String, u16, ControllerScope), String> {
     let trimmed = addr.trim();
+    // The client prepends its own scheme when it dials the controller, so
+    // a value that carries one would produce a broken authority like
+    // `http://http://127.0.0.1:9090`; the config field is `host:port`.
+    if trimmed.contains("://") {
+        return Err(format!(
+            "meow.api_addr {addr:?} must be host:port without a scheme"
+        ));
+    }
     if trimmed.parse::<IpAddr>().is_ok() {
         return Err(format!(
             "meow.api_addr {addr:?} is an address without a port, expected host:port"
@@ -165,6 +175,41 @@ fn is_tunnel_verdict(status: u16, message: &str) -> bool {
     }
 }
 
+/// Upper bound of a controller body the probe buffers: every endpoint
+/// answers a small JSON document (or a short error detail), so a bigger
+/// body is a malfunction — or an impersonator — and is rejected instead
+/// of being read into memory.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Read a controller body under [`MAX_BODY_BYTES`]: the content length is
+/// checked before the first byte, and a chunked body is rejected the
+/// moment it passes the cap, so an oversized (or lying) answer is never
+/// buffered whole.
+async fn read_body_capped(response: reqwest::Response, what: &str) -> Result<String, String> {
+    if let Some(len) = response.content_length()
+        && len > MAX_BODY_BYTES as u64
+    {
+        return Err(format!(
+            "{what} body of {len} bytes exceeds the {MAX_BODY_BYTES}-byte read cap"
+        ));
+    }
+    let mut response = response;
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("{what} read failed: {e}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+            return Err(format!(
+                "{what} body exceeds the {MAX_BODY_BYTES}-byte read cap"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|e| format!("{what} body is not UTF-8: {e}"))
+}
+
 impl MeowClient {
     /// Build the client for the configured controller.
     ///
@@ -186,30 +231,28 @@ impl MeowClient {
             ));
         }
         let timeout = Duration::from_secs(config.timeout_secs.max(1));
+        // One client, built exactly once: a builder failure is a startup
+        // error to report, not something to paper over with a silently
+        // rebuilt fallback.
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(timeout)
+            // The controller is a loopback or private-network service,
+            // vetted at startup, so ambient `HTTP(S)_PROXY` variables must
+            // not reroute this traffic: the proxy would intercept requests
+            // meant for the kernel and receive its bearer token.
+            .no_proxy()
+            // A redirect would carry the bearer token to whoever the
+            // controller points at: the controller answers, it does not
+            // redirect.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("cannot build the meow-rs HTTP client: {e}"))?;
         Ok(Self {
-            // Client-level timeouts as a floor: every call below also sets a
+            // Client-level timeout as a floor: every call below also sets a
             // per-request timeout (which takes precedence), but a future one
             // that forgets to would otherwise hang forever.
-            http: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(timeout)
-                // A redirect would carry the bearer token to whoever the
-                // controller points at: the controller answers, it does not
-                // redirect.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap_or_else(|_| {
-                    // The builder above cannot fail with static settings,
-                    // but a plain `Client::new()` fallback would defeat the
-                    // whole timeout floor, carry the timeouts and the
-                    // redirect policy into the fallback too.
-                    reqwest::Client::builder()
-                        .connect_timeout(Duration::from_secs(5))
-                        .timeout(timeout)
-                        .redirect(reqwest::redirect::Policy::none())
-                        .build()
-                        .expect("fallback client uses the same static, valid settings")
-                }),
+            http,
             base_url: format!("http://{}", format_host_port(&host, port)),
             test_urls: config.test_url.clone(),
             timeout,
@@ -346,8 +389,10 @@ impl MeowClient {
     /// `GET /memory`, the proxy kernel's own RSS reading.
     ///
     /// Not a JSON document but an endless newline-delimited feed, whose
-    /// first frame is a hardcoded zero placeholder. Real numbers start one
-    /// frame later, so the first is dropped rather than shown as "0 bytes".
+    /// first frame is a hardcoded zero placeholder. Frames are read until
+    /// one reports a non-zero `inuse` (within the same deadline), so the
+    /// placeholder never shows as "0 bytes"; a frame without the field is
+    /// an error, not a zero reading.
     pub async fn memory(&self) -> Result<MeowMemory, String> {
         // The feed never ends, so the request cannot finish on time: its
         // timeout is a backstop well above the per-frame deadline, and
@@ -366,32 +411,44 @@ impl MeowClient {
 
         // The feed never ends, so read frames until one is a real sample.
         let mut buf = Vec::new();
-        let deadline = frame_deadline;
-        let mut seen = 0usize;
-        while seen < 2 {
-            let chunk = tokio::time::timeout(deadline, response.chunk())
+        let started = std::time::Instant::now();
+        loop {
+            // A wall-clock bound of the whole read: a feed that answers
+            // on time but never leaves the zero placeholder would
+            // otherwise hold the request frame after frame forever.
+            if started.elapsed() >= frame_deadline {
+                return Err("meow-rs /memory feed stalled before a sample".into());
+            }
+            let chunk = tokio::time::timeout(frame_deadline, response.chunk())
                 .await
                 .map_err(|_| "meow-rs /memory feed stalled before a sample".to_string())?
                 .map_err(|e| format!("meow-rs /memory read failed: {e}"))?
                 .ok_or_else(|| "meow-rs /memory feed closed early".to_string())?;
             buf.extend_from_slice(&chunk);
+            // A frame is a small JSON document; a buffer that grows past
+            // the cap is not the feed it claims to be.
+            if buf.len() > MAX_BODY_BYTES {
+                return Err("meow-rs /memory frame exceeds the read cap".into());
+            }
             while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
-                seen += 1;
-                if seen < 2 {
-                    // Frame 1 is the zero placeholder, keep reading.
-                    continue;
-                }
                 let text = String::from_utf8_lossy(&line);
                 let frame: serde_json::Value = serde_json::from_str(text.trim())
                     .map_err(|e| format!("bad /memory frame: {e}"))?;
+                let Some(inuse) = frame.get("inuse").and_then(|v| v.as_u64()) else {
+                    return Err("meow-rs /memory frame has no inuse field".into());
+                };
+                if inuse == 0 {
+                    // The zero placeholder, or a kernel that has not
+                    // accounted anything yet: keep reading.
+                    continue;
+                }
                 return Ok(MeowMemory {
-                    rss_bytes: frame.get("inuse").and_then(|v| v.as_u64()).unwrap_or(0),
+                    rss_bytes: inuse,
                     os_limit_bytes: frame.get("oslimit").and_then(|v| v.as_u64()).unwrap_or(0),
                 });
             }
         }
-        Err("meow-rs /memory feed produced no sample".into())
     }
 
     /// `PUT /configs`, hot-reload the generated Clash YAML without
@@ -408,7 +465,11 @@ impl MeowClient {
             return Ok(());
         }
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        // The body is an error detail, not a document to trust: it is
+        // read under the same cap as every other controller answer.
+        let body = read_body_capped(response, "PUT /configs")
+            .await
+            .unwrap_or_else(|error| error);
         Err(format!("PUT /configs returned {status}: {body}"))
     }
 
@@ -440,10 +501,28 @@ impl MeowClient {
             Err(e) => return DelayOutcome::ServiceUnavailable(format!("transport error: {e}")),
         };
 
+        // The body is read after the status and under the shared cap: the
+        // endpoint answers a small JSON verdict, so a bigger body is an
+        // engine malfunction, not something to buffer.
         let status = response.status();
-        let body: serde_json::Value = match response.json().await {
+        let text = match read_body_capped(response, "delay").await {
+            Ok(text) => text,
+            Err(error) => return DelayOutcome::ServiceUnavailable(error),
+        };
+        let body: serde_json::Value = match serde_json::from_str(text.trim()) {
             Ok(body) => body,
-            Err(e) => return DelayOutcome::ServiceUnavailable(format!("bad delay payload: {e}")),
+            // A body that is not JSON still carries a verdict when the
+            // status is one (a 503/504 tunnel failure, or a 400 that
+            // names a fault of the proxy): the raw text becomes the
+            // message and the proxy is charged. Any other status stays
+            // an engine fault.
+            Err(_) => {
+                let message = text.trim();
+                if is_tunnel_verdict(status.as_u16(), message) {
+                    return DelayOutcome::ProxyFailed(format!("{status}: {message}"));
+                }
+                return DelayOutcome::ServiceUnavailable(format!("bad delay payload: {text}"));
+            }
         };
 
         if status.is_success() {
@@ -510,17 +589,29 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Stand up a mock meow-rs REST API on an ephemeral port. Captures the
-    /// `url` query parameter of every delay request for rotation asserts.
+    /// Bind and serve a mock app on an ephemeral loopback port; the
+    /// address string is the `meow.api_addr` of a client config.
+    async fn spawn_mock(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    /// Stand up a mock meow-rs REST API on an ephemeral port. Captures
+    /// both query parameters (`url` and `timeout`) of every delay request
+    /// for rotation and timeout asserts.
     async fn mock_api(
         reloads: Arc<AtomicUsize>,
     ) -> (
         String,
         fumox_core::config::MeowConfig,
-        Arc<std::sync::Mutex<HashSet<String>>>,
+        Arc<std::sync::Mutex<HashMap<String, String>>>,
     ) {
-        let seen_test_urls: Arc<std::sync::Mutex<HashSet<String>>> = Arc::default();
-        let capture = seen_test_urls.clone();
+        let seen_params: Arc<std::sync::Mutex<HashMap<String, String>>> = Arc::default();
+        let capture = seen_params.clone();
         let app = Router::new()
             .route(
                 "/version",
@@ -557,8 +648,10 @@ mod tests {
                           Query(query): Query<HashMap<String, String>>| {
                         let capture = capture.clone();
                         async move {
-                            if let Some(url) = query.get("url") {
-                                capture.lock().unwrap().insert(url.clone());
+                            // Both parameters are part of the contract
+                            // with the engine, not only the test URL.
+                            for (key, value) in query {
+                                capture.lock().unwrap().insert(key, value);
                             }
                             match name.as_str() {
                                 "fumox-1" => (
@@ -579,29 +672,21 @@ mod tests {
                 ),
             );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
+        let addr = spawn_mock(app).await;
         let config = MeowConfig {
-            api_addr: addr.to_string(),
-            api_token: String::new(),
-            config_path: std::env::temp_dir().join("fumox-meow-test.yaml"),
-            test_url: vec!["http://cp.cloudflare.com".to_string()],
+            api_addr: addr.clone(),
+            // The delay request must carry this timeout in milliseconds
+            // (see `ping_reload_and_delay_outcomes`).
             timeout_secs: 5,
-            backoff_initial_secs: 60,
-            backoff_max_secs: 900,
-            ipv6: false,
+            ..Default::default()
         };
-        (addr.to_string(), config, seen_test_urls)
+        (addr, config, seen_params)
     }
 
     #[tokio::test]
     async fn ping_reload_and_delay_outcomes() {
         let reloads = Arc::new(AtomicUsize::new(0));
-        let (_addr, config, _seen) = mock_api(reloads.clone()).await;
+        let (_addr, config, seen) = mock_api(reloads.clone()).await;
         let client = MeowClient::new(&config).unwrap();
 
         assert_eq!(client.ping().await.unwrap(), "mock-0.20");
@@ -630,6 +715,20 @@ mod tests {
             DelayOutcome::ServiceUnavailable(_) => {}
             other => panic!("expected ServiceUnavailable, got {other:?}"),
         }
+
+        // The delay request carries the configured timeout in
+        // milliseconds: the engine applies it to its own tunnel test.
+        let params = seen.lock().unwrap().clone();
+        let expected_ms = (config.timeout_secs * 1000).to_string();
+        assert_eq!(
+            params.get("timeout"),
+            Some(&expected_ms),
+            "the delay request must carry the configured timeout"
+        );
+        assert_eq!(
+            params.get("url").map(String::as_str),
+            Some("http://cp.cloudflare.com"),
+        );
     }
 
     /// The `Authorization` header of a request, as the controller sees it.
@@ -686,21 +785,11 @@ mod tests {
                 }),
             );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
+        let addr = spawn_mock(app).await;
         let config = MeowConfig {
-            api_addr: addr.to_string(),
+            api_addr: addr,
             api_token: "s3cr3t".to_string(),
-            config_path: std::env::temp_dir().join("fumox-meow-auth.yaml"),
-            test_url: vec!["https://www.gstatic.com/generate_204".to_string()],
-            timeout_secs: 5,
-            backoff_initial_secs: 60,
-            backoff_max_secs: 900,
-            ipv6: false,
+            ..Default::default()
         };
 
         let client = MeowClient::new(&config).unwrap();
@@ -745,13 +834,10 @@ mod tests {
         let config = MeowConfig {
             // Nothing listens here.
             api_addr: "127.0.0.1:1".into(),
-            api_token: String::new(),
-            config_path: std::env::temp_dir().join("fumox-meow-test.yaml"),
-            test_url: vec!["http://cp.cloudflare.com".to_string()],
+            // Keep the timeouts short: the test only exercises the
+            // transport-failure path.
             timeout_secs: 2,
-            backoff_initial_secs: 60,
-            backoff_max_secs: 900,
-            ipv6: false,
+            ..Default::default()
         };
         let client = MeowClient::new(&config).unwrap();
         assert!(client.ping().await.is_err());
@@ -782,7 +868,8 @@ mod tests {
             client.check_delay("fumox-1", &cycle_url).await,
             DelayOutcome::Ok(_)
         ));
-        assert_eq!(*seen.lock().unwrap(), HashSet::from([cycle_url]));
+        let params = seen.lock().unwrap().clone();
+        assert_eq!(params.get("url"), Some(&cycle_url));
     }
 
     #[test]
@@ -838,20 +925,10 @@ mod tests {
                     }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let addr = spawn_mock(app).await;
         let config = MeowConfig {
             api_addr: addr,
-            api_token: String::new(),
-            config_path: std::env::temp_dir().join("fumox-meow-retry.yaml"),
-            test_url: vec!["http://cp.cloudflare.com".to_string()],
-            timeout_secs: 5,
-            backoff_initial_secs: 60,
-            backoff_max_secs: 900,
-            ipv6: false,
+            ..Default::default()
         };
         let client = MeowClient::new(&config).unwrap();
         // Two attempts, 50ms between, first fails, second succeeds.
@@ -896,20 +973,10 @@ mod tests {
                     }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let addr = spawn_mock(app).await;
         let config = MeowConfig {
             api_addr: addr,
-            api_token: String::new(),
-            config_path: std::env::temp_dir().join("fumox-meow-retry.yaml"),
-            test_url: vec!["http://cp.cloudflare.com".to_string()],
-            timeout_secs: 5,
-            backoff_initial_secs: 60,
-            backoff_max_secs: 900,
-            ipv6: false,
+            ..Default::default()
         };
         let client = MeowClient::new(&config).unwrap();
         match client
@@ -975,20 +1042,10 @@ mod tests {
                         }
                     }),
                 );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap().to_string();
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
+            let addr = spawn_mock(app).await;
             let config = MeowConfig {
                 api_addr: addr,
-                api_token: String::new(),
-                config_path: std::env::temp_dir().join("fumox-meow-probefail.yaml"),
-                test_url: vec!["http://cp.cloudflare.com".to_string()],
-                timeout_secs: 5,
-                backoff_initial_secs: 60,
-                backoff_max_secs: 900,
-                ipv6: false,
+                ..Default::default()
             };
             let client = MeowClient::new(&config).unwrap();
 
@@ -1024,6 +1081,36 @@ mod tests {
         }
     }
 
+    /// A tunnel verdict spelled in plain text (a 503 whose body is not
+    /// JSON) is still a verdict about the proxy: the raw text becomes the
+    /// message and the proxy is charged. Reading the body before the
+    /// status used to file it as an engine outage (`ServiceUnavailable`)
+    /// and abort the whole batch over one dead tunnel.
+    #[tokio::test]
+    async fn a_non_json_tunnel_verdict_still_charges_the_proxy() {
+        for (status, label) in [
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "503"),
+            (axum::http::StatusCode::GATEWAY_TIMEOUT, "504"),
+        ] {
+            let app = Router::new().route(
+                "/proxies/{name}/delay",
+                get(move || async move { (status, "An error occurred in the delay test") }),
+            );
+            let addr = spawn_mock(app).await;
+            let client = MeowClient::new(&meow_config(&addr, "")).unwrap();
+            match client
+                .check_delay("fumox-dead", "http://cp.cloudflare.com")
+                .await
+            {
+                DelayOutcome::ProxyFailed(msg) => {
+                    assert!(msg.starts_with(label), "{label}: {msg}");
+                    assert!(msg.contains("delay test"), "{label}: {msg}");
+                }
+                other => panic!("{label} with a plain-text body must be a verdict, got {other:?}"),
+            }
+        }
+    }
+
     /// A status meow never uses for a probe result is engine trouble, and
     /// must still reach the retry/abort path.
     #[tokio::test]
@@ -1043,20 +1130,10 @@ mod tests {
                     )
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let addr = spawn_mock(app).await;
         let config = MeowConfig {
             api_addr: addr,
-            api_token: String::new(),
-            config_path: std::env::temp_dir().join("fumox-meow-boom.yaml"),
-            test_url: vec!["http://cp.cloudflare.com".to_string()],
-            timeout_secs: 5,
-            backoff_initial_secs: 60,
-            backoff_max_secs: 900,
-            ipv6: false,
+            ..Default::default()
         };
         let client = MeowClient::new(&config).unwrap();
         match client
@@ -1068,17 +1145,14 @@ mod tests {
         }
     }
 
-    /// A config with the given controller address and token.
+    /// A config with the given controller address and token. The timeout
+    /// stays pinned: the /memory tests derive their deadlines from it.
     fn meow_config(api_addr: &str, api_token: &str) -> MeowConfig {
         MeowConfig {
             api_addr: api_addr.to_string(),
             api_token: api_token.to_string(),
-            config_path: std::env::temp_dir().join("fumox-meow-validation.yaml"),
-            test_url: vec!["http://cp.cloudflare.com".to_string()],
             timeout_secs: 5,
-            backoff_initial_secs: 60,
-            backoff_max_secs: 900,
-            ipv6: false,
+            ..Default::default()
         }
     }
 
@@ -1134,6 +1208,40 @@ mod tests {
             let error = client_error(&meow_config(addr, "s3cr3t"));
             assert!(error.contains("meow.api_addr"), "{addr}: {error}");
         }
+    }
+
+    /// The client prepends its own scheme when it dials the controller,
+    /// so a configured `http://…` value would produce a broken authority;
+    /// the config field is `host:port` and nothing else.
+    #[tokio::test]
+    async fn an_api_addr_with_a_scheme_is_refused() {
+        let error = client_error(&meow_config("http://127.0.0.1:9090", "s3cr3t"));
+        assert!(error.contains("host:port without a scheme"), "{error}");
+        // The same address without the scheme is accepted.
+        assert!(MeowClient::new(&meow_config("127.0.0.1:9090", "s3cr3t")).is_ok());
+    }
+
+    /// A controller body is an error detail, not a document to buffer: an
+    /// oversized `PUT /configs` answer is rejected at the cap instead of
+    /// being read into memory whole.
+    #[tokio::test]
+    async fn an_oversized_configs_body_is_rejected() {
+        let app = Router::new().route(
+            "/configs",
+            put(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "x".repeat(200_000),
+                )
+            }),
+        );
+        let addr = spawn_mock(app).await;
+        let client = MeowClient::new(&meow_config(&addr, "")).unwrap();
+        let error = client
+            .reload_config(std::path::Path::new("/tmp/fumox-meow.yaml"))
+            .await
+            .expect_err("an oversized body must be rejected");
+        assert!(error.contains("exceeds the"), "{error}");
     }
 
     /// Only a verdict about the proxy may be charged to it: 503 and 504
@@ -1255,14 +1363,8 @@ mod tests {
                     }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let mut config = meow_config(&addr, "");
-        config.config_path = std::env::temp_dir().join("fumox-meow-delay.yaml");
-        MeowClient::new(&config).unwrap()
+        let addr = spawn_mock(app).await;
+        MeowClient::new(&meow_config(&addr, "")).unwrap()
     }
 
     /// A client whose delay endpoint answers 200 with a fixed body.
@@ -1277,27 +1379,15 @@ mod tests {
                 "/proxies/{name}/delay",
                 get(move || async move { (axum::http::StatusCode::OK, body) }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let mut config = meow_config(&addr, "");
-        config.config_path = std::env::temp_dir().join("fumox-meow-body.yaml");
-        MeowClient::new(&config).unwrap()
+        let addr = spawn_mock(app).await;
+        MeowClient::new(&meow_config(&addr, "")).unwrap()
     }
 
     /// A client whose `/version` answers with a fixed status and body.
     async fn version_client(status: axum::http::StatusCode, body: &'static str) -> MeowClient {
         let app = Router::new().route("/version", get(move || async move { (status, body) }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let mut config = meow_config(&addr, "");
-        config.config_path = std::env::temp_dir().join("fumox-meow-version.yaml");
-        MeowClient::new(&config).unwrap()
+        let addr = spawn_mock(app).await;
+        MeowClient::new(&meow_config(&addr, "")).unwrap()
     }
 
     /// A raw `/memory` feed: the given chunks are written with chunked
@@ -1394,5 +1484,26 @@ mod tests {
         let mem = client.memory().await.expect("memory sample");
         assert_eq!(mem.rss_bytes, 25_780_224);
         assert_eq!(mem.os_limit_bytes, 2_147_483_648);
+    }
+
+    /// A frame without the `inuse` field is a feed the probe does not
+    /// understand: an error, never a reading of "0 bytes".
+    #[tokio::test]
+    async fn a_memory_frame_without_inuse_is_an_error() {
+        let addr = memory_feed_server(vec![b"{\"oslimit\":0}\n".to_vec()], true).await;
+        let client = memory_client(&addr);
+        let error = client.memory().await.expect_err("no inuse field");
+        assert!(error.contains("no inuse field"), "{error}");
+    }
+
+    /// A frame bigger than the read cap is not the feed it claims to be:
+    /// the reading stops at the cap instead of buffering the body whole.
+    #[tokio::test]
+    async fn an_oversized_memory_frame_is_rejected() {
+        let oversized = vec![b'x'; 70_000];
+        let addr = memory_feed_server(vec![oversized], true).await;
+        let client = memory_client(&addr);
+        let error = client.memory().await.expect_err("an oversized frame");
+        assert!(error.contains("exceeds the read cap"), "{error}");
     }
 }

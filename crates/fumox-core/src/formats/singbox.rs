@@ -5,23 +5,44 @@
 //! `{"outbounds": []}` document.
 //! Outbound tags must be unique, so duplicate names get the same « (2)»
 //! suffixes as Clash output.
+//!
+//! The supported schemes are vless, vmess, trojan, ss (shadowsocks),
+//! hysteria2 and socks5. snell/anytls remain Clash-only — sing-box has no
+//! outbound types for them, and guessing a field layout would hand it a
+//! config it cannot start.
+//!
+//! Input fields travel under both spellings where feeds differ (`aid`
+//! beside `alterId`, `scy` beside `cipher`, the URI `type` beside the
+//! mihomo `network`); the inline comments at each read name them.
 
 use crate::models::{ProxyEntry, Scheme};
 use crate::params::Blocks;
 use serde_json::{Map, Value};
 
-/// Schemes with a sing-box counterpart used by Fumox; everything else is
-/// skipped in output (log-and-skip principle, never fatal).
+/// Schemes with a sing-box counterpart; everything else is skipped in
+/// output (log-and-skip principle, never fatal).
+///
+/// The mapping below is the authority: this asks it instead of keeping a
+/// second list of schemes, so the query and the mapping cannot drift
+/// apart. A caller that already holds an entry can simply ask the mapping
+/// itself — a `None` means "no sing-box counterpart".
 pub fn is_supported(scheme: Scheme) -> bool {
-    matches!(
+    entry_to_outbound_named(&bare_entry(scheme), "").is_some()
+}
+
+/// An entry that carries nothing but a scheme, for the support question.
+fn bare_entry(scheme: Scheme) -> ProxyEntry {
+    ProxyEntry {
         scheme,
-        Scheme::Vless
-            | Scheme::Vmess
-            | Scheme::Trojan
-            | Scheme::Ss
-            | Scheme::Hysteria2
-            | Scheme::Socks5
-    )
+        name: String::new(),
+        host: String::new(),
+        port: 0,
+        credential: String::new(),
+        params: Vec::new(),
+        raw_path: String::new(),
+        raw_line: String::new(),
+        canonical: None,
+    }
 }
 
 /// Map one entry onto a sing-box outbound using its own name as the tag.
@@ -69,14 +90,9 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
                 .or_else(|| super::param_value(entry, "cipher"))
                 .unwrap_or_else(|| "auto".into());
             m.insert("security".into(), Value::String(cipher));
-            let alter_id = super::param_value(entry, "aid")
-                .or_else(|| super::param_value(entry, "alterId"))
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            // `as u16` silently truncated (aid=65536 became 0) while the
-            // Clash encoder parses the same field as i64, so the two outputs
-            // disagreed for one proxy.
-            m.insert("alter_id".into(), unsigned(alter_id));
+            // One shared reader, one type (u64, a negative value is 0) for
+            // both encoders.
+            m.insert("alter_id".into(), unsigned(super::alter_id(entry)));
             // vmess JSON spells TLS as `tls: "tls"`; Clash input uses the
             // boolean `tls: true`; some feeds spell it `security=tls`.
             if crate::params::wants_tls(entry, &blocks)
@@ -109,11 +125,10 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
             m.insert("type".into(), Value::String("shadowsocks".into()));
             m.insert("server".into(), Value::String(entry.host.clone()));
             m.insert("server_port".into(), num(entry.port));
-            // Credential is stored as "method:password".
-            let (method, password) = entry
-                .credential
-                .split_once(':')
-                .unwrap_or(("chacha20-ietf-poly1305", &entry.credential));
+            // Credential is stored as "method:password"; the shared splitter
+            // owns the missing/empty-method fallback (see `parsers::clash`
+            // `SS_SPEC` for the parse-time canonicalization).
+            let (method, password) = super::split_ss_credential(&entry.credential);
             m.insert("method".into(), Value::String(method.to_string()));
             m.insert("password".into(), Value::String(password.to_string()));
             // SIP003 plugin: sing-box takes the raw plugin name and the
@@ -149,6 +164,11 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
                 }
                 m.insert("obfs".into(), Value::Object(o));
             }
+            // sing-box wants integer rates: the non-digit tail of e.g.
+            // "50 Mbps" is trimmed off, and a value left unparseable is
+            // dropped entirely instead of shipping a config sing-box
+            // rejects. The Clash writer copies the same fields through
+            // verbatim (see the `Hysteria2` arm of `entry_to_clash_named`).
             for (out_key, keys) in [
                 ("up_mbps", ["upMbps", "up"]),
                 ("down_mbps", ["downMbps", "down"]),
@@ -171,14 +191,15 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
             m.insert("type".into(), Value::String("socks".into()));
             m.insert("server".into(), Value::String(entry.host.clone()));
             m.insert("server_port".into(), num(entry.port));
-            // Credential is stored as "user:pass"; both parts are optional.
-            if let Some((user, password)) = entry.credential.split_once(':') {
-                if !user.is_empty() {
-                    m.insert("username".into(), Value::String(user.to_string()));
-                }
-                if !password.is_empty() {
-                    m.insert("password".into(), Value::String(password.to_string()));
-                }
+            // Credential is stored as "user:pass"; both parts are optional,
+            // and a colon-less credential is all username (the shared
+            // splitter owns the decision).
+            let (user, password) = super::split_user_password(&entry.credential);
+            if !user.is_empty() {
+                m.insert("username".into(), Value::String(user.to_string()));
+            }
+            if !password.is_empty() {
+                m.insert("password".into(), Value::String(password.to_string()));
             }
             if super::param_truthy(entry, "tls") {
                 m.insert("tls".into(), minimal_tls(entry));
@@ -198,13 +219,7 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
 /// Encode the final candidate list as a sing-box config document (pretty
 /// JSON). Duplicate tags are suffixed « (2)», « (3)»….
 pub fn encode_singbox(entries: &[ProxyEntry]) -> String {
-    let supported: Vec<&ProxyEntry> = entries.iter().filter(|e| is_supported(e.scheme)).collect();
-    let tags = super::dedupe_names(supported.iter().map(|e| e.name.as_str()));
-    let outbounds: Vec<Value> = supported
-        .iter()
-        .zip(tags)
-        .filter_map(|(entry, tag)| entry_to_outbound_named(entry, &tag))
-        .collect();
+    let outbounds = super::encode_entries(entries, "tag", entry_to_outbound);
 
     let mut root = Map::new();
     root.insert("outbounds".into(), Value::Array(outbounds));
@@ -407,35 +422,7 @@ fn unsigned(value: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Param;
-
-    fn entry(scheme: Scheme, credential: &str, params: &[(&str, &str)]) -> ProxyEntry {
-        ProxyEntry {
-            scheme,
-            name: "proxy".into(),
-            host: "example.com".into(),
-            port: 443,
-            credential: credential.into(),
-            params: params
-                .iter()
-                .map(|(k, v)| Param {
-                    key: (*k).into(),
-                    value: (*v).into(),
-                    known: true,
-                })
-                .collect(),
-            raw_path: String::new(),
-            raw_line: String::new(),
-        }
-    }
-
-    fn field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-        value.as_object().and_then(|m| m.get(key))
-    }
-
-    fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-        field(value, key).and_then(Value::as_str)
-    }
+    use crate::formats::test_util::{Fields, b64, entry, parse};
 
     #[test]
     fn vless_reality_maps_tls_and_transport() {
@@ -454,25 +441,25 @@ mod tests {
             ],
         );
         let v = entry_to_outbound(&e).unwrap();
-        assert_eq!(str_field(&v, "type"), Some("vless"));
-        assert_eq!(str_field(&v, "tag"), Some("proxy"));
-        assert_eq!(str_field(&v, "uuid"), Some("uuid-1"));
-        assert_eq!(str_field(&v, "flow"), Some("xtls-rprx-vision"));
+        assert_eq!(v.str_field("type"), Some("vless"));
+        assert_eq!(v.str_field("tag"), Some("proxy"));
+        assert_eq!(v.str_field("uuid"), Some("uuid-1"));
+        assert_eq!(v.str_field("flow"), Some("xtls-rprx-vision"));
 
-        let tls = field(&v, "tls").unwrap();
-        assert_eq!(field(tls, "enabled").and_then(Value::as_bool), Some(true));
-        assert_eq!(str_field(tls, "server_name"), Some("sni.example.com"));
+        let tls = v.field("tls").unwrap();
+        assert_eq!(tls.field("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(tls.str_field("server_name"), Some("sni.example.com"));
         assert_eq!(
-            str_field(field(tls, "utls").unwrap(), "fingerprint"),
+            tls.field("utls").unwrap().str_field("fingerprint"),
             Some("chrome")
         );
-        let reality = field(tls, "reality").unwrap();
-        assert_eq!(str_field(reality, "public_key"), Some("key"));
-        assert_eq!(str_field(reality, "short_id"), Some("short"));
+        let reality = tls.field("reality").unwrap();
+        assert_eq!(reality.str_field("public_key"), Some("key"));
+        assert_eq!(reality.str_field("short_id"), Some("short"));
 
-        let transport = field(&v, "transport").unwrap();
-        assert_eq!(str_field(transport, "type"), Some("grpc"));
-        assert_eq!(str_field(transport, "service_name"), Some("svc"));
+        let transport = v.field("transport").unwrap();
+        assert_eq!(transport.str_field("type"), Some("grpc"));
+        assert_eq!(transport.str_field("service_name"), Some("svc"));
     }
 
     /// A Clash YAML item spells the TLS toggle `tls: true` and the SNI
@@ -487,9 +474,11 @@ mod tests {
         let e = &result.entries[0];
 
         let v = entry_to_outbound(e).unwrap();
-        let tls = field(&v, "tls").expect("clash `tls: true` must survive the round trip");
-        assert_eq!(field(tls, "enabled").and_then(Value::as_bool), Some(true));
-        assert_eq!(str_field(tls, "server_name"), Some("s.example.com"));
+        let tls = v
+            .field("tls")
+            .expect("clash `tls: true` must survive the round trip");
+        assert_eq!(tls.field("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(tls.str_field("server_name"), Some("s.example.com"));
 
         // The Clash writer already read both spellings; the two outputs
         // must not disagree about whether this proxy uses TLS.
@@ -510,8 +499,8 @@ mod tests {
         let e = &crate::parsers::clash::parse_payload(yaml).unwrap().entries[0];
 
         let v = entry_to_outbound(e).unwrap();
-        assert_eq!(str_field(&v, "security"), Some("aes-128-gcm"));
-        assert_eq!(field(&v, "alter_id").and_then(Value::as_u64), Some(4));
+        assert_eq!(v.str_field("security"), Some("aes-128-gcm"));
+        assert_eq!(v.field("alter_id").and_then(Value::as_u64), Some(4));
 
         // The two writers must agree for the same entry.
         let clash = crate::formats::clash::entry_to_clash(e).unwrap();
@@ -540,7 +529,7 @@ mod tests {
         let result = crate::parsers::clash::parse_payload(yaml).unwrap();
         let e = &result.entries[0];
 
-        assert!(field(&entry_to_outbound(e).unwrap(), "tls").is_none());
+        assert!(entry_to_outbound(e).unwrap().field("tls").is_none());
         let clash = crate::formats::clash::entry_to_clash(e).unwrap();
         assert!(clash.get("tls").is_none());
     }
@@ -549,9 +538,9 @@ mod tests {
     fn trojan_tls_insecure_follows_the_entry_toggle() {
         let plain = entry(Scheme::Trojan, "pass", &[("sni", "t.example.com")]);
         let plain_out = entry_to_outbound(&plain).unwrap();
-        let tls = field(&plain_out, "tls").unwrap();
-        assert_eq!(str_field(tls, "server_name"), Some("t.example.com"));
-        assert!(field(tls, "insecure").is_none());
+        let tls = plain_out.field("tls").unwrap();
+        assert_eq!(tls.str_field("server_name"), Some("t.example.com"));
+        assert!(tls.field("insecure").is_none());
 
         let insecure = entry(
             Scheme::Trojan,
@@ -559,17 +548,17 @@ mod tests {
             &[("sni", "t.example.com"), ("allowInsecure", "1")],
         );
         let insecure_out = entry_to_outbound(&insecure).unwrap();
-        let tls = field(&insecure_out, "tls").unwrap();
-        assert_eq!(field(tls, "insecure").and_then(Value::as_bool), Some(true));
+        let tls = insecure_out.field("tls").unwrap();
+        assert_eq!(tls.field("insecure").and_then(Value::as_bool), Some(true));
     }
 
     #[test]
     fn shadowsocks_splits_method_and_password() {
         let e = entry(Scheme::Ss, "aes-256-gcm:secret", &[]);
         let v = entry_to_outbound(&e).unwrap();
-        assert_eq!(str_field(&v, "type"), Some("shadowsocks"));
-        assert_eq!(str_field(&v, "method"), Some("aes-256-gcm"));
-        assert_eq!(str_field(&v, "password"), Some("secret"));
+        assert_eq!(v.str_field("type"), Some("shadowsocks"));
+        assert_eq!(v.str_field("method"), Some("aes-256-gcm"));
+        assert_eq!(v.str_field("password"), Some("secret"));
     }
 
     #[test]
@@ -585,11 +574,11 @@ mod tests {
             ],
         );
         let v = entry_to_outbound(&e).unwrap();
-        assert_eq!(str_field(&v, "type"), Some("vmess"));
-        assert_eq!(str_field(&v, "security"), Some("aes-128-gcm"));
-        assert_eq!(field(&v, "alter_id").and_then(Value::as_u64), Some(4));
-        let tls = field(&v, "tls").unwrap();
-        assert_eq!(str_field(tls, "server_name"), Some("s.example.com"));
+        assert_eq!(v.str_field("type"), Some("vmess"));
+        assert_eq!(v.str_field("security"), Some("aes-128-gcm"));
+        assert_eq!(v.field("alter_id").and_then(Value::as_u64), Some(4));
+        let tls = v.field("tls").unwrap();
+        assert_eq!(tls.str_field("server_name"), Some("s.example.com"));
     }
 
     /// `alter_id` used to go through `as u16`, so 65536 silently became 0
@@ -601,7 +590,7 @@ mod tests {
             let e = entry(Scheme::Vmess, "uuid", &[("aid", aid)]);
             let v = entry_to_outbound(&e).unwrap();
             assert_eq!(
-                field(&v, "alter_id").and_then(Value::as_u64),
+                v.field("alter_id").and_then(Value::as_u64),
                 Some(aid.parse::<u64>().unwrap()),
                 "aid={aid}"
             );
@@ -617,36 +606,21 @@ mod tests {
         }
     }
 
-    /// Parse a raw subscription line into an entry (panics on failure).
-    fn parse(line: &str) -> ProxyEntry {
-        match crate::parsers::parse_line(line) {
-            crate::parsers::LineOutcome::Parsed(entry) => entry,
-            other => panic!("expected parsed entry, got {other:?}"),
-        }
-    }
-
-    fn b64(json: &str) -> String {
-        base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD_NO_PAD,
-            json.as_bytes(),
-        )
-    }
-
     #[test]
     fn raw_vmess_json_tls_ws_maps_completely() {
         let json = r#"{"v":"2","ps":"n","add":"h.example.com","port":"443","id":"uuid-2","aid":"0","scy":"auto","net":"ws","host":"ws.example.com","path":"/vmess","tls":"tls","sni":"s.example.com"}"#;
-        let line = format!("vmess://{}", b64(json));
+        let line = format!("vmess://{}", b64(json.as_bytes()));
         let e = parse(&line);
         let v = entry_to_outbound(&e).unwrap();
         // vmess TLS is spelled `tls: "tls"` in the JSON, not `security=tls`.
-        let tls = field(&v, "tls").unwrap();
-        assert_eq!(field(tls, "enabled").and_then(Value::as_bool), Some(true));
-        assert_eq!(str_field(tls, "server_name"), Some("s.example.com"));
-        let transport = field(&v, "transport").unwrap();
-        assert_eq!(str_field(transport, "type"), Some("ws"));
-        assert_eq!(str_field(transport, "path"), Some("/vmess"));
-        let headers = field(transport, "headers").unwrap();
-        assert_eq!(str_field(headers, "Host"), Some("ws.example.com"));
+        let tls = v.field("tls").unwrap();
+        assert_eq!(tls.field("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(tls.str_field("server_name"), Some("s.example.com"));
+        let transport = v.field("transport").unwrap();
+        assert_eq!(transport.str_field("type"), Some("ws"));
+        assert_eq!(transport.str_field("path"), Some("/vmess"));
+        let headers = transport.field("headers").unwrap();
+        assert_eq!(headers.str_field("Host"), Some("ws.example.com"));
     }
 
     #[test]
@@ -654,14 +628,14 @@ mod tests {
         let line = "vless://uuid-1@h.example.com:443?security=reality&sni=s.example.com&fp=chrome&pbk=pub-key&sid=01ab&type=grpc&serviceName=gr-svc#Name";
         let e = parse(line);
         let v = entry_to_outbound(&e).unwrap();
-        let tls = field(&v, "tls").unwrap();
-        let reality = field(tls, "reality").unwrap();
-        assert_eq!(str_field(reality, "public_key"), Some("pub-key"));
-        assert_eq!(str_field(reality, "short_id"), Some("01ab"));
-        let transport = field(&v, "transport").unwrap();
+        let tls = v.field("tls").unwrap();
+        let reality = tls.field("reality").unwrap();
+        assert_eq!(reality.str_field("public_key"), Some("pub-key"));
+        assert_eq!(reality.str_field("short_id"), Some("01ab"));
+        let transport = v.field("transport").unwrap();
         // Network comes from the URI `type` key.
-        assert_eq!(str_field(transport, "type"), Some("grpc"));
-        assert_eq!(str_field(transport, "service_name"), Some("gr-svc"));
+        assert_eq!(transport.str_field("type"), Some("grpc"));
+        assert_eq!(transport.str_field("service_name"), Some("gr-svc"));
     }
 
     #[test]
@@ -669,24 +643,24 @@ mod tests {
         let line = "trojan://pass@h.example.com:443?security=tls&sni=t.example.com&type=ws&host=ws.example.com&path=%2Fws#Name";
         let e = parse(line);
         let v = entry_to_outbound(&e).unwrap();
-        let transport = field(&v, "transport").unwrap();
-        assert_eq!(str_field(transport, "type"), Some("ws"));
-        assert_eq!(str_field(transport, "path"), Some("/ws"));
-        let headers = field(transport, "headers").unwrap();
-        assert_eq!(str_field(headers, "Host"), Some("ws.example.com"));
+        let transport = v.field("transport").unwrap();
+        assert_eq!(transport.str_field("type"), Some("ws"));
+        assert_eq!(transport.str_field("path"), Some("/ws"));
+        let headers = transport.field("headers").unwrap();
+        assert_eq!(headers.str_field("Host"), Some("ws.example.com"));
     }
 
     #[test]
     fn raw_ss_line_maps_plugin() {
-        let blob = b64("aes-256-gcm:secret");
+        let blob = b64("aes-256-gcm:secret".as_bytes());
         let line = format!(
             "ss://{blob}@h.example.com:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dob.example.com#Name"
         );
         let e = parse(&line);
         let v = entry_to_outbound(&e).unwrap();
-        assert_eq!(str_field(&v, "plugin"), Some("obfs-local"));
+        assert_eq!(v.str_field("plugin"), Some("obfs-local"));
         assert_eq!(
-            str_field(&v, "plugin_opts"),
+            v.str_field("plugin_opts"),
             Some("obfs=http;obfs-host=ob.example.com")
         );
     }
@@ -696,14 +670,14 @@ mod tests {
         let line = "hysteria2://hy-pass@h.example.com:443?sni=hy.example.com&obfs=salamander&obfs-password=ob-pass&upMbps=50&downMbps=200&alpn=h3#Name";
         let e = parse(line);
         let v = entry_to_outbound(&e).unwrap();
-        let obfs = field(&v, "obfs").unwrap();
-        assert_eq!(str_field(obfs, "type"), Some("salamander"));
-        assert_eq!(str_field(obfs, "password"), Some("ob-pass"));
-        assert_eq!(field(&v, "up_mbps").and_then(Value::as_u64), Some(50));
-        assert_eq!(field(&v, "down_mbps").and_then(Value::as_u64), Some(200));
-        let tls = field(&v, "tls").unwrap();
+        let obfs = v.field("obfs").unwrap();
+        assert_eq!(obfs.str_field("type"), Some("salamander"));
+        assert_eq!(obfs.str_field("password"), Some("ob-pass"));
+        assert_eq!(v.field("up_mbps").and_then(Value::as_u64), Some(50));
+        assert_eq!(v.field("down_mbps").and_then(Value::as_u64), Some(200));
+        let tls = v.field("tls").unwrap();
         assert_eq!(
-            field(tls, "alpn").and_then(Value::as_array).unwrap().len(),
+            tls.field("alpn").and_then(Value::as_array).unwrap().len(),
             1
         );
     }
@@ -712,9 +686,83 @@ mod tests {
     fn socks_maps_to_socks_type() {
         let e = entry(Scheme::Socks5, "user:pw", &[]);
         let v = entry_to_outbound(&e).unwrap();
-        assert_eq!(str_field(&v, "type"), Some("socks"));
-        assert_eq!(str_field(&v, "username"), Some("user"));
-        assert_eq!(str_field(&v, "password"), Some("pw"));
+        assert_eq!(v.str_field("type"), Some("socks"));
+        assert_eq!(v.str_field("username"), Some("user"));
+        assert_eq!(v.str_field("password"), Some("pw"));
+    }
+
+    /// A colon-less socks5 credential is all username: no password is
+    /// invented for it, in either encoder.
+    #[test]
+    fn a_colon_less_socks5_credential_is_all_username() {
+        let e = entry(Scheme::Socks5, "onlyuser", &[]);
+        let v = entry_to_outbound(&e).unwrap();
+        assert_eq!(v.str_field("username"), Some("onlyuser"));
+        assert!(v.field("password").is_none());
+    }
+
+    /// A leading empty method must not render an empty `method`: the
+    /// shared credential splitter falls back to the default cipher and
+    /// keeps what follows the slot as the password.
+    #[test]
+    fn a_leading_colon_ss_credential_does_not_render_an_empty_method() {
+        let e = entry(Scheme::Ss, ":secret", &[]);
+        let v = entry_to_outbound(&e).unwrap();
+        assert_eq!(
+            v.str_field("method"),
+            Some(crate::models::DEFAULT_SS_CIPHER)
+        );
+        assert_eq!(v.str_field("password"), Some("secret"));
+    }
+
+    /// The socks5 TLS toggle travels in both encoders; sing-box spells it
+    /// as `tls.enabled` and carries the server name along.
+    #[test]
+    fn socks5_tls_enables_tls_and_carries_the_server_name() {
+        let e = entry(
+            Scheme::Socks5,
+            "u:p",
+            &[("tls", "true"), ("sni", "s.example.com")],
+        );
+        let v = entry_to_outbound(&e).unwrap();
+        let tls = v.field("tls").unwrap();
+        assert_eq!(tls.field("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(tls.str_field("server_name"), Some("s.example.com"));
+    }
+
+    /// vmess JSON spells the plain-HTTP header obfuscation
+    /// `net: tcp, type: http`: sing-box's own transport type for it is
+    /// `http`, with the hosts as a list.
+    #[test]
+    fn raw_vmess_tcp_http_header_maps_to_http_transport() {
+        let json = r#"{"v":"2","ps":"n","add":"h.example.com","port":"443","id":"uuid-3","aid":"0","scy":"auto","net":"tcp","type":"http","path":"/hp","host":"hp.example.com"}"#;
+        let line = format!("vmess://{}", b64(json.as_bytes()));
+        let e = parse(&line);
+        let v = entry_to_outbound(&e).unwrap();
+        let transport = v.field("transport").unwrap();
+        assert_eq!(transport.str_field("type"), Some("http"));
+        assert_eq!(transport.str_field("path"), Some("/hp"));
+        assert_eq!(
+            transport.field("host").and_then(Value::as_array).unwrap()[0].as_str(),
+            Some("hp.example.com")
+        );
+    }
+
+    /// The HTTP-upgrade WebSocket has a transport type of its own: the
+    /// host is a transport field there, not a `Host` header like `ws`.
+    #[test]
+    fn raw_vless_httpupgrade_keeps_its_own_transport_type() {
+        let line =
+            "vless://u@h:443?security=tls&type=httpupgrade&host=up.example.com&path=%2Fup#Name";
+        let e = parse(line);
+        let v = entry_to_outbound(&e).unwrap();
+        let transport = v.field("transport").unwrap();
+        assert_eq!(transport.str_field("type"), Some("httpupgrade"));
+        assert_eq!(transport.str_field("host"), Some("up.example.com"));
+        assert!(
+            transport.field("headers").is_none(),
+            "httpupgrade carries the host as a field, not a Host header: {transport:?}"
+        );
     }
 
     #[test]
@@ -724,7 +772,9 @@ mod tests {
         assert!(entry_to_outbound(&entry(Scheme::Naive, "c", &[])).is_none());
         // No sing-box outbound type exists for either: guessing a field
         // layout would hand the client a config it cannot start, so the
-        // export leaves them out (clash/sing-box `is_supported` agree).
+        // export leaves them out (each encoder's behaviour matches its own
+        // `is_supported`; the two lists intentionally diverge for
+        // snell/anytls, see the comment in entry_to_outbound).
         assert!(entry_to_outbound(&entry(Scheme::Snell, "c", &[])).is_none());
         assert!(entry_to_outbound(&entry(Scheme::AnyTls, "c", &[])).is_none());
     }

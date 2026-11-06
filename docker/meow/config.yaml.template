@@ -39,5 +39,9 @@ log-level: warning
 external-controller: __FUMOX_MEOW_API_BIND__
 secret: "__FUMOX_MEOW_API_SECRET__"
 
+# Off and minimize disk writes
+traffic-ledger: {enable: false}
+logbook: {enable: false}
+
 proxies: []
 rules: []

@@ -83,6 +83,131 @@ pub(crate) fn network_of(entry: &crate::models::ProxyEntry, uri_key: &str) -> Op
         .map(|v| v.to_ascii_lowercase())
 }
 
+/// The vmess alter id under both spellings (`aid` in URIs and vmess JSON,
+/// `alterId` in Clash YAML), as the one type both encoders emit.
+///
+/// u64, with a negative value read as 0: the Clash encoder parsed `i64` and
+/// emitted the negative number verbatim while the sing-box encoder read
+/// `u64` and silently zeroed the field, so the two outputs disagreed for one
+/// proxy. (An earlier `as u16` cast truncated 65536 to 0 on the sing-box
+/// side; the wide type keeps that from coming back.)
+pub(crate) fn alter_id(entry: &crate::models::ProxyEntry) -> u64 {
+    param_value(entry, "aid")
+        .or_else(|| param_value(entry, "alterId"))
+        .and_then(|v| match v.parse::<i64>() {
+            Ok(n) => u64::try_from(n).ok(),
+            // Beyond i64's range a u64 read still succeeds.
+            Err(_) => v.parse::<u64>().ok(),
+        })
+        .unwrap_or(0)
+}
+
+/// The `method:password` of an ss credential.
+///
+/// A missing or empty method is not a cipher mihomo or sing-box can read:
+/// the default carries it and what follows the slot stays the password, so
+/// a leading `:` never renders an empty `cipher`/`method`. The colon-less
+/// fallback only catches rows predating the parse-time canonicalization
+/// (see `parsers::clash` `SS_SPEC`).
+pub(crate) fn split_ss_credential(credential: &str) -> (&str, &str) {
+    match credential.split_once(':') {
+        Some((method, password)) if !method.is_empty() => (method, password),
+        _ => match credential.rsplit_once(':') {
+            Some((_, password)) => (crate::models::DEFAULT_SS_CIPHER, password),
+            None => (crate::models::DEFAULT_SS_CIPHER, credential),
+        },
+    }
+}
+
+/// The `user:password` of a socks5 credential: either part may be empty
+/// (`":pw"` keeps only the password), and a colon-less credential is all
+/// username — no password is invented for it.
+pub(crate) fn split_user_password(credential: &str) -> (&str, &str) {
+    credential.split_once(':').unwrap_or((credential, ""))
+}
+
+/// One name-setting operation over the two value types the encoders emit:
+/// the encode skeleton owns the deduplicated name, and each value type
+/// keeps it under its own key (`name` for Clash, `tag` for sing-box) in the
+/// place the mapper put the entry's original one.
+pub(crate) trait Rename {
+    fn rename(&mut self, key: &str, name: &str);
+}
+
+impl Rename for serde_norway::Value {
+    fn rename(&mut self, key: &str, name: &str) {
+        if let Some(mapping) = self.as_mapping_mut() {
+            mapping.insert(
+                serde_norway::Value::String(key.into()),
+                serde_norway::Value::String(name.into()),
+            );
+        }
+    }
+}
+
+impl Rename for serde_json::Value {
+    fn rename(&mut self, key: &str, name: &str) {
+        if let Some(object) = self.as_object_mut() {
+            object.insert(key.into(), serde_json::Value::String(name.into()));
+        }
+    }
+}
+
+/// The shared skeleton of the structured encoders: keep the entries the
+/// mapper can express, suffix duplicate names among them, and hand the
+/// mapped values to the format-specific serializer.
+///
+/// The mapper is the single source of truth on what the format can express:
+/// an entry it cannot map is skipped here and counted, so no second list of
+/// schemes can drift from the encoders. The two aggregated signals land in
+/// tracing — how many entries the format could not carry, and how many
+/// names a « (2)» suffix changed.
+pub(crate) fn encode_entries<V: Rename>(
+    entries: &[ProxyEntry],
+    key: &str,
+    mut mapper: impl FnMut(&ProxyEntry) -> Option<V>,
+) -> Vec<V> {
+    let mut mapped: Vec<Option<V>> = entries.iter().map(&mut mapper).collect();
+    let kept: Vec<usize> = (0..entries.len())
+        .filter(|&i| mapped[i].is_some())
+        .collect();
+    if kept.len() < entries.len() {
+        tracing::debug!(
+            total = entries.len(),
+            skipped = entries.len() - kept.len(),
+            "encode skipped unsupported schemes"
+        );
+    }
+    // The names are deduplicated among the kept entries only: an
+    // unsupported entry consumes no name slot.
+    let names = dedupe_names(kept.iter().map(|&i| entries[i].name.as_str()));
+    let mut renamed = 0;
+    for (i, name) in kept.iter().zip(&names) {
+        if entries[*i].name != *name {
+            renamed += 1;
+        }
+    }
+    if renamed > 0 {
+        tracing::debug!(
+            entries = kept.len(),
+            renamed = renamed,
+            "duplicate names suffixed"
+        );
+    }
+    kept.into_iter()
+        .zip(names)
+        .map(|(i, name)| {
+            let mut value = mapped[i]
+                .take()
+                .expect("a kept entry carries a mapped value");
+            if name != entries[i].name {
+                value.rename(key, &name);
+            }
+            value
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +232,7 @@ mod tests {
             key: key.into(),
             value: value.into(),
             known: true,
+            bare: false,
         };
         let entry = |params: Vec<Param>| crate::models::ProxyEntry {
             scheme: crate::models::Scheme::Trojan,
@@ -117,6 +243,7 @@ mod tests {
             params,
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         };
         assert!(is_insecure(&entry(vec![param("allowInsecure", "1")])));
         assert!(is_insecure(&entry(vec![param("insecure", "true")])));
@@ -138,6 +265,87 @@ mod tests {
     }
 }
 
+/// Test helpers shared by the two encoder test modules and the agreement
+/// tests below: entry construction, raw-line parsing, base64, and field
+/// access over the two serde value types the encoders emit.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use crate::models::{Param, ProxyEntry, Scheme};
+
+    /// A minimal entry: `example.com:443`, the given credential and params.
+    pub(crate) fn entry(scheme: Scheme, credential: &str, params: &[(&str, &str)]) -> ProxyEntry {
+        ProxyEntry {
+            scheme,
+            name: "proxy".into(),
+            host: "example.com".into(),
+            port: 443,
+            credential: credential.into(),
+            params: params
+                .iter()
+                .map(|(k, v)| Param {
+                    key: (*k).into(),
+                    value: (*v).into(),
+                    known: true,
+                    bare: false,
+                })
+                .collect(),
+            raw_path: String::new(),
+            raw_line: String::new(),
+            canonical: None,
+        }
+    }
+
+    /// Parse a raw subscription line into an entry (panics on failure).
+    pub(crate) fn parse(line: &str) -> ProxyEntry {
+        match crate::parsers::parse_line(line) {
+            crate::parsers::LineOutcome::Parsed(entry) => entry,
+            other => panic!("expected parsed entry, got {other:?}"),
+        }
+    }
+
+    /// Unpadded standard base64, for vmess JSON payloads and ss userinfo.
+    pub(crate) fn b64(bytes: &[u8]) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, bytes)
+    }
+
+    /// Field access over the two serde value types the encoders emit: the
+    /// Clash tests read a `serde_norway` mapping, the sing-box tests a
+    /// `serde_json` object, and the same assertions run against both.
+    pub(crate) trait Fields: Sized {
+        /// The value under `key`, for the value type the encoder emits.
+        fn field<'a>(&'a self, key: &str) -> Option<&'a Self>;
+
+        /// The string value of this value (the inherent `as_str` of each
+        /// type, renamed so the trait never shadows it).
+        fn str_value(&self) -> Option<&str>;
+
+        /// The string under `key`.
+        fn str_field(&self, key: &str) -> Option<&str> {
+            self.field(key).and_then(Self::str_value)
+        }
+    }
+
+    impl Fields for serde_norway::Value {
+        fn field<'a>(&'a self, key: &str) -> Option<&'a Self> {
+            self.as_mapping().and_then(|m| m.get(key))
+        }
+
+        fn str_value(&self) -> Option<&str> {
+            self.as_str()
+        }
+    }
+
+    impl Fields for serde_json::Value {
+        fn field<'a>(&'a self, key: &str) -> Option<&'a Self> {
+            self.as_object().and_then(|m| m.get(key))
+        }
+
+        fn str_value(&self) -> Option<&str> {
+            self.as_str()
+        }
+    }
+}
+
 /// The two encoders must describe the same node.
 ///
 /// The review's acceptance check is that they agree on whether a node
@@ -145,27 +353,11 @@ mod tests {
 /// profile from one format to the other must not get a different node.
 #[cfg(test)]
 mod agreement {
-    use super::{clash, singbox};
-    use crate::models::{OutputFormat, Param, ProxyEntry, Scheme};
+    use super::{clash, singbox, test_util};
+    use crate::models::{OutputFormat, ProxyEntry, Scheme};
 
     fn entry(scheme: Scheme, params: &[(&str, &str)]) -> ProxyEntry {
-        ProxyEntry {
-            scheme,
-            name: "proxy".into(),
-            host: "example.com".into(),
-            port: 443,
-            credential: "secret".into(),
-            params: params
-                .iter()
-                .map(|(k, v)| Param {
-                    key: (*k).into(),
-                    value: (*v).into(),
-                    known: true,
-                })
-                .collect(),
-            raw_path: String::new(),
-            raw_line: String::new(),
-        }
+        test_util::entry(scheme, "secret", params)
     }
 
     /// Whether the node is TLS-wrapped, as each encoder says it.
@@ -238,6 +430,18 @@ mod agreement {
                 "the encoders disagree about TLS for {entry:?}"
             );
         }
+    }
+
+    /// The alter id is read by the shared helper with one type for both
+    /// encoders: a negative value used to be emitted verbatim by the Clash
+    /// writer (`i64`) and read as 0 by the sing-box one (`u64`).
+    #[test]
+    fn a_negative_aid_reads_as_zero_in_both_encoders() {
+        let e = entry(Scheme::Vmess, &[("aid", "-5")]);
+        let clash = clash::entry_to_clash(&e).expect("clash output");
+        assert_eq!(clash.get("alterId").and_then(|v| v.as_u64()), Some(0));
+        let singbox = singbox::entry_to_outbound(&e).expect("sing-box output");
+        assert_eq!(singbox.get("alter_id").and_then(|v| v.as_u64()), Some(0));
     }
 
     #[test]

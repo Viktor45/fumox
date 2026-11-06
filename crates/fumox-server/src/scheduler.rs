@@ -443,11 +443,20 @@ async fn retention_sweep(pool: &DbPool, retention: &ServerRetention) {
 
     // Stamp the run so /admin/probe surfaces it even without the daemon:
     // the stamp means "a retention pass ran recently", whoever ran it.
+    // A failed sweep keeps the stamp of the last successful run (see
+    // `LastRotation`); the server-side sweep reports its failures through
+    // the same `ok`/`error` pair.
     let stamp = probe::meta::LastRotation {
-        ts: now,
+        ts: if outcome.error.is_none() {
+            now
+        } else {
+            previous_rotation_ts(pool).await
+        },
         probe_results: 0,
         fetch_log: outcome.fetch_log,
         probe_requests: outcome.probe_requests,
+        ok: outcome.error.is_none(),
+        error: outcome.error,
     };
     if let Err(error) = fumox_core::repo::meta_set(
         pool,
@@ -457,6 +466,19 @@ async fn retention_sweep(pool: &DbPool, retention: &ServerRetention) {
     .await
     {
         tracing::debug!(error = %error, "server retention: cannot stamp last_rotation");
+    }
+}
+
+/// The `ts` of the last rotation stamp, for a failed run to keep: the age
+/// of the stamp is the "last successful rotation" signal and must not
+/// advance over a failure. A missing (or unparseable) stamp reads as 0,
+/// the honest "never succeeded".
+async fn previous_rotation_ts(pool: &DbPool) -> i64 {
+    match fumox_core::repo::meta_get(pool, probe::meta::LAST_ROTATION_KEY).await {
+        Ok(Some(raw)) => serde_json::from_str::<probe::meta::LastRotation>(&raw)
+            .map(|stamp| stamp.ts)
+            .unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -1650,6 +1672,7 @@ mod tests {
                     error: None,
                     error_class: None,
                 },
+                fetch_log::FetchTiming::default(),
             )
             .await
             .unwrap();
@@ -1720,6 +1743,7 @@ mod tests {
                 error: None,
                 error_class: None,
             },
+            fetch_log::FetchTiming::default(),
         )
         .await
         .unwrap();

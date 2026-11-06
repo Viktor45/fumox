@@ -1,5 +1,5 @@
 //! Shared URI mechanics for the line-oriented proxy schemes
-//! (vless, trojan, hysteria2, tuic, mieru, socks5, naive).
+//! (vless, trojan, hysteria2, tuic, mieru, socks5, snell, anytls, naive).
 //!
 //! Subscription URIs in the wild routinely violate RFC 3986, raw UTF-8
 //! fragments, raw `?` inside parameter values, mixed-case keys, junk
@@ -21,6 +21,8 @@
 //! `encode_query_delimiters`).
 
 use std::borrow::Cow;
+
+use base64::Engine;
 
 use crate::models::{Param, ProxyEntry, Scheme};
 
@@ -183,6 +185,29 @@ pub static NAIVE_SPEC: UriSchemeSpec = UriSchemeSpec {
     credential_required: true,
 };
 
+/// The scheme registry: one lookup from the lower-cased wire spelling onto
+/// the shared spec, with the aliases real feeds use (`hy2` for
+/// `hysteria2`). Both directions read it — `parse_line` maps a line's
+/// scheme onto its parser and `serialize` maps an entry's scheme onto its
+/// serializer — so a spelling one side accepts the other accepts too.
+///
+/// Not in the table: `ss` and `vmess` (bespoke payload formats) and the
+/// `naive+<transport>` family (the transport is scheme identity, see
+/// [`NAIVE_SPEC`]).
+pub fn spec_for(scheme: &str) -> Option<&'static UriSchemeSpec> {
+    Some(match scheme {
+        "vless" => &VLESS_SPEC,
+        "trojan" => &TROJAN_SPEC,
+        "hysteria2" | "hy2" => &HYSTERIA2_SPEC,
+        "tuic" => &TUIC_SPEC,
+        "mieru" => &MIERU_SPEC,
+        "socks5" => &SOCKS5_SPEC,
+        "snell" => &SNELL_SPEC,
+        "anytls" => &ANYTLS_SPEC,
+        _ => return None,
+    })
+}
+
 /// Decomposed URI with every component kept verbatim.
 #[derive(Debug)]
 pub struct UriParts {
@@ -280,9 +305,18 @@ pub fn parse_hostport(s: &str) -> Result<(String, u16), String> {
     if host.is_empty() {
         return Err("empty host".to_string());
     }
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| format!("invalid port: {port_str:?}"))?;
+    let port: u16 = port_str.parse().map_err(|_| {
+        // A junk "port" can be arbitrarily long; keep the diagnostic
+        // bounded (the caller logs the line truncated as well).
+        format!("invalid port: {:?}", super::truncate_utf8(port_str, 16))
+    })?;
+    // Port 0 is the listener's "any port" bind convention, not an address
+    // a client could dial, so a line carrying it is malformed feed content:
+    // the record must not reach the database or the subscription output.
+    // The schema CHECK (migration 0018) is the second gate behind this one.
+    if port == 0 {
+        return Err("port 0 is not a valid proxy port".to_string());
+    }
     Ok((host, port))
 }
 
@@ -317,7 +351,9 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Pairs are split on the first `=` only, so values may contain further `=`
 /// and `?`. Empty segments (a leading, trailing or doubled `&`) are kept as
 /// empty-key params so serialization can reproduce them byte-for-byte.
-/// Values keep their percent-encoding untouched.
+/// Values keep their percent-encoding untouched. A segment without `=` at
+/// all is a bare key ([`Param::bare`]), a different spelling from an empty
+/// value (`k=`), and serialization emits each form back as it was read.
 ///
 /// Fails when the query exceeds [`MAX_QUERY_PARAMS`] or any single key or
 /// value exceeds [`MAX_PARAM_BYTES`]; truncating instead would silently
@@ -341,6 +377,7 @@ pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
                     key: key.to_string(),
                     value: value.to_string(),
                     known: false,
+                    bare: false,
                 });
             }
             None => {
@@ -349,6 +386,9 @@ pub fn parse_query(query: &str) -> Result<Vec<Param>, String> {
                     key: pair.to_string(),
                     value: String::new(),
                     known: false,
+                    // No `=` in the segment: serialization must emit the
+                    // bare key, not `k=`.
+                    bare: true,
                 });
             }
         }
@@ -370,7 +410,8 @@ fn check_param_size(key: &str, value: &str) -> Result<(), String> {
 
 /// Serialize ordered parameters back into a query string (`k=v&k=v`).
 /// Empty-key params serialize as empty segments, reproducing the occasional
-/// `?&k=v` / `k=v&` quirks of real feeds.
+/// `?&k=v` / `k=v&` quirks of real feeds; bare keys ([`Param::bare`])
+/// serialize without the `=` they never had.
 ///
 /// Keys go through `encode_query_key`, values through
 /// `encode_query_delimiters`: a key carrying a raw `=` would shift the
@@ -382,6 +423,8 @@ pub fn serialize_query(params: &[Param]) -> String {
         .map(|p| {
             if p.key.is_empty() && p.value.is_empty() {
                 String::new()
+            } else if p.bare {
+                encode_query_key(&p.key).into_owned()
             } else {
                 format!(
                     "{}={}",
@@ -428,13 +471,22 @@ fn encode_query_chars(raw: &str, in_key: bool) -> Cow<'_, str> {
         if must_encode(ch, in_key) {
             let mut buf = [0u8; 4];
             for byte in ch.encode_utf8(&mut buf).as_bytes() {
-                out.push_str(&format!("%{byte:02X}"));
+                push_hex_escape(&mut out, *byte);
             }
         } else {
             out.push(ch);
         }
     }
     Cow::Owned(out)
+}
+
+/// Append `%XX` (upper-case hex) for one byte, without the intermediate
+/// `format!` allocation the naive spelling would pay per byte.
+fn push_hex_escape(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    out.push('%');
+    out.push(HEX[(byte >> 4) as usize] as char);
+    out.push(HEX[(byte & 0x0f) as usize] as char);
 }
 
 /// Lenient percent-decoding: valid `%XX` escapes are decoded, anything else
@@ -445,6 +497,37 @@ pub fn percent_decode(s: &str) -> String {
     percent_encoding::percent_decode_str(s)
         .decode_utf8_lossy()
         .into_owned()
+}
+
+/// Lenient base64 decoder: accepts both standard and URL-safe alphabets,
+/// with or without padding. Returns `None` on invalid input.
+///
+/// Shared by every parser that decodes a feed-controlled base64 payload
+/// (the ss userinfo/legacy blob, the vmess JSON line, the whole-payload
+/// unwrapping in `parse_subscription`), so the alphabets the wild accepts
+/// are decided in one place.
+pub fn decode_b64_lenient(input: &str) -> Option<Vec<u8>> {
+    if input.is_empty() {
+        return None;
+    }
+    // Map the URL-safe alphabet onto the standard one.
+    let normalized: String = input
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            c => c,
+        })
+        .collect();
+    let padded = match normalized.len() % 4 {
+        2 => format!("{normalized}=="),
+        3 => format!("{normalized}="),
+        0 => normalized,
+        _ => return None, // length % 4 == 1 is never valid base64
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(padded.as_bytes())
+        .ok()
 }
 
 /// Percent-encode a display name for use as a URI fragment.
@@ -459,7 +542,7 @@ pub fn encode_fragment(name: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             out.push(byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            push_hex_escape(&mut out, byte);
         }
     }
     out
@@ -481,6 +564,10 @@ pub fn parse_with_spec(
 ) -> Result<ProxyEntry, String> {
     let parts = split_uri(rest)?;
     let credential = match parts.userinfo {
+        // An `@` with nothing before it is as unusable as no `@` at all.
+        Some(userinfo) if spec.credential_required && userinfo.is_empty() => {
+            return Err("empty credential".to_string());
+        }
         Some(userinfo) => userinfo,
         None if spec.credential_required => {
             return Err("missing credential".to_string());
@@ -501,6 +588,7 @@ pub fn parse_with_spec(
         params,
         raw_path: parts.raw_path,
         raw_line: raw_line.to_string(),
+        canonical: None,
     })
 }
 
@@ -519,7 +607,7 @@ fn encode_structural<'a>(raw: &'a str, chars: &[char]) -> Cow<'a, str> {
         if chars.contains(&ch) {
             let mut buf = [0u8; 4];
             for byte in ch.encode_utf8(&mut buf).as_bytes() {
-                out.push_str(&format!("%{byte:02X}"));
+                push_hex_escape(&mut out, *byte);
             }
         } else {
             out.push(ch);
@@ -644,9 +732,11 @@ mod tests {
                 key: "security".into(),
                 value: "tls".into(),
                 known: true,
+                bare: false,
             }],
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         };
         let out = serialize_with_spec(&VLESS_SPEC, &entry);
         assert!(out.contains("@[2001:db8::1]:8443"), "{out}");
@@ -675,9 +765,11 @@ mod tests {
                 key: "security".into(),
                 value: "tls".into(),
                 known: true,
+                bare: false,
             }],
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         };
         let out = serialize_with_spec(&VLESS_SPEC, &entry);
         assert_eq!(
@@ -711,6 +803,9 @@ mod tests {
         assert!(parse_hostport("host:").is_err());
         assert!(parse_hostport("host").is_err());
         assert!(parse_hostport("").is_err());
+        // Port 0 is not a dialable endpoint: both host spellings drop it.
+        assert!(parse_hostport("host:0").is_err());
+        assert!(parse_hostport("[2001:db8::1]:0").is_err());
     }
 
     #[test]
@@ -719,6 +814,24 @@ mod tests {
         assert_eq!(pairs.len(), 3);
         assert_eq!(pairs[0].value, "");
         assert_eq!(pairs[1].value, "none");
+    }
+
+    /// A bare key (`?k`) and an empty value (`?k=`) are different spellings;
+    /// serialization must reproduce each byte-for-byte instead of folding
+    /// both into `k=`.
+    #[test]
+    fn bare_keys_are_kept_bare() {
+        let pairs = parse_query("a&b=&c=1").unwrap();
+        assert!(pairs[0].bare);
+        assert!(!pairs[1].bare);
+        assert!(!pairs[2].bare);
+        assert_eq!(serialize_query(&pairs), "a&b=&c=1");
+
+        // The bare key survives a full entry round-trip too.
+        let line = "vless://u@h.example.com:443?legacy#n";
+        let entry = parse_with_spec(&VLESS_SPEC, "u@h.example.com:443?legacy#n", line).unwrap();
+        assert!(entry.params[0].bare);
+        assert_eq!(serialize_with_spec(&VLESS_SPEC, &entry), line);
     }
 
     /// A 10 MiB line of `&` separators expanded into ~1 GB of `Param`s, a
@@ -855,15 +968,18 @@ mod tests {
                     key: "type".into(),
                     value: "ws".into(),
                     known: true,
+                    bare: false,
                 },
                 Param {
                     key: "path".into(),
                     value: "/search?q=1&host=evil".into(),
                     known: true,
+                    bare: false,
                 },
             ],
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         };
         let out = serialize_with_spec(&VLESS_SPEC, &entry);
         // `&` is escaped; the rest of the value is left as the producer
@@ -891,6 +1007,7 @@ mod tests {
                 key: "type".into(),
                 value: "/a#b".into(),
                 known: true,
+                bare: false,
             }],
             ..entry
         };
@@ -913,22 +1030,35 @@ mod tests {
                 key: "path".into(),
                 value: "/a%2Fb%20c?d=1".into(),
                 known: true,
+                bare: false,
             },
             Param {
                 key: "host".into(),
                 value: "%.DE".into(),
                 known: true,
+                bare: false,
             },
             Param {
                 key: "raw".into(),
                 value: "50%off&тест".into(),
                 known: false,
+                bare: false,
             },
         ];
         assert_eq!(
             serialize_query(&params),
             "path=/a%2Fb%20c?d=1&host=%.DE&raw=50%off%26тест"
         );
+
+        // Space and the C0/DEL controls are not legal in a URI at all; they
+        // are the one thing that is always encoded.
+        let controls = vec![Param {
+            key: "v".into(),
+            value: "a b\tc\u{7f}".into(),
+            known: true,
+            bare: false,
+        }];
+        assert_eq!(serialize_query(&controls), "v=a%20b%09c%7F");
     }
 
     /// A raw `=` in a key used to shift the first-`=` split on re-parse:
@@ -939,6 +1069,7 @@ mod tests {
             key: "allowInsecure=x".into(),
             value: "1".into(),
             known: false,
+            bare: false,
         }];
         let query = serialize_query(&params);
         assert_eq!(query, "allowInsecure%3Dx=1");
@@ -955,6 +1086,7 @@ mod tests {
             key: "path".into(),
             value: "/a=b".into(),
             known: true,
+            bare: false,
         }];
         assert_eq!(serialize_query(&value), "path=/a=b");
         let back = parse_query("path=/a=b").unwrap();
@@ -971,6 +1103,7 @@ mod tests {
             params,
             raw_path: String::new(),
             raw_line: String::new(),
+            canonical: None,
         };
         let out = serialize_with_spec(&VLESS_SPEC, &entry);
         let back =
@@ -1040,5 +1173,8 @@ mod tests {
                 spec.prefix
             );
         }
+        // An `@` with nothing before it is an empty credential, not a
+        // missing one, and is rejected all the same.
+        assert!(parse_with_spec(&SNELL_SPEC, "@h.example.com:44046", "").is_err());
     }
 }

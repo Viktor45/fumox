@@ -272,6 +272,7 @@
 "set.fetch_user_agent" = "Default User-Agent"
 "set.export_max_rows" = "Alive export row cap"
 "set.geo_cache" = "Host→geo cache entries"
+"set.geo_cache_ttl" = "Host→geo cache lifetime (seconds)"
 "set.geo_auto_download" = "Download the GeoLite2 databases"
 "set.geo_db" = "Database selector (legacy)"
 "set.geo_db_dir" = "GeoLite2 directory"

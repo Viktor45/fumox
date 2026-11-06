@@ -39,7 +39,10 @@
          open: the card renders the mask, and so do the params and the
          raw line below — masking this row alone would be a false comfort. #}
       <tr><th>{{ self.t("px.credential") }}</th><td class="mono small">{{ credential_display }}</td></tr>
-      <tr><th>{{ self.t("px.fingerprint") }}</th><td class="mono small">{{ proxy.fingerprint }}</td></tr>
+      {# The fingerprint is deliberately not shown next to the masked
+         credential: it is a plain hash over the credential pre-image, so
+         displaying it would hand an offline brute-force of the credential
+         to anyone who can open the card. #}
     </table>
     <p class="hint">{{ self.t("px.secret_note") }}</p>
 

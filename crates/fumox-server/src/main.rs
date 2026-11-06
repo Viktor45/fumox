@@ -681,6 +681,7 @@ mod tests {
             output_format: Default::default(),
             pipeline: None,
             countries: Vec::new(),
+            include_unknown_country: false,
             enabled: true,
             created_at: now,
             updated_at: now,

@@ -52,6 +52,7 @@ async fn make_source_named(pool: &DbPool, id: &str, name: &str) {
         &Source {
             id: id.to_string(),
             slug: None,
+            access_token: None,
             name: name.into(),
             url: "https://example.com".into(),
             enabled: true,

@@ -7,35 +7,33 @@
   <h1>{{ self.t("nav.probe") }}</h1>
 </div>
 
-{% if let Some(b) = backlog %}
-  <div class="flash {{ self.backlog_level_class() }} backlog-banner" role="alert">
-    <div class="flash-title">
-      {{ self.t_args("probe.backlog_title", &[self.backlog_level_label()][..]) }}
+<div class="flash {{ self.backlog_level_class() }} backlog-banner" role="alert">
+  <div class="flash-title">
+    {{ self.t_args("probe.backlog_title", &[self.backlog_level_label()][..]) }}
+  </div>
+  <ul class="factors">
+    {% for factor in backlog.factors %}
+      <li>{{ self.backlog_factor_text(loop.index0) | safe }}</li>
+    {% endfor %}
+  </ul>
+  {% if !backlog.recs.is_empty() %}
+    <div class="recs-head">
+      {{ self.t_args("probe.recs_head", &[backlog.target_drain_minutes.to_string()][..]) }}
     </div>
-    <ul class="factors">
-      {% for factor in b.factors %}
-        <li>{{ self.backlog_factor_text(loop.index0) | safe }}</li>
+    <ul class="recs">
+      {% for rec in backlog.recs %}
+        <li><code>{{ self.backlog_rec_label(loop.index0) | safe }}</code></li>
       {% endfor %}
     </ul>
-    {% if !b.recs.is_empty() %}
-      <div class="recs-head">
-        {{ self.t_args("probe.recs_head", &[b.target_drain_minutes.to_string()][..]) }}
-      </div>
-      <ul class="recs">
-        {% for rec in b.recs %}
-          <li><code>{{ self.backlog_rec_label(loop.index0) | safe }}</code></li>
-        {% endfor %}
-      </ul>
-    {% endif %}
-    <div class="muted small">
-      {{ self.t_args("probe.config_snapshot", &[
-        b.due_capacity.to_string(),
-        probe_view.cycle_interval_secs.to_string(),
-        probe_view.concurrency.to_string(),
-      ][..]) }}
-    </div>
+  {% endif %}
+  <div class="muted small">
+    {{ self.t_args("probe.config_snapshot", &[
+      backlog.due_capacity.to_string(),
+      probe_view.cycle_interval_secs.to_string(),
+      probe_view.concurrency.to_string(),
+    ][..]) }}
   </div>
-{% endif %}
+</div>
 
 <div class="grid cols-4">
   <div class="panel stat-card">
@@ -118,7 +116,7 @@
         {% for (bucket, count) in coverage %}
         <tr>
           <td class="small">{{ self.coverage_label(bucket) }}</td>
-          <td><a href="/admin/proxies?coverage={{ bucket }}">{{ count }}</a></td>
+          <td><a href="/admin/proxies?coverage={{ bucket }}" aria-label="{{ self.coverage_label(bucket) }}: {{ count }}">{{ count }}</a></td>
         </tr>
         {% endfor %}
       </tbody>
@@ -134,7 +132,19 @@
     {% when None %}
       <p class="muted small">{{ self.t("probe.retention_never") }}</p>
   {% endmatch %}
+  {#- The server's own pass over the two journals it writes; its stamp is
+      kept separate from the daemon's `last_rotation`, so the card names
+      each sweep's source instead of merging two runners into one line. #}
+  {% match server_retention %}
+    {% when Some with (rot) %}
+      <p class="muted small">{{ self.t("probe.retention_server") }} {{ self.ts(rot.ts) | safe }} · {{ self.t_args("probe.retention_server_deleted", &[rot.fetch_log.to_string(), rot.probe_requests.to_string()][..]) }}</p>
+      {% if !rot.ok %}
+        <p class="muted small">{{ self.t_args("probe.retention_server_failed", &[rot.error.as_deref().unwrap_or("?").to_string()][..]) }}</p>
+      {% endif %}
+    {% when None %}
+  {% endmatch %}
   <p class="muted small">{{ self.t_args("probe.retention_rows", &[journal_probe_rows.to_string(), journal_fetch_rows.to_string()][..]) }}</p>
+  <p class="muted small">{{ self.t_named("probe.retention_keep", &[("probe", retention_probe_days.to_string()), ("fetch", retention_fetch_days.to_string())][..]) }}</p>
 </div>
 
 <div class="panel">

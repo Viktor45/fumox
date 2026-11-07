@@ -1,9 +1,11 @@
 //! Public subscription endpoints.
 //!
 //! `GET /sub/{token|slug}` serves a profile, `GET /src/{token|slug}` a
-//! single source. Output format is fixed by the profile (`?format=` is
-//! forbidden); only 200 responses are cached, and the full
-//! outcome table is implemented:
+//! single source, `GET /export/alive/{token}` and `GET /export/ready/{token}`
+//! the two alive tiers (see [`crate::alive_export`]), and `GET /healthz`
+//! (added by [`public_app`]) is the liveness probe. Output format is fixed
+//! by the profile (`?format=` is forbidden); only 200 responses are cached,
+//! and the full outcome table is implemented:
 //!
 //! - recoverable source errors (`network`, `http_server`) → serve the DB
 //!   snapshot as stale + `X-Fumox-Stale: true`, no cutoff;
@@ -17,9 +19,11 @@
 //!   `X-Fumox-Warning: incompatible-entries-skipped` and the count in
 //!   `X-Fumox-Skipped`.
 
-use crate::cache::{Caches, InlineClaim, InlineOutcome, Rendered};
+// The freshness cap lives once, next to the cache it governs: the same
+// window `/sub`, `/src` and the alive exports serve under.
+use crate::cache::{Caches, InlineClaim, InlineOutcome, RENDER_FRESHNESS_CAP_SECS, Rendered};
 use crate::pipeline::{self, Candidate, CompiledPipeline, PipelineIssue};
-use crate::security::{RateLimiter, client_key, fmt_rfc3339_utc};
+use crate::security::{ClientKeySource, RateLimiter, client_key, fmt_rfc3339_utc};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -37,21 +41,6 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
-
-/// Upper bound on how long a rendered subscription body is served from the
-/// processed cache as fresh, in seconds.
-///
-/// A source TTL answers a different question: how often to re-download the
-/// upstream feed, and the admin form accepts up to a day. Health is owned by
-/// another process: `fumox-probe` moves rows between tiers, and the server
-/// only hears about it when the next ingest invalidates the rendering. Left
-/// unbounded, a node the probe just retired keeps being served for a whole
-/// TTL. The window is therefore fixed and short, the same reasoning (and the
-/// same value) as `alive_export::EXPORT_TTL_SECS`: long enough to collapse a
-/// burst of client downloads into one render, far shorter than a probe cycle.
-/// A stale entry is still served immediately (stale-while-revalidate), so
-/// this costs one background re-render per window, never a 5xx.
-const RENDER_FRESHNESS_CAP_SECS: i64 = 30;
 
 /// Deadline for one inline (cache-miss) render, and the same deadline a
 /// waiter gives the leader it is waiting behind. Generous next to a real
@@ -77,18 +66,16 @@ pub struct AppState {
     /// header is read; `None` honors none, so the peer address is the
     /// client even when a trusted proxy is configured.
     pub trusted_header: fumox_core::config::TrustedHeader,
-    /// Hostnames / IPs allowed to reach the public listener. Empty = accept
-    /// any host (today's behavior); setting this locks the alive-export
-    /// endpoint to the operator's own hostname.
-    pub allowed_hosts: Vec<String>,
-    /// Row ceiling of one `/export/alive` / `/export/ready` body
-    /// (`[server].export_max_rows`). The two links have no upstream cap of
-    /// their own, so this is the only thing bounding one public request.
-    pub export_max_rows: u32,
-    /// The capability token of the export links, kept in process memory
-    /// (the admin panel shares the instance, so a rotation reaches both
-    /// listeners at once).
-    pub export_token: crate::alive_export::TokenCache,
+    /// Hosts allowed to reach the public listener, canonicalized once at
+    /// construction ([`crate::host_gate::HostAllowlist`]). Empty = accept
+    /// any host; setting this locks the alive-export endpoint to the
+    /// operator's own hostname.
+    pub allowed_hosts: crate::host_gate::HostAllowlist,
+    /// The settings of the two export links: the row ceiling of one body
+    /// (`[server].export_max_rows`) and the capability token, kept in
+    /// process memory (the admin panel shares the instance, so a rotation
+    /// reaches both listeners at once).
+    pub export: crate::alive_export::ExportState,
 }
 
 impl AppState {
@@ -106,8 +93,7 @@ impl AppState {
         trusted_cidrs: Vec<ipnet::IpNet>,
         trusted_header: fumox_core::config::TrustedHeader,
         allowed_hosts: Vec<String>,
-        export_max_rows: u32,
-        export_token: crate::alive_export::TokenCache,
+        export: crate::alive_export::ExportState,
     ) -> Self {
         Self {
             pool,
@@ -116,10 +102,35 @@ impl AppState {
             limits,
             trusted_cidrs,
             trusted_header,
-            allowed_hosts,
-            export_max_rows,
-            export_token,
+            // The raw config list is canonicalized exactly once, here at
+            // the single construction site: the gate compares the request
+            // host against a ready list, never re-canonicalizing it.
+            allowed_hosts: crate::host_gate::HostAllowlist::new(&allowed_hosts),
+            export,
         }
+    }
+
+    /// The in-process preview state of the admin panel (the profile card
+    /// renders exactly what `/sub` would serve without crossing the
+    /// public listener): the owner's pool, caches, geo resolver and
+    /// export state, fresh unlimited rate-limit counters (never consulted
+    /// in-process) and no trusted proxies. Built next to the fields it
+    /// fills, so the preview cannot drift from the wiring [`Self::new`]
+    /// documents.
+    pub fn for_preview(owner: &crate::admin::AdminState) -> Self {
+        Self::new(
+            owner.pool.clone(),
+            owner.caches.clone(),
+            owner.geo.clone(),
+            PublicRateLimits::unlimited(),
+            Vec::new(),
+            fumox_core::config::TrustedHeader::None,
+            Vec::new(),
+            crate::alive_export::ExportState::new(
+                owner.server().export_max_rows,
+                owner.export_token.clone(),
+            ),
+        )
     }
 }
 
@@ -185,22 +196,50 @@ pub fn router(state: AppState) -> Router {
 /// exhausted public window must not make an orchestrator's probe answer
 /// 429 and restart a healthy instance. Kept as one function so the
 /// layering is testable without binding listeners.
-/// `health_pool` is a pool reserved for `/healthz` alone, not the render
-/// pool. The liveness answer must not depend on render load: a saturated
-/// pool is this process's own load, and an orchestrator reads 503 as
-/// "restart me", so sharing the pool turns a busy minute into a restart
-/// loop. The dedicated pool holds one connection and is only ever asked
-/// `SELECT 1`.
-pub fn public_app(state: AppState, health_pool: DbPool) -> Router {
+/// `health_pool` is a [`HealthPool`]: a pool reserved for `/healthz`
+/// alone, proven by its type.
+pub fn public_app(state: AppState, health_pool: HealthPool) -> Router {
     let geo = state.geo.clone();
+    let pool = health_pool.pool().clone();
     router(state).route(
         "/healthz",
         get(move || {
-            let pool = health_pool.clone();
+            let pool = pool.clone();
             let geo = geo.clone();
             async move { healthz(pool, geo).await }
         }),
     )
+}
+
+/// A pool reserved for `/healthz` alone, not the render pool. The
+/// liveness answer must not depend on render load: a saturated pool is
+/// this process's own load, and an orchestrator reads 503 as
+/// "restart me", so sharing the pool turns a busy minute into a restart
+/// loop. The dedicated pool holds one connection and is only ever asked
+/// `SELECT 1`.
+///
+/// The type proves the pool's provenance: the only constructor takes a
+/// [`fumox_core::config::DatabaseConfig`] and forces one connection, so a
+/// call site cannot hand the render pool over by accident.
+#[derive(Clone)]
+pub struct HealthPool(DbPool);
+
+impl HealthPool {
+    /// Build the dedicated `/healthz` pool: the deployment's database,
+    /// one connection, whatever `[database].max_connections` says.
+    pub async fn dedicated(
+        config: &fumox_core::config::DatabaseConfig,
+    ) -> fumox_core::Result<Self> {
+        let mut config = config.clone();
+        config.max_connections = 1;
+        Ok(Self(fumox_core::db::connect_pool(&config).await?))
+    }
+
+    /// The inner pool: `/healthz`'s `SELECT 1` runs on it; the tests hold
+    /// its single connection or close it outright.
+    pub(crate) fn pool(&self) -> &DbPool {
+        &self.0
+    }
 }
 
 /// Liveness probe: 200 while the database answers a trivial query, 503
@@ -254,36 +293,58 @@ async fn healthz(pool: DbPool, geo: Arc<GeoResolver>) -> Response {
 /// uncounted.
 async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(connect) = req.extensions().get::<ConnectInfo<SocketAddr>>().cloned() else {
+        // Once per process: such a request cannot be keyed per IP, so the
+        // per-IP ceilings are inactive for it. Embedded runtimes never
+        // carry the extension, and one line per request would be noise.
+        warn_missing_connect_info_once();
         return next.run(req).await;
     };
-    let ip = client_key(
+    let (key, source) = client_key(
         connect.0,
         req.headers(),
         &state.trusted_cidrs,
         state.trusted_header,
-    )
-    .to_string();
-    if !state.limits.all.allow(&ip).await {
-        return error_response(
+    );
+    let ip = key.to_string();
+    // A key that degraded to the peer despite a declared header and a
+    // trusted proxy ([`ClientKeySource::PeerFallback`]) puts everything
+    // behind that peer into one bucket: say so once per window, the
+    // condition holds for every request the window covers.
+    if source == ClientKeySource::PeerFallback {
+        crate::security::warn_shared_peer_bucket(&ip, state.limits.all.window());
+    }
+    if let Err(retry_after) = state.limits.all.check(&ip).await {
+        // Warn once per client key per window, debug after: a scraping
+        // burst must be visible without one line per 429. The client key
+        // is the only identity named — no token, no query string.
+        if should_warn_rate_limit(&ip) {
+            tracing::warn!(client = %ip, "public rate-limit window exhausted");
+        } else {
+            tracing::debug!(client = %ip, "public rate-limit window exhausted");
+        }
+        return error_response_with_retry(
             StatusCode::TOO_MANY_REQUESTS,
             "too many requests, try again later",
+            retry_after,
         );
     }
     let response = next.run(req).await;
     if let Some(check) = response.extensions().get::<AuthFailure>().copied() {
         // A failed secret check on a public route (profile access token,
-        // export capability token): warn once per client key per window,
-        // debug after: the same coalescing the host gate's
-        // `alive_export::HostRejectLog` uses, so a token-guessing campaign
-        // is visible without one log line per request. The client key is
-        // logged, never the rejected token value.
+        // source access token, export capability token): warn once per
+        // client key per window, debug after: the same coalescing the
+        // shared warn registry gives the host gate, so a token-guessing
+        // campaign is visible without one log line per request. The client
+        // key is logged, never the rejected token value.
         if should_warn_auth_failure(&ip) {
             tracing::warn!(client = %ip, check = check.0, "public secret check failed");
         } else {
             tracing::debug!(client = %ip, check = check.0, "public secret check failed");
         }
     }
-    if response.status() == StatusCode::FORBIDDEN && !state.limits.auth_failures.allow(&ip).await {
+    if response.status() == StatusCode::FORBIDDEN
+        && let Some(retry_after) = state.limits.auth_failures.check(&ip).await.err()
+    {
         // The failure window rejected the request, give the hit back to the
         // generous window so one brute-force attempt does not cost the
         // caller two windows.
@@ -292,9 +353,10 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
             client = %ip,
             "auth-failure rate limit window exhausted; rejecting the request"
         );
-        return error_response(
+        return error_response_with_retry(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed access attempts, try again later",
+            retry_after,
         );
     }
     response
@@ -318,115 +380,102 @@ const AUTH_FAIL_WARN_WINDOW: Duration = Duration::from_secs(3_600);
 
 /// Distinct client keys kept in the registry, bounding the memory a flood
 /// of distinct keys could pin. Hitting this count does not silence new
-/// keys: it bounds tracking, not warnings (see [`AuthFailLog::should_warn`]).
+/// keys: it bounds tracking, not warnings (see
+/// [`crate::security::WarnRegistry::should_warn`]).
 const AUTH_FAIL_MAX_TRACKED: usize = 1_024;
 
 /// Warns this registry may emit per [`AUTH_FAIL_WARN_WINDOW`]. Past it,
-/// failures drop to debug, but the first suppressed client of the window is
-/// named in a summary when the window rolls over.
+/// failures drop to debug, but the clients the window swallowed are named
+/// in a summary when the window rolls over.
 const AUTH_FAIL_MAX_WARNS: u32 = 64;
 
 /// Per-client warn registry for failed secret checks on the public
-/// listener, see [`AuthFailLog::should_warn`]. The same deduplication
-/// pattern as the host gate's `alive_export::HostRejectLog`, keyed by
-/// client key instead of host.
-static AUTH_FAIL_LOG: LazyLock<Mutex<AuthFailLog>> =
-    LazyLock::new(|| Mutex::new(AuthFailLog::default()));
-
-#[derive(Default)]
-struct AuthFailLog {
-    seen: HashMap<String, Instant>,
-    /// Start of the current warn window, and how much of
-    /// [`AUTH_FAIL_MAX_WARNS`] it has spent.
-    window_start: Option<Instant>,
-    warns_emitted: u32,
-    /// First client the window could not warn about, kept so the rollover
-    /// summary can name it.
-    suppressed: Option<String>,
-    /// Suppressed clients in the current window, for the rollover count.
-    suppressed_total: u64,
-}
-
-impl AuthFailLog {
-    /// Roll the window over if it has elapsed. Returns a summary to log
-    /// when the window that just closed had suppressed clients.
-    fn roll_window(&mut self, now: Instant) -> Option<String> {
-        let Some(start) = self.window_start else {
-            // First failure ever: open the window, report nothing.
-            self.window_start = Some(now);
-            return None;
-        };
-        if now.duration_since(start) < AUTH_FAIL_WARN_WINDOW {
-            return None;
-        }
-        let suppressed = self.suppressed.take();
-        let total = std::mem::take(&mut self.suppressed_total);
-        self.warns_emitted = 0;
-        self.window_start = Some(now);
-        suppressed.map(|client| {
-            format!(
-                "public auth failures: {total} dropped to debug this window, \
-                 first suppressed client {client}"
-            )
-        })
-    }
-
-    /// `true` when this failure of `client` should warn, plus a summary to
-    /// log when a window rolls over (see [`Self::roll_window`]).
-    ///
-    /// Three rules, in order: a client already warned inside the window is
-    /// quiet; a client past [`AUTH_FAIL_MAX_WARNS`] for the window is quiet
-    /// but remembered for the summary; otherwise it warns. The per-window
-    /// budget is what stops a token-guessing campaign from mirroring itself
-    /// into the log, and the summary is what stops the campaign from going
-    /// unseen: even as the hundred-and-first client of a busy hour it is
-    /// named once at the rollover.
-    ///
-    /// The budget covers every warning of the window, not only the ones
-    /// issued to a client seen for the first time: a client that comes back
-    /// after its own window elapsed spends the same budget as a new one, so
-    /// a campaign that rotates through a small set of clients cannot
-    /// out-warn the budget by waiting.
-    fn should_warn(&mut self, client: &str, now: Instant) -> (bool, Option<String>) {
-        let summary = self.roll_window(now);
-        if let Some(first) = self.seen.get(client) {
-            if now.duration_since(*first) < AUTH_FAIL_WARN_WINDOW {
-                return (false, summary);
-            }
-        } else if self.seen.len() >= AUTH_FAIL_MAX_TRACKED {
-            // Bound the map, not the warnings: drop the oldest entry.
-            if let Some(oldest) = self
-                .seen
-                .iter()
-                .min_by_key(|(_, first)| **first)
-                .map(|(client, _)| client.clone())
-            {
-                self.seen.remove(&oldest);
-            }
-        }
-        self.seen.insert(client.to_string(), now);
-        if self.warns_emitted >= AUTH_FAIL_MAX_WARNS {
-            self.suppressed.get_or_insert_with(|| client.to_string());
-            self.suppressed_total += 1;
-            return (false, summary);
-        }
-        self.warns_emitted += 1;
-        (true, summary)
-    }
-}
+/// listener, the shared bounded registry of
+/// [`crate::security::WarnRegistry`] keyed by client key — the same
+/// deduplication the host gate's `alive_export::HOST_REJECT_LOG` runs.
+static AUTH_FAIL_LOG: LazyLock<Mutex<crate::security::WarnRegistry>> = LazyLock::new(|| {
+    Mutex::new(crate::security::WarnRegistry::new(
+        AUTH_FAIL_WARN_WINDOW,
+        AUTH_FAIL_MAX_TRACKED,
+        AUTH_FAIL_MAX_WARNS,
+    ))
+});
 
 /// Whether a failed secret check from `client` should be logged at warn
-/// rather than debug (see [`AuthFailLog::should_warn`]). Logs the window
-/// summary when one came due, before the verdict for the request in hand.
+/// rather than debug (see [`crate::security::WarnRegistry::should_warn`]).
+/// Logs the window summary when one came due, before the verdict for the
+/// request in hand.
 fn should_warn_auth_failure(client: &str) -> bool {
     let (warn, summary) = AUTH_FAIL_LOG
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .should_warn(client, Instant::now());
     if let Some(summary) = summary {
-        tracing::warn!(summary);
+        let named = summary.suppressed.first().cloned().unwrap_or_default();
+        tracing::warn!(
+            "public auth failures: {} dropped to debug this window, \
+             first suppressed client {named}",
+            summary.suppressed_total
+        );
     }
     warn
+}
+
+/// Window and caps of the shared-window rejection log: the same shape as
+/// the auth-failure registry, because the two refusals read the same way
+/// in the log (a flood must be visible once, not per request).
+const RATE_LIMIT_WARN_WINDOW: Duration = AUTH_FAIL_WARN_WINDOW;
+const RATE_LIMIT_MAX_TRACKED: usize = AUTH_FAIL_MAX_TRACKED;
+const RATE_LIMIT_MAX_WARNS: u32 = AUTH_FAIL_MAX_WARNS;
+
+/// Per-client warn registry for refusals by the shared public window
+/// (`[server].rate_limit`), see [`should_warn_rate_limit`].
+static RATE_LIMIT_LOG: LazyLock<Mutex<crate::security::WarnRegistry>> = LazyLock::new(|| {
+    Mutex::new(crate::security::WarnRegistry::new(
+        RATE_LIMIT_WARN_WINDOW,
+        RATE_LIMIT_MAX_TRACKED,
+        RATE_LIMIT_MAX_WARNS,
+    ))
+});
+
+/// Whether one more refusal of `client` by the shared window should be
+/// logged at warn rather than debug: warn once per client key per window,
+/// debug after, so a scraping burst is visible without one line per 429.
+/// The registry's window is the limiter's own horizon: a refusal means
+/// nothing outside it.
+fn should_warn_rate_limit(client: &str) -> bool {
+    let (warn, summary) = RATE_LIMIT_LOG
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .should_warn(client, Instant::now());
+    if let Some(summary) = summary {
+        let named = summary.suppressed.first().cloned().unwrap_or_default();
+        tracing::warn!(
+            "public rate-limit refusals: {} dropped to debug this window, \
+             first suppressed client {named}",
+            summary.suppressed_total
+        );
+    }
+    warn
+}
+
+/// Set once per process, so a request arriving without
+/// `ConnectInfo<SocketAddr>` warns about the inactive per-IP rate limiting
+/// exactly once instead of once per request: embedded runtimes never carry
+/// the extension, so every request of such a deployment would repeat the
+/// same line forever.
+static MISSING_CONNECT_INFO_WARNED: LazyLock<std::sync::atomic::AtomicBool> =
+    LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+
+/// Warn once per process that a request came in without
+/// `ConnectInfo<SocketAddr>`: the per-IP rate limiting is inactive for it.
+/// Returns whether this call emitted the warning (the first one does).
+fn warn_missing_connect_info_once() -> bool {
+    let first = !MISSING_CONNECT_INFO_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst);
+    if first {
+        tracing::warn!("public request without ConnectInfo: per-IP rate limiting is inactive");
+    }
+    first
 }
 
 /// Non-cacheable error reply bubbling up from rendering.
@@ -443,8 +492,12 @@ struct ErrorReply {
 }
 
 impl ErrorReply {
-    fn internal(err: impl std::fmt::Display) -> Self {
-        tracing::error!(error = %err, "serving failed");
+    /// A database read failed mid-render. `target` names the cache key the
+    /// render was building (`sub:{profile_id}` / `src:{source_id}`), the
+    /// same identifier the cache and the invalidations use, so a log line
+    /// can be tied to the endpoint it broke.
+    fn internal(target: &str, err: impl std::fmt::Display) -> Self {
+        tracing::error!(target, error = %err, "serving failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "internal server error".to_string(),
@@ -466,6 +519,9 @@ impl ErrorReply {
     /// The source answered with an unrecoverable client error: the upstream
     /// status is the answer, and a cached snapshot must not keep masking it.
     fn upstream_unavailable(status: StatusCode, message: String) -> Self {
+        // The message names the source and its last error, so the reply the
+        // subscriber sees is traceable from the log without a request id.
+        tracing::warn!(status = %status, "upstream unavailable: serving the upstream status");
         Self {
             status,
             message,
@@ -522,7 +578,7 @@ async fn serve_sub(
         }
     }
 
-    let key = format!("sub:{}", profile.id);
+    let key = Caches::profile_key(&profile.id);
     let render_state = state.clone();
     let render_profile = profile.clone();
     let sources_state = state.clone();
@@ -548,6 +604,7 @@ async fn serve_src(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     if params.contains_key("format") {
         return error_response(
@@ -566,8 +623,32 @@ async fn serve_src(
     if !source.enabled {
         return error_response(StatusCode::NOT_FOUND, "source not found");
     }
+    // Optional per-source access token, the `/src` twin of the profile
+    // check in `serve_sub`: query parameter or Authorization: Bearer, NULL
+    // means the endpoint is public. A profile's token guards `/sub` only
+    // and does not extend here — the source row carries its own secret.
+    if let Some(required) = &source.access_token {
+        let provided = params
+            .get("token")
+            .cloned()
+            .or_else(|| bearer_token(&headers));
+        let ok = provided
+            .as_deref()
+            .is_some_and(|provided| fumox_core::token::verify(provided, required));
+        if !ok {
+            let mut response =
+                error_response(StatusCode::FORBIDDEN, "access token is missing or invalid");
+            // Flag the failure for the public rate-limit middleware, which
+            // logs it with the client key it computed; the token value is
+            // never logged.
+            response
+                .extensions_mut()
+                .insert(AuthFailure("source access token"));
+            return response;
+        }
+    }
 
-    let key = format!("src:{}", source.id);
+    let key = Caches::source_key(&source.id);
     let render_state = state.clone();
     let render_source = source.clone();
     let source_id = source.id.clone();
@@ -625,9 +706,19 @@ where
     S: FnOnce() -> SFut,
     SFut: Future<Output = Vec<String>>,
 {
+    // The cold-render horizon: the miss event below reports how long the
+    // one real render took, so an operator can tell an expensive render
+    // (log shows "miss") from a hot path ("hit"/"stale" only).
+    let serve_started = Instant::now();
     let now = fumox_core::models::now_ts();
     if let Some(rendered) = state.caches.processed_get(&key).await {
         if rendered.is_fresh(now) {
+            tracing::debug!(
+                key = %key,
+                elapsed_ms = serve_started.elapsed().as_millis() as u64,
+                outcome = "hit",
+                "subscription served from the processed cache"
+            );
             return to_response(&rendered);
         }
         if let Some(claim) = state.caches.try_start_revalidate(&key).await {
@@ -680,6 +771,12 @@ where
                 }
             });
         }
+        tracing::debug!(
+            key = %key,
+            elapsed_ms = serve_started.elapsed().as_millis() as u64,
+            outcome = "stale",
+            "stale snapshot served while a re-render runs"
+        );
         return to_response(&rendered);
     }
 
@@ -707,10 +804,8 @@ where
             // A render of this key failed a moment ago: its verdict is the
             // answer, a second render would fail the same way.
             InlineClaim::Failed { status, message } => {
-                return error_response(
-                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    &message,
-                );
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                return retryable_render_error(status, &message);
             }
             InlineClaim::Wait(mut ended) => {
                 // The leader's guard drop is the wake-up. The channel then
@@ -724,17 +819,17 @@ where
                     // lock, say). Answering beats parking the connection
                     // for as long as the leader lives.
                     tracing::warn!(key = %key, "inline render leader did not finish in time");
-                    return error_response(
+                    return error_response_with_retry(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "render in progress, try again",
+                        RENDER_RETRY_AFTER_SECS,
                     );
                 }
                 match ended.borrow_and_update().clone() {
                     InlineOutcome::Failed { status, message } => {
-                        return error_response(
-                            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                            &message,
-                        );
+                        let status =
+                            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        return retryable_render_error(status, &message);
                     }
                     InlineOutcome::Stored => {}
                 }
@@ -751,19 +846,37 @@ where
     // hold the claim (and every waiter behind it) for as long as the render
     // blocks.
     let rendered = match tokio::time::timeout(WAIT_FOR_LEADER, make_render()).await {
-        Ok(Ok(rendered)) => rendered,
+        Ok(Ok(rendered)) => {
+            tracing::info!(
+                key = %key,
+                elapsed_ms = serve_started.elapsed().as_millis() as u64,
+                outcome = "miss",
+                "cold render completed"
+            );
+            rendered
+        }
         Ok(Err(err)) => {
+            tracing::warn!(key = %key, status = %err.status, "inline render failed");
             claim.fail(err.status.as_u16(), err.message.clone());
             drop(claim);
-            return error_response(err.status, &err.message);
+            return retryable_render_error(err.status, &err.message);
         }
         Err(_) => {
+            tracing::warn!(
+                key = %key,
+                deadline_secs = WAIT_FOR_LEADER.as_secs(),
+                "inline render timed out"
+            );
             claim.fail(
                 StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                 "render timed out".to_string(),
             );
             drop(claim);
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "render timed out");
+            return error_response_with_retry(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "render timed out",
+                RENDER_RETRY_AFTER_SECS,
+            );
         }
     };
     let rendered = Arc::new(rendered);
@@ -792,7 +905,7 @@ where
 async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, ErrorReply> {
     let links = profiles::get_sources(&state.pool, &profile.id)
         .await
-        .map_err(ErrorReply::internal)?;
+        .map_err(|err| ErrorReply::internal(&format!("sub:{}", profile.id), err))?;
 
     // Load member sources in profile order with one `WHERE id IN (...)`
     // read: the per-member indexed fetch this replaced ran one query per
@@ -804,8 +917,8 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         .collect();
     let loaded = sources::get_many(&state.pool, &member_ids)
         .await
-        .map_err(ErrorReply::internal)?;
-    let mut members: Vec<(Source, CompiledPipeline)> = Vec::new();
+        .map_err(|err| ErrorReply::internal(&format!("sub:{}", profile.id), err))?;
+    let mut members: Vec<(Source, Arc<CompiledPipeline>)> = Vec::new();
     for (source_id, _position) in links {
         let Some(source) = loaded.get(&source_id) else {
             continue;
@@ -814,7 +927,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
             continue;
         }
         let merged = pipeline::merge_configs(source.pipeline.as_ref(), profile.pipeline.as_ref());
-        let compiled = CompiledPipeline::from_json(merged.as_ref()).map_err(|errors| {
+        let compiled = CompiledPipeline::from_json_cached(merged.as_ref()).map_err(|errors| {
             ErrorReply::corrupted_pipeline(&format!("sub:{}", profile.id), &errors)
         })?;
         members.push((source.clone(), compiled));
@@ -829,14 +942,14 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     }
 
     let profile_pipeline =
-        CompiledPipeline::from_json(profile.pipeline.as_ref()).map_err(|errors| {
+        CompiledPipeline::from_json_cached(profile.pipeline.as_ref()).map_err(|errors| {
             ErrorReply::corrupted_pipeline(&format!("sub:{}", profile.id), &errors)
         })?;
 
     let source_ids: Vec<String> = members.iter().map(|(s, _)| s.id.clone()).collect();
     let rows = proxies::list_with_source(&state.pool, &source_ids)
         .await
-        .map_err(ErrorReply::internal)?;
+        .map_err(|err| ErrorReply::internal(&format!("sub:{}", profile.id), err))?;
     let mut by_source: HashMap<String, Vec<proxies::ProxyRow>> = HashMap::new();
     for linked in rows {
         by_source
@@ -881,14 +994,15 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         }
         let rows = by_source.remove(&source.id).unwrap_or_default();
         let mut candidates = rows_to_candidates(rows, position as i64, &mut skipped);
-        if let Some(allowed) = &allowed_countries {
-            candidates.retain(|c| {
-                c.geo_country
-                    .as_deref()
-                    .is_some_and(|code| allowed.contains(&code.to_ascii_uppercase()))
-            });
-        }
+        // The tiers the source holds before the country filter, the same
+        // pre-filter bookkeeping `render_src` does: the "everything is
+        // hidden" verdict below is about the sources' health, so proxies a
+        // country allowlist removed must not make an alive source look
+        // quarantined (nor a quarantined one look healthy).
         loaded_statuses.extend(candidates.iter().map(|c| c.status));
+        if let Some(allowed) = &allowed_countries {
+            pipeline::retain_allowed_countries(&mut candidates, allowed);
+        }
         // Full per-source run, not just the per-source steps: the source's
         // own `limit.count` caps that source's contribution, and the
         // profile-level cap is applied again to the merged list below.
@@ -915,9 +1029,9 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     // source (in profile order) that set one, otherwise source order.
     let source_sort = members
         .iter()
-        .find(|(_, compiled)| compiled.sort_explicit)
+        .find(|(_, compiled)| compiled.sort_explicit())
         .map(|(source, _)| source)
-        .filter(|_| !profile_pipeline.sort_explicit)
+        .filter(|_| !profile_pipeline.sort_explicit())
         .and_then(|source| source.pipeline.as_ref())
         .and_then(|pipeline| pipeline.get("sort"))
         .cloned();
@@ -926,7 +1040,7 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     // reached the merged list from a *source* pipeline would truncate every
     // other source's proxies too. Each source's cap was already applied to
     // that source's own contribution by `apply` above.
-    let finalizer = CompiledPipeline::from_json(
+    let finalizer = CompiledPipeline::from_json_cached(
         finalize_config(profile.pipeline.as_ref(), source_sort).as_ref(),
     )
     .map_err(|errors| ErrorReply::corrupted_pipeline(&format!("sub:{}", profile.id), &errors))?;
@@ -937,11 +1051,17 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     // base64 text), and structured formats have their own document shape.
     let interval_hours: u64 = update_interval_hours(&members).parse().unwrap_or(1);
     let (body, content_type, skipped_entries) = encode(&all, profile.output_format, || {
-        url_list_header_block(&profile.name, interval_hours, all.len())
+        url_list_header_block(&profile.name, Some(interval_hours), all.len())
     });
 
+    // The name is user input and becomes an HTTP header value: kill line
+    // breaks so a crafted name cannot split the header (the body block
+    // applies the same sanitisation).
     let mut extra_headers: Vec<(String, String)> = vec![
-        ("profile-title".to_string(), profile.name.clone()),
+        (
+            "profile-title".to_string(),
+            profile.name.replace(['\n', '\r'], " "),
+        ),
         (
             "profile-update-interval".to_string(),
             update_interval_hours(&members),
@@ -989,12 +1109,12 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
         return Err(upstream_unavailable_reply(state, source).await);
     }
 
-    let compiled = CompiledPipeline::from_json(source.pipeline.as_ref())
+    let compiled = CompiledPipeline::from_json_cached(source.pipeline.as_ref())
         .map_err(|errors| ErrorReply::corrupted_pipeline(&format!("src:{}", source.id), &errors))?;
 
     let rows = proxies::list_with_source(&state.pool, std::slice::from_ref(&source.id))
         .await
-        .map_err(ErrorReply::internal)?;
+        .map_err(|err| ErrorReply::internal(&format!("src:{}", source.id), err))?;
     let mut skipped = SkippedRows::default();
     let mut candidates = rows_to_candidates(
         rows.into_iter().map(|linked| linked.proxy).collect(),
@@ -1026,7 +1146,7 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
     // rounded up from the source TTL, at least 1.
     let interval_hours = whole_hours(source.cache_ttl_seconds);
     let (body, content_type, skipped_entries) = encode(&out, OutputFormat::UriList, || {
-        url_list_header_block(&source.name, interval_hours as u64, out.len())
+        url_list_header_block(&source.name, Some(interval_hours as u64), out.len())
     });
 
     let mut extra_headers: Vec<(String, String)> = Vec::new();
@@ -1157,7 +1277,9 @@ fn rows_to_candidates(
             status,
             latency_ms: row.latency_ms,
             geo_country: row.geo_country.clone(),
-            geo_asn: row.geo_asn.clone(),
+            // The stored `AS{n}` spelling parses exactly once, here: the
+            // pipeline compares plain numbers downstream.
+            geo_asn: row.geo_asn.as_deref().and_then(pipeline::asn_number),
         });
     }
     candidates
@@ -1240,14 +1362,24 @@ fn uri_lines(candidates: &[Candidate]) -> String {
 /// Key names follow the de-facto subscription-header convention (mihomo,
 /// Stash, subconverter); URI-list parsers skip `#` lines, so the block is
 /// inert for clients (and for another fumox consuming it as a source).
-pub(crate) fn url_list_header_block(title: &str, interval_hours: u64, count: usize) -> String {
+/// `interval_hours` is the TTL-derived update schedule; `None` omits the
+/// interval line — the exports have no TTL to derive one from, and
+/// advertising a made-up schedule would mislead the client.
+pub(crate) fn url_list_header_block(
+    title: &str,
+    interval_hours: Option<u64>,
+    count: usize,
+) -> String {
     // Title comes from a user-editable name: kill newlines so a crafted
     // name cannot inject forged comment lines into the output.
     let title = title.replace(['\n', '\r'], " ");
     let timestamp = fmt_rfc3339_utc(fumox_core::models::now_ts());
+    let interval = interval_hours
+        .map(|hours| format!("# profile-update-interval: {hours}\n"))
+        .unwrap_or_default();
     format!(
         "# profile-title: {title}\n\
-         # profile-update-interval: {interval_hours}\n\
+         {interval}\
          # nodes count: {count}\n\
          # generated by: fumox {} at {timestamp}\n",
         env!("CARGO_PKG_VERSION"),
@@ -1286,7 +1418,7 @@ fn finalize_config(
 /// falls back to one hour. Both the render freshness window and the
 /// `profile-update-interval` derive from this single computation over
 /// the same members list.
-fn min_member_ttl(members: &[(Source, CompiledPipeline)]) -> i64 {
+fn min_member_ttl(members: &[(Source, Arc<CompiledPipeline>)]) -> i64 {
     members
         .iter()
         .map(|(s, _)| s.cache_ttl_seconds)
@@ -1303,7 +1435,7 @@ fn whole_hours(ttl_seconds: i64) -> i64 {
 
 /// `profile-update-interval` in whole hours (mihomo convention), rounded
 /// up from the shortest member-source TTL, at least 1.
-fn update_interval_hours(members: &[(Source, CompiledPipeline)]) -> String {
+fn update_interval_hours(members: &[(Source, Arc<CompiledPipeline>)]) -> String {
     whole_hours(min_member_ttl(members)).to_string()
 }
 
@@ -1399,6 +1531,38 @@ pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+/// [`error_response`] with a `Retry-After` header in whole seconds. The
+/// refusals a client can do nothing about but wait (an exhausted rate-limit
+/// window, a render still in progress) name the horizon, so a well-behaved
+/// client backs off instead of spinning on the same instant.
+pub(crate) fn error_response_with_retry(
+    status: StatusCode,
+    message: &str,
+    retry_after_secs: u64,
+) -> Response {
+    let mut response = error_response(status, message);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
+    response
+}
+
+/// Seconds a client is told to wait before retrying a 503 that came from
+/// the render machinery (`render in progress` / `render timed out`): a few
+/// seconds, far under [`WAIT_FOR_LEADER`], because the next attempt may
+/// find the leader finished and the entry stored.
+const RENDER_RETRY_AFTER_SECS: u64 = 5;
+
+/// A published render failure served to a waiter: a 503 verdict
+/// (`render timed out`) is retryable and names the horizon, any other
+/// status is the upstream's answer and carries nothing extra.
+fn retryable_render_error(status: StatusCode, message: &str) -> Response {
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        return error_response_with_retry(status, message, RENDER_RETRY_AFTER_SECS);
+    }
+    error_response(status, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1409,18 +1573,21 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    async fn test_state() -> AppState {
+    async fn test_state() -> (fumox_core::tempdir_lite::TempDir, AppState) {
         state_with_limits(PublicRateLimits::unlimited()).await
     }
 
     /// A state whose public rate limiters use the given window sizes, with
     /// the backing pool returned so tests can close or probe it directly.
-    async fn state_and_pool_with_limits(limits: PublicRateLimits) -> (AppState, DbPool) {
-        let dir =
-            std::env::temp_dir().join(format!("fumox-serve-test-{}", fumox_core::models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// The scratch directory comes back too: the `TempDir` guard removes
+    /// it on drop, so the binding has to outlive the test (`let (_dir,
+    /// state) = …`), the same contract every core/admin test helper uses.
+    async fn state_and_pool_with_limits(
+        limits: PublicRateLimits,
+    ) -> (fumox_core::tempdir_lite::TempDir, AppState, DbPool) {
+        let dir = fumox_core::tempdir_lite::TempDir::new("serve-test");
         let cfg = fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
+            path: dir.path().join("test.db"),
             ..Default::default()
         };
         let pool = fumox_core::db::connect_pool(&cfg).await.unwrap();
@@ -1430,6 +1597,7 @@ mod tests {
             ..Default::default()
         };
         (
+            dir,
             AppState::new(
                 pool.clone(),
                 Caches::new(),
@@ -1438,16 +1606,41 @@ mod tests {
                 Vec::new(),
                 fumox_core::config::TrustedHeader::None,
                 Vec::new(),
-                fumox_core::config::ServerConfig::default().export_max_rows,
-                crate::alive_export::TokenCache::new(),
+                crate::alive_export::ExportState::new(
+                    fumox_core::config::ServerConfig::default().export_max_rows,
+                    crate::alive_export::TokenCache::new(),
+                ),
             ),
             pool,
         )
     }
 
     /// A state whose public rate limiters use the given window sizes.
-    async fn state_with_limits(limits: PublicRateLimits) -> AppState {
-        state_and_pool_with_limits(limits).await.0
+    async fn state_with_limits(
+        limits: PublicRateLimits,
+    ) -> (fumox_core::tempdir_lite::TempDir, AppState) {
+        let (dir, state, _pool) = state_and_pool_with_limits(limits).await;
+        (dir, state)
+    }
+
+    /// A public app plus the dedicated `/healthz` pool over the same temp
+    /// database, for the tests that exercise the liveness endpoint.
+    async fn healthz_app(
+        limits: PublicRateLimits,
+    ) -> (
+        fumox_core::tempdir_lite::TempDir,
+        Router,
+        DbPool,
+        HealthPool,
+    ) {
+        let (dir, state, pool) = state_and_pool_with_limits(limits).await;
+        let cfg = fumox_core::config::DatabaseConfig {
+            path: dir.path().join("healthz.db"),
+            ..Default::default()
+        };
+        let health = HealthPool::dedicated(&cfg).await.unwrap();
+        let app = public_app(state, health.clone());
+        (dir, app, pool, health)
     }
 
     /// Perform one GET carrying a peer-address extension, the public
@@ -1481,7 +1674,7 @@ mod tests {
     /// reach the handler instead of tripping the limiter.
     #[tokio::test]
     async fn requests_without_connect_info_pass_through_uncounted() {
-        let state = state_with_limits(PublicRateLimits::new(1, 1)).await;
+        let (_dir, state) = state_with_limits(PublicRateLimits::new(1, 1)).await;
         let app = router(state);
         for _ in 0..3 {
             let response = app
@@ -1503,8 +1696,7 @@ mod tests {
     /// a healthy instance.
     #[tokio::test]
     async fn healthz_stays_outside_the_public_rate_limit() {
-        let (state, pool) = state_and_pool_with_limits(PublicRateLimits::new(1, 1)).await;
-        let app = public_app(state, pool);
+        let (_dir, app, _pool, _health) = healthz_app(PublicRateLimits::new(1, 1)).await;
         // Exhaust the single-request window from one IP.
         assert_eq!(
             get_with_ip(app.clone(), "/sub/missing", "10.0.0.1").await,
@@ -1524,16 +1716,37 @@ mod tests {
     /// dead pool would let an orchestrator keep routing traffic here.
     #[tokio::test]
     async fn healthz_goes_red_when_the_database_is_closed() {
-        let (state, pool) = state_and_pool_with_limits(PublicRateLimits::unlimited()).await;
-        let app = public_app(state, pool.clone());
+        let (_dir, app, _pool, health) = healthz_app(PublicRateLimits::unlimited()).await;
         assert_eq!(
             get_with_ip(app.clone(), "/healthz", "10.0.0.1").await,
             StatusCode::OK
         );
-        pool.close().await;
+        health.pool().close().await;
         assert_eq!(
             get_with_ip(app, "/healthz", "10.0.0.1").await,
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// A busy dedicated pool must read as 503 within the probe's own
+    /// timeout, not hang: with one connection held, the acquire timeout
+    /// (2 s) is what stops the answer, far under sqlx's default 30 s —
+    /// the wait an orchestrator would read as a hang and answer with a
+    /// restart anyway.
+    #[tokio::test]
+    async fn healthz_answers_503_when_the_dedicated_pool_is_busy() {
+        let (_dir, app, _pool, health) = healthz_app(PublicRateLimits::unlimited()).await;
+        // Hold the pool's only connection: the probe must not queue.
+        let _held = health.pool().acquire().await.unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            get_with_ip(app, "/healthz", "10.0.0.1").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the busy answer must come from the 2 s acquire timeout, took {:?}",
+            started.elapsed()
         );
     }
 
@@ -1542,8 +1755,7 @@ mod tests {
     /// apart without reading the log.
     #[tokio::test]
     async fn healthz_names_the_geo_state() {
-        let (state, pool) = state_and_pool_with_limits(PublicRateLimits::unlimited()).await;
-        let app = public_app(state, pool);
+        let (_dir, app, _pool, _health) = healthz_app(PublicRateLimits::unlimited()).await;
         let body = body_with_ip(app, "/healthz", "10.0.0.1").await;
         assert!(
             body.starts_with("ok\n"),
@@ -1560,7 +1772,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_cold_requests_share_one_render() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let renders = Arc::new(AtomicUsize::new(0));
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..8 {
@@ -1608,7 +1820,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_cold_render_costs_one_attempt_not_one_per_waiter() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let renders = Arc::new(AtomicUsize::new(0));
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..8 {
@@ -1648,7 +1860,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_rate_limit_caps_requests_per_ip() {
-        let state = state_with_limits(PublicRateLimits::new(2, 1_000_000)).await;
+        let (_dir, state) = state_with_limits(PublicRateLimits::new(2, 1_000_000)).await;
         let app = router(state);
         assert_eq!(
             get_with_ip(app.clone(), "/sub/missing", "10.0.0.1").await,
@@ -1658,10 +1870,24 @@ mod tests {
             get_with_ip(app.clone(), "/sub/missing", "10.0.0.1").await,
             StatusCode::NOT_FOUND
         );
-        assert_eq!(
-            get_with_ip(app.clone(), "/sub/missing", "10.0.0.1").await,
-            StatusCode::TOO_MANY_REQUESTS
-        );
+        let mut request = Request::builder()
+            .uri("/sub/missing")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo("10.0.0.1:1".parse::<SocketAddr>().unwrap()));
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The refusal names its horizon: the seconds left of the window,
+        // so a well-behaved client backs off instead of spinning.
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("a 429 must carry Retry-After");
+        assert!(retry_after > 0, "the window is not over yet");
         // Another IP has its own window.
         assert_eq!(
             get_with_ip(app, "/sub/missing", "10.0.0.2").await,
@@ -1671,7 +1897,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_access_token_checks_are_limited() {
-        let state = state_with_limits(PublicRateLimits::new(1_000_000, 2)).await;
+        let (_dir, state) = state_with_limits(PublicRateLimits::new(1_000_000, 2)).await;
         let profile = make_profile(&state, "profLim000000", &[]).await;
         sqlx::query("UPDATE profiles SET access_token = 'secret' WHERE id = ?")
             .bind(&profile.id)
@@ -1714,7 +1940,7 @@ mod tests {
         // both limits are small and equal, so the refund is observable:
         // without it the third request (rejected by the failure window)
         // would have also consumed the third slot of the generous window.
-        let state = state_with_limits(PublicRateLimits::new(3, 2)).await;
+        let (_dir, state) = state_with_limits(PublicRateLimits::new(3, 2)).await;
         let profile = make_profile(&state, "profRef000000", &[]).await;
         sqlx::query("UPDATE profiles SET access_token = 'secret' WHERE id = ?")
             .bind(&profile.id)
@@ -1762,7 +1988,7 @@ mod tests {
     /// key.
     #[tokio::test]
     async fn public_rate_limit_uses_xff_ip_for_trusted_peer() {
-        let (mut state, _pool) =
+        let (_dir, mut state, _pool) =
             state_and_pool_with_limits(PublicRateLimits::new(1_000_000, 2)).await;
         state.trusted_cidrs = vec!["2.2.2.2/32".parse().unwrap()];
         state.trusted_header = fumox_core::config::TrustedHeader::Xff;
@@ -1828,7 +2054,7 @@ mod tests {
     /// passing check carries no marker.
     #[tokio::test]
     async fn auth_failures_are_marked_for_the_rate_limit_middleware() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         let mut profile = make_profile(&state, "profMark000000", &["srcA0000000"]).await;
         profile.access_token = Some("secret".to_string());
@@ -1836,7 +2062,7 @@ mod tests {
         // Seed the export token so the wrong-token branch below is the
         // comparison failure, not a missing `meta` row (both answer 404,
         // only the first is an auth failure).
-        let _export_token = state.export_token.current(&state.pool).await.unwrap();
+        let _export_token = state.export.token.current(&state.pool).await.unwrap();
         let app = router(state);
 
         let marked = |response: Response| {
@@ -1898,12 +2124,22 @@ mod tests {
         assert_eq!(marked(response), None);
     }
 
+    /// A fresh shared registry with the auth-failure parameters, the shape
+    /// the production static is built with.
+    fn auth_fail_registry() -> crate::security::WarnRegistry {
+        crate::security::WarnRegistry::new(
+            AUTH_FAIL_WARN_WINDOW,
+            AUTH_FAIL_MAX_TRACKED,
+            AUTH_FAIL_MAX_WARNS,
+        )
+    }
+
     /// One warn per client key per window, then debug: a token-guessing
     /// campaign must be visible without mirroring every request into the
     /// log.
     #[test]
     fn auth_fail_log_warns_once_per_client_per_window() {
-        let mut log = AuthFailLog::default();
+        let mut log = auth_fail_registry();
         let t0 = Instant::now();
         assert!(log.should_warn("10.0.0.1", t0).0);
         assert!(!log.should_warn("10.0.0.1", t0).0);
@@ -1920,21 +2156,61 @@ mod tests {
     /// window swallowed is named at the rollover.
     #[test]
     fn auth_fail_log_is_bounded_under_a_flood() {
-        let mut log = AuthFailLog::default();
+        let mut log = auth_fail_registry();
         let t0 = Instant::now();
         let warned = (0..AUTH_FAIL_MAX_TRACKED + 100)
             .filter(|i| log.should_warn(&format!("10.0.{i}.1"), t0).0)
             .count();
         // The per-window budget caps the warns, not the tracked set.
         assert_eq!(warned, AUTH_FAIL_MAX_WARNS as usize);
-        assert_eq!(log.seen.len(), AUTH_FAIL_MAX_TRACKED);
+        assert_eq!(log.len_tracked(), AUTH_FAIL_MAX_TRACKED);
         // A tracked key stays quiet inside its window and warns again once
         // it has rolled over, handing back the summary that names what the
         // window swallowed.
         let (warn, summary) = log.should_warn("10.0.0.1", t0 + Duration::from_secs(3_601));
         assert!(warn);
         let summary = summary.expect("a window that suppressed keys must summarise them");
-        assert!(summary.contains("10.0.64.1"), "summary: {summary}");
+        let named = summary.suppressed.join(", ");
+        assert!(named.contains("10.0.64.1"), "summary: {named:?}");
+    }
+
+    /// The missing-ConnectInfo warning never repeats: whatever test (or
+    /// startup path) consumes the process's first call, every call after
+    /// it is silent, so an embedded runtime does not mirror all of its
+    /// traffic into the log.
+    #[test]
+    fn missing_connect_info_never_warns_twice() {
+        warn_missing_connect_info_once();
+        for _ in 0..3 {
+            assert!(
+                !warn_missing_connect_info_once(),
+                "the warning must not repeat within one process"
+            );
+        }
+    }
+
+    /// A refusal by the shared window warns once per client key per
+    /// window, then drops to debug (the same registry contract as the
+    /// auth-failure log): a scraping burst stays visible without one line
+    /// per 429.
+    #[test]
+    fn rate_limit_refusals_warn_once_per_client() {
+        let mut log = crate::security::WarnRegistry::new(
+            RATE_LIMIT_WARN_WINDOW,
+            RATE_LIMIT_MAX_TRACKED,
+            RATE_LIMIT_MAX_WARNS,
+        );
+        let t0 = Instant::now();
+        assert!(log.should_warn("10.9.9.1", t0).0);
+        assert!(!log.should_warn("10.9.9.1", t0).0);
+        assert!(!log.should_warn("10.9.9.1", t0 + Duration::from_secs(600)).0);
+        // A second client has its own window.
+        assert!(log.should_warn("10.9.9.2", t0 + Duration::from_secs(600)).0);
+        // And the first one warns again after the window rolled over.
+        assert!(
+            log.should_warn("10.9.9.1", t0 + Duration::from_secs(3_601))
+                .0
+        );
     }
 
     /// The per-window budget covers the aged branch too: a client that
@@ -1943,7 +2219,7 @@ mod tests {
     /// clients cannot out-warn the budget by waiting.
     #[test]
     fn auth_fail_log_budget_covers_the_aged_branch() {
-        let mut log = AuthFailLog::default();
+        let mut log = auth_fail_registry();
         let t0 = Instant::now();
         // The first failure opens the window.
         assert!(log.should_warn("10.0.0.1", t0).0);
@@ -1957,7 +2233,7 @@ mod tests {
         for i in 0..(AUTH_FAIL_MAX_WARNS - 1) {
             assert!(log.should_warn(&format!("10.1.{i}.1"), t1).0);
         }
-        assert_eq!(log.warns_emitted, AUTH_FAIL_MAX_WARNS);
+        assert_eq!(log.warns_emitted(), AUTH_FAIL_MAX_WARNS);
 
         // The aged client comes back while that window still holds: the
         // aged branch must respect the budget like every other branch.
@@ -2000,6 +2276,7 @@ mod tests {
         let source = Source {
             id: id.to_string(),
             slug: None,
+            access_token: None,
             name: format!("source {id}"),
             url: "https://example.com/list".to_string(),
             enabled: true,
@@ -2048,6 +2325,21 @@ mod tests {
         profile
     }
 
+    /// `make_profile` plus a non-default output format, stored the way
+    /// the admin save path writes it: the format is part of the profile
+    /// before the first request renders it.
+    async fn make_profile_with_format(
+        state: &AppState,
+        id: &str,
+        source_ids: &[&str],
+        format: OutputFormat,
+    ) -> Profile {
+        let mut profile = make_profile(state, id, source_ids).await;
+        profile.output_format = format;
+        profiles::update(&state.pool, &profile).await.unwrap();
+        profile
+    }
+
     async fn ingest(state: &AppState, source_id: &str, entries: &[ProxyEntry]) {
         // Test helper: no drop rules anywhere, linger allowed.
         proxies::reconcile_source(
@@ -2060,6 +2352,21 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Move the proxies of one host — or every proxy at once when `host`
+    /// is `None` — into `status`, standing in for the probe daemon that
+    /// owns the column in production. The call sites used to hand-write
+    /// the same UPDATE with a string status; the typed helper keeps the
+    /// `ProxyStatus` → column mapping in one place.
+    async fn set_status(state: &AppState, host: Option<&str>, status: ProxyStatus) {
+        let query = match host {
+            Some(host) => sqlx::query("UPDATE proxies SET status = ? WHERE host = ?")
+                .bind(status.as_str())
+                .bind(host),
+            None => sqlx::query("UPDATE proxies SET status = ?").bind(status.as_str()),
+        };
+        query.execute(&state.pool).await.unwrap();
     }
 
     /// Perform one GET and return (status, headers, body text).
@@ -2090,6 +2397,7 @@ mod tests {
             Source {
                 id: "ttl-src".to_string(),
                 slug: None,
+                access_token: None,
                 name: "ttl source".to_string(),
                 url: "https://example.com/list".to_string(),
                 enabled: true,
@@ -2108,9 +2416,9 @@ mod tests {
                 error_class: None,
             }
         }
-        let members = |ttls: &[i64]| -> Vec<(Source, CompiledPipeline)> {
+        let members = |ttls: &[i64]| -> Vec<(Source, Arc<CompiledPipeline>)> {
             ttls.iter()
-                .map(|&ttl| (source(ttl), CompiledPipeline::default()))
+                .map(|&ttl| (source(ttl), Arc::new(CompiledPipeline::default())))
                 .collect()
         };
 
@@ -2147,7 +2455,7 @@ mod tests {
 
     #[tokio::test]
     async fn sub_serves_merged_deduped_output() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_source(&state, "srcB0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000", "srcB0000000"]).await;
@@ -2171,7 +2479,7 @@ mod tests {
         )
         .await;
 
-        let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
+        let (status, headers, body) = get(router(state.clone()), "/sub/profA0000000").await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -2203,11 +2511,33 @@ mod tests {
         // last-writer-wins for the name, and serving emits it exactly once.
         let dup_count = body.matches("h1.example.com:443").count();
         assert_eq!(dup_count, 1, "duplicate must appear once: {body:?}");
+
+        // A disabled member drops out of the merged output entirely: the
+        // profile keeps serving, from its remaining sources only.
+        let mut b = sources::get(&state.pool, "srcB0000000")
+            .await
+            .unwrap()
+            .unwrap();
+        b.enabled = false;
+        b.updated_at = fumox_core::models::now_ts();
+        sources::update_settings(&state.pool, &b).await.unwrap();
+        // Saved means immediately effective: the save invalidates the /sub
+        // cache, the same way the admin handler does.
+        state.caches.invalidate_profile("profA0000000").await;
+        let (status, _, body) = get(router(state), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(proxy_lines(&body), 2, "srcA only: {body:?}");
+        assert!(body.contains("h1.example.com:443"), "{body:?}");
+        assert!(body.contains("h2.example.com:443"), "{body:?}");
+        assert!(
+            !body.contains("h3.example.com"),
+            "the disabled source's proxies are not served: {body:?}"
+        );
     }
 
     #[tokio::test]
     async fn profile_country_filter_follows_stored_geo_facts() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         // Three proxies: confirmed US, confirmed DE, and one whose country
@@ -2227,7 +2557,8 @@ mod tests {
             ("de1.example.com", Some("DE")),
             ("xx.example.com", None),
         ] {
-            sqlx::query("UPDATE proxies SET status = 'alive', geo_country = ? WHERE host = ?")
+            set_status(&state, Some(host), ProxyStatus::Alive).await;
+            sqlx::query("UPDATE proxies SET geo_country = ? WHERE host = ?")
                 .bind(country)
                 .bind(host)
                 .execute(&state.pool)
@@ -2275,9 +2606,69 @@ mod tests {
         assert!(!body.contains("xx.example.com"), "{body:?}");
     }
 
+    /// The quarantine verdict is a health fact, not a filter fact: a
+    /// country allowlist that happens to keep only a quarantined row (the
+    /// healthy rows sit outside the allowlist) must not report
+    /// "all-proxies-quarantined" — the operator would chase the wrong
+    /// thing. The statuses are therefore read before the country filter.
+    #[tokio::test]
+    async fn a_country_filter_that_keeps_only_a_quarantined_row_is_not_a_quarantine_warning() {
+        let (_dir, state) = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        profile.countries = vec!["US".into()];
+        profiles::update(&state.pool, &profile).await.unwrap();
+        ingest(
+            &state,
+            "srcA0000000",
+            &[
+                entry("de", "de1.example.com", 443),
+                entry("us", "us1.example.com", 443),
+            ],
+        )
+        .await;
+        set_status(&state, Some("de1.example.com"), ProxyStatus::Alive).await;
+        set_status(&state, Some("us1.example.com"), ProxyStatus::Quarantine).await;
+        sqlx::query("UPDATE proxies SET geo_country = 'DE' WHERE host = 'de1.example.com'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET geo_country = 'US' WHERE host = 'us1.example.com'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(proxy_lines(&body), 0, "{body:?}");
+        assert_eq!(
+            header_str(&headers, "x-fumox-warning"),
+            None,
+            "the alive row is merely outside the allowlist: {body:?}"
+        );
+    }
+
+    /// The profile title becomes an HTTP header value: a crafted name
+    /// cannot split the header with an embedded line break, the same
+    /// sanitisation the body's comment block applies.
+    #[tokio::test]
+    async fn a_line_break_in_the_profile_title_cannot_split_the_header() {
+        let (_dir, state) = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        profile.name = "evil\n# nodes count: 999".to_string();
+        profiles::update(&state.pool, &profile).await.unwrap();
+        ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+
+        let (status, headers, _) = get(router(state), "/sub/profA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        let title = header_str(&headers, "profile-title").expect("the title must be served");
+        assert_eq!(title, "evil # nodes count: 999", "{title:?}");
+    }
+
     #[tokio::test]
     async fn unknown_or_disabled_profile_is_404() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         profile.enabled = false;
@@ -2292,7 +2683,7 @@ mod tests {
 
     #[tokio::test]
     async fn access_token_is_enforced() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         profile.access_token = Some("secret-token".to_string());
@@ -2340,18 +2731,76 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    /// The source's own access token guards `/src`, the twin of the
+    /// profile check above: without (or with a wrong) token the endpoint
+    /// answers 403 and marks the failure for the rate-limit middleware,
+    /// with the right token it serves the live tiers. The tokens are
+    /// independent: a profile token on the same source does not open
+    /// `/src`.
     #[tokio::test]
-    async fn format_query_param_is_rejected() {
-        let state = test_state().await;
+    async fn source_access_token_is_enforced() {
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
-        let (status, _, _) = get(router(state), "/sub/profA0000000?format=clash").await;
+        // The stored form is the hash, exactly what the admin save path
+        // writes: the endpoint compares the hash of what was presented.
+        sqlx::query("UPDATE sources SET access_token = ? WHERE id = ?")
+            .bind(fumox_core::token::hash("secret-token"))
+            .bind("srcA0000000")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+        // /src serves the live tiers only.
+        set_status(&state, None, ProxyStatus::Alive).await;
+
+        let (status, _, _) = get(router(state.clone()), "/src/srcA0000000").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _, _) = get(router(state.clone()), "/src/srcA0000000?token=wrong-token").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _, body) =
+            get(router(state.clone()), "/src/srcA0000000?token=secret-token").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("h1.example.com:443"), "{body:?}");
+
+        let request = Request::builder()
+            .uri("/src/srcA0000000")
+            .header("Authorization", "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A source token set through the admin hash path verifies the
+        // same way: the stored form is a hash, not the secret.
+        let stored = sources::get(&state.pool, "srcA0000000")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            fumox_core::token::is_hashed(stored.access_token.as_deref().unwrap_or("")),
+            "the token must be stored as a hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn format_query_param_is_rejected() {
+        let (_dir, state) = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        make_profile(&state, "profA0000000", &["srcA0000000"]).await;
+        let (status, _, _) = get(router(state.clone()), "/sub/profA0000000?format=clash").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The single-source endpoint refuses it the same way.
+        let (status, _, _) = get(router(state), "/src/srcA0000000?format=clash").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn slug_resolves_like_token() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         profile.slug = Some("ru-free".to_string());
@@ -2365,14 +2814,11 @@ mod tests {
 
     #[tokio::test]
     async fn all_quarantined_produces_warning_and_empty_body() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
-        sqlx::query("UPDATE proxies SET status = 'quarantine'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        set_status(&state, None, ProxyStatus::Quarantine).await;
 
         let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
         assert_eq!(status, StatusCode::OK);
@@ -2395,7 +2841,7 @@ mod tests {
     /// health problem the operator would chase in the wrong place.
     #[tokio::test]
     async fn a_filter_that_hides_every_ready_proxy_is_not_a_quarantine_warning() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         profile.pipeline = Some(serde_json::json!({
@@ -2413,10 +2859,7 @@ mod tests {
         )
         .await;
         // Tunnel-verified tier: nothing is quarantined or removed here.
-        sqlx::query("UPDATE proxies SET status = 'ready'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        set_status(&state, None, ProxyStatus::Ready).await;
 
         let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
         assert_eq!(status, StatusCode::OK);
@@ -2430,7 +2873,7 @@ mod tests {
 
     #[tokio::test]
     async fn recoverable_source_error_serves_stale_with_header() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
@@ -2457,7 +2900,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_client_error_returns_upstream_code() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         fetch_log::insert(
@@ -2499,7 +2942,7 @@ mod tests {
     /// never took effect.
     #[tokio::test]
     async fn failed_revalidation_drops_the_cached_snapshot() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
@@ -2518,7 +2961,7 @@ mod tests {
             .expect("the cold render is cached");
         state
             .caches
-            .processed_put(
+            .processed_put_unguarded(
                 "sub:profA0000000",
                 Rendered {
                     status: cached.status,
@@ -2596,7 +3039,7 @@ mod tests {
     #[tokio::test]
     async fn source_limit_applies_with_and_without_an_explicit_sort() {
         for sort in [None, Some(serde_json::json!({ "by": "name" }))] {
-            let state = test_state().await;
+            let (_dir, state) = test_state().await;
             let mut source = make_source(&state, "srcA0000000").await;
             let mut pipeline = serde_json::json!({ "version": 1, "limit": { "count": 1 } });
             if let Some(sort) = sort.clone() {
@@ -2618,10 +3061,7 @@ mod tests {
             )
             .await;
             // /src serves the live tiers only, probe the three rows first.
-            sqlx::query("UPDATE proxies SET status = 'alive'")
-                .execute(&state.pool)
-                .await
-                .unwrap();
+            set_status(&state, None, ProxyStatus::Alive).await;
 
             let label = format!("sort={sort:?}");
             let (status, _, body) = get(router(state.clone()), "/sub/profA0000000").await;
@@ -2640,7 +3080,7 @@ mod tests {
     /// without a limit of its own cannot outgrow the profile's.
     #[tokio::test]
     async fn profile_limit_caps_the_merged_list() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let mut source = make_source(&state, "srcA0000000").await;
         source.pipeline = Some(serde_json::json!({ "version": 1 }));
         sources::update_settings(&state.pool, &source)
@@ -2675,7 +3115,7 @@ mod tests {
     /// source's proxies out of `/sub` as well.
     #[tokio::test]
     async fn source_limit_does_not_truncate_the_other_sources() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         // Source A: explicit sort *and* a cap of 2 over 3 proxies.
         let mut a = make_source(&state, "srcA0000000").await;
         a.pipeline = Some(serde_json::json!({
@@ -2709,10 +3149,7 @@ mod tests {
             ],
         )
         .await;
-        sqlx::query("UPDATE proxies SET status = 'alive'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        set_status(&state, None, ProxyStatus::Alive).await;
 
         let (status, _, body) = get(router(state), "/sub/profA0000000").await;
         assert_eq!(status, StatusCode::OK);
@@ -2733,7 +3170,7 @@ mod tests {
     /// fresh for longer than the same short bound `/export/alive` uses.
     #[tokio::test]
     async fn rendered_output_is_not_fresh_for_a_whole_source_ttl() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let mut source = make_source(&state, "srcA0000000").await;
         source.cache_ttl_seconds = 86_400;
         sources::update_settings(&state.pool, &source)
@@ -2741,10 +3178,7 @@ mod tests {
             .unwrap();
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
-        sqlx::query("UPDATE proxies SET status = 'alive'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        set_status(&state, None, ProxyStatus::Alive).await;
 
         for (key, uri) in [
             ("sub:profA0000000", "/sub/profA0000000"),
@@ -2773,7 +3207,7 @@ mod tests {
 
     #[tokio::test]
     async fn parse_error_sets_warning_header() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
@@ -2800,11 +3234,15 @@ mod tests {
 
     #[tokio::test]
     async fn base64_profile_wraps_uri_list() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
-        let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
-        profile.output_format = OutputFormat::Base64;
-        profiles::update(&state.pool, &profile).await.unwrap();
+        make_profile_with_format(
+            &state,
+            "profA0000000",
+            &["srcA0000000"],
+            OutputFormat::Base64,
+        )
+        .await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
 
         let (status, _, body) = get(router(state), "/sub/profA0000000").await;
@@ -2819,7 +3257,7 @@ mod tests {
 
     #[tokio::test]
     async fn src_endpoint_serves_single_source() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_source(&state, "srcB0000000").await;
         ingest(
@@ -2836,14 +3274,8 @@ mod tests {
         ingest(&state, "srcB0000000", &[entry("b", "h3.example.com", 443)]).await;
         // Only the first proxy passed the health check; the second stays
         // unknown (never probed).
-        sqlx::query("UPDATE proxies SET status = 'alive' WHERE host = 'h1.example.com'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE proxies SET status = 'alive' WHERE host = 'h3.example.com'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        set_status(&state, Some("h1.example.com"), ProxyStatus::Alive).await;
+        set_status(&state, Some("h3.example.com"), ProxyStatus::Alive).await;
 
         let (status, _, body) = get(router(state.clone()), "/src/srcA0000000").await;
         assert_eq!(status, StatusCode::OK);
@@ -2862,18 +3294,31 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// A source whose proxies have never been probed serves the
+    /// documented empty feed: 200 with `nodes count: 0` and no proxy
+    /// lines — "untested" is out of the live tiers, not an error.
+    #[tokio::test]
+    async fn an_untested_source_serves_an_empty_body_with_nodes_count_zero() {
+        let (_dir, state) = test_state().await;
+        make_source(&state, "srcA0000000").await;
+        ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
+        // No status update: every proxy is still untested.
+
+        let (status, _, body) = get(router(state), "/src/srcA0000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("# nodes count: 0"), "{body:?}");
+        assert_eq!(proxy_lines(&body), 0, "{body:?}");
+    }
+
     /// The single-source endpoint reports the same verdict as the profile
     /// one: a source whose proxies are all out of the live tiers is a
     /// health fact, not an empty feed.
     #[tokio::test]
     async fn an_all_quarantined_source_warns_on_the_src_endpoint() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
-        sqlx::query("UPDATE proxies SET status = 'quarantine'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        set_status(&state, None, ProxyStatus::Quarantine).await;
 
         let (status, headers, body) = get(router(state), "/src/srcA0000000").await;
         assert_eq!(status, StatusCode::OK);
@@ -2886,14 +3331,35 @@ mod tests {
 
     #[tokio::test]
     async fn alive_export_is_404_before_initialization() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let (status, _, _) = get(router(state), "/export/alive/anything0000").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// The tail both export-tier tests assert: an unknown token is an
+    /// ordinary 404, and one rotation kills the old link while the
+    /// fresh one keeps serving. Returns the rotated token so the caller
+    /// can still assert on the fresh link's body.
+    async fn assert_token_lifecycle(state: &AppState, path_prefix: &str, token: &str) -> String {
+        let app = router(state.clone());
+        // An unknown token is an ordinary 404: the endpoint does not
+        // disclose whether the link ever existed.
+        let (status, _, _) = get(app.clone(), &format!("{path_prefix}/zzzzzzzzzzzz")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Rotating the token kills the old link immediately.
+        let fresh = state.export.token.rotate(&state.pool).await.unwrap();
+        assert_ne!(fresh, token);
+        let (status, _, _) = get(app.clone(), &format!("{path_prefix}/{token}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = get(app, &format!("{path_prefix}/{fresh}")).await;
+        assert_eq!(status, StatusCode::OK);
+        fresh
+    }
+
     #[tokio::test]
     async fn alive_export_link_serves_only_alive_proxies() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         ingest(
             &state,
@@ -2905,16 +3371,10 @@ mod tests {
             ],
         )
         .await;
-        sqlx::query("UPDATE proxies SET status = 'alive' WHERE host = 'h1.example.com'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE proxies SET status = 'quarantine' WHERE host = 'h2.example.com'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        set_status(&state, Some("h1.example.com"), ProxyStatus::Alive).await;
+        set_status(&state, Some("h2.example.com"), ProxyStatus::Quarantine).await;
 
-        let token = state.export_token.current(&state.pool).await.unwrap();
+        let token = state.export.token.current(&state.pool).await.unwrap();
         let (status, _, body) = get(router(state.clone()), &format!("/export/alive/{token}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("h1.example.com"), "{body:?}");
@@ -2922,10 +3382,12 @@ mod tests {
         assert!(!body.contains("h2.example.com"), "{body:?}");
         assert!(!body.contains("h3.example.com"), "{body:?}");
 
-        // An unknown token is an ordinary 404: the endpoint does not
-        // disclose whether the link ever existed.
-        let (status, _, _) = get(router(state.clone()), "/export/alive/zzzzzzzzzzzz").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        // The ready link is the other tier: the quarantined and the
+        // never-probed hosts stay out of it too.
+        let (status, _, body) = get(router(state.clone()), &format!("/export/ready/{token}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("h2.example.com"), "{body:?}");
+        assert!(!body.contains("h3.example.com"), "{body:?}");
 
         // The download variant attaches a dated file name.
         let (_, headers, _) = get(
@@ -2939,11 +3401,8 @@ mod tests {
             "{disposition}"
         );
 
-        // Rotating the token kills the old link immediately.
-        let fresh = state.export_token.rotate(&state.pool).await.unwrap();
-        assert_ne!(fresh, token);
-        let (status, _, _) = get(router(state.clone()), &format!("/export/alive/{token}")).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Unknown token and rotation: the shared lifecycle tail.
+        let fresh = assert_token_lifecycle(&state, "/export/alive", &token).await;
         let (status, _, body) = get(router(state), &format!("/export/alive/{fresh}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("h1.example.com"), "{body:?}");
@@ -2954,7 +3413,7 @@ mod tests {
     /// `alive` (unverified) proxy stays out, and rotation kills both links.
     #[tokio::test]
     async fn ready_export_link_serves_only_the_verified_tier() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         ingest(
             &state,
@@ -2965,16 +3424,10 @@ mod tests {
             ],
         )
         .await;
-        sqlx::query("UPDATE proxies SET status = 'alive' WHERE host = 'h1.example.com'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE proxies SET status = 'ready' WHERE host = 'h2.example.com'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        set_status(&state, Some("h1.example.com"), ProxyStatus::Alive).await;
+        set_status(&state, Some("h2.example.com"), ProxyStatus::Ready).await;
 
-        let token = state.export_token.current(&state.pool).await.unwrap();
+        let token = state.export.token.current(&state.pool).await.unwrap();
         let (status, _, body) = get(router(state.clone()), &format!("/export/ready/{token}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("export/ready"), "title block: {body:?}");
@@ -2988,14 +3441,20 @@ mod tests {
         assert!(body.contains("h1.example.com"), "{body:?}");
         assert!(!body.contains("h2.example.com"), "{body:?}");
 
-        // An unknown token is the same ordinary 404.
-        let (status, _, _) = get(router(state.clone()), "/export/ready/zzzzzzzzzzzz").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        // The download variant attaches a dated file name.
+        let (_, headers, _) = get(
+            router(state.clone()),
+            &format!("/export/ready/{token}?download=1"),
+        )
+        .await;
+        let disposition = header_str(&headers, "content-disposition").unwrap_or_default();
+        assert!(
+            disposition.starts_with("attachment; filename=\"fumox-ready-"),
+            "{disposition}"
+        );
 
-        // Rotation kills both links, one secret, one rotation.
-        let fresh = state.export_token.rotate(&state.pool).await.unwrap();
-        let (status, _, _) = get(router(state.clone()), &format!("/export/ready/{token}")).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Unknown token and rotation: the shared lifecycle tail.
+        let fresh = assert_token_lifecycle(&state, "/export/ready", &token).await;
         let (status, _, body) = get(router(state), &format!("/export/ready/{fresh}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("h2.example.com"), "{body:?}");
@@ -3005,7 +3464,7 @@ mod tests {
     fn url_list_header_block_sanitizes_and_formats() {
         // Newlines in a crafted profile name must not inject forged
         // comment lines into the output.
-        let block = url_list_header_block("evil\n# nodes count: 999", 6, 42);
+        let block = url_list_header_block("evil\n# nodes count: 999", Some(6), 42);
         let lines: Vec<&str> = block.lines().collect();
         assert_eq!(
             lines[0], "# profile-title: evil # nodes count: 999",
@@ -3019,11 +3478,19 @@ mod tests {
                 && lines[3].ends_with('Z'),
             "{block:?}"
         );
+        // No interval to advertise: the line is left out entirely rather
+        // than claiming a schedule that does not exist.
+        let bare = url_list_header_block("plain", None, 7);
+        assert!(
+            !bare.contains("profile-update-interval"),
+            "an export-style block must not claim an update interval: {bare:?}"
+        );
+        assert!(bare.contains("# nodes count: 7"), "{bare:?}");
     }
 
     #[tokio::test]
-    async fn url_list_header_block_on_all_three_endpoints() {
-        let state = test_state().await;
+    async fn url_list_header_block_on_every_render_endpoint() {
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         ingest(
@@ -3035,45 +3502,42 @@ mod tests {
             ],
         )
         .await;
-        // Both proxies alive: they appear in /sub, /src and the alive export.
-        sqlx::query("UPDATE proxies SET status = 'alive'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
-        let token = state.export_token.current(&state.pool).await.unwrap();
+        // One proxy per tier: /sub and /src serve both live tiers, the two
+        // exports are disjoint, so every endpoint's block documents its own
+        // output.
+        set_status(&state, Some("h1.example.com"), ProxyStatus::Alive).await;
+        set_status(&state, Some("h2.example.com"), ProxyStatus::Ready).await;
+        let token = state.export.token.current(&state.pool).await.unwrap();
 
         let app = router(state);
         for (uri, title, count) in [
             ("/sub/profA0000000", "Profile profA0000000", "2"),
             ("/src/srcA0000000", "source srcA0000000", "2"),
-            (&format!("/export/alive/{token}"), "export/alive", "2"),
+            (&format!("/export/alive/{token}"), "export/alive", "1"),
+            (&format!("/export/ready/{token}"), "export/ready", "1"),
         ] {
             let (status, _, body) = get(app.clone(), uri).await;
             assert_eq!(status, StatusCode::OK, "{uri}");
+            // The title line is the one that differs between the
+            // endpoints; the exact format of the block's remaining lines
+            // is url_list_header_block_sanitizes_and_formats's business.
             let lines: Vec<&str> = body.lines().collect();
             assert_eq!(
                 lines[0],
                 format!("# profile-title: {title}"),
                 "{uri}: {body:?}"
             );
-            assert_eq!(lines[1], "# profile-update-interval: 1", "{uri}: {body:?}");
             assert_eq!(
-                lines[2],
-                format!("# nodes count: {count}"),
+                proxy_lines(&body),
+                count.parse::<usize>().unwrap(),
                 "{uri}: {body:?}"
             );
-            assert!(
-                lines[3].starts_with("# generated by: fumox "),
-                "{uri}: {body:?}"
-            );
-            // The proxy lines follow after the block.
-            assert_eq!(lines.len(), 6, "{uri}: {body:?}");
         }
     }
 
     #[tokio::test]
     async fn src_interval_rounds_ttl_up_to_whole_hours() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let mut source = make_source(&state, "srcA0000000").await;
         // 90 minutes → 2 hours (rounded up, never 0).
         source.cache_ttl_seconds = 5400;
@@ -3081,10 +3545,7 @@ mod tests {
             .await
             .unwrap();
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
-        sqlx::query("UPDATE proxies SET status = 'alive'")
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        set_status(&state, None, ProxyStatus::Alive).await;
 
         let (status, _, body) = get(router(state), "/src/srcA0000000").await;
         assert_eq!(status, StatusCode::OK);
@@ -3093,7 +3554,7 @@ mod tests {
 
     #[tokio::test]
     async fn processed_cache_serves_snapshot_until_invalidated() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
@@ -3114,7 +3575,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_pipeline_filters_protocols() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         let mut source = make_source(&state, "srcA0000000").await;
         source.pipeline = Some(serde_json::json!({
             "version": 1,
@@ -3141,97 +3602,110 @@ mod tests {
         assert!(!body.contains("vless://"));
     }
 
+    /// Both structured formats serve their own document shape: the
+    /// content type matches, two servers sharing a name come out with
+    /// the auto-suffix collision break, and the unsupported tuic entry —
+    /// whose skip is asserted in this one place — does not grow a broken
+    /// record: the document stays valid instead.
     #[tokio::test]
-    async fn clash_profile_serves_yaml() {
-        let state = test_state().await;
-        make_source(&state, "srcA0000000").await;
-        let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
-        profile.output_format = OutputFormat::Clash;
-        profiles::update(&state.pool, &profile).await.unwrap();
-        // Two servers sharing a name (collision → auto-suffix) plus an
-        // unsupported tuic entry that must be skipped.
-        let mut tuic = entry("t", "h3.example.com", 443);
-        tuic.scheme = Scheme::Tuic;
-        ingest(
-            &state,
-            "srcA0000000",
-            &[
-                entry("a", "h1.example.com", 443),
-                entry("a", "h2.example.com", 443),
-                tuic,
-            ],
-        )
-        .await;
+    async fn structured_profile_formats_serve_their_document_shape() {
+        for (format, content_type, shape_key) in [
+            (OutputFormat::Clash, "text/yaml; charset=utf-8", "proxies"),
+            (
+                OutputFormat::SingBox,
+                "application/json; charset=utf-8",
+                "outbounds",
+            ),
+        ] {
+            let kind = format.as_str();
+            let (_dir, state) = test_state().await;
+            make_source(&state, "srcA0000000").await;
+            make_profile_with_format(&state, "profA0000000", &["srcA0000000"], format).await;
+            // Two servers sharing a name (collision → auto-suffix) plus an
+            // unsupported tuic entry that must be skipped.
+            let mut tuic = entry("t", "h3.example.com", 443);
+            tuic.scheme = Scheme::Tuic;
+            ingest(
+                &state,
+                "srcA0000000",
+                &[
+                    entry("a", "h1.example.com", 443),
+                    entry("a", "h2.example.com", 443),
+                    tuic,
+                ],
+            )
+            .await;
 
-        let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            header_str(&headers, "content-type"),
-            Some("text/yaml; charset=utf-8")
-        );
-        let parsed: serde_norway::Value =
-            serde_norway::from_str(&body).expect("body must be valid YAML");
-        let proxies = parsed["proxies"]
-            .as_sequence()
-            .expect("proxies must be a list");
-        assert_eq!(proxies.len(), 2, "tuic must be skipped: {body:?}");
-        assert_eq!(proxies[0]["type"].as_str(), Some("vless"));
-        assert_eq!(proxies[0]["name"].as_str(), Some("a"));
-        assert_eq!(proxies[1]["name"].as_str(), Some("a (2)"));
-        assert_eq!(proxies[0]["server"].as_str(), Some("h1.example.com"));
+            let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
+            assert_eq!(status, StatusCode::OK, "{kind}");
+            assert_eq!(
+                header_str(&headers, "content-type"),
+                Some(content_type),
+                "{kind}"
+            );
+            assert!(
+                !body.contains("h3.example.com"),
+                "tuic must be skipped: {kind}: {body:?}"
+            );
+            // (name/tag, type, server) of every record, read from the
+            // format's own document shape.
+            let records: Vec<(String, String, String)> = match format {
+                OutputFormat::Clash => {
+                    let parsed: serde_norway::Value =
+                        serde_norway::from_str(&body).expect("body must be valid YAML");
+                    parsed[shape_key]
+                        .as_sequence()
+                        .expect("proxies must be a list")
+                        .iter()
+                        .map(|r| {
+                            (
+                                r["name"].as_str().unwrap_or_default().to_string(),
+                                r["type"].as_str().unwrap_or_default().to_string(),
+                                r["server"].as_str().unwrap_or_default().to_string(),
+                            )
+                        })
+                        .collect()
+                }
+                OutputFormat::SingBox => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&body).expect("body must be valid JSON");
+                    parsed[shape_key]
+                        .as_array()
+                        .expect("outbounds must be an array")
+                        .iter()
+                        .map(|r| {
+                            (
+                                r["tag"].as_str().unwrap_or_default().to_string(),
+                                r["type"].as_str().unwrap_or_default().to_string(),
+                                r["server"].as_str().unwrap_or_default().to_string(),
+                            )
+                        })
+                        .collect()
+                }
+                // The table covers the structured formats only.
+                OutputFormat::UriList | OutputFormat::Base64 => unreachable!(),
+            };
+            assert_eq!(records.len(), 2, "tuic must be skipped: {kind}: {body:?}");
+            assert_eq!(records[0].0, "a", "{kind}: {body:?}");
+            assert_eq!(records[0].1, "vless", "{kind}: {body:?}");
+            assert_eq!(records[0].2, "h1.example.com", "{kind}: {body:?}");
+            // The name collision is broken by the auto-suffix in both shapes.
+            assert_eq!(records[1].0, "a (2)", "{kind}: {body:?}");
+            assert_eq!(records[1].1, "vless", "{kind}: {body:?}");
+        }
     }
 
-    #[tokio::test]
-    async fn singbox_profile_serves_json() {
-        let state = test_state().await;
-        make_source(&state, "srcA0000000").await;
-        let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
-        profile.output_format = OutputFormat::SingBox;
-        profiles::update(&state.pool, &profile).await.unwrap();
-        ingest(
-            &state,
-            "srcA0000000",
-            &[
-                entry("a", "h1.example.com", 443),
-                entry("a", "h2.example.com", 443),
-            ],
-        )
-        .await;
-
-        let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            header_str(&headers, "content-type"),
-            Some("application/json; charset=utf-8")
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_str(&body).expect("body must be valid JSON");
-        let outbounds = parsed["outbounds"]
-            .as_array()
-            .expect("outbounds must be an array");
-        assert_eq!(outbounds.len(), 2, "{body:?}");
-        assert_eq!(outbounds[0]["type"].as_str(), Some("vless"));
-        assert_eq!(outbounds[0]["tag"].as_str(), Some("a"));
-        assert_eq!(outbounds[1]["tag"].as_str(), Some("a (2)"));
-        assert_eq!(outbounds[0]["server"].as_str(), Some("h1.example.com"));
-    }
-
+    /// Every output format answers an all-quarantined profile with its
+    /// own valid, proxy-free document and the quarantine warning header.
     #[tokio::test]
     async fn all_quarantined_structured_formats_serve_empty_valid_config() {
-        for (format, kind) in [
-            (OutputFormat::Clash, "clash"),
-            (OutputFormat::SingBox, "singbox"),
-        ] {
-            let state = test_state().await;
+        for format in OutputFormat::all() {
+            let kind = format.as_str();
+            let (_dir, state) = test_state().await;
             make_source(&state, "srcA0000000").await;
-            let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
-            profile.output_format = format;
-            profiles::update(&state.pool, &profile).await.unwrap();
+            make_profile_with_format(&state, "profA0000000", &["srcA0000000"], *format).await;
             ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
-            sqlx::query("UPDATE proxies SET status = 'quarantine'")
-                .execute(&state.pool)
-                .await
-                .unwrap();
+            set_status(&state, None, ProxyStatus::Quarantine).await;
 
             let (status, headers, body) = get(router(state), "/sub/profA0000000").await;
             assert_eq!(status, StatusCode::OK, "{kind}");
@@ -3240,22 +3714,37 @@ mod tests {
                 Some("all-proxies-quarantined"),
                 "{kind}"
             );
-            match kind {
-                "clash" => {
+            // Dispatch on the enum itself: a new OutputFormat variant has
+            // to answer here too, the missing arm is a compile error.
+            match *format {
+                OutputFormat::Clash => {
                     let parsed: serde_norway::Value =
                         serde_norway::from_str(&body).expect("valid YAML");
                     assert!(
                         parsed["proxies"].as_sequence().unwrap().is_empty(),
-                        "{body:?}"
+                        "{kind}: {body:?}"
                     );
                 }
-                _ => {
+                OutputFormat::SingBox => {
                     let parsed: serde_json::Value =
                         serde_json::from_str(&body).expect("valid JSON");
                     assert!(
                         parsed["outbounds"].as_array().unwrap().is_empty(),
-                        "{body:?}"
+                        "{kind}: {body:?}"
                     );
+                }
+                OutputFormat::Base64 => {
+                    // The blob must stay decodable to a bare list: decode
+                    // it and make sure the quarantine left no proxy line.
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(body.trim())
+                        .expect("body must be valid base64");
+                    let text = String::from_utf8(decoded).unwrap();
+                    assert!(!text.contains("://"), "{kind}: {text:?}");
+                }
+                OutputFormat::UriList => {
+                    assert!(body.contains("# nodes count: 0"), "{kind}: {body:?}");
+                    assert!(body.lines().all(|l| l.starts_with('#')), "{kind}: {body:?}");
                 }
             }
         }
@@ -3266,11 +3755,15 @@ mod tests {
     /// count as a comment for a file that was copied out of the browser.
     #[tokio::test]
     async fn a_clash_profile_reports_the_entries_it_cannot_express() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
-        let mut profile = make_profile(&state, "profA0000000", &["srcA0000000"]).await;
-        profile.output_format = OutputFormat::Clash;
-        profiles::update(&state.pool, &profile).await.unwrap();
+        make_profile_with_format(
+            &state,
+            "profA0000000",
+            &["srcA0000000"],
+            OutputFormat::Clash,
+        )
+        .await;
         ingest(
             &state,
             "srcA0000000",
@@ -3302,15 +3795,12 @@ mod tests {
     #[tokio::test]
     async fn a_recoverable_error_serves_stale_on_both_endpoints() {
         for uri in ["/sub/profA0000000", "/src/srcA0000000"] {
-            let state = test_state().await;
+            let (_dir, state) = test_state().await;
             make_source(&state, "srcA0000000").await;
             make_profile(&state, "profA0000000", &["srcA0000000"]).await;
             ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
             // The live tiers are what the endpoints serve.
-            sqlx::query("UPDATE proxies SET status = 'alive'")
-                .execute(&state.pool)
-                .await
-                .unwrap();
+            set_status(&state, None, ProxyStatus::Alive).await;
             sources::record_fetch_outcome(
                 &state.pool,
                 "srcA0000000",
@@ -3336,7 +3826,7 @@ mod tests {
     #[tokio::test]
     async fn an_unrecoverable_error_answers_the_upstream_code_on_both_endpoints() {
         for uri in ["/sub/profA0000000", "/src/srcA0000000"] {
-            let state = test_state().await;
+            let (_dir, state) = test_state().await;
             make_source(&state, "srcA0000000").await;
             make_profile(&state, "profA0000000", &["srcA0000000"]).await;
             ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
@@ -3378,7 +3868,7 @@ mod tests {
     /// holds the new content afterwards.
     #[tokio::test]
     async fn a_successful_revalidation_replaces_the_cached_snapshot() {
-        let state = test_state().await;
+        let (_dir, state) = test_state().await;
         make_source(&state, "srcA0000000").await;
         make_profile(&state, "profA0000000", &["srcA0000000"]).await;
         ingest(&state, "srcA0000000", &[entry("a", "h1.example.com", 443)]).await;
@@ -3397,7 +3887,7 @@ mod tests {
             .expect("the cold render is cached");
         state
             .caches
-            .processed_put(
+            .processed_put_unguarded(
                 "sub:profA0000000",
                 Rendered {
                     status: cached.status,
@@ -3473,6 +3963,13 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("a retryable 503 must carry Retry-After");
+        assert!(retry_after > 0);
         let body = body_of(response).await;
         assert!(body.contains("render in progress"), "{body:?}");
     }
@@ -3583,8 +4080,10 @@ mod tests {
             Vec::new(),
             fumox_core::config::TrustedHeader::None,
             Vec::new(),
-            fumox_core::config::ServerConfig::default().export_max_rows,
-            crate::alive_export::TokenCache::new(),
+            crate::alive_export::ExportState::new(
+                fumox_core::config::ServerConfig::default().export_max_rows,
+                crate::alive_export::TokenCache::new(),
+            ),
         )
     }
 

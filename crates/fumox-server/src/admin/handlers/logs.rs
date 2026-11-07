@@ -3,7 +3,9 @@
 //! Probe history intentionally has no page of its own, it lives on the
 //! proxy card.
 
-use super::{FormMap, clamp_limit, fmt_bytes, page_offset, pagination_pages, server_error};
+use super::{
+    FormMap, PageLink, clamp_limit, fmt_bytes, page_offset, pagination_pages, server_error,
+};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::render_html;
@@ -24,12 +26,21 @@ struct FetchLogsTemplate {
     csrf: String,
     rows: Vec<FetchLogListRow>,
     total: i64,
-    pages: Vec<(i64, bool)>,
+    pages: Vec<PageLink>,
+    /// The clamped current page and the last page of the strip: the
+    /// `_pagination.html` strip bounds its prev/next step links with
+    /// them.
+    page: i64,
+    pages_count: i64,
     per_page: i64,
     f_result: String,
     f_class: String,
     f_source: String,
     sources: Vec<(String, String, bool)>,
+    /// Every error class the schema knows, preselected where it matches
+    /// the current `class` filter. Derived from `ErrorClass::all()`, so
+    /// a new class is filterable the moment it exists.
+    error_classes: Vec<(String, bool)>,
 }
 
 impl FetchLogsTemplate {
@@ -80,6 +91,17 @@ fn filter_query_suffix(result: &str, class: &str, source: &str) -> String {
 
 impl_i18n!(FetchLogsTemplate);
 
+/// The `ok` half of [`FetchLogFilter`] from the `result` query parameter:
+/// `ok` keeps only the successful fetches, `error` only the failures,
+/// anything else (including an absent parameter) filters nothing.
+fn result_ok_filter(result: &str) -> Option<bool> {
+    match result {
+        "ok" => Some(true),
+        "error" => Some(false),
+        _ => None,
+    }
+}
+
 pub async fn fetch_logs(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -101,35 +123,50 @@ pub async fn fetch_logs(
     // count and rows below apply exactly the same clauses, and every
     // value flows through a bind.
     let filter = FetchLogFilter {
-        ok: match f_result.as_str() {
-            "ok" => Some(true),
-            "error" => Some(false),
-            _ => None,
-        },
+        ok: result_ok_filter(&f_result),
         error_class: f_class.clone(),
         source_id: f_source.clone(),
     };
 
     let total: i64 = match fetch_log::count_filtered(&state.pool, &filter).await {
         Ok(total) => total,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "logs.fetch", &err),
     };
+    // A page past the last one renders the last non-empty page instead of
+    // an empty table: a stale pagination link or a hand-typed ?page=999
+    // must not look like "the journal is empty".
+    let pages_count = ((total + per_page - 1) / per_page).max(1);
+    let page = page.min(pages_count);
 
-    let rows: Vec<FetchLogListRow> =
-        match fetch_log::list_page(&state.pool, &filter, per_page, page_offset(page, per_page))
-            .await
-        {
-            Ok(rows) => rows,
-            Err(err) => return server_error(lang, &err),
-        };
-
-    let sources = match super::all_sources_for_selects(&state.pool).await {
+    // The rows and the source selects are independent reads, issued
+    // together. The count has to land first: the clamp above reads its
+    // total before the page query can be placed.
+    let (rows, sources) = tokio::join!(
+        fetch_log::list_page(&state.pool, &filter, per_page, page_offset(page, per_page)),
+        super::all_sources_for_selects(&state.pool),
+    );
+    let rows: Vec<FetchLogListRow> = match rows {
+        Ok(rows) => rows,
+        Err(err) => return server_error(&state, &headers, "logs.fetch", &err),
+    };
+    let sources = match sources {
         Ok(sources) => sources,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "logs.fetch", &err),
     };
+    let mut error_classes: Vec<(String, bool)> = fumox_core::models::ErrorClass::all()
+        .iter()
+        .map(|class| (class.as_str().to_string(), class.as_str() == f_class))
+        .collect();
+    // A filter value the schema does not know (an old link, a hand-typed
+    // ?class=) filters the rows below all the same; it must also stay
+    // visible as the selected option of the select it is set in.
+    if !f_class.is_empty() && !error_classes.iter().any(|(class, _)| class == &f_class) {
+        error_classes.push((f_class.clone(), true));
+    }
 
     render_html(
         lang.clone(),
+        "logs/fetch.html",
         &FetchLogsTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -139,11 +176,14 @@ pub async fn fetch_logs(
             rows,
             total,
             pages: pagination_pages(page, total, per_page),
+            page,
+            pages_count,
             per_page,
             f_result,
             f_class,
             f_source,
             sources,
+            error_classes,
         },
         StatusCode::OK,
     )
@@ -151,7 +191,7 @@ pub async fn fetch_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::filter_query_suffix;
+    use super::{filter_query_suffix, result_ok_filter};
 
     /// Every filter of the pagination link is percent-encoded: a value
     /// with a special character cannot change the parameters of the link
@@ -173,5 +213,18 @@ mod tests {
         );
         // An empty filter is left out, the others still travel.
         assert_eq!(filter_query_suffix("", "network", ""), "&class=network");
+    }
+
+    /// The `result` query parameter maps onto the filter's `ok` half:
+    /// exactly the two known words filter, everything else — including
+    /// the empty string — filters nothing instead of matching one of the
+    /// two buckets by accident.
+    #[test]
+    fn the_result_filter_accepts_exactly_ok_and_error() {
+        assert_eq!(result_ok_filter("ok"), Some(true));
+        assert_eq!(result_ok_filter("error"), Some(false));
+        assert_eq!(result_ok_filter(""), None);
+        assert_eq!(result_ok_filter("OK"), None);
+        assert_eq!(result_ok_filter("failed"), None);
     }
 }

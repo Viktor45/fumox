@@ -412,11 +412,11 @@ mod tests {
             "the proxy row must carry the T2 recency stamp"
         );
 
-        // Schema version is stamped into meta by db::migrate. Bumped to 18
-        // by migration 0018 (the proxies rebuild that installs the port
-        // range CHECK; 0017 added the fetch-log failure indexes before it).
+        // Schema version is stamped into meta by db::migrate. Bumped to 19
+        // by migration 0019 (the sources access token; 0018 was the proxies
+        // rebuild that installs the port range CHECK).
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("18"));
+        assert_eq!(version.as_deref(), Some("19"));
 
         // The fetch-attempt stamp of migration 0015 is on the source row.
         let source_columns: Vec<(String,)> =

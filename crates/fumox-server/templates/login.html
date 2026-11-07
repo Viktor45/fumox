@@ -8,7 +8,7 @@
 </head>
 <body>
   <div class="login-wrap">
-    <div class="panel login-box">
+    <main class="panel login-box">
       {# Language and theme are chosen here and persisted in the
          fumox_lang / fumox_theme cookies; the same switchers also live in
          the topbar after login. The language list is dynamic: every
@@ -17,18 +17,22 @@
       <div class="login-prefs">
         <span class="lang-switch login-lang" role="group" aria-label="{{ self.t("nav.language") }}">
           {% for (code, label) in langs %}
-          <a href="/admin/login?lang={{ code }}"
+          <a href="{{ self.lang_href(code) }}"
              {% if self.lang_code() == code.as_str() %}class="active" aria-current="true"{% endif %}>{{ label }}</a>
           {% endfor %}
         </span>
         <span class="lang-switch login-lang theme-switch" role="group" aria-label="{{ self.t("nav.theme") }}">
-          <a href="/admin/set-theme?theme=light&next=/admin/login"
+          {# The login screen has no session yet, so the theme is chosen
+             through the login form itself (`?theme=` sets the same
+             fumox_theme cookie server-side); the topbar switcher after
+             the login is the POST form. #}
+          <a href="/admin/login?theme=light"
              aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
              {% if theme.is_light() %}class="active" aria-current="true"{% endif %}>
             <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
             <span class="theme-label">{{ self.t("theme.light") }}</span>
           </a>
-          <a href="/admin/set-theme?theme=dark&next=/admin/login"
+          <a href="/admin/login?theme=dark"
              aria-label="{{ self.t("theme.dark") }}" title="{{ self.t("theme.dark") }}"
              {% if theme.is_dark() %}class="active" aria-current="true"{% endif %}>
             <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
@@ -37,10 +41,10 @@
         </span>
       </div>
       <h1 class="visually-hidden">Fumox</h1>
-      <h2 style="margin-top:0">{{ self.t("login.heading") }}</h2>
+      <h2 class="login-heading">{{ self.t("login.heading") }}</h2>
       {% match error %}
         {% when Some with (message) %}
-          <div class="flash error" role="alert">{{ message }}</div>
+          <div class="flash error" role="alert" id="login-error">{{ message }}</div>
         {% when None %}
       {% endmatch %}
       {% match notice %}
@@ -49,16 +53,20 @@
         {% when None %}
       {% endmatch %}
       <form method="post" action="/admin/login" class="stack">
+        {# Where the successful login lands, carried through the submit and
+           re-validated server-side (admin-surface paths only). #}
+        <input type="hidden" name="next" value="{{ next }}">
         <div class="field">
           <label for="token">{{ self.t("login.token_label") }}</label>
-          <input type="password" id="token" name="token" autofocus required>
-          <div class="hint">{{ self.t("login.token_hint") }}</div>
+          <input type="password" id="token" name="token" autofocus required
+                 aria-describedby="{{ self.token_describedby() }}"{% if self.has_error() %} aria-invalid="true"{% endif %}>
+          <div class="hint" id="token-hint">{{ self.t("login.token_hint") }}</div>
         </div>
         <div class="form-actions">
           <button class="btn primary" type="submit">{{ self.t("login.submit") }}</button>
         </div>
       </form>
-    </div>
+    </main>
   </div>
 </body>
 </html>

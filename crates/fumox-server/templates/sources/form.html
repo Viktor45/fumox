@@ -33,7 +33,7 @@
     </div>
 
     <div class="field">
-      <label for="src-url">{{ self.t("src.url_label") }}</label>
+      <label for="src-url">{{ self.t("src.url_label") }} *</label>
       <input type="url" id="src-url" name="url" value="{{ values.url }}" required{{ self.error_attrs("url") | safe }}>
       <div class="hint">{{ self.t("src.url_hint") }}</div>
       {% if values.url_masked %}
@@ -41,6 +41,23 @@
       {% endif %}
       {% match self.error_for("url") %}
         {% when Some with (message) %}<div class="error-text" id="err-url" role="alert">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
+    </div>
+
+    <div class="field">
+      <label for="src-token">{{ self.t("src.token_label") }}</label>
+      {#- The field is a password input: the token is a secret and must
+          not sit in the DOM in clear text, and the browser must not fill
+          it with a stored password. The value is a placeholder or the
+          masked legacy token, never the secret itself. -#}
+      <input type="password" id="src-token" name="access_token" value="{{ values.access_token }}" autocomplete="new-password" spellcheck="false"{{ self.error_attrs("access_token") | safe }}>
+      <div class="hint">{{ self.t("src.token_hint") }}</div>
+      {% if token_masked_note %}
+        <div class="hint">{{ self.t("src.token_masked_note") }}</div>
+      {% endif %}
+      {% match self.error_for("access_token") %}
+        {% when Some with (message) %}<div class="error-text" id="err-access_token" role="alert">{{ message }}</div>
         {% when None %}
       {% endmatch %}
     </div>
@@ -128,13 +145,17 @@
 
     <div class="field">
       <label for="src-tags">{{ self.t("src.tags_label") }}</label>
-      <input type="text" id="src-tags" name="tags" value="{{ values.tags }}">
+      <input type="text" id="src-tags" name="tags" value="{{ values.tags }}"{{ self.error_attrs("tags") | safe }}>
       <div class="hint">{{ self.t("src.tags_hint") }}</div>
+      {% match self.error_for("tags") %}
+        {% when Some with (message) %}<div class="error-text" id="err-tags" role="alert">{{ message }}</div>
+        {% when None %}
+      {% endmatch %}
     </div>
 
     <div class="field">
       <label for="src-headers">{{ self.t("src.headers_label") }}</label>
-      <textarea class="mono" id="src-headers" name="headers" rows="3" placeholder="User-Agent: …
+      <textarea class="mono" id="src-headers" name="headers" rows="3" autocomplete="off" spellcheck="false" placeholder="User-Agent: …
 Authorization: Bearer …"{{ self.error_attrs("headers") | safe }}>{{ values.headers }}</textarea>
       <div class="hint">{{ self.t("src.headers_hint") }}</div>
       {% if headers_masked_note %}

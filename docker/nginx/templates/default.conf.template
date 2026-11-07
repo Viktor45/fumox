@@ -125,7 +125,8 @@ server {
     }
 
     # ---- public subscriptions (the public listener) ---------------------
-    # /sub/{id}, /src/{slug}, /export/alive/{token} and /healthz.
+    # /sub/{id}, /src/{slug}, /export/alive/{token}, /export/ready/{token}
+    # and /healthz.
     location / {
         # The URIs here carry the export tokens: they are bearer
         # credentials, and access_log masks them through $fumox_safe_uri

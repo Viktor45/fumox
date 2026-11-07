@@ -55,8 +55,13 @@ pub async fn headers(req: Request, next: Next) -> Response {
     );
     // The panel renders secrets (masked headers, the alive-export link,
     // the config export); nothing it serves belongs in any shared or
-    // intermediary cache.
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // intermediary cache. A handler that answers with a genuinely
+    // cacheable asset (the vendored `/admin/static/*` files) sets its own,
+    // narrower `private, max-age=…`, and it wins: the insert below only
+    // fills the default, it does not overwrite.
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     response
 }
 
@@ -120,5 +125,31 @@ mod tests {
             .find(|directive| directive.starts_with("script-src"))
             .expect("the policy names script-src");
         assert_eq!(script_src, "script-src 'self'");
+    }
+
+    /// A handler that answers with its own, narrower `Cache-Control` (the
+    /// vendored static assets, `private, max-age=…`) must keep it: the
+    /// middleware's `no-store` is the default for everything that did not
+    /// choose, not a blanket overwrite.
+    #[tokio::test]
+    async fn a_handler_set_cache_control_is_not_overwritten() {
+        let app = axum::Router::new()
+            .route(
+                "/static/app.css",
+                axum::routing::get(|| async {
+                    ([(header::CACHE_CONTROL, "private, max-age=3600")], "body")
+                }),
+            )
+            .layer(axum::middleware::from_fn(headers));
+
+        let response = app
+            .oneshot(Request::get("/static/app.css").body(Body::empty()).unwrap())
+            .await
+            .expect("the router answers");
+
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, max-age=3600"
+        );
     }
 }

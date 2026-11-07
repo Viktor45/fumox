@@ -3,8 +3,10 @@
    the same validator the save path uses. #}
 {% match json %}
   {% when Some with (value) %}
-  <label>{{ self.t("ped.preview_title") }}</label>
-  <pre class="mono ped-preview-json" aria-live="off">{{ value }}</pre>
+  {#- A heading, not a `<label>`: the `<pre>` is not a form control, and
+      the heading id lets the `<pre>` name its own caption. -#}
+  <h3 id="ped-preview-title" class="ped-section-heading">{{ self.t("ped.preview_title") }}</h3>
+  <pre class="mono ped-preview-json" aria-labelledby="ped-preview-title" aria-live="off">{{ value }}</pre>
   {% if valid %}
     <span class="badge on">{{ self.t("ped.preview_ok") }}</span>
   {% else %}

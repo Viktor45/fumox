@@ -886,6 +886,7 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.23.1",
+ "bytes",
  "clap",
  "fumox-core",
  "futures-util",

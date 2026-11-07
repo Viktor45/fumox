@@ -12,10 +12,13 @@
 use axum::http::HeaderMap;
 use fumox_core::config::TrustedHeader;
 use moka::future::Cache;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Constant-time string equality (cookie/CSRF comparison). Also used for
 /// the public capability-token checks (`/sub` access token, alive-export
@@ -52,11 +55,32 @@ enum Forwarded {
     Nothing,
 }
 
-/// The one address a single header names, if it names one.
-fn sole(found: Forwarded, peer: SocketAddr) -> IpAddr {
+/// Where a rate-limit key came from: a forwarding header the trusted peer
+/// vouched for, or the peer address itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientKeySource {
+    /// The key names the client a trusted chain forwarded.
+    Forwarded,
+    /// The key is the peer address by design: no forwarding header is
+    /// declared, no trusted proxy is configured, or the peer is not
+    /// trusted to speak for a client. This is the best-available key,
+    /// not a degradation.
+    Peer,
+    /// The operator declared a forwarding header and the peer is trusted,
+    /// but the walks still produced no client address: the key fell back
+    /// to the peer, and every client behind that peer shares one
+    /// rate-limit bucket. The rate-limit middlewares warn about this
+    /// once per window, see [`warn_shared_peer_bucket`].
+    PeerFallback,
+}
+
+/// The one address a single header names, if it names one, and where it
+/// came from. Past [`client_key`]'s gates a peer fallback is a degraded
+/// key ([`ClientKeySource::PeerFallback`]), not the designed outcome.
+fn sole(found: Forwarded, peer: SocketAddr) -> (IpAddr, ClientKeySource) {
     match found {
-        Forwarded::Client(ip) => ip,
-        Forwarded::TrustedChain | Forwarded::Nothing => peer.ip(),
+        Forwarded::Client(ip) => (ip, ClientKeySource::Forwarded),
+        Forwarded::TrustedChain | Forwarded::Nothing => (peer.ip(), ClientKeySource::PeerFallback),
     }
 }
 
@@ -80,37 +104,44 @@ fn sole(found: Forwarded, peer: SocketAddr) -> IpAddr {
 /// No precedence between `Forwarded` and `X-Forwarded-For`: the walk cannot
 /// tell a proxy-appended entry from a client-authored one, so either fixed
 /// order is client-chosen.
+///
+/// The returned [`ClientKeySource`] says where the key came from: rules
+/// 1–3 make the peer the key by design ([`ClientKeySource::Peer`]), past
+/// them a peer key is what the walks degraded to
+/// ([`ClientKeySource::PeerFallback`]).
 pub fn client_key(
     peer: SocketAddr,
     headers: &HeaderMap,
     trusted_cidrs: &[ipnet::IpNet],
     trusted_header: TrustedHeader,
-) -> IpAddr {
+) -> (IpAddr, ClientKeySource) {
     // 1. The operator named no header: nothing a client sends can move the
     // key off the peer address.
     if trusted_header == TrustedHeader::None {
-        return peer.ip();
+        return (peer.ip(), ClientKeySource::Peer);
     }
     // 2. No trusted proxies configured ⇒ never honor forwarded headers.
     if trusted_cidrs.is_empty() {
-        return peer.ip();
+        return (peer.ip(), ClientKeySource::Peer);
     }
     // 3. Peer is not in any trusted CIDR ⇒ the header is untrusted.
     if !trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) {
-        return peer.ip();
+        return (peer.ip(), ClientKeySource::Peer);
     }
     match trusted_header {
-        TrustedHeader::None => peer.ip(),
+        TrustedHeader::None => (peer.ip(), ClientKeySource::Peer),
         TrustedHeader::Xff => sole(walk_xff(headers, trusted_cidrs), peer),
         TrustedHeader::Forwarded => sole(walk_forwarded(headers, trusted_cidrs), peer),
         TrustedHeader::Both => match (
             walk_xff(headers, trusted_cidrs),
             walk_forwarded(headers, trusted_cidrs),
         ) {
-            (Forwarded::Client(a), Forwarded::Client(b)) if a == b => a,
-            (Forwarded::Client(a), Forwarded::TrustedChain) => a,
-            (Forwarded::TrustedChain, Forwarded::Client(b)) => b,
-            _ => peer.ip(),
+            (Forwarded::Client(a), Forwarded::Client(b)) if a == b => {
+                (a, ClientKeySource::Forwarded)
+            }
+            (Forwarded::Client(a), Forwarded::TrustedChain) => (a, ClientKeySource::Forwarded),
+            (Forwarded::TrustedChain, Forwarded::Client(b)) => (b, ClientKeySource::Forwarded),
+            _ => (peer.ip(), ClientKeySource::PeerFallback),
         },
     }
 }
@@ -152,7 +183,7 @@ fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
     }
     let mut parsed_any = false;
     for raw in value.split(',').rev() {
-        let candidate = raw.trim();
+        let candidate = strip_port(raw.trim());
         let Ok(ip) = candidate.parse::<IpAddr>() else {
             continue;
         };
@@ -170,7 +201,8 @@ fn walk_xff(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
 
 /// Walk RFC 7239 `Forwarded: for=…` right-to-left from the peer, the same
 /// direction [`walk_xff`] scans and for the same reason, and to the same
-/// three-way outcome. Bracket-strip IPv6 literals; skip `for=_hidden` and
+/// three-way outcome. Port-suffixed literals (`ip:port`,
+/// `[v6]:port`) are reduced to the bare address; skip `for=_hidden` and
 /// `for=unknown`, both mean the proxy declined to name the client, which
 /// is [`Forwarded::Nothing`], never a chain that ran past it.
 fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwarded {
@@ -197,11 +229,7 @@ fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwar
             if value == "_hidden" || value.eq_ignore_ascii_case("unknown") {
                 break;
             }
-            let value = value
-                .strip_prefix('[')
-                .and_then(|v| v.strip_suffix(']'))
-                .unwrap_or(value);
-            let Ok(ip) = value.parse::<IpAddr>() else {
+            let Ok(ip) = strip_port(value).parse::<IpAddr>() else {
                 continue;
             };
             parsed_any = true;
@@ -217,8 +245,31 @@ fn walk_forwarded(headers: &HeaderMap, trusted_cidrs: &[ipnet::IpNet]) -> Forwar
     }
 }
 
-/// Strip RFC 7239 §6.3 obfuscation (`for=_hidden`, `for=unknown`) and
-/// surrounding quotes; returns the inner value.
+/// Reduce one header entry to a bare IP literal: a proxy may append the
+/// port it observed (`1.2.3.4:8080`, `[2001:db8::1]:443`), which
+/// `IpAddr::parse` rejects and the walk would silently skip. IPv4 (or an
+/// unbracketed entry) is cut at its single colon; a bracketed IPv6
+/// literal loses its brackets and the port behind them; a bare IPv6
+/// literal always carries at least two colons, so a port is never cut
+/// from one. Whatever still does not parse is skipped by the caller,
+/// fail-closed as before.
+fn strip_port(entry: &str) -> &str {
+    if entry.starts_with('[') {
+        return entry
+            .split_once(']')
+            .and_then(|(ip, _)| ip.strip_prefix('['))
+            .unwrap_or(entry);
+    }
+    match entry.matches(':').count() {
+        0 => entry,
+        1 => entry.split_once(':').map_or(entry, |(ip, _)| ip),
+        _ => entry,
+    }
+}
+
+/// Strip surrounding quotes from a `for=` value; `_hidden`/`unknown` are
+/// recognised by the caller ([`walk_forwarded`]), this only unwraps
+/// quoting.
 fn strip_obfuscation(value: &str) -> &str {
     value
         .strip_prefix('"')
@@ -226,8 +277,210 @@ fn strip_obfuscation(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+/// Distinct keys the shared-peer-bucket warning tracks between warns,
+/// bounding the memory a flood of distinct peers could pin.
+const PEER_BUCKET_MAX_TRACKED: usize = 1_024;
+
+/// The rate-limit keys a shared-bucket warning was emitted for, with the
+/// instant the current window for that key began.
+static PEER_BUCKET_WARNS: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Warn that the rate-limit `key` degraded to the shared peer bucket
+/// ([`ClientKeySource::PeerFallback`]): a trusted peer's forwarding data
+/// produced no client address, so every client behind that peer now
+/// shares one rate-limit window. One warn per key per `window` — the
+/// limiter's own window is the natural horizon, since the condition holds
+/// for every request it covers — not one warn per request.
+pub fn warn_shared_peer_bucket(key: &str, window: Duration) {
+    let now = Instant::now();
+    let mut seen = PEER_BUCKET_WARNS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if seen.len() >= PEER_BUCKET_MAX_TRACKED {
+        // Bound the map, not the warnings: entries whose window elapsed
+        // go first, the keys they held warn again from scratch; past that
+        // the oldest entry is dropped.
+        seen.retain(|_, began| now.duration_since(*began) < window);
+        if seen.len() >= PEER_BUCKET_MAX_TRACKED
+            && let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, began)| **began)
+                .map(|(key, _)| key.clone())
+        {
+            seen.remove(&oldest);
+        }
+    }
+    if seen
+        .get(key)
+        .is_some_and(|began| now.duration_since(*began) < window)
+    {
+        return;
+    }
+    seen.insert(key.to_string(), now);
+    tracing::warn!(
+        client = %key,
+        "rate-limit key degraded to the shared peer bucket: every client \
+         behind it shares one window"
+    );
+}
+
 /// Default number of keys a limiter's counter cache holds.
 const DEFAULT_MAX_KEYS: u64 = 100_000;
+
+/// The data a warn window accumulated since its last rollover: the
+/// rejections it dropped to debug and how many there were in total. The
+/// caller renders the summary sentence — the two registries word theirs
+/// differently (auth failures vs. host-gate rejections), but the facts
+/// are the same.
+#[derive(Debug, Default)]
+pub struct WarnSummary {
+    /// Rejections the window dropped to debug, named ones first.
+    pub suppressed: Vec<String>,
+    /// How many rejections the window dropped to debug, suppressed names
+    /// included.
+    pub suppressed_total: u64,
+}
+
+/// One bounded per-key warn registry, the shape both public-listener
+/// coalescers share: a failed secret check (`serve`'s auth-failure log)
+/// and a host-gate rejection (`alive_export`'s host log) warn once per key
+/// per window, then drop to debug, under a per-window budget that stops a
+/// flood from mirroring itself into the log, with a rollover summary that
+/// names what the window swallowed.
+///
+/// The registry owns three caps: the window, the number of distinct keys
+/// tracked (bounding memory; hitting it never silences new keys), and the
+/// warn budget per window. Eviction is O(log n) (an insert-order map,
+/// oldest slot first), and a key that returns after its own quiet window
+/// re-enters tracking and spends the same budget as a new one — a
+/// campaign that rotates through a small key set cannot out-warn the
+/// budget by waiting.
+#[derive(Debug)]
+pub struct WarnRegistry {
+    window: Duration,
+    max_tracked: usize,
+    max_warns: u32,
+    /// Tracked keys: when they were last seen and the slot they hold in
+    /// the eviction order.
+    seen: HashMap<String, (Instant, u64)>,
+    /// The tracked keys by slot number, so the oldest one is dropped
+    /// without a scan over the whole map.
+    order: std::collections::BTreeMap<u64, String>,
+    /// Next slot number handed out.
+    next_slot: u64,
+    /// Start of the current warn window, and how much of `max_warns` it
+    /// has spent.
+    window_start: Option<Instant>,
+    warns_emitted: u32,
+    /// What the current window dropped to debug, for the rollover summary.
+    suppressed: WarnSummary,
+}
+
+impl WarnRegistry {
+    pub fn new(window: Duration, max_tracked: usize, max_warns: u32) -> Self {
+        Self {
+            window,
+            max_tracked,
+            max_warns,
+            seen: HashMap::new(),
+            order: std::collections::BTreeMap::new(),
+            next_slot: 0,
+            window_start: None,
+            warns_emitted: 0,
+            suppressed: WarnSummary::default(),
+        }
+    }
+
+    /// Number of keys currently tracked (the memory bound, for tests).
+    #[cfg(test)]
+    pub fn len_tracked(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Warns spent in the current window (for tests).
+    #[cfg(test)]
+    pub fn warns_emitted(&self) -> u32 {
+        self.warns_emitted
+    }
+
+    /// Roll the window over if it has elapsed, handing back the summary of
+    /// the window that just closed (when it suppressed anything).
+    fn roll_window(&mut self, now: Instant) -> Option<WarnSummary> {
+        let Some(start) = self.window_start else {
+            // First failure ever: open the window, report nothing.
+            self.window_start = Some(now);
+            return None;
+        };
+        if now.duration_since(start) < self.window {
+            return None;
+        }
+        let summary = std::mem::take(&mut self.suppressed);
+        self.warns_emitted = 0;
+        self.window_start = Some(now);
+        (summary.suppressed_total > 0).then_some(summary)
+    }
+
+    /// Remember `key` as seen, dropping the oldest tracked key when the
+    /// set is full. The order map makes that drop O(log n) instead of a
+    /// scan over every tracked key.
+    fn track(&mut self, key: &str, now: Instant) {
+        if !self.seen.contains_key(key) {
+            if self.seen.len() >= self.max_tracked {
+                // Bound the map, not the warnings: drop the oldest entry.
+                if let Some((_, oldest)) = self.order.pop_first() {
+                    self.seen.remove(&oldest);
+                }
+            }
+            self.next_slot += 1;
+            let slot = self.next_slot;
+            self.seen.insert(key.to_string(), (now, slot));
+            self.order.insert(slot, key.to_string());
+            return;
+        }
+        // A key that comes back after its own window keeps its slot: only
+        // the quiet window restarts.
+        let slot = self.seen.get(key).map(|(_, slot)| *slot).unwrap_or(0);
+        self.seen.insert(key.to_string(), (now, slot));
+    }
+
+    /// `true` when this occurrence for `key` should warn, plus the summary
+    /// of a window that just rolled over.
+    ///
+    /// Three rules, in order: a key already warned inside the window is
+    /// quiet; a key past the window's budget is quiet but remembered for
+    /// the summary; otherwise it warns. The per-window budget covers a key
+    /// that returns after its own quiet window as well: a flood of
+    /// *repeat* visitors must not be able to spend the window's warns
+    /// either.
+    pub fn should_warn(&mut self, key: &str, now: Instant) -> (bool, Option<WarnSummary>) {
+        let summary = self.roll_window(now);
+        if let Some((first, _)) = self.seen.get(key)
+            && now.duration_since(*first) < self.window
+        {
+            return (false, summary);
+        }
+        self.track(key, now);
+        if self.warns_emitted >= self.max_warns {
+            if self.suppressed.suppressed.len() < self.max_warns as usize {
+                self.suppressed.suppressed.push(key.to_string());
+            }
+            self.suppressed.suppressed_total += 1;
+            return (false, summary);
+        }
+        self.warns_emitted += 1;
+        (true, summary)
+    }
+}
+
+/// One fixed-window counter: the hit count and the instant the window
+/// closes. The deadline travels with the entry — the same moment moka's
+/// TTL starts from — so a rejection can name the exact `Retry-After`
+/// instead of the whole window.
+struct Window {
+    count: AtomicU64,
+    deadline: std::time::Instant,
+}
 
 /// Fixed-window per-key rate limiter: counters live in a moka cache with
 /// TTL = window, so expiry resets the window.
@@ -239,8 +492,9 @@ const DEFAULT_MAX_KEYS: u64 = 100_000;
 /// flood of distinct keys could pin; it never bounds the number of
 /// requests a single key may make.
 pub struct RateLimiter {
-    counters: Cache<String, Arc<AtomicU64>>,
+    counters: Cache<String, Arc<Window>>,
     limit: u64,
+    window: Duration,
 }
 
 impl RateLimiter {
@@ -260,17 +514,52 @@ impl RateLimiter {
                 .time_to_live(window)
                 .build(),
             limit,
+            window,
         }
     }
 
-    /// Count one hit for `key`; `true` while under the limit.
+    /// The window the counters live in: the horizon the shared-peer-bucket
+    /// warning deduplicates on (see [`warn_shared_peer_bucket`]), the same
+    /// span a degraded key keeps its clients in one bucket for.
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
+    /// Count one hit for `key`; `true` while under the limit. The
+    /// production paths read [`Self::check`] (a refusal carries the
+    /// `Retry-After` seconds); this boolean form stays for the unit tests
+    /// of the limiter itself.
+    #[cfg(test)]
     pub async fn allow(&self, key: &str) -> bool {
+        self.check(key).await.is_ok()
+    }
+
+    /// Count one hit for `key`; `Err(seconds)` when the window is
+    /// exhausted, carrying the `Retry-After` value: the seconds until the
+    /// window's deadline, never zero (a zero would let an aggressive
+    /// client spin on the same instant). The deadline is fixed by the
+    /// entry's creation — the first hit of the window, the same moment
+    /// moka's TTL starts from — so the header and the actual reset agree.
+    pub async fn check(&self, key: &str) -> Result<(), u64> {
         // moka's future cache expects a future (not a closure) as the init.
-        let init = async { Ok::<_, std::convert::Infallible>(Arc::new(AtomicU64::new(0))) };
-        let Ok(counter) = self.counters.try_get_with(key.to_string(), init).await else {
-            return true; // cache hiccup must not lock the admin out
+        let window = self.window;
+        let init = async move {
+            Ok::<_, std::convert::Infallible>(Arc::new(Window {
+                count: AtomicU64::new(0),
+                deadline: std::time::Instant::now() + window,
+            }))
         };
-        counter.fetch_add(1, Ordering::Relaxed) < self.limit
+        let Ok(entry) = self.counters.try_get_with(key.to_string(), init).await else {
+            return Ok(()); // cache hiccup must not lock the admin out
+        };
+        if entry.count.fetch_add(1, Ordering::Relaxed) < self.limit {
+            return Ok(());
+        }
+        Err(entry
+            .deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs()
+            .max(1))
     }
 
     /// Give one hit back to `key`'s window: the outer middleware counts
@@ -281,11 +570,16 @@ impl RateLimiter {
     /// existed) must never wrap below zero, the wrap would blacklist the
     /// key for the whole window.
     pub async fn refund(&self, key: &str) {
-        let init = async { Ok::<_, std::convert::Infallible>(Arc::new(AtomicU64::new(0))) };
-        if let Ok(counter) = self.counters.try_get_with(key.to_string(), init).await {
-            let mut current = counter.load(Ordering::Relaxed);
+        let init = async {
+            Ok::<_, std::convert::Infallible>(Arc::new(Window {
+                count: AtomicU64::new(0),
+                deadline: std::time::Instant::now(),
+            }))
+        };
+        if let Ok(entry) = self.counters.try_get_with(key.to_string(), init).await {
+            let mut current = entry.count.load(Ordering::Relaxed);
             loop {
-                match counter.compare_exchange_weak(
+                match entry.count.compare_exchange_weak(
                     current,
                     current.saturating_sub(1),
                     Ordering::Relaxed,
@@ -339,15 +633,15 @@ mod tests {
     /// The rate-limit key under each declaration, for the trusted peer of
     /// the tests above.
     fn key_xff(headers: &HeaderMap) -> IpAddr {
-        client_key(peer(), headers, &trusted_v4(), TrustedHeader::Xff)
+        client_key(peer(), headers, &trusted_v4(), TrustedHeader::Xff).0
     }
 
     fn key_forwarded(headers: &HeaderMap) -> IpAddr {
-        client_key(peer(), headers, &trusted_v4(), TrustedHeader::Forwarded)
+        client_key(peer(), headers, &trusted_v4(), TrustedHeader::Forwarded).0
     }
 
     fn key_both(headers: &HeaderMap) -> IpAddr {
-        client_key(peer(), headers, &trusted_v4(), TrustedHeader::Both)
+        client_key(peer(), headers, &trusted_v4(), TrustedHeader::Both).0
     }
 
     #[test]
@@ -356,12 +650,12 @@ mod tests {
         // not let the header influence the rate-limit key, peer wins.
         let h = xff("1.2.3.4");
         assert_eq!(
-            client_key(peer(), &h, &[], TrustedHeader::Both),
+            client_key(peer(), &h, &[], TrustedHeader::Both).0,
             peer().ip()
         );
         let h = fwd("for=1.2.3.4;proto=https");
         assert_eq!(
-            client_key(peer(), &h, &[], TrustedHeader::Both),
+            client_key(peer(), &h, &[], TrustedHeader::Both).0,
             peer().ip()
         );
     }
@@ -378,7 +672,7 @@ mod tests {
             "for=1.2.3.4;proto=https".parse().unwrap(),
         );
         assert_eq!(
-            client_key(peer(), &headers, &trusted_v4(), TrustedHeader::None),
+            client_key(peer(), &headers, &trusted_v4(), TrustedHeader::None).0,
             peer().ip(),
             "a consistent pair of headers must resolve to the peer without a declaration"
         );
@@ -521,7 +815,7 @@ mod tests {
             "for=9.9.9.9;proto=https".parse().unwrap(),
         );
         assert_eq!(
-            client_key(peer(), &headers, &trusted, TrustedHeader::Both),
+            client_key(peer(), &headers, &trusted, TrustedHeader::Both).0,
             "9.9.9.9".parse::<IpAddr>().unwrap(),
             "a trusted chain through two proxies must keep its per-client key"
         );
@@ -543,7 +837,7 @@ mod tests {
         headers.insert("x-forwarded-for", "10.0.0.7, 10.0.0.8".parse().unwrap());
         headers.insert(header::FORWARDED, "for=10.0.0.9".parse().unwrap());
         assert_eq!(
-            client_key(peer(), &headers, &trusted, TrustedHeader::Both),
+            client_key(peer(), &headers, &trusted, TrustedHeader::Both).0,
             peer().ip()
         );
 
@@ -555,7 +849,7 @@ mod tests {
             "for=9.9.9.9, for=10.0.0.8".parse().unwrap(),
         );
         assert_eq!(
-            client_key(peer(), &headers, &trusted, TrustedHeader::Both),
+            client_key(peer(), &headers, &trusted, TrustedHeader::Both).0,
             "9.9.9.9".parse::<IpAddr>().unwrap()
         );
     }
@@ -618,12 +912,35 @@ mod tests {
         assert_eq!(key_xff(&h), peer().ip());
     }
 
+    /// A proxy that appends the port it observed (`ip:port`, some do) must
+    /// not turn the client entry into unparsable text: the port is
+    /// stripped before the parse, for IPv4 and for a bracketed IPv6
+    /// literal alike, in both headers.
+    #[test]
+    fn port_suffixed_entries_still_name_the_client() {
+        // XFF: a bare IPv4 literal with port, and a bracketed IPv6 literal.
+        let h = xff("9.9.9.9:5678");
+        assert_eq!(key_xff(&h), "9.9.9.9".parse::<IpAddr>().unwrap());
+        let h = xff("[2001:db8::1]:443");
+        assert_eq!(key_xff(&h), "2001:db8::1".parse::<IpAddr>().unwrap());
+
+        // Forwarded: the quoted and the unquoted shape.
+        let h = fwd("for=\"9.9.9.9:5678\"");
+        assert_eq!(key_forwarded(&h), "9.9.9.9".parse::<IpAddr>().unwrap());
+        let h = fwd("for=[2001:db8::1]:443");
+        assert_eq!(key_forwarded(&h), "2001:db8::1".parse::<IpAddr>().unwrap());
+
+        // A bare IPv6 literal is never mistaken for `ip:port`.
+        let h = xff("2001:db8::1");
+        assert_eq!(key_xff(&h), "2001:db8::1".parse::<IpAddr>().unwrap());
+    }
+
     #[test]
     fn untrusted_peer_ignores_xff_and_keeps_peer() {
         let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
         let h = xff("1.2.3.4");
         assert_eq!(
-            client_key(untrusted_peer, &h, &trusted_v4(), TrustedHeader::Both),
+            client_key(untrusted_peer, &h, &trusted_v4(), TrustedHeader::Both).0,
             untrusted_peer.ip()
         );
     }

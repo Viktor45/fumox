@@ -1,5 +1,13 @@
 {#- Fragment: the enabled badge of the source card. The detail page
     wraps it in a stable live region and the toggle action re-renders it
     for every HTMX swap, so the badge itself is a plain span: the swap
-    replaces the content of the wrapper, not the wrapper itself. -#}
-{% if source.enabled %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+    replaces the content of the wrapper, not the wrapper itself.
+
+    Contract: the fragment reads `source.enabled` and `self.t` from the
+    including context, and the `common.on` / `common.off` keys must be
+    present in every supported localization. -#}
+{% import "../_badges.html" as badges %}
+{#- The card the badge belongs to rides in the visually hidden prefix:
+    a bare "on/off" announced out of context says nothing about WHAT is
+    on. The visible markup does not change. -#}
+<span class="visually-hidden">{{ self.t("common.source") }}: </span>{% call badges::enabled(source.enabled) %}{% endcall %}

@@ -1,0 +1,22 @@
+{#- Segmented status bar of one distribution row. `row` comes from the
+    including scope and must expose the five status counters plus
+    `total` (the scheme rows and the country rows of dashboard.html
+    both do). Each segment renders only when its counter is positive,
+    so an empty status never draws a zero-width sliver. -#}
+<div class="stat-split-bar" aria-hidden="true">
+  {% if row.alive > 0 %}
+    <span class="stat-split-seg alive" style="--w: {{ self.bar_width(row.alive, row.total) }}%"></span>
+  {% endif %}
+  {% if row.ready > 0 %}
+    <span class="stat-split-seg ready" style="--w: {{ self.bar_width(row.ready, row.total) }}%"></span>
+  {% endif %}
+  {% if row.quarantine > 0 %}
+    <span class="stat-split-seg quarantine" style="--w: {{ self.bar_width(row.quarantine, row.total) }}%"></span>
+  {% endif %}
+  {% if row.unknown > 0 %}
+    <span class="stat-split-seg unknown" style="--w: {{ self.bar_width(row.unknown, row.total) }}%"></span>
+  {% endif %}
+  {% if row.removed > 0 %}
+    <span class="stat-split-seg removed" style="--w: {{ self.bar_width(row.removed, row.total) }}%"></span>
+  {% endif %}
+</div>

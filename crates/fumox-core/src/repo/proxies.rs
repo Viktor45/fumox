@@ -650,6 +650,23 @@ pub async fn count_missing_geo(pool: &DbPool, mask: GeoFactMask) -> crate::Resul
 /// A stored fact clears the attempt counter: the row answered, so it is
 /// not a row that has to be asked again in every pass.
 pub async fn update_geo(pool: &DbPool, id: i64, geo: &GeoStamp) -> crate::Result<()> {
+    update_geo_on(pool, id, geo).await
+}
+
+/// [`update_geo`] against an open transaction, so a caller can commit a
+/// whole batch of rows atomically (the geo backfill's per-batch loop).
+pub async fn update_geo_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    geo: &GeoStamp,
+) -> crate::Result<()> {
+    update_geo_on(&mut **tx, id, geo).await
+}
+
+async fn update_geo_on<'e, E>(ex: E, id: i64, geo: &GeoStamp) -> crate::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         "UPDATE proxies
          SET geo_country = COALESCE(?, geo_country),
@@ -663,7 +680,7 @@ pub async fn update_geo(pool: &DbPool, id: i64, geo: &GeoStamp) -> crate::Result
     .bind(&geo.city)
     .bind(&geo.asn)
     .bind(id)
-    .execute(pool)
+    .execute(ex)
     .await?;
     Ok(())
 }
@@ -675,6 +692,24 @@ pub async fn update_geo(pool: &DbPool, id: i64, geo: &GeoStamp) -> crate::Result
 /// ([`GEO_RETRY_WINDOW_SECS`]) passed instead of asking again on every
 /// pass.
 pub async fn mark_geo_attempt(pool: &DbPool, id: i64, now: i64) -> crate::Result<()> {
+    mark_geo_attempt_on(pool, id, now).await
+}
+
+/// [`mark_geo_attempt`] against an open transaction, the pair of
+/// [`update_geo_tx`]: the backfill commits one batch's attempts and facts
+/// together.
+pub async fn mark_geo_attempt_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    now: i64,
+) -> crate::Result<()> {
+    mark_geo_attempt_on(&mut **tx, id, now).await
+}
+
+async fn mark_geo_attempt_on<'e, E>(ex: E, id: i64, now: i64) -> crate::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         "UPDATE proxies
          SET geo_attempts = geo_attempts + 1,
@@ -683,7 +718,7 @@ pub async fn mark_geo_attempt(pool: &DbPool, id: i64, now: i64) -> crate::Result
     )
     .bind(now)
     .bind(id)
-    .execute(pool)
+    .execute(ex)
     .await?;
     Ok(())
 }
@@ -1848,8 +1883,11 @@ const REVIVE_BATCH_SIZE: i64 = 1_000;
 ///
 /// The revival itself touches every matching row; the ids are only the
 /// head of that population, and the rows beyond the cap wait for the
-/// random T1 sample like any other unchecked row.
-pub const REVIVED_ID_CAP: usize = 10_000;
+/// random T1 sample like any other unchecked row. The number is the
+/// shared ceiling of `[ingest].refresh_check_limit`
+/// ([`crate::config::bounds::REFRESH_CHECK_LIMIT_MAX`]): the hand-off
+/// deliberately ignores that knob, but it never exceeds its range.
+pub const REVIVED_ID_CAP: usize = crate::config::bounds::REFRESH_CHECK_LIMIT_MAX as usize;
 
 /// The outcome of a bulk revival: how many rows were moved and which of
 /// them may be handed to the priority queue.

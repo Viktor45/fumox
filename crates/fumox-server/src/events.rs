@@ -3,11 +3,41 @@
 //! The scheduler publishes fetch lifecycle events here; the SSE endpoint
 //! (`GET /admin/events`) subscribes and forwards them to the browser as
 //! one-shot notifications. Polling fragments keep working as the no-JS
-//! fallback, SSE is a pure enhancement: a missed event (for example a
-//! lagged subscriber) costs a delayed update, not state, since every fragment
-//! a `fetch.*` event triggers a refresh for polls on its own too.
+//! fallback, SSE is a pure enhancement: every fragment refreshes on its
+//! own polling cadence as well, so a dropped event delays an update but
+//! never loses state.
+//!
+//! The names ([`FETCH_QUEUED`], [`FETCH_STARTED`], [`FETCH_DONE`],
+//! [`FETCH_FAILED`]) and the `data` fields each carries:
+//!
+//! - `fetch.queued`: `source_id` — the refresh has to wait for a
+//!   concurrency permit (a free permit skips straight to `fetch.started`).
+//! - `fetch.started`: `source_id` — the request can actually go out (a
+//!   concurrency permit is in hand).
+//! - `fetch.done`: `source_id`, `ok: true`, `proxies_found`, `dropped`,
+//!   `duration_ms`.
+//! - `fetch.failed`: `source_id`, `ok: false`, `error_class`, `message`,
+//!   `http_status` (set when the server answered one), `duration_ms` (a
+//!   panic before the fetch started reports none of the measured ones).
 
 use tokio::sync::broadcast;
+
+/// `fetch.queued`: the refresh has to wait for a concurrency permit; `data`
+/// carries `source_id`.
+pub const FETCH_QUEUED: &str = "fetch.queued";
+
+/// `fetch.started`: a permit was in hand and the fetch went out; `data`
+/// carries `source_id`.
+pub const FETCH_STARTED: &str = "fetch.started";
+
+/// `fetch.done`: the ingest finished; `data` carries `source_id`, `ok`,
+/// `proxies_found`, `dropped` and `duration_ms`.
+pub const FETCH_DONE: &str = "fetch.done";
+
+/// `fetch.failed`: the ingest failed; `data` carries `source_id`, `ok`,
+/// `error_class`, `message`, `http_status` (when the server answered one)
+/// and, when the attempt was measured, `duration_ms`.
+pub const FETCH_FAILED: &str = "fetch.failed";
 
 /// One published event. `name` is the SSE event name (`fetch.done`, …),
 /// `data` is the JSON payload.
@@ -56,8 +86,9 @@ mod tests {
     async fn publish_reaches_subscribers() {
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        bus.publish("fetch.done", serde_json::json!({"source_id": "s1"}));
+        bus.publish(FETCH_DONE, serde_json::json!({"source_id": "s1"}));
         let event = rx.recv().await.unwrap();
+        // The literal, not the constant: the value itself stays pinned.
         assert_eq!(event.name, "fetch.done");
         assert_eq!(event.data["source_id"], "s1");
     }
@@ -65,6 +96,6 @@ mod tests {
     #[tokio::test]
     async fn publish_without_subscribers_is_fine() {
         let bus = EventBus::new();
-        bus.publish("fetch.done", serde_json::json!({}));
+        bus.publish(FETCH_DONE, serde_json::json!({}));
     }
 }

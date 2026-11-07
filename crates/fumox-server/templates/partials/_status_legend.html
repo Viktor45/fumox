@@ -1,0 +1,12 @@
+{#- Legend of the scheme/country distribution splits: the five status
+    colors plus the neutral total. Shared by both panels of the
+    dashboard; the labels are the same localized status words the
+    badges and the pipeline editor render. -#}
+<div class="stat-split-legend">
+  <span class="legend"><span class="legend-dot alive"></span>{{ self.t("common.status_alive") }}</span>
+  <span class="legend"><span class="legend-dot ready"></span>{{ self.t("common.status_ready") }}</span>
+  <span class="legend"><span class="legend-dot quarantine"></span>{{ self.t("common.status_quarantine") }}</span>
+  <span class="legend"><span class="legend-dot unknown"></span>{{ self.t("common.status_unknown") }}</span>
+  <span class="legend"><span class="legend-dot removed"></span>{{ self.t("common.status_removed") }}</span>
+  <span class="legend"><span class="legend-dot neutral"></span>{{ self.t("common.total") }}</span>
+</div>

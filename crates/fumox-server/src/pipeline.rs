@@ -11,18 +11,22 @@
 //! ingestion, health-filtering is expressed as a status exclusion list for
 //! the repository query (and re-applied here defensively), encode lives in
 //! the serving layer. The `drop` rules run at ingestion too (the source's
-//! own pipeline, via [`CompiledPipeline::drop_entries`]), before
+//! own pipeline, via [`CompiledPipeline::drop_entries_with_geo`]), before
 //! `rename`, so both sides see the original values. The ASN filters read a
 //! fact the row may not carry yet, so [`fill_missing_asns`] completes it
-//! before them. Speed-enrich is a stub until Phase 4.
+//! before them. The two ASN exclusion mechanisms are deliberately
+//! distinct: `filter.exclude_asns` hides matching rows from the output
+//! while the rows stay stored, a drop rule with `target: "asn"` keeps them
+//! from being stored at all. Speed-enrich is a stub until Phase 4.
 
-use fumox_core::geo::{GeoInfo, GeoResolver, apply_template};
+use fumox_core::geo::{GEO_LOOKUP_CONCURRENCY, GeoResolver, HostGeo, apply_template};
 use fumox_core::models::{ProxyEntry, ProxyStatus, Scheme};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Default geo name template.
 pub(crate) const DEFAULT_GEO_TEMPLATE: &str = "{flag} {country} · {name}";
@@ -41,7 +45,11 @@ pub(crate) const DEFAULT_GEO_TEMPLATE: &str = "{flag} {country} · {name}";
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PipelineConfig {
-    /// Schema version; must be `1`.
+    /// Schema version; must be `1`. A missing key defaults to `0`, which
+    /// fails the `pipeline.version` check in [`CompiledPipeline::from_json`]
+    /// like any other wrong value: an unversioned document is a localized
+    /// field error instead of an opaque serde type error.
+    #[serde(default)]
     pub(crate) version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) filter: Option<FilterConfig>,
@@ -56,6 +64,10 @@ pub(crate) struct PipelineConfig {
     pub(crate) geo: Option<GeoStepConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) health: Option<HealthConfig>,
+    /// Accepted-but-ignored backward-compatibility key: v1 deduplication
+    /// is unconditional (by fingerprint), so any `dedup` section is a
+    /// no-op. Accepted rather than rejected by `deny_unknown_fields` so
+    /// old exports keep importing; real modes arrive in schema v2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dedup: Option<DedupConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +78,9 @@ pub(crate) struct PipelineConfig {
     pub(crate) limit: Option<LimitConfig>,
 }
 
+/// Protocol and ASN gates plus the insecure-TLS switch. `protocols` and
+/// `exclude_protocols` compose: when both keys are set, a proxy must pass
+/// both checks — the result is the intersection of the two lists.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FilterConfig {
@@ -77,7 +92,11 @@ pub(crate) struct FilterConfig {
     /// is accepted and normalized to the number. null = no allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) asns: Option<Vec<String>>,
-    /// AS numbers to drop, the same accepted format as [`Self::asns`].
+    /// AS numbers to hide from the output, the same accepted format as
+    /// [`Self::asns`]: rows whose ASN matches are filtered at serving and
+    /// stay stored otherwise untouched. To prevent storage entirely, use
+    /// a drop rule with `target: "asn"` — the two are complementary
+    /// ("hide" and "not store"), not interchangeable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exclude_asns: Option<Vec<String>>,
     /// Drop proxies that allow insecure TLS: any
@@ -232,7 +251,9 @@ impl RenameTarget {
 /// A discard rule: a proxy matching any rule is thrown away entirely. The
 /// mirror of [`RenameRule`] minus `replace`, the field is absent on purpose
 /// (`deny_unknown_fields` rejects a copy-pasted rewrite rule), a drop rule
-/// only selects.
+/// only selects. An ASN-targeted rule prevents storage entirely — the
+/// counterpart of `filter.exclude_asns`, which only hides the stored rows
+/// from the output; see [`CompiledDrop::Asn`].
 ///
 /// Two flavours share one rule shape:
 /// - regex over `name` / `host` / `port` / `param:KEY` (the rename-style
@@ -293,6 +314,8 @@ pub(crate) fn default_exclude_statuses() -> Vec<String> {
     vec!["quarantine".to_string(), "removed".to_string()]
 }
 
+/// The accepted-but-ignored `dedup` section, see [`PipelineConfig::dedup`]:
+/// any `by` value compiles, v1 deduplication is unconditional.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DedupConfig {
@@ -337,17 +360,18 @@ pub(crate) struct SortConfig {
     pub(crate) desc: bool,
 }
 
-/// Output-size cap. `count` is `i64` so that negative or fractional input
-/// fails with the field-level `pipeline.invalid_limit`
-/// error instead of an opaque serde type error; `null`/missing means "no
-/// cap", the explicit-defaults reset of the profile tri-state. Unlike the
-/// other fields, `count` serializes even when `None`: `"count": null` is
-/// the explicit no-cap reset the builder emits.
+/// Output-size cap. `count` is a raw JSON number so that fractional or
+/// out-of-range input fails with the field-level `pipeline.invalid_limit`
+/// error in [`CompiledPipeline::from_json`] instead of an opaque serde
+/// type error; `null`/missing means "no cap", the explicit-defaults reset
+/// of the profile tri-state. Unlike the other fields, `count` serializes
+/// even when `None`: `"count": null` is the explicit no-cap reset the
+/// builder emits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LimitConfig {
     #[serde(default)]
-    pub(crate) count: Option<i64>,
+    pub(crate) count: Option<serde_json::Number>,
 }
 
 const fn default_sort_by() -> SortBy {
@@ -369,8 +393,10 @@ struct CompiledRename {
 enum CompiledDrop {
     /// Regex over a single `ProxyEntry` field (name / host / port / param).
     Regex { regex: Regex, target: RenameTarget },
-    /// Discard when the proxy's resolved AS number is in `asns`. Missing
-    /// ASN is not a hit (matches `filter.exclude_asns`).
+    /// Discard when the proxy's resolved AS number is in `asns` — the
+    /// "never store" counterpart of the serving-side `filter.exclude_asns`
+    /// ("hide", see [`FilterConfig::exclude_asns`]). Missing ASN is not a
+    /// hit (the same lenient contract as the exclude list).
     Asn { asns: Vec<u32> },
 }
 
@@ -400,13 +426,16 @@ pub struct CompiledPipeline {
     limit_count: Option<usize>,
     /// Whether `sort` was set explicitly (used to pick the sort config when
     /// several pipelines are merged: profile wins, then the first source).
-    pub sort_explicit: bool,
+    /// Read through [`CompiledPipeline::sort_explicit`].
+    sort_explicit: bool,
 }
 
 impl Default for CompiledPipeline {
     /// Pass-through pipeline with the defaults: drop
     /// insecure-allowing entries, geo-enrich, drop quarantine/removed,
-    /// dedup by fingerprint, keep source order.
+    /// dedup by fingerprint, keep source order. The hidden statuses are
+    /// built from the one [`default_exclude_statuses`] source of truth,
+    /// parsed through the same `FromStr` the config path uses.
     fn default() -> Self {
         Self {
             filter_protocols: None,
@@ -418,7 +447,10 @@ impl Default for CompiledPipeline {
             drop: Vec::new(),
             geo_enabled: true,
             geo_template: DEFAULT_GEO_TEMPLATE.to_string(),
-            exclude_statuses: vec![ProxyStatus::Quarantine, ProxyStatus::Removed],
+            exclude_statuses: default_exclude_statuses()
+                .iter()
+                .map(|raw| ProxyStatus::from_str(raw).expect("default statuses parse"))
+                .collect(),
             sort_by: SortBy::Source,
             sort_desc: false,
             limit_count: None,
@@ -457,7 +489,10 @@ impl CompiledPipeline {
         }
 
         let mut errors = Vec::new();
-        let config: PipelineConfig = match serde_json::from_value(value.clone()) {
+        // Deserialize straight from the reference: `&serde_json::Value` is
+        // itself a `Deserializer` (the admin pipeline editor's ingest
+        // works the same way), the document does not need to be cloned.
+        let config: PipelineConfig = match serde::Deserialize::deserialize(value) {
             Ok(config) => config,
             Err(err) => {
                 return Err(vec![PipelineIssue {
@@ -498,11 +533,34 @@ impl CompiledPipeline {
                     compile_rule_regex(&rule.match_pattern, &rule.flags, &field, &mut errors)
                     && let Some(target) = target
                 {
-                    compiled.rename.push(CompiledRename {
-                        regex,
-                        replace: rule.replace.clone(),
-                        target,
-                    });
+                    // A literal replacement that is itself an invalid
+                    // host/port can only produce invalid values wherever
+                    // the rule fires; reject it here, instead of silently
+                    // skipping the rewrite for every entry at runtime.
+                    // Replacements with capture groups (`$1`, `${name}`)
+                    // depend on the matched text and stay exempt.
+                    let literal_ok = rule.replace.contains('$')
+                        || match &target {
+                            RenameTarget::Host => valid_rewritten_host(&rule.replace),
+                            RenameTarget::Port => rule.replace.parse::<u16>().is_ok(),
+                            _ => true,
+                        };
+                    if literal_ok {
+                        compiled.rename.push(CompiledRename {
+                            regex,
+                            replace: rule.replace.clone(),
+                            target,
+                        });
+                    } else {
+                        errors.push(PipelineIssue {
+                            key: if matches!(target, RenameTarget::Host) {
+                                "pipeline.never_valid_host"
+                            } else {
+                                "pipeline.never_valid_port"
+                            },
+                            args: vec![field, rule.replace.clone()],
+                        });
+                    }
                 }
             }
         }
@@ -596,14 +654,9 @@ impl CompiledPipeline {
             compiled.exclude_statuses = statuses;
         }
 
-        if let Some(dedup) = config.dedup
-            && dedup.by != "fingerprint"
-        {
-            errors.push(PipelineIssue {
-                key: "pipeline.dedup_by",
-                args: vec![dedup.by],
-            });
-        }
+        // `dedup` is accepted and ignored: v1 deduplication is
+        // unconditional (see [`PipelineConfig::dedup`]), so every `by`
+        // value compiles and no validation error exists for it.
 
         if let Some(sort) = config.sort {
             compiled.sort_by = sort.by;
@@ -613,17 +666,20 @@ impl CompiledPipeline {
 
         if let Some(limit) = config.limit {
             // `null`/missing keeps the cap unset (the profile's explicit
-            // "defaults" reset); `0` and anything below is a field error ,
-            // "no cap" is the absent section, not a magic number.
+            // "defaults" reset); an integer of at least 1 is the cap —
+            // fractional, zero, negative, or beyond the platform `usize`
+            // (also anything the JSON number exceeds `i64` with) is a
+            // field error, "no cap" is the absent section, not a magic
+            // number.
             match limit.count {
                 None => {}
-                Some(count) if count >= 1 => {
-                    compiled.limit_count = Some(count as usize);
-                }
-                Some(count) => errors.push(PipelineIssue {
-                    key: "pipeline.invalid_limit",
-                    args: vec![count.to_string()],
-                }),
+                Some(count) => match count.as_i64().and_then(|n| usize::try_from(n).ok()) {
+                    Some(count) if count >= 1 => compiled.limit_count = Some(count),
+                    _ => errors.push(PipelineIssue {
+                        key: "pipeline.invalid_limit",
+                        args: vec![count.to_string()],
+                    }),
+                },
             }
         }
 
@@ -631,6 +687,38 @@ impl CompiledPipeline {
             Ok(compiled)
         } else {
             Err(errors)
+        }
+    }
+
+    /// [`Self::from_json`] behind the serving-side compile cache: every
+    /// render re-compiles the same merged configs (source + profile), and
+    /// the compile rebuilds every regex from scratch. The cache key is the
+    /// config's serialized form, so an edited config lands on a different
+    /// key by construction. Validation errors are not cached: a broken
+    /// config keeps failing fast, and the fixed one recompiles.
+    pub fn from_json_cached(
+        value: Option<&serde_json::Value>,
+    ) -> Result<Arc<Self>, Vec<PipelineIssue>> {
+        static CACHE: LazyLock<Mutex<HashMap<u64, Arc<CompiledPipeline>>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        let key = config_cache_key(value);
+        if let Some(cached) = CACHE.lock().unwrap().get(&key) {
+            return Ok(Arc::clone(cached));
+        }
+        match Self::from_json(value) {
+            Ok(compiled) => {
+                let compiled = Arc::new(compiled);
+                let mut cache = CACHE.lock().unwrap();
+                // The key space is the distinct (source, profile) config
+                // pairs, small in practice; reset rather than grow without
+                // bound if an installation accumulates thousands of them.
+                if cache.len() >= 1024 {
+                    cache.clear();
+                }
+                cache.insert(key, Arc::clone(&compiled));
+                Ok(compiled)
+            }
+            Err(errors) => Err(errors),
         }
     }
 
@@ -642,65 +730,85 @@ impl CompiledPipeline {
         out
     }
 
-    /// Per-entry verdicts of the drop rules, in input order. `geo` may be
-    /// shorter than `entries` (inactive resolver): unstamped entries keep
-    /// their ASN rules unapplied and survive, zipping the two would
-    /// truncate the batch.
+    /// Per-entry verdicts of the drop rules, in input order. `asns` is the
+    /// pre-parsed ASN column (the caller parses the stored `AS{n}` spellings
+    /// once at its boundary) and may be shorter than `entries` (inactive
+    /// resolver): unstamped entries keep their ASN rules unapplied and
+    /// survive, zipping the two would truncate the batch. The mismatch is
+    /// a WARN only when the pipeline actually carries an ASN rule — that
+    /// is the case where a truncation silently changes what gets dropped —
+    /// and DEBUG otherwise.
     fn drop_survivors(
         &self,
         entries: &[ProxyEntry],
-        geo: &[Option<fumox_core::repo::proxies::GeoStamp>],
+        asns: &[Option<u32>],
+        source_id: &str,
     ) -> Vec<bool> {
-        if geo.len() < entries.len() {
-            tracing::warn!(
-                entries = entries.len(),
-                stamps = geo.len(),
-                "drop rules: fewer geo stamps than entries, unstamped entries keep their ASN drop rules unapplied"
-            );
+        if asns.len() < entries.len() {
+            let message = "drop rules: fewer resolved ASNs than entries, unstamped entries keep their ASN drop rules unapplied";
+            if self
+                .drop
+                .iter()
+                .any(|rule| matches!(rule, CompiledDrop::Asn { .. }))
+            {
+                tracing::warn!(
+                    source_id,
+                    entries = entries.len(),
+                    asns = asns.len(),
+                    "{message}"
+                );
+            } else {
+                tracing::debug!(
+                    source_id,
+                    entries = entries.len(),
+                    asns = asns.len(),
+                    "{message}"
+                );
+            }
         }
         entries
             .iter()
             .enumerate()
             .map(|(idx, entry)| {
-                let stamp = geo.get(idx).and_then(|stamp| stamp.as_ref());
-                !self.drop.iter().any(|rule| match rule {
-                    CompiledDrop::Regex { regex, target } => matches_target(entry, regex, target),
-                    CompiledDrop::Asn { asns } => stamp
-                        .and_then(|s| s.asn.as_deref())
-                        .and_then(stored_asn_number)
-                        .is_some_and(|n| asns.contains(&n)),
-                })
+                let asn = asns.get(idx).copied().flatten();
+                !self
+                    .drop
+                    .iter()
+                    .any(|rule| drop_rule_hits(rule, entry, asn))
             })
             .collect()
     }
 
     /// Drop rules, keeping every surviving entry paired with its own geo
-    /// stamp. The ingest path persists the entries *and* the stamps, and
-    /// `reconcile_source` pairs the two by index: returning the survivors
-    /// alone would silently re-point every stamp after the first dropped
-    /// entry at a host one or more positions earlier, stamping proxies
-    /// with another host's country and ASN.
+    /// stamp. The ASNs arrive pre-parsed (`asns`, the caller's boundary);
+    /// `facts` is the stamp column the ingest path persists *and* keeps
+    /// index-aligned, and `reconcile_source` pairs the two by index:
+    /// returning the survivors alone would silently re-point every stamp
+    /// after the first dropped entry at a host one or more positions
+    /// earlier, stamping proxies with another host's country and ASN.
     pub fn drop_entries_with_geo(
         &self,
         entries: Vec<ProxyEntry>,
-        geo: &[Option<fumox_core::repo::proxies::GeoStamp>],
+        asns: &[Option<u32>],
+        facts: &[Option<fumox_core::repo::proxies::GeoStamp>],
+        source_id: &str,
     ) -> (
         Vec<ProxyEntry>,
         Vec<Option<fumox_core::repo::proxies::GeoStamp>>,
     ) {
         if self.drop.is_empty() {
-            return (entries, geo.to_vec());
+            return (entries, facts.to_vec());
         }
-        let survivors = self.drop_survivors(&entries, geo);
+        let survivors = self.drop_survivors(&entries, asns, source_id);
         let mut kept_entries = Vec::with_capacity(entries.len());
-        let mut kept_geo = Vec::with_capacity(entries.len());
+        let mut kept_facts = Vec::with_capacity(entries.len());
         for (idx, entry) in entries.into_iter().enumerate() {
             if survivors[idx] {
                 kept_entries.push(entry);
-                kept_geo.push(geo.get(idx).cloned().flatten());
+                kept_facts.push(facts.get(idx).cloned().flatten());
             }
         }
-        (kept_entries, kept_geo)
+        (kept_entries, kept_facts)
     }
 
     /// Whether any `drop` rule is configured. Reconciliation asks before a
@@ -710,6 +818,12 @@ impl CompiledPipeline {
     /// them for good.
     pub fn has_drop_rules(&self) -> bool {
         !self.drop.is_empty()
+    }
+
+    /// Whether `sort` was set explicitly: the sort contest over the merged
+    /// profile reads it (profile wins, then the first source that set one).
+    pub fn sort_explicit(&self) -> bool {
+        self.sort_explicit
     }
 
     /// Per-source steps: filter → normalize → rename →
@@ -722,11 +836,15 @@ impl CompiledPipeline {
         geo: &G,
     ) -> Vec<Candidate> {
         // filter
-        if let Some(allowed) = &self.filter_protocols {
-            candidates.retain(|c| allowed.contains(&c.entry.scheme));
-        }
-        if let Some(excluded) = &self.exclude_protocols {
-            candidates.retain(|c| !excluded.contains(&c.entry.scheme));
+        if self.filter_protocols.is_some() || self.exclude_protocols.is_some() {
+            let before = candidates.len();
+            if let Some(allowed) = &self.filter_protocols {
+                candidates.retain(|c| allowed.contains(&c.entry.scheme));
+            }
+            if let Some(excluded) = &self.exclude_protocols {
+                candidates.retain(|c| !excluded.contains(&c.entry.scheme));
+            }
+            log_filter_step("protocols", before, candidates.len());
         }
         // Every step below reads `candidate.geo_asn`, which a row ingested
         // without geo does not carry: complete it before they run. Only the
@@ -746,28 +864,24 @@ impl CompiledPipeline {
         // profile country allowlist.
         // An allowlist drops proxies without a resolved ASN; an exclude
         // list only removes the named ASNs and keeps the unresolved ones.
-        if let Some(allowed) = &self.filter_asns {
-            candidates.retain(|c| {
-                c.geo_asn
-                    .as_deref()
-                    .and_then(stored_asn_number)
-                    .is_some_and(|asn| allowed.contains(&asn))
-            });
-        }
-        if let Some(excluded) = &self.exclude_asns {
-            candidates.retain(|c| {
-                c.geo_asn
-                    .as_deref()
-                    .and_then(stored_asn_number)
-                    .is_none_or(|asn| !excluded.contains(&asn))
-            });
+        if self.filter_asns.is_some() || self.exclude_asns.is_some() {
+            let before = candidates.len();
+            if let Some(allowed) = &self.filter_asns {
+                candidates.retain(|c| c.geo_asn.is_some_and(|asn| allowed.contains(&asn)));
+            }
+            if let Some(excluded) = &self.exclude_asns {
+                candidates.retain(|c| c.geo_asn.is_none_or(|asn| !excluded.contains(&asn)));
+            }
+            log_filter_step("asns", before, candidates.len());
         }
 
         // filter.forbid_insecure, drop proxies that allow insecure TLS in
         // any spelling. Falsy toggles (`insecure=0`) and
         // alias-free entries survive; the DB row is never touched.
         if self.forbid_insecure {
+            let before = candidates.len();
             Self::retain_secure(&mut candidates);
+            log_filter_step("forbid_insecure", before, candidates.len());
         }
 
         // drop, discard rules. Deliberately before
@@ -775,21 +889,17 @@ impl CompiledPipeline {
         // must see the original values, or the two would disagree; a
         // rewrite must never decide whether a proxy is stored. Any rule
         // matching discards the proxy (rules are OR-ed). ASN-targeted rules
-        // use the candidate's stored `geo_asn`; missing ASN is not a hit
+        // use the candidate's typed `geo_asn`; missing ASN is not a hit
         // (the same lenient contract as `filter.exclude_asns`).
         if !self.drop.is_empty() {
+            let before = candidates.len();
             candidates.retain(|c| {
-                !self.drop.iter().any(|rule| match rule {
-                    CompiledDrop::Regex { regex, target } => {
-                        matches_target(&c.entry, regex, target)
-                    }
-                    CompiledDrop::Asn { asns } => c
-                        .geo_asn
-                        .as_deref()
-                        .and_then(stored_asn_number)
-                        .is_some_and(|n| asns.contains(&n)),
-                })
+                !self
+                    .drop
+                    .iter()
+                    .any(|rule| drop_rule_hits(rule, &c.entry, c.geo_asn))
             });
+            log_filter_step("drop", before, candidates.len());
         }
 
         // rename, rules apply in order. A rule's `target` picks the field:
@@ -826,17 +936,48 @@ impl CompiledPipeline {
         // filter.forbid_insecure, again: the filter must see the final
         // parameters, a rename rule can introduce an insecure switch.
         if self.forbid_insecure {
+            let before = candidates.len();
             Self::retain_secure(&mut candidates);
+            log_filter_step("forbid_insecure", before, candidates.len());
         }
 
         // geo-enrich, rewrite the display name from the template and keep
         // the country code for sorting. No-op when the resolver is inactive.
+        // The hosts resolve with bounded parallelism (a slow host must not
+        // stall the whole pass) and under one wall-clock ceiling, like the
+        // ingest pass; on expiry the names stay as stored. The lookups are
+        // boxed futures collected up front, so no borrow of the generic
+        // resolver rides the stream across the await — the boxes stay
+        // `Send` whatever they borrow.
         if self.geo_enabled && geo.is_active() {
-            for candidate in &mut candidates {
-                if let Some(info) = geo.resolve_host(&candidate.entry.host).await {
-                    let renamed = apply_template(&self.geo_template, &info, &candidate.entry.name);
-                    candidate.entry.name = renamed;
-                    candidate.geo_country = info.country_code.clone();
+            use futures_util::StreamExt;
+            let lookups: Vec<_> = candidates
+                .iter()
+                .map(|c| geo.resolve_host(&c.entry.host))
+                .collect();
+            let resolved = tokio::time::timeout(
+                GEO_PASS_TIMEOUT,
+                futures_util::stream::iter(lookups)
+                    .buffered(GEO_LOOKUP_CONCURRENCY)
+                    .collect::<Vec<Option<_>>>(),
+            )
+            .await;
+            match resolved {
+                Ok(infos) => {
+                    for (candidate, info) in candidates.iter_mut().zip(infos) {
+                        if let Some(info) = info {
+                            let renamed =
+                                apply_template(&self.geo_template, &info, &candidate.entry.name);
+                            candidate.entry.name = renamed;
+                            candidate.geo_country = info.country_code.clone();
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = GEO_PASS_TIMEOUT.as_secs(),
+                        "geo-enrich exceeded the pass budget; the names stay as stored"
+                    );
                 }
             }
         }
@@ -844,7 +985,9 @@ impl CompiledPipeline {
         // health-filter, defensive re-check; the serving layer can load
         // every status and rely on this step for exclusion.
         let excluded: HashSet<ProxyStatus> = self.exclude_statuses.iter().copied().collect();
+        let before = candidates.len();
         candidates.retain(|c| !excluded.contains(&c.status));
+        log_filter_step("health", before, candidates.len());
 
         candidates
     }
@@ -867,13 +1010,17 @@ impl CompiledPipeline {
     /// latency comes from probe results already stored on the row.
     pub fn finalize(&self, candidates: &mut Vec<Candidate>) {
         let mut seen = HashSet::new();
+        let before = candidates.len();
         candidates.retain(|c| seen.insert(c.entry.fingerprint()));
+        log_filter_step("dedup", before, candidates.len());
         self.sort(candidates);
         // Output cap: applied after dedup and sorting, so
         // the list keeps its top in the chosen order, `sort: latency`
         // yields the N fastest, `sort: source` the first N of the feed.
         if let Some(limit) = self.limit_count {
+            let before = candidates.len();
             candidates.truncate(limit);
+            log_filter_step("limit", before, candidates.len());
         }
     }
 
@@ -892,10 +1039,20 @@ impl CompiledPipeline {
                 }
             }
             SortBy::Country => {
-                candidates.sort_by_cached_key(|c| c.geo_country.clone().unwrap_or_default());
-                if self.sort_desc {
-                    candidates.reverse();
-                }
+                // Unknown countries always go last, ascending or
+                // descending: an absent fact is not a country code (the
+                // same contract as the NULL latency below), so the
+                // reversal rides the country comparison, not the
+                // known/unknown placement.
+                candidates.sort_by(|a, b| match (&a.geo_country, &b.geo_country) {
+                    (Some(x), Some(y)) => {
+                        let ord = x.cmp(y);
+                        if self.sort_desc { ord.reverse() } else { ord }
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                });
             }
             SortBy::Latency => {
                 // NULL latencies always go last, even when descending.
@@ -908,30 +1065,11 @@ impl CompiledPipeline {
     }
 }
 
-/// The resolver call the ASN fill makes, behind a trait like ingest's
-/// `GeoLookup` so the fill is testable without a MaxMind database.
-pub(crate) trait HostGeo {
-    fn resolve_host(
-        &self,
-        host: &str,
-    ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send;
-
-    /// Whether the resolver can answer at all.
-    fn is_active(&self) -> bool;
-}
-
-impl HostGeo for GeoResolver {
-    fn resolve_host(
-        &self,
-        host: &str,
-    ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
-        self.resolve(host)
-    }
-
-    fn is_active(&self) -> bool {
-        GeoResolver::is_active(self)
-    }
-}
+/// Wall-clock ceiling for one geo-enrich pass: every uncached host can
+/// cost a DNS round-trip, so the batch is bounded in time as well as in
+/// concurrency (the same contract as the ingest pass). On expiry the
+/// names stay as stored instead of blocking the render.
+const GEO_PASS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Give every candidate without a stored ASN the one the resolver can
 /// name now: an exclude list keeps what it cannot name, and the resolver
@@ -949,9 +1087,28 @@ async fn fill_missing_asns<G: HostGeo + ?Sized>(candidates: &mut [Candidate], ge
         if let Some(info) = geo.resolve_host(&candidate.entry.host).await
             && let Some(asn) = info.asn
         {
-            candidate.geo_asn = Some(format!("AS{asn}"));
+            candidate.geo_asn = Some(asn);
         }
     }
+}
+
+/// The profile-level country allowlist as one filtering step, the matcher
+/// `/sub` applies per source. It runs *before* the pipeline's own steps
+/// (`CompiledPipeline::apply`): the allowlist is about confirmed geo facts,
+/// not a pipeline rule, so it also runs on the tiers the live-filter would
+/// drop later, and its own order is fixed — proxies without a determined
+/// country stay out while the filter is active, "only these countries"
+/// means confirmed facts, not guesses (the same semantics as
+/// `filter_asns`). The country codes come in pre-normalized (uppercase).
+pub(crate) fn retain_allowed_countries(
+    candidates: &mut Vec<Candidate>,
+    allowed: &std::collections::HashSet<String>,
+) {
+    candidates.retain(|c| {
+        c.geo_country
+            .as_deref()
+            .is_some_and(|code| allowed.contains(&code.to_ascii_uppercase()))
+    });
 }
 
 /// Merge a source pipeline with the profile override: the profile's
@@ -971,8 +1128,18 @@ pub fn merge_configs(
                 return Some(s.clone());
             }
             let (Some(s_map), Some(p_map)) = (s.as_object(), p.as_object()) else {
-                // Non-object configs are invalid; the profile side wins so
-                // the error surfaces against the profile form.
+                // Non-object configs are invalid, so the merged result
+                // fails `from_json` one way or another. The profile side
+                // wins, its form gets the error; when the source is the
+                // non-object one while the profile is a valid object, a
+                // WARN names the source config as the broken side.
+                if p.as_object().is_some() {
+                    tracing::warn!(
+                        source = %s,
+                        "pipeline merge: the source config is not an object, \
+                         the profile's object replaces it"
+                    );
+                }
                 return Some(p.clone());
             };
             let mut merged = s_map.clone();
@@ -1034,6 +1201,39 @@ fn matches_target(entry: &ProxyEntry, regex: &Regex, target: &RenameTarget) -> b
             .params
             .iter()
             .any(|p| p.key.eq_ignore_ascii_case(key) && regex.is_match(&p.value)),
+    }
+}
+
+/// Whether one drop rule hits this entry — the single evaluation both drop
+/// passes share. The ASN source stays with the caller: the ingest pass
+/// reads the pre-parsed stamp column, the serving pass reads the
+/// candidate's typed `geo_asn`; a missing ASN is not a hit (the same
+/// lenient contract as `filter.exclude_asns`).
+fn drop_rule_hits(rule: &CompiledDrop, entry: &ProxyEntry, asn: Option<u32>) -> bool {
+    match rule {
+        CompiledDrop::Regex { regex, target } => matches_target(entry, regex, target),
+        CompiledDrop::Asn { asns } => asn.is_some_and(|n| asns.contains(&n)),
+    }
+}
+
+/// One filtering step's bookkeeping: a DEBUG event with the in/out counts
+/// and the removals, so a subscription that shrank can be traced to the
+/// step that shrank it, plus a WARN when the step emptied a non-empty
+/// input — a misconfigured rule must not quietly blank the feed.
+fn log_filter_step(step: &str, before: usize, after: usize) {
+    tracing::debug!(
+        step,
+        in = before,
+        out = after,
+        removed = before.saturating_sub(after),
+        "pipeline filtering step"
+    );
+    if before > 0 && after == 0 {
+        tracing::warn!(
+            step,
+            removed = before,
+            "pipeline step removed every entry of a non-empty input"
+        );
     }
 }
 
@@ -1149,19 +1349,16 @@ fn parse_scheme_list(
 }
 
 /// The AS number carried by a stored `geo_asn` value (`"AS24940"`), or any
-/// `AS{n}` / `24940` spelling accepted from a pipeline config.
-fn asn_number(raw: &str) -> Option<u32> {
+/// `AS{n}` / `24940` spelling accepted from a pipeline config. `pub(crate)`
+/// because the DB boundaries (`rows_to_candidates`, the ingest drop pass)
+/// parse the column exactly once, on their side.
+pub(crate) fn asn_number(raw: &str) -> Option<u32> {
     let digits = raw
         .trim()
         .strip_prefix("AS")
         .or_else(|| raw.trim().strip_prefix("as"))
         .unwrap_or(raw.trim());
     digits.parse::<u32>().ok()
-}
-
-/// [`asn_number`] over the stored `geo_asn` column format.
-fn stored_asn_number(raw: &str) -> Option<u32> {
-    asn_number(raw)
 }
 
 /// Validate an ASN list field (`filter.asns` / `filter.exclude_asns`):
@@ -1200,13 +1397,31 @@ pub struct Candidate {
     pub latency_ms: Option<i64>,
     /// Country code stored on the proxy row by earlier enrichment.
     pub geo_country: Option<String>,
-    /// Autonomous system stored as `AS{n}` on the proxy row.
-    pub geo_asn: Option<String>,
+    /// Autonomous system stored on the proxy row, parsed to its number
+    /// once at the DB boundary (`rows_to_candidates`); the filters and
+    /// drop rules compare plain numbers, never `AS{n}` strings.
+    pub geo_asn: Option<u32>,
+}
+
+/// The [`CompiledPipeline::from_json_cached`] cache key: the config's
+/// serialized bytes. Identical documents serialize identically, any edit
+/// produces different bytes, and a missing config keys apart from an
+/// empty one.
+fn config_cache_key(value: Option<&serde_json::Value>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match value {
+        None => None::<u8>.hash(&mut hasher),
+        Some(value) => serde_json::to_vec(value)
+            .expect("serializing a serde_json::Value cannot fail")
+            .hash(&mut hasher),
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fumox_core::geo::GeoInfo;
     use fumox_core::models::{Param, Scheme};
     use serde_json::json;
 
@@ -1241,6 +1456,58 @@ mod tests {
         GeoResolver::new(&cfg)
     }
 
+    /// The mmdb-backed resolver the geo tests share, or `None` when the
+    /// GeoLite2 files are absent (gitignored, so a fresh checkout has
+    /// none): the caller skips instead of testing a disabled resolver.
+    /// The tests are also marked `#[ignore = "requires GeoLite2 mmdb"]`,
+    /// so the skip is explicit even before this guard runs.
+    fn active_geo_with_dbs() -> Option<GeoResolver> {
+        let db_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        if !db_dir.join("GeoLite2-ASN.mmdb").exists() || !db_dir.join("GeoLite2-City.mmdb").exists()
+        {
+            eprintln!("skipped: GeoLite2-ASN/City.mmdb not present");
+            return None;
+        }
+        let geo = GeoResolver::new(&fumox_core::config::GeoConfig {
+            enabled: true,
+            db_dir,
+            ..Default::default()
+        });
+        assert!(geo.is_active());
+        Some(geo)
+    }
+
+    /// Capture log lines of one scope at `max` level and above: the
+    /// observability assertions read them back instead of matching on
+    /// internals. Returns the buffer and the subscriber guard, which must
+    /// stay alive for the capture to run.
+    fn capture_logs(
+        max: tracing::Level,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(max)
+            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+
     #[test]
     fn null_and_empty_configs_compile_to_defaults() {
         assert!(CompiledPipeline::from_json(None).is_ok());
@@ -1251,6 +1518,8 @@ mod tests {
             compiled.exclude_statuses,
             vec![ProxyStatus::Quarantine, ProxyStatus::Removed]
         );
+        // No `sort` section: source order is the default, not a choice.
+        assert!(!compiled.sort_explicit());
     }
 
     #[test]
@@ -1269,6 +1538,16 @@ mod tests {
         let err = CompiledPipeline::from_json(Some(&json!({ "version": 2 }))).unwrap_err();
         assert_eq!(err[0].key, "pipeline.version");
         assert_eq!(err[0].args, vec!["2"]);
+    }
+
+    /// A JSON without the `version` key takes the serde default (`0`),
+    /// which fails the same localized `pipeline.version` check as any
+    /// other wrong value, instead of the opaque serde type error.
+    #[test]
+    fn a_missing_version_is_a_pipeline_version_error() {
+        let err = CompiledPipeline::from_json(Some(&json!({ "filter": {} }))).unwrap_err();
+        assert_eq!(err[0].key, "pipeline.version");
+        assert_eq!(err[0].args, vec!["0"]);
     }
 
     #[test]
@@ -1334,15 +1613,18 @@ mod tests {
         assert_eq!(err[0].args[1], "z");
     }
 
+    /// The `dedup` section is accepted and ignored: v1 deduplication is
+    /// unconditional (by fingerprint), so any `by` value compiles and real
+    /// modes arrive in v2 — old exports keep importing either way.
     #[test]
-    fn dedup_by_only_supports_fingerprint() {
-        let err = CompiledPipeline::from_json(Some(&json!({
-            "version": 1,
-            "dedup": { "by": "name" }
-        })))
-        .unwrap_err();
-        assert_eq!(err[0].key, "pipeline.dedup_by");
-        assert_eq!(err[0].args, vec!["name"]);
+    fn the_dedup_section_is_accepted_and_ignored() {
+        for by in ["fingerprint", "name"] {
+            CompiledPipeline::from_json(Some(&json!({
+                "version": 1,
+                "dedup": { "by": by }
+            })))
+            .unwrap_or_else(|errors| panic!("dedup.by={by} must compile: {errors:?}"));
+        }
     }
 
     #[tokio::test]
@@ -1411,15 +1693,17 @@ mod tests {
         .unwrap_err();
         assert_eq!(err[0].key, "pipeline.unknown_target");
 
-        // The four valid spellings (and the absent target) compile.
-        for target in [
-            None,
-            Some("name"),
-            Some("host"),
-            Some("port"),
-            Some("param:fp"),
+        // The four valid spellings (and the absent target) compile. The
+        // replacement must be a valid literal of its target: `1` for the
+        // port, a plain word for the rest.
+        for (target, replace) in [
+            (None, "b"),
+            (Some("name"), "b"),
+            (Some("host"), "b"),
+            (Some("port"), "1"),
+            (Some("param:fp"), "b"),
         ] {
-            let mut rule = json!({ "match": "a", "replace": "b" });
+            let mut rule = json!({ "match": "a", "replace": replace });
             if let Some(target) = target {
                 rule["target"] = json!(target);
             }
@@ -1434,49 +1718,26 @@ mod tests {
     }
 
     fn candidate_with_params(name: &str, host: &str, port: u16, params: Vec<Param>) -> Candidate {
-        Candidate {
-            entry: ProxyEntry {
-                scheme: Scheme::Vless,
-                name: name.to_string(),
-                host: host.to_string(),
-                port,
-                credential: "cred".to_string(),
-                params,
-                raw_path: String::new(),
-                raw_line: String::new(),
-                canonical: None,
-            },
-            source_position: 0,
-            status: ProxyStatus::Unknown,
-            latency_ms: None,
-            geo_country: None,
-            geo_asn: None,
-        }
+        let mut c = candidate(name, Scheme::Vless, host);
+        c.entry.port = port;
+        c.entry.params = params;
+        c
     }
 
     /// A candidate carrying stored geo facts, as `rows_to_candidates`
-    /// loads them from the DB. The host is derived from the name so the
-    /// candidates differ by fingerprint and survive `finalize`'s dedup.
-    fn candidate_with_asn(name: &str, asn: Option<&str>) -> Candidate {
+    /// loads them from the DB (the `AS{n}` column parsed to its number at
+    /// the boundary). The host is derived from the name so the candidates
+    /// differ by fingerprint and survive `finalize`'s dedup.
+    fn candidate_with_asn(name: &str, asn: Option<u32>) -> Candidate {
         let mut c = candidate(name, Scheme::Vless, &format!("{name}.example.com"));
-        c.geo_asn = asn.map(String::from);
+        c.geo_asn = asn;
         c
     }
 
     /// Build a `ProxyEntry` for ingestion-side tests: scheme is fixed,
     /// credential too, the drop rules only look at the chosen fields.
     fn entry(name: &str, host: &str) -> ProxyEntry {
-        ProxyEntry {
-            scheme: Scheme::Vless,
-            name: name.to_string(),
-            host: host.to_string(),
-            port: 443,
-            credential: "cred".to_string(),
-            params: Vec::new(),
-            raw_path: String::new(),
-            raw_line: String::new(),
-            canonical: None,
-        }
+        candidate(name, Scheme::Vless, host).entry
     }
 
     #[tokio::test]
@@ -1487,9 +1748,9 @@ mod tests {
         })))
         .unwrap();
         let candidates = vec![
-            candidate_with_asn("hetzner", Some("AS24940")),
-            candidate_with_asn("cloudflare", Some("AS13335")),
-            candidate_with_asn("other", Some("AS9009")),
+            candidate_with_asn("hetzner", Some(24940)),
+            candidate_with_asn("cloudflare", Some(13335)),
+            candidate_with_asn("other", Some(9009)),
             candidate_with_asn("unresolved", None),
         ];
         let out = compiled.apply(candidates, &inactive_geo()).await;
@@ -1505,8 +1766,8 @@ mod tests {
         })))
         .unwrap();
         let candidates = vec![
-            candidate_with_asn("hetzner", Some("AS24940")),
-            candidate_with_asn("other", Some("AS9009")),
+            candidate_with_asn("hetzner", Some(24940)),
+            candidate_with_asn("other", Some(9009)),
             candidate_with_asn("unresolved", None),
         ];
         let out = compiled.apply(candidates, &inactive_geo()).await;
@@ -1514,63 +1775,71 @@ mod tests {
         assert_eq!(names, ["other", "unresolved"]);
     }
 
-    /// Stand-in resolver for the ASN fill, answering one ASN for every host
-    /// or none at all, like ingest's `GeoLookup` seam.
+    /// The one resolver fake of the pipeline tests, standing in for the
+    /// shared [`HostGeo`] seam: it answers one ASN for every host (per-host
+    /// overrides first), counts its lookups, tracks how many ran
+    /// concurrently, and can report itself inactive — everything the fill,
+    /// the exclude list and the geo-enrich assertions need without a
+    /// MaxMind database.
+    #[derive(Default)]
     struct FakeGeo {
+        /// The blanket answer for hosts without a `by_host` override.
         asn: Option<u32>,
+        /// Per-host answers, consulted first.
+        by_host: std::collections::HashMap<&'static str, u32>,
+        active: bool,
+        calls: std::sync::atomic::AtomicUsize,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        sleep_ms: u64,
+    }
+
+    impl FakeGeo {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     impl HostGeo for FakeGeo {
-        fn resolve_host(
-            &self,
-            _host: &str,
-        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
-            let asn = self.asn;
-            async move {
+        fn is_active(&self) -> bool {
+            self.active
+        }
+
+        fn resolve_host<'a>(
+            &'a self,
+            host: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<GeoInfo>>> + Send + 'a>>
+        {
+            let asn = self.by_host.get(host).copied().or(self.asn);
+            let sleep_ms = self.sleep_ms;
+            Box::pin(async move {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The counter moves inside the future, on its first poll:
+                // building a future starts no work, so the peak reflects
+                // lookups actually running, not ones merely created.
+                let running = self
+                    .in_flight
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                self.peak
+                    .fetch_max(running, std::sync::atomic::Ordering::Relaxed);
+                if sleep_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                }
+                self.in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 asn.map(|asn| {
                     Arc::new(GeoInfo {
                         asn: Some(asn),
                         ..Default::default()
                     })
                 })
-            }
-        }
-
-        fn is_active(&self) -> bool {
-            true
-        }
-    }
-
-    /// A resolver that counts its lookups, so a test can see that a
-    /// pipeline without an ASN rule resolves nothing at all.
-    struct CountingGeo {
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    impl CountingGeo {
-        fn new() -> Self {
-            Self {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        fn calls(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::Relaxed)
-        }
-    }
-
-    impl HostGeo for CountingGeo {
-        fn resolve_host(
-            &self,
-            _host: &str,
-        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            async { None }
-        }
-
-        fn is_active(&self) -> bool {
-            false
+            })
         }
     }
 
@@ -1580,19 +1849,33 @@ mod tests {
     async fn the_fill_names_a_candidate_that_carries_no_asn() {
         let mut candidates = vec![
             candidate_with_asn("missing", None),
-            candidate_with_asn("stored", Some("AS24940")),
+            candidate_with_asn("stored", Some(24940)),
         ];
-        fill_missing_asns(&mut candidates, &FakeGeo { asn: Some(13335) }).await;
-        assert_eq!(candidates[0].geo_asn.as_deref(), Some("AS13335"));
+        fill_missing_asns(
+            &mut candidates,
+            &FakeGeo {
+                asn: Some(13335),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(candidates[0].geo_asn, Some(13335));
     }
 
     /// The stored ASN is the confirmed fact, never overwritten by a lookup
     /// that would disagree.
     #[tokio::test]
     async fn the_fill_never_overwrites_a_stored_asn() {
-        let mut candidates = vec![candidate_with_asn("stored", Some("AS24940"))];
-        fill_missing_asns(&mut candidates, &FakeGeo { asn: Some(13335) }).await;
-        assert_eq!(candidates[0].geo_asn.as_deref(), Some("AS24940"));
+        let mut candidates = vec![candidate_with_asn("stored", Some(24940))];
+        fill_missing_asns(
+            &mut candidates,
+            &FakeGeo {
+                asn: Some(13335),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(candidates[0].geo_asn, Some(24940));
     }
 
     /// A resolver with no ASN to give (City-only install, or a range the ASN
@@ -1600,28 +1883,53 @@ mod tests {
     #[tokio::test]
     async fn a_resolver_without_an_asn_changes_nothing() {
         let mut candidates = vec![candidate_with_asn("no-asn", None)];
-        fill_missing_asns(&mut candidates, &FakeGeo { asn: None }).await;
+        fill_missing_asns(&mut candidates, &FakeGeo::default()).await;
         assert_eq!(candidates[0].geo_asn, None);
     }
 
     /// The reported failure: the exclude list was honoured for every row
     /// whose ingest stamped an ASN and silently kept the rest, while
-    /// geo-enrich printed the excluded AS in the output name.
+    /// geo-enrich printed the excluded AS in the output name. The fake
+    /// resolver covers the mechanics without a database; the mmdb variant
+    /// below exercises the real resolver end to end.
     #[tokio::test]
-    async fn a_proxy_without_a_stored_asn_still_honours_the_exclude_list() {
-        // GeoLite2 files are gitignored, so CI runs without them.
-        let db_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
-        if !db_dir.join("GeoLite2-ASN.mmdb").exists() || !db_dir.join("GeoLite2-City.mmdb").exists()
-        {
-            eprintln!("skipped: GeoLite2-ASN/City.mmdb not present");
-            return;
-        }
-        let geo = GeoResolver::new(&fumox_core::config::GeoConfig {
-            enabled: true,
-            db_dir,
+    async fn the_exclude_list_drops_a_resolved_asn_without_a_stored_one() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "exclude_asns": ["13335"] },
+            // Geo enrichment off: the names stay as stored, the assertion
+            // reads them back verbatim.
+            "geo": { "enabled": false }
+        })))
+        .unwrap();
+        let geo = FakeGeo {
+            by_host: std::collections::HashMap::from([("1.1.1.1", 13335), ("8.8.8.8", 15169)]),
             ..Default::default()
-        });
-        assert!(geo.is_active());
+        };
+        // Neither candidate carries a stored ASN: the exclude list acts on
+        // the ASN the fill just resolved.
+        let out = compiled
+            .apply_per_source(
+                vec![
+                    candidate("cloudflare", Scheme::Vless, "1.1.1.1"),
+                    candidate("google", Scheme::Vless, "8.8.8.8"),
+                ],
+                &geo,
+            )
+            .await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["google"], "only the excluded AS is dropped");
+    }
+
+    /// The same exclusion against the real resolver: 1.1.1.1 is AS13335
+    /// (excluded), 8.8.8.8 is AS15169, and neither candidate carries a
+    /// stored ASN.
+    #[tokio::test]
+    #[ignore = "requires GeoLite2 mmdb"]
+    async fn a_proxy_without_a_stored_asn_still_honours_the_exclude_list() {
+        let Some(geo) = active_geo_with_dbs() else {
+            return;
+        };
 
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
@@ -1629,8 +1937,6 @@ mod tests {
             "geo": { "enabled": true, "template": "{asn} {name}" }
         })))
         .unwrap();
-        // Literal IPs, no DNS round-trip: 1.1.1.1 is AS13335 (excluded), 8.8.8.8
-        // is AS15169, and neither candidate carries a stored ASN.
         let out = compiled
             .apply(
                 vec![
@@ -1745,34 +2051,42 @@ mod tests {
 
     #[tokio::test]
     async fn rename_host_target_guards_invalid_results() {
+        // A literal replacement that is never a valid host is a
+        // compile-time field error: wherever the rule fires, the rewrite
+        // would be invalid and silently skipped.
+        let err = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "rename": [{ "match": ".*", "replace": "evil.tr/../../x", "target": "host" }]
+        })))
+        .unwrap_err();
+        assert_eq!(err[0].key, "pipeline.never_valid_host");
+        assert_eq!(err[0].args, ["rename[0]", "evil.tr/../../x"]);
+
+        let err = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "rename": [{ "match": ".*", "replace": "", "target": "host" }]
+        })))
+        .unwrap_err();
+        assert_eq!(err[0].key, "pipeline.never_valid_host");
+
+        // "99999" is a valid host in shape: it compiles and rewrites.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
-            "rename": [
-                // A port value is not a host, an empty host would break the
-                // URI, both keep the original host.
-                { "match": ".*", "replace": "99999", "target": "host" }
-            ]
+            "rename": [{ "match": ".*", "replace": "99999", "target": "host" }]
         })))
         .unwrap();
-        // The rule matches, but the result is a valid host only in shape:
-        // "99999" has no delimiters, so it rewrites. A delimiter-bearing
-        // result must not.
         let candidates = vec![candidate("n", Scheme::Vless, "h.example.com")];
         let out = compiled.apply(candidates, &inactive_geo()).await;
         assert_eq!(out[0].entry.host, "99999");
 
+        // A capture-group replacement depends on the matched text, so the
+        // guard is the runtime one: a delimiter-bearing result is rejected
+        // and the original host kept.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
-            "rename": [{ "match": ".*", "replace": "evil.tr/../../x", "target": "host" }]
-        })))
-        .unwrap();
-        let candidates = vec![candidate("n", Scheme::Vless, "h.example.com")];
-        let out = compiled.apply(candidates, &inactive_geo()).await;
-        assert_eq!(out[0].entry.host, "h.example.com");
-
-        let compiled = CompiledPipeline::from_json(Some(&json!({
-            "version": 1,
-            "rename": [{ "match": ".*", "replace": "", "target": "host" }]
+            "rename": [
+                { "match": "(h\\.example\\.com)", "replace": "$1/../../x", "target": "host" }
+            ]
         })))
         .unwrap();
         let candidates = vec![candidate("n", Scheme::Vless, "h.example.com")];
@@ -1796,11 +2110,12 @@ mod tests {
         assert_eq!(out[0].entry.host, "2001:db8::2");
 
         // A colon pair that is not an IPv6 address (a smuggled port) is
-        // rejected and the original host kept.
+        // rejected and the original host kept. The rule carries a capture
+        // group, so the replacement is only guarded at runtime.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [
-                { "match": "h\\.example\\.com", "replace": "h.example.com:8443", "target": "host" }
+                { "match": "(h\\.example\\.com)", "replace": "$1:8443", "target": "host" }
             ]
         })))
         .unwrap();
@@ -1950,11 +2265,35 @@ mod tests {
         assert_eq!(out[0].entry.name, "b");
     }
 
+    /// The stamp shorthand the drop tests build on: one resolved ASN, no
+    /// other facts.
+    fn stamp(asn: &str) -> Option<fumox_core::repo::proxies::GeoStamp> {
+        Some(fumox_core::repo::proxies::GeoStamp {
+            asn: Some(asn.into()),
+            ..Default::default()
+        })
+    }
+
+    /// The parsed ASN column for a stamp slice, exactly what the ingest
+    /// caller (`apply_drop_rules`) hands the drop pass at its boundary.
+    fn stamp_asns(stamps: &[Option<fumox_core::repo::proxies::GeoStamp>]) -> Vec<Option<u32>> {
+        stamps
+            .iter()
+            .map(|stamp| {
+                stamp
+                    .as_ref()
+                    .and_then(|stamp| stamp.asn.as_deref())
+                    .and_then(asn_number)
+            })
+            .collect()
+    }
+
     #[test]
     fn drop_by_asn_discards_matching_proxies() {
-        // The pipeline-level helper (`drop_entries`) runs before any DB
-        // interaction, so it is the cheapest place to exercise ASN drop.
-        // Geo stamps are passed in parallel; an empty stamp is "unknown".
+        // The pipeline-level helper (`drop_entries_with_geo`) runs before
+        // any DB interaction, so it is the cheapest place to exercise ASN
+        // drop. The ASNs arrive pre-parsed, the stamps ride along
+        // index-aligned; an empty stamp is "unknown".
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "asn", "asns": ["24940"] }]
@@ -1965,26 +2304,22 @@ mod tests {
             entry("as13335", "h2.example.com"),
             entry("as24940-via-prefix", "h3.example.com"),
         ];
-        let stamps = vec![
-            Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS24940".into()),
-                ..Default::default()
-            }),
-            Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS13335".into()),
-                ..Default::default()
-            }),
-            Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS24940".into()),
-                ..Default::default()
-            }),
-        ];
-        let after = compiled.drop_entries_with_geo(entries.clone(), &stamps).0;
+        let stamps = vec![stamp("AS24940"), stamp("AS13335"), stamp("AS24940")];
+        let after = compiled
+            .drop_entries_with_geo(
+                entries.clone(),
+                &stamp_asns(&stamps),
+                &stamps,
+                "test-source",
+            )
+            .0;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].host, "h2.example.com");
         // Verify the geometry contract: empty stamps leave entries alone.
-        let no_geo = vec![None; entries.len()];
-        let untouched = compiled.drop_entries_with_geo(entries, &no_geo).0;
+        let no_geo: Vec<Option<fumox_core::repo::proxies::GeoStamp>> = vec![None; entries.len()];
+        let untouched = compiled
+            .drop_entries_with_geo(entries, &stamp_asns(&no_geo), &no_geo, "test-source")
+            .0;
         assert_eq!(untouched.len(), 3, "missing ASN is not a hit");
     }
 
@@ -2011,7 +2346,11 @@ mod tests {
         let names =
             |kept: Vec<ProxyEntry>| -> Vec<String> { kept.into_iter().map(|e| e.name).collect() };
         assert_eq!(
-            names(compiled.drop_entries_with_geo(entries.clone(), &[]).0),
+            names(
+                compiled
+                    .drop_entries_with_geo(entries.clone(), &[], &[], "test-source")
+                    .0
+            ),
             ["p1", "p2", "p3"]
         );
         // Regex rules need no stamp, so they still fire on a stamp-less
@@ -2020,18 +2359,20 @@ mod tests {
             .drop_entries_with_geo(
                 vec![entry("p1", "h1.example.com"), entry("cn", "h.cn")],
                 &[],
+                &[],
+                "test-source",
             )
             .0;
         assert_eq!(names(with_cn), ["p1"]);
         // A partially resolved slice behaves the same for the tail: the
         // entries past its end are unstamped, not dropped.
+        let partial_stamps = vec![stamp("AS13335")];
         let partial = compiled
             .drop_entries_with_geo(
                 entries,
-                &[Some(fumox_core::repo::proxies::GeoStamp {
-                    asn: Some("AS13335".into()),
-                    ..Default::default()
-                })],
+                &stamp_asns(&partial_stamps),
+                &partial_stamps,
+                "test-source",
             )
             .0;
         assert_eq!(names(partial), ["p1", "p2", "p3"]);
@@ -2052,23 +2393,27 @@ mod tests {
             entry("b", "h2.example.com"),
             entry("c", "h3.example.com"),
         ];
-        let stamps = vec![
-            Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS24940".into()),
-                ..Default::default()
-            }),
-            Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS13335".into()),
-                ..Default::default()
-            }),
-            Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS99999".into()),
-                ..Default::default()
-            }),
-        ];
-        let after = compiled.drop_entries_with_geo(entries, &stamps).0;
+        let stamps = vec![stamp("AS24940"), stamp("AS13335"), stamp("AS99999")];
+        let after = compiled
+            .drop_entries_with_geo(entries, &stamp_asns(&stamps), &stamps, "test-source")
+            .0;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].host, "h3.example.com");
+
+        // The lowercase spelling compiles too and matches the same stored
+        // `AS24940`: `asn_number` strips the prefix in either case.
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "drop": [{ "target": "asn", "asns": ["as24940"] }]
+        })))
+        .unwrap();
+        let entries = vec![entry("a", "h1.example.com"), entry("b", "h2.example.com")];
+        let stamps = vec![stamp("AS24940"), stamp("AS13335")];
+        let after = compiled
+            .drop_entries_with_geo(entries, &stamp_asns(&stamps), &stamps, "test-source")
+            .0;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].host, "h2.example.com");
     }
 
     #[test]
@@ -2080,8 +2425,10 @@ mod tests {
         })))
         .unwrap();
         let entries = vec![entry("n", "h.example.com")];
-        let stamps = vec![None];
-        let after = compiled.drop_entries_with_geo(entries, &stamps).0;
+        let stamps: Vec<Option<fumox_core::repo::proxies::GeoStamp>> = vec![None];
+        let after = compiled
+            .drop_entries_with_geo(entries, &stamp_asns(&stamps), &stamps, "test-source")
+            .0;
         assert_eq!(after.len(), 1);
     }
 
@@ -2102,21 +2449,10 @@ mod tests {
             entry("blocked-asn", "h.example.com"),
             entry("kept", "h.example.com"),
         ];
-        let stamps = vec![
-            Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS99999".into()),
-                ..Default::default()
-            }),
-            Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS24940".into()),
-                ..Default::default()
-            }),
-            Some(fumox_core::repo::proxies::GeoStamp {
-                asn: Some("AS99999".into()),
-                ..Default::default()
-            }),
-        ];
-        let after = compiled.drop_entries_with_geo(entries, &stamps).0;
+        let stamps = vec![stamp("AS99999"), stamp("AS24940"), stamp("AS99999")];
+        let after = compiled
+            .drop_entries_with_geo(entries, &stamp_asns(&stamps), &stamps, "test-source")
+            .0;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].host, "h.example.com");
         assert_eq!(after[0].name, "kept");
@@ -2180,11 +2516,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_target_message_lists_asn_alongside_other_values() {
-        // The rendered text for an unknown target must include `asn` in
-        // the allowed list, admins see the full picture from one
-        // message. We exercise the runtime translator to make sure both
-        // catalogs (en, ru) have been updated, not just the validator.
+    fn unknown_target_is_a_field_error() {
+        // The validator rejects an unknown target with the shared
+        // `pipeline.unknown_target` key; the rendered copy (the `asn`
+        // entry in the allowed list) is pinned by the admin/i18n tests.
         let issues = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "drop": [{ "target": "foo", "match": "." }]
@@ -2194,19 +2529,6 @@ mod tests {
             issues.iter().any(|i| i.key == "pipeline.unknown_target"),
             "unknown_target error must be present: {issues:?}"
         );
-        let locales =
-            crate::admin::i18n::Locales::load(std::path::Path::new("/nonexistent-locales-dir"));
-        for code in ["en", "ru"] {
-            let lang = locales.resolve(code);
-            let rendered = lang.t_args(
-                "pipeline.unknown_target",
-                &["drop[0]".to_string(), "foo".to_string()],
-            );
-            assert!(
-                rendered.contains("asn"),
-                "{code} locale must mention asn in allowed targets; got: {rendered:?}"
-            );
-        }
     }
 
     #[test]
@@ -2236,9 +2558,9 @@ mod tests {
         })))
         .unwrap();
         let mut keep = candidate("keep", Scheme::Vless, "h1.example.com");
-        keep.geo_asn = Some("AS99999".into());
+        keep.geo_asn = Some(99999);
         let mut drop_me = candidate("drop", Scheme::Vless, "h2.example.com");
-        drop_me.geo_asn = Some("AS24940".into());
+        drop_me.geo_asn = Some(24940);
         let mut unresolved = candidate("unresolved", Scheme::Vless, "h3.example.com");
         unresolved.geo_asn = None;
         let out = compiled
@@ -2250,27 +2572,22 @@ mod tests {
 
     #[tokio::test]
     async fn rename_port_target_guards_invalid_results() {
-        let compiled = CompiledPipeline::from_json(Some(&json!({
-            "version": 1,
-            "rename": [{ "match": ".*", "replace": "70000", "target": "port" }]
-        })))
-        .unwrap();
-        let candidates = vec![candidate("n", Scheme::Vless, "h.example.com")];
-        let out = compiled.apply(candidates, &inactive_geo()).await;
-        assert_eq!(out[0].entry.port, 443);
+        // A literal replacement that is never a valid port is a
+        // compile-time field error: the rewrite could only be skipped for
+        // every entry it matches.
+        for replace in ["70000", "443:evil"] {
+            let err = CompiledPipeline::from_json(Some(&json!({
+                "version": 1,
+                "rename": [{ "match": ".*", "replace": replace, "target": "port" }]
+            })))
+            .unwrap_err();
+            assert_eq!(err[0].key, "pipeline.never_valid_port", "{replace}");
+        }
 
-        let compiled = CompiledPipeline::from_json(Some(&json!({
-            "version": 1,
-            "rename": [{ "match": ".*", "replace": "443:evil", "target": "port" }]
-        })))
-        .unwrap();
-        let candidates = vec![candidate("n", Scheme::Vless, "h.example.com")];
-        let out = compiled.apply(candidates, &inactive_geo()).await;
-        assert_eq!(out[0].entry.port, 443);
-
-        // Zero is refused like any other unusable value: the parsers drop it
-        // and the schema CHECK (migration 0018) would reject the row at the
-        // upsert.
+        // Zero is refused at runtime like any other unusable value: the
+        // parsers drop it and the schema CHECK (migration 0018) would
+        // reject the row at the upsert. "0" parses as u16, so the rule
+        // compiles and the guard is the runtime one.
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
             "rename": [{ "match": ".*", "replace": "0", "target": "port" }]
@@ -2304,21 +2621,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GeoLite2 mmdb"]
     async fn geo_step_renders_merged_country_city_and_asn_facts() {
-        // GeoLite2 files are gitignored, so CI runs without them.
-        let db_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
-        if !db_dir.join("GeoLite2-ASN.mmdb").exists() || !db_dir.join("GeoLite2-City.mmdb").exists()
-        {
-            eprintln!("skipped: GeoLite2-ASN/City.mmdb not present");
+        let Some(geo) = active_geo_with_dbs() else {
             return;
-        }
-        let cfg = fumox_core::config::GeoConfig {
-            enabled: true,
-            db_dir,
-            ..Default::default()
         };
-        let geo = GeoResolver::new(&cfg);
-        assert!(geo.is_active());
 
         // The resolver merges every database in db_dir, so one template can
         // draw country and ASN facts at once, the one-database era could
@@ -2329,12 +2636,29 @@ mod tests {
             "geo": { "enabled": true, "template": "{country} {city} · {asn} {name}" }
         })))
         .unwrap();
-        // Literal IP → no DNS round-trip; 8.8.8.8 is US, AS15169 (Google).
+        // Literal IP → no DNS round-trip. The country/city wording is the
+        // database's, so the assert pins only the shape: facts merged
+        // around the `·` separator, the ASN as `AS<n>` and the original
+        // name kept.
         let out = compiled
             .apply(vec![candidate("Node-1", Scheme::Vless, "8.8.8.8")], &geo)
             .await;
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].entry.name, "United States · AS15169 Node-1");
+        let name = &out[0].entry.name;
+        let (facts, tail) = name.split_once('·').expect("separator renders");
+        assert!(
+            facts
+                .split_whitespace()
+                .chain(tail.split_whitespace())
+                .any(|token| token.strip_prefix("AS").is_some_and(
+                    |digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                )),
+            "ASN must render as AS<n>: {name:?}"
+        );
+        assert!(
+            tail.contains("Node-1"),
+            "the original name is kept: {name:?}"
+        );
     }
 
     #[tokio::test]
@@ -2352,6 +2676,32 @@ mod tests {
             .await;
         let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
         assert_eq!(names, vec!["u", "a"]);
+    }
+
+    /// The health exclusion list is the operator's choice, both ways: an
+    /// empty list hides nothing (a quarantined proxy is served), a list
+    /// that names `unknown` hides the never-probed tier too.
+    #[tokio::test]
+    async fn health_exclude_statuses_is_the_operators_choice() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "health": { "exclude_statuses": [] }
+        })))
+        .unwrap();
+        let mut quarantined = candidate("q", Scheme::Vless, "h1.example.com");
+        quarantined.status = ProxyStatus::Quarantine;
+        let out = compiled.apply(vec![quarantined], &inactive_geo()).await;
+        assert_eq!(out.len(), 1, "an empty exclusion list hides nothing");
+
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "health": { "exclude_statuses": ["quarantine", "removed", "unknown"] }
+        })))
+        .unwrap();
+        let mut unknown = candidate("u", Scheme::Vless, "h2.example.com");
+        unknown.status = ProxyStatus::Unknown;
+        let out = compiled.apply(vec![unknown], &inactive_geo()).await;
+        assert!(out.is_empty(), "a listed status is excluded");
     }
 
     #[tokio::test]
@@ -2375,6 +2725,9 @@ mod tests {
             "sort": { "by": "name" }
         })))
         .unwrap();
+        // An explicit `sort` section is the sort contest's "was chosen"
+        // marker.
+        assert!(by_name.sort_explicit());
         let candidates = vec![
             candidate("beta", Scheme::Vless, "h1.example.com"),
             candidate("Alpha", Scheme::Vless, "h2.example.com"),
@@ -2399,6 +2752,138 @@ mod tests {
         let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
         // Descending, but the NULL latency stays last.
         assert_eq!(names, vec!["slow", "fast", "unknown"]);
+    }
+
+    /// Unknown countries always sort last, ascending or descending: an
+    /// absent fact is not a country code, so a reversed sort must not
+    /// float it to the top.
+    #[tokio::test]
+    async fn sort_by_country_puts_unknown_last_in_both_directions() {
+        let mut de = candidate("de", Scheme::Vless, "h1.example.com");
+        de.geo_country = Some("DE".into());
+        let mut us = candidate("us", Scheme::Vless, "h2.example.com");
+        us.geo_country = Some("US".into());
+        let unknown = candidate("unknown", Scheme::Vless, "h3.example.com");
+
+        let asc = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "sort": { "by": "country" }
+        })))
+        .unwrap();
+        let out = asc
+            .apply(
+                vec![us.clone(), unknown.clone(), de.clone()],
+                &inactive_geo(),
+            )
+            .await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["de", "us", "unknown"]);
+
+        let desc = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "sort": { "by": "country", "desc": true }
+        })))
+        .unwrap();
+        let out = desc.apply(vec![us, unknown, de], &inactive_geo()).await;
+        let names: Vec<&str> = out.iter().map(|c| c.entry.name.as_str()).collect();
+        assert_eq!(names, ["us", "de", "unknown"]);
+    }
+
+    /// Every filtering step reports its in/out counts in a DEBUG event, and
+    /// a step that empties a non-empty input warns — a misconfigured rule
+    /// must not quietly blank the feed.
+    #[tokio::test]
+    async fn filtering_steps_log_their_counts_and_a_full_wipe_warns() {
+        let (logs, _guard) = capture_logs(tracing::Level::DEBUG);
+
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "protocols": ["vless"] }
+        })))
+        .unwrap();
+        let out = compiled
+            .apply(
+                vec![
+                    candidate("a", Scheme::Vless, "h1.example.com"),
+                    candidate("b", Scheme::Trojan, "h2.example.com"),
+                ],
+                &inactive_geo(),
+            )
+            .await;
+        assert_eq!(out.len(), 1);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains(r#"step="protocols""#),
+            "the protocols step must log its counts: {logs}"
+        );
+        assert!(logs.contains("removed=1"), "{logs}");
+        assert!(
+            logs.contains(r#"step="health""#),
+            "the health step must log its counts: {logs}"
+        );
+        // `apply` ends with `finalize`: the dedup step logs there too (the
+        // limit step only fires with a configured cap).
+        assert!(logs.contains(r#"step="dedup""#), "{logs}");
+        let warnings = logs.lines().filter(|line| line.contains("WARN")).count();
+        assert_eq!(warnings, 0, "a partial removal must not warn: {logs}");
+
+        // A rule that removes everything of a non-empty input warns.
+        let (logs, _guard) = capture_logs(tracing::Level::DEBUG);
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "filter": { "protocols": ["ss"] }
+        })))
+        .unwrap();
+        let out = compiled
+            .apply(
+                vec![candidate("a", Scheme::Vless, "h1.example.com")],
+                &inactive_geo(),
+            )
+            .await;
+        assert!(out.is_empty());
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("removed every entry of a non-empty input"),
+            "a full wipe must warn: {logs}"
+        );
+    }
+
+    /// The geo pass resolves hosts with bounded parallelism: more than one
+    /// lookup is in flight at a time (the old strictly serial loop peaked
+    /// at 1) and the peak stays within [`GEO_LOOKUP_CONCURRENCY`].
+    #[tokio::test]
+    async fn geo_enrich_resolves_hosts_with_bounded_concurrency() {
+        let compiled = CompiledPipeline::from_json(Some(&json!({
+            "version": 1,
+            "geo": { "enabled": true }
+        })))
+        .unwrap();
+        let geo = FakeGeo {
+            active: true,
+            sleep_ms: 20,
+            ..Default::default()
+        };
+        let candidates: Vec<Candidate> = (0..GEO_LOOKUP_CONCURRENCY * 2)
+            .map(|idx| {
+                candidate(
+                    &format!("n{idx}"),
+                    Scheme::Vless,
+                    &format!("h{idx}.example.com"),
+                )
+            })
+            .collect();
+        let out = compiled.apply_per_source(candidates, &geo).await;
+        assert_eq!(out.len(), GEO_LOOKUP_CONCURRENCY * 2);
+
+        let peak = geo.peak();
+        assert!(
+            peak > 1,
+            "lookups must overlap; peak concurrency was {peak}, a serial loop would report 1"
+        );
+        assert!(
+            peak <= GEO_LOOKUP_CONCURRENCY,
+            "the concurrency cap must hold, peak was {peak}"
+        );
     }
 
     #[tokio::test]
@@ -2461,6 +2946,22 @@ mod tests {
         }
     }
 
+    /// Fractional and beyond-`usize` caps are localized field errors too,
+    /// not the opaque serde type error the `i64` field produced for
+    /// fractions.
+    #[test]
+    fn fractional_and_oversized_limit_counts_are_field_errors() {
+        for count in [json!(2.5), json!(9_223_372_036_854_775_808u64)] {
+            let errors = CompiledPipeline::from_json(Some(&json!({
+                "version": 1,
+                "limit": { "count": count }
+            })))
+            .unwrap_err();
+            assert_eq!(errors[0].key, "pipeline.invalid_limit", "{count}");
+            assert_eq!(errors[0].args, [count.to_string()]);
+        }
+    }
+
     #[test]
     fn profile_sections_override_source_sections() {
         let source = json!({
@@ -2492,6 +2993,40 @@ mod tests {
         assert_eq!(merged, source);
     }
 
+    /// The merge table: absent sides pass through, a non-object profile
+    /// wins so the error surfaces against the profile form, and a
+    /// non-object source merged with a valid object profile is replaced
+    /// by it — with a WARN naming the source config as the broken side,
+    /// since only the source could have caused the mismatch.
+    #[test]
+    fn merge_configs_table() {
+        assert_eq!(merge_configs(None, None), None);
+        let source = json!({ "version": 1, "sort": { "by": "name" } });
+        let profile = json!({ "version": 1, "limit": { "count": 5 } });
+
+        // (Some(obj), None) → the source, untouched.
+        assert_eq!(merge_configs(Some(&source), None), Some(source.clone()));
+        // (None, Some(p)) → the profile.
+        assert_eq!(merge_configs(None, Some(&profile)), Some(profile.clone()));
+        // (Some(obj), Some(non-object)) → the profile wins.
+        for broken in [json!("oops"), json!(42)] {
+            assert_eq!(
+                merge_configs(Some(&source), Some(&broken)),
+                Some(broken.clone())
+            );
+        }
+        // (Some(non-object), Some(obj)) → the profile's object, merged
+        // over nothing, with a WARN that names the source.
+        let (logs, _guard) = capture_logs(tracing::Level::WARN);
+        let merged = merge_configs(Some(&json!("oops")), Some(&profile));
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(merged, Some(profile.clone()));
+        assert!(
+            logs.contains("source"),
+            "the WARN must name the source config as the broken side: {logs}"
+        );
+    }
+
     /// The ASN fill is a geo lookup per candidate: only the ASN rules need
     /// it, a pipeline without one resolves nothing.
     #[tokio::test]
@@ -2501,7 +3036,7 @@ mod tests {
             "filter": { "protocols": ["vless"] }
         })))
         .unwrap();
-        let geo = CountingGeo::new();
+        let geo = FakeGeo::default();
         let candidates = vec![candidate_with_asn("n", None)];
         let out = compiled.apply_per_source(candidates, &geo).await;
         assert_eq!(out.len(), 1);
@@ -2513,7 +3048,7 @@ mod tests {
             "filter": { "asns": ["13335"] }
         })))
         .unwrap();
-        let geo = CountingGeo::new();
+        let geo = FakeGeo::default();
         let candidates = vec![candidate_with_asn("n", None)];
         let _ = compiled.apply_per_source(candidates, &geo).await;
         assert_eq!(geo.calls(), 1);
@@ -2564,31 +3099,16 @@ mod tests {
     }
 
     /// A broken rename rule warns once per rule, not once per proxy: a
-    /// thousand proxies must not write a thousand WARN lines.
+    /// thousand proxies must not write a thousand WARN lines. The rule
+    /// carries a capture group (so it compiles past the literal-replacement
+    /// check) and its runtime results are invalid hosts.
     #[tokio::test]
     async fn a_broken_rename_rule_warns_once_per_rule() {
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let make_writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (captured, _guard) = capture_logs(tracing::Level::INFO);
 
         let compiled = CompiledPipeline::from_json(Some(&json!({
             "version": 1,
-            "rename": [{ "match": ".*", "replace": "evil.tr/../../x", "target": "host" }]
+            "rename": [{ "match": "(.*)", "replace": "$1:8443", "target": "host" }]
         })))
         .unwrap();
         let candidates: Vec<Candidate> = (0..5)
@@ -2828,7 +3348,9 @@ mod tests {
                 by: SortBy::Latency,
                 desc: true,
             }),
-            limit: Some(LimitConfig { count: Some(100) }),
+            limit: Some(LimitConfig {
+                count: Some(serde_json::Number::from(100)),
+            }),
         };
         let value = serde_json::to_value(&full).unwrap();
         let parsed: PipelineConfig = serde_json::from_value(value.clone()).unwrap();
@@ -2837,7 +3359,9 @@ mod tests {
             CompiledPipeline::from_json(Some(&value)).is_ok(),
             "{value:?}"
         );
-        // `limit: null` serializes explicitly (the no-cap reset).
+        // `limit: {"count": null}` serializes explicitly (the no-cap
+        // reset); `limit: null` deserializes as `None` (no section), not
+        // as the reset.
         let no_cap = PipelineConfig {
             limit: Some(LimitConfig { count: None }),
             ..full

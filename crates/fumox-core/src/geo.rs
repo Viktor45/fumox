@@ -44,6 +44,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
+/// Ceiling on concurrent geo host lookups in one pass, shared by the
+/// server's ingest batch and the backfill pass. Every unseen domain host
+/// costs up to `[geo].dns_timeout` (5 s by default) when DNS hangs, so the
+/// lookups run concurrently instead of one await per row; the cap keeps a
+/// large feed from fanning out into thousands of sockets.
+pub const GEO_LOOKUP_CONCURRENCY: usize = 32;
+
 /// Geo facts resolved for one proxy host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeoInfo {
@@ -775,6 +782,48 @@ impl GeoResolver {
                 GeoOutcome::NoRecord { ip }
             }
         }
+    }
+}
+
+/// The one resolver call the seams make (the serving pipeline's ASN fill
+/// and geo-enrich, ingest's stamp resolution): resolve one host, `None`
+/// when nothing is known about it, behind the [`GeoResolver::is_active`]
+/// gate that lets a caller skip a whole pass when the installation has no
+/// usable database. The real resolver implements it once, here; the test
+/// fakes on both sides implement the same seam, so the lookup shape is
+/// observable without a MaxMind database and a slow DNS server.
+///
+/// The future is boxed on purpose: `impl Trait` in a trait method does not
+/// leak auto-trait bounds (`Send`) to downstream crates, and the callers'
+/// render futures must stay `Send` across the crate boundary. One small
+/// allocation per lookup is nothing next to the DNS round-trip it wraps.
+pub trait HostGeo {
+    /// Whether the resolver can enrich at all.
+    fn is_active(&self) -> bool;
+
+    /// Resolve one host, `None` when nothing is known about it. Building
+    /// the future starts no work; the lookup runs on the first poll,
+    /// exactly like [`GeoResolver::resolve`].
+    fn resolve_host<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<std::sync::Arc<GeoInfo>>> + Send + 'a>,
+    >;
+}
+
+impl HostGeo for GeoResolver {
+    fn is_active(&self) -> bool {
+        GeoResolver::is_active(self)
+    }
+
+    fn resolve_host<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<std::sync::Arc<GeoInfo>>> + Send + 'a>,
+    > {
+        Box::pin(self.resolve(host))
     }
 }
 

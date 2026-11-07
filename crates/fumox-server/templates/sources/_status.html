@@ -1,16 +1,24 @@
-{#- Fragment: the "Refresh now" status. While the job is in flight the
-    fragment polls itself every 2 seconds (no-JS/SSE fallback) and also
-    listens for the fumox:refresh event re-broadcast by the SSE handler in
-    base.html on fetch.done/fetch.failed; when finished it shows the result.
+{#- Fragment: the content of the "Refresh now" status. While the job is
+    in flight the fragment polls itself every 2 seconds as the fallback
+    for when the SSE connection is unavailable; this path requires
+    htmx/JS. The fragment also listens for the fumox:refresh event
+    re-broadcast by the SSE handler in base.html on
+    fetch.done/fetch.failed; when finished it shows the result.
 
-    The polled element is swapped whole (`hx-swap="outerHTML"`), so
-    everything the busy state shows lives inside it: a sibling would
-    survive the swap and pile up on every poll. -#}
+    The fragment renders only the content INSIDE the live region: the
+    carrier (`<span id="refresh-status" aria-live="polite"
+    aria-atomic="true">`) is owned by detail.html and every swap here
+    targets it with `innerHTML`, so a screen reader keeps one announced
+    region instead of watching the carrier being torn down and rebuilt
+    on every poll (a live region that is recreated is never announced).
+    The busy span carries the polling contract and is removed by the
+    same innerHTML swap when the outcome arrives, which stops the
+    polling. -#}
 {% if busy %}
-<span id="refresh-status" data-busy="1"
-      aria-live="polite" aria-atomic="true"
+<span class="refresh-state" data-busy="1"
       hx-get="/admin/sources/{{ source_id }}/refresh-status"
-      hx-trigger="every 2s, fumox:refresh" hx-swap="outerHTML">
+      hx-trigger="every 2s, fumox:refresh from:#refresh-status"
+      hx-target="#refresh-status" hx-swap="innerHTML">
   <span class="badge neutral">{{ self.t("common.refreshing") }}</span>
   {% match elapsed_seconds %}
     {% when Some with (seconds) %}
@@ -22,8 +30,14 @@
       again. -#}
   <span class="hint">{{ budget_hint }}</span>
 </span>
+{% else if pending %}
+<span class="refresh-state">
+  {#- The source has never been fetched: a neutral state, neither an
+      error (nothing failed) nor busy (nothing is running). -#}
+  <span class="badge neutral">{{ self.t("src.refresh_pending") }}</span>
+</span>
 {% else %}
-<span id="refresh-status" aria-live="polite" aria-atomic="true">
+<span class="refresh-state">
   {% if ok %}
     <span class="badge on">{{ self.t("common.done") }}</span>
   {% else %}

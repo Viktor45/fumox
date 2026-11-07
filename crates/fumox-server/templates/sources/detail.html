@@ -5,24 +5,34 @@
 {% block content %}
 <div class="page-head">
   <h1>{{ source.name }}</h1>
-  {#- The badge and the toggle form are the same fragment templates the
-      toggle action re-renders for its HTMX swap, so the initial markup and
-      every swap share one definition. The badge sits in a wrapper that
-      the swap does not touch: a live region that is recreated with every
+  {#- The badge and the toggle form are the same fragments the toggle
+      action re-renders for its HTMX swap (the form's markup lives once
+      in the shared `_toggle_form.html`), so the initial markup and every
+      swap share one definition. The badge sits in a wrapper that the
+      swap does not touch: a live region that is recreated with every
       swap is never announced. -#}
   <span id="enabled-badge" aria-live="polite" aria-atomic="true">{% include "sources/_enabled_badge.html" %}</span>
   <span id="toggle-error" class="error-text" role="alert" data-error-fallback="{{ self.t("common.action_failed") }}"></span>
   {% match source.error_class %}
-    {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+    {% when Some with (class) %}<span class="badge {{ self.error_class_badge_class(class.as_str()) }}">{{ self.error_class_label(class.as_str()) }}</span>
     {% when None %}
   {% endmatch %}
+  {#- The permanent carrier of the refresh status: the polled fragment
+      swaps its content from inside (innerHTML), the region itself is
+      never re-rendered — a live region that is recreated with every
+      swap is never announced. The error slot next to it takes the
+      failures of the refresh request itself (the network refused, the
+      server returned an error page): the live region only ever carries
+      the poll's own outcome. -#}
   <span id="refresh-status" aria-live="polite" aria-atomic="true"></span>
+  <span id="refresh-error" class="error-text" role="alert" data-error-fallback="{{ self.t("common.action_failed") }}"></span>
   <span class="spacer"></span>
   <div class="row-actions">
     <a class="btn" href="/admin/sources/{{ source.id }}/edit">{{ self.t("common.edit") }}</a>
-    {% include "sources/_toggle_form.html" %}
+    {% include "../_toggle_form.html" %}
     <form method="post" action="/admin/sources/{{ source.id }}/refresh"
-          hx-post="/admin/sources/{{ source.id }}/refresh" hx-target="#refresh-status" hx-swap="outerHTML">
+          hx-post="/admin/sources/{{ source.id }}/refresh" hx-target="#refresh-status" hx-swap="innerHTML"
+          hx-disabled-elt="find button" data-error-target="refresh-error">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
       <button class="btn" type="submit">{{ self.t("src.refresh_now") }}</button>
     </form>
@@ -41,14 +51,22 @@
   <div class="panel">
     <h2>{{ self.t("src.params_title") }}</h2>
     <table class="kv">
-      <tr><th>URL</th><td class="small mono">{{ url_display }}</td></tr>
-      <tr><th>Slug</th><td class="mono">
+      <tr><th>{{ self.t("common.url") }}</th><td class="small mono">{{ url_display }}</td></tr>
+      <tr><th>{{ self.t("common.slug") }}</th><td class="mono">
         {% match source.slug %}
           {% when Some with (slug) %}{{ slug }}
           {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
       <tr><th>{{ self.t("src.endpoint") }}</th><td class="mono small"><a href="{{ serve_url }}">{{ serve_url }}</a></td></tr>
+      <tr><th>{{ self.t("src.token_label") }}</th><td>
+        {% if source.token_protected %}
+          {{ self.t("prof.token_protected") }}
+        {% else %}
+          {{ self.t("prof.token_public") }}
+        {% endif %}
+        <div class="hint">{{ self.t("src.token_scope_note") }}</div>
+      </td></tr>
       <tr><th>{{ self.t("src.encoding") }}</th><td>{{ source.encoding.as_str() }}</td></tr>
       <tr><th>{{ self.t("src.input_format") }}</th><td>
         {% match source.input_format %}
@@ -75,7 +93,8 @@
       <tr><th>{{ self.t("dash.last_fetch") }}</th><td class="small">{{ self.opt_ts(source.last_fetched_at) | safe }}</td></tr>
       <tr><th>{{ self.t("src.last_error") }}</th><td class="small">
         {% match source.last_error %}
-          {% when Some with (message) %}{{ message }}
+          {% when Some with (message) %}
+            {{ message }}{{ self.next_retry_line() | safe }}
           {% when None %}<span class="muted">–</span>
         {% endmatch %}
       </td></tr>
@@ -107,7 +126,7 @@
     {% endif %}
 
     {% if !pipeline_display.is_empty() %}
-      <h3>Pipeline</h3>
+      <h3>{{ self.t("src.pipeline_title") }}</h3>
       <pre class="mono small">{{ pipeline_display }}</pre>
     {% endif %}
   </div>
@@ -130,13 +149,15 @@
   </div>
   {% if pages.len() > 1 %}
     <div class="pagination">
-      {% for (p, current) in pages %}
-        {% if *p == 0 %}
-          <span class="page gap">…</span>
-        {% else if current %}
-          <span class="page current" aria-current="page">{{ p }}</span>
+      {% for link in pages %}
+        {% if link.gap %}
+          {#- The dots lead to the first page the window hides (the
+              marker carries it), same as the shared strip. -#}
+          <a class="page gap" href="/admin/sources/{{ source.id }}?page={{ link.page }}">…</a>
+        {% else if link.current %}
+          <span class="page current" aria-current="page">{{ link.page }}</span>
         {% else %}
-          <a class="page" href="/admin/sources/{{ source.id }}?page={{ p }}">{{ p }}</a>
+          <a class="page" href="/admin/sources/{{ source.id }}?page={{ link.page }}">{{ link.page }}</a>
         {% endif %}
       {% endfor %}
     </div>

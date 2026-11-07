@@ -1,5 +1,15 @@
 {% extends "base.html" %}
 
+{#- One validation error of a form field: the message block every field
+    of the form repeats. The field name is a template literal, never
+    user input, so it may travel into the message id. -#}
+{% macro field_error(field) %}
+{% match self.error_for(field) %}
+  {% when Some with (message) %}<div class="error-text" id="err-{{ field }}" role="alert">{{ message }}</div>
+  {% when None %}
+{% endmatch %}
+{% endmacro %}
+
 {% block title %}{% if form_id.is_some() %}{{ self.t("prof.edit_title") }}{% else %}{{ self.t("prof.new_title") }}{% endif %}{% endblock %}
 
 {% block content %}
@@ -16,10 +26,7 @@
     <div class="field">
       <label for="profile-name">{{ self.t("common.name") }} *</label>
       <input type="text" id="profile-name" name="name" value="{{ values.name }}" maxlength="200" required{{ self.error_attrs("name") | safe }}>
-      {% match self.error_for("name") %}
-        {% when Some with (message) %}<div class="error-text" id="err-name" role="alert">{{ message }}</div>
-        {% when None %}
-      {% endmatch %}
+      {% call field_error("name") %}{% endcall %}
     </div>
 
     <div class="field">
@@ -29,10 +36,7 @@
       {% if slug_warning %}
         <div class="hint">{{ self.t("prof.slug_change_warning") }}</div>
       {% endif %}
-      {% match self.error_for("slug") %}
-        {% when Some with (message) %}<div class="error-text" id="err-slug" role="alert">{{ message }}</div>
-        {% when None %}
-      {% endmatch %}
+      {% call field_error("slug") %}{% endcall %}
     </div>
 
     <div class="field">
@@ -46,10 +50,7 @@
       {% if token_masked_note %}
         <div class="hint">{{ self.t("prof.token_masked_note") }}</div>
       {% endif %}
-      {% match self.error_for("access_token") %}
-        {% when Some with (message) %}<div class="error-text" id="err-access_token" role="alert">{{ message }}</div>
-        {% when None %}
-      {% endmatch %}
+      {% call field_error("access_token") %}{% endcall %}
     </div>
 
     <div class="field">
@@ -59,20 +60,14 @@
           <option value="{{ option.value }}" {% if !option.available %}disabled{% endif %} {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
         {% endfor %}
       </select>
-      {% match self.error_for("output_format") %}
-        {% when Some with (message) %}<div class="error-text" id="err-output_format" role="alert">{{ message }}</div>
-        {% when None %}
-      {% endmatch %}
+      {% call field_error("output_format") %}{% endcall %}
     </div>
 
     <div class="field">
       <label for="profile-countries">{{ self.t("prof.countries_label") }}</label>
       <input type="text" id="profile-countries" name="countries" value="{{ values.countries }}" placeholder="DE, US"{{ self.error_attrs("countries") | safe }}>
       <div class="hint">{{ self.t("prof.countries_hint") }}</div>
-      {% match self.error_for("countries") %}
-        {% when Some with (message) %}<div class="error-text" id="err-countries" role="alert">{{ message }}</div>
-        {% when None %}
-      {% endmatch %}
+      {% call field_error("countries") %}{% endcall %}
     </div>
 
     <div class="field">
@@ -95,7 +90,7 @@
       <div class="table-scroll">
         <table class="data"{{ self.describedby("sources") | safe }}>
           <thead>
-            <tr><th></th><th>{{ self.t("common.source") }}</th><th>{{ self.t("prof.order_column") }}</th></tr>
+            <tr><th scope="col"></th><th scope="col">{{ self.t("common.source") }}</th><th scope="col">{{ self.t("prof.order_column") }}</th></tr>
           </thead>
           <tbody>
             {% for pick in source_picks %}
@@ -105,16 +100,14 @@
                 <label for="pick-{{ pick.id }}">{{ pick.name }}</label>
                 {% if !pick.enabled %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
               </td>
-              <td><input type="number" name="pos_{{ pick.id }}" value="{{ pick.position }}" min="0" style="width: 80px;"></td>
+              <td><input type="number" name="pos_{{ pick.id }}" id="pos-{{ pick.id }}" value="{{ pick.position }}" min="0"
+                         class="order-pos" aria-label="{{ self.t("prof.order_column") }}: {{ pick.name }}"></td>
             </tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
-      {% match self.error_for("sources") %}
-        {% when Some with (message) %}<div class="error-text" id="err-sources" role="alert">{{ message }}</div>
-        {% when None %}
-      {% endmatch %}
+      {% call field_error("sources") %}{% endcall %}
     {% endif %}
   </div>
 

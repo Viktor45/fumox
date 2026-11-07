@@ -15,6 +15,7 @@ use crate::pipeline::{
 };
 use askama::Template;
 use fumox_core::models::{ProxyStatus, Scheme};
+use serde::Deserialize;
 
 /// The most rule rows one section of the builder may hold. The widget
 /// renders a handful at most, so the cap only bounds a programmatic
@@ -140,32 +141,56 @@ pub(crate) struct BuilderState {
     pub limit_count: String,
 }
 
-/// Form-field values a section mode control submits: the source form uses a
-/// checkbox (`"1"` = set), the profile form a radio triple
-/// (`"skip"`/`"defaults"`/`"set"`); no field at all means "not set".
-fn mode_flags(value: &str) -> (bool, bool) {
-    (value == "1" || value == "set", value == "defaults")
+/// The last submitted value of a form field, taken verbatim. The raw
+/// lookup without the trim: a rule's own text (the pattern, the
+/// replacement, the flags, the key, the ASN list) and the raw JSON are
+/// whitespace-significant — a pattern may end with a space, a
+/// replacement may start with one, and the JSON is not re-formatted
+/// behind the operator's back. What the validator cannot accept it
+/// reports, instead of the widget silently editing the input.
+fn form_get_raw(form: &[(String, String)], key: &str) -> String {
+    form.iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default()
 }
 
-/// Ready-made builder states; `blank` is the empty state.
-pub(crate) fn preset(name: &str) -> BuilderState {
+/// [`form_get_raw`] with the trim the fixed-vocabulary and single-value
+/// fields get (selectors, numbers, the mode controls): surrounding
+/// whitespace is never part of their meaning.
+fn form_get_trimmed(form: &[(String, String)], key: &str) -> String {
+    form_get_raw(form, key).trim().to_string()
+}
+
+/// Form-field values a section mode control submits: both the source and
+/// the profile form render the same radio triple
+/// (`"skip"`/`"defaults"`/`"set"`); no field at all means "not set".
+fn mode_flags(value: &str) -> (bool, bool) {
+    (value == "set", value == "defaults")
+}
+
+/// Ready-made builder states; `blank` is the empty state. `None` for a
+/// name no preset carries: the caller answers with an explicit error
+/// instead of silently rendering an empty widget.
+pub(crate) fn preset(name: &str) -> Option<BuilderState> {
     match name {
         // Output only proxies that passed a probe: drop everything never
         // verified, including the permanently `unknown` unprobeable
         // protocols.
-        "workers" => BuilderState {
+        "workers" => Some(BuilderState {
             health_set: true,
             exclude_statuses: vec!["unknown".into(), "quarantine".into(), "removed".into()],
             ..BuilderState::new()
-        },
+        }),
         // Country-first naming.
-        "country" => BuilderState {
+        "country" => Some(BuilderState {
             geo_set: true,
             geo_template: "{country} · {name}".into(),
             ..BuilderState::new()
-        },
+        }),
         // Plain list: no geo rewriting, names trimmed at both ends.
-        "clean" => BuilderState {
+        "clean" => Some(BuilderState {
             geo_set: true,
             geo_enabled: false,
             rename: vec![RenameRow {
@@ -175,8 +200,9 @@ pub(crate) fn preset(name: &str) -> BuilderState {
                 ..RenameRow::default()
             }],
             ..BuilderState::new()
-        },
-        _ => BuilderState::new(),
+        }),
+        "blank" => Some(BuilderState::new()),
+        _ => None,
     }
 }
 
@@ -195,18 +221,14 @@ impl BuilderState {
     /// (`ped_filter_protocols`, `ped_filter_exclude`, `ped_health_exclude`)
     /// repeat the name; rename/drop rows carry their index:
     /// `ped_rename_<i>_match|replace|flags|target|key`,
-    /// `ped_drop_<i>_match|flags|target|key`; section mode controls submit
-    /// `ped_<section>` = `1`/`skip`/`defaults`/`set`. Only `ped_*` fields are
+    /// `ped_drop_<i>_match|flags|target|key|asns` — `asns` is the
+    /// comma-separated list of AS numbers for `target=asn` (an ASN rule
+    /// carries no `match`); section mode controls submit
+    /// `ped_<section>` = `skip`/`defaults`/`set`. Only `ped_*` fields are
     /// read, so the same form body can carry the rest of the source/profile
     /// form.
     pub(crate) fn from_form(form: &[(String, String)]) -> Self {
-        let get = |key: &str| -> String {
-            form.iter()
-                .rev()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.trim().to_string())
-                .unwrap_or_default()
-        };
+        let get = |key: &str| form_get_trimmed(form, key);
         let get_all = |key: &str| -> Vec<String> {
             form.iter()
                 .filter(|(k, _)| k == key)
@@ -214,18 +236,7 @@ impl BuilderState {
                 .filter(|v| !v.is_empty())
                 .collect()
         };
-        // The same lookup without the trim: a rule's own text (the
-        // pattern, the replacement, the flags, the key, the ASN list) is
-        // taken verbatim, whitespace included. A pattern may end with a
-        // space, a replacement may start with one, and the validator
-        // reports what it cannot accept.
-        let get_raw = |key: &str| -> String {
-            form.iter()
-                .rev()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_default()
-        };
+        let get_raw = |key: &str| form_get_raw(form, key);
         // A tri-state flag. The widget renders a hidden companion with
         // the value "0" before the checkbox, so an unchecked box submits
         // "0" and a checked one "1" (the last value of the name wins).
@@ -563,8 +574,9 @@ impl BuilderState {
         // rides along as a JSON string so the validator reports it on the
         // panel language instead of the field silently disappearing. That
         // output is deliberately not a valid v1 config, so it cannot
-        // travel inside `LimitConfig` (whose `count` is `Option<i64>`) and
-        // is patched into the serialized document below.
+        // travel inside `LimitConfig` (whose `count` is
+        // `Option<serde_json::Number>`) and is patched into the serialized
+        // document below.
         if self.limit_defaults {
             // An explicit `null` cap: a profile resets the source's limit
             // back to "no cap" (the same reset semantics as an empty
@@ -574,7 +586,11 @@ impl BuilderState {
             let raw = self.limit_count.trim();
             if !raw.is_empty() {
                 match raw.parse::<i64>() {
-                    Ok(count) => config.limit = Some(LimitConfig { count: Some(count) }),
+                    Ok(count) => {
+                        config.limit = Some(LimitConfig {
+                            count: Some(serde_json::Number::from(count)),
+                        })
+                    }
                     Err(_) => {
                         mistyped_limit = Some(raw.to_string());
                         issues.push(PipelineIssue {
@@ -639,8 +655,18 @@ pub(crate) enum Ingest {
     /// Structural parse failed (unknown fields, wrong types), the version is
     /// not 1, or the config means something the widget cannot express, the
     /// widget stays out of the way and the raw JSON is edited by hand;
-    /// nothing is reinterpreted silently.
+    /// nothing is reinterpreted silently. The rough reason why (logged by
+    /// [`raw`]) names the kind of degradation, never the config contents.
     Raw,
+}
+
+/// The `Ingest::Raw` constructor: the degradation is logged here with the
+/// rough reason (`structure`/`version`/`unrepresentable`), never with the
+/// config contents, so the panel log can tell a hand-edited document from
+/// a schema drift without leaking a stored pipeline into it.
+fn raw(reason: &'static str) -> Ingest {
+    tracing::debug!(reason, "stored pipeline fell back to raw mode");
+    Ingest::Raw
 }
 
 /// Result of [`BuilderState::emit`].
@@ -710,11 +736,14 @@ impl BuilderState {
             }
             _ => {}
         }
-        let Ok(config) = serde_json::from_value::<PipelineConfig>(value.clone()) else {
-            return Ingest::Raw;
+        // Deserialize straight from the reference: `&serde_json::Value`
+        // is itself a `Deserializer`, the document does not need to be
+        // cloned to be read.
+        let Ok(config) = PipelineConfig::deserialize(value) else {
+            return raw("structure");
         };
         if config.version != 1 {
-            return Ingest::Raw;
+            return raw("version");
         }
         // An empty allowlist means "output nothing" and an empty `match`
         // pattern matches everywhere, real configs the widget cannot
@@ -726,7 +755,7 @@ impl BuilderState {
             .as_ref()
             .is_some_and(|f| f.protocols.as_ref().is_some_and(|p| p.is_empty()))
         {
-            return Ingest::Raw;
+            return raw("unrepresentable");
         }
         // Same raw-guard for the ASN allowlist: an empty `asns` array is
         // "keep nothing", which the text field cannot distinguish from
@@ -736,14 +765,14 @@ impl BuilderState {
             .as_ref()
             .is_some_and(|f| f.asns.as_ref().is_some_and(|a| a.is_empty()))
         {
-            return Ingest::Raw;
+            return raw("unrepresentable");
         }
         if config
             .rename
             .as_ref()
             .is_some_and(|rules| rules.iter().any(|r| r.match_pattern.trim().is_empty()))
         {
-            return Ingest::Raw;
+            return raw("unrepresentable");
         }
         // Same raw-guard for drop: an empty `match` discards everything ,
         // a real rule the widget cannot express (its empty line means
@@ -754,7 +783,7 @@ impl BuilderState {
                 .iter()
                 .any(|r| r.target.as_deref() != Some("asn") && r.match_pattern.trim().is_empty())
         }) {
-            return Ingest::Raw;
+            return raw("unrepresentable");
         }
         let mut state = Self::new();
 
@@ -888,9 +917,9 @@ impl BuilderState {
                 }
             }
         }
-        // `dedup` has no builder field: in v1 it only accepts `by:
-        // "fingerprint"`, which is semantically the default, so emit
-        // canonicalizes it away.
+        // `dedup` has no builder field: the section is accepted and
+        // ignored in v1 (deduplication is unconditional, any `by`
+        // compiles), so emit canonicalizes it away.
         Ingest::Builder(Box::new(state))
     }
 }
@@ -1002,6 +1031,22 @@ impl BuilderView {
     pub(crate) fn limit_section_active(&self) -> bool {
         self.state.limit_set || self.state.limit_defaults
     }
+
+    /// The rename section is being overridden: the user has picked "set"
+    /// or "defaults" on the profile form (the source form carries no
+    /// tri-state for the rule lists, so there they are always active).
+    /// When `skip`, the rule rows are hidden because the JSON omits
+    /// `rename` entirely and the typed rules would be silently dropped on
+    /// save.
+    pub(crate) fn rename_section_active(&self) -> bool {
+        !self.state.rename_skip || self.state.rename_defaults
+    }
+
+    /// The drop section, the same tri-state as
+    /// [`WidgetFragment::rename_section_active`], over the drop rules.
+    pub(crate) fn drop_section_active(&self) -> bool {
+        !self.state.drop_skip || self.state.drop_defaults
+    }
 }
 
 fn any_of(values: &[String], name: &str) -> bool {
@@ -1047,16 +1092,10 @@ impl Schema {
 
     /// Geo template placeholders, all six that
     /// `fumox_core::geo::apply_template` renders, so the hint cannot drift
-    /// from the engine.
-    pub(crate) fn geo_placeholders() -> [&'static str; 6] {
-        [
-            "{flag}",
-            "{country}",
-            "{city}",
-            "{asn}",
-            "{asn_org}",
-            "{name}",
-        ]
+    /// from the engine: the names come from the engine's own registry,
+    /// braced here for the template hint.
+    pub(crate) fn geo_placeholders() -> [String; 6] {
+        fumox_core::geo::TEMPLATE_PLACEHOLDERS.map(|name| format!("{{{name}}}"))
     }
 }
 
@@ -1131,7 +1170,12 @@ pub(crate) fn preview_body(lang: &Lang, built: &BuilderState) -> String {
             }
         }
     };
-    fragment.render().unwrap_or_default()
+    fragment.render().unwrap_or_else(|err| {
+        // A broken preview must not pass silently: the log names the
+        // fragment and the failure, the panel shows an empty region.
+        tracing::error!(error = %err, "pipeline preview fragment rendering failed");
+        String::new()
+    })
 }
 
 /// `#ped-rows` / `#ped-drop-rows` content: the rule lines of one section
@@ -1146,17 +1190,20 @@ pub(crate) struct RowsFragment {
 }
 
 impl RowsFragment {
-    /// The fragment for a section name, clamped to the two known sections.
-    pub(crate) fn for_section(lang: Lang, builder: BuilderView, section: &str) -> Self {
+    /// The fragment for a section name; `None` for a section the widget
+    /// does not render rows for, so the caller answers with an explicit
+    /// error instead of silently showing the rename rows.
+    pub(crate) fn for_section(lang: Lang, builder: BuilderView, section: &str) -> Option<Self> {
         let section = match section {
             "drop" => "drop",
-            _ => "rename",
+            "rename" => "rename",
+            _ => return None,
         };
-        Self {
+        Some(Self {
             lang,
             builder,
             section,
-        }
+        })
     }
 }
 
@@ -1171,7 +1218,9 @@ impl_i18n!(RowsFragment);
 #[template(path = "pipeline/_widget.html")]
 pub(crate) struct WidgetFragment {
     pub lang: Lang,
-    pub builder: BuilderView,
+    /// The builder fields; `None` in raw mode, where the widget renders
+    /// only the JSON textarea and no builder view is built at all.
+    pub builder: Option<BuilderView>,
     /// `"builder"` or `"raw"`, the `pipeline_mode` value of the form.
     pub mode: &'static str,
     /// Raw-mode textarea content.
@@ -1191,6 +1240,20 @@ pub(crate) struct WidgetFragment {
 impl_i18n!(WidgetFragment);
 
 impl WidgetFragment {
+    /// Label of a status checkbox in the health filter. The five schema
+    /// values render localized, the same labels the dashboard legend and
+    /// the status badges use; a value outside the schema (imported JSON
+    /// can carry one) keeps its raw wire token, because the row exists
+    /// so the administrator sees exactly what the validator will
+    /// reject.
+    #[allow(dead_code)]
+    fn health_status_label(&self, status: &str) -> String {
+        match crate::admin::presentation::known_status_key(status) {
+            Some(key) => self.lang.t(key).to_string(),
+            None => status.to_string(),
+        }
+    }
+
     pub(crate) fn builder_mode(
         lang: Lang,
         csrf: &str,
@@ -1200,7 +1263,7 @@ impl WidgetFragment {
     ) -> Self {
         Self {
             preview_html: preview_body(&lang, built),
-            builder: BuilderView::new(built),
+            builder: Some(BuilderView::new(built)),
             mode: "builder",
             pipeline_value: String::new(),
             csrf: csrf.to_string(),
@@ -1219,7 +1282,7 @@ impl WidgetFragment {
         error: Option<String>,
     ) -> Self {
         Self {
-            builder: BuilderView::new(&BuilderState::new()),
+            builder: None,
             mode: "raw",
             pipeline_value,
             csrf: csrf.to_string(),
@@ -1263,19 +1326,68 @@ pub(crate) fn widget_from_posted(
     profile: bool,
     error: Option<String>,
 ) -> String {
-    let get = |key: &str| {
-        form.iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default()
-    };
+    let get = |key: &str| form_get_raw(form, key);
     if get("pipeline_mode") == "builder" {
         WidgetFragment::builder_mode(lang, csrf, &BuilderState::from_form(form), profile, error)
     } else {
         WidgetFragment::raw_mode(lang, csrf, get("pipeline"), false, error)
     }
     .html()
+}
+
+/// The widget after an asymmetric builder ⇄ raw mode switch (the
+/// `pipeline/mode` endpoint): everything that decides the next mode lives
+/// here, the handler only hands over the query and the form.
+///
+/// Builder → raw is always safe, the JSON is generated from the fields.
+/// Raw → builder only when the textarea parses into the builder;
+/// otherwise the widget stays in raw mode with the raw-mode warning and
+/// the text untouched. A form with no textarea at all (only `ped_*`
+/// fields) is already in builder mode: the fields are kept. An unparsable
+/// textarea is a broken input, not a server error: the reason is logged
+/// without the payload and shown next to the field.
+pub(crate) fn widget_from_mode_switch(
+    lang: Lang,
+    csrf: &str,
+    to: Option<&str>,
+    form: &[(String, String)],
+    profile: bool,
+) -> WidgetFragment {
+    if to == Some("raw") {
+        let json = BuilderState::from_form(form)
+            .emit()
+            .map(|emitted| serde_json::to_string_pretty(emitted.document()).unwrap_or_default())
+            .unwrap_or_default();
+        return WidgetFragment::raw_mode(lang, csrf, json, false, None);
+    }
+    if form.iter().any(|(k, _)| k.starts_with("ped_")) {
+        // Already in builder mode (no textarea on the form): keep the fields.
+        return WidgetFragment::builder_mode(
+            lang,
+            csrf,
+            &BuilderState::from_form(form),
+            profile,
+            None,
+        );
+    }
+    // The last submitted value of the textarea, trimmed: a mode control
+    // and a single-value field, surrounding whitespace is not content.
+    let raw = form_get_trimmed(form, "pipeline");
+    if raw.is_empty() {
+        return WidgetFragment::builder_mode(lang, csrf, &BuilderState::new(), profile, None);
+    }
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(value) => match BuilderState::ingest(Some(&value)) {
+            Ingest::Builder(built) => {
+                WidgetFragment::builder_mode(lang, csrf, &built, profile, None)
+            }
+            Ingest::Raw => WidgetFragment::raw_mode(lang, csrf, raw, true, None),
+        },
+        Err(err) => {
+            tracing::debug!(error = %err, "pipeline textarea is not valid JSON");
+            WidgetFragment::raw_mode(lang, csrf, raw, true, Some(err.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1757,7 +1869,7 @@ mod tests {
     #[test]
     fn from_form_parses_every_field() {
         let form: Vec<(String, String)> = [
-            set("ped_filter", &["1"]),
+            set("ped_filter", &["set"]),
             set("ped_filter_protocols", &["vless", "trojan"]),
             set("ped_filter_exclude", &["naive"]),
             vec![("ped_filter_asns".to_string(), "24940, AS13335".to_string())],
@@ -1773,11 +1885,11 @@ mod tests {
                 ("ped_rename_0_match".to_string(), "a".to_string()),
                 ("ped_rename_0_flags".to_string(), "i".to_string()),
             ],
-            set("ped_geo", &["1"]),
+            set("ped_geo", &["set"]),
             vec![("ped_geo_template".to_string(), "{asn} · {name}".to_string())],
-            set("ped_health", &["1"]),
+            set("ped_health", &["set"]),
             set("ped_health_exclude", &["alive"]),
-            set("ped_sort", &["1"]),
+            set("ped_sort", &["set"]),
             vec![("ped_sort_by".to_string(), "country".to_string())],
             set("ped_sort_desc", &["1"]),
             vec![("name".to_string(), "не поле конструктора".to_string())],
@@ -2422,7 +2534,7 @@ mod tests {
 
     #[test]
     fn presets_produce_valid_builder_states() {
-        let workers = preset("workers");
+        let workers = preset("workers").expect("workers is a known preset");
         assert!(workers.health_set);
         assert_eq!(
             workers.exclude_statuses,
@@ -2430,16 +2542,18 @@ mod tests {
         );
         assert!(crate::pipeline::CompiledPipeline::from_json(workers.doc().as_ref()).is_ok());
 
-        let country = preset("country");
+        let country = preset("country").expect("country is a known preset");
         assert!(country.geo_set);
         assert_eq!(country.geo_template, "{country} · {name}");
 
-        let clean = preset("clean");
+        let clean = preset("clean").expect("clean is a known preset");
         assert!(clean.geo_set && !clean.geo_enabled);
         assert_eq!(clean.rename.len(), 1);
 
-        assert_eq!(preset("blank"), BuilderState::new());
-        assert_eq!(preset("nope"), BuilderState::new());
+        assert_eq!(preset("blank"), Some(BuilderState::new()));
+        // An unknown name is None, an explicit error for the caller —
+        // never a silently empty widget.
+        assert_eq!(preset("nope"), None);
     }
 
     #[test]
@@ -2468,17 +2582,13 @@ mod tests {
             Schema::sort_options(),
             ["source", "name", "country", "latency"]
         );
+        // The hint's placeholders are the geo engine's own registry,
+        // braced for the template hint.
         assert_eq!(
             Schema::geo_placeholders(),
-            [
-                "{flag}",
-                "{country}",
-                "{city}",
-                "{asn}",
-                "{asn_org}",
-                "{name}"
-            ]
+            fumox_core::geo::TEMPLATE_PLACEHOLDERS.map(|name| format!("{{{name}}}"))
         );
+        assert_eq!(Schema::geo_placeholders()[0], "{flag}");
     }
 
     #[test]
@@ -2548,6 +2658,7 @@ mod tests {
             ..BuilderState::new()
         };
         let html = RowsFragment::for_section(lang.clone(), BuilderView::new(&s), "rename")
+            .expect("rename is a known section")
             .render()
             .unwrap_or_default();
 
@@ -2568,6 +2679,7 @@ mod tests {
         // The drop fragment renders its own rows: no `replace` field, the
         // drop-prefixed names, its own remove endpoint.
         let html = RowsFragment::for_section(lang, BuilderView::new(&s), "drop")
+            .expect("drop is a known section")
             .render()
             .unwrap_or_default();
         assert!(html.contains(r#"<option value="host" selected"#), "{html}");
@@ -2596,6 +2708,7 @@ mod tests {
             ..BuilderState::new()
         };
         let html = RowsFragment::for_section(lang.clone(), BuilderView::new(&s), "drop")
+            .expect("drop is a known section")
             .render()
             .unwrap_or_default();
         // Every drop row's target select carries the htmx wiring: note the
@@ -2616,6 +2729,7 @@ mod tests {
         // Rename rows do the same, different endpoint, different
         // container id.
         let html = RowsFragment::for_section(lang, BuilderView::new(&s), "rename")
+            .expect("rename is a known section")
             .render()
             .unwrap_or_default();
         assert!(
@@ -2638,7 +2752,7 @@ mod tests {
         let view = BuilderView::new(&state);
         let widget = WidgetFragment {
             lang: lang.clone(),
-            builder: view,
+            builder: Some(view),
             csrf: "csrf-token".into(),
             mode: "builder",
             pipeline_value: String::new(),
@@ -2669,24 +2783,32 @@ mod tests {
         s.protocols = vec!["vless".into()];
         let widget = WidgetFragment::builder_mode(lang.clone(), "csrf-token", &s, false, None);
         let html = widget.html();
+        // Structural markers: the mode control names the active mode and
+        // the builder fields are present, the texts come from the same
+        // catalog the template renders (the literals here would not
+        // notice a copy change).
         assert!(html.contains(r#"value="builder""#), "{html}");
         assert!(html.contains("ped_filter_protocols"), "{html}");
-        assert!(html.contains("Сгенерированный конвейер JSON"), "{html}");
+        // The preview area and its live title come from the same catalog
+        // the fragment renders.
+        assert!(html.contains(lang.t("ped.preview_title")), "{html}");
         assert!(
             html.contains("hx-post=\"/admin/pipeline/preview\""),
             "{html}"
         );
         assert!(!html.contains(r#"value="raw""#), "{html}");
 
-        let widget =
-            WidgetFragment::raw_mode(lang, "csrf-token", "{\"version\": 1}".into(), true, None);
+        let widget = WidgetFragment::raw_mode(
+            lang.clone(),
+            "csrf-token",
+            "{\"version\": 1}".into(),
+            true,
+            None,
+        );
         let html = widget.html();
         assert!(html.contains(r#"value="raw""#), "{html}");
-        assert!(html.contains("id=\"pipeline-field\""), "{html}");
-        assert!(
-            html.contains("невозможно представить в конструкторе"),
-            "{html}"
-        );
+        assert!(html.contains(r#"id="pipeline-field""#), "{html}");
+        assert!(html.contains(lang.t("ped.raw_mode")), "{html}");
         assert!(!html.contains("ped_filter_protocols"), "{html}");
     }
 
@@ -2695,7 +2817,7 @@ mod tests {
         let lang = test_lang();
         let form = vec![
             ("pipeline_mode".into(), "builder".into()),
-            ("ped_filter".into(), "1".into()),
+            ("ped_filter".into(), "set".into()),
             ("ped_filter_protocols".into(), "trojan".into()),
             ("pipeline".into(), "stale".into()),
         ];
@@ -2720,37 +2842,103 @@ mod tests {
         crate::admin::i18n::Locales::load(Path::new("/nonexistent-fumox-locales")).default_lang()
     }
 
-    /// When the geo section is `skip` (or absent), the inner
-    /// `ped_geo_enabled` checkbox and the `ped_geo_template` input stay
-    /// in the DOM but get the `hidden` attribute. The CSS rule
-    /// `.ped-inner[hidden]` hides them; the JS in base.html toggles the
-    /// attribute on radio change. The DOM-presence is what lets the
-    /// browser hold typed values across toggles without a server round
-    /// trip.
+    /// Sections that carry the tri-state radio on the source form.
+    const SOURCE_FORM_SECTIONS: [&str; 5] = ["filter", "geo", "health", "sort", "limit"];
+    /// The sections that carry it on the profile form: the source form's
+    /// set plus the two rule lists.
+    const ALL_SECTIONS: [&str; 7] = ["filter", "rename", "drop", "geo", "health", "sort", "limit"];
+    /// The rule lists: profile-only by design, the source form carries no
+    /// rename/drop toggle at all.
+    const PROFILE_ONLY_SECTIONS: [&str; 2] = ["rename", "drop"];
+
+    /// Every listed section renders all three mode radios; on the source
+    /// form the profile-only rule-list radios are additionally asserted
+    /// absent, by input name alone — whatever the attribute order and
+    /// values of the rendered tag.
+    fn assert_tri_state_radios(html: &str, profile: bool) {
+        let sections: &[&str] = if profile {
+            &ALL_SECTIONS
+        } else {
+            &SOURCE_FORM_SECTIONS
+        };
+        for section in sections {
+            for mode in ["skip", "defaults", "set"] {
+                let needle = format!(r#"name="ped_{section}" value="{mode}""#);
+                assert!(
+                    html.contains(&needle),
+                    "profile={profile} form must render {section} {mode} radio: missing {needle}"
+                );
+            }
+        }
+        if !profile {
+            for section in PROFILE_ONLY_SECTIONS {
+                assert!(
+                    !html.contains(&format!(r#"name="ped_{section}""#)),
+                    "source form must NOT carry a {section} radio: {html}"
+                );
+            }
+        }
+    }
+
+    /// The opening tag of a section's inner block, extracted by its
+    /// `data-ped-inner="<section>"` marker up to the closing `>`. Checks
+    /// run on this tag's tokens, so attribute order and values cannot
+    /// make a `hidden` check pass by accident.
+    fn inner_block_tag(html: &str, section: &str) -> String {
+        let marker = format!(r#"data-ped-inner="{section}""#);
+        let start = html
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no inner block for {section}: {html}"));
+        let tag_start = html[..start]
+            .rfind('<')
+            .unwrap_or_else(|| panic!("no opening tag before {marker}"));
+        let tag_end = start
+            + marker.len()
+            + html[start + marker.len()..]
+                .find('>')
+                .unwrap_or_else(|| panic!("unterminated tag for {section}: {html}"));
+        html[tag_start..=tag_end].to_string()
+    }
+
+    /// Whether the section's inner block tag carries `hidden` as an
+    /// independent attribute token.
+    fn inner_tag_has_hidden(html: &str, section: &str) -> bool {
+        let tag = inner_block_tag(html, section);
+        let tag = tag.strip_suffix('>').unwrap_or(&tag);
+        tag.split_whitespace().any(|token| token == "hidden")
+    }
+
+    /// When a section is `skip` (its radio checked by default), its inner
+    /// block carries the `hidden` attribute while the inner inputs stay
+    /// in the DOM: CSS (`.ped-inner[hidden]`) hides them, the JS toggles
+    /// the attribute on radio change, and the DOM-presence is what lets
+    /// the browser hold typed values across toggles without a server
+    /// round trip.
     #[test]
-    fn geo_skip_marks_inner_block_hidden() {
+    fn section_skip_marks_inner_block_hidden() {
         let lang = test_lang();
         let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
-        let html = widget_from_posted(lang.clone(), "c", &form, false, None);
-        assert!(
-            html.contains(r#"id="ped-geo-skip" checked"#),
-            "expected skip radio checked by default: {html}"
-        );
-        // Inner block is rendered with `hidden`.
-        assert!(
-            html.contains(r#"data-ped-inner="geo" hidden"#),
-            "inner block must carry the hidden attribute when geo is skipped: {html}"
-        );
-        // The inner inputs themselves stay in the DOM so the user can
-        // type into them as soon as the JS un-hides the block.
-        assert!(
-            html.contains(r#"id="ped-geo-enabled""#),
-            "disable checkbox stays in the DOM: {html}"
-        );
-        assert!(
-            html.contains(r#"id="ped-geo-template""#),
-            "template input stays in the DOM: {html}"
-        );
+        let html = widget_from_posted(lang, "c", &form, false, None);
+        for (section, inner_ids) in [
+            ("geo", &["ped-geo-enabled", "ped-geo-template"] as &[&str]),
+            ("sort", &["ped-sort-by", "ped-sort-desc"]),
+            ("limit", &["ped-limit-count"]),
+        ] {
+            assert!(
+                html.contains(&format!(r#"id="ped-{section}-skip" checked"#)),
+                "expected {section} skip radio checked by default: {html}"
+            );
+            assert!(
+                inner_tag_has_hidden(&html, section),
+                "{section} inner block must carry the hidden attribute: {html}"
+            );
+            for id in inner_ids {
+                assert!(
+                    html.contains(&format!(r#"id="{id}""#)),
+                    "{id} stays in the DOM: {html}"
+                );
+            }
+        }
     }
 
     /// The source form's geo section can now emit `geo: {}` (explicit
@@ -2800,33 +2988,6 @@ mod tests {
         );
     }
 
-    /// When the sort section is `skip` (the default), the inner sort
-    /// controls stay in the DOM but get the `hidden` attribute, so the
-    /// browser holds typed values across toggles. CSS hides the block;
-    /// the base.html JS toggles on radio change.
-    #[test]
-    fn sort_skip_marks_inner_block_hidden() {
-        let lang = test_lang();
-        let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
-        let html = widget_from_posted(lang.clone(), "c", &form, false, None);
-        assert!(
-            html.contains(r#"id="ped-sort-skip" checked"#),
-            "expected sort-skip radio checked by default: {html}"
-        );
-        assert!(
-            html.contains(r#"data-ped-inner="sort" hidden"#),
-            "sort inner block must carry hidden attribute: {html}"
-        );
-        assert!(
-            html.contains(r#"id="ped-sort-by""#),
-            "sort_by select stays in the DOM: {html}"
-        );
-        assert!(
-            html.contains(r#"id="ped-sort-desc""#),
-            "sort_desc checkbox stays in the DOM: {html}"
-        );
-    }
-
     /// The source form's sort section can now emit `sort: {}` (explicit
     /// defaults), this was unreachable before the tri-state radio was
     /// added to the source form. The `defaults` branch of `emit()`
@@ -2845,29 +3006,6 @@ mod tests {
         );
     }
 
-    /// When the limit section is `skip` (the default), the count input
-    /// stays in the DOM but the inner block gets the `hidden` attribute.
-    /// The browser can hold a typed number across toggles; CSS hides
-    /// the block; the JS toggles on radio change.
-    #[test]
-    fn limit_skip_marks_inner_block_hidden() {
-        let lang = test_lang();
-        let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
-        let html = widget_from_posted(lang.clone(), "c", &form, false, None);
-        assert!(
-            html.contains(r#"id="ped-limit-skip" checked"#),
-            "expected limit-skip radio checked by default: {html}"
-        );
-        assert!(
-            html.contains(r#"data-ped-inner="limit" hidden"#),
-            "limit inner block must carry hidden attribute: {html}"
-        );
-        assert!(
-            html.contains(r#"id="ped-limit-count""#),
-            "limit count input stays in the DOM: {html}"
-        );
-    }
-
     /// The source form's limit section can now emit `limit: { count:
     /// null }` (explicit defaults reset), this was unreachable from the
     /// source form before the tri-state radio was added.
@@ -2878,7 +3016,7 @@ mod tests {
         let json = s.doc().expect("limit_defaults must produce a JSON");
         let limit = json
             .get("limit")
-            .expect("emit must include limit under defaults: {json}");
+            .unwrap_or_else(|| panic!("emit must include limit under defaults: {json}"));
         assert_eq!(
             limit.get("count"),
             Some(&serde_json::Value::Null),
@@ -2901,7 +3039,9 @@ mod tests {
             "limit": { "count": 100 }
         });
         let Ingest::Builder(state) = BuilderState::ingest(Some(&pipeline)) else {
-            panic!("ingest must return Builder for a representable pipeline");
+            panic!(
+                "ingest must return Builder for a representable pipeline, got Raw for: {pipeline}"
+            );
         };
         let html = WidgetFragment::builder_mode(lang, "c", &state, false, None).html();
 
@@ -2917,13 +3057,11 @@ mod tests {
         // Inner blocks are visible: no `hidden` attribute on the inner
         // div, the inner inputs stay in the DOM.
         assert!(
-            html.contains(r#"data-ped-inner="sort""#)
-                && !html.contains(r#"data-ped-inner="sort" hidden"#),
+            !inner_tag_has_hidden(&html, "sort"),
             "sort inner block must be visible on reload: {html}"
         );
         assert!(
-            html.contains(r#"data-ped-inner="limit""#)
-                && !html.contains(r#"data-ped-inner="limit" hidden"#),
+            !inner_tag_has_hidden(&html, "limit"),
             "limit inner block must be visible on reload: {html}"
         );
         assert!(
@@ -2943,9 +3081,9 @@ mod tests {
     /// Every field of every section, set to a non-default value,
     /// survives the round-trip through `emit`/`ingest`. This is the
     /// master check: if a field is dropped, renamed, or silently
-    /// canonicalized, this test catches it. Both source (`ped_*` checkbox
-    /// = `"1"`) and profile (`ped_*` radio = `"set"`) form paths are
-    /// exercised.
+    /// canonicalized, this test catches it. Both form paths are
+    /// exercised: the source and the profile form submit the same
+    /// tri-state radios (`skip`/`defaults`/`set`).
     #[test]
     fn every_field_round_trips_through_emit_and_ingest() {
         fn check(form: Vec<(String, String)>) {
@@ -2956,38 +3094,45 @@ mod tests {
             let Ingest::Builder(loaded) = BuilderState::ingest(Some(&json)) else {
                 panic!("ingest must return Builder, got Raw: {json}");
             };
-            // Re-emit; idempotency.
+            // Re-emit; idempotency. The message names the two sides of the
+            // comparison (the original emit and the re-emit), not the step
+            // that produced the second one.
+            let reemit = loaded.doc();
             assert_eq!(
-                loaded.doc(),
+                reemit,
                 Some(json.clone()),
-                "round-trip lost data: emit={json}, ingest={:?}",
-                loaded.doc()
+                "round-trip lost data: original={json}, re-emit={reemit:?}"
             );
-            // Per-field checks against the *re-emitted* JSON.
-            let v = &json;
+            // Per-field checks against the emitted JSON.
             // filter
-            assert_eq!(v["filter"]["protocols"][0], "vless");
-            assert_eq!(v["filter"]["exclude_protocols"][0], "trojan");
-            assert_eq!(v["filter"]["asns"][0], "24940");
-            assert_eq!(v["filter"]["asns"][1], "AS13335");
-            assert_eq!(v["filter"]["exclude_asns"][0], "9009");
-            assert_eq!(v["filter"]["forbid_insecure"], false);
+            assert_eq!(json["filter"]["protocols"][0], "vless");
+            assert_eq!(json["filter"]["exclude_protocols"][0], "trojan");
+            assert_eq!(json["filter"]["asns"][0], "24940");
+            assert_eq!(json["filter"]["asns"][1], "AS13335");
+            assert_eq!(json["filter"]["exclude_asns"][0], "9009");
+            assert_eq!(json["filter"]["forbid_insecure"], false);
             // rename
-            assert_eq!(v["rename"][0]["match"], "a");
-            assert_eq!(v["rename"][0]["replace"], "A");
-            assert_eq!(v["rename"][0]["flags"], "i");
+            assert_eq!(json["rename"][0]["match"], "a");
+            assert_eq!(json["rename"][0]["replace"], "A");
+            assert_eq!(json["rename"][0]["flags"], "i");
+            assert_eq!(json["rename"][1]["match"], "cn");
+            assert_eq!(json["rename"][1]["replace"], "CN");
+            assert_eq!(json["rename"][1]["flags"], "i");
+            // drop
+            assert_eq!(json["drop"][0]["match"], "free");
+            assert_eq!(json["drop"][0]["flags"], "i");
             // geo
-            assert_eq!(v["geo"]["enabled"], false);
-            assert_eq!(v["geo"]["template"], "{asn} · {name}");
+            assert_eq!(json["geo"]["enabled"], false);
+            assert_eq!(json["geo"]["template"], "{asn} · {name}");
             // health
-            assert_eq!(v["health"]["exclude_statuses"][0], "removed");
-            assert_eq!(v["health"]["exclude_statuses"][1], "quarantine");
-            assert_eq!(v["health"]["exclude_statuses"][2], "unknown");
+            assert_eq!(json["health"]["exclude_statuses"][0], "removed");
+            assert_eq!(json["health"]["exclude_statuses"][1], "quarantine");
+            assert_eq!(json["health"]["exclude_statuses"][2], "unknown");
             // sort
-            assert_eq!(v["sort"]["by"], "latency");
-            assert_eq!(v["sort"]["desc"], true);
+            assert_eq!(json["sort"]["by"], "latency");
+            assert_eq!(json["sort"]["desc"], true);
             // limit
-            assert_eq!(v["limit"]["count"], 100);
+            assert_eq!(json["limit"]["count"], 100);
         }
 
         let form_common = vec![
@@ -3000,6 +3145,12 @@ mod tests {
             ("ped_rename_0_match".into(), "a".into()),
             ("ped_rename_0_replace".into(), "A".into()),
             ("ped_rename_0_flags".into(), "i".into()),
+            ("ped_rename_1_match".into(), "cn".into()),
+            ("ped_rename_1_replace".into(), "CN".into()),
+            ("ped_rename_1_flags".into(), "i".into()),
+            ("ped_drop_0_match".into(), "free".into()),
+            ("ped_drop_0_flags".into(), "i".into()),
+            ("ped_drop_0_target".into(), "host".into()),
             ("ped_geo_enabled".into(), "0".into()),
             ("ped_geo_template".into(), "{asn} · {name}".into()),
             // override the built-in default exclude_statuses (q+r) so the
@@ -3012,14 +3163,14 @@ mod tests {
             ("ped_limit_count".into(), "100".into()),
         ];
 
-        // Source form: section toggles are checkboxes ("1" = set).
+        // Source form: the same tri-state radios as the profile form.
         let mut source = form_common.clone();
         source.extend([
-            ("ped_filter".into(), "1".into()),
-            ("ped_geo".into(), "1".into()),
-            ("ped_health".into(), "1".into()),
-            ("ped_sort".into(), "1".into()),
-            ("ped_limit".into(), "1".into()),
+            ("ped_filter".into(), "set".into()),
+            ("ped_geo".into(), "set".into()),
+            ("ped_health".into(), "set".into()),
+            ("ped_sort".into(), "set".into()),
+            ("ped_limit".into(), "set".into()),
         ]);
         check(source);
 
@@ -3068,28 +3219,8 @@ mod tests {
     fn source_form_renders_all_three_radios_for_every_section() {
         let lang = test_lang();
         let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
-        let html = widget_from_posted(lang.clone(), "c", &form, false, None);
-        // Sections with the unified tri-state: skip/defaults/set radios
-        // all rendered on both source and profile forms.
-        for section in ["filter", "geo", "health", "sort", "limit"] {
-            for mode in ["skip", "defaults", "set"] {
-                let needle = format!(r#"name="ped_{section}" value="{mode}""#);
-                assert!(
-                    html.contains(&needle),
-                    "source form must render {section} {mode} radio: missing {needle}"
-                );
-            }
-        }
-        // Rename and drop have no source-form toggle at all
-        // (profile-only by design).
-        assert!(
-            !html.contains(r#"name="ped_rename" value="skip""#),
-            "source form must NOT carry a rename radio: {html}"
-        );
-        assert!(
-            !html.contains(r#"name="ped_drop" value="skip""#),
-            "source form must NOT carry a drop radio: {html}"
-        );
+        let html = widget_from_posted(lang, "c", &form, false, None);
+        assert_tri_state_radios(&html, false);
     }
 
     /// Profile form must render the tri-state radios for **every**
@@ -3098,16 +3229,134 @@ mod tests {
     fn profile_form_renders_all_three_radios_for_every_section() {
         let lang = test_lang();
         let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
-        let html = widget_from_posted(lang.clone(), "c", &form, true, None);
-        for section in ["filter", "rename", "drop", "geo", "health", "sort", "limit"] {
-            for mode in ["skip", "defaults", "set"] {
-                let needle = format!(r#"name="ped_{section}" value="{mode}""#);
+        let html = widget_from_posted(lang, "c", &form, true, None);
+        assert_tri_state_radios(&html, true);
+    }
+
+    /// The profile form's rule lists follow the same visibility contract
+    /// as the other sections' inner blocks: marked with `data-ped-section`
+    /// / `data-ped-inner` for the JS toggle, and server-side `hidden` when
+    /// the section is `skip`, so the state matches the rendered radios
+    /// before any script runs. The source form has no tri-state for the
+    /// lists: its rows are never hidden. (A fresh profile form defaults to
+    /// `set`, the same state the pre-tri-state form had, so the hidden
+    /// case is the explicitly posted `skip`.)
+    #[test]
+    fn profile_rule_lists_follow_the_skip_visibility() {
+        let lang = test_lang();
+        let fresh: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
+        let html = widget_from_posted(lang.clone(), "c", &fresh, true, None);
+        for section in PROFILE_ONLY_SECTIONS {
+            assert!(
+                html.contains(&format!(r#"data-ped-section="{section}""#)),
+                "{section} section must be marked for the JS toggle: {html}"
+            );
+            assert!(
+                !inner_tag_has_hidden(&html, section),
+                "a fresh profile form has {section} on set, its rows must be visible: {html}"
+            );
+        }
+        // `skip` hides the rule rows server-side: the JSON would omit the
+        // section and any typed rule would be silently dropped on save.
+        let skip: Vec<(String, String)> = vec![
+            ("pipeline_mode".into(), "builder".into()),
+            ("ped_rename".into(), "skip".into()),
+            ("ped_drop".into(), "skip".into()),
+        ];
+        let html = widget_from_posted(lang.clone(), "c", &skip, true, None);
+        for section in PROFILE_ONLY_SECTIONS {
+            assert!(
+                inner_tag_has_hidden(&html, section),
+                "{section} on skip must carry hidden on its rows: {html}"
+            );
+        }
+        // `set` keeps the rule rows visible, `defaults` too (the user may
+        // want to see what they are resetting).
+        let set: Vec<(String, String)> = vec![
+            ("pipeline_mode".into(), "builder".into()),
+            ("ped_rename".into(), "set".into()),
+            ("ped_drop".into(), "set".into()),
+        ];
+        let html = widget_from_posted(lang.clone(), "c", &set, true, None);
+        for section in PROFILE_ONLY_SECTIONS {
+            assert!(
+                !inner_tag_has_hidden(&html, section),
+                "{section} rows must be visible on set: {html}"
+            );
+        }
+        let defaults: Vec<(String, String)> = vec![
+            ("pipeline_mode".into(), "builder".into()),
+            ("ped_rename".into(), "defaults".into()),
+            ("ped_drop".into(), "defaults".into()),
+        ];
+        let html = widget_from_posted(lang.clone(), "c", &defaults, true, None);
+        for section in PROFILE_ONLY_SECTIONS {
+            assert!(
+                !inner_tag_has_hidden(&html, section),
+                "{section} rows must be visible on defaults: {html}"
+            );
+        }
+        // The source form has no tri-state for the lists: always visible.
+        let html = widget_from_posted(lang, "c", &fresh, false, None);
+        for section in PROFILE_ONLY_SECTIONS {
+            assert!(
+                !inner_tag_has_hidden(&html, section),
+                "the source form has no {section} toggle, its rows must be visible: {html}"
+            );
+        }
+    }
+
+    /// Accessibility wiring of the mode controls: every radio id has its
+    /// `<label for=…>`, every tri-state group names itself through the
+    /// section heading (`role="radiogroup"` + `aria-labelledby`), and the
+    /// builder/raw switch is a radio group whose buttons carry the checked
+    /// state of the rendered mode. The attributes are rendered verbatim by
+    /// askama, so the checks are exact string needles.
+    #[test]
+    fn mode_controls_carry_labels_and_aria_state() {
+        let lang = test_lang();
+        let form: Vec<(String, String)> = vec![("pipeline_mode".into(), "builder".into())];
+        for profile in [false, true] {
+            let html = widget_from_posted(lang.clone(), "c", &form, profile, None);
+            let sections: &[&str] = if profile {
+                &ALL_SECTIONS
+            } else {
+                &SOURCE_FORM_SECTIONS
+            };
+            for section in sections {
+                for mode in ["skip", "defaults", "set"] {
+                    assert!(
+                        html.contains(&format!(r#"id="ped-{section}-{mode}""#)),
+                        "profile={profile}: expected id ped-{section}-{mode}: {html}"
+                    );
+                    assert!(
+                        html.contains(&format!(r#"<label for="ped-{section}-{mode}">"#)),
+                        "profile={profile}: expected label for ped-{section}-{mode}: {html}"
+                    );
+                }
                 assert!(
-                    html.contains(&needle),
-                    "profile form must render {section} {mode} radio: missing {needle}"
+                    html.contains(&format!(
+                        r#"role="radiogroup" aria-labelledby="ped-section-{section}""#
+                    )),
+                    "profile={profile}: the {section} group must be named by its heading: {html}"
                 );
             }
         }
+        // The builder/raw switch: a radio group whose two buttons name the
+        // rendered mode through aria-checked.
+        let html = widget_from_posted(test_lang(), "c", &form, false, None);
+        assert!(
+            html.contains(r#"class="ped-modes" role="radiogroup""#),
+            "the mode switch must be a radio group: {html}"
+        );
+        assert!(
+            html.contains(r#"role="radio" aria-checked="true""#),
+            "the active mode button must be aria-checked=true: {html}"
+        );
+        assert!(
+            html.contains(r#"role="radio" aria-checked="false""#),
+            "the inactive mode button must be aria-checked=false: {html}"
+        );
     }
 
     /// A brand-new source (no stored pipeline): the widget renders with
@@ -3123,25 +3372,32 @@ mod tests {
         let state = BuilderState::new();
         let html = WidgetFragment::builder_mode(lang, "c", &state, false, None).html();
         // Every section's skip radio is the default selection.
-        for section in ["filter", "geo", "health", "sort", "limit"] {
+        for section in SOURCE_FORM_SECTIONS {
             assert!(
                 html.contains(&format!(r#"id="ped-{section}-skip" checked"#)),
                 "expected {section} skip radio checked by default: {html}"
             );
         }
         // Every section's inner block is rendered with `hidden`.
-        for section in ["filter", "geo", "health", "sort", "limit"] {
+        for section in SOURCE_FORM_SECTIONS {
             assert!(
-                html.contains(&format!(r#"data-ped-inner="{section}" hidden"#)),
+                inner_tag_has_hidden(&html, section),
                 "{section} inner block must carry hidden: {html}"
             );
         }
         // Inner inputs themselves remain in the DOM (so the JS toggle
         // can immediately show them with their default values).
-        assert!(html.contains(r#"id="ped-sort-by""#), "{html}");
-        assert!(html.contains(r#"id="ped-sort-desc""#), "{html}");
-        assert!(html.contains(r#"id="ped-limit-count""#), "{html}");
-        assert!(html.contains(r#"id="ped-asns""#), "{html}");
-        assert!(html.contains(r#"id="ped-status-alive""#), "{html}");
+        for id in [
+            "ped-sort-by",
+            "ped-sort-desc",
+            "ped-limit-count",
+            "ped-asns",
+            "ped-status-alive",
+        ] {
+            assert!(
+                html.contains(&format!(r#"id="{id}""#)),
+                "expected {id} input in DOM: {html}"
+            );
+        }
     }
 }

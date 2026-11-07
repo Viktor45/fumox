@@ -28,13 +28,15 @@ use crate::admin::pipeline_editor::BuilderState;
 use crate::admin::presentation::{fmt_day_element, fmt_day_plain};
 use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
-use crate::pipeline::CompiledPipeline;
+use crate::fetcher;
+use crate::pipeline::{CompiledPipeline, PipelineIssue};
 use askama::Template;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::admin::dash_top_n::{self, DashTopN};
+use fumox_core::models::ProxyStatus;
 
 /// Dashboard (merged with the former statistics screen,
 /// aggregate counters, source errors (the
@@ -60,11 +62,25 @@ struct DashboardTemplate {
     fetch_ok_24h: i64,
     /// Age in seconds of the last scheduler sweep start (stamped into
     /// `meta.server_cycle` in `scheduler::sweep`), rendered as a sub-line
-    /// of the fetches card. `None` until the first sweep ever ran.
+    /// of the fetches card. `None` until the first sweep ever ran. A
+    /// stamp that exists but does not parse is a different fact: it sets
+    /// [`Self::server_cycle_corrupt`] instead of collapsing into the
+    /// clean "no sweep yet" state.
     server_cycle_age_secs: Option<i64>,
+    /// The `server_cycle` stamp exists but does not parse: a cut-short
+    /// write or a format the reader does not know. Rendered as its own
+    /// "corrupt" state, so a broken stamp is never read as "no sweep yet".
+    server_cycle_corrupt: bool,
     recent_errors: Vec<SourceErrorRow>,
+    /// The source-errors read failed: the block renders empty with an
+    /// inline note instead of failing the whole page (the rest of the
+    /// dashboard is independent of that one query).
+    recent_errors_unavailable: bool,
     /// Per-source health counters (the former stats screen table).
     sources: Vec<SourceStatRow>,
+    /// The per-source health read failed; same degradation as
+    /// [`Self::recent_errors_unavailable`].
+    sources_unavailable: bool,
     top_alive: Vec<TopAliveRow>,
     schemes: Vec<SchemeSplitRow>,
     countries: Vec<CountrySplitRow>,
@@ -72,7 +88,9 @@ struct DashboardTemplate {
     latency_min: Option<i64>,
     latency_avg: Option<i64>,
     latency_median: Option<i64>,
-    /// `(total probes in 24h, successful probes in 24h)`.
+    /// `(total probes in 24h, successful probes in 24h)`. Speed probes
+    /// are excluded: they measure transfer bandwidth, not liveness, so
+    /// they are not a check that can succeed or fail.
     probes_total_24h: i64,
     probes_ok_24h: i64,
     /// Counters of the probe summary panel.
@@ -120,7 +138,7 @@ struct SourceStatRow {
     oldest_ready_at: Option<i64>,
 }
 
-/// One row of the "longest-living alive proxies" top.
+/// One row of the "longest-living ready (T2-verified) proxies" top.
 #[derive(Debug, sqlx::FromRow)]
 struct TopAliveRow {
     id: i64,
@@ -189,16 +207,12 @@ impl DashboardTemplate {
     }
     /// Percentage of `part` relative to `whole` (0 when whole is 0).
     fn pct(&self, part: &i64, whole: &i64) -> i64 {
-        if *whole == 0 { 0 } else { (part * 100) / whole }
+        pct_of(*part, *whole)
     }
     /// Width in percent of one distribution bar (relative to the largest
     /// bucket of its group); 1 is the floor so non-zero counts stay visible.
     fn bar_width(&self, count: &i64, max: &i64) -> i64 {
-        if *max <= 0 || *count <= 0 {
-            0
-        } else {
-            (*count * 100 / max).max(1)
-        }
+        bar_width_of(*count, *max)
     }
     /// Truncate long display names (the full name is on the proxy card).
     fn short_name(&self, name: &str) -> String {
@@ -212,12 +226,59 @@ impl DashboardTemplate {
     }
 }
 
+/// Percentage of `part` relative to `whole` (0 when whole is 0). The
+/// arithmetic of [`DashboardTemplate::pct`], free so it is testable
+/// without a template instance.
+fn pct_of(part: i64, whole: i64) -> i64 {
+    if whole == 0 { 0 } else { (part * 100) / whole }
+}
+
+/// Width in percent of one distribution bar (relative to the largest
+/// bucket of its group); 1 is the floor so non-zero counts stay visible.
+/// The arithmetic of [`DashboardTemplate::bar_width`], free so it is
+/// testable without a template instance.
+fn bar_width_of(count: i64, max: i64) -> i64 {
+    if max <= 0 || count <= 0 {
+        0
+    } else {
+        (count * 100 / max).max(1)
+    }
+}
+
 impl_i18n!(DashboardTemplate);
 
 pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let started = std::time::Instant::now();
     let lang = state.locales.lang_from_headers(&headers);
-    let theme = theme::from_headers(&headers);
-    let top_n = dash_top_n::from_headers(&headers);
+    // `dashboard_inner` carries the `?`-style flow and answers either the
+    // rendered model or the finished error response; the only match on
+    // the error path stays here.
+    let template = match dashboard_inner(&state, &headers, &lang).await {
+        Ok(template) => template,
+        Err(response) => return response,
+    };
+    // One timing line per render: a slow dashboard is visible in the log
+    // without reproducing it.
+    tracing::debug!(
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "dashboard rendered"
+    );
+    render_html(lang.clone(), "dashboard.html", &template, StatusCode::OK)
+}
+
+/// The dashboard's reads. Every fallible step maps its error to the
+/// finished 500 response with the name of the failed query in the log,
+/// so the `?`s below stay one-liners; the two widgets the operator
+/// triages from (source errors, per-source health) degrade on their own
+/// instead ([`DashboardTemplate::recent_errors_unavailable`]).
+#[allow(clippy::result_large_err)] // the Err is a finished Response, by design
+async fn dashboard_inner(
+    state: &AdminState,
+    headers: &HeaderMap,
+    lang: &Lang,
+) -> Result<DashboardTemplate, Response> {
+    let theme = theme::from_headers(headers);
+    let top_n = dash_top_n::from_headers(headers);
     let pool = &state.pool;
 
     // One read transaction for the whole screen: every counter and every
@@ -225,154 +286,133 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
     // state between two queries cannot make the page contradict itself.
     // The transaction also holds one connection instead of taking one per
     // query.
-    let mut tx = match pool.begin().await {
-        Ok(tx) => tx,
-        Err(err) => return server_error(lang, &err),
-    };
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.begin", &err))?;
 
-    let (src_total, src_enabled, src_errors): (i64, i64, i64) = match sqlx::query_as(
+    let (src_total, src_enabled, src_errors): (i64, i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), COALESCE(SUM(enabled), 0),
                 COALESCE(SUM(error_class IS NOT NULL), 0) FROM sources",
     )
     .fetch_one(&mut *tx)
     .await
-    {
-        Ok(row) => row,
-        Err(err) => return server_error(lang, &err),
-    };
+    .map_err(|err| server_error(state, headers, "dashboard.sources", &err))?;
 
-    let profiles_total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM profiles")
+    let profiles_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profiles")
         .fetch_one(&mut *tx)
         .await
-    {
-        Ok(count) => count,
-        Err(err) => return server_error(lang, &err),
-    };
+        .map_err(|err| server_error(state, headers, "dashboard.profiles", &err))?;
 
     // The proxy counters come from one grouped pass over the table, so
     // the breakdown by status and the scalar counters cannot disagree.
-    let aggregates = match fumox_core::repo::proxies::status_aggregates(&mut *tx).await {
-        Ok(aggregates) => aggregates,
-        Err(err) => return server_error(lang, &err),
-    };
+    let aggregates = fumox_core::repo::proxies::status_aggregates(&mut *tx)
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.status_aggregates", &err))?;
     let proxy_counts = aggregates.counts.clone();
 
     let day_ago = fumox_core::models::now_ts() - 86_400;
-    let (fetch_total_24h, fetch_ok_24h): (i64, i64) = match sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(SUM(ok), 0) FROM fetch_log WHERE fetched_at > ?",
-    )
-    .bind(day_ago)
-    .fetch_one(&mut *tx)
-    .await
-    {
-        Ok(row) => row,
-        Err(err) => return server_error(lang, &err),
-    };
+    let (fetch_total_24h, fetch_ok_24h): (i64, i64) =
+        fumox_core::repo::fetch_log::success_counts_since(&mut *tx, day_ago)
+            .await
+            .map_err(|err| server_error(state, headers, "dashboard.fetch_24h", &err))?;
 
-    let recent_errors: Vec<SourceErrorRow> = match sqlx::query_as(
-        "SELECT id, name, error_class, last_error, last_fetched_at FROM sources
-         WHERE error_class IS NOT NULL
-         ORDER BY COALESCE(last_fetched_at, 0) DESC LIMIT ?",
-    )
-    .bind(top_n.as_i64())
-    .fetch_all(&mut *tx)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
-    };
+    // The two widgets the operator triages from degrade independently: a
+    // failed read leaves the block empty with an inline note instead of
+    // taking the whole screen down.
+    let (recent_errors, recent_errors_unavailable): (Vec<SourceErrorRow>, bool) =
+        match sqlx::query_as(
+            "SELECT id, name, error_class, last_error, last_fetched_at FROM sources
+             WHERE error_class IS NOT NULL
+             ORDER BY COALESCE(last_fetched_at, 0) DESC LIMIT ?",
+        )
+        .bind(top_n.as_i64())
+        .fetch_all(&mut *tx)
+        .await
+        {
+            Ok(rows) => (rows, false),
+            Err(err) => {
+                tracing::warn!(error = %err, "the dashboard source-errors widget failed to load");
+                (Vec::new(), true)
+            }
+        };
 
     // Per-source health counters (single aggregate over the join table).
-    let sources: Vec<SourceStatRow> = match sqlx::query_as(
-        "SELECT s.id, s.name, s.enabled,
-                COALESCE(SUM(p.status = 'unknown'), 0)   AS unknown,
-                COALESCE(SUM(p.status = 'alive'), 0)     AS alive,
-                COALESCE(SUM(p.status = 'ready'), 0)     AS ready,
-                COALESCE(SUM(p.status = 'quarantine'), 0) AS quarantine,
-                COALESCE(SUM(p.status = 'removed'), 0)    AS removed,
-                COUNT(DISTINCT p.id)                      AS total,
-                MIN(CASE WHEN p.status = 'ready' THEN p.created_at END) AS oldest_ready_at
-         FROM sources s
-         LEFT JOIN proxy_source_links l ON l.source_id = s.id
-         LEFT JOIN proxies p ON p.id = l.proxy_id
-         GROUP BY s.id
-         ORDER BY alive DESC, total DESC, s.name COLLATE NOCASE",
+    let (sources, sources_unavailable): (Vec<SourceStatRow>, bool) = match source_health_split(
+        &mut *tx,
     )
-    .fetch_all(&mut *tx)
     .await
     {
-        Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
+        Ok(rows) => (rows, false),
+        Err(err) => {
+            tracing::warn!(error = %err, "the dashboard per-source health widget failed to load");
+            (Vec::new(), true)
+        }
     };
 
     // Longest-living ready proxies: oldest `created_at` first, the
     // tunnel-verified tier (`ready`) is a strict subset of `alive`, set
     // only by a successful T2, so showing the top-N there surfaces the
-    // proxies that have stayed end-to-end working the longest.
-    let top_alive: Vec<TopAliveRow> = match sqlx::query_as(
-        "SELECT p.id, p.name, p.scheme, p.host, p.port, p.latency_ms, p.geo_country,
+    // proxies that have stayed end-to-end working the longest. The tier
+    // is bound like every status value on this screen: no inline status
+    // literal survives in the dashboard's SQL. The picked ids come from
+    // a CTE, so the LIMIT applies before the source-links fan-out joins
+    // in their names.
+    let top_alive: Vec<TopAliveRow> = sqlx::query_as(
+        "WITH picked AS (
+             SELECT id FROM proxies WHERE status = ?
+             ORDER BY created_at ASC, id ASC LIMIT ?
+         )
+         SELECT p.id, p.name, p.scheme, p.host, p.port, p.latency_ms, p.geo_country,
                 p.created_at,
                 COALESCE(GROUP_CONCAT(s.name, ', '), '') AS source_names
-         FROM proxies p
+         FROM picked
+         JOIN proxies p ON p.id = picked.id
          JOIN proxy_source_links l ON l.proxy_id = p.id
          JOIN sources s ON s.id = l.source_id
-         WHERE p.status = 'ready'
          GROUP BY p.id
-         ORDER BY p.created_at ASC, p.id ASC
-         LIMIT ?",
+         ORDER BY p.created_at ASC, p.id ASC",
     )
+    .bind(ProxyStatus::Ready.as_str())
     .bind(top_n.as_i64())
     .fetch_all(&mut *tx)
     .await
-    {
-        Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
-    };
+    .map_err(|err| server_error(state, headers, "dashboard.top_alive", &err))?;
 
-    let schemes = match scheme_split(&mut *tx).await {
-        Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
-    };
-    let countries = match country_split(&mut *tx, top_n.as_i64()).await {
-        Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
-    };
+    let schemes = scheme_split(&mut *tx)
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.scheme_split", &err))?;
+    let countries = country_split(&mut *tx, top_n.as_i64())
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.country_split", &err))?;
 
     // Latency of the live pool (`alive` and `ready`): the same set the
     // dashboard's other widgets count. SQLite has no median builtin, so
     // the median is a separate window-function query.
     let (latency_min, latency_avg) = (aggregates.latency_min, aggregates.latency_avg);
-    let latency_median = match fumox_core::repo::proxies::latency_median(&mut *tx).await {
-        Ok(median) => median,
-        Err(err) => return server_error(lang, &err),
-    };
+    let latency_median = fumox_core::repo::proxies::latency_median(&mut *tx)
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.latency_median", &err))?;
 
-    // Probe success rate over the last 24 hours.
-    let (probes_total_24h, probes_ok_24h): (i64, i64) = match sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(SUM(ok), 0) FROM probe_results
-         WHERE checked_at > ? AND probe_kind != 'speed'",
-    )
-    .bind(day_ago)
-    .fetch_one(&mut *tx)
-    .await
-    {
-        Ok(row) => row,
-        Err(err) => return server_error(lang, &err),
-    };
+    // Probe success rate over the last 24 hours. Speed probes are
+    // excluded (see `probe::success_counts_since`): they measure
+    // transfer bandwidth, not liveness.
+    let (probes_total_24h, probes_ok_24h): (i64, i64) =
+        fumox_core::repo::probe::success_counts_since(&mut *tx, day_ago)
+            .await
+            .map_err(|err| server_error(state, headers, "dashboard.probes_24h", &err))?;
 
     // Top failure reasons over the rolling 24h window, the operator's
     // most actionable signal after the source-errors block at the top:
     // "what kind of probe failure is happening most often right now?"
     let top_failures: Vec<(String, i64)> =
-        match fumox_core::repo::probe::top_failure_reasons(&mut *tx, day_ago, top_n.as_i64()).await
-        {
-            Ok(rows) => rows,
-            Err(err) => return server_error(lang, &err),
-        };
+        fumox_core::repo::probe::top_failure_reasons(&mut *tx, day_ago, top_n.as_i64())
+            .await
+            .map_err(|err| server_error(state, headers, "dashboard.top_failures", &err))?;
 
     // Ingest dynamics: proxies created per day over the last 7 days,
     // zero-filled for gap days (the chart must not silently skip a day).
-    let rows: Vec<IngestDayRow> = match sqlx::query_as(
+    let rows: Vec<IngestDayRow> = sqlx::query_as(
         "SELECT (created_at / 86400) * 86400 AS day, COUNT(*) AS created
          FROM proxies
          WHERE created_at >= ?
@@ -381,11 +421,84 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
     .bind(day_ago - 6 * 86_400)
     .fetch_all(&mut *tx)
     .await
-    {
-        Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
-    };
+    .map_err(|err| server_error(state, headers, "dashboard.ingest_days", &err))?;
     let now = fumox_core::models::now_ts();
+    let ingest_days = fill_ingest_days(&rows, now);
+    let ingest_max = ingest_days
+        .iter()
+        .map(|(_, count)| *count)
+        .max()
+        .unwrap_or(0);
+
+    // Age of the scheduler's last sweep (the stamp is written at sweep
+    // start, so a hung sweep shows as aging). A negative clock skew clamps
+    // to zero rather than rendering "-3 s". A stamp that does not parse
+    // is its own "corrupt" state, not the clean "no sweep yet".
+    let server_cycle_raw =
+        fumox_core::repo::meta_get(&mut *tx, fumox_core::repo::probe::meta::SERVER_CYCLE_KEY)
+            .await
+            .map_err(|err| server_error(state, headers, "dashboard.server_cycle", &err))?;
+    let (server_cycle_age_secs, server_cycle_corrupt) = match server_cycle_raw {
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(ts) => (Some((now - ts).max(0)), false),
+            Err(_) => {
+                tracing::warn!(
+                    key = fumox_core::repo::probe::meta::SERVER_CYCLE_KEY,
+                    raw_len = raw.len(),
+                    "unparseable server cycle stamp"
+                );
+                (None, true)
+            }
+        },
+        None => (None, false),
+    };
+
+    tx.commit()
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.commit", &err))?;
+
+    Ok(DashboardTemplate {
+        lang: lang.clone(),
+        langs: state.locales.choices().to_vec(),
+        theme,
+        active: "dashboard",
+        csrf: state.csrf_for(headers),
+        sources_total: src_total,
+        sources_enabled: src_enabled,
+        sources_with_errors: src_errors,
+        profiles_total,
+        proxy_counts,
+        fetch_total_24h,
+        fetch_ok_24h,
+        server_cycle_age_secs,
+        server_cycle_corrupt,
+        recent_errors,
+        recent_errors_unavailable,
+        sources,
+        sources_unavailable,
+        top_alive,
+        schemes,
+        countries,
+        latency_min,
+        latency_avg,
+        latency_median,
+        probes_total_24h,
+        probes_ok_24h,
+        unprobeable: aggregates.unprobeable,
+        quarantine_second_chance: aggregates.quarantine_second_chance,
+        in_quarantine: aggregates.in_quarantine,
+        never_checked: aggregates.never_checked,
+        ingest_days,
+        ingest_max,
+        top_n,
+        top_failures,
+    })
+}
+
+/// The 7-day ingest series, oldest first, zero-filled for gap days: a
+/// day with no creations must still render as an empty column, not be
+/// skipped silently.
+fn fill_ingest_days(rows: &[IngestDayRow], now: i64) -> Vec<(i64, i64)> {
     let first_day = (now / 86_400) * 86_400 - 6 * 86_400;
     let mut ingest_days: Vec<(i64, i64)> = Vec::with_capacity(7);
     for offset in 0..7 {
@@ -396,65 +509,50 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
             .map_or(0, |row| row.created);
         ingest_days.push((day, created));
     }
-    let ingest_max = ingest_days
+    ingest_days
+}
+
+/// The per-status SUM columns the split queries select: one bound
+/// `COALESCE(SUM(...), 0)` per status, aliased with the status name the
+/// row structs and the dashboard template key on. Generated from
+/// [`ProxyStatus::all`], so a new status joins every split instead of
+/// silently dropping out of the buckets (the bucket-sum test in this
+/// module fails until the row struct grows the matching column).
+fn status_sum_sql(column: &str) -> String {
+    ProxyStatus::all()
         .iter()
-        .map(|(_, count)| *count)
-        .max()
-        .unwrap_or(0);
+        .map(|status| format!("COALESCE(SUM({column} = ?), 0) AS {}", status.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
-    // Age of the scheduler's last sweep (the stamp is written at sweep
-    // start, so a hung sweep shows as aging). A negative clock skew clamps
-    // to zero rather than rendering "-3 s".
-    let server_cycle_age_secs =
-        match fumox_core::repo::meta_get(&mut *tx, fumox_core::repo::probe::meta::SERVER_CYCLE_KEY)
-            .await
-        {
-            Ok(Some(raw)) => raw.parse::<i64>().ok().map(|ts| (now - ts).max(0)),
-            Ok(None) => None,
-            Err(err) => return server_error(lang, &err),
-        };
-
-    if let Err(err) = tx.commit().await {
-        return server_error(lang, &err);
+/// Per-source health counters (single aggregate over the join table).
+/// The status literals travel as bound parameters: the SUM predicate set
+/// is generated from `ProxyStatus::all()`, so a new status joins the
+/// table instead of silently dropping out of the buckets.
+async fn source_health_split<'e, E>(executor: E) -> Result<Vec<SourceStatRow>, fumox_core::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let status_sums = status_sum_sql("p.status");
+    let mut query = sqlx::query_as::<_, SourceStatRow>(sqlx::AssertSqlSafe(format!(
+        "SELECT s.id, s.name, s.enabled,
+                {status_sums},
+                COUNT(DISTINCT p.id) AS total,
+                MIN(CASE WHEN p.status = ? THEN p.created_at END) AS oldest_ready_at
+         FROM sources s
+         LEFT JOIN proxy_source_links l ON l.source_id = s.id
+         LEFT JOIN proxies p ON p.id = l.proxy_id
+         GROUP BY s.id
+         ORDER BY alive DESC, total DESC, s.name COLLATE NOCASE",
+    )));
+    for status in ProxyStatus::all() {
+        query = query.bind(status.as_str());
     }
-
-    render_html(
-        lang.clone(),
-        &DashboardTemplate {
-            lang,
-            langs: state.locales.choices().to_vec(),
-            theme,
-            active: "dashboard",
-            csrf: state.csrf_for(&headers),
-            sources_total: src_total,
-            sources_enabled: src_enabled,
-            sources_with_errors: src_errors,
-            profiles_total,
-            proxy_counts,
-            fetch_total_24h,
-            fetch_ok_24h,
-            server_cycle_age_secs,
-            recent_errors,
-            sources,
-            top_alive,
-            schemes,
-            countries,
-            latency_min,
-            latency_avg,
-            latency_median,
-            probes_total_24h,
-            probes_ok_24h,
-            unprobeable: aggregates.unprobeable,
-            quarantine_second_chance: aggregates.quarantine_second_chance,
-            in_quarantine: aggregates.in_quarantine,
-            never_checked: aggregates.never_checked,
-            ingest_days,
-            ingest_max,
-            top_n,
-            top_failures,
-        },
-        StatusCode::OK,
-    )
+    Ok(query
+        .bind(ProxyStatus::Ready.as_str())
+        .fetch_all(executor)
+        .await?)
 }
 
 /// Grouped health counters per scheme, largest bucket first (`scheme` is
@@ -463,20 +561,19 @@ async fn scheme_split<'e, E>(executor: E) -> Result<Vec<SchemeSplitRow>, fumox_c
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    Ok(sqlx::query_as::<_, SchemeSplitRow>(
+    let status_sums = status_sum_sql("status");
+    let mut query = sqlx::query_as::<_, SchemeSplitRow>(sqlx::AssertSqlSafe(format!(
         "SELECT scheme AS value,
-                COALESCE(SUM(status = 'alive'), 0)     AS alive,
-                COALESCE(SUM(status = 'ready'), 0)     AS ready,
-                COALESCE(SUM(status = 'quarantine'), 0) AS quarantine,
-                COALESCE(SUM(status = 'unknown'), 0)   AS unknown,
-                COALESCE(SUM(status = 'removed'), 0)   AS removed,
-                COUNT(*)                               AS total
+                {status_sums},
+                COUNT(*) AS total
          FROM proxies
          GROUP BY scheme
          ORDER BY total DESC, value ASC",
-    )
-    .fetch_all(executor)
-    .await?)
+    )));
+    for status in ProxyStatus::all() {
+        query = query.bind(status.as_str());
+    }
+    Ok(query.fetch_all(executor).await?)
 }
 
 /// Grouped health counters per country, largest bucket first; proxies
@@ -490,22 +587,20 @@ async fn country_split<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    Ok(sqlx::query_as::<_, CountrySplitRow>(
+    let status_sums = status_sum_sql("status");
+    let mut query = sqlx::query_as::<_, CountrySplitRow>(sqlx::AssertSqlSafe(format!(
         "SELECT geo_country AS value,
-                COALESCE(SUM(status = 'alive'), 0)     AS alive,
-                COALESCE(SUM(status = 'ready'), 0)     AS ready,
-                COALESCE(SUM(status = 'quarantine'), 0) AS quarantine,
-                COALESCE(SUM(status = 'unknown'), 0)   AS unknown,
-                COALESCE(SUM(status = 'removed'), 0)   AS removed,
-                COUNT(*)                               AS total
+                {status_sums},
+                COUNT(*) AS total
          FROM proxies
          GROUP BY geo_country
          ORDER BY total DESC, value IS NULL, value ASC
          LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_all(executor)
-    .await?)
+    )));
+    for status in ProxyStatus::all() {
+        query = query.bind(status.as_str());
+    }
+    Ok(query.bind(limit).fetch_all(executor).await?)
 }
 
 /// Human-readable byte size for fetch logs (units follow the UI language).
@@ -527,6 +622,16 @@ pub fn fmt_bytes(lang: &Lang, bytes: i64) -> String {
     } else {
         format!("{value:.1} {}", units[unit])
     }
+}
+
+/// A byte count that may not be there, as the cards render it: the
+/// formatted size, or the neutral `common.na` placeholder for a reading
+/// the row does not carry. One definition for every card and fragment,
+/// so the empty state cannot drift between them.
+pub(super) fn fmt_opt_bytes(lang: &Lang, bytes: Option<i64>) -> String {
+    bytes
+        .map(|bytes| fmt_bytes(lang, bytes))
+        .unwrap_or_else(|| lang.t("common.na").to_string())
 }
 
 /// The tail every masked secret ends with. It marks a value as a mask,
@@ -554,16 +659,82 @@ pub fn flag_for(country: &Option<String>) -> String {
         .unwrap_or_default()
 }
 
-/// Standard 500 for unexpected DB failures.
-pub fn server_error(lang: Lang, err: &impl std::fmt::Display) -> Response {
-    tracing::error!(error = %err, "admin handler failed");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        format!("{}\n", lang.t("err.internal")),
-    )
-        .into_response()
+/// Short correlation id of one admin 500: 8 hex characters, enough to
+/// grep the log for the exact failure behind a message the operator
+/// saw, and to tell two failures apart.
+fn error_id() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+    // Sub-second clock plus a process-wide sequence (mixed with a fixed
+    // odd constant, so two ids never collide by cancellation): no crypto
+    // is wanted here, only uniqueness within the deployment's log.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u32, |d| d.subsec_nanos());
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{:08x}", nanos ^ seq.wrapping_mul(0x9E37_79B9))
 }
+
+/// Standard 500 for unexpected failures. `ctx` names the read or write
+/// that failed, so the log line says which query broke without the
+/// reader reverse-engineering the call stack, and `error_id` ties the
+/// line to the response the operator saw. The shape follows the client:
+/// an HTMX request keeps the 500 (htmx does not swap error bodies, so
+/// the page survives) with the failure delivered as an error toast
+/// through `HX-Trigger`; a plain browser gets the error page in the
+/// common layout, with the correlation id and a way back to the panel.
+pub fn server_error(
+    state: &AdminState,
+    headers: &HeaderMap,
+    ctx: &str,
+    err: &impl std::fmt::Display,
+) -> Response {
+    let lang = state.locales.lang_from_headers(headers);
+    let id = error_id();
+    tracing::error!(error_id = %id, query = ctx, error = %err, "admin handler failed");
+    if is_htmx(headers) {
+        let message = lang.t("err.internal").to_string();
+        let mut response = (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            format!("{message}\n{}\n", lang.t("err.error_id").replace("{}", &id)),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert("HX-Trigger", toast_trigger("error", &message));
+        return response;
+    }
+    render_html(
+        lang.clone(),
+        "error.html",
+        &ErrorPage {
+            lang,
+            langs: state.locales.choices().to_vec(),
+            theme: theme::from_headers(headers),
+            active: "error",
+            csrf: state.csrf_for(headers),
+            error_id: id,
+        },
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+/// Error page in the common layout: what a plain browser gets instead of
+/// a bare text 500 (see [`server_error`]).
+#[derive(Template)]
+#[template(path = "error.html")]
+struct ErrorPage {
+    lang: Lang,
+    langs: Vec<(String, String)>,
+    theme: Theme,
+    active: &'static str,
+    csrf: String,
+    /// The correlation id the log line carries (see [`error_id`]).
+    error_id: String,
+}
+
+impl_i18n!(ErrorPage);
 
 /// Why a submitted form could not be turned into a model.
 #[derive(Debug)]
@@ -581,15 +752,19 @@ pub(super) enum FormError {
 ///
 /// The two used to travel as one (`Option::None` for both), so a broken
 /// database answered "not found" and a client could not tell a deleted
-/// row from a failed query.
+/// row from a failed query. `not_found_key` doubles as the log context:
+/// it already names the entity the read was for.
 pub(super) fn row_error_response(
-    lang: Lang,
+    state: &AdminState,
+    headers: &HeaderMap,
     err: &fumox_core::Error,
     not_found_key: &str,
 ) -> Response {
     match err {
-        fumox_core::Error::NotFound(_) => not_found(lang, not_found_key),
-        other => server_error(lang, other),
+        fumox_core::Error::NotFound(_) => {
+            not_found(state.locales.lang_from_headers(headers), not_found_key)
+        }
+        other => server_error(state, headers, not_found_key, other),
     }
 }
 
@@ -843,10 +1018,18 @@ where
         errors.push(("slug".into(), message));
         return Some(slug_raw.to_string());
     }
-    if let Ok(Some(other)) = lookup.await
-        && other.row_id() != existing_id.unwrap_or_default()
-    {
-        errors.push(("slug".into(), lang.t("val.slug_taken").into()));
+    match lookup.await {
+        Ok(Some(other)) if other.row_id() != existing_id.unwrap_or_default() => {
+            errors.push(("slug".into(), lang.t("val.slug_taken").into()));
+        }
+        Ok(_) => {}
+        // A DB failure counts as "free" (the slug still fails the table's
+        // UNIQUE constraint at save time), but a persistently broken
+        // lookup must stay visible instead of silently disabling the
+        // check.
+        Err(err) => {
+            tracing::warn!(error = %err, "slug uniqueness lookup failed, skipping check");
+        }
     }
     Some(slug_raw.to_string())
 }
@@ -879,8 +1062,22 @@ pub(super) fn validate_ttl(seconds: i64, lang: &Lang) -> Result<(), String> {
     if (caps::TTL_MIN..=caps::TTL_MAX).contains(&seconds) {
         Ok(())
     } else {
-        Err(lang.t("val.ttl_range").into())
+        Err(ttl_range_message(lang))
     }
+}
+
+/// The localized TTL-range message with the actual bounds substituted:
+/// the numbers live next to [`caps::TTL_MIN`] / [`caps::TTL_MAX`], the
+/// catalogs carry only `{min}` / `{max}` placeholders, so a cap change
+/// cannot leave a stale range in the error text.
+pub(super) fn ttl_range_message(lang: &Lang) -> String {
+    lang.t_named(
+        "val.ttl_range",
+        &[
+            ("min", caps::TTL_MIN.to_string()),
+            ("max", caps::TTL_MAX.to_string()),
+        ],
+    )
 }
 
 /// Validate a slug's format (the uniqueness check is per table and stays
@@ -955,8 +1152,10 @@ pub(super) fn validate_header_map(
 }
 
 /// Validate a country allowlist and return it normalized (uppercase,
-/// without repeats): at most [`caps::COUNTRIES`] codes, each two ASCII
-/// letters.
+/// without repeats): at most [`caps::COUNTRIES`] codes, each parsed by
+/// the shared [`fumox_core::models::CountryCode`] rule (exactly two ASCII
+/// letters), so a code the forms accept cannot be refused by the import
+/// path or the cleanup forms, and the other way round.
 pub(super) fn validate_countries(countries: &[String], lang: &Lang) -> Result<Vec<String>, String> {
     let mut normalized: Vec<String> = Vec::with_capacity(countries.len());
     for code in countries {
@@ -964,10 +1163,10 @@ pub(super) fn validate_countries(countries: &[String], lang: &Lang) -> Result<Ve
         if code.is_empty() {
             continue;
         }
-        let upper = code.to_ascii_uppercase();
-        if upper.len() != 2 || !upper.chars().all(|c| c.is_ascii_alphabetic()) {
+        let Some(upper) = fumox_core::models::CountryCode::parse(code) else {
             return Err(lang.t("val.country_format").replace("{}", code));
-        }
+        };
+        let upper = upper.as_str().to_string();
         if !normalized.contains(&upper) {
             normalized.push(upper);
         }
@@ -1009,6 +1208,8 @@ fn pipeline_from_form(
     lang: &Lang,
     errors: &mut Vec<(String, String)>,
 ) -> Option<serde_json::Value> {
+    // The last value of a repeated key wins — the same semantics as
+    // `FormMap`.
     let get = |key: &str| -> String {
         form.iter()
             .rev()
@@ -1017,69 +1218,36 @@ fn pipeline_from_form(
             .unwrap_or_default()
     };
     if get("pipeline_mode") == "builder" {
-        let generated = BuilderState::from_form(form).emit();
-        match generated {
-            None => None,
-            Some(emitted) => {
-                // The field issues name the input to fix, the validator
-                // reads the document without the values the typed schema
-                // could not hold: one unreadable value must not mask the
-                // problems in the rest of the pipeline.
-                let mut issues = emitted.issues().to_vec();
-                if let Err(found) = CompiledPipeline::from_json(Some(emitted.readable())) {
-                    issues.extend(found);
-                }
-                if !issues.is_empty() {
-                    for issue in issues {
-                        errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
-                    }
-                    return None;
-                }
-                let value = emitted.document();
-                // Same cap as raw mode: the generated JSON is stored
-                // verbatim and re-rendered into every edit form, so a
-                // form with thousands of widget rows must not exceed
-                // the budget either.
-                if pipeline_size(value) > caps::PIPELINE_BYTES {
-                    errors.push((
-                        "pipeline".into(),
-                        lang.t("val.field_too_long")
-                            .replace("{}", &caps::PIPELINE_BYTES.to_string()),
-                    ));
-                    None
-                } else {
-                    Some(value.clone())
-                }
-            }
-        }
+        let emitted = BuilderState::from_form(form).emit()?;
+        // The field issues name the input to fix, the validator reads the
+        // document without the values the typed schema could not hold:
+        // one unreadable value must not mask the problems in the rest of
+        // the pipeline.
+        let issues = emitted.issues().to_vec();
+        // The builder carries its own wording of the oversize message:
+        // the fix is to drop widget rows, not to shorten a text field.
+        pipeline_document(
+            emitted.document(),
+            emitted.readable(),
+            issues,
+            lang,
+            errors,
+            "val.pipeline_builder_too_long",
+        )
     } else {
         let pipeline_raw = get("pipeline");
         if pipeline_raw.trim().is_empty() {
             None
         } else {
             match serde_json::from_str::<serde_json::Value>(&pipeline_raw) {
-                // The cap is measured on the compact JSON, the same
-                // measure the import path applies: the text field holds
-                // the pretty rendering of the document, and a pretty
-                // document of an accepted size would be refused by the
-                // form on every later save if the two measures differed.
-                Ok(value) if pipeline_size(&value) > caps::PIPELINE_BYTES => {
-                    errors.push((
-                        "pipeline".into(),
-                        lang.t("val.pipeline_too_long")
-                            .replace("{}", &caps::PIPELINE_BYTES.to_string()),
-                    ));
-                    None
-                }
-                Ok(value) => match CompiledPipeline::from_json(Some(&value)) {
-                    Ok(_) => Some(value),
-                    Err(issues) => {
-                        for issue in issues {
-                            errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
-                        }
-                        None
-                    }
-                },
+                Ok(value) => pipeline_document(
+                    &value,
+                    &value,
+                    Vec::new(),
+                    lang,
+                    errors,
+                    "val.pipeline_too_long",
+                ),
                 Err(err) => {
                     errors.push((
                         "pipeline".into(),
@@ -1090,6 +1258,60 @@ fn pipeline_from_form(
             }
         }
     }
+}
+
+/// The tail both form modes share: the cap is measured on the compact
+/// JSON first — the stored form, the same measure the import path
+/// applies, so a document of an accepted size is not refused again on
+/// every later save — and an oversized document is refused before the
+/// validator reads it, symmetric in both modes. Then the document is
+/// compiled and every issue lands on the `pipeline` field. `readable`
+/// is what the validator reads (the builder strips the values its typed
+/// schema cannot hold); `issues` carries the field issues collected
+/// before the compile pass; `too_long_key` is the mode's own wording of
+/// the oversize message.
+fn pipeline_document(
+    value: &serde_json::Value,
+    readable: &serde_json::Value,
+    issues: Vec<PipelineIssue>,
+    lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+    too_long_key: &str,
+) -> Option<serde_json::Value> {
+    if pipeline_size(value) > caps::PIPELINE_BYTES {
+        errors.push((
+            "pipeline".into(),
+            lang.t(too_long_key)
+                .replace("{}", &caps::PIPELINE_BYTES.to_string()),
+        ));
+        return None;
+    }
+    let mut issues = issues;
+    if let Err(found) = CompiledPipeline::from_json(Some(readable)) {
+        issues.extend(found);
+    }
+    if !issues.is_empty() {
+        for issue in issues {
+            errors.push(("pipeline".into(), lang.t_args(issue.key, &issue.args)));
+        }
+        return None;
+    }
+    Some(value.clone())
+}
+
+/// Render a typed URL problem in the panel language. The fetcher layer
+/// returns [`fetcher::UrlProblem`] variants and knows no catalog keys;
+/// this is the only place that maps them onto the `val.url_*` section of
+/// the locales (the source form and the import validation render it).
+fn url_problem_message(lang: &Lang, problem: &fetcher::UrlProblem) -> String {
+    let (key, args): (&'static str, Vec<String>) = match problem {
+        fetcher::UrlProblem::TooLong(limit) => ("val.url_too_long", vec![limit.to_string()]),
+        fetcher::UrlProblem::Invalid(message) => ("val.url_invalid", vec![message.clone()]),
+        fetcher::UrlProblem::Scheme(scheme) => ("val.url_scheme", vec![scheme.clone()]),
+        fetcher::UrlProblem::NoHost => ("val.url_no_host", Vec::new()),
+        fetcher::UrlProblem::Ssrf { reason, .. } => ("val.url_ssrf", vec![reason.clone()]),
+    };
+    lang.t_args(key, &args)
 }
 
 /// Clamp a requested page size into the allowed range.
@@ -1108,19 +1330,35 @@ pub fn page_offset(page: i64, per_page: i64) -> i64 {
     page.saturating_sub(1).saturating_mul(per_page)
 }
 
-/// Build the pagination context: `(page number, is current)` pairs to
-/// render, with gaps encoded as `(0, false)` sentinel rows the templates
-/// print as `…`. Templates iterate without any arithmetic of their own.
+/// One element of the shared pagination strip ([`_pagination.html`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageLink {
+    /// The page the element leads to. For a gap marker this is the first
+    /// page the window hides: the dots are a link to it, so a page the
+    /// window skips is one click away, not unreachable.
+    pub page: i64,
+    /// Whether the element is the page the user is on (a span with
+    /// `aria-current`, not a link).
+    pub current: bool,
+    /// Whether the element is a gap marker (`…`) between two runs of
+    /// page numbers.
+    pub gap: bool,
+}
+
+/// Build the pagination context: the [`PageLink`] elements to render.
+/// Templates iterate without any arithmetic of their own.
 ///
 /// The window is first/last plus ±2 around the current page, so the render
 /// cost is bounded (~9 links) no matter how large the table is: with a
 /// million-row `fetch_log` and `per_page=1` the old `1..=pages` loop
 /// emitted a million `<a>` tags per request.
-pub fn pagination_pages(page: i64, total: i64, per_page: i64) -> Vec<(i64, bool)> {
+pub fn pagination_pages(page: i64, total: i64, per_page: i64) -> Vec<PageLink> {
+    // Callers pass a clamped size (`clamp_limit`), so the divisor is at
+    // least 1; saturating keeps the sum from overflowing on a huge COUNT.
     let per_page = per_page.max(1);
     // Stable ceiling division (i64::div_ceil is not stable on this
     // toolchain); `total` is a COUNT and non-negative.
-    let pages = (total.max(0) + per_page - 1) / per_page.max(1);
+    let pages = total.max(0).saturating_add(per_page - 1) / per_page;
     let pages = pages.max(1);
     let current = page.clamp(1, pages);
     const SPAN: i64 = 2;
@@ -1138,15 +1376,23 @@ pub fn pagination_pages(page: i64, total: i64, per_page: i64) -> Vec<(i64, bool)
     push(pages, &mut wanted);
     wanted.sort_unstable();
 
-    let mut out: Vec<(i64, bool)> = Vec::with_capacity(wanted.len() * 2);
+    let mut out: Vec<PageLink> = Vec::with_capacity(wanted.len() * 2);
     let mut previous: Option<i64> = None;
     for p in wanted {
         if let Some(prev) = previous
             && p > prev + 1
         {
-            out.push((0, false)); // gap marker
+            out.push(PageLink {
+                page: prev + 1,
+                current: false,
+                gap: true,
+            });
         }
-        out.push((p, p == current));
+        out.push(PageLink {
+            page: p,
+            current: p == current,
+            gap: false,
+        });
         previous = Some(p);
     }
     out
@@ -1265,25 +1511,110 @@ mod tests {
         assert_eq!(page_offset(i64::MIN, MAX_PAGE_SIZE), i64::MIN);
     }
 
+    /// The dashboard's percent/bar arithmetic at the boundaries: zero
+    /// whole, and the 1%-floor that keeps a non-zero bar visible while
+    /// zero counts stay zero.
+    #[test]
+    fn pct_and_bar_width_hold_at_the_boundaries() {
+        assert_eq!(pct_of(1, 0), 0);
+        assert_eq!(pct_of(1, 4), 25);
+        assert_eq!(bar_width_of(1, 100), 1);
+        assert_eq!(bar_width_of(0, 100), 0);
+        assert_eq!(bar_width_of(100, 0), 0);
+    }
+
+    /// The ingest series is seven pairs oldest-first, contiguous by day;
+    /// a day without creations is zero, not skipped, and the bar scale
+    /// takes the largest value of the series.
+    #[test]
+    fn ingest_days_are_oldest_first_and_zero_filled() {
+        let now = 10 * 86_400 + 3_600; // mid of the last day
+        let today = 10 * 86_400;
+        // Rows for today and two days ago; yesterday has no row at all.
+        let rows = [
+            IngestDayRow {
+                day: today - 2 * 86_400,
+                created: 5,
+            },
+            IngestDayRow {
+                day: today,
+                created: 9,
+            },
+        ];
+        let days = fill_ingest_days(&rows, now);
+        assert_eq!(days.len(), 7);
+        // Oldest first, one calendar day per pair.
+        assert_eq!(days[0].0, today - 6 * 86_400);
+        assert_eq!(days[6].0, today);
+        for pair in days.windows(2) {
+            assert_eq!(pair[1].0, pair[0].0 + 86_400);
+        }
+        // The skipped day is zero; the present days carry their counts.
+        assert_eq!(days[4], (today - 2 * 86_400, 5));
+        assert_eq!(days[5], (today - 86_400, 0));
+        assert_eq!(days[6], (today, 9));
+        // The bar scale is the maximum of the series.
+        let ingest_max = days.iter().map(|(_, count)| *count).max().unwrap_or(0);
+        assert_eq!(ingest_max, 9);
+    }
+
     /// The pagination window is bounded no matter how many pages the table
     /// has: a million-row `fetch_log` at `per_page=1` used to render a
     /// million links per request.
     #[test]
     fn pagination_pages_render_a_bounded_window() {
         // Deep inside a huge table: first, current±2, last, with gaps.
+        // A gap's `page` is the first page the window hides (the dots
+        // are a link to it).
         let window = pagination_pages(500_000, 1_000_000, 1);
         assert_eq!(
             window,
             vec![
-                (1, false),
-                (0, false), // gap
-                (499_998, false),
-                (499_999, false),
-                (500_000, true),
-                (500_001, false),
-                (500_002, false),
-                (0, false), // gap
-                (1_000_000, false),
+                PageLink {
+                    page: 1,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 2,
+                    current: false,
+                    gap: true
+                },
+                PageLink {
+                    page: 499_998,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 499_999,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 500_000,
+                    current: true,
+                    gap: false
+                },
+                PageLink {
+                    page: 500_001,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 500_002,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 500_003,
+                    current: false,
+                    gap: true
+                },
+                PageLink {
+                    page: 1_000_000,
+                    current: false,
+                    gap: false
+                },
             ]
         );
         // The render is bounded: ~9 elements for any page count.
@@ -1295,13 +1626,41 @@ mod tests {
         assert_eq!(
             window,
             vec![
-                (1, false),
-                (2, false),
-                (3, true),
-                (4, false),
-                (5, false),
-                (0, false), // gap before the last page
-                (10, false),
+                PageLink {
+                    page: 1,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 2,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 3,
+                    current: true,
+                    gap: false
+                },
+                PageLink {
+                    page: 4,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 5,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 6,
+                    current: false,
+                    gap: true
+                }, // before the last page
+                PageLink {
+                    page: 10,
+                    current: false,
+                    gap: false
+                },
             ]
         );
 
@@ -1309,15 +1668,72 @@ mod tests {
         let window = pagination_pages(4, 50, 10);
         assert_eq!(
             window,
-            vec![(1, false), (2, false), (3, false), (4, true), (5, false)]
+            vec![
+                PageLink {
+                    page: 1,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 2,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 3,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 4,
+                    current: true,
+                    gap: false
+                },
+                PageLink {
+                    page: 5,
+                    current: false,
+                    gap: false
+                },
+            ]
         );
 
         // A single page renders nothing (the templates check len > 1).
-        assert_eq!(pagination_pages(1, 7, 50), vec![(1, true)]);
+        assert_eq!(
+            pagination_pages(1, 7, 50),
+            vec![PageLink {
+                page: 1,
+                current: true,
+                gap: false
+            }]
+        );
         // A page beyond the end clamps to the last page; the window then
         // covers everything up to it, no gap needed for four pages.
         let window = pagination_pages(i64::MAX, 40, 10);
-        assert_eq!(window, vec![(1, false), (2, false), (3, false), (4, true)]);
+        assert_eq!(
+            window,
+            vec![
+                PageLink {
+                    page: 1,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 2,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 3,
+                    current: false,
+                    gap: false
+                },
+                PageLink {
+                    page: 4,
+                    current: true,
+                    gap: false
+                },
+            ]
+        );
     }
 
     /// A `HashMap` keeps only the last value of a repeating key, which broke
@@ -1473,6 +1889,26 @@ mod tests {
             errors.is_empty(),
             "the stale textarea must be ignored: {errors:?}"
         );
+
+        // Enough rename rows to push the generated compact JSON past the
+        // cap: the document is refused with the builder's own wording of
+        // the limit (the fix is to drop widget rows), like the raw mode
+        // refuses an oversized textarea.
+        let mut form: Vec<(String, String)> =
+            vec![("pipeline_mode".to_string(), "builder".to_string())];
+        for i in 0..256usize {
+            form.push((format!("ped_rename_{i}_match"), "x".repeat(300)));
+            form.push((format!("ped_rename_{i}_replace"), "y".to_string()));
+            form.push((format!("ped_rename_{i}_target"), "name".to_string()));
+        }
+        let mut errors = Vec::new();
+        assert_eq!(pipeline_from_form(&form, &lang, &mut errors), None);
+        assert!(
+            errors
+                .iter()
+                .any(|(field, message)| field == "pipeline" && message.contains("65536")),
+            "{errors:?}"
+        );
     }
 
     /// A mistyped cap is reported from the field that holds it, and the
@@ -1509,6 +1945,65 @@ mod tests {
         assert!(SLUG_RE.is_match(&"a".repeat(64)));
     }
 
+    /// The uniqueness half of the shared slug validation, against a stub
+    /// lookup: the row found is free when it is the row being edited,
+    /// taken when it belongs to another row, and a failed lookup counts
+    /// as free (the table's UNIQUE constraint still holds at save time).
+    #[tokio::test]
+    async fn validate_slug_judges_uniqueness_from_the_lookup_row() {
+        struct Row(&'static str);
+        impl RowId for Row {
+            fn row_id(&self) -> &str {
+                self.0
+            }
+        }
+        let found =
+            |row: Option<Row>| std::future::ready::<fumox_core::Result<Option<Row>>>(Ok(row));
+        let lang = test_lang();
+
+        // The row found is the row being edited: no error.
+        let mut errors = Vec::new();
+        let slug = validate_slug(
+            "same",
+            Some("row-1"),
+            &lang,
+            &mut errors,
+            found(Some(Row("row-1"))),
+        )
+        .await;
+        assert_eq!(slug, Some("same".to_string()));
+        assert!(errors.is_empty(), "{errors:?}");
+
+        // The row found belongs to another row: the slug is taken.
+        let mut errors = Vec::new();
+        validate_slug(
+            "taken",
+            Some("row-1"),
+            &lang,
+            &mut errors,
+            found(Some(Row("row-2"))),
+        )
+        .await;
+        assert_eq!(
+            errors,
+            vec![("slug".to_string(), lang.t("val.slug_taken").to_string())]
+        );
+
+        // The lookup itself failed: no error, the save re-checks.
+        let mut errors = Vec::new();
+        validate_slug(
+            "any",
+            Some("row-1"),
+            &lang,
+            &mut errors,
+            std::future::ready::<fumox_core::Result<Option<Row>>>(Err(fumox_core::Error::Config(
+                "db down".into(),
+            ))),
+        )
+        .await;
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
     /// The credential mask is a fixed shape: three leading characters
     /// plus a fixed tail, a short value hidden entirely. The prefix is
     /// counted in characters, so a non-ASCII secret keeps three of them
@@ -1522,5 +2017,152 @@ mod tests {
         assert_eq!(mask_secret("ключ"), "клю…••••");
         assert_eq!(mask_secret("日本語のトークン"), "日本語…••••");
         assert_eq!(mask_secret("鍵"), "••••");
+    }
+
+    /// The split aggregates bucket every proxy status: the per-status SUM
+    /// predicates are generated from `ProxyStatus::all()`, so a row's
+    /// buckets always sum to its total. A status missing from the
+    /// predicates (or a row struct missing the column) breaks the sum
+    /// here instead of silently disappearing from the dashboard.
+    #[tokio::test]
+    async fn the_dashboard_splits_bucket_every_status() {
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig::default(),
+            Default::default(),
+        )
+        .await;
+        let pool = state.pool.clone();
+
+        // One proxy of every status, split over two schemes and two
+        // countries, all linked to one source (the per-source table joins
+        // through the links).
+        sqlx::query(
+            "INSERT INTO sources (id, name, url, enabled, created_at, updated_at)
+             VALUES ('src-1', 'one', 'https://one.example/list', 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (index, status) in ProxyStatus::all().iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, geo_country, created_at, updated_at)
+                 VALUES (?, ?, ?, 'h.example.com', 443, 'c', ?, ?, 1, 1)",
+            )
+            .bind(format!("fp-{index}"))
+            .bind(if index % 2 == 0 { "vless" } else { "ss" })
+            .bind(format!("p-{index}"))
+            .bind(status.as_str())
+            .bind(if index % 2 == 0 { "DE" } else { "FR" })
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
+                 VALUES ((SELECT id FROM proxies WHERE fingerprint = ?), 'src-1', 1)",
+            )
+            .bind(format!("fp-{index}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let scheme_bucket = |row: &SchemeSplitRow, status: &str| match status {
+            "unknown" => row.unknown,
+            "alive" => row.alive,
+            "ready" => row.ready,
+            "quarantine" => row.quarantine,
+            "removed" => row.removed,
+            other => unreachable!("every ProxyStatus needs a bucket column: {other}"),
+        };
+        let country_bucket = |row: &CountrySplitRow, status: &str| match status {
+            "unknown" => row.unknown,
+            "alive" => row.alive,
+            "ready" => row.ready,
+            "quarantine" => row.quarantine,
+            "removed" => row.removed,
+            other => unreachable!("every ProxyStatus needs a bucket column: {other}"),
+        };
+        let source_bucket = |row: &SourceStatRow, status: &str| match status {
+            "unknown" => row.unknown,
+            "alive" => row.alive,
+            "ready" => row.ready,
+            "quarantine" => row.quarantine,
+            "removed" => row.removed,
+            other => unreachable!("every ProxyStatus needs a bucket column: {other}"),
+        };
+
+        let schemes = scheme_split(&pool).await.unwrap();
+        for row in &schemes {
+            let bucketed: i64 = ProxyStatus::all()
+                .iter()
+                .map(|status| scheme_bucket(row, status.as_str()))
+                .sum();
+            assert_eq!(
+                bucketed, row.total,
+                "scheme {} must bucket every proxy",
+                row.value
+            );
+        }
+        let countries = country_split(&pool, i64::MAX).await.unwrap();
+        for row in &countries {
+            let bucketed: i64 = ProxyStatus::all()
+                .iter()
+                .map(|status| country_bucket(row, status.as_str()))
+                .sum();
+            assert_eq!(
+                bucketed, row.total,
+                "country {:?} must bucket every proxy",
+                row.value
+            );
+        }
+        let sources = source_health_split(&pool).await.unwrap();
+        assert_eq!(sources.len(), 1);
+        for row in &sources {
+            let bucketed: i64 = ProxyStatus::all()
+                .iter()
+                .map(|status| source_bucket(row, status.as_str()))
+                .sum();
+            assert_eq!(
+                bucketed, row.total,
+                "source {} must bucket every proxy",
+                row.name
+            );
+            // The oldest-ready stamp rides the same bound parameters.
+            assert!(row.oldest_ready_at.is_some(), "{row:?}");
+        }
+        // One proxy per status: every bucket holds exactly one across
+        // the split rows.
+        for status in ProxyStatus::all() {
+            let counted: i64 = schemes
+                .iter()
+                .map(|row| scheme_bucket(row, status.as_str()))
+                .sum();
+            assert_eq!(
+                counted,
+                1,
+                "status {} must land in a bucket",
+                status.as_str()
+            );
+        }
+    }
+
+    /// The dashboard's SQL carries no status string literals: every
+    /// status value is generated from `ProxyStatus::all()` and bound as a
+    /// parameter, so a new status cannot be missed by a query the enum
+    /// does not know about.
+    #[test]
+    fn the_dashboard_sql_carries_no_status_literals() {
+        let source = include_str!("mod.rs");
+        for status in ProxyStatus::all() {
+            for predicate in [
+                format!("status = '{}'", status.as_str()),
+                format!("status IN ('{}'", status.as_str()),
+            ] {
+                assert!(
+                    !source.contains(&predicate),
+                    "the dashboard SQL must bind {predicate:?}, not inline it"
+                );
+            }
+        }
     }
 }

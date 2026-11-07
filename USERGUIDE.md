@@ -591,7 +591,7 @@ All public endpoints live on the public listener (default port **8080**).
 | Endpoint                   | Description                                                                                                                                      |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `GET /sub/{id}`            | Merged subscription for a **profile**. `{id}` is the profile id or its slug.                                                                     |
-| `GET /src/{id}`            | Parsed proxies of a **single source**. The health filter applies here too: only the live tiers `alive` and `ready` are served — never-probed (`unknown`), quarantined and removed proxies are left out even when the pipeline's health filter would have let them through. `{id}` is the source id or slug. |
+| `GET /src/{id}`            | Parsed proxies of a **single source**. The health filter applies here too: only the live tiers `alive` and `ready` are served — never-probed (`unknown`), quarantined and removed proxies are left out even when the pipeline's health filter would have let them through. `{id}` is the source id or slug. A source can carry its **own access token** (see below); a profile's token does not extend to `/src`. |
 | `GET /export/alive/{token}` | Every proxy in the `alive` tier as a plain `url_list` — that tier exactly, not "every proxy that is alive": a `ready` proxy belongs to the other tier and is served by `/export/ready`. `{token}` is the capability token of the export links. |
 | `GET /export/ready/{token}` | The `ready` tier only (proxies whose latest T2 tunnel check succeeded, hysteria2 included). Same token, same shape.                                  |
 | `GET /healthz`             | Liveness probe, returns `ok`.                                                                                                                    |
@@ -671,6 +671,13 @@ the secret. Consequences worth knowing:
 - a profile that was protected before the upgrade keeps working: rows still
   holding a plain token are re-hashed on the next start, and the clients
   that already know the token are unaffected.
+
+A **source** can be protected the same way: the source form carries its own
+access token, and then `GET /src/{id}` requires it (`?token=…` or
+`Authorization: Bearer`). The two tokens are independent — the profile
+access token guards `/sub` only and does **not** extend to `/src`; a source
+without its own token serves its data publicly, whatever its profiles
+require.
 
 ### Output formats
 
@@ -1080,7 +1087,7 @@ and the first is the one to prefer:
 | `auth_fail_rate_limit` | `"30/min"`       | Per-IP limit on failed access-token checks (403); exhausted → `429` until the window resets                                                                                                                      |
 | `trust_proxy_ips`      | `[]`             | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the per-IP rate-limit and admin URL scheme. Empty = never trust forwarded headers (direct-connection default). Set this when behind nginx |
 | `trust_proxy_header`   | `"none"`         | Which forwarding header the trusted proxy writes: `"none"` (read no forwarding header), `"xff"` (`X-Forwarded-For` / `-Proto` / `-Host`), `"forwarded"` (RFC 7239 `Forwarded`), `"both"`. Only the declared family is read, so a client that forges one cannot pick its own rate-limit bucket |
-| `allowed_hosts`        | `[]`             | Hostnames / IPs allowed to reach the public listener, including the `/export/alive/{token}` and `/export/ready/{token}` endpoints. Empty = accept any `Host` value. Set this when serving from a fixed domain name |
+| `allowed_hosts`        | `[]`             | Hostnames / IPs allowed to reach the public listener, including the `/export/alive/{token}` and `/export/ready/{token}` endpoints. Empty = accept any `Host` value. Set this when serving from a fixed domain name. An entry is a DNS name, an IPv4 literal or an IPv6 literal in brackets (`[::1]`); a port an entry spells (`example.com:443`) is ignored — the entry matches the host on any port, and the server logs a warning for such entries at startup. Entries are matched after the same canonicalization as the request's `Host` (lowercased, port stripped) |
 | `export_max_rows`      | `50000`          | Row ceiling of one `/export/alive/{token}` / `/export/ready/{token}` body, applied as a `LIMIT` in the query behind them. These two links have no per-source or per-profile cap of their own, so this is what keeps one public download from reading and shipping the whole tier; raise it when your tier is bigger. The cut takes the lowest ids and the `nodes count` header reports what the body really carries, while the admin tier counts stay uncapped, so a truncated export is visible as smaller than the tier; the response headers name the cut (`X-Fumox-Export-Truncated`) and the size of the tier (`X-Fumox-Export-Total`). `0` does not mean "unlimited": the value is clamped up to 1 row (a negative or zero `LIMIT` would otherwise read as unbounded in SQLite), so a body of `0` serves a single node. The body is cached for 30 s, so a status change can take up to 30 s to reach the link |
 
 ### `[database]` – SQLite
@@ -1147,7 +1154,7 @@ and the first is the one to prefer:
 | `secure_cookies`     | `false`            | Add `; Secure` to the session cookie; enable when the panel is reached through an HTTPS reverse proxy. Plain-HTTP deployments must keep it `false`: browsers silently drop `Secure` cookies on `http://`, which looks like a successful login (`admin logged in` in logs) followed by a permanent redirect to `/admin/login`. Note the split default: `config/app.toml` ships `false`, but `docker-compose.yml` defaults `FUMOX_ADMIN__SECURE_COOKIES` to `true` (presuming an HTTPS front), so a plain-HTTP compose deployment must set it to `false` in `.env` (env wins over the file). |
 | `trust_proxy_ips`    | `[]`               | CIDRs whose `X-Forwarded-For` / `Forwarded for=` headers are honored for the admin per-IP rate-limit and rendered URL scheme. Empty = never trust forwarded headers                   |
 | `trust_proxy_header` | `"none"`           | Which forwarding header the trusted proxy writes: `"none"` (read no forwarding header), `"xff"` (`X-Forwarded-For` / `-Proto` / `-Host`), `"forwarded"` (RFC 7239 `Forwarded`), `"both"`. Only the declared family is read |
-| `allowed_hosts`      | `[]`               | Hostnames / IPs allowed to reach the admin listener. A request whose `Host` is not on the list is refused with `400` on every panel route. Empty = accept any `Host` value. Set this when serving the admin from a fixed domain name (e.g. reverse-proxied to `fumox.local`) |
+| `allowed_hosts`      | `[]`               | Hostnames / IPs allowed to reach the admin listener. A request whose `Host` is not on the list is refused with `400` on every panel route. Empty = accept any `Host` value. Set this when serving the admin from a fixed domain name (e.g. reverse-proxied to `fumox.local`). Same entry forms as `[server].allowed_hosts`: a DNS name, an IPv4 literal or an IPv6 literal in brackets; a port an entry spells is ignored — the entry matches the host on any port, and a warning names such entries at startup |
 | `locales_dir`        | `"locales"`        | Directory with UI translation catalogs (`<code>.toml`)                                                                                                                               |
 
 ### `[probe]` – health-check daemon

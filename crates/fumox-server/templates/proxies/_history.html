@@ -1,12 +1,29 @@
-{#- Fragment: probe history of one proxy (last 20). Rendered both inside
-    the card (include) and standalone for the live hx-get refresh. -#}
+{#- Fragment: probe history of one proxy. Rendered both inside the card
+    (include) and standalone for the live hx-get refresh. -#}
 {% if probes.is_empty() %}
   <p class="muted">{{ self.t("px.no_probes") }}</p>
 {% else %}
+  {#- The counter replaces the "(last 20)" the title used to hardcode:
+      the row count is whatever the handler passed in, and the strip
+      cannot drift from the catalog text. -#}
+  <p class="muted small">{{ self.t_args("px.history_shown", &[probes.len().to_string()][..]) }}</p>
   <div class="table-scroll">
     <table class="data">
+      <caption class="visually-hidden">{{ self.t("px.history_title") }}</caption>
       <thead>
-        <tr><th>{{ self.t("common.time") }}</th><th>{{ self.t("common.result") }}</th><th>{{ self.t("common.latency") }}</th><th>{{ self.t("px.probe_kind") }}</th><th>{{ self.t("common.error") }}</th></tr>
+        <tr>
+          {#- The zone rides in the header: the server shows UTC, the
+              browser rewrites the cells into the local zone (the same
+              fact the per-cell tooltip carries, here it survives
+              without JavaScript). -#}
+          <th scope="col" title="{{ self.t("common.time_utc_hint") }}">{{ self.t("common.time_utc") }}</th>
+          <th scope="col">{{ self.t("common.result") }}</th>
+          <th scope="col">{{ self.t("common.latency") }}</th>
+          {#- The kinds decode in the tooltip of the column header (the
+              cells carry the localized labels themselves). -#}
+          <th scope="col" title="{{ self.t("px.kind_legend") }}">{{ self.t("px.probe_kind") }}</th>
+          <th scope="col">{{ self.t("common.error") }}</th>
+        </tr>
       </thead>
       <tbody>
         {% for probe in probes %}
@@ -21,7 +38,7 @@
               {% when None %}<span class="muted">–</span>
             {% endmatch %}
           </td>
-          <td class="mono small">{{ probe.probe_kind }}</td>
+          <td class="mono small">{{ self.kind_label(&probe.probe_kind) }}</td>
           <td class="small">
             {% match probe.error %}
               {% when Some with (message) %}{{ message }}

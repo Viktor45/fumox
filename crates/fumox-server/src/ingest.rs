@@ -15,10 +15,10 @@
 //! default) its rules detach the proxies they would have discarded, so a
 //! rule added later cannot be held off by still-alive rows.
 
-use crate::cache::Caches;
 use crate::fetcher::{FetchFailure, FetchedPayload, Fetcher};
+use crate::pipeline::{CompiledPipeline, PipelineIssue, asn_number};
 use fumox_core::db::DbPool;
-use fumox_core::geo::{GeoInfo, GeoResolver};
+use fumox_core::geo::{GEO_LOOKUP_CONCURRENCY, GeoResolver, HostGeo};
 use fumox_core::models::{ProxyEntry, Source};
 use fumox_core::repo::{fetch_log, probe, proxies, sources};
 
@@ -99,14 +99,12 @@ pub struct IngestSettings {
 /// at the start of its next cycle, newest first, so new servers get
 /// verified instead of waiting out the random sample.
 ///
-/// The `caches` handle stays in the signature for its callers (the
-/// scheduler hands one in; the invalidations happen at the call sites that
-/// know the outcome), and the freshness marker this function used to maintain
-/// in it now lives on the source row alone.
+/// Rendered outputs are invalidated by the *callers* (the scheduler drops
+/// the processed entries whose sources changed, see the outcome's
+/// `stats`), so this function takes no cache handle.
 pub async fn ingest_source(
     pool: &DbPool,
     fetcher: &Fetcher,
-    _caches: &Caches,
     geo: &GeoResolver,
     settings: IngestSettings,
     source: &Source,
@@ -118,13 +116,10 @@ pub async fn ingest_source(
     // scheduler re-reads every sweep, the admin *Refresh now* passes
     // `force`): no in-memory marker of our own to keep in step with the DB
     // stamp that `journal_success` writes. An unset or expired stamp means
-    // the payload must be fetched; the comparison mirrors `is_due` in the
-    // scheduler, of which this is the second, row-fresh guard.
-    if !force
-        && source
-            .last_fetched_at
-            .is_some_and(|fetched_at| now.saturating_sub(fetched_at) < source.cache_ttl_seconds)
-    {
+    // the payload must be fetched; the comparison is the same
+    // [`source_is_fresh`] predicate the scheduler's due check asks, this
+    // being the second, row-fresh guard.
+    if !force && source_is_fresh(now, source.last_fetched_at, source.cache_ttl_seconds) {
         tracing::debug!(source = %source.id, "raw snapshot still fresh; skipping fetch");
         return IngestOutcome::Ok {
             proxies_found: 0,
@@ -142,20 +137,21 @@ pub async fn ingest_source(
     // `fetch_log.duration_ms` and carried on the outcome for the caller's
     // logs and events.
     let fetch_started = std::time::Instant::now();
-    let payload = match fetcher
-        .fetch(
-            &source.url,
-            &source.headers.clone().unwrap_or_default(),
-            source.ip_family,
-        )
-        .await
-    {
-        Ok(payload) => payload,
-        Err(failure) => {
+    let fetched = match fetch_and_filter(fetcher, geo, source).await {
+        Ok(fetched) => fetched,
+        Err(FetchAndFilterError::Fetch(failure)) => {
             let duration_ms = elapsed_ms(fetch_started);
             journal_failure(pool, source, &failure, now, duration_ms).await;
             return IngestOutcome::FetchFailed {
                 failure,
+                duration_ms,
+            };
+        }
+        Err(FetchAndFilterError::Parse { payload, message }) => {
+            let duration_ms = elapsed_ms(fetch_started);
+            journal_parse_failure(pool, source, &payload, &message, now, duration_ms).await;
+            return IngestOutcome::ParseFailed {
+                message,
                 duration_ms,
             };
         }
@@ -168,114 +164,83 @@ pub async fn ingest_source(
     // after the reconcile): stamping it before that made a single parse or
     // DB failure suppress every non-forced re-fetch for a whole TTL while
     // the scheduler kept reporting successful ingests.
-
-    match parse_payload(source, &payload) {
-        Ok(filtered) => {
-            let recognised = filtered.recognized;
-            // The protocol allowlist already threw away part of the
-            // payload; the pipeline drop rules throw away more below.
-            // Both are counted, so the report adds up: recognized =
-            // dropped + kept.
-            let dropped_by_allowlist = recognised.saturating_sub(filtered.entries.len());
-            let geo_stamps = resolve_geo_stamps(geo, &filtered.entries, None).await;
-            // Drop rules (including ASN-targeted ones) run after ASN
-            // resolution, see [`apply_drop_rules`]. They run before the
-            // `removed_as_unknown` revival handoff so the revived set is
-            // the same one that survives drop.
-            let (entries_after_drop, geo_after_drop, dropped_by_pipeline) =
-                match apply_drop_rules(source, filtered.entries, &geo_stamps) {
-                    Ok(triple) => triple,
-                    Err(message) => {
-                        journal_parse_failure(pool, source, &payload, &message, now, duration_ms)
-                            .await;
-                        return IngestOutcome::ParseFailed {
-                            message,
-                            duration_ms,
-                        };
-                    }
-                };
-            let dropped = dropped_by_allowlist + dropped_by_pipeline;
-            let found = entries_after_drop.len();
-            // Alive-linger. `[ingest].drop_gate` decides whether a
-            // source's drop rules disable it, see
-            // [`fumox_core::ingest::IngestPolicy`].
-            let policy = fumox_core::ingest::IngestPolicy::refresh(
-                settings.drop_gate,
-                filtered.has_drop_rules,
-            );
-            match proxies::reconcile_source(
-                pool,
-                &source.id,
-                &entries_after_drop,
-                &geo_after_drop,
-                now,
-                policy,
-            )
-            .await
-            {
-                Ok(stats) => {
-                    // The database is now the content of this payload, so
-                    // `journal_success` stamps `last_fetched_at`, the
-                    // freshness marker the TTL short-circuit checks before
-                    // the next re-fetch.
-                    journal_success(pool, source, &payload, found, now, duration_ms).await;
-                    if dropped > 0 {
-                        tracing::info!(
+    let payload = fetched.payload;
+    let found = fetched.kept.len();
+    // Alive-linger. `[ingest].drop_gate` decides whether a source's drop
+    // rules disable it, see [`fumox_core::ingest::IngestPolicy`].
+    let policy =
+        fumox_core::ingest::IngestPolicy::refresh(settings.drop_gate, fetched.has_drop_rules);
+    match proxies::reconcile_source(
+        pool,
+        &source.id,
+        &fetched.kept,
+        &fetched.kept_geo,
+        now,
+        policy,
+    )
+    .await
+    {
+        Ok(stats) => {
+            // The database is now the content of this payload, so
+            // `journal_success` stamps `last_fetched_at`, the freshness
+            // marker the TTL short-circuit checks before the next
+            // re-fetch.
+            journal_success(pool, source, &payload, found, now, duration_ms).await;
+            if fetched.dropped > 0 {
+                tracing::info!(
+                    source = %source.id,
+                    recognised = fetched.recognized,
+                    dropped = fetched.dropped,
+                    kept = found,
+                    "the source's own filters discarded entries before reconcile"
+                );
+            }
+            // `[ingest].removed_as_unknown`: a removed proxy the feed
+            // still carries resets to the pristine `unknown` state and
+            // gets the same priority-queue handoff as a fresh insert.
+            // A failure is logged and never fails the ingest, the
+            // next refresh simply retries.
+            let mut queue_ids = stats.inserted_ids.clone();
+            if settings.removed_as_unknown {
+                let fps: Vec<String> = fetched.kept.iter().map(ProxyEntry::fingerprint).collect();
+                match proxies::revive_removed(pool, &fps, now).await {
+                    Ok(ids) => queue_ids.extend(ids),
+                    Err(err) => {
+                        tracing::warn!(
                             source = %source.id,
-                            recognised,
-                            dropped,
-                            kept = found,
-                            "the source's own filters discarded entries before reconcile"
-                        );
-                    }
-                    // `[ingest].removed_as_unknown`: a removed proxy the feed
-                    // still carries resets to the pristine `unknown` state and
-                    // gets the same priority-queue handoff as a fresh insert.
-                    // A failure is logged and never fails the ingest, the
-                    // next refresh simply retries.
-                    let mut queue_ids = stats.inserted_ids.clone();
-                    if settings.removed_as_unknown {
-                        let fps: Vec<String> = entries_after_drop
-                            .iter()
-                            .map(ProxyEntry::fingerprint)
-                            .collect();
-                        match proxies::revive_removed(pool, &fps, now).await {
-                            Ok(ids) => queue_ids.extend(ids),
-                            Err(err) => {
-                                tracing::warn!(error = %err, "removed-as-unknown revival failed")
-                            }
-                        }
-                    }
-                    enqueue_probe_requests(pool, &queue_ids, settings.refresh_check_limit, now)
-                        .await;
-                    IngestOutcome::Ok {
-                        proxies_found: found,
-                        dropped,
-                        stats,
-                        duration_ms: Some(duration_ms),
-                    }
-                }
-                Err(err) => {
-                    // The payload was fetched and parsed, but this
-                    // process could not store it. That is not an upstream
-                    // failure: the feed answered with HTTP 200, and
-                    // reporting it as a fetch error would send the
-                    // operator looking at the wrong side. It gets its own
-                    // error class and the real status of the response.
-                    let message = err.to_string();
-                    tracing::error!(error = %err, source = %source.id, "reconciliation failed");
-                    journal_storage_failure(pool, source, &payload, &message, now, duration_ms)
-                        .await;
-                    IngestOutcome::StorageFailed {
-                        message,
-                        duration_ms,
+                            fingerprints = fps.len(),
+                            error = %err,
+                            "removed-as-unknown revival failed"
+                        )
                     }
                 }
             }
+            enqueue_probe_requests(
+                pool,
+                &source.id,
+                &queue_ids,
+                settings.refresh_check_limit,
+                now,
+            )
+            .await;
+            IngestOutcome::Ok {
+                proxies_found: found,
+                dropped: fetched.dropped,
+                stats,
+                duration_ms: Some(duration_ms),
+            }
         }
-        Err(message) => {
-            journal_parse_failure(pool, source, &payload, &message, now, duration_ms).await;
-            IngestOutcome::ParseFailed {
+        Err(err) => {
+            // The payload was fetched and parsed, but this
+            // process could not store it. That is not an upstream
+            // failure: the feed answered with HTTP 200, and
+            // reporting it as a fetch error would send the
+            // operator looking at the wrong side. It gets its own
+            // error class and the real status of the response.
+            let message = err.to_string();
+            tracing::error!(error = %err, source = %source.id, "reconciliation failed");
+            journal_storage_failure(pool, source, &payload, &message, now, duration_ms).await;
+            IngestOutcome::StorageFailed {
                 message,
                 duration_ms,
             }
@@ -312,48 +277,20 @@ pub enum DryRunOutcome {
 }
 
 /// Fetch and parse a source without touching the database (dry run).
+///
+/// The pipeline runs through the same [`fetch_and_filter`] the real ingest
+/// uses, so the preview's counters are the real pass's counters by
+/// construction; the two paths differ only in what happens after —
+/// journaling and reconcile versus a preview sample.
 pub async fn dry_run_source(
     fetcher: &Fetcher,
     geo: &GeoResolver,
     source: &Source,
 ) -> DryRunOutcome {
-    let payload = match fetcher
-        .fetch(
-            &source.url,
-            &source.headers.clone().unwrap_or_default(),
-            source.ip_family,
-        )
-        .await
-    {
-        Ok(payload) => payload,
-        Err(failure) => return DryRunOutcome::FetchFailed { failure },
-    };
-    match parse_payload(source, &payload) {
-        Ok(filtered) => {
-            // Drop rules run after geo resolution so ASN-targeted rules
-            // (and any future geo-aware rules) get a fair preview; the
-            // resolver is async-and-cached so a re-fetch in dry-run adds
-            // at most one round-trip per unseen host.
-            let recognized = filtered.recognized;
-            let geo_stamps =
-                resolve_geo_stamps(geo, &filtered.entries, Some(DRY_RUN_GEO_LIMIT)).await;
-            let (kept_entries, _, _) = match apply_drop_rules(source, filtered.entries, &geo_stamps)
-            {
-                Ok(triple) => triple,
-                Err(message) => {
-                    return DryRunOutcome::ParseFailed {
-                        http_status: payload.http_status,
-                        message,
-                    };
-                }
-            };
-            // The protocol allowlist threw away part of the payload before
-            // the drop rules ran, and the rules threw away more. Both
-            // belong to the report: `dropped` is what the source's own
-            // filters discarded, so recognised = dropped + kept holds here
-            // exactly as it does in the real run.
-            let dropped = recognized.saturating_sub(kept_entries.len());
-            let sample = kept_entries
+    match fetch_and_filter(fetcher, geo, source).await {
+        Ok(fetched) => {
+            let sample = fetched
+                .kept
                 .iter()
                 .take(10)
                 .map(|entry| {
@@ -368,18 +305,108 @@ pub async fn dry_run_source(
                 })
                 .collect();
             DryRunOutcome::Ok {
-                http_status: payload.http_status,
-                bytes: payload.bytes,
-                proxies_found: recognized,
-                dropped,
+                http_status: fetched.payload.http_status,
+                bytes: fetched.payload.bytes,
+                proxies_found: fetched.recognized,
+                dropped: fetched.dropped,
                 sample,
             }
         }
-        Err(message) => DryRunOutcome::ParseFailed {
+        Err(FetchAndFilterError::Fetch(failure)) => DryRunOutcome::FetchFailed { failure },
+        Err(FetchAndFilterError::Parse { payload, message }) => DryRunOutcome::ParseFailed {
             http_status: payload.http_status,
             message,
         },
     }
+}
+
+/// Whether a source row's freshness stamp (`last_fetched_at`) still covers
+/// `now` under the source's TTL. The one freshness question both the
+/// scheduler's due check and the ingest's fetch short-circuit ask, kept in
+/// a single function so the two answers can never drift apart.
+pub(crate) fn source_is_fresh(now: i64, last_fetched_at: Option<i64>, ttl_seconds: i64) -> bool {
+    last_fetched_at.is_some_and(|fetched_at| now.saturating_sub(fetched_at) < ttl_seconds)
+}
+
+/// Everything a real ingest and a dry run do identically: the fetch, the
+/// decode/parse, the geo resolution over the whole payload and the drop
+/// rules. Both callers branch on the same outcome and differ only in what
+/// they do next — journaling and reconcile versus a preview sample — so
+/// their kept/dropped counters and recognized counts cannot drift apart.
+struct FetchedAndFiltered {
+    payload: FetchedPayload,
+    /// Recognised count before any filter (for logging / dry-run totals).
+    recognized: usize,
+    /// Whether the source's pipeline carries drop rules at all: gates the
+    /// alive-linger policy.
+    has_drop_rules: bool,
+    /// The entries that survived the protocol allowlist and the drop
+    /// rules, and the stamps that belong to exactly those entries (same
+    /// length, same order — reconcile pairs the two by index).
+    kept: Vec<ProxyEntry>,
+    kept_geo: Vec<Option<proxies::GeoStamp>>,
+    /// What the source's own filters discarded (protocol allowlist and
+    /// pipeline drop rules together): recognized = dropped + kept.len().
+    dropped: usize,
+}
+
+/// Why [`fetch_and_filter`] gave up: the fetch failed with a classified
+/// error, or the payload did not parse (the payload comes along so the
+/// caller journals the real status and size of the response).
+enum FetchAndFilterError {
+    Fetch(FetchFailure),
+    Parse {
+        payload: FetchedPayload,
+        message: String,
+    },
+}
+
+/// The shared fetch → decode → parse → geo → drop-rules pass behind
+/// [`ingest_source`] and [`dry_run_source`]. Geo resolution covers the
+/// whole payload in both paths: drop rules may target ASNs anywhere in the
+/// feed, so a truncated preview would count differently from the pass it
+/// previews.
+async fn fetch_and_filter(
+    fetcher: &Fetcher,
+    geo: &GeoResolver,
+    source: &Source,
+) -> Result<FetchedAndFiltered, FetchAndFilterError> {
+    let payload = fetcher
+        .fetch(
+            &source.url,
+            &source.headers.clone().unwrap_or_default(),
+            source.ip_family,
+        )
+        .await
+        .map_err(FetchAndFilterError::Fetch)?;
+    let filtered =
+        parse_payload(source, &payload).map_err(|message| FetchAndFilterError::Parse {
+            payload: payload.clone(),
+            message,
+        })?;
+    // Drop rules (including ASN-targeted ones) run after geo resolution,
+    // see [`apply_drop_rules`]. The resolver is async-and-cached so the
+    // lookups cost at most one round-trip per unseen host.
+    let geo_stamps = resolve_geo_stamps(geo, &filtered.entries, None).await;
+    let has_drop_rules = filtered.has_drop_rules();
+    let (kept, kept_geo, _) = apply_drop_rules(
+        filtered.pipeline.as_ref(),
+        filtered.entries,
+        &geo_stamps,
+        &source.id,
+    );
+    // The protocol allowlist threw away part of the payload before the
+    // drop rules ran, and the rules threw away more. Both belong to the
+    // report: recognized = dropped + kept holds in both paths.
+    let dropped = filtered.recognized.saturating_sub(kept.len());
+    Ok(FetchedAndFiltered {
+        payload,
+        recognized: filtered.recognized,
+        has_drop_rules,
+        kept,
+        kept_geo,
+        dropped,
+    })
 }
 
 /// Priority-check handoff: enqueue up to `limit` of the pass's
@@ -387,26 +414,32 @@ pub async fn dry_run_source(
 /// proxies (repo-side filtering keeps only T1-probeable
 /// `unknown` rows). A failure is logged and never fails the ingest, the
 /// random sample covers those proxies anyway.
-async fn enqueue_probe_requests(pool: &DbPool, ids: &[i64], limit: u32, now: i64) {
+async fn enqueue_probe_requests(pool: &DbPool, source_id: &str, ids: &[i64], limit: u32, now: i64) {
     if limit == 0 || ids.is_empty() {
         return;
     }
     match probe::enqueue_checks(pool, ids, limit, now).await {
         Ok(0) => {}
         Ok(queued) => {
-            tracing::debug!(queued, "new proxies queued for priority probing");
+            tracing::debug!(
+                source = %source_id,
+                ids = ids.len(),
+                limit,
+                queued,
+                "new proxies queued for priority probing"
+            );
         }
         Err(err) => {
-            tracing::warn!(error = %err, "failed to queue new proxies for probing");
+            tracing::warn!(
+                source = %source_id,
+                ids = ids.len(),
+                limit,
+                error = %err,
+                "failed to queue new proxies for probing"
+            );
         }
     }
 }
-
-/// Ceiling on concurrent host lookups inside one ingest pass. Every
-/// unseen host costs up to `[geo].dns_timeout` (5 s by default) when DNS
-/// hangs, so the lookups run concurrently instead of one await per entry;
-/// the cap keeps a large feed from fanning out into thousands of sockets.
-const GEO_LOOKUP_CONCURRENCY: usize = 32;
 
 /// Hard cap on the unique hosts one pass resolves. A feed with thousands
 /// of distinct hosts would otherwise cost thousands of DNS round-trips
@@ -419,43 +452,15 @@ const GEO_HOST_BUDGET: usize = 256;
 /// stored" instead of blocking the ingest.
 const GEO_PASS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How many records the admin dry run resolves geo facts for. A dry run
-/// is a preview, not a pass: resolving every host of a large feed would
-/// make the button slow without telling the operator anything more.
-const DRY_RUN_GEO_LIMIT: usize = 64;
-
-/// The two [`GeoResolver`] calls [`resolve_geo_stamps`] makes. The real
-/// resolver implements it as-is; the seam exists so the lookup *shape*
-/// (concurrent, capped, input-ordered) can be observed without a MaxMind
-/// database and a slow DNS server on the test machine. The test drives
-/// [`resolve_geo_stamps`] itself, not a copy of its loop.
-trait GeoLookup {
-    /// Whether the resolver can enrich at all.
-    fn is_active(&self) -> bool;
-    /// Resolve one host, `None` when nothing is known about it.
-    fn resolve_host(
-        &self,
-        host: &str,
-    ) -> impl std::future::Future<Output = Option<std::sync::Arc<GeoInfo>>> + Send;
-}
-
-impl GeoLookup for GeoResolver {
-    fn is_active(&self) -> bool {
-        GeoResolver::is_active(self)
-    }
-
-    fn resolve_host(
-        &self,
-        host: &str,
-    ) -> impl std::future::Future<Output = Option<std::sync::Arc<GeoInfo>>> + Send {
-        self.resolve(host)
-    }
-}
-
 /// Resolve geo facts for the parsed entries; the returned vector stays
 /// index-aligned with `entries`. With an inactive resolver (geo disabled
 /// or database missing) every stamp is `None`, which the upsert treats as
-/// "keep what is stored".
+/// "keep what is stored". The one [`GeoResolver`] call it makes goes
+/// through the shared [`HostGeo`] seam (implemented once in
+/// `fumox_core::geo`, also used by the serving pipeline), so the lookup
+/// *shape* (concurrent, capped, input-ordered) is observable without a
+/// MaxMind database and a slow DNS server on the test machine: the test
+/// drives [`resolve_geo_stamps`] itself, not a copy of its loop.
 ///
 /// The pass is bounded twice over: only the unique hosts are looked up
 /// (a feed repeats the same host many times over) and at most
@@ -466,7 +471,7 @@ impl GeoLookup for GeoResolver {
 ///
 /// `limit` restricts the lookup to the first records of the pass (the
 /// dry run passes one); the records beyond it keep "no facts".
-async fn resolve_geo_stamps<G: GeoLookup>(
+async fn resolve_geo_stamps<G: HostGeo>(
     geo: &G,
     entries: &[ProxyEntry],
     limit: Option<usize>,
@@ -531,22 +536,34 @@ async fn resolve_geo_stamps<G: GeoLookup>(
 }
 
 /// What [`parse_payload`] produced: the entries that survived the
-/// protocol allowlist, the total recognised before any filtering and
-/// whether the source's pipeline has any drop rules at all.
+/// protocol allowlist, the total recognised before any filtering and the
+/// source's compiled pipeline.
 ///
 /// Drop rules do not run inside `parse_payload`, they need a resolved
 /// ASN stamp per entry, which only exists after [`resolve_geo_stamps`].
 /// The caller runs the drop step explicitly once the geo stamps are
-/// ready; this struct only carries the pre-drop entries plus the
-/// `has_drop_rules` flag that gates the alive-linger policy.
+/// ready; this struct carries the pre-drop entries plus the pipeline,
+/// compiled once here and reused for the drop step (a second compile
+/// would re-run every regex build for nothing).
 #[derive(Debug)]
 struct FilteredPayload {
     entries: Vec<ProxyEntry>,
     /// Recognised count before any filter (for logging / dry-run totals).
     recognized: usize,
-    /// Gates the alive-linger policy: a source with drop rules
-    /// must not keep links its rules would have discarded.
-    has_drop_rules: bool,
+    /// The source's compiled pipeline, `None` when it has none. Gates the
+    /// alive-linger policy (a source with drop rules must not keep links
+    /// its rules would have discarded) and carries the drop rules.
+    pipeline: Option<CompiledPipeline>,
+}
+
+impl FilteredPayload {
+    /// Whether the source's pipeline carries drop rules at all: gates the
+    /// alive-linger policy.
+    fn has_drop_rules(&self) -> bool {
+        self.pipeline
+            .as_ref()
+            .is_some_and(CompiledPipeline::has_drop_rules)
+    }
 }
 
 /// Decode + parse the raw payload according to the source settings.
@@ -561,10 +578,16 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     let parsed = fumox_core::parsers::parse_subscription(text, encoding, source.input_format)
         .map_err(|e| e.to_string())?;
     if parsed.entries.is_empty() {
-        // HTTP 200 with zero recognized lines is parse_error.
+        // HTTP 200 with zero recognized lines is parse_error. The message
+        // spells the parser's counts out in the operator's terms — how
+        // many lines matched nothing, how many recognized entries were
+        // dropped, how many structured entries were skipped — instead of
+        // internal field names.
         return Err(format!(
-            "no proxies recognized (discarded={}, unrecognized={}, skipped={})",
-            parsed.discarded, parsed.unrecognized, parsed.skipped
+            "no proxies recognized: {} lines matched no supported format, \
+             {} duplicates discarded, {} clash entries skipped — check the \
+             source's input format setting",
+            parsed.unrecognized, parsed.discarded, parsed.skipped
         ));
     }
     let recognized = parsed.entries.len();
@@ -577,18 +600,20 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
             .collect(),
         None => parsed.entries,
     };
-    // The pipeline is compiled only to learn whether drop rules exist
-    // (alive-linger gate) and to fail closed on a broken config. Drop
-    // rules themselves run later, after ASN stamps are available. Only
-    // the source's own pipeline participates in ingestion, profiles may
+    // The pipeline is compiled exactly once, here: the compiled value
+    // rides along in [`FilteredPayload`] for the drop step. Only the
+    // source's own pipeline participates in ingestion, profiles may
     // override the section on serving, but they never take part here
     // (one source feeds many profiles).
-    let has_drop_rules = match &source.pipeline {
-        None => false,
-        Some(value) => match crate::pipeline::CompiledPipeline::from_json(Some(value)) {
-            Ok(compiled) => compiled.has_drop_rules(),
-            Err(_) => {
-                return Err("pipeline config failed validation; refusing to ingest".to_string());
+    let pipeline = match &source.pipeline {
+        None => None,
+        Some(value) => match CompiledPipeline::from_json(Some(value)) {
+            Ok(compiled) => Some(compiled),
+            Err(issues) => {
+                return Err(format!(
+                    "pipeline config failed validation: {}; refusing to ingest",
+                    pipeline_issues_text(&issues)
+                ));
             }
         },
     };
@@ -597,9 +622,28 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
     }
     Ok(FilteredPayload {
         recognized,
-        has_drop_rules,
+        pipeline,
         entries,
     })
+}
+
+/// Render pipeline validation issues in their technical debug form for the
+/// ingest error message. Not localized (unlike the admin form, which maps
+/// the same catalog keys through `Lang::t_args`), but naming every issue
+/// the compiler found: `last_error` is the only trace a hand-edited row
+/// leaves.
+fn pipeline_issues_text(issues: &[PipelineIssue]) -> String {
+    issues
+        .iter()
+        .map(|issue| {
+            if issue.args.is_empty() {
+                issue.key.to_string()
+            } else {
+                format!("{} ({})", issue.key, issue.args.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// What a drop-rule pass hands back: the surviving entries, the stamps that
@@ -607,29 +651,36 @@ fn parse_payload(source: &Source, payload: &FetchedPayload) -> Result<FilteredPa
 /// pairs the two by index), and how many entries were discarded.
 type DropOutcome = (Vec<ProxyEntry>, Vec<Option<proxies::GeoStamp>>, usize);
 
-/// Compile the source's pipeline and run its drop rules against the
-/// entries paired with their resolved ASN stamps. Returns the surviving
-/// entries, the stamps that belong to exactly those entries, and how many
-/// were discarded. Fails closed when the pipeline does not compile (the
-/// previous `parse_payload` already validated this path; the re-check is
-/// defensive).
+/// Run the source's compiled drop rules against the entries paired with
+/// their resolved ASN stamps. Returns the surviving entries, the stamps
+/// that belong to exactly those entries, and how many were discarded. The
+/// pipeline arrives already compiled (`parse_payload` validated it and
+/// fails closed there), so this step cannot fail.
+///
+/// The stamp ASNs parse exactly once here — the boundary between the
+/// stored `AS{n}` column and the drop pass, which compares plain numbers.
 fn apply_drop_rules(
-    source: &Source,
+    pipeline: Option<&CompiledPipeline>,
     entries: Vec<ProxyEntry>,
     geo: &[Option<proxies::GeoStamp>],
-) -> Result<DropOutcome, String> {
-    let before_count = entries.len();
-    let compiled = match &source.pipeline {
-        None => return Ok((entries, geo.to_vec(), 0)),
-        Some(value) => crate::pipeline::CompiledPipeline::from_json(Some(value))
-            .map_err(|_| "pipeline config failed validation; refusing to ingest".to_string())?,
+    source_id: &str,
+) -> DropOutcome {
+    let Some(compiled) = pipeline.filter(|compiled| compiled.has_drop_rules()) else {
+        return (entries, geo.to_vec(), 0);
     };
-    if !compiled.has_drop_rules() {
-        return Ok((entries, geo.to_vec(), 0));
-    }
-    let (after, after_geo) = compiled.drop_entries_with_geo(entries, geo);
+    let asns: Vec<Option<u32>> = geo
+        .iter()
+        .map(|stamp| {
+            stamp
+                .as_ref()
+                .and_then(|stamp| stamp.asn.as_deref())
+                .and_then(asn_number)
+        })
+        .collect();
+    let before_count = entries.len();
+    let (after, after_geo) = compiled.drop_entries_with_geo(entries, &asns, geo, source_id);
     let dropped = before_count - after.len();
-    Ok((after, after_geo, dropped))
+    (after, after_geo, dropped)
 }
 
 async fn journal_success(
@@ -655,7 +706,7 @@ async fn journal_success(
         attempts: Some(i64::from(payload.attempts)),
     };
     if let Err(err) = fetch_log::insert(pool, &log, timing).await {
-        tracing::error!(error = %err, "failed to write fetch_log");
+        tracing::error!(source = %source.id, error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
         pool,
@@ -664,7 +715,7 @@ async fn journal_success(
     )
     .await
     {
-        tracing::error!(error = %err, "failed to update source after success");
+        tracing::error!(source = %source.id, error = %err, "failed to update source after success");
     }
 }
 
@@ -692,7 +743,7 @@ async fn journal_failure(
         attempts: Some(i64::from(failure.attempts())),
     };
     if let Err(err) = fetch_log::insert(pool, &log, timing).await {
-        tracing::error!(error = %err, "failed to write fetch_log");
+        tracing::error!(source = %source.id, error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
         pool,
@@ -705,7 +756,7 @@ async fn journal_failure(
     )
     .await
     {
-        tracing::error!(error = %err, "failed to update source after failure");
+        tracing::error!(source = %source.id, error = %err, "failed to update source after failure");
     }
 }
 
@@ -738,7 +789,7 @@ async fn journal_storage_failure(
         attempts: Some(i64::from(payload.attempts)),
     };
     if let Err(err) = fetch_log::insert(pool, &log, timing).await {
-        tracing::error!(error = %err, "failed to write fetch_log");
+        tracing::error!(source = %source.id, error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
         pool,
@@ -751,7 +802,7 @@ async fn journal_storage_failure(
     )
     .await
     {
-        tracing::error!(error = %err, "failed to update source after failure");
+        tracing::error!(source = %source.id, error = %err, "failed to update source after failure");
     }
 }
 
@@ -778,7 +829,7 @@ async fn journal_parse_failure(
         attempts: Some(i64::from(payload.attempts)),
     };
     if let Err(err) = fetch_log::insert(pool, &log, timing).await {
-        tracing::error!(error = %err, "failed to write fetch_log");
+        tracing::error!(source = %source.id, error = %err, "failed to write fetch_log");
     }
     if let Err(err) = sources::record_fetch_outcome(
         pool,
@@ -791,13 +842,14 @@ async fn journal_parse_failure(
     )
     .await
     {
-        tracing::error!(error = %err, "failed to update source after parse failure");
+        tracing::error!(source = %source.id, error = %err, "failed to update source after parse failure");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fumox_core::geo::GeoInfo;
     use fumox_core::models::{Encoding, InputFormat, Scheme};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -807,6 +859,7 @@ mod tests {
         Source {
             id: "srcA0000000".into(),
             slug: None,
+            access_token: None,
             name: "s".into(),
             url: "https://example.com".into(),
             enabled: true,
@@ -836,10 +889,20 @@ mod tests {
     }
 
     /// A `Fetcher` pointed at a one-shot local HTTP server, plus the
-    /// database and caches one `ingest_source` call needs. The private-IP
-    /// policy is switched off so the loopback test server is reachable.
-    /// The counter tracks how many requests reached the upstream.
-    async fn ingest_env(body: &'static str) -> (DbPool, Caches, Fetcher, Source, Arc<AtomicUsize>) {
+    /// database one `ingest_source` call needs. The private-IP policy is
+    /// switched off so the loopback test server is reachable. The counter
+    /// tracks how many requests reached the upstream. The first tuple
+    /// element owns the scratch directory: it removes itself on drop, so
+    /// a test cannot leave its database behind.
+    async fn ingest_env(
+        body: &'static str,
+    ) -> (
+        fumox_core::tempdir_lite::TempDir,
+        DbPool,
+        Fetcher,
+        Source,
+        Arc<AtomicUsize>,
+    ) {
         ingest_env_with_bodies(vec![body]).await
     }
 
@@ -849,7 +912,13 @@ mod tests {
     /// ingest of the same source needs a second, different feed.
     async fn ingest_env_with_bodies(
         bodies: Vec<&'static str>,
-    ) -> (DbPool, Caches, Fetcher, Source, Arc<AtomicUsize>) {
+    ) -> (
+        fumox_core::tempdir_lite::TempDir,
+        DbPool,
+        Fetcher,
+        Source,
+        Arc<AtomicUsize>,
+    ) {
         assert!(!bodies.is_empty(), "the upstream needs at least one body");
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&requests);
@@ -892,13 +961,9 @@ mod tests {
             }
         });
 
-        let dir = std::env::temp_dir().join(format!(
-            "fumox-ingest-test-{}",
-            fumox_core::models::new_id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = fumox_core::tempdir_lite::TempDir::new("ingest-test");
         let cfg = fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
+            path: dir.path().join("test.db"),
             ..Default::default()
         };
         let pool = fumox_core::db::connect_pool(&cfg).await.unwrap();
@@ -913,7 +978,7 @@ mod tests {
             true, // allow_private_urls: the mirror above is loopback
             std::time::Duration::from_secs(5),
         );
-        (pool, Caches::new(), fetcher, source, requests)
+        (dir, pool, fetcher, source, requests)
     }
 
     fn settings() -> IngestSettings {
@@ -945,18 +1010,10 @@ mod tests {
     /// every non-forced re-fetch for a whole TTL.
     #[tokio::test]
     async fn a_parse_failure_leaves_no_freshness_stamp() {
-        let (pool, caches, fetcher, source, _requests) =
+        let (_dir, pool, fetcher, source, _requests) =
             ingest_env("this is not a subscription").await;
-        let outcome = ingest_source(
-            &pool,
-            &fetcher,
-            &caches,
-            &inactive_geo(),
-            settings(),
-            &source,
-            false,
-        )
-        .await;
+        let outcome =
+            ingest_source(&pool, &fetcher, &inactive_geo(), settings(), &source, false).await;
         assert!(matches!(outcome, IngestOutcome::ParseFailed { .. }));
 
         let stored = sources::get(&pool, &source.id).await.unwrap().unwrap();
@@ -972,18 +1029,10 @@ mod tests {
     /// while a forced one always hits the network.
     #[tokio::test]
     async fn a_reconciled_payload_stamps_freshness_and_skips_the_next_fetch() {
-        let (pool, caches, fetcher, source, requests) =
+        let (_dir, pool, fetcher, source, requests) =
             ingest_env("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
-        let outcome = ingest_source(
-            &pool,
-            &fetcher,
-            &caches,
-            &inactive_geo(),
-            settings(),
-            &source,
-            false,
-        )
-        .await;
+        let outcome =
+            ingest_source(&pool, &fetcher, &inactive_geo(), settings(), &source, false).await;
         assert!(matches!(outcome, IngestOutcome::Ok { .. }));
         assert_eq!(requests.load(Ordering::SeqCst), 1, "the first pass fetches");
 
@@ -999,7 +1048,6 @@ mod tests {
         let outcome = ingest_source(
             &pool,
             &fetcher,
-            &caches,
             &inactive_geo(),
             settings(),
             &stamped,
@@ -1024,16 +1072,8 @@ mod tests {
 
         // A forced refresh (the admin *Refresh now* button) bypasses the
         // stamp and hits the network.
-        let outcome = ingest_source(
-            &pool,
-            &fetcher,
-            &caches,
-            &inactive_geo(),
-            settings(),
-            &stamped,
-            true,
-        )
-        .await;
+        let outcome =
+            ingest_source(&pool, &fetcher, &inactive_geo(), settings(), &stamped, true).await;
         assert!(matches!(outcome, IngestOutcome::Ok { .. }));
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -1050,18 +1090,10 @@ mod tests {
     /// indistinguishable from a fast one.
     #[tokio::test]
     async fn fetch_duration_is_journaled_and_carried_in_the_outcome() {
-        let (pool, caches, fetcher, source, requests) =
+        let (_dir, pool, fetcher, source, requests) =
             ingest_env("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
-        let outcome = ingest_source(
-            &pool,
-            &fetcher,
-            &caches,
-            &inactive_geo(),
-            settings(),
-            &source,
-            false,
-        )
-        .await;
+        let outcome =
+            ingest_source(&pool, &fetcher, &inactive_geo(), settings(), &source, false).await;
         assert!(
             matches!(outcome, IngestOutcome::Ok { .. }),
             "expected a successful ingest, got {outcome:?}"
@@ -1088,7 +1120,6 @@ mod tests {
         let outcome = ingest_source(
             &pool,
             &fetcher,
-            &caches,
             &inactive_geo(),
             settings(),
             &stamped,
@@ -1186,19 +1217,20 @@ mod tests {
         peak: Arc<AtomicUsize>,
     }
 
-    impl GeoLookup for CountingGeo {
+    impl HostGeo for CountingGeo {
         fn is_active(&self) -> bool {
             true
         }
 
-        fn resolve_host(
-            &self,
-            host: &str,
-        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+        fn resolve_host<'a>(
+            &'a self,
+            host: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<GeoInfo>>> + Send + 'a>>
+        {
             let in_flight = Arc::clone(&self.in_flight);
             let peak = Arc::clone(&self.peak);
             let host = host.to_string();
-            async move {
+            Box::pin(async move {
                 let running = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(running, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1208,7 +1240,7 @@ mod tests {
                     country_code: Some(host),
                     ..Default::default()
                 }))
-            }
+            })
         }
     }
 
@@ -1217,25 +1249,26 @@ mod tests {
         asked: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
-    impl GeoLookup for RecordingGeo {
+    impl HostGeo for RecordingGeo {
         fn is_active(&self) -> bool {
             true
         }
 
-        fn resolve_host(
-            &self,
-            host: &str,
-        ) -> impl std::future::Future<Output = Option<Arc<GeoInfo>>> + Send {
+        fn resolve_host<'a>(
+            &'a self,
+            host: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<GeoInfo>>> + Send + 'a>>
+        {
             let asked = Arc::clone(&self.asked);
             let host = host.to_string();
-            async move {
+            Box::pin(async move {
                 asked.lock().unwrap().push(host.clone());
                 Some(Arc::new(GeoInfo {
                     ip: host.clone(),
                     country_code: Some(host),
                     ..Default::default()
                 }))
-            }
+            })
         }
     }
 
@@ -1315,7 +1348,7 @@ mod tests {
         let body = "vless://uuid@1.2.3.4:443#keep\n\
                     vless://uuid@1.2.3.5:443#drop-me\n\
                     trojan://pw@1.2.3.6:443#other-protocol\n";
-        let (_pool, _caches, fetcher, mut source, _requests) = ingest_env(body).await;
+        let (_dir, _pool, fetcher, mut source, _requests) = ingest_env(body).await;
         source.protocols = Some(vec![fumox_core::models::Scheme::Vless]);
         source.pipeline = Some(serde_json::json!({
             "version": 1,
@@ -1346,7 +1379,7 @@ mod tests {
     /// points the operator at the database, not at the feed.
     #[tokio::test]
     async fn a_storage_failure_is_journaled_as_a_storage_error() {
-        let (pool, _caches, _fetcher, source, _requests) =
+        let (_dir, pool, _fetcher, source, _requests) =
             ingest_env("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
         let payload = FetchedPayload {
             http_status: 200,
@@ -1384,19 +1417,11 @@ mod tests {
     /// parse failure. The feed answered with HTTP 200.
     #[tokio::test]
     async fn a_closed_database_is_a_storage_failure() {
-        let (pool, caches, fetcher, source, _requests) =
+        let (_dir, pool, fetcher, source, _requests) =
             ingest_env("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n").await;
         pool.close().await;
-        let outcome = ingest_source(
-            &pool,
-            &fetcher,
-            &caches,
-            &inactive_geo(),
-            settings(),
-            &source,
-            false,
-        )
-        .await;
+        let outcome =
+            ingest_source(&pool, &fetcher, &inactive_geo(), settings(), &source, false).await;
         assert!(
             matches!(outcome, IngestOutcome::StorageFailed { .. }),
             "got {outcome:?}"
@@ -1426,6 +1451,19 @@ mod tests {
         let source = source_with(Encoding::Auto, None);
         let err = parse_payload(&source, &payload("hello world\nno proxies here\n")).unwrap_err();
         assert!(err.contains("no proxies recognized"));
+        // The counts are spelled out in the operator's terms, not as
+        // internal field names.
+        assert!(
+            err.contains("2 lines matched no supported format"),
+            "the unrecognized count must be explained: {err}"
+        );
+        assert!(err.contains("duplicates discarded"), "{err}");
+        assert!(err.contains("clash entries skipped"), "{err}");
+        assert!(err.contains("input format setting"), "{err}");
+        assert!(
+            !err.contains("unrecognized=") && !err.contains("discarded="),
+            "no internal field names in the message: {err}"
+        );
     }
 
     #[test]
@@ -1468,10 +1506,12 @@ mod tests {
             ]
         }));
         let body = "vless://uuid@1.2.3.4:443#free node\nvless://uuid@h.cn:443#cn\nvless://uuid@h.example.com:443#keep\n";
-        let entries = parse_payload(&source, &payload(body)).unwrap().entries;
+        let filtered = parse_payload(&source, &payload(body)).unwrap();
+        let entries = filtered.entries;
         assert_eq!(entries.len(), 3);
         let geo = vec![None; entries.len()];
-        let (kept, _geo, dropped) = apply_drop_rules(&source, entries, &geo).unwrap();
+        let (kept, _geo, dropped) =
+            apply_drop_rules(filtered.pipeline.as_ref(), entries, &geo, "test-source");
         assert_eq!(dropped, 2);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].host, "h.example.com");
@@ -1492,7 +1532,12 @@ mod tests {
         let body = "vless://uuid@1.2.3.4:443#A\nvless://uuid@h:443#B\n";
         let filtered = parse_payload(&source, &payload(body)).unwrap();
         let geo = vec![None; filtered.entries.len()];
-        let (kept, _geo, dropped) = apply_drop_rules(&source, filtered.entries, &geo).unwrap();
+        let (kept, _geo, dropped) = apply_drop_rules(
+            filtered.pipeline.as_ref(),
+            filtered.entries,
+            &geo,
+            "test-source",
+        );
         assert!(kept.is_empty());
         assert_eq!(dropped, filtered.recognized);
     }
@@ -1529,7 +1574,9 @@ mod tests {
             stamp("AS300"),
             stamp("AS400"),
         ];
-        let (kept, kept_geo, dropped) = apply_drop_rules(&source, entries, &geo).unwrap();
+        let compiled = CompiledPipeline::from_json(source.pipeline.as_ref()).unwrap();
+        let (kept, kept_geo, dropped) =
+            apply_drop_rules(Some(&compiled), entries, &geo, "test-source");
         assert_eq!(dropped, 2);
         assert_eq!(kept.len(), 2, "the two survivors remain");
         assert_eq!(
@@ -1556,11 +1603,21 @@ mod tests {
     fn corrupted_pipeline_config_fails_closed() {
         // Cannot happen through the admin forms (save-time validation), but
         // a hand-edited row must not let its proxies slip past the rules.
+        // The message carries the compiler's issues, so `last_error` and
+        // the dry-run response say what exactly failed validation.
         let mut source = source_with(Encoding::Auto, None);
         source.pipeline = Some(serde_json::json!({ "version": 2 }));
         let body = "vless://uuid@1.2.3.4:443#A\n";
         let err = parse_payload(&source, &payload(body)).unwrap_err();
         assert!(err.contains("failed validation"), "{err}");
+        assert!(
+            err.contains("pipeline.version"),
+            "the issue catalog keys must reach the message: {err}"
+        );
+        assert!(
+            err.contains("2"),
+            "the offending value must reach the message: {err}"
+        );
     }
 
     #[test]
@@ -1614,7 +1671,7 @@ mod tests {
         assert!(
             !parse_payload(&source, &payload("vless://uuid@h:443#A\n"))
                 .unwrap()
-                .has_drop_rules
+                .has_drop_rules()
         );
 
         // …a drop section that matches nothing still does (the rules are
@@ -1626,7 +1683,7 @@ mod tests {
         assert!(
             parse_payload(&source, &payload("vless://uuid@h:443#A\n"))
                 .unwrap()
-                .has_drop_rules
+                .has_drop_rules()
         );
 
         // …and neither a pipeline without drop nor no pipeline at all does.
@@ -1637,13 +1694,13 @@ mod tests {
         assert!(
             !parse_payload(&source, &payload("vless://uuid@h:443#A\n"))
                 .unwrap()
-                .has_drop_rules
+                .has_drop_rules()
         );
         source.pipeline = None;
         assert!(
             !parse_payload(&source, &payload("vless://uuid@h:443#A\n"))
                 .unwrap()
-                .has_drop_rules
+                .has_drop_rules()
         );
     }
 
@@ -1656,7 +1713,7 @@ mod tests {
     /// inside the same wall-clock second, which would leave the link
     /// looking fresh.
     async fn vanished_proxy_after_two_ingests(drop_gate: bool) -> (String, usize) {
-        let (pool, caches, fetcher, mut source, _requests) = ingest_env_with_bodies(vec![
+        let (_dir, pool, fetcher, mut source, _requests) = ingest_env_with_bodies(vec![
             "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n",
             "vless://22222222-2222-2222-2222-222222222222@5.6.7.8:443#B\n",
         ])
@@ -1670,16 +1727,7 @@ mod tests {
         sources::update_settings(&pool, &source).await.unwrap();
 
         let settings = settings_with_drop_gate(drop_gate);
-        let first = ingest_source(
-            &pool,
-            &fetcher,
-            &caches,
-            &inactive_geo(),
-            settings,
-            &source,
-            false,
-        )
-        .await;
+        let first = ingest_source(&pool, &fetcher, &inactive_geo(), settings, &source, false).await;
         assert!(matches!(first, IngestOutcome::Ok { .. }), "got {first:?}");
 
         let id: i64 = sqlx::query_scalar("SELECT id FROM proxies WHERE host = '1.2.3.4'")
@@ -1699,16 +1747,7 @@ mod tests {
 
         // The second pass is forced: the first one stamped the source row
         // as fresh, and the admin *Refresh now* bypasses that stamp.
-        let second = ingest_source(
-            &pool,
-            &fetcher,
-            &caches,
-            &inactive_geo(),
-            settings,
-            &source,
-            true,
-        )
-        .await;
+        let second = ingest_source(&pool, &fetcher, &inactive_geo(), settings, &source, true).await;
         assert!(matches!(second, IngestOutcome::Ok { .. }), "got {second:?}");
 
         let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
@@ -1747,5 +1786,130 @@ mod tests {
             status, "unknown",
             "the gate is off: only the probe's own verdict may retire it"
         );
+    }
+
+    /// `[ingest].removed_as_unknown`: a proxy the feed dropped (and the
+    /// drop gate retired) comes back to the pristine `unknown` state on
+    /// the refresh whose feed carries it again, and re-enters the priority
+    /// probe queue like a fresh insert.
+    #[tokio::test]
+    async fn a_removed_proxy_the_feed_carries_again_is_revived_and_queued() {
+        let (_dir, pool, fetcher, mut source, _requests) = ingest_env_with_bodies(vec![
+            "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n",
+            "vless://22222222-2222-2222-2222-222222222222@5.6.7.8:443#B\n",
+            "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#A\n",
+        ])
+        .await;
+        // A drop rule that matches nothing: the rules are there (the gate
+        // applies), they simply do not fire on any feed content.
+        source.pipeline = Some(serde_json::json!({
+            "version": 1,
+            "drop": [{ "match": "^zzz-nonexistent$", "target": "name" }]
+        }));
+        sources::update_settings(&pool, &source).await.unwrap();
+
+        // First pass stores the proxy; the second (a feed without it,
+        // forced past the freshness stamp) detaches and retires it.
+        let gate_on = settings_with_drop_gate(true);
+        let first = ingest_source(&pool, &fetcher, &inactive_geo(), gate_on, &source, false).await;
+        assert!(matches!(first, IngestOutcome::Ok { .. }), "got {first:?}");
+        let id: i64 = sqlx::query_scalar("SELECT id FROM proxies WHERE host = '1.2.3.4'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxy_source_links SET seen_at = seen_at - 5")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = ingest_source(&pool, &fetcher, &inactive_geo(), gate_on, &source, true).await;
+        assert!(matches!(second, IngestOutcome::Ok { .. }), "got {second:?}");
+        assert_eq!(
+            proxies::get_by_id(&pool, id).await.unwrap().unwrap().status,
+            "removed",
+            "the vanished proxy was retired by the gate"
+        );
+
+        // The feed carries the proxy again: with removed_as_unknown the
+        // same refresh revives it and hands it to the priority queue.
+        let reviving = IngestSettings {
+            refresh_check_limit: 5,
+            removed_as_unknown: true,
+            ..settings()
+        };
+        // The links are aged before this pass, exactly as
+        // `vanished_proxy_after_two_ingests` does: all three passes run
+        // inside one wall-clock second, and the reconcile's
+        // strictly-increasing link stamp would otherwise sit ahead of
+        // `now`, making this pass's own fresh link look stale to the
+        // linger sweep — and a link-less row cannot be revived.
+        sqlx::query("UPDATE proxy_source_links SET seen_at = seen_at - 5")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let third = ingest_source(&pool, &fetcher, &inactive_geo(), reviving, &source, true).await;
+        assert!(matches!(third, IngestOutcome::Ok { .. }), "got {third:?}");
+        assert_eq!(
+            proxies::get_by_id(&pool, id).await.unwrap().unwrap().status,
+            "unknown",
+            "the proxy the feed carries again is revived to unknown"
+        );
+        let queued: Vec<i64> = probe::select_queued_checks(&pool, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect();
+        assert!(
+            queued.contains(&id),
+            "the revived proxy is queued for priority probing: {queued:?}"
+        );
+    }
+
+    /// `[ingest].refresh_check_limit`: at most that many newly inserted
+    /// unknown proxies per refresh reach the priority probe queue, and the
+    /// ids that do are exactly the pass's inserts.
+    #[tokio::test]
+    async fn the_priority_queue_takes_at_most_refresh_check_limit_ids() {
+        let (_dir, pool, fetcher, source, _requests) = ingest_env(
+            "vless://11111111-1111-1111-1111-111111111111@10.0.0.1:443#n1\n\
+             vless://11111111-1111-1111-1111-111111111111@10.0.0.2:443#n2\n\
+             vless://11111111-1111-1111-1111-111111111111@10.0.0.3:443#n3\n\
+             vless://11111111-1111-1111-1111-111111111111@10.0.0.4:443#n4\n\
+             vless://11111111-1111-1111-1111-111111111111@10.0.0.5:443#n5\n",
+        )
+        .await;
+        let settings = IngestSettings {
+            refresh_check_limit: 3,
+            ..settings()
+        };
+        let outcome =
+            ingest_source(&pool, &fetcher, &inactive_geo(), settings, &source, false).await;
+        assert!(
+            matches!(outcome, IngestOutcome::Ok { .. }),
+            "got {outcome:?}"
+        );
+
+        let inserted: Vec<i64> = sqlx::query_scalar("SELECT id FROM proxies ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(inserted.len(), 5, "the whole feed is stored");
+        let queued: Vec<i64> = probe::select_queued_checks(&pool, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect();
+        assert!(
+            queued.len() <= 3,
+            "the limit bounds the queue handoff, got {queued:?}"
+        );
+        for id in &queued {
+            assert!(
+                inserted.contains(id),
+                "only ids the pass inserted are queued, {id} is not"
+            );
+        }
+        assert_eq!(queued.len(), 3, "the limit is reached, not hit early");
     }
 }

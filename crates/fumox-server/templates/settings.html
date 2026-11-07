@@ -17,7 +17,10 @@
 </div>
 
 {% if !self.has_config_file() %}
-  <div class="flash error">
+  {#- The panel runs on defaults and will not write what the operator
+      changes: an assertive live role makes sure the banner is
+      announced instead of hoping the reader scrolls past it. -#}
+  <div class="flash error" role="alert">
     {{ self.t_named("set.no_file_banner", &[("path", self.editing_path())][..]) }}
   </div>
 {% else if !self.config_writable() %}
@@ -39,7 +42,7 @@
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("probe.fail_limit") }}</th><td>{{ state.probe.fail_limit }}</td></tr>
-        <tr><th>{{ self.t("probe.second_chance_window") }}</th><td>{{ state.probe.second_chance_min_hours }} {{ self.t("probe.hours_short") }} + U(0..{{ state.probe.second_chance_spread_hours }} {{ self.t("probe.hours_short") }})</td></tr>
+        <tr><th>{{ self.t("probe.second_chance_window") }}</th><td>{{ self.t_named("probe.second_chance_value", &[("min", state.probe.second_chance_min_hours.to_string()), ("spread", state.probe.second_chance_spread_hours.to_string())][..]) }}</td></tr>
         <tr><th>{{ self.t("set.ladder") }}</th><td class="mono small">{{ self.ladder_sentence() }}</td></tr>
         <tr><th>{{ self.t("set.queue_stale") }}</th><td>{{ state.probe.queue_stale_days }} {{ self.t("probe.days_short") }}</td></tr>
         <tr><th>{{ self.t("probe.history_rotation") }}</th><td>{{ self.t("probe.every_n_sec").replace("{}", &state.probe.retention_interval_secs.to_string()) }}</td></tr>
@@ -56,7 +59,7 @@
         <tr><th>{{ self.t("probe.tcp_timeout") }}</th><td>{{ state.probe.connect_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><th>{{ self.t("probe.tls_timeout") }}</th><td>{{ state.probe.tls_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><th>{{ self.t("probe.concurrency") }}</th><td>{{ state.probe.concurrency }}</td></tr>
-        <tr><th>{{ self.t("probe.allow_private_targets") }}</th><td>{{ state.probe.allow_private_targets }}</td></tr>
+        <tr><th>{{ self.t("probe.allow_private_targets") }}</th><td>{{ self.bool_label(&state.probe.allow_private_targets) }}</td></tr>
         <tr><th>{{ self.t("probe.backlog_target_drain") }}</th><td>{{ state.probe.backlog_target_drain_minutes }} {{ self.t("probe.mins_short") }}</td></tr>
         <tr><th>{{ self.t("set.heartbeat") }}</th><td>{{ self.t("probe.every_n_sec").replace("{}", &state.probe.heartbeat_interval_secs.to_string()) }}</td></tr>
       </tbody>
@@ -68,8 +71,8 @@
     <table class="kv">
       <tbody>
         <tr><th>{{ self.t("set.refresh_check_limit") }}</th><td>{{ state.ingest.refresh_check_limit }}</td></tr>
-        <tr><th>{{ self.t("set.drop_gate") }}</th><td>{{ state.ingest.drop_gate }}</td></tr>
-        <tr><th>{{ self.t("set.removed_as_unknown") }}</th><td>{{ state.ingest.removed_as_unknown }}</td></tr>
+        <tr><th>{{ self.t("set.drop_gate") }}</th><td>{{ self.bool_label(&state.ingest.drop_gate) }}</td></tr>
+        <tr><th>{{ self.t("set.removed_as_unknown") }}</th><td>{{ self.bool_label(&state.ingest.removed_as_unknown) }}</td></tr>
       </tbody>
     </table>
   </div>
@@ -116,11 +119,11 @@
     <h2>{{ self.t("set.geo_panel") }}</h2>
     <table class="kv">
       <tbody>
-        <tr><th>{{ self.t("set.enabled") }}</th><td>{{ state.geo_config.enabled }}</td></tr>
+        <tr><th>{{ self.t("set.enabled") }}</th><td>{{ self.bool_label(&state.geo_config.enabled) }}</td></tr>
         <tr><th>{{ self.t("set.geo_db_dir") }}</th><td class="mono small">{{ state.geo_config.db_dir.display() }}</td></tr>
         <tr><th>{{ self.t("set.geo_cache") }}</th><td>{{ state.geo_config.cache_max_entries }}</td></tr>
         <tr><th>{{ self.t("set.dns_timeout") }}</th><td>{{ state.geo_config.dns_timeout_secs }} {{ self.t("common.sec") }}</td></tr>
-        <tr><th>{{ self.t("set.geo_auto_download") }}</th><td>{{ state.geo_config.auto_download }}</td></tr>
+        <tr><th>{{ self.t("set.geo_auto_download") }}</th><td>{{ self.bool_label(&state.geo_config.auto_download) }}</td></tr>
       </tbody>
     </table>
   </div>
@@ -138,13 +141,13 @@
     <h2>{{ self.t("set.admin_panel") }}</h2>
     <table class="kv">
       <tbody>
-        <tr><th>{{ self.t("set.enabled") }}</th><td>{{ state.admin.enabled }}</td></tr>
+        <tr><th>{{ self.t("set.enabled") }}</th><td>{{ self.bool_label(&state.admin.enabled) }}</td></tr>
         <tr><th>{{ self.t("set.bind") }}</th><td class="mono small">{{ state.admin.bind }}</td></tr>
         <tr><th>{{ self.t("set.session_ttl") }}</th><td>{{ state.admin.session_ttl_hours }} {{ self.t("probe.hours_short") }}</td></tr>
-        <tr><th>{{ self.t("set.allow_private_urls") }}</th><td>{{ state.admin.allow_private_urls }}</td></tr>
+        <tr><th>{{ self.t("set.allow_private_urls") }}</th><td>{{ self.bool_label(&state.admin.allow_private_urls) }}</td></tr>
         <tr><th>{{ self.t("set.rate_limit") }}</th><td>{{ self.rate_limit(&state.admin.rate_limit) }}</td></tr>
         <tr><th>{{ self.t("set.login_rate_limit") }}</th><td>{{ self.rate_limit(&state.admin.login_rate_limit) }}</td></tr>
-        <tr><th>{{ self.t("set.secure_cookies") }}</th><td>{{ state.admin.secure_cookies }}</td></tr>
+        <tr><th>{{ self.t("set.secure_cookies") }}</th><td>{{ self.bool_label(&state.admin.secure_cookies) }}</td></tr>
         <tr><th>{{ self.t("set.locales_dir") }}</th><td class="mono small">{{ state.admin.locales_dir }}</td></tr>
       </tbody>
     </table>

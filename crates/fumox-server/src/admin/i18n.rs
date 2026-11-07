@@ -24,16 +24,16 @@
 //! `lang: Lang` field. Messages injected from Rust (toasts, validation,
 //! badges) are translated with [`Lang::t`] at the call site.
 
-use axum::http::{HeaderMap, header};
+use crate::admin::AdminState;
+use axum::extract::{Form, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
 /// Language cookie name. The value is not signed: it only selects UI text.
 pub const LANG_COOKIE: &str = "fumox_lang";
-
-/// Language cookie lifetime: one year.
-const LANG_MAX_AGE_SECS: u64 = 365 * 24 * 3600;
 
 /// Catalogs compiled into the binary: the fallback when the locales
 /// directory is absent or does not contain a given language.
@@ -63,7 +63,11 @@ pub struct Locales {
 
 impl Locales {
     /// Load catalogs: embedded first, then every `<code>.toml` in `dir`.
-    /// Unreadable or malformed files are logged and skipped.
+    /// Unreadable or malformed files are logged and skipped. A `dir` that
+    /// cannot be read at all (missing, or present but inaccessible) falls
+    /// back to the embedded catalogs too: a missing directory is the
+    /// normal no-extra-languages case (info), any other read error is
+    /// warned about, the operator's files are then silently unused.
     ///
     /// A disk file is merged **per key** onto the embedded catalog of the
     /// same language: the file's text wins for the keys it defines, the
@@ -98,6 +102,23 @@ impl Locales {
                     if code.is_empty() {
                         continue;
                     }
+                    // The code travels into the switcher's request
+                    // (`?lang=` on the login form, the setter's form
+                    // field) and into the cookie value, so only the
+                    // characters a language code can hold are accepted: a
+                    // file named `..toml` or `w%20w.toml` must not smuggle
+                    // anything into either.
+                    if !code
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    {
+                        tracing::warn!(
+                            code = %code,
+                            path = %path.display(),
+                            "locale file skipped: invalid language code"
+                        );
+                        continue;
+                    }
                     match std::fs::read_to_string(&path)
                         .map_err(|err| err.to_string())
                         .and_then(|text| parse_catalog(&text))
@@ -113,10 +134,21 @@ impl Locales {
                     }
                 }
             }
-            Err(_) => {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!(
                     dir = %dir.display(),
                     "locales directory not found, using embedded catalogs"
+                );
+            }
+            Err(err) => {
+                // The directory exists but cannot be read (permissions, a
+                // file standing in its place): every extra language the
+                // operator dropped there is silently unavailable, so this
+                // is a warning, not the expected no-directory case.
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %err,
+                    "locales directory unreadable, using embedded catalogs"
                 );
             }
         }
@@ -175,21 +207,20 @@ impl Locales {
         self.resolve(&self.default_code)
     }
 
-    /// Resolve the UI language from the `fumox_lang` cookie.
+    /// Resolve the UI language from the `fumox_lang` cookie. A
+    /// quoted-string value (`RFC 6265` allows the cookie-value in
+    /// `DQUOTE`s) is read with the quotes stripped.
     pub fn lang_from_headers(&self, headers: &HeaderMap) -> Lang {
-        for cookie_header in headers.get_all(header::COOKIE).iter() {
-            let Ok(text) = cookie_header.to_str() else {
-                continue;
-            };
-            for pair in text.split(';') {
-                if let Some((name, value)) = pair.trim().split_once('=')
-                    && name.trim() == LANG_COOKIE
-                {
-                    return self.resolve(value.trim());
-                }
+        match super::cookie_value(headers, LANG_COOKIE) {
+            Some(value) => {
+                let value = value
+                    .strip_prefix('"')
+                    .and_then(|stripped| stripped.strip_suffix('"'))
+                    .unwrap_or(value);
+                self.resolve(value)
             }
+            None => self.default_lang(),
         }
-        self.default_lang()
     }
 
     /// `(code, native name)` pairs for the language switchers.
@@ -269,11 +300,12 @@ impl Lang {
     /// instead of pre-rendered text. A missing catalog entry renders as the
     /// key itself (like [`Lang::t`]), with the arguments substituted in.
     pub fn t_args(&self, key: &str, args: &[String]) -> String {
-        let mut text = self.t(key).to_string();
-        for (idx, arg) in args.iter().enumerate() {
-            text = text.replace(&format!("{{{idx}}}"), arg);
-        }
-        text
+        let indexed: Vec<(String, &str)> = args
+            .iter()
+            .enumerate()
+            .map(|(idx, arg)| (idx.to_string(), arg.as_str()))
+            .collect();
+        self.substitute(self.t(key), &indexed)
     }
 
     /// Translate a message key and substitute named arguments `{name}`,
@@ -283,17 +315,78 @@ impl Lang {
     /// argument (e.g. the file path on the settings screens); positional
     /// `t_args` is the right tool when the phrase lists several values.
     pub fn t_named(&self, key: &str, args: &[(&str, String)]) -> String {
-        let mut text = self.t(key).to_string();
-        for (name, value) in args {
-            text = text.replace(&format!("{{{name}}}"), value);
+        let named: Vec<(String, &str)> = args
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.as_str()))
+            .collect();
+        self.substitute(self.t(key), &named)
+    }
+
+    /// One-pass substitution over `template`: every `{name}` placeholder
+    /// is replaced by its argument at the moment it is met, an unknown
+    /// name (and an unclosed brace) is copied through verbatim. One pass
+    /// over the original template is the whole contract: an argument that
+    /// itself contains `{…}` is inserted literally and never re-scanned,
+    /// which a sequential `String::replace` cascade could not guarantee
+    /// (an argument carrying a later placeholder used to be substituted
+    /// into, corrupting the value).
+    fn substitute(&self, template: &str, args: &[(String, &str)]) -> String {
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            let tail = &rest[open..];
+            match tail[1..].find('}') {
+                Some(close) => {
+                    let name = &tail[1..1 + close];
+                    match args.iter().find(|(key, _)| key == name) {
+                        Some((_, value)) => out.push_str(value),
+                        None => out.push_str(&tail[..close + 2]),
+                    }
+                    rest = &tail[close + 2..];
+                }
+                // No closing brace: the rest is not a placeholder.
+                None => {
+                    out.push_str(tail);
+                    rest = "";
+                }
+            }
         }
-        text
+        out.push_str(rest);
+        out
     }
 }
 
-/// `Set-Cookie` header value persisting the language choice.
+/// `Set-Cookie` header value persisting the language choice (shared
+/// builder in `super`, the one source of the attributes and the lifetime).
 pub fn lang_cookie(code: &str) -> String {
-    format!("{LANG_COOKIE}={code}; Path=/; HttpOnly; SameSite=Lax; Max-Age={LANG_MAX_AGE_SECS}")
+    super::preference_cookie(LANG_COOKIE, code)
+}
+
+/// Language switch: persists the choice in the `fumox_lang` cookie and
+/// redirects back to `next` (validated by [`crate::admin::admin_next`],
+/// admin-surface paths only, no open redirect). Endpoint:
+/// `/admin/set-lang`, an authenticated POST under the auth+CSRF nest (see
+/// the route group in `crate::admin::router`). The login screen has no
+/// session yet and switches through `?lang=` on the login form instead
+/// (`auth::login_form`).
+pub async fn set_lang(
+    State(state): State<AdminState>,
+    Form(params): Form<HashMap<String, String>>,
+) -> Response {
+    let lang = params
+        .get("lang")
+        .map(|value| state.locales.resolve(value))
+        .unwrap_or_else(|| state.locales.default_lang());
+    let next = super::admin_next(&params);
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::SET_COOKIE, lang_cookie(lang.code())),
+            (header::LOCATION, next),
+        ],
+    )
+        .into_response()
 }
 
 /// Add the shared template helpers to a template struct that carries a
@@ -397,6 +490,26 @@ mod tests {
             .collect()
     }
 
+    /// The `{…}` placeholder names of one message, in order of
+    /// appearance, with repeats. Same scanning rules as
+    /// [`Lang::substitute`]: a brace without its closing twin is not a
+    /// placeholder and everything after it is copied through.
+    fn placeholders(template: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            let tail = &rest[open..];
+            match tail[1..].find('}') {
+                Some(close) => {
+                    names.push(tail[1..1 + close].to_string());
+                    rest = &tail[close + 2..];
+                }
+                None => break,
+            }
+        }
+        names
+    }
+
     #[test]
     fn embedded_catalogs_parse_and_share_the_same_keys() {
         let catalogs = embedded_catalogs();
@@ -448,6 +561,30 @@ mod tests {
                 assert_ne!(text, key, "{key} is untranslated in {code}");
             }
         }
+        // The en/ru pair must also agree on the placeholder names of
+        // every key, repeats included: a translation that drops,
+        // renames or duplicates a `{…}` renders the argument raw (or
+        // binds it in the wrong spot). Sorted lists keep the comparison
+        // order-insensitive while still counting repeated names.
+        let by_code = |code: &str| {
+            &catalogs
+                .iter()
+                .find(|(c, _)| c == code)
+                .unwrap_or_else(|| panic!("embedded {code} catalog"))
+                .1
+        };
+        let (en, ru) = (by_code("en"), by_code("ru"));
+        for (key, en_text) in en {
+            let mut en_names = placeholders(en_text);
+            let mut ru_names =
+                placeholders(ru.get(key).unwrap_or_else(|| panic!("{key} missing in ru")));
+            en_names.sort();
+            ru_names.sort();
+            assert_eq!(
+                en_names, ru_names,
+                "placeholder mismatch for {key} between en and ru"
+            );
+        }
     }
 
     #[test]
@@ -474,28 +611,75 @@ mod tests {
 
     #[test]
     fn t_args_substitutes_positional_arguments() {
-        let locales = Locales::load(Path::new("/nonexistent-locales-dir"));
-        let args = vec!["rename[0]".to_string(), "z".to_string()];
+        // The substitution contract is pinned on a synthetic catalog
+        // (same pattern as `disk_files_add_and_override_languages`), so
+        // the test does not move whenever a shipped phrase is reworded.
+        let dir = std::env::temp_dir().join(format!(
+            "fumox-locales-args-{}",
+            fumox_core::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("zz.toml"),
+            "\"test.pos\" = \"A {0} B {1} C\"\n\"test.open\" = \"A {0 B\"\n",
+        )
+        .unwrap();
+        let locales = Locales::load(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let zz = locales.resolve("zz");
+
         assert_eq!(
-            locales.resolve("ru").t_args("pipeline.unknown_flag", &args),
-            "rename[0].flags: неизвестный флаг «z»"
-        );
-        assert_eq!(
-            locales.resolve("en").t_args("pipeline.unknown_flag", &args),
-            "rename[0].flags: unknown flag 'z'"
+            zz.t_args("test.pos", &["one".to_string(), "two".to_string()]),
+            "A one B two C"
         );
         // A placeholder without its argument stays visible.
+        assert_eq!(zz.t_args("test.pos", &["one".to_string()]), "A one B {1} C");
+        // An argument that itself carries a placeholder is inserted
+        // verbatim: the single-pass substitution never re-scans an
+        // inserted value.
         assert_eq!(
-            locales
-                .resolve("en")
-                .t_args("pipeline.bad_regex", &args[..1]),
-            "rename[0].match: invalid regex: {1}"
+            zz.t_args("test.pos", &["{1}".to_string(), "two".to_string()]),
+            "A {1} B two C"
         );
+        // An unclosed brace is copied through, not swallowed.
+        assert_eq!(zz.t_args("test.open", &["one".to_string()]), "A {0 B");
         // Unknown keys echo themselves, arguments still substituted.
         assert_eq!(
-            locales.resolve("en").t_args("no.such.key", &args),
+            zz.t_args("no.such.key", &["one".to_string()]),
             "no.such.key"
         );
+
+        // The shipped catalogs keep the keys the pipeline errors ride on:
+        // presence and the placeholder count, not the wording.
+        for (code, catalog) in embedded_catalogs() {
+            let text = catalog
+                .get("pipeline.unknown_flag")
+                .unwrap_or_else(|| panic!("pipeline.unknown_flag missing in {code}"));
+            assert!(
+                text.contains("{0}") && text.contains("{1}"),
+                "pipeline.unknown_flag lost a placeholder in {code}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_unknown_target_lists_asn_in_both_languages() {
+        // The rendered text for an unknown drop target must include `asn`
+        // in the allowed list, admins see the full picture from one
+        // message (the pipeline tests pin the validator side, this pins
+        // the copy). Rendered through `t_args` exactly as the runtime
+        // error path does.
+        let locales = Locales::load(Path::new("/nonexistent-locales-dir"));
+        for code in ["en", "ru"] {
+            let rendered = locales.resolve(code).t_args(
+                "pipeline.unknown_target",
+                &["drop[0]".to_string(), "foo".to_string()],
+            );
+            assert!(
+                rendered.contains("asn"),
+                "{code} locale must mention asn in allowed targets; got: {rendered:?}"
+            );
+        }
     }
 
     #[test]
@@ -562,6 +746,29 @@ mod tests {
         assert!(choices.contains(&("ru".to_string(), "Русский".to_string())));
     }
 
+    /// A file whose stem is not a usable language code is skipped with a
+    /// warning: the code rides into the switcher links and the cookie, so
+    /// `..toml` or `de fr.toml` must not add a "language".
+    #[test]
+    fn locale_files_with_invalid_codes_are_skipped() {
+        let dir = std::env::temp_dir().join(format!(
+            "fumox-locales-code-{}",
+            fumox_core::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("..toml"), "\"lang.name\" = \"DotDot\"\n").unwrap();
+        std::fs::write(dir.join("de fr.toml"), "\"lang.name\" = \"X\"\n").unwrap();
+        std::fs::write(dir.join("ok-code.toml"), "\"lang.name\" = \"OK\"\n").unwrap();
+
+        let locales = Locales::load(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(!locales.contains("."));
+        assert!(!locales.contains("de fr"));
+        // A code within the accepted alphabet still loads.
+        assert!(locales.contains("ok-code"));
+    }
+
     #[test]
     fn lang_cookie_reading_and_writing() {
         let locales = Locales::load(Path::new("/nonexistent-locales-dir"));
@@ -573,9 +780,24 @@ mod tests {
         assert_eq!(locales.lang_from_headers(&headers).code(), "en");
         assert_eq!(locales.lang_from_headers(&HeaderMap::new()).code(), "ru");
 
+        // The language may arrive in its own `Cookie` header, not only in
+        // a shared one: every header is scanned.
+        let mut split = HeaderMap::new();
+        split.append(header::COOKIE, "other=1".parse().unwrap());
+        split.append(header::COOKIE, "fumox_lang=en".parse().unwrap());
+        assert_eq!(locales.lang_from_headers(&split).code(), "en");
+
+        // A quoted-string value reads as the bare code.
+        let mut quoted = HeaderMap::new();
+        quoted.insert(header::COOKIE, "fumox_lang=\"en\"".parse().unwrap());
+        assert_eq!(locales.lang_from_headers(&quoted).code(), "en");
+
         let cookie = lang_cookie("en");
         assert!(cookie.starts_with("fumox_lang=en;"));
         assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("Max-Age=31536000"));
     }
 
     /// Every key referenced by a template must exist in every embedded
@@ -604,13 +826,22 @@ mod tests {
     }
 
     /// The keys the Rust code looks up by value rather than by a literal
-    /// argument: the status labels of the proxy badges.
+    /// argument: the status labels of the proxy badges and the error-class
+    /// labels of the fetch journal.
     fn rust_side_keys() -> Vec<&'static str> {
         crate::admin::presentation::STATUS_KEYS
             .iter()
             .map(|(_, key)| *key)
+            .chain(
+                crate::admin::presentation::ERROR_CLASS_KEYS
+                    .iter()
+                    .map(|(_, key)| *key),
+            )
             .chain(std::iter::once(
                 crate::admin::presentation::UNKNOWN_STATUS_KEY,
+            ))
+            .chain(std::iter::once(
+                crate::admin::presentation::UNKNOWN_ERROR_CLASS_KEY,
             ))
             .collect()
     }

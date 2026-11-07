@@ -165,23 +165,40 @@
   // across toggles; the `hidden` attribute is the only visibility knob.
   // Runs on initial load (initial state) and on every HTMX settle (the
   // widget re-renders on preset / mode / preview refresh).
+  //
+  // The token names below are the contract between the rendered widget
+  // and this script: the template emits `data-ped-section="<name>"`,
+  // the radio group `ped_<name>` and the inner block
+  // `data-ped-inner="<name>"` for every section. A test suite keeps the
+  // two sides in sync (template_contracts.rs); change them together.
+  var PED_SECTION_ATTR = 'data-ped-section';
+  var PED_INNER_ATTR = 'data-ped-inner';
+  var PED_INPUT_PREFIX = 'ped_';
   (function () {
     function syncSection(section) {
-      var name = section.getAttribute('data-ped-section');
+      var name = section.getAttribute(PED_SECTION_ATTR);
       if (!name) return;
-      var checked = section.querySelector('input[name="ped_' + name + '"]:checked');
-      var inner = section.querySelector('[data-ped-inner="' + name + '"]');
+      var checked = section.querySelector('input[name="' + PED_INPUT_PREFIX + name + '"]:checked');
+      var inner = section.querySelector('[' + PED_INNER_ATTR + '="' + name + '"]');
       if (!inner) return;
       // Hide when the section is `skip`; show otherwise. `defaults`
       // and `set` keep the inner fields visible so the user can edit.
+      // A hidden block is disabled along with the hiding: its fields
+      // are dropped on save (the section is skipped), so submitting
+      // them would promise what the server silently ignores. Disabled
+      // controls are left out of the submission by both the plain form
+      // and htmx, and they keep their typed values for the toggle-back.
+      var inputs = inner.querySelectorAll('input, select, textarea');
       if (checked && checked.value === 'skip') {
         inner.setAttribute('hidden', '');
+        for (var i = 0; i < inputs.length; i++) inputs[i].disabled = true;
       } else {
         inner.removeAttribute('hidden');
+        for (var j = 0; j < inputs.length; j++) inputs[j].disabled = false;
       }
     }
     function syncAll(root) {
-      var sections = (root || document).querySelectorAll('[data-ped-section]');
+      var sections = (root || document).querySelectorAll('[' + PED_SECTION_ATTR + ']');
       for (var i = 0; i < sections.length; i++) syncSection(sections[i]);
     }
     syncAll(document);
@@ -190,8 +207,8 @@
       var target = event.target;
       if (!(target instanceof HTMLInputElement)) return;
       var name = target.name;
-      if (!name || name.indexOf('ped_') !== 0) return;
-      var section = target.closest('[data-ped-section]');
+      if (!name || name.indexOf(PED_INPUT_PREFIX) !== 0) return;
+      var section = target.closest('[' + PED_SECTION_ATTR + ']');
       if (section) syncSection(section);
     });
     // The widget is re-rendered by HTMX on preset / mode / preview
@@ -250,6 +267,87 @@
     syncRuleCounts();
   })();
 
+  // Pipeline rule rows: the container is re-rendered wholesale after a
+  // target change or a row removal, and only the target select carries
+  // a stable id for htmx to hand the focus back to. Track where the
+  // focus sat (row number and the control's position inside the row)
+  // and put it back after the settle; when the row the user was on was
+  // removed, land on the neighbouring remove button. A hidden live
+  // region next to the rows says that the list changed: the rows
+  // themselves stay silent, a re-rendered table would read itself out.
+  (function () {
+    var ROW_CONTAINER_SEL = '#ped-rows, #ped-drop-rows';
+    var snapshot = null;
+
+    function indexIn(parent, el) {
+      return Array.prototype.indexOf.call(parent.children, el);
+    }
+
+    // Where the focus sits, kept current on every focus move inside the
+    // rows: the restore must not depend on which control fired the
+    // request.
+    document.body.addEventListener('focusin', function (event) {
+      var active = event.target;
+      if (!active || !active.closest) return;
+      var row = active.closest('.ped-row');
+      if (!row) return;
+      var container = row.closest(ROW_CONTAINER_SEL);
+      if (!container) return;
+      snapshot = {
+        container: container.id,
+        row: indexIn(container, row),
+        control: indexIn(row, active),
+        removed: false
+      };
+    });
+
+    // The remove button drops its own row: remember the row so the
+    // focus can land on the neighbour's button after the swap. The
+    // click runs before the request; the button's hx-post carries the
+    // rows endpoint's `remove=` form — a contract with _rows.html.
+    document.body.addEventListener('click', function (event) {
+      var target = event.target;
+      if (!(target instanceof HTMLButtonElement)) return;
+      var row = target.closest('.ped-row');
+      if (!row) return;
+      var container = row.closest(ROW_CONTAINER_SEL);
+      if (!container) return;
+      var path = target.getAttribute('hx-post') || '';
+      if (path.indexOf('remove=') === -1) return;
+      snapshot = {
+        container: container.id,
+        row: indexIn(container, row),
+        removed: true
+      };
+    });
+
+    document.body.addEventListener('htmx:afterSettle', function (event) {
+      var target = event.detail && event.detail.target;
+      if (!target || !snapshot) return;
+      if (target.id !== 'ped-rows' && target.id !== 'ped-drop-rows') return;
+      var remembered = snapshot;
+      snapshot = null;
+
+      var live = document.querySelector('[data-ped-live="' + remembered.container + '"]');
+      if (live) live.textContent = live.getAttribute('data-list-changed') || '';
+
+      // The keyboard user's focus fell to <body> with the row it sat
+      // in; put it back, but only when focus was not moved elsewhere in
+      // the meantime.
+      if (document.activeElement !== document.body) return;
+      var rows = target.querySelectorAll('.ped-row');
+      if (!rows.length) return;
+      var row = remembered.removed
+        ? rows[Math.min(remembered.row, rows.length - 1)]
+        : rows[remembered.row];
+      if (!row) return;
+      var control = remembered.removed
+        ? row.querySelector('button')
+        : row.children[remembered.control];
+      if (control && typeof control.focus === 'function') control.focus();
+    });
+  })();
+
   // Dialogs: a trigger carries `data-dialog-open="<dialog id>"`, a
   // cancel button carries `data-dialog-close`. The no-JS fallback in
   // base.html renders the dialog as a plain panel and hides the trigger,
@@ -304,6 +402,15 @@
       var message = xhr && xhr.responseText ? xhr.responseText.trim() : '';
       slot.textContent = message || slot.getAttribute('data-error-fallback') || '';
     });
+    // A request that never got an answer (the network dropped, the
+    // server is gone): htmx fires sendError and no responseError, so
+    // without this the slot would keep claiming the action succeeded.
+    // There is no body to print, the slot's fallback text stands in.
+    document.body.addEventListener('htmx:sendError', function (event) {
+      var slot = slotFor(event.detail && event.detail.elt);
+      if (!slot) return;
+      slot.textContent = slot.getAttribute('data-error-fallback') || '';
+    });
   })();
 
   // A table that refreshes itself: the container is re-rendered on every
@@ -345,19 +452,13 @@
     updateAll();
   })();
 
-  // The theme and language switchers return to the current page: the
-  // link carries `data-next`, the current path is appended as `next`.
-  document.body.addEventListener('click', function (event) {
-    var target = event.target;
-    if (!target || !target.closest) return;
-    var link = target.closest('a[data-next]');
-    if (!link) return;
-    var href = link.getAttribute('href');
-    if (!href || href.indexOf('next=') !== -1) return;
-    link.setAttribute(
-      'href',
-      href + '&next=' + encodeURIComponent(location.pathname + location.search)
-    );
+  // The theme and language switchers return to the current page: their
+  // hidden `next` inputs carry the current path, filled here once per
+  // document load (the script is deferred, so this runs before any
+  // interaction). Without JavaScript the inputs stay empty and the
+  // server falls back to the dashboard.
+  document.querySelectorAll('input[data-next-input]').forEach(function (input) {
+    input.value = location.pathname + location.search;
   });
 
   // A select that submits its own form (the dashboard's row count).

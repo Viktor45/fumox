@@ -1,0 +1,17 @@
+{#- Shared badge macros for the admin tables. The importing templates
+    call them per row (an include cannot see loop variables, a macro
+    takes them as arguments); both macros read `self.t` and the status
+    helpers from the calling template's context, so the badges render in
+    the page language everywhere, htmx-swapped fragments included. -#}
+
+{#- The on/off state badge: `on` is the row's enabled flag. -#}
+{% macro enabled(on) -%}
+{%- if on %}<span class="badge on">{{ self.t("common.on") }}</span>{% else %}<span class="badge off">{{ self.t("common.off") }}</span>{% endif %}
+{%- endmacro %}
+
+{#- The fetch error-class badge: `cls` is the wire token of the error
+    class; the CSS modifier is the token itself and the label is
+    localized. -#}
+{% macro error_badge(cls) -%}
+<span class="badge {{ self.error_class_badge_class(cls) }}">{{ self.error_class_label(cls) }}</span>
+{%- endmacro %}

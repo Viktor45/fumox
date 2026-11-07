@@ -2,8 +2,11 @@
    No framework, no CDN: the interface must work offline.
 
    Day/night themes: every color goes through a CSS custom property; the
-   server renders the chosen theme as <html data-theme="light|dark"> and
-   the palette flips below. The topbar stays dark navy in both themes. */
+   server renders the chosen theme as <html data-theme="auto|light|dark">
+   and the palette flips below. `auto` (the default, no explicit choice
+   yet) follows the OS setting through the `prefers-color-scheme` media
+   query right under the dark block. The topbar stays dark navy in both
+   themes. */
 
 :root {
   color-scheme: light;
@@ -52,11 +55,19 @@
   --topbar-link: #c3cbdc;
   --topbar-hover: rgba(255, 255, 255, 0.08);
   --topbar-active: rgba(255, 255, 255, 0.14);
+  /* SSE status dot on the dark topbar: live and stale. Fixed values in
+     both themes (like the topbar itself), not the --ok/--warn pairs. */
+  --topbar-ok: #4cc38a;
+  --topbar-warn: #d9a441;
   /* switchers (language/theme) outside the topbar, login screen */
   --switch-text: #5a6478;
   --switch-hover: rgba(20, 32, 58, 0.06);
   --switch-active-bg: rgba(20, 32, 58, 0.1);
   --switch-active-text: #14203a;
+  /* Clearance the sticky topbar needs above a focused or
+     program-scrolled control (52px bar + margin). The 1300px media
+     query re-declares it for the wrapped two-row topbar. */
+  --scroll-offset: 64px;
   font-size: 15px;
 }
 
@@ -95,6 +106,51 @@
   --switch-hover: rgba(255, 255, 255, 0.08);
   --switch-active-bg: rgba(255, 255, 255, 0.14);
   --switch-active-text: #ffffff;
+}
+
+/* No explicit choice (`auto`, the default): follow the OS setting. The
+   dark palette repeats the `[data-theme="dark"]` block above verbatim —
+   CSS has no mixins and the panel has no build step, one duplicated
+   block is the cheaper evil; keep the two in sync. The selector matches
+   `data-theme="auto"` and a missing attribute; re-matching an explicit
+   `dark` is harmless (same values). */
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #12151c;
+    --panel: #1a1f28;
+    --border: #2a3140;
+    --border-strong: #6f7a8e;
+    --text: #e7eaf0;
+    --muted: #98a1b3;
+    --accent: #7aa2f7;
+    --accent-hover: #97b5f9;
+    --on-accent: #14203a;
+    --danger: #ef8a90;
+    --danger-bg: #3a2226;
+    --ok: #4cc38a;
+    --ok-bg: #1d3229;
+    --warn: #d9a441;
+    --warn-bg: #362c1a;
+    --info-bg: #22304d;
+    --ready: #a78bfa;
+    --ready-bg: #2a2236;
+    --code-bg: #232936;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+    --th-bg: #202634;
+    --row-hover: #1f2530;
+    --badge-neutral-bg: #2a3140;
+    --input-bg: #141821;
+    --focus-ring: #7aa2f7;
+    --btn-bg: #1f2530;
+    --btn-hover: #262e3d;
+    --toast-bg: #2a3140;
+    --toast-text: #e7eaf0;
+    --switch-text: #98a1b3;
+    --switch-hover: rgba(255, 255, 255, 0.08);
+    --switch-active-bg: rgba(255, 255, 255, 0.14);
+    --switch-active-text: #ffffff;
+  }
 }
 
 * { box-sizing: border-box; }
@@ -165,26 +221,35 @@ a:hover { text-decoration: underline; }
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #d9a441;
+  background: var(--topbar-warn);
 }
-.sse-status[data-state="live"]::before { background: #4cc38a; }
-.sse-status[data-state="stale"]::before { background: #d9a441; }
+.sse-status[data-state="live"]::before { background: var(--topbar-ok); }
+.sse-status[data-state="stale"]::before { background: var(--topbar-warn); }
 
-/* language/theme switchers (topbar: dark context, login box: page context) */
-.lang-switch { display: inline-flex; gap: 2px; }
+/* language/theme switchers (topbar: dark context, login box: page context).
+   The topbar switchers are POST forms (the setters are CSRF-protected
+   POSTs, see admin::router); the login screen keeps plain links. The
+   button rules reset the UA chrome so a button reads as the link it
+   replaced. */
+.lang-switch { display: inline-flex; gap: 2px; margin: 0; }
 /* Theme icons (sun/moon, inline SVG, no icon font: offline-safe) are
    shown only on very narrow screens, where the text labels would push
    the logout button off the first topbar row (see the 480px block). */
-.lang-switch a .theme-icon { display: none; }
-.lang-switch a {
+.lang-switch button .theme-icon { display: none; }
+.lang-switch button {
+  appearance: none;
+  background: none;
+  border: 0;
+  font: inherit;
+  cursor: pointer;
   color: var(--topbar-link);
   font-size: 12px;
   padding: 4px 8px;
   border-radius: 6px;
   white-space: nowrap;
 }
-.lang-switch a:hover { background: var(--topbar-hover); text-decoration: none; }
-.lang-switch a.active { background: var(--topbar-active); color: var(--topbar-brand); }
+.lang-switch button:hover { background: var(--topbar-hover); text-decoration: none; }
+.lang-switch button.active { background: var(--topbar-active); color: var(--topbar-brand); }
 .lang-switch.login-lang a { color: var(--switch-text); }
 .lang-switch.login-lang a:hover { background: var(--switch-hover); text-decoration: none; }
 .lang-switch.login-lang a.active { background: var(--switch-active-bg); color: var(--switch-active-text); }
@@ -311,6 +376,10 @@ table.data td.rank { white-space: nowrap; }
    The word stays whole and .table-scroll takes the width instead. */
 table.data td > a { overflow-wrap: normal; }
 table.data .truncate { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The order cell of the source-composition table (profile form): the
+   number input stays narrow enough not to stretch its column. Replaces
+   an inline width style, so the rule lives with the other table rules. */
+table.data input.order-pos { width: 80px; }
 /* Truncated source link inside a table cell (dashboard, fetch journal):
    same effect as .truncate, but as a class instead of an inline style. */
 .cell-link {
@@ -384,6 +453,11 @@ time.ts { white-space: nowrap; }
   font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
+  /* Neutral fallback: a badge whose class has no rule below (a new
+     ErrorClass variant, an unmodelled status) still renders readable
+     instead of transparent-on-transparent. */
+  background: var(--badge-neutral-bg);
+  color: var(--muted);
 }
 .badge.alive { background: var(--ok-bg); color: var(--ok); }
 .badge.ready { background: var(--ready-bg); color: var(--ready); }
@@ -393,9 +467,14 @@ time.ts { white-space: nowrap; }
 .badge.on { background: var(--ok-bg); color: var(--ok); }
 .badge.off { background: var(--badge-neutral-bg); color: var(--muted); }
 .badge.error { background: var(--danger-bg); color: var(--danger); }
+/* Error-class badges: one rule per ErrorClass variant (fumox-core
+   models::ErrorClass) — keep this block in sync when the enum grows.
+   `storage` is not an upstream failure (the feed was fine, the write
+   failed), so it renders neutral like `.off`, not alarming. */
 .badge.network, .badge.http_server { background: var(--warn-bg); color: var(--warn); }
 .badge.http_client { background: var(--danger-bg); color: var(--danger); }
 .badge.parse_error { background: var(--info-bg); color: var(--accent); }
+.badge.storage { background: var(--badge-neutral-bg); color: var(--muted); }
 .badge.neutral { background: var(--badge-neutral-bg); color: var(--muted); }
 
 /* forms */
@@ -530,7 +609,7 @@ input.tab-input {
 :where(.btn,
        .btn.primary, .btn.danger,
        .topbar nav a,
-       .lang-switch a, .lang-switch.login-lang a,
+       .lang-switch button, .lang-switch.login-lang a,
        .pagination a, .pagination span.page):focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
@@ -659,8 +738,10 @@ input.tab-input {
    it sits next to the table and stays empty until something arrives. */
 .live-status { display: block; min-height: 18px; color: var(--muted); font-size: 13px; }
 /* Focused or program-scrolled controls must stay clear of the sticky
-   topbar (52px + margin). */
-input, select, textarea, button, a, [tabindex] { scroll-margin-top: 64px; }
+   topbar (52px + margin); the offset lives in --scroll-offset so the
+   wrapped-topbar media query below re-declares the value instead of
+   repeating the whole rule. */
+input, select, textarea, button, a, [tabindex] { scroll-margin-top: var(--scroll-offset); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 code, pre.code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -695,7 +776,9 @@ pre.mono { white-space: pre-wrap; }
   background: var(--btn-bg);
 }
 .pagination span.current { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
-.pagination span.gap { border: none; background: none; color: var(--muted); padding: 4px 4px; }
+/* The gap dots are a link to the first page the window hides (see
+   _pagination.html), so the rule covers the anchor too. */
+.pagination .gap { border: none; background: none; color: var(--muted); padding: 4px 4px; }
 
 .filters {
   display: flex;
@@ -770,6 +853,8 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   justify-content: center;
 }
 .login-box { width: min(340px, calc(100vw - 32px)); }
+/* The panel padding already separates the prefs row from the heading. */
+.login-heading { margin-top: 0; }
 
 .htmx-indicator { display: none; }
 .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline-block; }
@@ -963,8 +1048,8 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 
 /* Live preview in-flight cue: htmx flags the builder with
    .htmx-request while the preview request runs (the preview container
-   is the builder's sibling). */
-#ped-builder.htmx-request ~ #ped-preview { opacity: 0.55; }
+   sits inside the builder, so the rule is a descendant selector). */
+#ped-builder.htmx-request #ped-preview { opacity: 0.55; }
 
 /* topbar squeeze (phones) */
 
@@ -975,9 +1060,9 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
    dark theme. */
 @media (max-width: 480px) {
   .topbar { gap: 2px 8px; }
-  .lang-switch a { padding: 4px 8px; }
-  .theme-switch a .theme-label { display: none; }
-  .theme-switch a .theme-icon {
+  .lang-switch button { padding: 4px 8px; }
+  .theme-switch button .theme-label { display: none; }
+  .theme-switch button .theme-icon {
     display: inline-block;
     vertical-align: -3px;
   }
@@ -1025,8 +1110,8 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   }
   /* Below 1300px the topbar wraps to two rows (~110px): the 64px base
      scroll-margin drops anchors and validation focus behind the header. */
-  input, select, textarea, button, a, [tabindex] {
-    scroll-margin-top: 120px;
+  :root {
+    --scroll-offset: 120px;
   }
 }
 
@@ -1132,10 +1217,11 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 
   /* Pipeline builder rows: the base `flex: 0 0 70px` on `.mono` inputs
      plus the four other controls exceed a 360 px row. Let everything
-     grow to 100 % and stack vertically. */
+     grow to 100 % and stack vertically. The important shorthand on
+     `.ped-row > *` already resets every child's basis, so no per-input
+     override is needed. */
   .ped-row { flex-direction: column; align-items: stretch; }
   .ped-row > * { flex: 1 1 auto !important; width: 100%; min-width: 0; }
-  .ped-row input[type="text"]:not(.mono) { flex-basis: auto; }
   .ped-arrow { transform: rotate(90deg); align-self: flex-start; }
   /* The remove button keeps its own size: a full-width row of its own is
      an easy mis-tap on a destructive action, and it wasted a whole

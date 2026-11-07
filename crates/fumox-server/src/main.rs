@@ -19,6 +19,8 @@ mod redact;
 mod scheduler;
 mod security;
 mod serve;
+#[cfg(test)]
+mod test_support;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -51,6 +53,9 @@ struct Cli {
     /// Probe the running server's /healthz and exit 0 when it answers 200,
     /// 1 otherwise. Used as the container healthcheck: the runtime image
     /// ships no curl or wget, and the binary already has an HTTP client.
+    /// The bind address comes from the same config the server reads, so
+    /// the probe needs the same `--config`/FUMOX_CONFIG the server was
+    /// started with.
     #[arg(long)]
     health_check: bool,
 
@@ -84,7 +89,13 @@ async fn main() -> anyhow::Result<()> {
         return match probe_healthz(config.server.bind).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                eprintln!("/healthz did not answer 200: {error}");
+                // The URL, not the bare endpoint: the address the probe
+                // derived from the bind is the first thing to compare
+                // against the listener the server actually opened.
+                eprintln!(
+                    "{} did not answer 200: {error}",
+                    health_probe_url(config.server.bind)
+                );
                 std::process::exit(1);
             }
         };
@@ -246,8 +257,11 @@ async fn main() -> anyhow::Result<()> {
     let events = events::EventBus::new();
     // The admin panel sends source ids over this channel for an immediate
     // refresh; the sender lives in the serving state, the receiver drives
-    // the scheduler loop.
-    let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // the scheduler loop. Bounded with `try_send` on the sender side: a
+    // flood of clicks is dropped instead of piling up behind a wedged
+    // loop.
+    let (refresh_tx, refresh_rx) =
+        tokio::sync::mpsc::channel::<String>(scheduler::REFRESH_CHANNEL_CAP);
     let scheduler_task = tokio::spawn(scheduler::run(
         scheduler::IngestEnv {
             pool: pool.clone(),
@@ -270,14 +284,14 @@ async fn main() -> anyhow::Result<()> {
         scheduler::ServerRetention::from_config(&config),
     ));
 
-    // Public listener: /sub/{id}, /src/{id} and /export/alive/{token}.
+    // Public listener: /sub/{id}, /src/{id}, /export/alive/{token} and
+    // /export/ready/{token}.
     //
     // `/healthz` gets a pool of its own, one connection, so its answer does
     // not queue behind renders. An orchestrator reads 503 as "restart me",
-    // and a busy render pool is this process's own load, not a fault.
-    let mut health_cfg = config.database.clone();
-    health_cfg.max_connections = 1;
-    let health_pool = fumox_core::db::connect_pool(&health_cfg).await?;
+    // and a busy render pool is this process's own load, not a fault. The
+    // type (`serve::HealthPool`) is what proves the pool stays dedicated.
+    let health_pool = serve::HealthPool::dedicated(&config.database).await?;
 
     let state = serve::AppState::new(
         pool.clone(),
@@ -287,8 +301,7 @@ async fn main() -> anyhow::Result<()> {
         admin::parse_trusted_cidrs(&config.server.trust_proxy_ips),
         config.server.trust_proxy_header,
         config.server.allowed_hosts.clone(),
-        config.server.export_max_rows,
-        export_token.clone(),
+        alive_export::ExportState::new(config.server.export_max_rows, export_token.clone()),
     );
     let app = serve::public_app(state, health_pool.clone());
 
@@ -315,8 +328,28 @@ async fn main() -> anyhow::Result<()> {
         axum::Router::new()
     };
 
-    let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
-    let admin_listener = tokio::net::TcpListener::bind(config.admin.bind).await?;
+    // The binds do not shortcut with `?`: a failed bind takes the same
+    // completion as a server that served and stopped — the scheduler drain
+    // and the in-flight warning run on this path too, and the error is
+    // reported after the exit line rather than in place of it.
+    let (listener, admin_listener) = match (
+        tokio::net::TcpListener::bind(config.server.bind).await,
+        tokio::net::TcpListener::bind(config.admin.bind).await,
+    ) {
+        (Ok(listener), Ok(admin_listener)) => (listener, admin_listener),
+        (listener, admin_listener) => {
+            let error = listener
+                .err()
+                .or(admin_listener.err())
+                .expect("the arm above took the both-ok case");
+            tracing::error!(error = %error, "cannot bind the listeners");
+            // The admin router holds the channel's other sender: drop it,
+            // so the scheduler below sees the close, not the timeout.
+            drop(admin_router);
+            finish_shutdown(refresh_tx, scheduler_task, &scheduler_state).await;
+            return Err(error.into());
+        }
+    };
     tracing::info!(bind = %config.server.bind, "fumox-server listening");
 
     // The listeners are bound; the download still runs. Give it its
@@ -363,9 +396,9 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
     .into_future();
 
-    // Drain the background scheduler even when a listener failed: the
-    // `?` used to return here first, so a bind error skipped the drain and
-    // the process exited with the scheduler's in-flight fetches unnamed.
+    // A listener's error surfaces only at the end, after the shared
+    // completion below — the same drain the failed binds above take, so
+    // no exit path skips it.
     let serving = tokio::select! {
         // A listener that fails ends the wait right away.
         result = async {
@@ -390,10 +423,26 @@ async fn main() -> anyhow::Result<()> {
     drop(public_server);
     drop(admin_server);
 
-    // Dropping `refresh_tx` (the admin router's clone went with its
-    // server) closes the channel, and the loop treats that as its
-    // shutdown signal. The await is bounded so a wedged loop cannot hold
-    // the process past its shutdown.
+    finish_shutdown(refresh_tx, scheduler_task, &scheduler_state).await;
+    serving?;
+    Ok(())
+}
+
+/// The one completion every exit behind the startup takes: close the
+/// scheduler's refresh channel, wait (bounded) for the loop to stop, name
+/// the in-flight fetches that are being abandoned, and log the completion
+/// line. Called both after the listeners end — a shutdown signal, or a
+/// listener that failed — and when a bind fails, so no exit path skips
+/// the drain the old `?` shortcuts used to.
+async fn finish_shutdown(
+    refresh_tx: tokio::sync::mpsc::Sender<String>,
+    scheduler_task: tokio::task::JoinHandle<()>,
+    scheduler_state: &SchedulerState,
+) {
+    // Dropping the last sender closes the channel (the admin router's
+    // clone went with its server, or was dropped by the caller), and the
+    // loop treats that as its shutdown signal. The await is bounded so a
+    // wedged loop cannot hold the process past its shutdown.
     drop(refresh_tx);
     match tokio::time::timeout(Duration::from_secs(5), scheduler_task).await {
         Ok(Ok(())) => {}
@@ -413,8 +462,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("shutdown complete");
-    serving?;
-    Ok(())
 }
 
 /// GET the local public listener's `/healthz` and accept only 200. The

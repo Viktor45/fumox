@@ -2,6 +2,7 @@
     live hx-get refresh of #log-live (source card) and included by
     sources/detail.html for the initial server render, the markup lives
     here exactly once. -#}
+{% import "../_badges.html" as badges %}
 {% if log.is_empty() %}
   <p class="muted">{{ self.t("dash.no_fetches") }}</p>
 {% else %}
@@ -19,7 +20,7 @@
               <span class="badge alive">{{ self.t("common.ok") }}</span>
             {% else %}
               {% match row.error_class %}
-                {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+                {% when Some with (class) %}{% call badges::error_badge(class) %}{% endcall %}
                 {% when None %}<span class="badge error">{{ self.t("common.error") }}</span>
               {% endmatch %}
             {% endif %}
@@ -41,7 +42,9 @@
             {% match row.error %}
               {% when Some with (message) %}
                 <span class="cell-wrap">{{ message }}</span>
-              {% when None %}
+              {#- The dash keeps the column from collapsing; the label
+                  says what it means (a missing message is not an error). -#}
+              {% when None %}<span class="muted" aria-label="{{ self.t("common.no_error") }}">–</span>
             {% endmatch %}
           </td>
         </tr>

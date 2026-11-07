@@ -23,7 +23,7 @@
 //! periodic one the scheduler runs.
 
 use fumox_core::db::DbPool;
-use fumox_core::geo::{GeoFactMask, GeoInfo, GeoResolver};
+use fumox_core::geo::{GEO_LOOKUP_CONCURRENCY, GeoFactMask, GeoInfo, GeoResolver};
 use fumox_core::repo::proxies::{self, GeoStamp};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,34 +31,9 @@ use std::time::Duration;
 /// How many rows to pull from the database per pass.
 const BATCH: i64 = 500;
 
-/// Ceiling on concurrent host lookups inside one backfill pass, the same
-/// shape ingest uses (`GEO_LOOKUP_CONCURRENCY` there): every unseen
-/// domain host costs up to `[geo].dns_timeout` (5 s by default) when DNS
-/// hangs, so the lookups run concurrently instead of one await per row.
-const GEO_LOOKUP_CONCURRENCY: usize = 32;
-
-/// Wall-clock budget for one backfill pass, mirroring the geo download
-/// startup budget (`[geo].startup_download_budget_secs`, 60 s by default,
-/// the same bound `main` applies to `geo_download`). `main` passes the
-/// configured value straight through [`backfill_missing_geo_within_budget`];
-/// this default only backs [`backfill_missing_geo`], the config-less shape
-/// the tests drive. Past the budget the pass stops issuing lookups and the
-/// rows it did not reach stay NULL for the next start.
-#[cfg(test)]
-const DEFAULT_STARTUP_BUDGET: Duration = Duration::from_secs(60);
-
-/// Fill geo facts for every proxy row that has none, bounded by
-/// [`DEFAULT_STARTUP_BUDGET`] (the tests' config-less shape; `main` calls
-/// [`backfill_missing_geo_within_budget`] with the configured budget).
-/// Never blocks startup: call sites spawn it as a background task.
-#[cfg(test)]
-pub async fn backfill_missing_geo(pool: DbPool, geo: Arc<GeoResolver>) {
-    backfill_missing_geo_within_budget(pool, geo, DEFAULT_STARTUP_BUDGET).await;
-}
-
-/// [`backfill_missing_geo`] with an explicit wall-clock budget, for
-/// callers holding the config (pass
-/// `config.geo.startup_download_budget()`).
+/// Fill geo facts for every proxy row that has none, bounded by `budget`
+/// (pass `config.geo.startup_download_budget()`). Never blocks startup:
+/// call sites spawn it as a background task.
 pub async fn backfill_missing_geo_within_budget(
     pool: DbPool,
     geo: Arc<GeoResolver>,
@@ -68,20 +43,34 @@ pub async fn backfill_missing_geo_within_budget(
         tracing::debug!("geo resolver inactive, skipping geo backfill");
         return;
     }
-    let mask = geo.fact_mask();
+    backfill_pass(geo.as_ref(), &pool, geo.fact_mask(), budget).await;
+}
+
+/// [`backfill_missing_geo_within_budget`] around any [`GeoLookup`] with an
+/// explicit fact mask: the shared tail of the pass (the walk, the
+/// remaining count, the summary). The tests drive it with fake resolvers,
+/// so the lookup shape and the second-pass no-op are observable without a
+/// MaxMind database on the machine.
+async fn backfill_pass<G: GeoLookup>(geo: &G, pool: &DbPool, mask: GeoFactMask, budget: Duration) {
     let started = std::time::Instant::now();
-    let updated = run_backfill(geo.as_ref(), &pool, budget, mask).await;
+    let updated = run_backfill(geo, pool, budget, mask).await;
     // Rows the resolver could not answer (or the budget did not reach) stay
     // missing; the summary names how many, so a directory without a usable
     // database is visible instead of only the rows that happened to
     // resolve.
-    let remaining = proxies::count_missing_geo(&pool, mask).await.ok();
+    let remaining = match proxies::count_missing_geo(pool, mask).await {
+        Ok(count) => Some(count),
+        Err(err) => {
+            tracing::warn!(error = %err, "geo backfill: cannot count remaining rows");
+            None
+        }
+    };
     if updated > 0 || remaining != Some(0) {
         tracing::info!(
             updated,
             remaining = ?remaining,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "geo backfill complete"
+            "geo backfill pass finished"
         );
     } else {
         tracing::debug!("geo backfill: nothing to fill");
@@ -179,6 +168,16 @@ async fn run_backfill<G: GeoLookup>(
         .buffered(GEO_LOOKUP_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
+        // One batch commits as one transaction: the fact updates of a batch
+        // land together or not at all, so a concurrent reader never sees
+        // half of a batch's rows filled.
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(err) => {
+                tracing::warn!(error = %err, "geo backfill: cannot open the batch transaction");
+                return updated;
+            }
+        };
         for ((id, _), stamp) in rows.iter().zip(stamps) {
             cursor = (*id).max(cursor);
             match stamp {
@@ -189,18 +188,21 @@ async fn run_backfill<G: GeoLookup>(
                 // address: remember the attempt so the next pass leaves the
                 // row alone for a while.
                 Lookup::NoFacts => {
-                    if let Err(err) = proxies::mark_geo_attempt(pool, *id, now()).await {
+                    if let Err(err) = proxies::mark_geo_attempt_tx(&mut tx, *id, now()).await {
                         tracing::warn!(proxy = id, error = %err, "geo backfill: cannot record the attempt");
                     }
                 }
                 Lookup::Facts(stamp) => {
-                    if let Err(err) = proxies::update_geo(pool, *id, &stamp).await {
+                    if let Err(err) = proxies::update_geo_tx(&mut tx, *id, &stamp).await {
                         tracing::warn!(proxy = id, error = %err, "geo backfill: update failed");
                     } else {
                         updated += 1;
                     }
                 }
             }
+        }
+        if let Err(err) = tx.commit().await {
+            tracing::warn!(error = %err, "geo backfill: cannot commit the batch");
         }
         if !has_more {
             break;
@@ -247,28 +249,12 @@ mod tests {
         pool
     }
 
-    /// GeoLite2-City from the workspace `config/` directory (gitignored ,
-    /// the test skips itself when the file is absent, like the geo tests).
-    fn geo_resolver() -> Option<Arc<GeoResolver>> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/GeoLite2-City.mmdb");
-        if !path.exists() {
-            return None;
-        }
-        let cfg = GeoConfig {
-            enabled: true,
-            db_dir: path.parent().unwrap().to_path_buf(),
-            ..Default::default()
-        };
-        let resolver = GeoResolver::new(&cfg);
-        resolver.is_active().then(|| Arc::new(resolver))
-    }
-
     fn source(id: &str) -> Source {
         let now = fumox_core::models::now_ts();
         Source {
             id: id.into(),
             slug: None,
+            access_token: None,
             name: "s".into(),
             url: "https://example.com".into(),
             enabled: true,
@@ -405,14 +391,11 @@ mod tests {
     }
 
     /// Rows ingested without geo (empty stamp slice, as an inactive resolver
-    /// produces) start with NULL columns; the backfill fills them. Skipped
-    /// without the mmdb file (CI runs without it).
+    /// produces) start with NULL columns; the backfill fills them. The fake
+    /// resolver stands in for the MaxMind databases, so the test runs on
+    /// every machine, not only where a City database is installed.
     #[tokio::test]
     async fn backfill_fills_rows_ingested_without_geo() {
-        let Some(geo) = geo_resolver() else {
-            eprintln!("skipping: config/GeoLite2-City.mmdb not present");
-            return;
-        };
         let pool = temp_pool().await;
         let src = source("srcBackfill01");
         fumox_core::repo::sources::create(&pool, &src)
@@ -431,15 +414,30 @@ mod tests {
         .unwrap();
         assert_eq!(fetch_row(&pool, "8.8.8.8").await.geo_country, None);
 
-        backfill_missing_geo(pool.clone(), geo.clone()).await;
+        let geo = FakeGeo {
+            delay: Duration::ZERO,
+            stats: Arc::new(LookupStats::default()),
+        };
+        backfill_pass(&geo, &pool, BOTH_FACTS, Duration::from_secs(60)).await;
 
         let first = fetch_row(&pool, "8.8.8.8").await;
         let second = fetch_row(&pool, "8.8.4.4").await;
         assert_eq!(first.geo_country.as_deref(), Some("US"));
         assert!(second.geo_country.is_some());
 
-        // A second run is a no-op: the rows no longer count as missing.
-        backfill_missing_geo(pool.clone(), geo).await;
+        // A second run is a no-op: the rows no longer count as missing, and
+        // the facts the first pass stored are not touched.
+        backfill_pass(&geo, &pool, BOTH_FACTS, Duration::from_secs(60)).await;
+
+        assert_eq!(
+            fetch_row(&pool, "8.8.8.8").await.geo_country.as_deref(),
+            Some("US"),
+            "the second pass must not disturb the stored facts"
+        );
+        assert_eq!(
+            proxies::count_missing_geo(&pool, BOTH_FACTS).await.unwrap(),
+            0
+        );
     }
 
     /// A row that carries a country but no ASN counted as filled under the
@@ -537,7 +535,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         }));
-        backfill_missing_geo(pool.clone(), inactive).await;
+        backfill_missing_geo_within_budget(pool.clone(), inactive, Duration::from_secs(60)).await;
         assert_eq!(fetch_row(&pool, "8.8.8.8").await.geo_country, None);
     }
 

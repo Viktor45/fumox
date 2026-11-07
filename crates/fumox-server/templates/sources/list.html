@@ -1,5 +1,9 @@
 {% extends "base.html" %}
 
+{#- The badges are shared macros: the list renders them per row, the
+    source journal (sources/_log.html) renders the error one too. -#}
+{% import "../_badges.html" as badges %}
+
 {% block title %}{{ self.t("nav.sources") }}{% endblock %}
 
 {% block content %}
@@ -45,15 +49,16 @@
   {% else %}
     <div class="table-scroll">
       <table class="data">
+        <caption class="visually-hidden">{{ self.t("nav.sources") }}</caption>
         <thead>
           <tr>
-            <th>{{ self.t("common.name") }}</th>
-            <th class="col-optional">{{ self.t("common.slug") }}</th>
-            <th class="col-optional">{{ self.t("common.url") }}</th>
-            <th>{{ self.t("nav.proxies") }}</th>
-            <th>{{ self.t("src.ttl_column") }}</th>
-            <th>{{ self.t("dash.last_fetch") }}</th>
-            <th>{{ self.t("common.state") }}</th>
+            <th scope="col">{{ self.t("common.name") }}</th>
+            <th scope="col" class="col-optional">{{ self.t("common.slug") }}</th>
+            <th scope="col" class="col-optional">{{ self.t("common.url") }}</th>
+            <th scope="col">{{ self.t("nav.proxies") }}</th>
+            <th scope="col">{{ self.t("src.ttl_column") }}</th>
+            <th scope="col">{{ self.t("dash.last_fetch") }}</th>
+            <th scope="col">{{ self.t("common.state") }}</th>
           </tr>
         </thead>
         <tbody>
@@ -66,18 +71,17 @@
                 {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
-            <td class="small truncate col-optional">{{ row.url }}</td>
+            {#- The cell is clipped, the tooltip carries the whole URL.
+                The handler masks the row's secrets (mask_url_secrets), so
+                the title shows no credential either. -#}
+            <td class="small truncate col-optional" title="{{ row.url }}">{{ row.url }}</td>
             <td class="num">{{ row.proxies_count }}</td>
             <td class="num">{{ row.cache_ttl_seconds }}</td>
             <td class="small muted">{{ self.opt_ts(row.last_fetched_at) | safe }}</td>
             <td>
-              {% if row.enabled %}
-                <span class="badge on">{{ self.t("common.on") }}</span>
-              {% else %}
-                <span class="badge off">{{ self.t("common.off") }}</span>
-              {% endif %}
+              {% call badges::enabled(row.enabled) %}{% endcall %}
               {% match row.error_class %}
-                {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+                {% when Some with (class) %}{% call badges::error_badge(class) %}{% endcall %}
                 {% when None %}
               {% endmatch %}
             </td>

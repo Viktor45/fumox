@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use fumox_core::models::{ProxyStatus, Scheme, now_ts};
+use fumox_core::models::{CountryCode, ProxyStatus, Scheme, now_ts};
 use fumox_core::repo::probe as probe_repo;
 use fumox_core::repo::proxies::{
     self, CheckCoverage, ProxyLinkRow, ProxyListCursor, ProxyListDirection, ProxyListFilter,
@@ -29,6 +29,10 @@ use fumox_core::repo::proxies::{
 };
 
 // List
+
+/// The placeholder every cell without a value renders: a bare comma or an
+/// empty string in its place reads as a typo or as missing markup.
+const NO_VALUE: &str = "–";
 
 #[derive(Template)]
 #[template(path = "proxies/list.html")]
@@ -62,6 +66,11 @@ struct ProxiesListTemplate {
     f_sort: String,
     /// Active coverage bucket ("" = no filter).
     f_coverage: String,
+    /// The current view as a query string (empty when nothing narrows
+    /// it). The bulk-action dialogs carry it as a hidden field, so the
+    /// redirect after an action lands back on the same filtered page
+    /// instead of resetting the operator's view.
+    view_query: String,
     all_statuses: Vec<(String, bool)>,
     all_schemes: Vec<(String, bool)>,
     countries: Vec<String>,
@@ -123,7 +132,7 @@ impl ProxiesListTemplate {
             (false, true) => "T2".to_string(),
             // Same placeholder the timestamp cells use, a bare comma here
             // read as a typo.
-            (false, false) => "–".to_string(),
+            (false, false) => NO_VALUE.to_string(),
         }
     }
 }
@@ -235,6 +244,41 @@ fn list_query_suffix(filter: &ProxyListFilter, order: ProxyListOrder) -> String 
     }
 }
 
+/// The filter keys the bulk-action dialogs may carry back to the list.
+const VIEW_KEYS: [&str; 9] = [
+    "status", "scheme", "country", "source", "q", "coverage", "sort", "per_page", "cur",
+];
+
+/// The redirect target of a bulk action: the list, back on the view the
+/// dialog was opened from. The view travels in the dialogs' hidden
+/// `view` field; it is rebuilt pair by pair from the allow-listed keys
+/// ([`VIEW_KEYS`]) with every value decoded once and re-encoded, so a
+/// crafted field cannot smuggle another path, another key or raw markup
+/// into the redirect.
+fn list_view_target(form: &[(String, String)]) -> String {
+    let Some(view) = form.iter().find(|(k, _)| k == "view").map(|(_, v)| v) else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for pair in view.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if !VIEW_KEYS.contains(&key) {
+            continue;
+        }
+        // The field carries the query string already urlencoded; decode
+        // before the shared re-encoding, so a value round-trips once.
+        let value = percent_encoding::percent_decode_str(value).decode_utf8_lossy();
+        parts.push(format!("{key}={}", urlencoding(&value)));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
 /// The link to one page of the browser: the cursor token of the page
 /// (absent for the first page) and the parameters of the current view.
 fn list_page_link(
@@ -289,6 +333,11 @@ pub async fn proxies_list(
     let f_country = params.get("country").cloned().unwrap_or_default();
     let f_source = params.get("source").cloned().unwrap_or_default();
     let f_q = params.get("q").cloned().unwrap_or_default();
+    // Sort key: the valid values and the default are decided by
+    // `repo::proxies::ProxyListOrder::from_param` below — any string it
+    // does not map to falls back to `ProxyListOrder::Updated`, whose
+    // parameter is exactly "updated"; the fallback here only seeds the
+    // same default.
     let f_sort = params
         .get("sort")
         .cloned()
@@ -332,24 +381,27 @@ pub async fn proxies_list(
         direction: *direction,
     });
 
-    let total: i64 = match proxies::count_filtered(&state.pool, &filter).await {
-        Ok(total) => total,
-        Err(err) => return server_error(lang, &err),
-    };
-
+    // The four reads below are independent of one another — the counters
+    // do not derive from the page rows — so one `try_join!` runs them
+    // concurrently (SQLite reads run concurrently in WAL mode) and keeps
+    // one error site for their identical handlers.
+    //
+    // `total` counts the filtered set for the pagination line.
+    //
     // The purge dialog acts on every `removed` row regardless of the
     // active filters, so the count it shows is unfiltered too.
-    let removed_count: i64 = match proxies::count_removed(&state.pool).await {
-        Ok(count) => count,
-        Err(err) => return server_error(lang, &err),
-    };
-
-    // Rows without a source link: no feed reaches them and no probe
-    // lane can pick them up. The panel names them, so the operator can
-    // see how much of the table is detached.
-    let detached_count: i64 = match proxies::count_detached(&state.pool).await {
-        Ok(count) => count,
-        Err(err) => return server_error(lang, &err),
+    //
+    // Detached rows: no feed reaches them and no probe lane can pick
+    // them up. The panel names them, so the operator can see how much
+    // of the table is detached.
+    let (total, removed_count, detached_count, mut rows) = match tokio::try_join!(
+        proxies::count_filtered(&state.pool, &filter),
+        proxies::count_removed(&state.pool),
+        proxies::count_detached(&state.pool),
+        proxies::list_filtered(&state.pool, &filter, order, per_page + 1, page.as_ref()),
+    ) {
+        Ok(reads) => reads,
+        Err(err) => return server_error(&state, &headers, "proxies.list", &err),
     };
 
     // The side of the cursor the page takes: a page reached backwards
@@ -361,18 +413,6 @@ pub async fn proxies_list(
 
     // One row more than the page holds: the extra row says whether a
     // further page exists without a second count.
-    let mut rows: Vec<ProxyListRow> = match proxies::list_filtered(
-        &state.pool,
-        &filter,
-        order,
-        per_page + 1,
-        page.as_ref(),
-    )
-    .await
-    {
-        Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
-    };
     let has_more = rows.len() as i64 > per_page;
     if backward && has_more {
         // The rows closest to the cursor come last, so the over-fetched
@@ -424,6 +464,7 @@ pub async fn proxies_list(
     };
 
     let suffix = list_query_suffix(&filter, order);
+    let view_query = suffix.strip_prefix('&').unwrap_or_default().to_string();
     let nav_first = page
         .is_some()
         .then(|| list_page_link(&suffix, per_page, None, ProxyListDirection::Forward));
@@ -434,17 +475,23 @@ pub async fn proxies_list(
         .as_ref()
         .map(|(cursor, direction)| list_page_link(&suffix, per_page, Some(cursor), *direction));
 
-    let countries: Vec<String> = proxies::distinct_countries(&state.pool)
-        .await
-        .unwrap_or_default();
+    // The country dropdown of the filter panel: a failed read answers
+    // like every other query of this screen — the page says so instead of
+    // rendering a silently empty dropdown the operator would read as "no
+    // countries in the table".
+    let countries: Vec<String> = match proxies::distinct_countries(&state.pool).await {
+        Ok(countries) => countries,
+        Err(err) => return server_error(&state, &headers, "proxies.list", &err),
+    };
 
     let sources = match super::all_sources_for_selects(&state.pool).await {
         Ok(sources) => sources,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "proxies.list", &err),
     };
 
     render_html(
         lang.clone(),
+        "proxies/list.html",
         &ProxiesListTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -478,6 +525,7 @@ pub async fn proxies_list(
             f_q,
             f_sort,
             f_coverage,
+            view_query,
             countries,
             sources,
         },
@@ -597,7 +645,7 @@ pub async fn proxy_detail(
     let proxy = match proxies::get_by_id(&state.pool, id).await {
         Ok(Some(proxy)) => proxy,
         Ok(None) => return not_found(lang, "err.proxy_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "proxies.detail", &err),
     };
 
     // Opening the card refreshes the geo facts from every available
@@ -649,26 +697,26 @@ pub async fn proxy_detail(
             proxy
                 .latency_ms
                 .map(|ms| format!("{ms} {}", lang.t("common.ms")))
-                .unwrap_or_else(|| ",".into()),
+                .unwrap_or_else(|| NO_VALUE.into()),
         ),
         (
             lang.t("px.speed").into(),
             proxy
                 .speed_mbps
                 .map(|mbps| format!("{mbps:.1} {}", lang.t("px.speed_unit")))
-                .unwrap_or_else(|| ",".into()),
+                .unwrap_or_else(|| NO_VALUE.into()),
         ),
     ];
 
     let probes: Vec<probe_repo::ProbeHistoryRow> =
         match probe_repo::recent_for_proxy(&state.pool, id, 20).await {
             Ok(rows) => rows,
-            Err(err) => return server_error(lang, &err),
+            Err(err) => return server_error(&state, &headers, "proxies.detail", &err),
         };
 
     let links: Vec<ProxyLinkRow> = match proxies::links_with_source_name(&state.pool, id).await {
         Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "proxies.detail", &err),
     };
 
     // Unprobeable badge: the schemes the daemon cannot check
@@ -681,6 +729,7 @@ pub async fn proxy_detail(
 
     render_html(
         lang.clone(),
+        "proxies/detail.html",
         &ProxyDetailTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -722,15 +771,20 @@ pub async fn proxy_probe_history(
     headers: HeaderMap,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
-    if matches!(proxies::get_by_id(&state.pool, id).await, Ok(None)) {
-        return not_found(lang, "err.proxy_not_found");
+    // A failed read is not an empty history: it is a broken database and
+    // must not render as "the proxy has no checks yet".
+    match proxies::get_by_id(&state.pool, id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found(lang, "err.proxy_not_found"),
+        Err(err) => return server_error(&state, &headers, "proxies.history", &err),
     }
     let probes = match probe_repo::recent_for_proxy(&state.pool, id, 20).await {
         Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "proxies.history", &err),
     };
     render_html(
         lang.clone(),
+        "proxies/_history.html",
         &ProbeHistoryFragment { lang, probes },
         StatusCode::OK,
     )
@@ -744,11 +798,12 @@ pub async fn proxies_purge_removed(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Form(form): Form<Vec<(String, String)>>,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let deleted = match proxies::purge_removed(&state.pool).await {
         Ok(deleted) => deleted,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "proxies.purge_removed", &err),
     };
     // The peer names who ran the destructive action: the purge cannot be
     // undone.
@@ -759,7 +814,7 @@ pub async fn proxies_purge_removed(
     );
     action_response(
         is_htmx(&headers),
-        "/admin/proxies",
+        &format!("/admin/proxies{}", list_view_target(&form)),
         fragment,
         &lang
             .t("px.purged_toast")
@@ -775,18 +830,21 @@ pub async fn proxies_purge_removed(
 // until purged.
 
 /// Shared tail of the parameterless cleanup handlers: run the repo
-/// transition, log it and answer with the count badge + toast.
+/// transition, log it and answer with the count badge + toast. The
+/// redirect carries the view the dialog was opened from (the hidden
+/// `view` field), so the operator lands back on the filtered list.
 macro_rules! bulk_cleanup_handler {
     ($name:ident, $repo_fn:ident, $log_msg:literal) => {
         pub async fn $name(
             State(state): State<AdminState>,
             ConnectInfo(peer): ConnectInfo<SocketAddr>,
             headers: HeaderMap,
+            Form(form): Form<Vec<(String, String)>>,
         ) -> Response {
             let lang = state.locales.lang_from_headers(&headers);
             let moved = match proxies::$repo_fn(&state.pool).await {
                 Ok(moved) => moved,
-                Err(err) => return server_error(lang, &err),
+                Err(err) => return server_error(&state, &headers, "proxies.bulk_revival", &err),
             };
             tracing::info!(moved, peer = %peer, $log_msg);
             let fragment = format!(
@@ -796,7 +854,7 @@ macro_rules! bulk_cleanup_handler {
             );
             action_response(
                 is_htmx(&headers),
-                "/admin/proxies",
+                &format!("/admin/proxies{}", list_view_target(&form)),
                 fragment,
                 &lang
                     .t("px.cleanup_moved_toast")
@@ -835,95 +893,197 @@ fn normalize_asn(input: &str) -> Option<String> {
     fumox_core::geo::canonical_asn(input)
 }
 
-/// Move every `alive` proxy of one autonomous system into `removed`
-/// (cleanup panel). The form field `asn` accepts `24940` and `AS24940`.
-pub async fn proxies_remove_alive_by_asn(
-    State(state): State<AdminState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Form(form): Form<Vec<(String, String)>>,
-) -> Response {
-    let lang = state.locales.lang_from_headers(&headers);
-    let raw = form
-        .iter()
-        .find(|(k, _)| k == "asn")
+/// The country form field: the shared parser of the core model
+/// ([`CountryCode`]), `None` when the operator typed something that is
+/// not a two-letter code. The same rule the profile allowlist and the
+/// import validation apply, so a code one path accepts another cannot
+/// refuse.
+fn normalize_country(raw: &str) -> Option<String> {
+    CountryCode::parse(raw).map(|code| code.as_str().to_string())
+}
+
+/// The raw text of one keyed form field (absent = empty).
+fn keyed_form_raw(form: &[(String, String)], field: &str) -> String {
+    form.iter()
+        .find(|(k, _)| k == field)
         .map(|(_, v)| v.as_str())
-        .unwrap_or_default();
-    let Some(asn) = normalize_asn(raw) else {
-        tracing::info!("cleanup by ASN rejected: invalid input");
-        return action_response_err(
-            is_htmx(&headers),
-            "/admin/proxies",
-            String::new(),
-            lang.t("val.asn_format"),
-        );
-    };
-    let moved = match proxies::remove_alive_by_asn(&state.pool, &asn).await {
-        Ok(moved) => moved,
-        Err(err) => return server_error(lang, &err),
-    };
-    tracing::info!(asn = %asn, moved, peer = %peer, "removed alive proxies by ASN");
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The rejection toast of the ASN form: the format rule, no substitution.
+fn reject_asn_message(lang: &Lang, _raw: &str) -> String {
+    lang.t("val.asn_format").to_string()
+}
+
+/// The rejection toast of the country form: names the rejected value.
+fn reject_country_message(lang: &Lang, raw: &str) -> String {
+    lang.t("val.country_format")
+        .replace("{}", &raw.trim().to_ascii_uppercase())
+}
+
+/// The shared answer of the keyed bulk handlers: the count badge (the
+/// field value substituted into the localized text), the toast, and the
+/// redirect back to the view the dialog was opened from (the hidden
+/// `view` field).
+#[allow(clippy::too_many_arguments)]
+fn keyed_action_response(
+    headers: &HeaderMap,
+    lang: &Lang,
+    rows_key: &str,
+    subst: &str,
+    value: &str,
+    count: u64,
+    badge_class: &str,
+    toast_key: &str,
+    form: &[(String, String)],
+) -> Response {
     let fragment = format!(
-        "<span class=\"badge removed\">{}</span>",
-        lang.t("px.cleanup_asn_rows")
-            .replace("{}", &moved.to_string())
-            .replace("{asn}", &asn),
+        "<span class=\"badge {badge_class}\">{}</span>",
+        lang.t(rows_key)
+            .replace("{}", &count.to_string())
+            .replace(subst, value)
     );
     action_response(
-        is_htmx(&headers),
-        "/admin/proxies",
+        is_htmx(headers),
+        &format!("/admin/proxies{}", list_view_target(form)),
         fragment,
-        &lang
-            .t("px.cleanup_moved_toast")
-            .replace("{}", &moved.to_string()),
+        &lang.t(toast_key).replace("{}", &count.to_string()),
     )
 }
 
-/// Move every `alive` proxy of one country into `removed` (cleanup panel).
-/// The form field `country` must be a 2-letter ISO code offered by the
-/// country dropdown.
-pub async fn proxies_remove_alive_by_country(
-    State(state): State<AdminState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Form(form): Form<Vec<(String, String)>>,
-) -> Response {
-    let lang = state.locales.lang_from_headers(&headers);
-    let raw = form
-        .iter()
-        .find(|(k, _)| k == "country")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or_default();
-    let code = raw.trim().to_ascii_uppercase();
-    if code.len() != 2 || !code.bytes().all(|b| b.is_ascii_alphabetic()) {
-        tracing::info!("cleanup by country rejected: invalid input");
-        return action_response_err(
-            is_htmx(&headers),
-            "/admin/proxies",
-            String::new(),
-            &lang.t("val.country_format").replace("{}", &code),
-        );
-    }
-    let moved = match proxies::remove_alive_by_country(&state.pool, &code).await {
-        Ok(moved) => moved,
-        Err(err) => return server_error(lang, &err),
+/// Shared tail of the four keyed (ASN/country) cleanup and revival
+/// handlers, parameterized by the form field, its normalizer, the
+/// rejection message, the repo transition, the error key, the badge key
+/// and its substitution: parse the field, run the transition, log the
+/// move with the peer and answer through [`keyed_action_response`]. The
+/// `revive` arm moves rows back to `unknown` and hands their ids to the
+/// probe queue; the `cleanup` arm soft-removes them.
+macro_rules! keyed_bulk_handler {
+    (
+        $(#[$meta:meta])*
+        $name:ident, $field:ident, $normalize:expr, $reject:expr, $reject_log:literal,
+        $repo_fn:ident, $err_key:literal, $log_msg:literal, $rows_key:literal,
+        $subst:literal, revive
+    ) => {
+        $(#[$meta])*
+        pub async fn $name(
+            State(state): State<AdminState>,
+            ConnectInfo(peer): ConnectInfo<SocketAddr>,
+            headers: HeaderMap,
+            Form(form): Form<Vec<(String, String)>>,
+        ) -> Response {
+            let lang = state.locales.lang_from_headers(&headers);
+            let raw = keyed_form_raw(&form, stringify!($field));
+            let Some(value) = ($normalize)(&raw) else {
+                // The (truncated) rejected value names what the operator
+                // actually sent, so the log line is actionable.
+                tracing::info!(input = %raw.chars().take(32).collect::<String>(), $reject_log);
+                return action_response_err(
+                    is_htmx(&headers),
+                    &format!("/admin/proxies{}", list_view_target(&form)),
+                    String::new(),
+                    &($reject)(&lang, &raw),
+                );
+            };
+            let outcome = match proxies::$repo_fn(&state.pool, &value, now_ts()).await {
+                Ok(outcome) => outcome,
+                Err(err) => return server_error(&state, &headers, $err_key, &err),
+            };
+            let revived = outcome.revived;
+            tracing::info!($field = %value, revived, peer = %peer, $log_msg);
+            enqueue_revived(&state, &outcome.ids).await;
+            keyed_action_response(
+                &headers,
+                &lang,
+                $rows_key,
+                $subst,
+                &value,
+                revived,
+                "unknown",
+                "px.revive_moved_toast",
+                &form,
+            )
+        }
     };
-    tracing::info!(country = %code, moved, peer = %peer, "removed alive proxies by country");
-    let fragment = format!(
-        "<span class=\"badge removed\">{}</span>",
-        lang.t("px.cleanup_country_rows")
-            .replace("{}", &moved.to_string())
-            .replace("{country}", &code),
-    );
-    action_response(
-        is_htmx(&headers),
-        "/admin/proxies",
-        fragment,
-        &lang
-            .t("px.cleanup_moved_toast")
-            .replace("{}", &moved.to_string()),
-    )
+    (
+        $(#[$meta:meta])*
+        $name:ident, $field:ident, $normalize:expr, $reject:expr, $reject_log:literal,
+        $repo_fn:ident, $err_key:literal, $log_msg:literal, $rows_key:literal,
+        $subst:literal, cleanup
+    ) => {
+        $(#[$meta])*
+        pub async fn $name(
+            State(state): State<AdminState>,
+            ConnectInfo(peer): ConnectInfo<SocketAddr>,
+            headers: HeaderMap,
+            Form(form): Form<Vec<(String, String)>>,
+        ) -> Response {
+            let lang = state.locales.lang_from_headers(&headers);
+            let raw = keyed_form_raw(&form, stringify!($field));
+            let Some(value) = ($normalize)(&raw) else {
+                // The (truncated) rejected value names what the operator
+                // actually sent, so the log line is actionable.
+                tracing::info!(input = %raw.chars().take(32).collect::<String>(), $reject_log);
+                return action_response_err(
+                    is_htmx(&headers),
+                    &format!("/admin/proxies{}", list_view_target(&form)),
+                    String::new(),
+                    &($reject)(&lang, &raw),
+                );
+            };
+            let moved = match proxies::$repo_fn(&state.pool, &value).await {
+                Ok(moved) => moved,
+                Err(err) => return server_error(&state, &headers, $err_key, &err),
+            };
+            tracing::info!($field = %value, moved, peer = %peer, $log_msg);
+            keyed_action_response(
+                &headers,
+                &lang,
+                $rows_key,
+                $subst,
+                &value,
+                moved,
+                "removed",
+                "px.cleanup_moved_toast",
+                &form,
+            )
+        }
+    };
 }
+
+keyed_bulk_handler!(
+    /// Move every `alive` proxy of one autonomous system into `removed`
+    /// (cleanup panel). The form field `asn` accepts `24940` and `AS24940`.
+    proxies_remove_alive_by_asn,
+    asn,
+    normalize_asn,
+    reject_asn_message,
+    "cleanup by ASN rejected: invalid input",
+    remove_alive_by_asn,
+    "proxies.remove_by_asn",
+    "removed alive proxies by ASN",
+    "px.cleanup_asn_rows",
+    "{asn}",
+    cleanup
+);
+
+keyed_bulk_handler!(
+    /// Move every `alive` proxy of one country into `removed` (cleanup
+    /// panel). The form field `country` must be a 2-letter ISO code
+    /// offered by the country dropdown.
+    proxies_remove_alive_by_country,
+    country,
+    normalize_country,
+    reject_country_message,
+    "cleanup by country rejected: invalid input",
+    remove_alive_by_country,
+    "proxies.remove_by_country",
+    "removed alive proxies by country",
+    "px.cleanup_country_rows",
+    "{country}",
+    cleanup
+);
 
 // Bulk revival
 //
@@ -936,10 +1096,11 @@ pub async fn proxies_remove_alive_by_country(
 /// operator's `[ingest].refresh_check_limit` cannot silently disable the
 /// hand-off (`0` disables the *ingest* queue, and reusing it here used to
 /// turn every revival click into a success toast that enqueued nothing).
-/// The cap matches the configured ceiling of the ingest knob
-/// (`[ingest].refresh_check_limit` accepts 0..=10 000); ids beyond it are
+/// The cap is the configured ceiling of the ingest knob
+/// ([`fumox_core::config::bounds::REFRESH_CHECK_LIMIT_MAX`], the same
+/// number `repo::proxies::REVIVED_ID_CAP` uses); ids beyond it are
 /// not lost, they simply wait in the random sample as before.
-const REVIVE_ENQUEUE_LIMIT: u32 = 10_000;
+const REVIVE_ENQUEUE_LIMIT: u32 = fumox_core::config::bounds::REFRESH_CHECK_LIMIT_MAX as u32;
 
 /// Enqueue revived ids for priority probing. Failures are logged and
 /// never fail the revival: the proxy sits in the random sample until
@@ -954,24 +1115,29 @@ async fn enqueue_revived(state: &AdminState, ids: &[i64]) {
     if let Err(err) =
         probe_repo::enqueue_checks(&state.pool, ids, REVIVE_ENQUEUE_LIMIT, now_ts()).await
     {
-        tracing::warn!(error = %err, "failed to enqueue revived proxies");
+        // The scale matters: a click that revived hundreds of rows and
+        // enqueued none of them reads very different from one lost row.
+        tracing::warn!(error = %err, ids = ids.len(), "failed to enqueue revived proxies");
     }
 }
 
 /// Shared tail of the parameterless revival handlers: run the repo
 /// transition (which returns the revived ids), enqueue them for
-/// priority probing, log the count, answer with the badge + toast.
+/// priority probing, log the count, answer with the badge + toast. The
+/// redirect carries the view the dialog was opened from (the hidden
+/// `view` field), so the operator lands back on the filtered list.
 macro_rules! bulk_revival_handler {
     ($name:ident, $repo_fn:ident, $log_msg:literal, $rows_key:literal) => {
         pub async fn $name(
             State(state): State<AdminState>,
             ConnectInfo(peer): ConnectInfo<SocketAddr>,
             headers: HeaderMap,
+            Form(form): Form<Vec<(String, String)>>,
         ) -> Response {
             let lang = state.locales.lang_from_headers(&headers);
             let outcome = match proxies::$repo_fn(&state.pool, now_ts()).await {
                 Ok(outcome) => outcome,
-                Err(err) => return server_error(lang, &err),
+                Err(err) => return server_error(&state, &headers, "proxies.bulk_revival", &err),
             };
             let revived = outcome.revived;
             tracing::info!(revived, peer = %peer, $log_msg);
@@ -982,7 +1148,7 @@ macro_rules! bulk_revival_handler {
             );
             action_response(
                 is_htmx(&headers),
-                "/admin/proxies",
+                &format!("/admin/proxies{}", list_view_target(&form)),
                 fragment,
                 &lang
                     .t("px.revive_moved_toast")
@@ -1005,101 +1171,40 @@ bulk_revival_handler!(
     "px.revive_quarantine_rows"
 );
 
-/// Move every `removed` proxy of one autonomous system back to
-/// `unknown` (revival panel). The form field `asn` accepts `24940`
-/// and `AS24940`; the canonical `AS{n}` form is built once before the
-/// SQL.
-pub async fn proxies_revive_removed_by_asn(
-    State(state): State<AdminState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Form(form): Form<Vec<(String, String)>>,
-) -> Response {
-    let lang = state.locales.lang_from_headers(&headers);
-    let raw = form
-        .iter()
-        .find(|(k, _)| k == "asn")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or_default();
-    let Some(asn) = normalize_asn(raw) else {
-        tracing::info!("revival by ASN rejected: invalid input");
-        return action_response_err(
-            is_htmx(&headers),
-            "/admin/proxies",
-            String::new(),
-            lang.t("val.asn_format"),
-        );
-    };
-    let outcome = match proxies::revive_removed_by_asn(&state.pool, &asn, now_ts()).await {
-        Ok(outcome) => outcome,
-        Err(err) => return server_error(lang, &err),
-    };
-    let revived = outcome.revived;
-    tracing::info!(asn = %asn, revived, peer = %peer, "revived removed proxies by ASN");
-    enqueue_revived(&state, &outcome.ids).await;
-    let fragment = format!(
-        "<span class=\"badge unknown\">{}</span>",
-        lang.t("px.revive_asn_rows")
-            .replace("{}", &revived.to_string())
-            .replace("{asn}", &asn),
-    );
-    action_response(
-        is_htmx(&headers),
-        "/admin/proxies",
-        fragment,
-        &lang
-            .t("px.revive_moved_toast")
-            .replace("{}", &revived.to_string()),
-    )
-}
+keyed_bulk_handler!(
+    /// Move every `removed` proxy of one autonomous system back to
+    /// `unknown` (revival panel). The form field `asn` accepts `24940`
+    /// and `AS24940`; the canonical `AS{n}` form is built once before
+    /// the SQL.
+    proxies_revive_removed_by_asn,
+    asn,
+    normalize_asn,
+    reject_asn_message,
+    "revival by ASN rejected: invalid input",
+    revive_removed_by_asn,
+    "proxies.revive_by_asn",
+    "revived removed proxies by ASN",
+    "px.revive_asn_rows",
+    "{asn}",
+    revive
+);
 
-/// Move every `removed` proxy of one country back to `unknown` (revival
-/// panel). The form field `country` must be a 2-letter ISO code offered
-/// by the country dropdown.
-pub async fn proxies_revive_removed_by_country(
-    State(state): State<AdminState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Form(form): Form<Vec<(String, String)>>,
-) -> Response {
-    let lang = state.locales.lang_from_headers(&headers);
-    let raw = form
-        .iter()
-        .find(|(k, _)| k == "country")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or_default();
-    let code = raw.trim().to_ascii_uppercase();
-    if code.len() != 2 || !code.bytes().all(|b| b.is_ascii_alphabetic()) {
-        tracing::info!("revival by country rejected: invalid input");
-        return action_response_err(
-            is_htmx(&headers),
-            "/admin/proxies",
-            String::new(),
-            &lang.t("val.country_format").replace("{}", &code),
-        );
-    }
-    let outcome = match proxies::revive_removed_by_country(&state.pool, &code, now_ts()).await {
-        Ok(outcome) => outcome,
-        Err(err) => return server_error(lang, &err),
-    };
-    let revived = outcome.revived;
-    tracing::info!(country = %code, revived, peer = %peer, "revived removed proxies by country");
-    enqueue_revived(&state, &outcome.ids).await;
-    let fragment = format!(
-        "<span class=\"badge unknown\">{}</span>",
-        lang.t("px.revive_country_rows")
-            .replace("{}", &revived.to_string())
-            .replace("{country}", &code),
-    );
-    action_response(
-        is_htmx(&headers),
-        "/admin/proxies",
-        fragment,
-        &lang
-            .t("px.revive_moved_toast")
-            .replace("{}", &revived.to_string()),
-    )
-}
+keyed_bulk_handler!(
+    /// Move every `removed` proxy of one country back to `unknown`
+    /// (revival panel). The form field `country` must be a 2-letter ISO
+    /// code offered by the country dropdown.
+    proxies_revive_removed_by_country,
+    country,
+    normalize_country,
+    reject_country_message,
+    "revival by country rejected: invalid input",
+    revive_removed_by_country,
+    "proxies.revive_by_country",
+    "revived removed proxies by country",
+    "px.revive_country_rows",
+    "{country}",
+    revive
+);
 
 // Actions
 
@@ -1150,9 +1255,9 @@ pub async fn proxy_reset(
                 );
             }
             Ok(None) => return not_found(lang, "err.proxy_not_found"),
-            Err(err) => return server_error(lang, &err),
+            Err(err) => return server_error(&state, &headers, "proxies.reset", &err),
         },
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "proxies.reset", &err),
     }
     tracing::info!(proxy_id = id, "proxy status reset");
     action_response(
@@ -1161,10 +1266,9 @@ pub async fn proxy_reset(
         // The wrapper id must survive the swap: the form's hx-target points
         // at it, so losing it kills the button for every subsequent click.
         // The aria attributes keep the initial template's announcements.
-        format!(
-            r#"<span id="status-badge" aria-live="polite" aria-atomic="true"><span class="badge unknown">{}</span></span>"#,
-            lang.t("common.status_unknown"),
-        ),
+        // The badge is the shared one: a reset lands on `unknown`, so the
+        // success branch renders the same fragment the refusals do.
+        status_badge(&lang, "unknown"),
         lang.t("px.reset_toast"),
     )
 }
@@ -1346,6 +1450,140 @@ mod tests {
         assert!(!ProxyListOrder::Name.accepts_cursor(&updated));
     }
 
+    fn test_lang() -> Lang {
+        crate::admin::i18n::Locales::load(std::path::Path::new("/nonexistent")).default_lang()
+    }
+
+    /// The AS-number normalizer behind the cleanup/revival forms: both
+    /// spellings (bare digits and `AS`-prefixed, any case, padded) land
+    /// on the canonical `AS{n}` text, and anything else is refused.
+    #[test]
+    fn normalize_asn_accepts_both_spellings_and_refuses_the_rest() {
+        for raw in ["24940", "AS24940", "as24940", " AS24940 "] {
+            assert_eq!(
+                normalize_asn(raw),
+                Some("AS24940".to_string()),
+                "{raw:?} must normalize"
+            );
+        }
+        for raw in ["", "AS", "AS-1", "12345678901"] {
+            assert_eq!(normalize_asn(raw), None, "{raw:?} must be refused");
+        }
+    }
+
+    /// The badge swap fragment carries the ids and aria attributes the
+    /// detail template renders and the form's `hx-target` points at, and
+    /// the class follows the status value, never an interpolated one.
+    #[test]
+    fn the_status_badge_carries_the_swap_contract_for_every_status() {
+        let lang = test_lang();
+        for (status, class, key) in [
+            ("alive", "alive", "common.status_alive"),
+            ("ready", "ready", "common.status_ready"),
+            ("quarantine", "quarantine", "common.status_quarantine"),
+            ("removed", "removed", "common.status_removed"),
+            ("unknown", "unknown", "common.status_unknown"),
+        ] {
+            let badge = status_badge(&lang, status);
+            assert!(
+                badge.contains(r#"id="status-badge""#),
+                "{status}: the wrapper id must survive the swap: {badge}"
+            );
+            assert!(
+                badge.contains(r#"aria-live="polite""#),
+                "{status}: the aria attributes keep the announcements: {badge}"
+            );
+            assert!(badge.contains(r#"aria-atomic="true""#), "{status}: {badge}");
+            assert!(
+                badge.contains(&format!(r#"<span class="badge {class}">"#)),
+                "{status}: the class follows the status: {badge}"
+            );
+            assert!(
+                badge.contains(lang.t(key)),
+                "{status}: the localized label is there: {badge}"
+            );
+        }
+    }
+
+    /// The empty-state "clear filters" link appears exactly when a
+    /// filter narrows the list: every filter field alone activates it,
+    /// and a bare list (sorting alone never hides rows) never does.
+    #[test]
+    fn filters_active_tracks_every_filter_field() {
+        let lang = test_lang();
+        let template = |f_statuses: Vec<String>,
+                        f_scheme: &str,
+                        f_country: &str,
+                        f_source: &str,
+                        f_q: &str,
+                        f_coverage: &str| {
+            ProxiesListTemplate {
+                lang: lang.clone(),
+                langs: Vec::new(),
+                theme: theme::from_headers(&HeaderMap::new()),
+                active: "proxies",
+                csrf: String::new(),
+                rows: Vec::new(),
+                total: 0,
+                removed_count: 0,
+                detached_count: 0,
+                nav_first: None,
+                nav_prev: None,
+                nav_next: None,
+                f_statuses,
+                f_scheme: f_scheme.into(),
+                f_country: f_country.into(),
+                f_source: f_source.into(),
+                f_q: f_q.into(),
+                f_sort: "updated".into(),
+                f_coverage: f_coverage.into(),
+                view_query: String::new(),
+                all_statuses: Vec::new(),
+                all_schemes: Vec::new(),
+                countries: Vec::new(),
+                sources: Vec::new(),
+            }
+        };
+
+        assert!(!template(Vec::new(), "", "", "", "", "").filters_active());
+        assert!(template(vec!["alive".into()], "", "", "", "", "").filters_active());
+        assert!(template(Vec::new(), "vless", "", "", "", "").filters_active());
+        assert!(template(Vec::new(), "", "DE", "", "", "").filters_active());
+        assert!(template(Vec::new(), "", "", "src1", "", "").filters_active());
+        assert!(template(Vec::new(), "", "", "", "node", "").filters_active());
+        assert!(template(Vec::new(), "", "", "", "", "t1_only").filters_active());
+    }
+
+    /// The bulk actions redirect back to the view the dialog was opened
+    /// from: the hidden `view` field is rebuilt pair by pair from the
+    /// allow-listed keys with every value decoded once and re-encoded, so
+    /// a crafted field cannot smuggle another key, a path or raw markup
+    /// into the redirect.
+    #[test]
+    fn the_bulk_redirect_rebuilds_the_view_from_allow_listed_keys() {
+        let form = vec![
+            ("_csrf".to_string(), "t".to_string()),
+            (
+                "view".to_string(),
+                "status=alive&status=quarantine&q=node%20one&cur=abc".to_string(),
+            ),
+        ];
+        assert_eq!(
+            list_view_target(&form),
+            "?status=alive&status=quarantine&q=node%20one&cur=abc"
+        );
+
+        // Unknown keys, a path-ish pair and a bare word do not survive.
+        let crafted = vec![(
+            "view".to_string(),
+            "x=1&token=secret&/../evil=1&junk&country=DE".to_string(),
+        )];
+        assert_eq!(list_view_target(&crafted), "?country=DE");
+
+        // No view field at all: the bare list.
+        assert_eq!(list_view_target(&[("_csrf".into(), "t".into())]), "");
+    }
+
     /// The page links carry the cursor and the filters of the current
     /// view, so a filtered list stays filtered while it is paged.
     #[test]
@@ -1403,55 +1641,22 @@ mod tests {
         has_any.then(|| dir.canonicalize().unwrap())
     }
 
-    /// A throwaway directory per call: the tests of one binary run in
-    /// parallel, and a second-resolution timestamp would hand two tests
-    /// the same database file.
-    fn unique_dir(label: &str) -> std::path::PathBuf {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("fumox-{label}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// An admin state on a throwaway database, with the card resolver
     /// pointed at the workspace GeoLite2 files. `None` when none are
-    /// present.
-    async fn geo_card_state() -> Option<AdminState> {
+    /// present. The dir guard travels with the state: keep it in scope
+    /// while the pool is in use.
+    async fn geo_card_state() -> Option<(fumox_core::tempdir_lite::TempDir, AdminState)> {
         let db_dir = workspace_db_dir()?;
-        let dir = unique_dir("card-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        fumox_core::db::migrate(&pool).await.unwrap();
-        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-        std::mem::forget(refresh_rx); // keep the channel open for sends
-        let config = fumox_core::AppConfig::default();
-        let fetcher =
-            crate::fetcher::Fetcher::new(config.fetch.clone(), false, config.ssrf_dns_timeout());
-        let mut state = AdminState::new(
-            pool,
-            crate::cache::Caches::new(),
-            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
-            refresh_tx,
-            crate::scheduler::SchedulerState::new(1),
-            crate::events::EventBus::new(),
-            fetcher,
-            config,
-            fumox_core::config::ResolvedConfigPath::Missing,
-            crate::alive_export::TokenCache::new(),
-        );
+        let mut config = fumox_core::AppConfig::default();
+        config.geo.db_dir = db_dir.clone();
+        let (dir, mut state) = crate::admin::admin_state_on_tmp_db(config).await;
         state.geo_full = std::sync::Arc::new(fumox_core::geo::FullResolver::from_dir(
             &fumox_core::config::GeoConfig {
                 db_dir,
                 ..Default::default()
             },
         ));
-        state.geo_full.is_active().then_some(state)
+        state.geo_full.is_active().then_some((dir, state))
     }
 
     /// The card end to end: opening it refreshes the geo facts, and for a
@@ -1461,7 +1666,7 @@ mod tests {
     /// build that does not reproduce the ASN-only shape.
     #[tokio::test]
     async fn card_refresh_keeps_stored_geo_when_the_lookup_only_yields_an_asn() {
-        let Some(state) = geo_card_state().await else {
+        let Some((_dir, state)) = geo_card_state().await else {
             eprintln!("skipping: no GeoLite2 databases in workspace config/");
             return;
         };
@@ -1508,39 +1713,12 @@ mod tests {
     }
 
     /// Admin state with `[ingest].refresh_check_limit = 0`: the operator
-    /// setting that documents "0 disables the queue" for *ingest*. Built
-    /// by hand (the `test_admin_state` helper fixes the default config)
-    /// with the same shape as the geo card fixture above.
-    async fn no_ingest_queue_state() -> AdminState {
-        let dir = unique_dir("revive-test");
-        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
-            path: dir.join("test.db"),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        fumox_core::db::migrate(&pool).await.unwrap();
-        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-        std::mem::forget(refresh_rx); // keep the channel open for sends
+    /// setting that documents "0 disables the queue" for *ingest*. The
+    /// shared fixture wiring, only the knob differs.
+    async fn no_ingest_queue_state() -> (fumox_core::tempdir_lite::TempDir, AdminState) {
         let mut config = fumox_core::AppConfig::default();
         config.ingest.refresh_check_limit = 0;
-        let fetcher = crate::fetcher::Fetcher::new(
-            config.fetch.clone(),
-            config.admin.allow_private_urls,
-            config.ssrf_dns_timeout(),
-        );
-        AdminState::new(
-            pool,
-            crate::cache::Caches::new(),
-            std::sync::Arc::new(fumox_core::geo::GeoResolver::new(&Default::default())),
-            refresh_tx,
-            crate::scheduler::SchedulerState::new(1),
-            crate::events::EventBus::new(),
-            fetcher,
-            config,
-            fumox_core::config::ResolvedConfigPath::Missing,
-            crate::alive_export::TokenCache::new(),
-        )
+        crate::admin::admin_state_on_tmp_db(config).await
     }
 
     /// A revival must hand its rows to the probe queue even when the
@@ -1549,7 +1727,7 @@ mod tests {
     /// report success while enqueueing nothing (`0` disables the queue).
     #[tokio::test]
     async fn revival_enqueues_even_when_the_ingest_queue_is_disabled() {
-        let state = no_ingest_queue_state().await;
+        let (_dir, state) = no_ingest_queue_state().await;
         assert_eq!(
             state.ingest().refresh_check_limit,
             0,
@@ -1612,7 +1790,7 @@ mod tests {
     /// end up in `probe_requests` (the queue the probe daemon reads).
     #[tokio::test]
     async fn the_country_revival_handler_enqueues_the_revived_rows() {
-        let state = no_ingest_queue_state().await;
+        let (_dir, state) = no_ingest_queue_state().await;
         sqlx::query(
             "INSERT OR IGNORE INTO sources (id, name, url, enabled, cache_ttl_seconds, created_at, updated_at)
              VALUES ('srcB0000000', 's', 'https://example.com', 1, 3600, 1, 1)",

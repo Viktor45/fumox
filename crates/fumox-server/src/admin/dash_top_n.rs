@@ -11,7 +11,7 @@
 //! `10`. The dashboard widgets respect this limit when paging
 //! `recent_errors`, `top_alive`, `top_failures`, and the country split.
 
-use axum::extract::Query;
+use axum::extract::Form;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
@@ -20,11 +20,11 @@ use std::collections::HashMap;
 /// widget renders, never a security boundary.
 pub const TOP_N_COOKIE: &str = "fumox_dash_top_n";
 
-/// Cookie lifetime: one year, matching the language and theme cookies.
-const TOP_N_MAX_AGE_SECS: u64 = 365 * 24 * 3600;
-
-/// Allowed values for the picker. Order does not have to match the menu
-/// order, the picker template iterates `ALLOWED` in declaration order.
+/// The allowed values; this constant is also what validates the input.
+/// The picker template (`templates/dashboard.html`) hardcodes the same
+/// list for the menu, and it alone decides the menu order — the order
+/// here does not affect the UI. `allowed_values_are_pinned_to_the_picker`
+/// keeps the two lists from drifting.
 pub const ALLOWED: &[i64] = &[5, 10, 15, 25, 50];
 
 /// Default Top-N when the cookie is missing, garbled, or carries an
@@ -63,36 +63,33 @@ impl Default for DashTopN {
 /// Read the cookie value from a `HeaderMap`. Returns the default when the
 /// cookie is missing or invalid.
 pub fn from_headers(headers: &HeaderMap) -> DashTopN {
-    for cookie_header in headers.get_all(header::COOKIE).iter() {
-        let Ok(text) = cookie_header.to_str() else {
-            continue;
-        };
-        for pair in text.split(';') {
-            if let Some((name, value)) = pair.trim().split_once('=')
-                && name.trim() == TOP_N_COOKIE
-            {
-                return DashTopN::parse(value.trim());
-            }
-        }
-    }
-    DashTopN::default()
+    super::cookie_value(headers, TOP_N_COOKIE)
+        .map(DashTopN::parse)
+        .unwrap_or_default()
 }
 
-/// `Set-Cookie` value persisting the choice.
+/// `Set-Cookie` value persisting the choice (shared builder in `super`,
+/// the one source of the attributes and the lifetime).
 pub fn top_n_cookie(value: DashTopN) -> String {
-    format!(
-        "{TOP_N_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={TOP_N_MAX_AGE_SECS}",
-        value.as_i64()
-    )
+    super::preference_cookie(TOP_N_COOKIE, &value.as_i64().to_string())
 }
 
 /// Top-N picker setter: persists the choice in the cookie and redirects back
 /// to `next` (validated by `super::admin_next`, admin-surface paths only,
-/// no open redirect, no control characters). Mounted outside the auth/CSRF
-/// layers so the picker also works on a freshly installed system before the
-/// operator has logged in.
-pub async fn set_top_n(Query(params): Query<HashMap<String, String>>) -> Response {
-    let n = DashTopN::parse(params.get("n").map(String::as_str).unwrap_or(""));
+/// no open redirect, no control characters). Endpoint:
+/// `/admin/set-dash-top-n`, an authenticated POST under the auth+CSRF nest
+/// (see the route group in `super::router`), like the language and theme
+/// setters. A request without an `n` field is answered with the bare
+/// redirect: no choice made, no cookie pinned.
+pub async fn set_top_n(Form(params): Form<HashMap<String, String>>) -> Response {
+    let Some(value) = params.get("n") else {
+        return (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, super::admin_next(&params))],
+        )
+            .into_response();
+    };
+    let n = DashTopN::parse(value);
     let next = super::admin_next(&params);
     (
         StatusCode::SEE_OTHER,
@@ -163,5 +160,36 @@ mod tests {
         assert!(c.contains("SameSite=Lax"));
         assert!(c.contains("Path=/"));
         assert!(c.contains("Max-Age=31536000"));
+    }
+
+    /// The picker template hardcodes the menu (the only place the order is
+    /// decided); this constant validates the submitted value. The two
+    /// lists must stay the same set, or the picker offers a value the
+    /// setter silently rewrites to the default.
+    #[test]
+    fn allowed_values_are_pinned_to_the_picker() {
+        let template = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/dashboard.html"),
+        )
+        .expect("dashboard template readable");
+        // The menu is the `{% for n in [...] %}` list of the top-n picker
+        // form; the `<option>` tags render `{{ n }}`, not a literal.
+        let list = template
+            .split("{% for n in [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("the picker template must declare its option list");
+        let mut offered: Vec<i64> = list
+            .split(',')
+            .filter_map(|item| item.trim().trim_end_matches("_i64").parse().ok())
+            .collect();
+        offered.sort_unstable();
+        offered.dedup();
+        let mut allowed = ALLOWED.to_vec();
+        allowed.sort_unstable();
+        assert_eq!(
+            offered, allowed,
+            "the picker menu and ALLOWED drifted apart"
+        );
     }
 }

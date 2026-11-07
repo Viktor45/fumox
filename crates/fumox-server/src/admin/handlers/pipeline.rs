@@ -6,16 +6,28 @@
 //! Rendering itself (widget, preview, rows) lives in the editor module ,
 //! these handlers are HTTP glue only.
 
-use super::FormMap;
+use super::{FormMap, not_found};
+use crate::admin::html_response;
+use crate::admin::i18n::Lang;
 use crate::admin::pipeline_editor::{
-    BuilderState, BuilderView, Ingest, RowsFragment, WidgetFragment, preset, preview_body,
+    BuilderState, BuilderView, RowsFragment, WidgetFragment, preset, preview_body,
+    widget_from_mode_switch,
 };
-use crate::admin::render_html;
+use askama::Template;
 use axum::extract::{Form, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
 
 use crate::admin::AdminState;
+
+/// The response every `#ped-*` fragment endpoint answers with: the
+/// rendered fragment as `text/html` with a 200. A fragment that fails to
+/// render is a server bug like a full page that does, so the failure
+/// takes the same logged-500 path [`render_html`] takes — the handlers
+/// share one helper instead of four hand-written response tuples.
+fn html_fragment(lang: Lang, name: &'static str, fragment: &impl Template) -> Response {
+    html_response(lang, name, StatusCode::OK, fragment.render())
+}
 
 /// `#ped-preview` content: the generated JSON plus its validation outcome
 /// (the same `CompiledPipeline::from_json` the save path uses).
@@ -25,13 +37,10 @@ pub async fn pipeline_preview(
     Form(form): Form<Vec<(String, String)>>,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
+    // `preview_body` has already handled its own rendering failure (logged,
+    // empty region), so the body arrives pre-rendered.
     let body = preview_body(&lang, &BuilderState::from_form(&form));
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        body,
-    )
-        .into_response()
+    html_response(lang, "pipeline/_preview.html", StatusCode::OK, Ok(body))
 }
 
 /// `#ped-rows` content: the rule lines after add/remove. `section` picks
@@ -49,8 +58,20 @@ pub async fn pipeline_rows(
     let mut built = BuilderState::from_form(&form);
     apply_rows_request(&mut built, &params);
     let section = params.get("section").cloned().unwrap_or_default();
-    let fragment = RowsFragment::for_section(lang.clone(), BuilderView::new(&built), &section);
-    render_html(lang, &fragment, StatusCode::OK)
+    // An absent section is the rename container (the *Add rule* button
+    // posts without one). An unknown name is a broken request, not the
+    // rename rows: the caller asked for a container the widget does not
+    // render.
+    let section = if section.is_empty() {
+        "rename"
+    } else {
+        &section
+    };
+    let Some(fragment) = RowsFragment::for_section(lang.clone(), BuilderView::new(&built), section)
+    else {
+        return not_found(lang, "err.section_not_found");
+    };
+    html_fragment(lang, "pipeline/_rows.html", &fragment)
 }
 
 /// What the `remove` parameter asks the rows endpoint for.
@@ -111,10 +132,9 @@ fn apply_rows_request(built: &mut BuilderState, params: &FormMap) {
     }
 }
 
-/// Mode switch: the asymmetric builder ⇄ raw toggle.
-/// Builder → raw is always safe, the JSON is generated from the fields.
-/// Raw → builder only when the textarea parses into the builder; otherwise
-/// the widget stays in raw mode with the warning and the JSON untouched.
+/// Mode switch: the asymmetric builder ⇄ raw toggle. The mode decision
+/// and the form parsing live in the editor module
+/// ([`widget_from_mode_switch`]); this handler is HTTP glue only.
 pub async fn pipeline_mode(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -124,45 +144,14 @@ pub async fn pipeline_mode(
     let lang = state.locales.lang_from_headers(&headers);
     let csrf = state.csrf_for(&headers);
     let profile = params.get("profile").map(|v| v == "1").unwrap_or(false);
-    let get = |key: &str| {
-        form.iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.trim().to_string())
-            .unwrap_or_default()
-    };
-
-    let widget = if params.get("to").map(String::as_str) == Some("raw") {
-        let json = BuilderState::from_form(&form)
-            .emit()
-            .map(|emitted| serde_json::to_string_pretty(emitted.document()).unwrap_or_default())
-            .unwrap_or_default();
-        WidgetFragment::raw_mode(lang, &csrf, json, false, None)
-    } else if form.iter().any(|(k, _)| k.starts_with("ped_")) {
-        // Already in builder mode (no textarea on the form): keep the fields.
-        WidgetFragment::builder_mode(lang, &csrf, &BuilderState::from_form(&form), profile, None)
-    } else {
-        let raw = get("pipeline");
-        if raw.is_empty() {
-            WidgetFragment::builder_mode(lang, &csrf, &BuilderState::new(), profile, None)
-        } else {
-            match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(value) => match BuilderState::ingest(Some(&value)) {
-                    Ingest::Builder(built) => {
-                        WidgetFragment::builder_mode(lang, &csrf, &built, profile, None)
-                    }
-                    Ingest::Raw => WidgetFragment::raw_mode(lang, &csrf, raw, true, None),
-                },
-                Err(_) => WidgetFragment::raw_mode(lang, &csrf, raw, true, None),
-            }
-        }
-    };
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        widget.html(),
-    )
-        .into_response()
+    let widget = widget_from_mode_switch(
+        lang.clone(),
+        &csrf,
+        params.get("to").map(String::as_str),
+        &form,
+        profile,
+    );
+    html_fragment(lang, "pipeline/_widget.html", &widget)
 }
 
 /// A preset: re-render the whole widget with the ready-made
@@ -176,14 +165,16 @@ pub async fn pipeline_preset(
     let lang = state.locales.lang_from_headers(&headers);
     let csrf = state.csrf_for(&headers);
     let profile = params.get("profile").map(|v| v == "1").unwrap_or(false);
-    let built = preset(params.get("name").map(String::as_str).unwrap_or("blank"));
-    let widget = WidgetFragment::builder_mode(lang, &csrf, &built, profile, None);
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        widget.html(),
-    )
-        .into_response()
+    // A preset name the widget does not know is refused with an explicit
+    // error instead of silently rendering the empty state: the operator
+    // asked for a ready-made configuration and must not lose the built
+    // one to a typo in a link.
+    let built = match preset(params.get("name").map(String::as_str).unwrap_or("blank")) {
+        Some(built) => built,
+        None => return not_found(lang, "err.preset_not_found"),
+    };
+    let widget = WidgetFragment::builder_mode(lang.clone(), &csrf, &built, profile, None);
+    html_fragment(lang, "pipeline/_widget.html", &widget)
 }
 
 #[cfg(test)]

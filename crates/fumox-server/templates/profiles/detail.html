@@ -5,17 +5,18 @@
 {% block content %}
 <div class="page-head">
   <h1>{{ name }}</h1>
-  {#- The badge and the toggle form are the same fragment templates the
-      toggle action re-renders for its HTMX swap, so the initial markup and
-      every swap share one definition. The badge sits in a wrapper that
-      the swap does not touch: a live region that is recreated with every
+  {#- The badge and the toggle form are the same fragments the toggle
+      action re-renders for its HTMX swap (the form's markup lives once
+      in the shared `_toggle_form.html`), so the initial markup and every
+      swap share one definition. The badge sits in a wrapper that the
+      swap does not touch: a live region that is recreated with every
       swap is never announced. -#}
   <span id="enabled-badge" aria-live="polite" aria-atomic="true">{% include "profiles/_enabled_badge.html" %}</span>
   <span id="toggle-error" class="error-text" role="alert" data-error-fallback="{{ self.t("common.action_failed") }}"></span>
   <span class="spacer"></span>
   <div class="row-actions">
     <a class="btn" href="/admin/profiles/{{ profile_id }}/edit">{{ self.t("common.edit") }}</a>
-    {% include "profiles/_toggle_form.html" %}
+    {% include "../_toggle_form.html" %}
     <button class="btn danger" type="button" aria-haspopup="dialog" aria-controls="delete-dialog" data-dialog-open="delete-dialog">{{ self.t("common.delete") }}</button>
   </div>
 </div>
@@ -24,7 +25,7 @@
   <div class="panel">
     <h2>{{ self.t("src.params_title") }}</h2>
     <table class="kv">
-      <tr><th>Slug</th><td class="mono">
+      <tr><th>{{ self.t("common.slug") }}</th><td class="mono">
         {% match slug %}
           {% when Some with (slug) %}{{ slug }}
           {% when None %}<span class="muted">–</span>
@@ -44,6 +45,7 @@
 
     {% if !pipeline_display.is_empty() %}
       <h3>{{ self.t("prof.pipeline_of_profile") }}</h3>
+      <p class="muted small">{{ self.t("prof.pipeline_display_hint") }}</p>
       <pre class="mono small">{{ pipeline_display }}</pre>
     {% endif %}
   </div>
@@ -92,7 +94,7 @@
 </div>
 
 <div class="panel">
-  <h2>{{ self.t("prof.preview_prefix") }} {{ preview.len() }} {{ self.t("prof.preview_suffix") }}</h2>
+  <h2>{{ self.t_args("prof.preview_count", &[preview.len().to_string()][..]) }}</h2>
   {% match preview_note %}
     {% when Some with (note) %}<p class="muted">{{ note }}</p>
     {% when None %}

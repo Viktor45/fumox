@@ -105,6 +105,19 @@ pub enum ResolvedConfigPath {
     Missing,
 }
 
+impl ResolvedConfigPath {
+    /// The file path, or the default location when no file was loaded.
+    /// Readers that act on "the config file" (the admin settings editor
+    /// writes there, the overview names it) share this one choice instead
+    /// of repeating the `Missing` fallback.
+    pub fn path_or_default(&self) -> PathBuf {
+        match self {
+            ResolvedConfigPath::Loaded(path) => path.clone(),
+            ResolvedConfigPath::Missing => PathBuf::from(DEFAULT_CONFIG_PATH),
+        }
+    }
+}
+
 /// Resolve the TOML file location by priority: the explicit `path` (the
 /// `--config` flag) → [`CONFIG_PATH_ENV`] → [`DEFAULT_CONFIG_PATH`] against
 /// the CWD. An explicitly requested file (flag or env) must exist, a typo
@@ -772,7 +785,10 @@ pub struct ServerConfig {
     pub trust_proxy_header: TrustedHeader,
     /// Hostnames / IPs allowed to reach the public listener. Empty = accept
     /// any host (today's behavior); setting this locks the
-    /// alive-export endpoint to the operator's own hostname.
+    /// alive-export endpoint to the operator's own hostname. An entry is a
+    /// DNS name, an IPv4 literal or an IPv6 literal in brackets; a port an
+    /// entry spells is ignored — entries are matched by host only, on any
+    /// port, and the server logs a warning for entries that name one.
     #[serde(default = "defaults::allowed_hosts")]
     pub allowed_hosts: Vec<String>,
     /// Hard ceiling on the rows one `/export/alive` / `/export/ready` body
@@ -1188,7 +1204,10 @@ pub struct AdminConfig {
     #[serde(default)]
     pub trust_proxy_header: TrustedHeader,
     /// Hostnames / IPs allowed to reach the admin listener. Empty = accept
-    /// any host (today's behavior).
+    /// any host (today's behavior). An entry is a DNS name, an IPv4
+    /// literal or an IPv6 literal in brackets; a port an entry spells is
+    /// ignored — entries are matched by host only, on any port, and the
+    /// server logs a warning for entries that name one.
     #[serde(default = "defaults::allowed_hosts")]
     pub allowed_hosts: Vec<String>,
 }
@@ -1477,6 +1496,12 @@ impl LogLevel {
             LogLevel::Trace => "trace",
         }
     }
+
+    /// Every level as its wire string. This is the closed set the serde
+    /// deserializer accepts, so it is also what the admin settings editor
+    /// validates its dropdowns against — the strings here and the
+    /// deserializer's vocabulary must not drift.
+    pub const ALL_AS_STR: &'static [&'static str] = &["error", "warn", "info", "debug", "trace"];
 }
 
 /// Per-binary console levels. Both processes read the same `app.toml`, so
@@ -1746,6 +1771,13 @@ pub mod bounds {
     /// Longest single recheck delay, 30 days.
     pub const RECHECK_MAX_DELAY_SECS: i64 = 30 * 24 * 60 * 60;
 
+    /// Ceiling of `[ingest].refresh_check_limit` and of the two bulk
+    /// revival hand-offs that deliberately ignore that knob
+    /// (`repo::proxies::REVIVED_ID_CAP`, the server's
+    /// `REVIVE_ENQUEUE_LIMIT`). One shared number, so the config bound
+    /// and the queue hand-offs cannot drift apart.
+    pub const REFRESH_CHECK_LIMIT_MAX: u64 = 10_000;
+
     /// Accepted range of a numeric setting, inclusive on both ends.
     /// Every numeric setting has one: a setting without a ceiling is a
     /// setting nobody checked.
@@ -1782,7 +1814,10 @@ pub mod bounds {
         ("fetch.max_concurrency", Range::new(1, 1024)),
         ("fetch.max_retries", Range::new(0, 16)),
         ("fetch.retry_base_backoff_ms", Range::new(0, 60_000)),
-        ("ingest.refresh_check_limit", Range::new(0, 10_000)),
+        (
+            "ingest.refresh_check_limit",
+            Range::new(0, REFRESH_CHECK_LIMIT_MAX),
+        ),
         ("geo.cache_max_entries", Range::new(0, 10_000_000)),
         // One second .. 30 days; a zero TTL would expire every entry
         // immediately and turn the cache off without saying so.

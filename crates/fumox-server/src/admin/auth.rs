@@ -11,7 +11,7 @@
 use crate::admin::AdminState;
 use crate::admin::i18n::{self, Lang};
 use crate::admin::theme::{self, Theme};
-use crate::security::{client_key, ct_eq};
+use crate::security::{ClientKeySource, client_key, ct_eq};
 use askama::Template;
 use axum::extract::{ConnectInfo, Form, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
@@ -26,8 +26,10 @@ use std::time::Duration;
 /// Session cookie name.
 pub const SESSION_COOKIE: &str = "fumox_session";
 
-/// Upper bound for buffered POST bodies (CSRF inspection).
-const MAX_BODY_BYTES: usize = 1 << 20;
+/// Upper bound for buffered POST bodies (CSRF inspection) and the
+/// router-wide `DefaultBodyLimit` (see `admin::router`): one constant, so
+/// the two limits cannot drift apart.
+pub(crate) const MAX_BODY_BYTES: usize = 1 << 20;
 
 /// Derive a 32-byte key from the admin token and a purpose tag.
 pub fn derive_key(purpose: &[u8], token: &str) -> Vec<u8> {
@@ -195,6 +197,20 @@ pub fn session_cookie_value(headers: &axum::http::HeaderMap) -> Option<String> {
     None
 }
 
+/// `Set-Cookie` value of the session cookie: the attributes shared by the
+/// minting login and the clearing logout — scoped to the panel, closed to
+/// scripts and other sites, valid for `max_age` seconds. The `Secure` flag
+/// follows the caller's `[admin].secure_cookies`: a plain-http panel would
+/// never see its own cookie back otherwise.
+fn session_cookie(value: &str, max_age: u64, secure: bool) -> String {
+    let mut cookie =
+        format!("{SESSION_COOKIE}={value}; Path=/admin; HttpOnly; SameSite=Lax; Max-Age={max_age}");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
 /// Trimmed header value as UTF-8, or nothing. Empty values carry no
 /// signal either way.
 fn header_str<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
@@ -337,45 +353,56 @@ pub async fn rate_limit(
     if path.starts_with("/admin/static/") {
         return next.run(req).await;
     }
-    if cross_site_context(req.method(), req.headers()) {
-        tracing::warn!(path = %path, "cross-site admin request rejected without counting");
-        let lang = state.locales.lang_from_headers(req.headers());
-        return plain(StatusCode::FORBIDDEN, lang.t("err.cross_site"));
-    }
-    let ip = client_key(
+    let (key, source) = client_key(
         addr,
         req.headers(),
         &state.trusted_cidrs,
         state.trusted_header,
-    )
-    .to_string();
+    );
+    let ip = key.to_string();
+    // A key that degraded to the peer despite a declared header and a
+    // trusted proxy ([`ClientKeySource::PeerFallback`]) puts everything
+    // behind that peer into one bucket: say so once per window, the
+    // condition holds for every request the window covers.
+    if source == ClientKeySource::PeerFallback {
+        crate::security::warn_shared_peer_bucket(&ip, state.admin_limiter.window());
+    }
+    if cross_site_context(req.method(), req.headers()) {
+        tracing::warn!(
+            ip = %ip,
+            path = %path,
+            "cross-site admin request rejected without counting"
+        );
+        let lang = state.locales.lang_from_headers(req.headers());
+        return plain(StatusCode::FORBIDDEN, lang.t("err.cross_site"));
+    }
     let is_login = req.method() == Method::POST && path == "/admin/login";
     let limiter = if is_login {
         state.login_limiter.clone()
     } else {
         state.admin_limiter.clone()
     };
-    if !limiter.allow(&ip).await {
+    if let Err(retry_after) = limiter.check(&ip).await {
         tracing::warn!(ip = %ip, path = %path, "admin rate limit exceeded");
         let lang = state.locales.lang_from_headers(req.headers());
-        return (
+        let mut response = (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             format!("{}\n", lang.t("err.rate_limited")),
         )
             .into_response();
+        // The window's remaining seconds, so a well-behaved client waits
+        // instead of burning the quota again on the next attempt.
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, retry_after.into());
+        return response;
     }
     // The failed-login attribution below runs after `req` is consumed;
     // keep owned copies of the request identity for it.
     let method = req.method().clone();
     let path = path.to_owned();
     let response = next.run(req).await;
-    // A rejected response was already punished by a stricter limiter (the
-    // login one) or is not this layer's business at all: the outer window
-    // must not pay for it twice.
-    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-        limiter.refund(&ip).await;
-    }
     // The login window counts *failed* attempts: a successful login is
     // not a guess, and it must not cost the operator a slot in the
     // brute-force window. The slot is given back, the window is not
@@ -386,10 +413,11 @@ pub async fn rate_limit(
         limiter.refund(&ip).await;
     }
     // A failed login is the panel's primary brute-force audit signal, but
-    // the handler never sees the client address (it extracts no
-    // ConnectInfo). Attribute the 422 it renders to its source here, where
-    // the per-IP key is already computed; the 429 warn above only covers
-    // the exhausted-window case.
+    // the handler stays out of the failure log: the attempt is attributed
+    // here, in the one layer that holds the per-IP key, so a grep over the
+    // event yields exactly one record per attempt (the success line is the
+    // handler's, with the same key). The 429 warn above only covers the
+    // exhausted-window case.
     if is_login && response.status() == StatusCode::UNPROCESSABLE_ENTITY {
         tracing::warn!(ip = %ip, method = %method, path = %path, "failed admin login attempt");
     }
@@ -404,21 +432,28 @@ pub async fn rate_limit(
 /// rotated through the settings screen changes the effective key at once
 /// and every cookie minted under the old one stops verifying.
 pub async fn require_auth(State(state): State<AdminState>, req: Request, next: Next) -> Response {
-    let epoch = match session_epoch(&state.pool).await {
-        Ok(epoch) => epoch,
-        Err(err) => {
-            // The epoch is the revocation state: without it a session
-            // could outlive the revocation it was supposed to die in.
-            tracing::error!(error = %err, "cannot read the session epoch; rejecting the request");
-            return plain(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the session revocation state is unavailable, try again\n",
-            );
-        }
+    // The epoch read is a database round trip: make it only for a request
+    // that carries a session cookie to verify, the same order
+    // `login_submit` follows. A request without the cookie has no session
+    // to check and goes straight to the redirect below.
+    let authenticated = match session_cookie_value(req.headers()) {
+        Some(value) => match session_epoch(&state.pool).await {
+            Ok(epoch) => verify_session(&state.session_key(), &value, epoch).is_some(),
+            Err(err) => {
+                // The epoch is the revocation state: without it a session
+                // could outlive the revocation it was supposed to die in.
+                tracing::error!(
+                    error = %err,
+                    "cannot read the session epoch; rejecting the request"
+                );
+                return plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the session revocation state is unavailable, try again\n",
+                );
+            }
+        },
+        None => false,
     };
-    let authenticated = session_cookie_value(req.headers())
-        .and_then(|value| verify_session(&state.session_key(), &value, epoch))
-        .is_some();
     if authenticated {
         return next.run(req).await;
     }
@@ -436,19 +471,73 @@ pub async fn csrf_protect(State(state): State<AdminState>, req: Request, next: N
         return next.run(req).await;
     }
     let lang = state.locales.lang_from_headers(req.headers());
+    // The per-IP key for the audit log below, the same key the rate
+    // limiter counts (see `rate_limit`): a CSRF failure is a forgery
+    // signal and has to name its source.
+    let ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| {
+            client_key(
+                info.0,
+                req.headers(),
+                &state.trusted_cidrs,
+                state.trusted_header,
+            )
+            .0
+            .to_string()
+        });
     let session = session_cookie_value(req.headers()).unwrap_or_default();
     let expected = csrf_token(&state.csrf_key(), &session);
 
     let (parts, body) = req.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
-        return plain(StatusCode::BAD_REQUEST, lang.t("err.body_too_large"));
+    let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(err)
+            if std::error::Error::source(&err)
+                .is_some_and(|src| src.is::<http_body_util::LengthLimitError>()) =>
+        {
+            return plain(StatusCode::BAD_REQUEST, lang.t("err.body_too_large"));
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %parts.uri.path(),
+                "cannot read the admin request body"
+            );
+            return plain(StatusCode::BAD_REQUEST, lang.t("err.body_unreadable"));
+        }
     };
     let provided = form_field(&bytes, "_csrf").unwrap_or_default();
     let req = Request::from_parts(parts, axum::body::Body::from(bytes));
 
     if !ct_eq(&expected, &provided) {
-        tracing::warn!(path = %req.uri(), "CSRF check failed");
-        return plain(StatusCode::FORBIDDEN, lang.t("err.csrf_failed"));
+        tracing::warn!(
+            path = %req.uri(),
+            ip = ip.as_deref().unwrap_or("unknown"),
+            "CSRF check failed"
+        );
+        // An HTMX request swaps only the fragment it targeted: a 403 body
+        // would land inside the already-rendered page and leave the
+        // operator stuck. Send the whole page to the login screen — a
+        // session that ended (logout, token rotation) is the common cause,
+        // and a fresh page re-mints the CSRF token with it.
+        if req.headers().contains_key("HX-Request") {
+            return (StatusCode::FORBIDDEN, [("HX-Redirect", "/admin/login")]).into_response();
+        }
+        let body = format!(
+            "<!doctype html><html lang=\"{}\"><head><meta charset=\"utf-8\"><title>403</title>\
+             </head><body><h1>403</h1><p>{}</p><p><a href=\"/admin\">{}</a></p></body></html>",
+            lang.code(),
+            lang.t("err.csrf_stale"),
+            lang.t("nav.dashboard"),
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            body,
+        )
+            .into_response();
     }
     next.run(req).await
 }
@@ -457,6 +546,10 @@ pub async fn csrf_protect(State(state): State<AdminState>, req: Request, next: N
 pub struct LoginForm {
     #[serde(default)]
     token: String,
+    /// Where to redirect after a successful login, the hidden field the
+    /// login form carried (validated by [`super::admin_next_value`], so a
+    /// forged value degrades to `/admin`).
+    next: Option<String>,
 }
 
 #[derive(Template)]
@@ -472,55 +565,120 @@ struct LoginTemplate {
     /// database refused the epoch bump): the operator has to know that
     /// the cookie they hold may still work.
     notice: Option<String>,
+    /// Where the successful login redirects to, carried through the form
+    /// as a hidden field and re-validated on submit
+    /// ([`super::admin_next_value`], admin-surface paths only).
+    next: String,
 }
 
 i18n::impl_i18n!(LoginTemplate);
 
+impl LoginTemplate {
+    /// The `?lang=` switch link of one language choice. The code is
+    /// percent-encoded before it rides in the href: the choices come from
+    /// the locales directory, and a crafted file name must not be able to
+    /// add a query parameter (or close the attribute) through the link.
+    fn lang_href(&self, code: &str) -> String {
+        format!(
+            "/admin/login?lang={}",
+            percent_encoding::utf8_percent_encode(code, percent_encoding::NON_ALPHANUMERIC)
+        )
+    }
+
+    /// The `aria-describedby` targets of the token field: the error
+    /// message of the failed attempt (when one is shown) and the hint
+    /// below the field (login.html).
+    #[allow(dead_code)]
+    fn token_describedby(&self) -> &'static str {
+        if self.error.is_some() {
+            "login-error token-hint"
+        } else {
+            "token-hint"
+        }
+    }
+
+    /// Whether the previous attempt failed: the field is marked invalid
+    /// so screen readers announce the error with it.
+    #[allow(dead_code)]
+    fn has_error(&self) -> bool {
+        self.error.is_some()
+    }
+}
+
 /// Login screen. The `?lang=` query parameter selects the UI language and
 /// persists it in the `fumox_lang` cookie; without it the cookie decides
-/// (Russian by default).
+/// (Russian by default). `?theme=` pins the theme the same way
+/// (`fumox_theme` cookie) — the pre-auth equivalent of the topbar's
+/// `/admin/set-theme` POST, which needs a session the login screen does
+/// not have. `?next=` is the page to land on after the login, validated
+/// and passed through the form as a hidden field.
 pub async fn login_form(
     State(state): State<AdminState>,
     headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let (lang, set_cookie) = match params.get("lang") {
+    let mut set_cookies: Vec<String> = Vec::new();
+    let lang = match params.get("lang") {
         Some(value) => {
             let lang = state.locales.resolve(value);
-            let cookie = i18n::lang_cookie(lang.code());
-            (lang, Some(cookie))
+            set_cookies.push(i18n::lang_cookie(lang.code()));
+            lang
         }
-        None => (state.locales.lang_from_headers(&headers), None),
+        None => state.locales.lang_from_headers(&headers),
+    };
+    let theme = match params.get("theme") {
+        Some(value) => {
+            let theme = Theme::parse(value);
+            set_cookies.push(theme::theme_cookie(theme));
+            theme
+        }
+        None => theme::from_headers(&headers),
     };
     // `?revoked=0` is the logout's answer when the revocation did not
     // happen: the session the browser held may still work, and the
-    // operator has to hear it instead of a silent redirect.
+    // operator has to hear it instead of a silent redirect. `?logout=1`
+    // is the regular logout's answer, naming the side effect a
+    // single-session panel has: every other browser was logged out too.
     let notice = match params.get("revoked").map(String::as_str) {
         Some("0") => Some(lang.t("login.not_revoked").to_string()),
-        _ => None,
+        _ => params
+            .get("logout")
+            .map(|_| lang.t("login.logged_out").to_string()),
     };
     let template = LoginTemplate {
         langs: state.locales.choices().to_vec(),
-        theme: theme::from_headers(&headers),
+        theme,
         lang,
         error: None,
         notice,
+        next: super::admin_next(&params),
     };
-    let mut response = crate::admin::render_html(template.lang.clone(), &template, StatusCode::OK);
-    if let Some(cookie) = set_cookie
-        && let Ok(value) = cookie.parse()
-    {
-        response.headers_mut().insert(header::SET_COOKIE, value);
+    let mut response = crate::admin::render_html(
+        template.lang.clone(),
+        "login.html",
+        &template,
+        StatusCode::OK,
+    );
+    // Both preferences can be chosen at once, so the cookies append.
+    for cookie in set_cookies {
+        if let Ok(value) = cookie.parse() {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
     }
     response
 }
 
 pub async fn login_submit(
     State(state): State<AdminState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
+    // The failed attempt is attributed by the rate-limit middleware (the
+    // only layer that sees the client key); the handler renders the 422
+    // and stays out of the log.
+    let next = super::admin_next_value(form.next.as_deref());
     // The empty token disables the panel entirely; never match it. The
     // historical "change-me" placeholder is not a credential either: it
     // means "no token configured", so it must never open a session. The
@@ -545,24 +703,15 @@ pub async fn login_submit(
             }
         };
         let value = issue_session(&state.session_key(), ttl, epoch);
-        let mut cookie = format!(
-            "{SESSION_COOKIE}={value}; Path=/admin; HttpOnly; SameSite=Lax; Max-Age={}",
-            ttl.as_secs()
-        );
-        if admin.secure_cookies {
-            cookie.push_str("; Secure");
-        }
-        tracing::info!("admin logged in");
+        let cookie = session_cookie(&value, ttl.as_secs(), admin.secure_cookies);
+        let ip = client_key(addr, &headers, &state.trusted_cidrs, state.trusted_header).0;
+        tracing::info!(ip = %ip, "admin logged in");
         return (
             StatusCode::SEE_OTHER,
-            [
-                (header::SET_COOKIE, cookie),
-                (header::LOCATION, "/admin".to_string()),
-            ],
+            [(header::SET_COOKIE, cookie), (header::LOCATION, next)],
         )
             .into_response();
     }
-    tracing::warn!("failed admin login attempt");
     let error = lang.t("login.bad_token").to_string();
     let template = LoginTemplate {
         langs: state.locales.choices().to_vec(),
@@ -570,35 +719,14 @@ pub async fn login_submit(
         lang,
         error: Some(error),
         notice: None,
+        next,
     };
     crate::admin::render_html(
         template.lang.clone(),
+        "login.html",
         &template,
         StatusCode::UNPROCESSABLE_ENTITY,
     )
-}
-
-/// Language switch: persists the choice in the `fumox_lang` cookie and
-/// redirects back to `next` (validated by `super::admin_next`, admin-surface
-/// paths only, no open redirect). Mounted outside the auth/CSRF layers so it
-/// works pre-auth.
-pub async fn set_lang(
-    State(state): State<AdminState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    let lang = params
-        .get("lang")
-        .map(|value| state.locales.resolve(value))
-        .unwrap_or_else(|| state.locales.default_lang());
-    let next = super::admin_next(&params);
-    (
-        StatusCode::SEE_OTHER,
-        [
-            (header::SET_COOKIE, i18n::lang_cookie(lang.code())),
-            (header::LOCATION, next),
-        ],
-    )
-        .into_response()
 }
 
 /// Log out: clear the cookie *and* bump the server-side session epoch, so
@@ -613,13 +741,32 @@ pub async fn set_lang(
 /// When the bump could not be persisted the cookie is cleared anyway, but
 /// the redirect says so: a copy of it may keep working, and the operator
 /// has to know that the revocation did not happen.
-pub async fn logout(State(state): State<AdminState>) -> Response {
+pub async fn logout(
+    State(state): State<AdminState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let ip = client_key(addr, &headers, &state.trusted_cidrs, state.trusted_header).0;
     let revoked = revoke_all_sessions(&state.pool).await;
-    let cookie = format!("{SESSION_COOKIE}=; Path=/admin; HttpOnly; SameSite=Lax; Max-Age=0");
-    let location = if revoked {
-        "/admin/login".to_string()
+    // Both outcomes are attributed: the regular logout is the audit line
+    // for the operator's own action, the failed bump is the case where a
+    // cleared-cookie copy may keep working (`revoke_all_sessions` logs the
+    // database error itself, this line ties it to the logout and its key).
+    if revoked {
+        tracing::info!(ip = %ip, "admin logged out; all sessions revoked");
     } else {
-        "/admin/login?revoked=0".to_string()
+        tracing::warn!(
+            ip = %ip,
+            "admin logout could not revoke the sessions; the cleared cookie's copies may stay valid"
+        );
+    }
+    let cookie = session_cookie("", 0, state.admin().secure_cookies);
+    // `?logout=1` renders the sign-out notice on the login screen; the
+    // failed revocation adds the not-revoked warning on top of it.
+    let location = if revoked {
+        "/admin/login?logout=1".to_string()
+    } else {
+        "/admin/login?logout=1&revoked=0".to_string()
     };
     (
         StatusCode::SEE_OTHER,
@@ -831,6 +978,22 @@ mod tests {
             .unwrap();
         assert_eq!(stored.as_deref(), Some("1"));
 
+        // The login screen announces the sign-out, naming the side effect
+        // a single-session panel has: the other browsers were ended too.
+        use http_body_util::BodyExt;
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/admin/login?logout=1&lang=en", "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains("signed out"),
+            "the login screen must carry the logout notice: {html:.400}"
+        );
+
         // A fresh login under the bumped epoch authenticates again.
         let response = app
             .clone()
@@ -882,6 +1045,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The 429 names the wait: the seconds left in the exhausted window,
+        // so a client backs off instead of probing the reset itself.
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("the exhausted window must carry Retry-After");
+        assert!(
+            retry_after > 0 && retry_after <= 60,
+            "Retry-After must name the remaining window seconds: {retry_after}"
+        );
     }
 
     /// L-099: the login window counts *failed* attempts. A successful
@@ -1136,7 +1311,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             response.headers().get(header::LOCATION).unwrap(),
-            "/admin/login?revoked=0",
+            "/admin/login?logout=1&revoked=0",
             "the redirect must say that the revocation did not happen"
         );
 
@@ -1538,7 +1713,7 @@ mod tests {
             .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        crate::admin::stabilize_callsite_interests();
+        crate::test_support::stabilize_callsite_interests();
         // A call site whose first execution predates this test may already
         // be cached as `never`; re-evaluate every call site against the
         // now-multi-dispatcher registry so the lines below are observable.
@@ -1584,6 +1759,76 @@ mod tests {
         let b = csrf_token(&key, "session-b");
         assert_ne!(a, b);
         assert_eq!(a, csrf_token(&key, "session-a"));
+    }
+
+    /// A CSRF mismatch sends the browser back to a working state instead
+    /// of a bare 403 text: an HTMX request gets `HX-Redirect` (a fragment
+    /// swap would bury the error inside the already-rendered page), a
+    /// plain browser gets a localized HTML page that explains the stale
+    /// session and offers the way back.
+    #[tokio::test]
+    async fn a_csrf_mismatch_sends_the_browser_back_to_a_working_page() {
+        use http_body_util::BodyExt;
+
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = cookie_from(&response);
+
+        // A POST whose body carries no CSRF field: the session is valid,
+        // the token is not (a stale tab after a logout elsewhere, say).
+        // The English catalog cookie pins the language the page must use.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/logout",
+                "",
+                Some(&format!("{cookie}; fumox_lang=en")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().get("HX-Redirect").is_none());
+        let html = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        assert!(
+            html.contains("<!doctype html>") && html.contains("session has been refreshed"),
+            "the plain browser must get a localized HTML page: {html:.400}"
+        );
+
+        // The same request from HTMX moves the whole page to login.
+        let mut htmx = request("POST", "/admin/logout", "", Some(&cookie));
+        htmx.headers_mut()
+            .insert("HX-Request", "true".parse().unwrap());
+        let response = app.oneshot(htmx).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get("HX-Redirect")
+                .map(|value| value.to_str().unwrap()),
+            Some("/admin/login")
+        );
     }
 
     #[test]

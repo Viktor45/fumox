@@ -311,6 +311,20 @@ pub async fn count_all(pool: &DbPool) -> crate::Result<i64> {
     count_filtered(pool, &FetchLogFilter::default()).await
 }
 
+/// `(total, ok)` fetch counts over a rolling window, the dashboard's
+/// fetches card. One grouped pass, so the two figures cannot disagree.
+pub async fn success_counts_since<'e, E>(executor: E, since_ts: i64) -> crate::Result<(i64, i64)>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row: (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(ok), 0) FROM fetch_log WHERE fetched_at > ?")
+            .bind(since_ts)
+            .fetch_one(executor)
+            .await?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,6 +16,10 @@
 //! error: the reference binds them together, so the file does not say
 //! which row a profile composition means.
 //!
+//! The file carries the source request headers as stored — in plain
+//! text, secrets included — so a downloaded export must be handled as a
+//! secret (the export hint on the screen says the same).
+//!
 //! Validation mirrors the source/profile forms (the shared field
 //! validators in [`super`]) and is all-or-nothing: any hard error yields a
 //! 422 with the full list and writes nothing. A *transient* DNS failure is
@@ -42,9 +46,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
+use bytes::{BufMut, BytesMut};
+
 use super::{
-    caps, pipeline_size, validate_countries, validate_header_map, validate_name,
-    validate_slug_format, validate_tags, validate_token, validate_ttl,
+    caps, pipeline_size, url_problem_message, validate_countries, validate_header_map,
+    validate_name, validate_slug_format, validate_tags, validate_token, validate_ttl,
 };
 
 /// Body of `POST /admin/import`. A typed `Form` extractor parses only the
@@ -83,6 +89,12 @@ struct ExportSource {
     reference: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slug: Option<String>,
+    /// The source's `/src` access token **as stored**: a hash, never the
+    /// secret — the same rule as the profile token above. A source
+    /// without its own token stays public on import (the profile token
+    /// does not extend to `/src`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_token: Option<String>,
     name: String,
     url: String,
     #[serde(default)]
@@ -136,6 +148,110 @@ struct ExportProfile {
     source_refs: Vec<String>,
 }
 
+// The stable configuration fields of a source/profile, defined once per
+// direction: the export takes them from a stored row, the import writes
+// them back into a fresh one. A field added to both structs is a compile
+// error in these impls instead of being silently dropped from one of the
+// two directions. Runtime fields (ids, the collision-checked slug, the
+// timestamps, the last-error facts) are the write phase's, not the file's.
+
+impl From<&models::Source> for ExportSource {
+    fn from(s: &models::Source) -> Self {
+        Self {
+            reference: s.id.clone(),
+            slug: s.slug.clone(),
+            // The stored token is a hash, so the file carries the hash: no
+            // working secret ever leaves the deployment.
+            access_token: s.access_token.clone(),
+            name: s.name.clone(),
+            url: s.url.clone(),
+            enabled: s.enabled,
+            encoding: s.encoding,
+            input_format: s.input_format,
+            protocols: s.protocols.clone(),
+            cache_ttl_seconds: s.cache_ttl_seconds,
+            tags: s.tags.clone(),
+            pipeline: s.pipeline.clone(),
+            headers: s.headers.clone(),
+            ip_family: s.ip_family,
+        }
+    }
+}
+
+impl From<&models::Profile> for ExportProfile {
+    fn from(p: &models::Profile) -> Self {
+        Self {
+            slug: p.slug.clone(),
+            // The stored token is a hash, so the file carries the hash: no
+            // working secret ever leaves the deployment, and the import
+            // stores the same hash, which keeps the endpoint usable for
+            // the clients that already know the token.
+            access_token: p.access_token.clone(),
+            name: p.name.clone(),
+            output_format: p.output_format,
+            pipeline: p.pipeline.clone(),
+            countries: p.countries.clone(),
+            include_unknown_country: p.include_unknown_country,
+            enabled: p.enabled,
+            // The composition is per-deployment state, not a stable field:
+            // `export_config` resolves it separately, in profile order.
+            source_refs: Vec::new(),
+        }
+    }
+}
+
+impl From<ExportSource> for models::Source {
+    fn from(s: ExportSource) -> Self {
+        Self {
+            // Stamped by the write phase (a fresh id, the collision-checked
+            // slug, the creation stamps); the last-error facts belong to
+            // the new row, not to the file.
+            id: String::new(),
+            slug: s.slug,
+            access_token: s.access_token,
+            name: s.name,
+            url: s.url,
+            enabled: s.enabled,
+            encoding: s.encoding,
+            input_format: s.input_format,
+            // An empty allowlist means "no filter", never "nothing passes":
+            // the list is normalised before the source is written.
+            protocols: models::normalize_protocols(s.protocols),
+            cache_ttl_seconds: s.cache_ttl_seconds,
+            tags: s.tags,
+            pipeline: s.pipeline,
+            headers: s.headers,
+            ip_family: s.ip_family,
+            created_at: 0,
+            updated_at: 0,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        }
+    }
+}
+
+impl From<ExportProfile> for models::Profile {
+    fn from(p: ExportProfile) -> Self {
+        Self {
+            // Stamped by the write phase, like [`models::Source`] above;
+            // the country allowlist is normalized by the caller, which
+            // owns the validation language for its messages.
+            id: String::new(),
+            slug: p.slug,
+            access_token: p.access_token,
+            name: p.name,
+            output_format: p.output_format,
+            pipeline: p.pipeline,
+            countries: p.countries,
+            include_unknown_country: p.include_unknown_country,
+            enabled: p.enabled,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+}
+
 // Export
 
 /// Which import cap an export exceeds.
@@ -159,17 +275,35 @@ struct ImportLimit {
     actual: usize,
 }
 
+/// One-off wrapper that appends the [`ImportLimit`] marker to the
+/// streamed document: `flatten` writes the file's own fields, the marker
+/// joins as one more key, so the whole document is never re-serialized
+/// from its own JSON form.
+#[derive(Serialize)]
+struct ExportWithLimit<'a> {
+    #[serde(flatten)]
+    file: &'a ConfigExport,
+    import_limit: &'a ImportLimit,
+}
+
 /// Serialize the export and say whether the import would take it.
 ///
 /// The import accepts at most [`caps::IMPORT_ROWS`] rows per table and a
 /// document of at most [`caps::IMPORT_BODY_BYTES`] bytes. A bigger
 /// deployment exports a file the import refuses, so the file says so
 /// instead of the operator finding out at the import step.
+///
+/// The document is written once, compact, straight into the response
+/// buffer; the limit marker (when there is one) rides along through the
+/// [`ExportWithLimit`] wrapper. `actual` stays the size of the document
+/// *without* the marker, so the row-cap case still reports the row
+/// counts and the byte cap the size that was measured.
 fn serialize_export(
     file: &ConfigExport,
-) -> Result<(String, Option<ImportLimit>), serde_json::Error> {
-    let plain = serde_json::to_string_pretty(file)?;
-    let limit = if file.sources.len() > caps::IMPORT_ROWS {
+) -> Result<(BytesMut, Option<ImportLimit>), serde_json::Error> {
+    // The row caps are counts on the in-memory file: they need no
+    // serialization.
+    if let Some(limit) = if file.sources.len() > caps::IMPORT_ROWS {
         Some(ImportLimit {
             cap: ImportCap::Rows,
             limit: caps::IMPORT_ROWS,
@@ -181,78 +315,76 @@ fn serialize_export(
             limit: caps::IMPORT_ROWS,
             actual: file.profiles.len(),
         })
-    } else if plain.len() > caps::IMPORT_BODY_BYTES {
-        Some(ImportLimit {
-            cap: ImportCap::Bytes,
-            limit: caps::IMPORT_BODY_BYTES,
-            actual: plain.len(),
-        })
     } else {
         None
+    } {
+        let mut body = BytesMut::new();
+        serde_json::to_writer(
+            (&mut body).writer(),
+            &ExportWithLimit {
+                file,
+                import_limit: &limit,
+            },
+        )?;
+        return Ok((body, Some(limit)));
+    }
+
+    let mut body = BytesMut::new();
+    serde_json::to_writer((&mut body).writer(), file)?;
+    if body.len() <= caps::IMPORT_BODY_BYTES {
+        return Ok((body, None));
+    }
+    // Over the byte cap: re-measure the marker says so on the size the
+    // plain document had.
+    let limit = ImportLimit {
+        cap: ImportCap::Bytes,
+        limit: caps::IMPORT_BODY_BYTES,
+        actual: body.len(),
     };
-    let Some(limit) = limit else {
-        return Ok((plain, None));
-    };
-    let mut value = serde_json::to_value(file)?;
-    value["import_limit"] = serde_json::to_value(limit)?;
-    Ok((serde_json::to_string_pretty(&value)?, Some(limit)))
+    body.clear();
+    serde_json::to_writer(
+        (&mut body).writer(),
+        &ExportWithLimit {
+            file,
+            import_limit: &limit,
+        },
+    )?;
+    Ok((body, Some(limit)))
 }
 
 /// `GET /admin/export`, download the whole configuration as JSON.
 pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    let lang = state.locales.lang_from_headers(&headers);
-
     let src_rows = match sources::list(&state.pool, false).await {
         Ok(rows) => rows,
-        Err(err) => return super::server_error(lang, &err),
+        Err(err) => return super::server_error(&state, &headers, "export.sources_list", &err),
     };
     let prof_rows = match profiles::list(&state.pool, false).await {
         Ok(rows) => rows,
-        Err(err) => return super::server_error(lang, &err),
+        Err(err) => return super::server_error(&state, &headers, "export.profiles_list", &err),
     };
 
     let mut export_sources = Vec::with_capacity(src_rows.len());
-    for s in src_rows {
-        export_sources.push(ExportSource {
-            reference: s.id.clone(),
-            slug: s.slug.clone(),
-            name: s.name.clone(),
-            url: s.url.clone(),
-            enabled: s.enabled,
-            encoding: s.encoding,
-            input_format: s.input_format,
-            protocols: s.protocols.clone(),
-            cache_ttl_seconds: s.cache_ttl_seconds,
-            tags: s.tags.clone(),
-            pipeline: s.pipeline.clone(),
-            headers: s.headers.clone(),
-            ip_family: s.ip_family,
-        });
+    for s in &src_rows {
+        export_sources.push(ExportSource::from(s));
     }
 
+    // One read groups the whole composition table by profile; the
+    // per-profile read below used to issue one indexed query per row.
+    let compositions = match profiles::sources_by_profile(&state.pool).await {
+        Ok(compositions) => compositions,
+        Err(err) => return super::server_error(&state, &headers, "export.profile_sources", &err),
+    };
+
     let mut export_profiles = Vec::with_capacity(prof_rows.len());
-    for p in prof_rows {
-        let composition = match profiles::get_sources(&state.pool, &p.id).await {
-            Ok(composition) => composition,
-            Err(err) => return super::server_error(lang, &err),
-        };
-        let mut ordered = composition;
-        ordered.sort_by_key(|(_, position)| *position);
-        export_profiles.push(ExportProfile {
-            slug: p.slug.clone(),
-            // The stored token is a hash, so the file carries the hash: no
-            // working secret ever leaves the deployment, and the import
-            // stores the same hash, which keeps the endpoint usable for
-            // the clients that already know the token.
-            access_token: p.access_token.clone(),
-            name: p.name.clone(),
-            output_format: p.output_format,
-            pipeline: p.pipeline.clone(),
-            countries: p.countries.clone(),
-            include_unknown_country: p.include_unknown_country,
-            enabled: p.enabled,
-            source_refs: ordered.into_iter().map(|(id, _)| id).collect(),
-        });
+    for p in &prof_rows {
+        let mut export = ExportProfile::from(p);
+        // Each profile's rows arrive in position order (the query orders
+        // them, the same order the per-profile read sorted into).
+        export.source_refs = compositions
+            .get(&p.id)
+            .map(|rows| rows.iter().map(|(id, _)| id.clone()).collect())
+            .unwrap_or_default();
+        export_profiles.push(export);
     }
 
     let file = ConfigExport {
@@ -263,7 +395,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
     };
     let (body, limit) = match serialize_export(&file) {
         Ok(body) => body,
-        Err(err) => return super::server_error(lang, &err),
+        Err(err) => return super::server_error(&state, &headers, "export.serialize", &err),
     };
 
     // The audit line carries the row counts only: no URL, no token, no
@@ -283,7 +415,7 @@ pub async fn export_config(State(state): State<AdminState>, headers: HeaderMap) 
     }
 
     let date = export_date();
-    let mut response = (StatusCode::OK, body).into_response();
+    let mut response = (StatusCode::OK, body.freeze()).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("application/json; charset=utf-8"),
@@ -414,6 +546,7 @@ async fn render_page(state: &AdminState, args: RenderArgs<'_>) -> Response {
     );
     render_html(
         lang.clone(),
+        "import.html",
         &ImportTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -490,47 +623,25 @@ pub async fn import_submit(
         .await;
     }
 
-    let file: ConfigExport = match serde_json::from_str(&payload) {
-        Ok(file) => file,
-        Err(err) => {
-            let errors = vec![lang.t("io.err_parse").replace("{}", &err.to_string())];
-            return render_page(
-                &state,
-                RenderArgs {
-                    lang,
-                    theme,
-                    peer,
-                    headers: &headers,
-                    status: StatusCode::UNPROCESSABLE_ENTITY,
-                    errors,
-                    payload: Some(payload),
-                },
-            )
-            .await;
-        }
-    };
-    if file.version != SUPPORTED_VERSION {
-        let errors = vec![
+    // Parse, then the version, then the shared validation: every refusal
+    // funnels into the one 422 return below, so the screen, the echoed
+    // payload and the error list cannot drift between the branches.
+    let mut validation = ImportValidation::default();
+    let mut file = None;
+    match serde_json::from_str::<ConfigExport>(&payload) {
+        Err(err) => validation
+            .errors
+            .push(lang.t("io.err_parse").replace("{}", &err.to_string())),
+        Ok(parsed) if parsed.version != SUPPORTED_VERSION => validation.errors.push(
             lang.t("io.err_version")
-                .replace("{}", &file.version.to_string()),
-        ];
-        return render_page(
-            &state,
-            RenderArgs {
-                lang,
-                theme,
-                peer,
-                headers: &headers,
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                errors,
-                payload: Some(payload),
-            },
-        )
-        .await;
+                .replace("{}", &parsed.version.to_string()),
+        ),
+        Ok(parsed) => {
+            // All-or-nothing validation pass.
+            validation = validate_import(&state, &lang, &parsed).await;
+            file = Some(parsed);
+        }
     }
-
-    // All-or-nothing validation pass.
-    let validation = validate_import(&state, &lang, &file).await;
     if !validation.errors.is_empty() {
         return render_page(
             &state,
@@ -546,6 +657,7 @@ pub async fn import_submit(
         )
         .await;
     }
+    let file = file.expect("a file without validation errors has been parsed");
 
     match apply_import(&state, &lang, file, validation.warnings).await {
         Ok(summary) => {
@@ -580,7 +692,7 @@ pub async fn import_submit(
             };
             super::flash_redirect("/admin/import", &message, "ok")
         }
-        Err(err) => super::server_error(lang, &err),
+        Err(err) => super::server_error(&state, &headers, "import.apply", &err),
     }
 }
 
@@ -614,6 +726,7 @@ pub async fn rotate_alive_token_form(
     let theme = theme::from_headers(&headers);
     render_html(
         lang.clone(),
+        "import_rotate.html",
         &RotateTokenTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -625,19 +738,25 @@ pub async fn rotate_alive_token_form(
     )
 }
 
-/// `POST /admin/import/alive-token`, issue a fresh token for the «all
-/// alive» export link; the previous link stops working immediately.
-pub async fn rotate_alive_token(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+/// `POST /admin/import/alive-token`, issue a fresh token shared by the
+/// «all alive» and «all ready» export links; both stop working
+/// immediately.
+pub async fn rotate_alive_token(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     match state.export_token.rotate(&state.pool).await {
         Ok(_) => {
             // Audit line for a capability change that instantly invalidates
             // both export links (one secret, shared by /export/alive and
-            // /export/ready). The token value itself is never logged.
-            tracing::info!("alive-export capability token rotated");
+            // /export/ready). The peer names who ran the rotation; the
+            // token value itself is never logged.
+            tracing::info!(peer = %peer, "alive-export capability token rotated");
             super::flash_redirect("/admin/import", lang.t("io.alive_rotated"), "ok")
         }
-        Err(err) => super::server_error(lang, &err),
+        Err(err) => super::server_error(&state, &headers, "import.rotate_token", &err),
     }
 }
 
@@ -647,6 +766,46 @@ pub async fn rotate_alive_token(State(state): State<AdminState>, headers: Header
 struct ImportValidation {
     errors: Vec<String>,
     warnings: Vec<String>,
+}
+
+/// The prefix of every message about one imported row: the kind of row,
+/// its 1-based position in the file (an error list without a position is
+/// unreadable past the first row), the display name and, for a source,
+/// the reference the profiles join on.
+fn row_ctx(word: &str, index: usize, name: &str, reference: Option<&str>) -> String {
+    match reference {
+        Some(reference) => format!("{word} #{} «{name}» (ref {reference})", index + 1),
+        None => format!("{word} #{} «{name}»", index + 1),
+    }
+}
+
+/// The pipeline problems of one imported row: the stored-JSON size cap
+/// (the same measure the source and profile forms apply) and every
+/// compile issue, each prefixed with the row context. Shared by the
+/// source and the profile loops, so the two cannot drift.
+fn push_pipeline_errors(
+    pipeline: &serde_json::Value,
+    ctx: &str,
+    lang: &Lang,
+    errors: &mut Vec<String>,
+) {
+    // Same cap the source form applies: the JSON is stored verbatim and
+    // re-rendered into every edit form, and the preview
+    // recompiles it on each keystroke.
+    if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
+        errors.push(format!(
+            "{ctx}: {}",
+            lang.t("val.field_too_long")
+                .replace("{}", &caps::PIPELINE_BYTES.to_string())
+        ));
+    }
+    for issue in CompiledPipeline::from_json(Some(pipeline))
+        .err()
+        .into_iter()
+        .flatten()
+    {
+        errors.push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
+    }
 }
 
 /// Validate every imported object with the same rules as the forms.
@@ -697,8 +856,8 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
     // worth a name lookup.
     let mut url_is_valid: Vec<bool> = Vec::with_capacity(file.sources.len());
 
-    for s in &file.sources {
-        let ctx = format!("{} «{}»", lang.t("io.source_word"), s.name);
+    for (index, s) in file.sources.iter().enumerate() {
+        let ctx = row_ctx(lang.t("io.source_word"), index, &s.name, Some(&s.reference));
         if !seen_refs.insert(s.reference.as_str()) {
             validation.errors.push(format!(
                 "{ctx}: {}",
@@ -707,6 +866,23 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         }
         if let Err(message) = validate_name(&s.name, lang) {
             validation.errors.push(format!("{ctx}: {message}"));
+        }
+        // The same floor the profile token has: a third-party file must
+        // not plant a guessable secret on a public endpoint (`/src`), and
+        // an already-hashed value is what a deployment stored, not what
+        // the file chooses.
+        if let Some(token) = s.access_token.as_deref()
+            && !token.is_empty()
+            && !fumox_core::token::is_hashed(token)
+        {
+            if token.chars().count() < caps::TOKEN_MIN {
+                validation
+                    .errors
+                    .push(format!("{ctx}: {}", lang.t("val.token_too_short_import")));
+            }
+            if let Err(message) = validate_token(token, lang) {
+                validation.errors.push(format!("{ctx}: {message}"));
+            }
         }
         let mut url_ok = true;
         if s.url.trim().is_empty() {
@@ -724,7 +900,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
         } else if let Err(issue) = fetcher::validate_url(&s.url) {
             validation
                 .errors
-                .push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
+                .push(format!("{ctx}: {}", url_problem_message(lang, &issue)));
             url_ok = false;
         }
         url_is_valid.push(url_ok);
@@ -748,30 +924,12 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             validation.errors.push(format!("{ctx}: {message}"));
         }
         if let Some(pipeline) = s.pipeline.as_ref() {
-            // Same cap the source form applies: the JSON is stored verbatim
-            // and re-rendered into every edit form, and the preview
-            // recompiles it on each keystroke.
-            if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
-                validation.errors.push(format!(
-                    "{ctx}: {}",
-                    lang.t("val.field_too_long")
-                        .replace("{}", &caps::PIPELINE_BYTES.to_string())
-                ));
-            }
-            for issue in CompiledPipeline::from_json(Some(pipeline))
-                .err()
-                .into_iter()
-                .flatten()
-            {
-                validation
-                    .errors
-                    .push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
-            }
+            push_pipeline_errors(pipeline, &ctx, lang, &mut validation.errors);
         }
     }
 
-    for p in &file.profiles {
-        let ctx = format!("{} «{}»", lang.t("io.profile_word"), p.name);
+    for (index, p) in file.profiles.iter().enumerate() {
+        let ctx = row_ctx(lang.t("io.profile_word"), index, &p.name, None);
         if let Err(message) = validate_name(&p.name, lang) {
             validation.errors.push(format!("{ctx}: {message}"));
         }
@@ -803,22 +961,7 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             }
         }
         if let Some(pipeline) = p.pipeline.as_ref() {
-            if pipeline_size(pipeline) > caps::PIPELINE_BYTES {
-                validation.errors.push(format!(
-                    "{ctx}: {}",
-                    lang.t("val.field_too_long")
-                        .replace("{}", &caps::PIPELINE_BYTES.to_string())
-                ));
-            }
-            for issue in CompiledPipeline::from_json(Some(pipeline))
-                .err()
-                .into_iter()
-                .flatten()
-            {
-                validation
-                    .errors
-                    .push(format!("{ctx}: {}", lang.t_args(issue.key, &issue.args)));
-            }
+            push_pipeline_errors(pipeline, &ctx, lang, &mut validation.errors);
         }
         if let Err(message) = validate_countries(&p.countries, lang) {
             validation.errors.push(format!("{ctx}: {message}"));
@@ -831,19 +974,18 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
     // hygiene, not a security hole). The whole window is bounded by
     // `IMPORT_DNS_WINDOW`: the per-URL timeout alone would add up.
     let mut vetted = 0usize;
+    let mut expired = false;
     let deadline = tokio::time::Instant::now() + caps::IMPORT_DNS_WINDOW;
-    for (s, url_ok) in file.sources.iter().zip(url_is_valid.iter()) {
+    for ((index, s), url_ok) in file.sources.iter().enumerate().zip(url_is_valid.iter()) {
         if !url_ok {
             continue;
         }
         if vetted >= caps::IMPORT_DNS_VET {
-            break;
+            continue; // past the budget: counted below, vetted at fetch time
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            validation
-                .warnings
-                .push(lang.t("io.warn_dns_window").to_string());
+            expired = true;
             break;
         }
         vetted += 1;
@@ -860,12 +1002,12 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             ),
         )
         .await;
-        let ctx = format!("{} «{}»", lang.t("io.source_word"), s.name);
+        let ctx = row_ctx(lang.t("io.source_word"), index, &s.name, Some(&s.reference));
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(issue)) => {
-                let message = lang.t_args(issue.key, &issue.args);
-                if issue.kind.is_permanent() {
+                let message = url_problem_message(lang, &issue);
+                if issue.is_permanent() {
                     validation.errors.push(format!("{ctx}: {message}"));
                 } else {
                     // A name that did not resolve (timeout, SERVFAIL) says
@@ -878,22 +1020,32 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
                 }
             }
             Err(_elapsed) => {
-                validation
-                    .warnings
-                    .push(lang.t("io.warn_dns_window").to_string());
+                expired = true;
                 break;
             }
         }
     }
 
-    // Not an error: the remaining URLs were only statically validated and
-    // are re-vetted (with DNS) at fetch time.
-    if vetted < file.sources.len() {
+    // Not an error: the URLs the window left behind were only statically
+    // validated and are re-vetted (with DNS) at fetch time. The operator
+    // sees it either way: the deadline case keeps its own warning, the
+    // budget case says how many rows it covered.
+    let total_valid = url_is_valid.iter().filter(|ok| **ok).count();
+    let unvetted = total_valid.saturating_sub(vetted);
+    if expired {
+        validation
+            .warnings
+            .push(lang.t("io.warn_dns_window").to_string());
+    } else if unvetted > 0 {
         tracing::info!(
             vetted,
-            total = file.sources.len(),
-            "import DNS vetting hit the per-request window"
+            unvetted,
+            "import DNS vetting hit the per-request budget"
         );
+        validation.warnings.push(lang.t_args(
+            "io.warn_dns_budget",
+            &[vetted.to_string(), total_valid.to_string()],
+        ));
     }
 
     validation
@@ -924,18 +1076,16 @@ async fn apply_import(
     // `/src/{id}` (serve.rs:295), each querying one table. The same slug is
     // therefore legal on a source and on a profile, and must survive the
     // round trip on both.
-    let mut taken_source_slugs: HashSet<String> = HashSet::new();
-    for s in sources::list(&state.pool, false).await? {
-        if let Some(slug) = s.slug {
-            taken_source_slugs.insert(slug);
-        }
-    }
-    let mut taken_profile_slugs: HashSet<String> = HashSet::new();
-    for p in profiles::list(&state.pool, false).await? {
-        if let Some(slug) = p.slug {
-            taken_profile_slugs.insert(slug);
-        }
-    }
+    let mut taken_source_slugs: HashSet<String> = sources::list_slugs(&state.pool)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut taken_profile_slugs: HashSet<String> = profiles::list_slugs(&state.pool)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
 
     let now = models::now_ts();
     let mut ref_to_id: HashMap<String, String> = HashMap::new();
@@ -949,29 +1099,19 @@ async fn apply_import(
     for s in file.sources {
         let id = models::new_id();
         ref_to_id.insert(s.reference.clone(), id.clone());
-        let slug = claim_slug(s.slug, &mut taken_source_slugs, &s.name, lang, &mut summary);
-        let source = models::Source {
-            id: id.clone(),
-            slug,
-            name: s.name.clone(),
-            url: s.url,
-            enabled: s.enabled,
-            encoding: s.encoding,
-            input_format: s.input_format,
-            // An empty allowlist means "no filter", never "nothing passes":
-            // the list is normalised before the source is written.
-            protocols: models::normalize_protocols(s.protocols),
-            cache_ttl_seconds: s.cache_ttl_seconds,
-            tags: s.tags,
-            pipeline: s.pipeline,
-            headers: s.headers,
-            ip_family: s.ip_family,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
-        };
+        // The stable fields come from the file; the write phase stamps the
+        // fresh id, the collision-checked slug and the creation stamps.
+        let mut source = models::Source::from(s);
+        source.slug = claim_slug(
+            source.slug.take(),
+            &mut taken_source_slugs,
+            &source.name,
+            lang,
+            &mut summary,
+        );
+        source.id = id;
+        source.created_at = now;
+        source.updated_at = now;
         sources::create(&mut *tx, &source).await?;
         // No cache invalidation: the id is brand new, no rendered output can
         // reference it yet, and `last_fetched_at` is NULL, so the first
@@ -981,13 +1121,6 @@ async fn apply_import(
 
     for p in file.profiles {
         let id = models::new_id();
-        let slug = claim_slug(
-            p.slug,
-            &mut taken_profile_slugs,
-            &p.name,
-            lang,
-            &mut summary,
-        );
 
         // Remap composition onto the freshly created source ids; references
         // to sources missing from the file are dropped with a warning.
@@ -1014,24 +1147,24 @@ async fn apply_import(
             }
         }
 
-        let profile = models::Profile {
-            id: id.clone(),
-            slug,
-            // A plaintext token from a hand-written file is hashed by the
-            // repository; a hash from an export is stored as it is.
-            access_token: p.access_token,
-            name: p.name,
-            output_format: p.output_format,
-            pipeline: p.pipeline,
-            // The same normalization the profile form applies: the
-            // allowlist is compared against the uppercase country codes of
-            // the proxies.
-            countries: validate_countries(&p.countries, lang).unwrap_or_default(),
-            include_unknown_country: p.include_unknown_country,
-            enabled: p.enabled,
-            created_at: now,
-            updated_at: now,
-        };
+        let mut profile = models::Profile::from(p);
+        // The write phase stamps the fresh id, the collision-checked slug,
+        // the normalized allowlist and the creation stamps. A plaintext
+        // token from a hand-written file is hashed by the repository; a
+        // hash from an export is stored as it is.
+        profile.slug = claim_slug(
+            profile.slug.take(),
+            &mut taken_profile_slugs,
+            &profile.name,
+            lang,
+            &mut summary,
+        );
+        // The same normalization the profile form applies: the allowlist is
+        // compared against the uppercase country codes of the proxies.
+        profile.countries = validate_countries(&profile.countries, lang).unwrap_or_default();
+        profile.id = id.clone();
+        profile.created_at = now;
+        profile.updated_at = now;
         profiles::create(&mut *tx, &profile).await?;
         profiles::set_sources(&mut tx, &id, &composition).await?;
         created_profiles.push(id);
@@ -1079,6 +1212,7 @@ mod tests {
         ExportSource {
             reference: reference.into(),
             slug: slug.map(str::to_string),
+            access_token: None,
             name: name.into(),
             url: "https://example.com/sub".into(),
             enabled: true,
@@ -1201,7 +1335,15 @@ mod tests {
             profiles: Vec::new(),
         };
         let errors = validate_import(&state, &lang, &flood).await.errors;
-        assert!(!errors.is_empty(), "row cap must fire");
+        // The cap is substituted into the message before the kind suffix
+        // is appended, so the assert matches the substituted wording.
+        let wording = lang
+            .t("val.import_too_many_rows")
+            .replace("{}", &caps::IMPORT_ROWS.to_string());
+        assert!(
+            errors.iter().any(|e| e.contains(&wording)),
+            "the row-cap wording must be the reason: {errors:?}"
+        );
 
         // A profile with a guessable short token from a third-party file is
         // rejected (the endpoint would be "protected" by a known secret).
@@ -1287,6 +1429,7 @@ mod tests {
         let existing_source = models::Source {
             id: models::new_id(),
             slug: Some("main".into()),
+            access_token: None,
             name: "s0".into(),
             url: "https://example.com/sub".into(),
             enabled: true,
@@ -1391,14 +1534,67 @@ mod tests {
         assert_eq!(composition.len(), 1, "the ref is stored exactly once");
     }
 
+    /// A profile naming a source the file does not carry: the composition
+    /// keeps only the sources that are present, and the summary carries
+    /// the localized warning naming the profile and the ghost reference —
+    /// an import that silently dropped half a composition would look
+    /// successful while serving a different subscription.
+    #[tokio::test]
+    async fn an_unknown_source_reference_is_dropped_with_a_warning() {
+        let (_dir, state) = test_state().await;
+        let lang = state.locales.default_lang();
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: vec![source("srcA0000000", "s1", None)],
+            profiles: vec![profile("p1", None, &["srcA0000000", "ghost"])],
+        };
+
+        let summary = apply_import(&state, &lang, file, Vec::new())
+            .await
+            .expect("an unknown reference is a warning, not an error");
+        assert_eq!(summary.profiles_created, 1);
+
+        let rows = profiles::list(&state.pool, false).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let composition = profiles::get_sources(&state.pool, &rows[0].id)
+            .await
+            .unwrap();
+        assert_eq!(
+            composition.len(),
+            1,
+            "the known ref is kept, the ghost dropped"
+        );
+
+        let expected = lang
+            .t("io.warn_unknown_ref")
+            .replace("{profile}", "p1")
+            .replace("{ref}", "ghost");
+        assert!(
+            summary.warnings.iter().any(|w| w.contains(&expected)),
+            "the ghost ref must be named in the warnings: {:?}",
+            summary.warnings
+        );
+    }
+
     /// Two *source rows* sharing one `ref`: the write phase keys the fresh
     /// ids by reference, so the second row would overwrite the first in
     /// `ref_to_id` and the profile would bind only that one while the other
     /// source is created and silently orphaned. Validation rejects the
-    /// ambiguity instead of picking a winner.
+    /// ambiguity instead of picking a winner. The state vet URLs
+    /// deterministically (`allow_private_urls` skips the name resolution,
+    /// so neither a DNS hiccup nor a policy hit can add an unrelated
+    /// error): only the ref rule is under test.
     #[tokio::test]
     async fn duplicate_source_reference_is_rejected() {
-        let (_dir, state) = test_state().await;
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                allow_private_urls: true,
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
         let lang = state.locales.default_lang();
         let dup_text = lang.t("val.dup_ref").replace("{ref}", "srcA0000000");
 
@@ -1522,7 +1718,12 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let response = rotate_alive_token(State(state.clone()), HeaderMap::new()).await;
+        let response = rotate_alive_token(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:41000".parse().unwrap()),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
         // The rotation took effect: a fresh token replaced the old one.
@@ -1555,6 +1756,7 @@ mod tests {
         let source = models::Source {
             id: models::new_id(),
             slug: Some("s0".into()),
+            access_token: None,
             name: "s0".into(),
             url: "https://secret-host.example/sub".into(),
             enabled: true,
@@ -1667,6 +1869,10 @@ mod tests {
     /// screen will refuse.
     #[test]
     fn an_export_over_the_import_limits_says_so_in_the_file() {
+        // The serializer answers with the response buffer; the assertions
+        // read it as text.
+        let text = |body: BytesMut| String::from_utf8(body.to_vec()).unwrap();
+
         // A small file is importable: no marker.
         let file = ConfigExport {
             version: SUPPORTED_VERSION,
@@ -1676,6 +1882,7 @@ mod tests {
         };
         let (body, limit) = serialize_export(&file).unwrap();
         assert!(limit.is_none(), "a small file is importable");
+        let body = text(body);
         assert!(!body.contains("import_limit"), "{body}");
 
         // Too many rows: the row cap is named.
@@ -1692,6 +1899,7 @@ mod tests {
         assert_eq!(limit.cap, ImportCap::Rows);
         assert_eq!(limit.limit, caps::IMPORT_ROWS);
         assert_eq!(limit.actual, caps::IMPORT_ROWS + 1);
+        let body = text(body);
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             value["import_limit"]["cap"], "rows",
@@ -1712,6 +1920,7 @@ mod tests {
         assert_eq!(limit.cap, ImportCap::Bytes);
         assert_eq!(limit.limit, caps::IMPORT_BODY_BYTES);
         assert!(limit.actual > caps::IMPORT_BODY_BYTES);
+        let body = text(body);
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             value["import_limit"]["cap"], "bytes",

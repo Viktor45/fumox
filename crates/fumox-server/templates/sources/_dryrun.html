@@ -7,21 +7,28 @@
     <p><span class="badge error">{{ self.t("common.error") }}</span> {{ message }}</p>
   {% endif %}
   <table class="kv">
+    <caption class="visually-hidden">{{ self.t("src.dryrun_table_title") }}</caption>
     <tbody>
       {% match http_status %}
         {% when Some with (status) %}
-          <tr><td>{{ self.t("src.dryrun_http_status") }}</td><td>{{ status }}</td></tr>
+          <tr><th scope="row">{{ self.t("src.dryrun_http_status") }}</th><td>{{ status }}</td></tr>
         {% when None %}
       {% endmatch %}
-      <tr><td>{{ self.t("common.size") }}</td><td>{{ self.fmt_bytes(bytes) }}</td></tr>
+      {#- No answer, no size: the row only appears when the fetch
+          reported one, like the other optional rows of the table. -#}
+      {% match bytes %}
+        {% when Some with (bytes) %}
+          <tr><th scope="row">{{ self.t("common.size") }}</th><td>{{ self.fmt_bytes(bytes) }}</td></tr>
+        {% when None %}
+      {% endmatch %}
       {% match proxies_found %}
         {% when Some with (count) %}
-          <tr><td>{{ self.t("src.dryrun_recognized") }}</td><td>{{ count }}</td></tr>
+          <tr><th scope="row">{{ self.t("src.dryrun_recognized") }}</th><td>{{ count }}</td></tr>
         {% when None %}
       {% endmatch %}
       {% match dropped %}
         {% when Some with (count) %}
-          <tr><td>{{ self.t("src.dryrun_dropped") }}</td><td>{{ count }}</td></tr>
+          <tr><th scope="row">{{ self.t("src.dryrun_dropped") }}</th><td>{{ count }}</td></tr>
         {% when None %}
       {% endmatch %}
     </tbody>

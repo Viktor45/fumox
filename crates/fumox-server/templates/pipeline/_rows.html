@@ -11,7 +11,10 @@
    row keeps its previous layout and the ASN row would still show the
    regex inputs. `hx-include` pulls the whole `ped_*` form so the server
    rebuilds state from the full document, not just the select that
-   fired. #}
+   fired. Every target select also carries a stable id
+   (`ped-<section>-<row>-target`): the container is re-rendered
+   wholesale and htmx returns the focus to the re-created select with
+   the same id, so a keyboard user does not fall to <body> mid-edit. #}
 {% if section == "drop" %}
   {% for row in builder.state.drop %}
   {% if row.target == "asn" %}
@@ -19,6 +22,7 @@
     <input type="text" name="ped_drop_{{ loop.index0 }}_asns" value="{{ row.asns }}"
            placeholder="{{ self.t("ped.drop_asns_placeholder") }}" aria-label="{{ self.t("ped.target_asn") }}">
     <select name="ped_drop_{{ loop.index0 }}_target"
+            id="ped-drop-{{ loop.index0 }}-target"
             hx-post="/admin/pipeline/rows?section=drop&amp;render=1"
             hx-trigger="change" hx-target="#ped-drop-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
@@ -36,15 +40,16 @@
             hx-post="/admin/pipeline/rows?section=drop&amp;remove={{ loop.index0 }}"
             hx-target="#ped-drop-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
-            title="{{ self.t("ped.drop_remove") }}" aria-label="{{ self.t("ped.drop_remove") }}">✕</button>
+            title="{{ self.t("ped.drop_remove") }}" aria-label="{{ self.t("ped.drop_remove") }} {{ self.t_args("ped.rule_number", &[loop.index.to_string()][..]) }}">✕</button>
   </div>
   {% else %}
   <div class="ped-row">
     <input type="text" name="ped_drop_{{ loop.index0 }}_match" value="{{ row.match_pattern }}"
-           placeholder="{{ self.t("ped.drop_match") }}" aria-label="{{ self.t("ped.drop_match") }}">
+           placeholder="{{ self.t("ped.drop_match") }}" aria-label="{{ self.t("ped.drop_match") }} {{ self.t_args("ped.rule_number", &[loop.index.to_string()][..]) }}">
     <input type="text" class="mono" name="ped_drop_{{ loop.index0 }}_flags" value="{{ row.flags }}" maxlength="3"
            placeholder="{{ self.t("ped.drop_flags") }}" aria-label="{{ self.t("ped.drop_flags") }}">
     <select name="ped_drop_{{ loop.index0 }}_target"
+            id="ped-drop-{{ loop.index0 }}-target"
             hx-post="/admin/pipeline/rows?section=drop&amp;render=1"
             hx-trigger="change" hx-target="#ped-drop-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
@@ -58,13 +63,18 @@
       <option value="{{ row.target }}" selected>{{ row.target }}</option>
       {% endif %}
     </select>
+    {#- The parameter key belongs to the `param` target alone; the target
+        select re-renders the rows on change, so the field comes back
+        when `param` is picked. -#}
+    {% if row.target == "param" %}
     <input type="text" class="mono" name="ped_drop_{{ loop.index0 }}_key" value="{{ row.param_key }}"
-           placeholder="{{ self.t("ped.target_param_key") }}" aria-label="{{ self.t("ped.target_param_key") }}">
+           placeholder="{{ self.t("ped.target_param_key") }}" aria-label="{{ self.t("ped.target_param_key") }} {{ self.t_args("ped.rule_number", &[loop.index.to_string()][..]) }}">
+    {% endif %}
     <button class="btn small" type="button"
             hx-post="/admin/pipeline/rows?section=drop&amp;remove={{ loop.index0 }}"
             hx-target="#ped-drop-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
-            title="{{ self.t("ped.drop_remove") }}" aria-label="{{ self.t("ped.drop_remove") }}">✕</button>
+            title="{{ self.t("ped.drop_remove") }}" aria-label="{{ self.t("ped.drop_remove") }} {{ self.t_args("ped.rule_number", &[loop.index.to_string()][..]) }}">✕</button>
   </div>
   {% endif %}
   {% endfor %}
@@ -72,13 +82,14 @@
   {% for row in builder.state.rename %}
   <div class="ped-row">
     <input type="text" name="ped_rename_{{ loop.index0 }}_match" value="{{ row.match_pattern }}"
-           placeholder="{{ self.t("ped.rename_match") }}" aria-label="{{ self.t("ped.rename_match") }}">
+           placeholder="{{ self.t("ped.rename_match") }}" aria-label="{{ self.t("ped.rename_match") }} {{ self.t_args("ped.rule_number", &[loop.index.to_string()][..]) }}">
     <span class="ped-arrow">→</span>
     <input type="text" name="ped_rename_{{ loop.index0 }}_replace" value="{{ row.replace }}"
            placeholder="{{ self.t("ped.rename_replace") }}" aria-label="{{ self.t("ped.rename_replace") }}">
     <input type="text" class="mono" name="ped_rename_{{ loop.index0 }}_flags" value="{{ row.flags }}" maxlength="3"
            placeholder="{{ self.t("ped.rename_flags") }}" aria-label="{{ self.t("ped.rename_flags") }}">
     <select name="ped_rename_{{ loop.index0 }}_target"
+            id="ped-rename-{{ loop.index0 }}-target"
             hx-post="/admin/pipeline/rows?render=1"
             hx-trigger="change" hx-target="#ped-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
@@ -91,13 +102,18 @@
       <option value="{{ row.target }}" selected>{{ row.target }}</option>
       {% endif %}
     </select>
+    {#- The parameter key belongs to the `param` target alone; the target
+        select re-renders the rows on change, so the field comes back
+        when `param` is picked. -#}
+    {% if row.target == "param" %}
     <input type="text" class="mono" name="ped_rename_{{ loop.index0 }}_key" value="{{ row.param_key }}"
-           placeholder="{{ self.t("ped.target_param_key") }}" aria-label="{{ self.t("ped.target_param_key") }}">
+           placeholder="{{ self.t("ped.target_param_key") }}" aria-label="{{ self.t("ped.target_param_key") }} {{ self.t_args("ped.rule_number", &[loop.index.to_string()][..]) }}">
+    {% endif %}
     <button class="btn small" type="button"
             hx-post="/admin/pipeline/rows?remove={{ loop.index0 }}"
             hx-target="#ped-rows" hx-swap="innerHTML"
             hx-include="[name^='ped_'], [name='_csrf']"
-            title="{{ self.t("ped.rename_remove") }}" aria-label="{{ self.t("ped.rename_remove") }}">✕</button>
+            title="{{ self.t("ped.rename_remove") }}" aria-label="{{ self.t("ped.rename_remove") }} {{ self.t_args("ped.rule_number", &[loop.index.to_string()][..]) }}">✕</button>
   </div>
   {% endfor %}
 {% endif %}

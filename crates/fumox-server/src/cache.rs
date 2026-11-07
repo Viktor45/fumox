@@ -18,7 +18,8 @@
 //! short-circuit reads (see `ingest::ingest_source`), so the fact "when was
 //! this payload fetched" has exactly one home.
 //!
-//! Only 200 responses are cached; 404/500 must stay fresh.
+//! Only 200 responses are cached; 404/500 responses are never cached
+//! (every request re-renders them).
 //! Invalidation happens in the same handler that saves the
 //! change: a source change clears every processed entry that contains the
 //! source; a profile change clears its processed entry. A successful ingest
@@ -75,7 +76,6 @@ const PROCESSED_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const ENTRY_OVERHEAD_BYTES: u32 = 512;
 
 /// Rendered subscription output (layer 2).
-#[derive(Debug)]
 pub struct Rendered {
     pub status: u16,
     /// Shared byte body: concurrent responses of one cached rendering clone
@@ -92,11 +92,41 @@ pub struct Rendered {
     pub source_ids: Vec<String>,
 }
 
+/// A manual `Debug`, not the derived one: the body is a multi-megabyte
+/// payload (subscription renderings, error text), and a debug print of a
+/// [`Rendered`] must name its size, not dump the bytes into a log or a
+/// panic message.
+impl std::fmt::Debug for Rendered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rendered")
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .field("fresh_until", &self.fresh_until)
+            .field("source_ids", &self.source_ids)
+            .field("body_len", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Rendered {
     pub fn is_fresh(&self, now: i64) -> bool {
         now < self.fresh_until
     }
 }
+
+/// Upper bound on how long a rendered body is served from the processed
+/// cache as fresh, in seconds — the one freshness window `/sub`, `/src`
+/// (`RENDER_FRESHNESS_CAP_SECS`) and the alive exports (`EXPORT_TTL_SECS`)
+/// share. A source TTL answers a different question: how often to
+/// re-download the upstream feed. Health is owned by another process: the
+/// probe moves rows between tiers, and the server only hears about it when
+/// the next ingest invalidates the rendering. Left unbounded, a node the
+/// probe just retired keeps being served for a whole TTL. The window is
+/// therefore fixed and short: long enough to collapse a burst of client
+/// downloads into one render, far shorter than a probe cycle. A stale
+/// entry is still served immediately (stale-while-revalidate), so this
+/// costs one background re-render per window, never a 5xx.
+pub const RENDER_FRESHNESS_CAP_SECS: i64 = 30;
 
 /// Shared cache handle (cheap to clone, used by serving and admin handlers).
 #[derive(Clone)]
@@ -238,7 +268,16 @@ impl Caches {
         self.processed.get(&key.to_string()).await
     }
 
-    pub async fn processed_put(&self, key: &str, rendered: Rendered) -> Arc<Rendered> {
+    /// Put a rendering into the cache without a generation check.
+    ///
+    /// Only for keys that do not participate in per-source invalidation
+    /// (the `export:*` renderings, whose `source_ids` are empty). The
+    /// result of a render claimed through [`Caches::try_start_revalidate`]
+    /// or [`Caches::begin_inline_render`] must be stored through
+    /// [`Caches::processed_put_guarded`] with the generation from the
+    /// claim: an unguarded put behind an invalidation of that key would
+    /// store pre-change rows as fresh for a whole TTL.
+    pub async fn processed_put_unguarded(&self, key: &str, rendered: Rendered) -> Arc<Rendered> {
         let arc = Arc::new(rendered);
         self.store(key, arc.clone()).await;
         arc
@@ -276,14 +315,17 @@ impl Caches {
         if self.generation(key) != generation {
             return None;
         }
-        self.store(key, rendered).await;
+        // The stored entry is a clone of the one being handed back, so the
+        // happy path needs no second read of the cache; `None` stays
+        // reserved for the superseded branches.
+        self.store(key, rendered.clone()).await;
         if self.generation(key) != generation {
             // An invalidation landed between the check and the insert and
             // therefore did not see this entry; drop it by hand.
             self.processed_invalidate(key).await;
             return None;
         }
-        self.processed_get(key).await
+        Some(rendered)
     }
 
     /// Drop a rendered output and bump its generation, so a render still
@@ -351,16 +393,28 @@ impl Caches {
         );
         drop(inline);
         for key in affected {
-            self.bump_generation(&key);
-            self.processed.invalidate(&key).await;
+            self.processed_invalidate(&key).await;
         }
     }
 
     /// Profile changed (composition/format/pipeline/enabled): drop its
     /// rendered output.
     pub async fn invalidate_profile(&self, profile_id: &str) {
-        self.processed_invalidate(&format!("sub:{profile_id}"))
+        self.processed_invalidate(&Self::profile_key(profile_id))
             .await;
+    }
+
+    /// The processed-cache key of a profile's output: the one format the
+    /// serving path and every invalidation path must agree on, owned here
+    /// so a format change cannot drift between the two sides.
+    pub fn profile_key(profile_id: &str) -> String {
+        format!("sub:{profile_id}")
+    }
+
+    /// The processed-cache key of a single source's output (the `/src`
+    /// twin of [`Self::profile_key`]).
+    pub fn source_key(source_id: &str) -> String {
+        format!("src:{source_id}")
     }
 
     /// Claim the background revalidation of a key. Returns a guard that
@@ -636,13 +690,13 @@ mod tests {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
         caches
-            .processed_put("sub:p1", rendered(now + 60, &["s1", "s2"]))
+            .processed_put_unguarded("sub:p1", rendered(now + 60, &["s1", "s2"]))
             .await;
         caches
-            .processed_put("src:s1", rendered(now + 60, &["s1"]))
+            .processed_put_unguarded("src:s1", rendered(now + 60, &["s1"]))
             .await;
         caches
-            .processed_put("sub:p2", rendered(now + 60, &["s2"]))
+            .processed_put_unguarded("sub:p2", rendered(now + 60, &["s2"]))
             .await;
 
         caches.invalidate_processed_for_source("s1").await;
@@ -658,10 +712,10 @@ mod tests {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
         caches
-            .processed_put("sub:p1", rendered(now + 60, &["s1"]))
+            .processed_put_unguarded("sub:p1", rendered(now + 60, &["s1"]))
             .await;
         caches
-            .processed_put("sub:p2", rendered(now + 60, &["s1"]))
+            .processed_put_unguarded("sub:p2", rendered(now + 60, &["s1"]))
             .await;
 
         caches.invalidate_profile("p1").await;
@@ -725,7 +779,7 @@ mod tests {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
         caches
-            .processed_put("sub:p1", rendered(now - 1, &["s1"]))
+            .processed_put_unguarded("sub:p1", rendered(now - 1, &["s1"]))
             .await;
 
         // A stale request claims the key and starts re-rendering.
@@ -886,7 +940,7 @@ mod tests {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
         caches
-            .processed_put("sub:p1", rendered(now - 1, &["s1"]))
+            .processed_put_unguarded("sub:p1", rendered(now - 1, &["s1"]))
             .await;
         let claim = caches.try_start_revalidate("sub:p1").await.unwrap();
         let stored = caches
@@ -909,7 +963,7 @@ mod tests {
         let now = fumox_core::models::now_ts();
         let mut big = rendered(now + 60, &[]);
         big.body = Bytes::from(vec![b'x'; 1024 * 1024]);
-        caches.processed_put("sub:big", big).await;
+        caches.processed_put_unguarded("sub:big", big).await;
         // The write buffer is applied on demand, so the counters are read
         // after the maintenance pass.
         caches.processed.run_pending_tasks().await;
@@ -940,7 +994,7 @@ mod tests {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
         caches
-            .processed_put("sub:p1", rendered(now + 60, &["s1"]))
+            .processed_put_unguarded("sub:p1", rendered(now + 60, &["s1"]))
             .await;
         caches.processed_invalidate("sub:p1").await;
         assert!(caches.processed_get("sub:p1").await.is_none());
@@ -1008,10 +1062,10 @@ mod tests {
         let caches = Caches::new();
         let now = fumox_core::models::now_ts();
         caches
-            .processed_put("sub:p1", rendered(now + 60, &["s1"]))
+            .processed_put_unguarded("sub:p1", rendered(now + 60, &["s1"]))
             .await;
         caches
-            .processed_put("sub:p2", rendered(now + 60, &["s2"]))
+            .processed_put_unguarded("sub:p2", rendered(now + 60, &["s2"]))
             .await;
         caches.invalidate_processed_for_source("s1").await;
         assert!(caches.processed_get("sub:p1").await.is_none());

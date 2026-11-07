@@ -58,7 +58,7 @@ use fumox_core::db::DbPool;
 use fumox_core::repo;
 use fumox_core::repo::proxies;
 use fumox_core::repo::proxies::ProxyRow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -69,13 +69,41 @@ pub(crate) const TOKEN_KEY: &str = "alive_export_token";
 /// The exports carry no per-source TTL, and the probe (not an ingest) is
 /// what moves rows between tiers, so the window is fixed and short: long
 /// enough to collapse a burst of downloads into one query, far shorter than
-/// a probe cycle.
-const EXPORT_TTL_SECS: i64 = 30;
+/// a probe cycle. One definition with the subscription endpoints: the same
+/// [`crate::cache::RENDER_FRESHNESS_CAP_SECS`].
+const EXPORT_TTL_SECS: i64 = crate::cache::RENDER_FRESHNESS_CAP_SECS;
 
 /// How long a waiter queues behind the leader of an export render before
-/// rendering the body itself. The render is one bounded query, so this only
-/// ever fires when the leader is stuck.
-const EXPORT_RENDER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// rendering the body itself. Kept a separate constant well under the
+/// cache TTL above: the render is one bounded query, so this only ever
+/// fires when the leader is stuck, and a waiter that renders itself still
+/// finishes long before a client waiting on the cached window would.
+const EXPORT_RENDER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The two export tiers. A typed enum rather than a route string: the
+/// backing queries and the response labels select on it exhaustively, so
+/// adding a tier is a compiler-checked change, and no wildcard arm can
+/// silently fold an unknown tier into the alive query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tier {
+    /// `GET /export/alive/{token}`: T1-alive proxies without a fresh
+    /// successful T2.
+    Alive,
+    /// `GET /export/ready/{token}`: proxies whose latest T2 tunnel check
+    /// succeeded.
+    Ready,
+}
+
+impl Tier {
+    /// The tier's name in the cache key, the download file name and the
+    /// logs — the fixed route literal.
+    fn as_str(self) -> &'static str {
+        match self {
+            Tier::Alive => "alive",
+            Tier::Ready => "ready",
+        }
+    }
+}
 
 /// The capability token shared by both export links, kept in process
 /// memory.
@@ -127,6 +155,27 @@ impl TokenCache {
     }
 }
 
+/// The settings of the two export links, grouped so they travel through
+/// [`crate::serve::AppState`] as one field: the row ceiling of one body
+/// and the capability token the links check. The token is kept in process
+/// memory (see [`TokenCache`]), so a rotation reaches both listeners at
+/// once.
+#[derive(Clone)]
+pub struct ExportState {
+    /// Row ceiling of one `/export/alive` / `/export/ready` body
+    /// (`[server].export_max_rows`). The two links have no upstream cap of
+    /// their own, so this is the only thing bounding one public request.
+    pub max_rows: u32,
+    /// The capability token shared by both links.
+    pub token: TokenCache,
+}
+
+impl ExportState {
+    pub fn new(max_rows: u32, token: TokenCache) -> Self {
+        Self { max_rows, token }
+    }
+}
+
 /// UTC calendar date for export file names (shared with the config export).
 pub(crate) fn export_date() -> String {
     const FMT: &[time::format_description::FormatItem<'static>] =
@@ -147,120 +196,23 @@ const HOST_REJECT_WARN_WINDOW: Duration = Duration::from_secs(3_600);
 /// Distinct rejected hosts kept in the registry, bounding the memory a
 /// flood of distinct random hosts could pin. Hitting this count does not
 /// silence new hosts: it bounds tracking, not warnings (see
-/// [`HostRejectLog::should_warn`]).
+/// [`crate::security::WarnRegistry::should_warn`]).
 const HOST_REJECT_MAX_TRACKED: usize = 1_024;
 
 /// Warns this registry may emit per [`HOST_REJECT_WARN_WINDOW`]. Past it,
-/// rejections drop to debug, but the first suppressed host of the window
-/// is named in a summary when the window rolls over.
+/// rejections drop to debug, but the hosts the window swallowed are named
+/// in a summary when the window rolls over.
 const HOST_REJECT_MAX_WARNS: u32 = 64;
 
-/// Per-host warn registry for the host gate, see
-/// [`HostRejectLog::should_warn`].
-static HOST_REJECT_LOG: LazyLock<Mutex<HostRejectLog>> =
-    LazyLock::new(|| Mutex::new(HostRejectLog::default()));
-
-#[derive(Default)]
-struct HostRejectLog {
-    /// Tracked hosts: when they were last seen and the slot they hold in
-    /// the eviction order.
-    seen: HashMap<String, (Instant, u64)>,
-    /// The tracked hosts by slot number, so the oldest one is dropped
-    /// without a scan over the whole map.
-    order: BTreeMap<u64, String>,
-    /// Next slot number handed out.
-    next_slot: u64,
-    /// Start of the current warn window, and how much of
-    /// [`HOST_REJECT_MAX_WARNS`] it has spent.
-    window_start: Option<Instant>,
-    warns_emitted: u32,
-    /// First host the window could not warn about, kept so the rollover
-    /// summary can name it.
-    suppressed: Option<String>,
-    /// Suppressed hosts in the current window, for the rollover count.
-    suppressed_total: u64,
-}
-
-impl HostRejectLog {
-    /// Roll the window over if it has elapsed. Returns a summary to log
-    /// when the window that just closed had suppressed hosts.
-    fn roll_window(&mut self, now: Instant) -> Option<String> {
-        let Some(start) = self.window_start else {
-            // First rejection ever: open the window, report nothing.
-            self.window_start = Some(now);
-            return None;
-        };
-        if now.duration_since(start) < HOST_REJECT_WARN_WINDOW {
-            return None;
-        }
-        let suppressed = self.suppressed.take();
-        let total = std::mem::take(&mut self.suppressed_total);
-        self.warns_emitted = 0;
-        self.window_start = Some(now);
-        suppressed.map(|host| {
-            format!(
-                "host-gate rejections: {total} dropped to debug this window, \
-                 first suppressed host {host}"
-            )
-        })
-    }
-
-    /// Remember `host` as seen, dropping the oldest tracked host when the
-    /// set is full. The order map makes that drop O(log n) instead of a
-    /// scan over every tracked host.
-    fn track(&mut self, host: &str, now: Instant) {
-        if !self.seen.contains_key(host) {
-            if self.seen.len() >= HOST_REJECT_MAX_TRACKED {
-                // Bound the map, not the warnings: drop the oldest entry.
-                if let Some((_, oldest)) = self.order.pop_first() {
-                    self.seen.remove(&oldest);
-                }
-            }
-            self.next_slot += 1;
-            let slot = self.next_slot;
-            self.seen.insert(host.to_string(), (now, slot));
-            self.order.insert(slot, host.to_string());
-            return;
-        }
-        // A host that comes back after its own window keeps its slot: only
-        // the quiet window restarts.
-        let slot = self.seen.get(host).map(|(_, slot)| *slot).unwrap_or(0);
-        self.seen.insert(host.to_string(), (now, slot));
-    }
-
-    /// `true` when this rejection of `host` should warn, plus a summary to
-    /// log when a window rolls over (see [`Self::roll_window`]).
-    ///
-    /// Three rules, in order: a host already warned inside the window is
-    /// quiet; a host past [`HOST_REJECT_MAX_WARNS`] for the window is quiet
-    /// but remembered for the summary; otherwise it warns. The per-window
-    /// budget is what stops a scan sweeping random `Host` headers from
-    /// mirroring itself into the log, and the summary is what stops a
-    /// misconfigured allowlist from going unseen: the operator's own domain
-    /// is rejected on every request under a broken allowlist, so even as
-    /// the hundred-and-first host of a busy hour it is named once at the
-    /// rollover.
-    ///
-    /// The budget covers a host that returns after its own quiet window as
-    /// well: a flood of *repeat* visitors must not be able to spend the
-    /// window's warns either.
-    fn should_warn(&mut self, host: &str, now: Instant) -> (bool, Option<String>) {
-        let summary = self.roll_window(now);
-        if let Some((first, _)) = self.seen.get(host)
-            && now.duration_since(*first) < HOST_REJECT_WARN_WINDOW
-        {
-            return (false, summary);
-        }
-        self.track(host, now);
-        if self.warns_emitted >= HOST_REJECT_MAX_WARNS {
-            self.suppressed.get_or_insert_with(|| host.to_string());
-            self.suppressed_total += 1;
-            return (false, summary);
-        }
-        self.warns_emitted += 1;
-        (true, summary)
-    }
-}
+/// Per-host warn registry for the host gate, the shared bounded registry
+/// of [`crate::security::WarnRegistry`] keyed by host.
+static HOST_REJECT_LOG: LazyLock<Mutex<crate::security::WarnRegistry>> = LazyLock::new(|| {
+    Mutex::new(crate::security::WarnRegistry::new(
+        HOST_REJECT_WARN_WINDOW,
+        HOST_REJECT_MAX_TRACKED,
+        HOST_REJECT_MAX_WARNS,
+    ))
+});
 
 /// Whether a host-gate rejection should be logged at warn rather than
 /// debug (see [`HostRejectLog::should_warn`]). Logs the window summary when
@@ -271,7 +223,17 @@ fn should_warn_host_reject(host: &str, now: Instant) -> bool {
         .unwrap_or_else(|poison| poison.into_inner())
         .should_warn(host, now);
     if let Some(summary) = summary {
-        tracing::warn!(summary);
+        let named = summary.suppressed.join(", ");
+        let unnamed = summary.suppressed_total - summary.suppressed.len() as u64;
+        let mut message = format!(
+            "host-gate rejections: {} dropped to debug this window, \
+             suppressed hosts: {named}",
+            summary.suppressed_total
+        );
+        if unnamed > 0 {
+            message.push_str(&format!(", and {unnamed} more"));
+        }
+        tracing::warn!(message);
     }
     warn
 }
@@ -285,7 +247,7 @@ pub async fn serve(
     Path(token): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    serve_tier(state, headers, token, params, "alive").await
+    serve_tier(state, headers, token, params, Tier::Alive).await
 }
 
 /// `GET /export/ready/{token}`, the url_list of all ready (T2-verified)
@@ -296,18 +258,18 @@ pub async fn serve_ready(
     Path(token): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    serve_tier(state, headers, token, params, "ready").await
+    serve_tier(state, headers, token, params, Tier::Ready).await
 }
 
-/// Shared body of both export links. `tier` is a fixed route literal
-/// ("alive" | "ready") that selects the backing query and the response
-/// labels, it never carries user input.
+/// Shared body of both export links. `tier` selects the backing query and
+/// the response labels; it is a fixed route variant ([`Tier`]), never
+/// user input.
 async fn serve_tier(
     state: AppState,
     headers: HeaderMap,
     token: String,
     params: HashMap<String, String>,
-    tier: &str,
+    tier: Tier,
 ) -> Response {
     // Origin check first (before token check): the response on rejection is
     // identical to a wrong token (404 "link not found") so probing cannot
@@ -328,13 +290,7 @@ async fn serve_tier(
         }
         return serve::error_response(StatusCode::NOT_FOUND, "link not found");
     }
-    if params.contains_key("format") {
-        return serve::error_response(
-            StatusCode::BAD_REQUEST,
-            "the ?format= parameter is not supported: the export is always a plain url_list",
-        );
-    }
-    let expected = match state.export_token.current(&state.pool).await {
+    let expected = match state.export.token.current(&state.pool).await {
         Ok(expected) => expected,
         Err(err) => {
             tracing::error!(error = %err, "export token lookup failed");
@@ -355,11 +311,21 @@ async fn serve_tier(
             .insert(serve::AuthFailure("export capability token"));
         return response;
     }
+    // The ?format= refusal comes after both gates: a request the host gate
+    // or the token rejected answers with the gate's own 404, so the 400
+    // (the one visible feature difference) is only reachable with a valid
+    // token.
+    if params.contains_key("format") {
+        return serve::error_response(
+            StatusCode::BAD_REQUEST,
+            "the ?format= parameter is not supported: the export is always a plain url_list",
+        );
+    }
 
     let rendered = match cached_render(&state, tier).await {
         Ok(rendered) => rendered,
         Err(err) => {
-            tracing::error!(error = %err, "export render failed");
+            tracing::error!(tier = tier.as_str(), error = %err, "export render failed");
             return serve::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal server error",
@@ -372,7 +338,8 @@ async fn serve_tier(
         let date = export_date();
         // ASCII-only value (fixed prefix + calendar date), try_from cannot fail.
         if let Ok(value) = header::HeaderValue::try_from(format!(
-            "attachment; filename=\"fumox-{tier}-{date}.txt\""
+            "attachment; filename=\"fumox-{}-{date}.txt\"",
+            tier.as_str()
         )) {
             response
                 .headers_mut()
@@ -383,8 +350,8 @@ async fn serve_tier(
 }
 
 /// Processed-cache key of one export tier.
-fn cache_key(tier: &str) -> String {
-    format!("export:{tier}")
+fn cache_key(tier: Tier) -> String {
+    format!("export:{}", tier.as_str())
 }
 
 /// The rendered export body, cached for [`EXPORT_TTL_SECS`].
@@ -404,7 +371,7 @@ fn cache_key(tier: &str) -> String {
 /// The row cap is applied here, *after* the host and token gates in
 /// [`serve_tier`]: a rejected request must not be able to tell a capped
 /// render from a full one, and it must not cost a query at all.
-async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fumox_core::Error> {
+async fn cached_render(state: &AppState, tier: Tier) -> Result<Arc<Rendered>, fumox_core::Error> {
     let key = cache_key(tier);
     // An expired entry falls through to the re-render below rather than
     // serving a stale download.
@@ -421,8 +388,8 @@ async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fu
     // claim is here purely to collapse a download burst.
     match state.caches.begin_inline_render(&key, Vec::new()).await {
         InlineClaim::Leader(claim) => {
-            let rendered = render_tier(&state.pool, tier, state.export_max_rows).await?;
-            let stored = state.caches.processed_put(&key, rendered).await;
+            let rendered = render_tier(&state.pool, tier, state.export.max_rows).await?;
+            let stored = state.caches.processed_put_unguarded(&key, rendered).await;
             drop(claim);
             Ok(stored)
         }
@@ -441,21 +408,21 @@ async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fu
                     // a leader that never ends turns every waiter into a
                     // render of its own.
                     tracing::warn!(
-                        tier,
+                        tier = tier.as_str(),
                         "export render single-flight deadline exceeded, rendering independently"
                     );
                 }
             }
-            let rendered = render_tier(&state.pool, tier, state.export_max_rows).await?;
-            Ok(state.caches.processed_put(&key, rendered).await)
+            let rendered = render_tier(&state.pool, tier, state.export.max_rows).await?;
+            Ok(state.caches.processed_put_unguarded(&key, rendered).await)
         }
         InlineClaim::Failed { .. } => {
             // The export render never publishes a verdict (a failing
             // export fails its own request instead), so this branch is
             // unreachable today. It renders independently rather than
             // answering with a verdict that belongs to another endpoint.
-            let rendered = render_tier(&state.pool, tier, state.export_max_rows).await?;
-            Ok(state.caches.processed_put(&key, rendered).await)
+            let rendered = render_tier(&state.pool, tier, state.export.max_rows).await?;
+            Ok(state.caches.processed_put_unguarded(&key, rendered).await)
         }
     }
 }
@@ -464,9 +431,10 @@ async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fu
 /// in SQL ([`cached_render`] passes the configured
 /// `[server].export_max_rows`). Same metadata
 /// comments as `/sub` and `/src` (they document the file when the HTTP
-/// headers are lost to a copy-paste); the exports have no fetch TTL to
-/// derive an interval from, so they advertise the shortest sensible one:
-/// 1 hour.
+/// headers are lost to a copy-paste), except the interval: the exports
+/// have no fetch TTL to derive an update schedule from and the probe owns
+/// the tiers, so the block carries no interval hint at all rather than a
+/// made-up one.
 ///
 /// The `nodes count` header reports how many rows this body carries, which
 /// is *not* the same as how many the tier holds: a capped render reports the
@@ -480,13 +448,13 @@ async fn cached_render(state: &AppState, tier: &str) -> Result<Arc<Rendered>, fu
 /// size of the tier and `X-Fumox-Export-Truncated: true` marks a body the
 /// cap cut. A client therefore tells a full list from a truncated one
 /// without parsing the `nodes count` comment.
-async fn render_tier(pool: &DbPool, tier: &str, limit: u32) -> Result<Rendered, fumox_core::Error> {
+async fn render_tier(pool: &DbPool, tier: Tier, limit: u32) -> Result<Rendered, fumox_core::Error> {
     // The backing query clamps the limit to at least one row; the
     // comparison below has to count with the same number.
     let limit = limit.max(1);
     let rows: Vec<ProxyRow> = match tier {
-        "ready" => proxies::list_ready(pool, limit).await?,
-        _ => proxies::list_alive(pool, limit).await?,
+        Tier::Ready => proxies::list_ready(pool, limit).await?,
+        Tier::Alive => proxies::list_alive(pool, limit).await?,
     };
     let mut lines: Vec<String> = Vec::with_capacity(rows.len());
     let mut skipped: Vec<i64> = Vec::new();
@@ -501,19 +469,20 @@ async fn render_tier(pool: &DbPool, tier: &str, limit: u32) -> Result<Rendered, 
     if !skipped.is_empty() {
         let examples: Vec<i64> = skipped.iter().take(5).copied().collect();
         tracing::warn!(
-            tier,
+            tier = tier.as_str(),
             skipped = skipped.len(),
             examples = ?examples,
             "corrupt proxy rows skipped in export render"
         );
     }
-    let mut header = serve::url_list_header_block(&format!("export/{tier}"), 1, lines.len());
+    let mut header =
+        serve::url_list_header_block(&format!("export/{}", tier.as_str()), None, lines.len());
     // The tier size is looked up in the same request: a body that holds
     // exactly the cap may be truncated or may be the whole tier, and only
     // the size tells the two apart.
     let total = match tier {
-        "ready" => proxies::count_ready(pool).await?,
-        _ => proxies::count_alive(pool).await?,
+        Tier::Ready => proxies::count_ready(pool).await?,
+        Tier::Alive => proxies::count_alive(pool).await?,
     };
     let mut extra_headers = vec![("X-Fumox-Export-Total".to_string(), total.to_string())];
     if total > i64::from(limit) {
@@ -521,7 +490,7 @@ async fn render_tier(pool: &DbPool, tier: &str, limit: u32) -> Result<Rendered, 
             "# truncated: showing {limit} of {total} — raise [server].export_max_rows\n"
         ));
         extra_headers.push(("X-Fumox-Export-Truncated".to_string(), "true".to_string()));
-        warn_truncation(tier, limit, total);
+        warn_truncation(tier.as_str(), limit, total);
     }
     let body = format!("{header}{}", lines.join("\n"));
     Ok(Rendered {
@@ -607,17 +576,27 @@ mod tests {
             Vec::new(),
             fumox_core::config::TrustedHeader::None,
             allowed_hosts,
-            export_max_rows,
-            TokenCache::new(),
+            ExportState::new(export_max_rows, TokenCache::new()),
         );
         let app = crate::serve::router(state.clone());
         (app, token, state)
     }
 
-    /// One GET of an export link, body as text.
-    async fn get(app: axum::Router, uri: &str) -> (StatusCode, String) {
+    /// One GET of an export link with an explicit `Host` header (`None`
+    /// sends none, the deny-by-default case), body as text. The one
+    /// driver of every host-gate test, so the request shape exists once.
+    async fn get_with_host(
+        app: &axum::Router,
+        uri: &str,
+        host: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut request = Request::builder().uri(uri);
+        if let Some(host) = host {
+            request = request.header(header::HOST, host);
+        }
         let response = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -627,38 +606,38 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// One GET of an export link without a `Host` header, body as text.
+    async fn get(app: axum::Router, uri: &str) -> (StatusCode, String) {
+        get_with_host(&app, uri, None).await
+    }
+
     #[tokio::test]
     async fn non_allowlisted_host_returns_404_even_with_valid_token() {
         let (app, token, _state) =
             app_with_token(vec!["vpn.example.com".to_string()], default_cap()).await;
-        let request = Request::builder()
-            .method("GET")
-            .uri(format!("/export/alive/{token}"))
-            .header(header::HOST, "evil.example")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let (status, body) = get_with_host(
+            &app,
+            &format!("/export/alive/{token}"),
+            Some("evil.example"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         // Identical body to a wrong-token response so probing cannot
         // distinguish the two.
-        let body = response.into_body();
-        let bytes = axum::body::to_bytes(body, 1024).await.unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        assert_eq!(text, "link not found\n");
+        assert_eq!(body, "link not found\n");
     }
 
     #[tokio::test]
     async fn allowlisted_host_returns_200() {
         let (app, token, _state) =
             app_with_token(vec!["vpn.example.com".to_string()], default_cap()).await;
-        let request = Request::builder()
-            .method("GET")
-            .uri(format!("/export/alive/{token}"))
-            .header(header::HOST, "vpn.example.com")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let (status, _) = get_with_host(
+            &app,
+            &format!("/export/alive/{token}"),
+            Some("vpn.example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// Deny-by-default: a request with no `Host` header must be rejected
@@ -669,23 +648,17 @@ mod tests {
     async fn missing_host_with_allowlist_returns_404_with_identical_body() {
         let (app, token, _state) =
             app_with_token(vec!["vpn.example.com".to_string()], default_cap()).await;
-        let request = Request::builder()
-            .method("GET")
-            .uri(format!("/export/alive/{token}"))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&bytes), "link not found\n");
+        let (status, body) = get_with_host(&app, &format!("/export/alive/{token}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "link not found\n");
     }
 
     /// Two distinct failure modes (bad host vs bad token) must yield
     /// byte-identical responses, same status, same body, same
     /// Content-Type, so an attacker cannot probe the link to learn
     /// whether the host check or the token check rejected the request.
+    /// This test drives the raw responses because the Content-Type header
+    /// is part of the equality; [`get_with_host`] returns status + body.
     #[tokio::test]
     async fn bad_host_and_bad_token_return_byte_equal_bodies_and_content_type() {
         let (app, token, _state) =
@@ -732,35 +705,51 @@ mod tests {
     async fn case_mismatch_in_allowlist_succeeds() {
         let (app, token, _state) =
             app_with_token(vec!["vpn.example.com".to_string()], default_cap()).await;
-        let request = Request::builder()
-            .method("GET")
-            .uri(format!("/export/alive/{token}"))
-            .header(header::HOST, "VPN.EXAMPLE.COM")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let (status, _) = get_with_host(
+            &app,
+            &format!("/export/alive/{token}"),
+            Some("VPN.EXAMPLE.COM"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
-    /// The host gate must run before the `?format=` branch, a malformed
-    /// format on a rejected host must not widen the response to 400 or
-    /// 500 (both would tell the attacker the host was checked at all).
+    /// The `?format=` refusal sits behind both gates: a request a gate
+    /// rejects answers with the gate's own 404 ("link not found"), so the
+    /// parameter cannot be probed through a rejection, and the 400 — the
+    /// one visible feature difference — is reachable only with a valid
+    /// token.
     #[tokio::test]
-    async fn format_query_with_bad_host_returns_404_not_500() {
-        let (app, _token, _state) =
+    async fn format_query_refusal_sits_behind_the_host_and_token_gates() {
+        let (app, token, _state) =
             app_with_token(vec!["vpn.example.com".to_string()], default_cap()).await;
-        let request = Request::builder()
-            .method("GET")
-            .uri("/export/alive/anything?format=json")
-            .header(header::HOST, "evil.example")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&bytes), "link not found\n");
+        // Bad host: the host gate answers first, 404.
+        let (status, body) = get_with_host(
+            &app,
+            "/export/alive/anything?format=json",
+            Some("evil.example"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "link not found\n");
+        // Valid host, wrong token: the token gate answers, also 404.
+        let (status, body) = get_with_host(
+            &app,
+            "/export/alive/wrong?format=json",
+            Some("vpn.example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "link not found\n");
+        // Only a valid token gets as far as the 400.
+        let (status, body) = get_with_host(
+            &app,
+            &format!("/export/alive/{token}?format=json"),
+            Some("vpn.example.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("not supported"), "{body:?}");
     }
 
     /// The export body is a full read + re-serialize of the whole tier, so
@@ -774,6 +763,7 @@ mod tests {
         let source = fumox_core::models::Source {
             id: "srcA0000000".to_string(),
             slug: None,
+            access_token: None,
             name: "source".to_string(),
             url: "https://example.com/list".to_string(),
             enabled: true,
@@ -842,7 +832,7 @@ mod tests {
         // stale.
         state
             .caches
-            .processed_put(
+            .processed_put_unguarded(
                 "export:alive",
                 Rendered {
                     status: 200,
@@ -878,48 +868,23 @@ mod tests {
         .await
         .unwrap();
         fumox_core::db::migrate(&pool).await.unwrap();
-        sqlx::query(
-            "INSERT INTO sources (id, name, url, enabled, encoding, cache_ttl_seconds, created_at, updated_at)
-             VALUES ('srcC0000000', 'cap', 'https://example.com', 1, 'auto', 3600, 1, 1)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
         // Five linked alive rows, ids 1..5.
-        for i in 1..=5i64 {
-            sqlx::query(
-                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-                 VALUES (?, 'vless', 'n', ?, 443, 'c', 'alive', 1, 1)",
-            )
-            .bind(format!("fp-cap-{i}"))
-            .bind(format!("cap{i}.example.com"))
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
-                 VALUES (?, 'srcC0000000', 1)",
-            )
-            .bind(i)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
+        seed_alive_tier(&pool, "srcC0000000", 5).await;
 
         // Under the cap the whole tier is served.
-        let full = render_tier(&pool, "alive", 100).await.unwrap();
+        let full = render_tier(&pool, Tier::Alive, 100).await.unwrap();
         let full_body = String::from_utf8(full.body.to_vec()).unwrap();
         assert!(full_body.contains("# nodes count: 5"), "{full_body:?}");
-        assert!(full_body.contains("cap5.example.com"), "{full_body:?}");
+        assert!(full_body.contains("tier5.example.com"), "{full_body:?}");
 
         // At the cap the body is truncated, and it truncates the stable id
         // order: the two lowest ids, not an arbitrary slice.
-        let capped = render_tier(&pool, "alive", 2).await.unwrap();
+        let capped = render_tier(&pool, Tier::Alive, 2).await.unwrap();
         let body = String::from_utf8(capped.body.to_vec()).unwrap();
         assert!(body.contains("# nodes count: 2"), "{body:?}");
-        assert!(body.contains("cap1.example.com"), "{body:?}");
-        assert!(body.contains("cap2.example.com"), "{body:?}");
-        assert!(!body.contains("cap3.example.com"), "{body:?}");
+        assert!(body.contains("tier1.example.com"), "{body:?}");
+        assert!(body.contains("tier2.example.com"), "{body:?}");
+        assert!(!body.contains("tier3.example.com"), "{body:?}");
 
         // The admin badge stays uncapped: the operator must be able to
         // see that the tier is bigger than what the export ships.
@@ -947,19 +912,19 @@ mod tests {
 
         // Under the cap: the whole tier ships and says nothing about a
         // truncation that did not happen.
-        let full = render_tier(&pool, "alive", 100).await.unwrap();
+        let full = render_tier(&pool, Tier::Alive, 100).await.unwrap();
         let body = String::from_utf8(full.body.to_vec()).unwrap();
         assert!(!body.contains("truncated"), "{body:?}");
 
         // Exactly the tier size: nothing was left out, so nothing is
         // announced.
-        let exact = render_tier(&pool, "alive", 5).await.unwrap();
+        let exact = render_tier(&pool, Tier::Alive, 5).await.unwrap();
         let body = String::from_utf8(exact.body.to_vec()).unwrap();
         assert!(!body.contains("truncated"), "{body:?}");
 
         // At the cap with a larger tier: the body names the cap, the tier
         // size and the setting to raise.
-        let capped = render_tier(&pool, "alive", 2).await.unwrap();
+        let capped = render_tier(&pool, Tier::Alive, 2).await.unwrap();
         let body = String::from_utf8(capped.body.to_vec()).unwrap();
         assert!(body.contains("# truncated: showing 2 of 5"), "{body:?}");
         assert!(body.contains("[server].export_max_rows"), "{body:?}");
@@ -1075,7 +1040,7 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let rendered = render_tier(&pool, "alive", 100).await.unwrap();
+        let rendered = render_tier(&pool, Tier::Alive, 100).await.unwrap();
         let body = String::from_utf8(rendered.body.to_vec()).unwrap();
         // The good rows still ship.
         assert!(body.contains("tier1.example.com"), "{body:?}");
@@ -1162,26 +1127,103 @@ mod tests {
         // the byte-identical "link not found" body they had before the
         // cap existed, i.e. the cap added no new observable on them.
         for (uri, host) in [
-            (format!("/export/alive/{token}"), "evil.example"),
-            ("/export/alive/wrong-token".to_string(), "vpn.example.com"),
+            (format!("/export/alive/{token}"), Some("evil.example")),
+            (
+                "/export/alive/wrong-token".to_string(),
+                Some("vpn.example.com"),
+            ),
         ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(&uri)
-                        .header(header::HOST, host)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
-            let bytes = axum::body::to_bytes(response.into_body(), 1024)
-                .await
-                .unwrap();
-            assert_eq!(String::from_utf8_lossy(&bytes), "link not found\n");
+            let (status, body) = get_with_host(&app, &uri, host).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(body, "link not found\n", "{uri}");
         }
+    }
+
+    /// `meta` is the source of truth across restarts: a token written
+    /// there directly (a restart, or a hand-seeded deployment) is what a
+    /// cold [`TokenCache`] serves, and a rotation is what a second cold
+    /// cache picks up afterwards.
+    #[tokio::test]
+    async fn the_token_cache_picks_up_a_preexisting_meta_token() {
+        let (_app, _token, state) = app_with_token(Vec::new(), default_cap()).await;
+        fumox_core::repo::meta_set(&state.pool, TOKEN_KEY, "existing")
+            .await
+            .unwrap();
+
+        // A cold cache reads the stored token instead of minting its own.
+        let cache = TokenCache::new();
+        assert_eq!(
+            cache.current(&state.pool).await.unwrap(),
+            "existing",
+            "a preexisting meta token must survive the cache's first read"
+        );
+
+        // Rotation replaces it, and a second cold cache (the restart
+        // case) picks up the rotated value from `meta`.
+        let rotated = cache.rotate(&state.pool).await.unwrap();
+        let fresh = TokenCache::new();
+        assert_eq!(fresh.current(&state.pool).await.unwrap(), rotated);
+    }
+
+    /// The wait branch of the single-flight: a request that arrives while
+    /// the leader holds the claim wakes when the claim ends and serves the
+    /// fresh entry the leader stored, without rendering its own copy.
+    #[tokio::test]
+    async fn a_waiter_serves_the_entry_the_leader_stored() {
+        let (app, token, state) = app_with_token(Vec::new(), default_cap()).await;
+        // The tier is empty on purpose: the body below is the leader's
+        // entry, and an independent (empty-tier) render would not carry
+        // it, so the assertion really pins the wait path.
+        let claim = match state
+            .caches
+            .begin_inline_render("export:alive", Vec::new())
+            .await
+        {
+            InlineClaim::Leader(claim) => claim,
+            InlineClaim::Wait(_) => panic!("a fresh cache must hand out the leader claim"),
+            InlineClaim::Failed { .. } => panic!("a fresh cache has no failure verdict"),
+        };
+        let uri = format!("/export/alive/{token}");
+        let waiter = tokio::spawn(async move { get_with_host(&app, &uri, None).await });
+        // Give the request time to reach the claim: without the pause it
+        // could arrive after the drop below and render independently.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The leader finishes: a fresh entry goes in, then the claim ends
+        // and every waiter wakes.
+        state
+            .caches
+            .processed_put_unguarded(
+                "export:alive",
+                Rendered {
+                    status: 200,
+                    body: b"the-leaders-entry.example\n".to_vec().into(),
+                    content_type: "text/plain; charset=utf-8".to_string(),
+                    extra_headers: Vec::new(),
+                    fresh_until: fumox_core::models::now_ts() + EXPORT_TTL_SECS,
+                    source_ids: Vec::new(),
+                },
+            )
+            .await;
+        drop(claim);
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must finish within 5s")
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("the-leaders-entry.example"),
+            "the waiter must serve the entry the leader stored: {body:?}"
+        );
+    }
+
+    /// A fresh shared registry with the host-gate parameters, the shape
+    /// the production static is built with.
+    fn host_reject_registry() -> crate::security::WarnRegistry {
+        crate::security::WarnRegistry::new(
+            HOST_REJECT_WARN_WINDOW,
+            HOST_REJECT_MAX_TRACKED,
+            HOST_REJECT_MAX_WARNS,
+        )
     }
 
     /// One warn per rejected host per window, then debug: a misconfigured
@@ -1189,7 +1231,7 @@ mod tests {
     /// operator's own traffic into the log.
     #[test]
     fn host_reject_warns_once_per_host_per_window() {
-        let mut log = HostRejectLog::default();
+        let mut log = host_reject_registry();
         let t0 = Instant::now();
         assert!(log.should_warn("warn-once.example", t0).0);
         assert!(!log.should_warn("warn-once.example", t0).0);
@@ -1208,7 +1250,7 @@ mod tests {
     /// scan, and the hosts it swallowed are named when the window rolls.
     #[test]
     fn host_reject_log_is_bounded_under_a_flood() {
-        let mut log = HostRejectLog::default();
+        let mut log = host_reject_registry();
         let t0 = Instant::now();
         let warned = (0..HOST_REJECT_MAX_TRACKED + 100)
             .filter(|i| log.should_warn(&format!("flood-{i}.example"), t0).0)
@@ -1216,7 +1258,7 @@ mod tests {
         // The per-window budget caps the warns, not the tracked set: the
         // log must not mirror the scan.
         assert_eq!(warned, HOST_REJECT_MAX_WARNS as usize);
-        assert_eq!(log.seen.len(), HOST_REJECT_MAX_TRACKED);
+        assert_eq!(log.len_tracked(), HOST_REJECT_MAX_TRACKED);
         // A tracked host stays quiet inside its window...
         assert!(!log.should_warn("flood-0.example", t0).0);
         // ...and warns again once the window has rolled over, handing back
@@ -1224,7 +1266,8 @@ mod tests {
         let (warn, summary) = log.should_warn("flood-0.example", t0 + Duration::from_secs(3_601));
         assert!(warn);
         let summary = summary.expect("a window that suppressed hosts must summarise them");
-        assert!(summary.contains("flood-64.example"), "summary: {summary}");
+        let named = summary.suppressed.join(", ");
+        assert!(named.contains("flood-64.example"), "summary: {named:?}");
     }
 
     /// The registry must not let a flood of tracked hosts hide the one that
@@ -1233,7 +1276,7 @@ mod tests {
     /// still has to be named.
     #[test]
     fn a_misconfigured_allowlist_is_still_named_after_a_flood() {
-        let mut log = HostRejectLog::default();
+        let mut log = host_reject_registry();
         let t0 = Instant::now();
         for i in 0..HOST_REJECT_MAX_WARNS {
             assert!(log.should_warn(&format!("flood-{i}.example"), t0).0);
@@ -1244,10 +1287,10 @@ mod tests {
         // ...and the rollover summary is what surfaces it.
         let (warn, summary) = log.should_warn("operator.example", t0 + Duration::from_secs(3_601));
         assert!(warn);
-        let summary = summary.unwrap_or_default();
+        let named = summary.map(|s| s.suppressed.join(", ")).unwrap_or_default();
         assert!(
-            summary.contains("operator.example"),
-            "the suppressed host must be named, got {summary:?}"
+            named.contains("operator.example"),
+            "the suppressed host must be named, got {named:?}"
         );
     }
 
@@ -1255,11 +1298,11 @@ mod tests {
     /// arrive, which is the memory half of the cap.
     #[test]
     fn tracking_stays_bounded_across_windows() {
-        let mut log = HostRejectLog::default();
+        let mut log = host_reject_registry();
         let t0 = Instant::now();
         for i in 0..HOST_REJECT_MAX_TRACKED * 3 {
             log.should_warn(&format!("h-{i}.example"), t0);
-            assert!(log.seen.len() <= HOST_REJECT_MAX_TRACKED);
+            assert!(log.len_tracked() <= HOST_REJECT_MAX_TRACKED);
         }
     }
 
@@ -1268,7 +1311,7 @@ mod tests {
     /// spend the window's warns either.
     #[test]
     fn a_returning_host_does_not_bypass_the_window_budget() {
-        let mut log = HostRejectLog::default();
+        let mut log = host_reject_registry();
         let t0 = Instant::now();
         // A host that warns early in the window.
         assert!(log.should_warn("repeat.example", t0).0);

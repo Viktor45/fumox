@@ -51,6 +51,7 @@
        card never waits for the resolver). The values below are the
        stored ones: the fresh facts show up on the next open. #}
     <h3>{{ self.t("px.geography") }}</h3>
+    <p class="hint">{{ self.t("px.geography_hint") }}</p>
     <table class="kv">
       <tr><th>{{ self.t("common.country") }}</th><td>{{ self.flag(proxy.geo_country) }}
         {% match proxy.geo_country %}

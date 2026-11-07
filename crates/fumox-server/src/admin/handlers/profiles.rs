@@ -34,7 +34,7 @@ const TOKEN_PLACEHOLDER: &str = "••••••";
 
 /// The value the token field of the form carries: a stand-in for a
 /// stored token, empty when the profile has none.
-fn token_placeholder(stored: Option<&str>) -> String {
+pub(super) fn token_placeholder(stored: Option<&str>) -> String {
     match stored {
         None => String::new(),
         Some(value) if fumox_core::token::is_hashed(value) => TOKEN_PLACEHOLDER.to_string(),
@@ -64,15 +64,49 @@ struct ProfilesListTemplate {
 
 impl_i18n!(ProfilesListTemplate);
 
+impl ProfilesListTemplate {
+    /// Human-readable name of the row's output format: the list renders
+    /// the localized label, the machine name stays in the `title` of the
+    /// cell (profiles/list.html). A value outside the schema falls back
+    /// to the machine name.
+    #[allow(dead_code)]
+    fn format_label(&self, machine: &str) -> String {
+        match machine {
+            "base64" => self.lang.t("prof.format_base64"),
+            "clash" => self.lang.t("prof.format_clash"),
+            "sing_box" => self.lang.t("prof.format_sing_box"),
+            "uri_list" => self.lang.t("prof.format_uri_list"),
+            other => return other.to_string(),
+        }
+        .to_string()
+    }
+
+    /// The `title` of the format cell: the machine name plus the
+    /// one-line content description of the format from the catalog, so
+    /// the tooltip names the stored value and what the output is.
+    #[allow(dead_code)]
+    fn format_title(&self, machine: &str) -> String {
+        let hint = match machine {
+            "base64" => self.lang.t("prof.format_base64_hint"),
+            "clash" => self.lang.t("prof.format_clash_hint"),
+            "sing_box" => self.lang.t("prof.format_sing_box_hint"),
+            "uri_list" => self.lang.t("prof.format_uri_list_hint"),
+            other => return other.to_string(),
+        };
+        format!("{machine}: {hint}")
+    }
+}
+
 pub async fn profiles_list(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
     let rows: Vec<profiles::ProfileListRow> = match profiles::list_with_counts(&state.pool).await {
         Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "profiles.list", &err),
     };
     render_html(
         lang.clone(),
+        "profiles/list.html",
         &ProfilesListTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -153,7 +187,7 @@ fn format_options(selected: &str, lang: &Lang) -> Vec<FormatOption> {
         },
         FormatOption {
             value: "base64".into(),
-            label: "Base64".into(),
+            label: lang.t("prof.format_base64").into(),
             available: true,
             selected: selected == "base64",
         },
@@ -202,11 +236,12 @@ pub async fn profile_form(State(state): State<AdminState>, headers: HeaderMap) -
     let theme = theme::from_headers(&headers);
     let picks = match source_picks(&state, &[]).await {
         Ok(picks) => picks,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "profiles.form_data", &err),
     };
     let formats = format_options("uri_list", &lang);
     render_html(
         lang.clone(),
+        "profiles/form.html",
         &ProfileFormTemplate {
             lang: lang.clone(),
             langs: state.locales.choices().to_vec(),
@@ -249,15 +284,15 @@ pub async fn profile_edit_form(
     let profile = match profiles::get(&state.pool, &id).await {
         Ok(Some(profile)) => profile,
         Ok(None) => return not_found(lang, "err.profile_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "profiles.edit_row", &err),
     };
     let composition = match profiles::get_sources(&state.pool, &id).await {
         Ok(composition) => composition,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "profiles.edit_row", &err),
     };
     let picks = match source_picks(&state, &composition).await {
         Ok(picks) => picks,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "profiles.edit_row", &err),
     };
     let format = profile.output_format.as_str().to_string();
     let raw_value = profile
@@ -283,6 +318,7 @@ pub async fn profile_edit_form(
     let formats = format_options(&format, &lang);
     render_html(
         lang.clone(),
+        "profiles/form.html",
         &ProfileFormTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -306,6 +342,21 @@ pub async fn profile_edit_form(
     )
 }
 
+/// The last value of one form field, trimmed.
+///
+/// The contract is last-wins: browsers append repeated fields in
+/// document order, so when a stale earlier field and the fresh one
+/// disagree, the fresh (last) one is what the operator meant — the same
+/// rule the pipeline widget and the `FormMap` comment spell out. An
+/// absent field comes back empty, never an error.
+fn form_get(form: &[(String, String)], key: &str) -> String {
+    form.iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// Parse the submitted composition: checked `sources` fields ordered by
 /// their `pos_{id}` numbers (ties keep the checkbox order), normalized to
 /// dense 0-based positions.
@@ -320,11 +371,9 @@ fn composition_from_form(form: &[(String, String)]) -> Vec<(String, i64)> {
         .iter()
         .enumerate()
         .map(|(index, id)| {
-            let position = form
-                .iter()
-                .rev()
-                .find(|(k, _)| k == &format!("pos_{id}"))
-                .and_then(|(_, v)| v.trim().parse::<i64>().ok())
+            let position = form_get(form, &format!("pos_{id}"))
+                .parse::<i64>()
+                .ok()
                 .unwrap_or(index as i64);
             (position, index, id.clone())
         })
@@ -378,24 +427,17 @@ async fn build_profile_from_form(
     state: &AdminState,
     lang: &Lang,
     form: &[(String, String)],
+    composition: &[(String, i64)],
     existing_id: Option<&str>,
 ) -> Result<BuiltProfile, FormError> {
-    let get = |key: &str| -> String {
-        form.iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.trim().to_string())
-            .unwrap_or_default()
-    };
-
     let mut errors: Vec<(String, String)> = Vec::new();
 
-    let name = get("name");
+    let name = form_get(form, "name");
     if let Err(message) = validate_name(&name, lang) {
         errors.push(("name".into(), message));
     }
 
-    let slug_raw = get("slug");
+    let slug_raw = form_get(form, "slug");
     let slug = validate_slug(
         &slug_raw,
         existing_id,
@@ -408,7 +450,7 @@ async fn build_profile_from_form(
     // The placeholder is resolved before validation: `…`/`•` are outside
     // the token charset, so an unchanged placeholder must never be
     // checked as typed.
-    let token_raw = get("access_token");
+    let token_raw = form_get(form, "access_token");
     let stored = match existing_id {
         Some(id) => match profiles::get(&state.pool, id).await {
             Ok(Some(profile)) => Some(profile),
@@ -450,7 +492,7 @@ async fn build_profile_from_form(
         }
     }
 
-    let format_raw = get("output_format");
+    let format_raw = form_get(form, "output_format");
     let output_format = match OutputFormat::from_str(&format_raw) {
         Ok(format) => format,
         Err(_) => {
@@ -466,7 +508,7 @@ async fn build_profile_from_form(
 
     // Country allowlist: comma-separated ISO 3166-1 alpha-2 codes; empty
     // means no filtering. Validated per code, normalized to uppercase.
-    let countries_raw = get("countries");
+    let countries_raw = form_get(form, "countries");
     let countries: Vec<String> = match validate_countries(
         &countries_raw
             .split(',')
@@ -483,18 +525,24 @@ async fn build_profile_from_form(
     };
 
     // Every selected source must exist (guards against stale form posts).
-    let composition = composition_from_form(form);
-    for (source_id, _) in &composition {
-        match sources::get(&state.pool, source_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => errors.push((
+    // One batched read covers the whole composition; duplicate picks are
+    // collapsed so a doubled row is not reported twice.
+    let mut unique_ids: Vec<&str> = composition.iter().map(|(id, _)| id.as_str()).collect();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    let found = match sources::get_many(&state.pool, &unique_ids).await {
+        Ok(by_id) => by_id,
+        // A failed query is not a bad choice of sources: it is a
+        // broken database, and it must not be rendered as a field
+        // error the operator can "fix".
+        Err(err) => return Err(FormError::Server(err)),
+    };
+    for (source_id, _) in composition {
+        if !found.contains_key(source_id) {
+            errors.push((
                 "sources".into(),
                 lang.t("val.source_missing").replace("{}", source_id),
-            )),
-            // A failed query is not a bad choice of sources: it is a
-            // broken database, and it must not be rendered as a field
-            // error the operator can "fix".
-            Err(err) => return Err(FormError::Server(err)),
+            ));
         }
     }
 
@@ -531,19 +579,12 @@ async fn build_profile_from_form(
 }
 
 fn form_values_from(form: &[(String, String)]) -> ProfileFormValues {
-    let get = |key: &str| -> String {
-        form.iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.trim().to_string())
-            .unwrap_or_default()
-    };
     ProfileFormValues {
-        name: get("name"),
-        slug: get("slug"),
-        access_token: get("access_token"),
-        output_format: get("output_format"),
-        countries: get("countries"),
+        name: form_get(form, "name"),
+        slug: form_get(form, "slug"),
+        access_token: form_get(form, "access_token"),
+        output_format: form_get(form, "output_format"),
+        countries: form_get(form, "countries"),
         enabled: form.iter().any(|(k, _)| k == "enabled"),
     }
 }
@@ -564,7 +605,7 @@ async fn form_error_response(
     // wrong composition.
     let picks = match source_picks(state, &composition).await {
         Ok(picks) => picks,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(state, headers, "profiles.form_extras", &err),
     };
     // The edited row's slug decides whether the form has to warn about a
     // broken link. The row is read again here (the error path only).
@@ -572,7 +613,7 @@ async fn form_error_response(
         Some(id) => match profiles::get(&state.pool, id).await {
             Ok(Some(profile)) => profile.slug.is_some(),
             Ok(None) => false,
-            Err(err) => return server_error(lang, &err),
+            Err(err) => return server_error(state, headers, "profiles.form_extras", &err),
         },
         None => false,
     };
@@ -590,6 +631,7 @@ async fn form_error_response(
     );
     render_html(
         lang.clone(),
+        "profiles/form.html",
         &ProfileFormTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -620,13 +662,13 @@ pub async fn profile_create(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let composition = composition_from_form(&form);
-    let profile = match build_profile_from_form(&state, &lang, &form, None).await {
+    let profile = match build_profile_from_form(&state, &lang, &form, &composition, None).await {
         Ok(profile) => profile,
         Err(FormError::Validation(errors)) => {
             return form_error_response(&state, lang, &headers, &form, None, errors).await;
         }
         Err(FormError::Server(err)) => {
-            return row_error_response(lang, &err, "err.profile_not_found");
+            return row_error_response(&state, &headers, &err, "err.profile_not_found");
         }
     };
     // The profile row and its composition are one object: they are
@@ -635,7 +677,7 @@ pub async fn profile_create(
     if let Err(err) =
         profiles::upsert_with_sources(&state.pool, &profile.profile, &composition, true).await
     {
-        return server_error(lang, &err);
+        return server_error(&state, &headers, "profiles.create", &err);
     }
     tracing::info!(profile = %profile.id, "profile created");
     Redirect::to(&format!("/admin/profiles/{}", profile.id)).into_response()
@@ -649,13 +691,14 @@ pub async fn profile_update(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let composition = composition_from_form(&form);
-    let profile = match build_profile_from_form(&state, &lang, &form, Some(&id)).await {
+    let profile = match build_profile_from_form(&state, &lang, &form, &composition, Some(&id)).await
+    {
         Ok(profile) => profile,
         Err(FormError::Validation(errors)) => {
             return form_error_response(&state, lang, &headers, &form, Some(id), errors).await;
         }
         Err(FormError::Server(err)) => {
-            return row_error_response(lang, &err, "err.profile_not_found");
+            return row_error_response(&state, &headers, &err, "err.profile_not_found");
         }
     };
     // The row and the composition are written together; the cached
@@ -664,7 +707,7 @@ pub async fn profile_update(
     if let Err(err) =
         profiles::upsert_with_sources(&state.pool, &profile.profile, &composition, false).await
     {
-        return row_error_response(lang, &err, "err.profile_not_found");
+        return row_error_response(&state, &headers, &err, "err.profile_not_found");
     }
     state.caches.invalidate_profile(&profile.id).await;
     // A changed slug breaks the links the subscribers hold: the old
@@ -737,6 +780,10 @@ struct ProfileDetailTemplate {
     stats_dupes: i64,
     preview: Vec<String>,
     preview_note: Option<String>,
+    /// The toggle endpoint of this profile, as a flat field: the markup
+    /// lives once in the shared `_toggle_form.html`, which the page
+    /// includes directly (sources and profiles render the same fragment).
+    toggle_url: String,
     /// The card includes `profiles/_toggle_form.html`, whose standalone
     /// variant marks the form as an out-of-band swap in the toggle
     /// response; the page itself always renders it plain.
@@ -756,37 +803,28 @@ pub async fn profile_detail(
     let profile = match profiles::get(&state.pool, &id).await {
         Ok(Some(profile)) => profile,
         Ok(None) => return not_found(lang, "err.profile_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "profiles.detail", &err),
     };
 
     let composition: Vec<profiles::CompositionRow> =
         match profiles::composition(&state.pool, &id).await {
             Ok(rows) => rows,
-            Err(err) => return server_error(lang, &err),
+            Err(err) => return server_error(&state, &headers, "profiles.detail", &err),
         };
 
     // Dedup statistics across the composition:
     // total link rows vs distinct fingerprints.
     let stats = match profiles::dedup_stats(&state.pool, &id).await {
         Ok(stats) => stats,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "profiles.detail", &err),
     };
     let (stats_total, stats_unique) = (stats.total, stats.unique);
 
     // Output preview: render in-process exactly what /sub would serve.
-    let app_state = crate::serve::AppState::new(
-        state.pool.clone(),
-        state.caches.clone(),
-        state.geo.clone(),
-        // The preview renders in-process and never crosses the public
-        // rate-limit middleware; fresh counters here are never consulted.
-        crate::serve::PublicRateLimits::unlimited(),
-        Vec::new(),
-        fumox_core::config::TrustedHeader::None,
-        Vec::new(),
-        state.server().export_max_rows,
-        state.export_token.clone(),
-    );
+    // The factory assembles the state next to the fields it fills; the
+    // preview never crosses the public rate-limit middleware (fresh,
+    // unlimited counters).
+    let app_state = crate::serve::AppState::for_preview(&state);
     let (preview, preview_note) =
         match crate::serve::preview_sub(&app_state, &profile, PREVIEW_LINES).await {
             Ok(lines) if lines.is_empty() => {
@@ -809,7 +847,14 @@ pub async fn profile_detail(
     // they set.
     let base = match state.serve_base(peer, &headers) {
         Ok(b) => b,
-        Err(err) => return super::server_error(lang, &fumox_core::Error::Config(err.to_string())),
+        Err(err) => {
+            return super::server_error(
+                &state,
+                &headers,
+                "profiles.detail",
+                &fumox_core::Error::Config(err.to_string()),
+            );
+        }
     };
     let serve_url = format!("{base}{serve_path}");
 
@@ -826,6 +871,7 @@ pub async fn profile_detail(
     };
     render_html(
         lang.clone(),
+        "profiles/detail.html",
         &ProfileDetailTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -855,6 +901,7 @@ pub async fn profile_detail(
             stats_unique,
             preview,
             preview_note,
+            toggle_url: format!("/admin/profiles/{}/toggle", profile.id),
             swap_oob: false,
         },
         StatusCode::OK,
@@ -876,14 +923,17 @@ struct EnabledBadgeFragment {
 impl_i18n!(EnabledBadgeFragment);
 
 /// The toggle form of the profile card, same include-as-initial-render
-/// pattern as [`EnabledBadgeFragment`]. `swap_oob` adds the
-/// `hx-swap-oob` attribute that makes the form in a toggle response
-/// replace itself out-of-band; the initial page renders it plain.
+/// pattern as [`EnabledBadgeFragment`]. The markup lives in the shared
+/// `_toggle_form.html` (sources and profiles render the same fragment);
+/// this wrapper binds the profile context to it as flat fields.
+/// `swap_oob` adds the `hx-swap-oob` attribute that makes the form in a
+/// toggle response replace itself out-of-band; the initial page renders
+/// it plain.
 #[derive(Template)]
 #[template(path = "profiles/_toggle_form.html")]
 struct ToggleFormFragment {
     lang: Lang,
-    profile_id: String,
+    toggle_url: String,
     enabled: bool,
     csrf: String,
     swap_oob: bool,
@@ -908,7 +958,7 @@ fn toggle_swap_fragment(lang: &Lang, profile_id: &str, enabled: bool, csrf: &str
     .expect("badge fragment renders");
     let form = ToggleFormFragment {
         lang: lang.clone(),
-        profile_id: profile_id.to_string(),
+        toggle_url: format!("/admin/profiles/{profile_id}/toggle"),
         enabled,
         csrf: csrf.to_string(),
         swap_oob: true,
@@ -930,7 +980,7 @@ pub async fn profile_toggle(
     let enabled = match profiles::toggle_enabled(&state.pool, &id).await {
         Ok((enabled, _)) => enabled,
         Err(fumox_core::Error::NotFound(_)) => return not_found(lang, "err.profile_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "profiles.toggle", &err),
     };
     state.caches.invalidate_profile(&id).await;
     let message = if enabled {
@@ -962,7 +1012,7 @@ pub async fn profile_delete(
     match profiles::delete(&state.pool, &id).await {
         Ok(true) => {}
         Ok(false) => return not_found(lang, "err.profile_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "profiles.delete", &err),
     }
     state.caches.invalidate_profile(&id).await;
     tracing::info!(profile = %id, "profile deleted");
@@ -1012,6 +1062,64 @@ mod tests {
         }
     }
 
+    /// The composition parser, case by case: the `pos_{id}` numbers order
+    /// the picks (ties keep the checkbox order), a missing or unparseable
+    /// position falls back to the checkbox order, a repeated id is kept
+    /// once, and the positions come out dense and 0-based whatever came
+    /// in.
+    #[test]
+    fn composition_from_form_orders_and_normalizes() {
+        let case = |form: &[(&str, &str)]| -> Vec<(String, i64)> {
+            composition_from_form(
+                &form
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // An explicit position wins over the checkbox order.
+        assert_eq!(
+            case(&[
+                ("sources", "a"),
+                ("sources", "b"),
+                ("pos_a", "5"),
+                ("pos_b", "1")
+            ]),
+            vec![("b".into(), 0), ("a".into(), 1)]
+        );
+        // No pos_ field at all: the checkbox order stands.
+        assert_eq!(
+            case(&[("sources", "a"), ("sources", "b")]),
+            vec![("a".into(), 0), ("b".into(), 1)]
+        );
+        // An unparseable position falls back to the checkbox order too.
+        assert_eq!(
+            case(&[("sources", "a"), ("sources", "b"), ("pos_a", "first")]),
+            vec![("a".into(), 0), ("b".into(), 1)]
+        );
+        // A repeated id is stored once.
+        assert_eq!(
+            case(&[("sources", "a"), ("sources", "a"), ("pos_a", "1")]),
+            vec![("a".into(), 0)]
+        );
+        // Equal positions: the checkbox order breaks the tie.
+        assert_eq!(
+            case(&[
+                ("sources", "a"),
+                ("sources", "b"),
+                ("pos_a", "2"),
+                ("pos_b", "2")
+            ]),
+            vec![("a".into(), 0), ("b".into(), 1)]
+        );
+        // A negative position sorts first and comes out renumbered.
+        assert_eq!(
+            case(&[("sources", "a"), ("sources", "b"), ("pos_b", "-7")]),
+            vec![("b".into(), 0), ("a".into(), 1)]
+        );
+    }
+
     /// The edit form re-renders the stored secret as a fixed placeholder
     /// (`••••••`) and posts it back verbatim on any save. The placeholder
     /// is not a token, so the charset check used to reject it and the
@@ -1048,7 +1156,7 @@ mod tests {
             ("enabled".into(), "on".into()),
         ];
 
-        let built = build_profile_from_form(&state, &lang, &form, Some(&stored.id))
+        let built = build_profile_from_form(&state, &lang, &form, &[], Some(&stored.id))
             .await
             .expect("posting the form back unchanged must save");
         assert_eq!(
@@ -1066,7 +1174,7 @@ mod tests {
             ("access_token".into(), String::new()),
             ("output_format".into(), "uri_list".into()),
         ];
-        let built = build_profile_from_form(&state, &lang, &form, Some(&stored.id))
+        let built = build_profile_from_form(&state, &lang, &form, &[], Some(&stored.id))
             .await
             .expect("clearing the token must save");
         assert_eq!(built.access_token, None);
@@ -1091,7 +1199,7 @@ mod tests {
         };
 
         let errors = field_errors(
-            build_profile_from_form(&state, &lang, &with_token("bad token!"), None)
+            build_profile_from_form(&state, &lang, &with_token("bad token!"), &[], None)
                 .await
                 .expect_err("a token outside the charset must be refused"),
         );
@@ -1102,7 +1210,7 @@ mod tests {
 
         let over = "a".repeat(caps::ACCESS_TOKEN + 1);
         let errors = field_errors(
-            build_profile_from_form(&state, &lang, &with_token(&over), None)
+            build_profile_from_form(&state, &lang, &with_token(&over), &[], None)
                 .await
                 .expect_err("an over-long token must be refused"),
         );
@@ -1111,10 +1219,15 @@ mod tests {
             "the cap must still fire: {errors:?}"
         );
 
-        let built =
-            build_profile_from_form(&state, &lang, &with_token("good-token_0123456789"), None)
-                .await
-                .expect("a well-formed token must save");
+        let built = build_profile_from_form(
+            &state,
+            &lang,
+            &with_token("good-token_0123456789"),
+            &[],
+            None,
+        )
+        .await
+        .expect("a well-formed token must save");
         assert_eq!(built.access_token.as_deref(), Some("good-token_0123456789"));
     }
 
@@ -1148,7 +1261,7 @@ mod tests {
 
         let short = "a".repeat(caps::TOKEN_MIN - 1);
         let errors = field_errors(
-            build_profile_from_form(&state, &lang, &with_token(&short), Some(&stored.id))
+            build_profile_from_form(&state, &lang, &with_token(&short), &[], Some(&stored.id))
                 .await
                 .expect_err("a token below the floor must be refused"),
         );
@@ -1166,9 +1279,10 @@ mod tests {
 
         // Exactly at the floor the token is accepted.
         let exact = "a".repeat(caps::TOKEN_MIN);
-        let built = build_profile_from_form(&state, &lang, &with_token(&exact), Some(&stored.id))
-            .await
-            .expect("a token at the floor must save");
+        let built =
+            build_profile_from_form(&state, &lang, &with_token(&exact), &[], Some(&stored.id))
+                .await
+                .expect("a token at the floor must save");
         assert_eq!(built.access_token.as_deref(), Some(exact.as_str()));
     }
 
@@ -1200,10 +1314,15 @@ mod tests {
 
         // The placeholder itself still restores the stored token.
         let placeholder = token_placeholder(Some(&stored_hash));
-        let built =
-            build_profile_from_form(&state, &lang, &with_token(&placeholder), Some(&stored.id))
-                .await
-                .expect("the unchanged placeholder must save");
+        let built = build_profile_from_form(
+            &state,
+            &lang,
+            &with_token(&placeholder),
+            &[],
+            Some(&stored.id),
+        )
+        .await
+        .expect("the unchanged placeholder must save");
         assert_eq!(built.access_token.as_deref(), Some(stored_hash.as_str()));
 
         // A typed value that merely contains a bullet is not the
@@ -1211,7 +1330,7 @@ mod tests {
         // '•' is outside the token charset and the save is refused rather
         // than silently keeping the old token.
         let errors = field_errors(
-            build_profile_from_form(&state, &lang, &with_token("tok•en"), Some(&stored.id))
+            build_profile_from_form(&state, &lang, &with_token("tok•en"), &[], Some(&stored.id))
                 .await
                 .expect_err("a typed bullet must not resolve to the stored token"),
         );
@@ -1225,6 +1344,7 @@ mod tests {
             &state,
             &lang,
             &with_token("rotated-token-0123456789"),
+            &[],
             Some(&stored.id),
         )
         .await
@@ -1256,7 +1376,7 @@ mod tests {
 
         // Bad format: outside the shared slug charset/length rules.
         let errors = field_errors(
-            build_profile_from_form(&state, &lang, &with_slug("no spaces"), None)
+            build_profile_from_form(&state, &lang, &with_slug("no spaces"), &[], None)
                 .await
                 .expect_err("an invalid slug format must be refused"),
         );
@@ -1267,7 +1387,7 @@ mod tests {
 
         // Taken: a new profile may not claim the stored row's slug.
         let errors = field_errors(
-            build_profile_from_form(&state, &lang, &with_slug("p1"), None)
+            build_profile_from_form(&state, &lang, &with_slug("p1"), &[], None)
                 .await
                 .expect_err("a slug held by another profile must be refused"),
         );
@@ -1277,13 +1397,13 @@ mod tests {
         );
 
         // Editing the row itself: its own slug stays valid…
-        let built = build_profile_from_form(&state, &lang, &with_slug("p1"), Some(&stored.id))
+        let built = build_profile_from_form(&state, &lang, &with_slug("p1"), &[], Some(&stored.id))
             .await
             .expect("the row's own slug must stay valid on edit");
         assert_eq!(built.slug.as_deref(), Some("p1"));
 
         // …and an empty field stores no slug at all.
-        let built = build_profile_from_form(&state, &lang, &with_slug(""), None)
+        let built = build_profile_from_form(&state, &lang, &with_slug(""), &[], None)
             .await
             .expect("an empty slug must save");
         assert_eq!(built.slug, None);
@@ -1383,7 +1503,7 @@ mod tests {
         let id = sample_id();
         let page_form = ToggleFormFragment {
             lang: lang.clone(),
-            profile_id: id.clone(),
+            toggle_url: format!("/admin/profiles/{id}/toggle"),
             enabled: true,
             csrf: "csrf-token".into(),
             swap_oob: false,
@@ -1392,7 +1512,7 @@ mod tests {
         .unwrap();
         let swap_form = ToggleFormFragment {
             lang: lang.clone(),
-            profile_id: id,
+            toggle_url: format!("/admin/profiles/{id}/toggle"),
             enabled: true,
             csrf: "csrf-token".into(),
             swap_oob: true,
@@ -1447,6 +1567,7 @@ mod tests {
         let source = fumox_core::models::Source {
             id: id.into(),
             slug: None,
+            access_token: None,
             name: name.into(),
             url: "https://example.com/sub".into(),
             enabled: true,
@@ -1533,10 +1654,14 @@ mod tests {
             Vec::new(),
             fumox_core::config::TrustedHeader::None,
             Vec::new(),
-            state.server().export_max_rows,
-            state.export_token.clone(),
+            crate::alive_export::ExportState::new(
+                state.server().export_max_rows,
+                state.export_token.clone(),
+            ),
         );
-        let public = crate::serve::public_app(public_state, pool.clone());
+        // The preview renders `/sub` through the real public router; the
+        // liveness route (and its dedicated pool) is listener wiring.
+        let public = crate::serve::router(public_state);
 
         // The first request renders the subscription and caches it: the
         // sources of the composition decide the order of the output.

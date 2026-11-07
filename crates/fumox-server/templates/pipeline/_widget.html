@@ -10,12 +10,15 @@
    (Input: filter. Rules: rename + drop, the lists that grow. Output:
    health, geo, sort, limit) so one stage is open at a time. #}
 <div class="ped-modes" role="radiogroup" aria-label="{{ self.t("ped.mode_builder") }} / {{ self.t("ped.mode_json") }}">
-  <button type="button" class="btn small{% if mode == "builder" %} ped-active{% endif %}"
+  {#- Stable ids on every button the widget re-renders: htmx puts the
+      focus back on the element with the same id after the swap, so the
+      keyboard does not fall to <body> on a mode change. -#}
+  <button type="button" id="ped-mode-builder" class="btn small{% if mode == "builder" %} ped-active{% endif %}"
           hx-post="/admin/pipeline/mode?to=builder{% if profile %}&profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
           hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']"
           role="radio" aria-checked="{% if mode == "builder" %}true{% else %}false{% endif %}">{{ self.t("ped.mode_builder") }}</button>
-  <button type="button" class="btn small{% if mode == "raw" %} ped-active{% endif %}"
+  <button type="button" id="ped-mode-raw" class="btn small{% if mode == "raw" %} ped-active{% endif %}"
           hx-post="/admin/pipeline/mode?to=raw{% if profile %}&profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
           hx-include="[name^='ped_'], [name='pipeline'], [name='_csrf']"
@@ -23,6 +26,11 @@
   <input type="hidden" name="_csrf" value="{{ csrf }}">
   <input type="hidden" name="pipeline_mode" value="{{ mode }}">
 </div>
+{#- The mode switch, the presets and the row buttons act through htmx
+    endpoints, so they do nothing without JavaScript. The note (and the
+    base.html <noscript> style that hides them) keeps the inert controls
+    from looking like working ones. -#}
+<noscript><p class="hint">{{ self.t("ped.no_js_hint") }}</p></noscript>
 
 {% if mode == "raw" %}
 <div class="field">
@@ -38,27 +46,29 @@
   {% endmatch %}
 </div>
 {% else %}
+{% match builder %}
+{% when Some with (builder) %}
 {#- A preset replaces the rules the user has built, so it asks before it
     does: the rest of the form is untouched, only the builder state
     changes. -#}
 <div class="ped-presets" role="group" aria-labelledby="ped-presets-label">
   <span id="ped-presets-label" class="hint">{{ self.t("ped.presets") }}</span>
-  <button type="button" class="btn small"
+  <button type="button" id="ped-preset-workers" class="btn small"
           hx-post="/admin/pipeline/preset?name=workers{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
           hx-include="[name='_csrf']"
           hx-confirm="{{ self.t("ped.preset_confirm").replace("{name}", self.t("ped.preset_workers")) }}">{{ self.t("ped.preset_workers") }}</button>
-  <button type="button" class="btn small"
+  <button type="button" id="ped-preset-country" class="btn small"
           hx-post="/admin/pipeline/preset?name=country{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
           hx-include="[name='_csrf']"
           hx-confirm="{{ self.t("ped.preset_confirm").replace("{name}", self.t("ped.preset_country")) }}">{{ self.t("ped.preset_country") }}</button>
-  <button type="button" class="btn small"
+  <button type="button" id="ped-preset-clean" class="btn small"
           hx-post="/admin/pipeline/preset?name=clean{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
           hx-include="[name='_csrf']"
           hx-confirm="{{ self.t("ped.preset_confirm").replace("{name}", self.t("ped.preset_clean")) }}">{{ self.t("ped.preset_clean") }}</button>
-  <button type="button" class="btn small"
+  <button type="button" id="ped-preset-blank" class="btn small"
           hx-post="/admin/pipeline/preset?name=blank{% if profile %}&amp;profile=1{% endif %}"
           hx-target="#ped-widget" hx-swap="innerHTML"
           hx-include="[name='_csrf']"
@@ -168,10 +178,15 @@
   <section id="pedtab-rules-pane" class="tab-pane" role="tabpanel" aria-labelledby="pedtab-rules-label">
     <div class="hint">{{ self.t("ped.tab_rules_hint") }}</div>
 
-    <div class="field">
+    <div class="field" data-ped-section="rename">
       <h3 class="ped-section-heading" id="ped-section-rename">
         {{ self.t("ped.section_rename") }}
         <span class="badge neutral ped-count" data-ped-count="rename"{% if builder.state.rename.is_empty() %} hidden{% endif %}>{{ builder.state.rename.len() }}</span>
+        {#- Announces the rule-list swaps (app.js fills it): the rows
+            container is re-rendered wholesale and stays silent, so this
+            region sits outside the swap and is never recreated. -#}
+        <span class="visually-hidden" role="status" aria-live="polite" data-ped-live="ped-rows"
+              data-list-changed="{{ self.t("ped.rows_changed") }}"></span>
       </h3>
       {% if profile %}
       <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-rename">
@@ -189,19 +204,27 @@
         </span>
       </div>
       {% endif %}
-      <div id="ped-rows" class="ped-rows">
-        {% include "pipeline/_rows_rename.html" %}
+      {#- The rule rows follow the same visibility contract as the other
+          sections' inner blocks: hidden on `skip` (profile form only, the
+          source form carries no toggle), server-side so the state matches
+          the rendered radios before the JS runs. -#}
+      <div class="ped-inner" data-ped-inner="rename"{% if profile && !builder.rename_section_active() %} hidden{% endif %}>
+        <div id="ped-rows" class="ped-rows">
+          {% include "pipeline/_rows_rename.html" %}
+        </div>
+        <button class="btn small" type="button"
+                hx-post="/admin/pipeline/rows"
+                hx-target="#ped-rows" hx-swap="innerHTML"
+                hx-include="[name^='ped_'], [name='_csrf']">{{ self.t("ped.rename_add") }}</button>
       </div>
-      <button class="btn small" type="button"
-              hx-post="/admin/pipeline/rows"
-              hx-target="#ped-rows" hx-swap="innerHTML"
-              hx-include="[name^='ped_'], [name='_csrf']">{{ self.t("ped.rename_add") }}</button>
     </div>
 
-    <div class="field">
+    <div class="field" data-ped-section="drop">
       <h3 class="ped-section-heading" id="ped-section-drop">
         {{ self.t("ped.section_drop") }}
         <span class="badge neutral ped-count" data-ped-count="drop"{% if builder.state.drop.is_empty() %} hidden{% endif %}>{{ builder.state.drop.len() }}</span>
+        <span class="visually-hidden" role="status" aria-live="polite" data-ped-live="ped-drop-rows"
+              data-list-changed="{{ self.t("ped.rows_changed") }}"></span>
       </h3>
       {% if profile %}
       <div class="ped-modes3" role="radiogroup" aria-labelledby="ped-section-drop">
@@ -220,13 +243,15 @@
       </div>
       {% endif %}
       <div class="hint">{{ self.t("ped.drop_hint") }}</div>
-      <div id="ped-drop-rows" class="ped-rows">
-        {% include "pipeline/_rows_drop.html" %}
+      <div class="ped-inner" data-ped-inner="drop"{% if profile && !builder.drop_section_active() %} hidden{% endif %}>
+        <div id="ped-drop-rows" class="ped-rows">
+          {% include "pipeline/_rows_drop.html" %}
+        </div>
+        <button class="btn small" type="button"
+                hx-post="/admin/pipeline/rows?section=drop"
+                hx-target="#ped-drop-rows" hx-swap="innerHTML"
+                hx-include="[name^='ped_'], [name='_csrf']">{{ self.t("ped.drop_add") }}</button>
       </div>
-      <button class="btn small" type="button"
-              hx-post="/admin/pipeline/rows?section=drop"
-              hx-target="#ped-drop-rows" hx-swap="innerHTML"
-              hx-include="[name^='ped_'], [name='_csrf']">{{ self.t("ped.drop_add") }}</button>
     </div>
   </section>
 
@@ -252,10 +277,13 @@
         </div>
         <div class="ped-inner" data-ped-inner="health"{% if !builder.health_section_active() %} hidden{% endif %}>
           <div class="hint">{{ self.t("ped.health_exclude") }}</div>
+          {#- The label is the localized status name, the same wording the
+              dashboard legend and the status badges use; the value and the
+              id keep the wire token the form round-trips. -#}
           {% for (status, selected) in builder.statuses %}
           <span class="check-row">
             <input type="checkbox" name="ped_health_exclude" value="{{ status }}" id="ped-status-{{ status }}" {% if selected %}checked{% endif %}>
-            <label for="ped-status-{{ status }}">{{ status }}</label>
+            <label for="ped-status-{{ status }}">{{ self.health_status_label(status) }}</label>
           </span>
           {% endfor %}
         </div>
@@ -356,4 +384,6 @@
       drown the verdict. -#}
   <div id="ped-preview" role="status" aria-live="polite">{{ preview_html | safe }}</div>
 </div>
+{% when None %}
+{% endmatch %}
 {% endif %}

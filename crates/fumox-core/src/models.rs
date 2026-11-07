@@ -482,6 +482,31 @@ pub fn normalize_protocols(protocols: Option<Vec<Scheme>>) -> Option<Vec<Scheme>
     protocols.filter(|list| !list.is_empty())
 }
 
+/// An ISO 3166-1 alpha-2 country code in stored form: exactly two ASCII
+/// letters, uppercase.
+///
+/// One parser for every entry point that accepts a typed code — the
+/// profile allowlist field, the import validation and the admin
+/// cleanup/revival forms — so the rule (case-insensitive input, uppercase
+/// at rest) cannot drift apart between them and a code one path accepts
+/// another refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountryCode(String);
+
+impl CountryCode {
+    /// The code a typed value normalizes to; `None` for anything that is
+    /// not two ASCII letters. Whitespace around the value is tolerated.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let code = raw.trim().to_ascii_uppercase();
+        (code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic())).then_some(Self(code))
+    }
+
+    /// The normalized text the database columns carry.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Subscription source (`sources` table).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
@@ -489,6 +514,13 @@ pub struct Source {
     pub id: String,
     /// Optional human-readable identifier for `/sub/{slug}`-style references.
     pub slug: Option<String>,
+    /// Optional access token for `/src`; `None` = public. A profile's
+    /// access token guards `/sub` only and does not extend here: the
+    /// source row carries its own. The token is a secret (the database
+    /// keeps its hash), so it never leaves the server in a serialised
+    /// form.
+    #[serde(default, skip_serializing)]
+    pub access_token: Option<String>,
     pub name: String,
     pub url: String,
     pub enabled: bool,
@@ -550,6 +582,12 @@ impl IpFamily {
     pub const fn all() -> &'static [IpFamily] {
         &[IpFamily::Any, IpFamily::Ipv4, IpFamily::Ipv6]
     }
+
+    /// Every family as its wire string, `all()` rendered through
+    /// [`IpFamily::as_str`]. This is the closed set `FromStr` accepts, so
+    /// it is also what the admin settings editor validates its dropdown
+    /// against — the two must not drift.
+    pub const ALL_AS_STR: &'static [&'static str] = &["any", "ipv4", "ipv6"];
 }
 
 impl FromStr for IpFamily {
@@ -776,6 +814,22 @@ mod tests {
         }
     }
 
+    /// The shared country-code parser: case-insensitive input, whitespace
+    /// tolerated, exactly two ASCII letters at rest — and nothing else.
+    #[test]
+    fn country_code_parse_normalizes_to_two_uppercase_letters() {
+        for raw in ["de", "DE", " De ", "dE"] {
+            assert_eq!(
+                CountryCode::parse(raw),
+                Some(CountryCode("DE".into())),
+                "{raw:?} must parse"
+            );
+        }
+        for raw in ["", " ", "D", "DEU", "D1", "ДE", "D-E"] {
+            assert_eq!(CountryCode::parse(raw), None, "{raw:?} must be refused");
+        }
+    }
+
     #[test]
     fn scheme_wire_names_round_trip() {
         for scheme in Scheme::all() {
@@ -848,6 +902,7 @@ mod tests {
         let source = Source {
             id: "s".into(),
             slug: None,
+            access_token: Some("super-secret-token".into()),
             name: "n".into(),
             url: "https://example.com".into(),
             enabled: true,
@@ -873,6 +928,10 @@ mod tests {
         // The field is gone entirely, not emptied: there is no key to fill
         // with a secret later.
         assert!(!json.contains("headers"), "{json}");
+        // The endpoint token is a secret like the headers: it never
+        // reaches a serialised form either.
+        assert!(!json.contains("access_token"), "{json}");
+        assert!(!json.contains("super-secret-token"), "{json}");
 
         let profile = Profile {
             id: "p".into(),

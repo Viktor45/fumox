@@ -2,6 +2,55 @@
 
 {% block title %}{{ self.t("nav.proxies") }}{% endblock %}
 
+{#- One bulk operation of the cleanup/revive dialogs: the CSRF'd POST
+    form, the title/description pair and the apply button. An operation
+    that takes a control (the ASN input, the country select) passes it
+    as the `call` block, with `has_controls` switching between the
+    inline-controls row and a lone button; operations without controls
+    pass an empty block. -#}
+{% macro op(action, apply_class, apply_label, apply_aria, title, desc, has_controls) %}
+<li>
+  <form method="post" action="{{ action }}">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="view" value="{{ view_query }}">
+    <div class="cleanup-op">
+      <div>
+        <strong>{{ title }}</strong>
+        <p class="muted small">{{ desc }}</p>
+      </div>
+      {% if has_controls %}
+      <div class="inline-controls">
+        {{ caller() }}
+        <button class="{{ apply_class }}" type="submit" aria-label="{{ apply_aria }}">{{ apply_label }}</button>
+      </div>
+      {% else %}
+      <button class="{{ apply_class }}" type="submit" aria-label="{{ apply_aria }}">{{ apply_label }}</button>
+      {% endif %}
+    </div>
+  </form>
+</li>
+{% endmacro %}
+
+{#- The control the ASN-based operations take. The value is
+    alphanumeric (`normalize_asn` accepts `24940` and `AS24940`), so the
+    placeholder shows both forms and no numeric keyboard is forced; the
+    title carries the same hint (the op descriptions name the two forms
+    too, a visible note here would say it twice). -#}
+{% macro asn_controls() %}
+<input type="text" name="asn" placeholder="24940 / AS24940" autocomplete="off"
+       title="{{ self.t("px.asn_input_hint") }}">
+{% endmacro %}
+
+{#- The control the country-based operations take. -#}
+{% macro country_controls() %}
+<select name="country">
+  <option value="">{{ self.t("common.choose") }}</option>
+  {% for country in countries %}
+    <option value="{{ country }}">{{ country }}</option>
+  {% endfor %}
+</select>
+{% endmacro %}
+
 {% block content %}
 <div class="page-head">
   <h1>{{ self.t("nav.proxies") }} <span class="muted small">{{ self.t("common.total_prefix") }} {{ total }}</span></h1>
@@ -15,97 +64,24 @@
   </div>
 </div>
 
-<!-- Bulk cleanup: five separate plain POST forms in one dialog. Every
-     action here transitions rows into `removed` (a soft state); the
-     actual delete from the database stays the "purge removed" button
-     above. Keeping the two buttons apart makes a mistake reversible. -->
+{# Bulk cleanup: five separate plain POST forms in one dialog. Every
+   action here transitions rows into `removed` (a soft state); the
+   actual delete from the database stays the "purge removed" button
+   above. Keeping the two buttons apart makes a mistake reversible. #}
 <dialog id="cleanup-dialog" aria-labelledby="cleanup-dialog-title">
   <h2 id="cleanup-dialog-title" tabindex="-1">{{ self.t("px.cleanup_title") }}</h2>
   <p class="muted small">{{ self.t("px.cleanup_note") }}</p>
   <ul class="cleanup-ops">
-    <li>
-      <form method="post" action="/admin/proxies/quarantine-to-removed">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.cleanup_quarantine_title") }}</strong>
-            <p class="muted small">{{ self.t("px.cleanup_quarantine_desc") }}</p>
-          </div>
-          <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_quarantine_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
-        </div>
-      </form>
-    </li>
-    <li>
-      <form method="post" action="/admin/proxies/remove-alive-no-country">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.cleanup_no_country_title") }}</strong>
-            <p class="muted small">{{ self.t("px.cleanup_no_country_desc") }}</p>
-          </div>
-          <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_no_country_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
-        </div>
-      </form>
-    </li>
-    <li>
-      <form method="post" action="/admin/proxies/remove-alive-by-asn">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.cleanup_asn_title") }}</strong>
-            <p class="muted small">{{ self.t("px.cleanup_asn_desc") }}</p>
-          </div>
-          <div class="inline-controls">
-            <input type="text" name="asn" placeholder="AS24940" inputmode="numeric" autocomplete="off">
-            <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_asn_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
-          </div>
-        </div>
-      </form>
-    </li>
-    <li>
-      <form method="post" action="/admin/proxies/remove-alive-by-country">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.cleanup_country_title") }}</strong>
-            <p class="muted small">{{ self.t("px.cleanup_country_desc") }}</p>
-          </div>
-          <div class="inline-controls">
-            <select name="country">
-              <option value="">{{ self.t("common.choose") }}</option>
-              {% for country in countries %}
-                <option value="{{ country }}">{{ country }}</option>
-              {% endfor %}
-            </select>
-            <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_country_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
-          </div>
-        </div>
-      </form>
-    </li>
-    <li>
-      <form method="post" action="/admin/proxies/remove-detached">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.cleanup_detached_title") }}</strong>
-            <p class="muted small">{{ self.t("px.cleanup_detached_desc").replace("{}", &detached_count.to_string()) }}</p>
-          </div>
-          <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_detached_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
-        </div>
-      </form>
-    </li>
-    <li>
-      <form method="post" action="/admin/proxies/remove-unprobeable">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.cleanup_unprobeable_title") }}</strong>
-            <p class="muted small">{{ self.t("px.cleanup_unprobeable_desc") }}</p>
-          </div>
-          <button class="btn danger small" type="submit" aria-label="{{ self.t("px.cleanup_apply_unprobeable_aria") }}">{{ self.t("px.cleanup_apply") }}</button>
-        </div>
-      </form>
-    </li>
+    {% call op("/admin/proxies/quarantine-to-removed", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_quarantine_aria"), self.t("px.cleanup_quarantine_title"), self.t("px.cleanup_quarantine_desc"), false) %}{% endcall %}
+    {% call op("/admin/proxies/remove-alive-no-country", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_no_country_aria"), self.t("px.cleanup_no_country_title"), self.t("px.cleanup_no_country_desc"), false) %}{% endcall %}
+    {% call op("/admin/proxies/remove-alive-by-asn", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_asn_aria"), self.t("px.cleanup_asn_title"), self.t("px.cleanup_asn_desc"), true) %}
+      {{ asn_controls() }}
+    {% endcall %}
+    {% call op("/admin/proxies/remove-alive-by-country", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_country_aria"), self.t("px.cleanup_country_title"), self.t("px.cleanup_country_desc"), true) %}
+      {{ country_controls() }}
+    {% endcall %}
+    {% call op("/admin/proxies/remove-detached", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_detached_aria"), self.t("px.cleanup_detached_title"), self.t_named("px.cleanup_detached_desc", &[("count", detached_count.to_string())][..]), false) %}{% endcall %}
+    {% call op("/admin/proxies/remove-unprobeable", "btn danger small", self.t("px.cleanup_apply"), self.t("px.cleanup_apply_unprobeable_aria"), self.t("px.cleanup_unprobeable_title"), self.t("px.cleanup_unprobeable_desc"), false) %}{% endcall %}
   </ul>
   <div class="form-actions">
     <button class="btn" type="button" data-dialog-close>{{ self.t("common.cancel") }}</button>
@@ -116,7 +92,8 @@
   <h2 id="purge-dialog-title" tabindex="-1">{{ self.t("px.purge_button") }}</h2>
   <form method="post" action="/admin/proxies/purge-removed">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
-    <p class="muted small">{{ self.t("px.purge_count").replace("{}", &removed_count.to_string()) }}</p>
+    <input type="hidden" name="view" value="{{ view_query }}">
+    <p class="muted small">{{ self.t_named("px.purge_count", &[("count", removed_count.to_string())][..]) }}</p>
     <p>{{ self.t("px.purge_confirm") }}</p>
     <p class="muted small">{{ self.t("px.purge_note") }}</p>
     <div class="form-actions">
@@ -126,73 +103,22 @@
   </form>
 </dialog>
 
-<!-- Bulk revival: inverse of cleanup, every action here moves rows
-     back to `unknown`, not to `removed`. Revived ids are enqueued for
-     priority probing so the daemon picks them up on its next cycle
-     instead of waiting for the random sample. -->
+{# Bulk revival: inverse of cleanup, every action here moves rows
+   back to `unknown`, not to `removed`. Revived ids are enqueued for
+   priority probing so the daemon picks them up on its next cycle
+   instead of waiting for the random sample. #}
 <dialog id="revive-dialog" aria-labelledby="revive-dialog-title">
   <h2 id="revive-dialog-title" tabindex="-1">{{ self.t("px.revive_title") }}</h2>
   <p class="muted small">{{ self.t("px.revive_note") }}</p>
   <ul class="cleanup-ops">
-    <li>
-      <form method="post" action="/admin/proxies/revive-removed-by-country">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.revive_country_title") }}</strong>
-            <p class="muted small">{{ self.t("px.revive_country_desc") }}</p>
-          </div>
-          <div class="inline-controls">
-            <select name="country">
-              <option value="">{{ self.t("common.choose") }}</option>
-              {% for country in countries %}
-                <option value="{{ country }}">{{ country }}</option>
-              {% endfor %}
-            </select>
-            <button class="btn small" type="submit" aria-label="{{ self.t("px.revive_apply_country_aria") }}">{{ self.t("px.revive_apply") }}</button>
-          </div>
-        </div>
-      </form>
-    </li>
-    <li>
-      <form method="post" action="/admin/proxies/revive-removed-by-asn">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.revive_asn_title") }}</strong>
-            <p class="muted small">{{ self.t("px.revive_asn_desc") }}</p>
-          </div>
-          <div class="inline-controls">
-            <input type="text" name="asn" placeholder="AS24940" inputmode="numeric" autocomplete="off">
-            <button class="btn small" type="submit" aria-label="{{ self.t("px.revive_apply_asn_aria") }}">{{ self.t("px.revive_apply") }}</button>
-          </div>
-        </div>
-      </form>
-    </li>
-    <li>
-      <form method="post" action="/admin/proxies/revive-removed-never-checked">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.revive_never_checked_title") }}</strong>
-            <p class="muted small">{{ self.t("px.revive_never_checked_desc") }}</p>
-          </div>
-          <button class="btn small" type="submit" aria-label="{{ self.t("px.revive_apply_no_history_aria") }}">{{ self.t("px.revive_apply") }}</button>
-        </div>
-      </form>
-    </li>
-    <li>
-      <form method="post" action="/admin/proxies/revive-quarantine">
-        <input type="hidden" name="_csrf" value="{{ csrf }}">
-        <div class="cleanup-op">
-          <div>
-            <strong>{{ self.t("px.revive_quarantine_title") }}</strong>
-            <p class="muted small">{{ self.t("px.revive_quarantine_desc") }}</p>
-          </div>
-          <button class="btn small" type="submit" aria-label="{{ self.t("px.revive_apply_quarantine_aria") }}">{{ self.t("px.revive_apply") }}</button>
-        </div>
-      </form>
-    </li>
+    {% call op("/admin/proxies/revive-removed-by-country", "btn small", self.t("px.revive_apply"), self.t("px.revive_apply_country_aria"), self.t("px.revive_country_title"), self.t("px.revive_country_desc"), true) %}
+      {{ country_controls() }}
+    {% endcall %}
+    {% call op("/admin/proxies/revive-removed-by-asn", "btn small", self.t("px.revive_apply"), self.t("px.revive_apply_asn_aria"), self.t("px.revive_asn_title"), self.t("px.revive_asn_desc"), true) %}
+      {{ asn_controls() }}
+    {% endcall %}
+    {% call op("/admin/proxies/revive-removed-never-checked", "btn small", self.t("px.revive_apply"), self.t("px.revive_apply_no_history_aria"), self.t("px.revive_never_checked_title"), self.t("px.revive_never_checked_desc"), false) %}{% endcall %}
+    {% call op("/admin/proxies/revive-quarantine", "btn small", self.t("px.revive_apply"), self.t("px.revive_apply_quarantine_aria"), self.t("px.revive_quarantine_title"), self.t("px.revive_quarantine_desc"), false) %}{% endcall %}
   </ul>
   <div class="form-actions">
     <button class="btn" type="button" data-dialog-close>{{ self.t("common.cancel") }}</button>
@@ -265,6 +191,10 @@
     </select>
   </div>
   <button class="btn" type="submit">{{ self.t("common.apply") }}</button>
+  {#- One click back to the unfiltered list: the empty-state link below
+      only helps when nothing matched, this one works while rows are
+      still on the page. -#}
+  {% if self.filters_active() %}<a class="btn" href="/admin/proxies">{{ self.t("px.clear_filters") }}</a>{% endif %}
 </form>
 
 <div class="panel">
@@ -325,8 +255,8 @@
     </div>
   {% endif %}
 
-  <!-- Keyset navigation: the links carry the cursor of the page they
-       lead to, so the browser seeks straight to it. -->
+  {# Keyset navigation: the links carry the cursor of the page they
+     lead to, so the browser seeks straight to it. #}
   {% if nav_first.is_some() || nav_prev.is_some() || nav_next.is_some() %}
     <nav class="pagination" aria-label="{{ self.t("px.pagination_label") }}">
       {% if let Some(link) = nav_first %}<a class="page" href="{{ link }}">{{ self.t("px.page_first") }}</a>{% endif %}

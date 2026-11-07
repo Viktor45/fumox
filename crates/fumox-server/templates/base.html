@@ -28,6 +28,11 @@
       dialog { display: block; position: static; margin: 16px 0; }
       dialog button[data-dialog-close] { display: none; }
       button[data-dialog-open] { display: none; }
+      /* Pipeline widget controls that act through htmx endpoints only:
+         the mode switch, the presets and the add-row buttons. The
+         hidden `pipeline_mode` input still submits, so the rendered
+         mode survives the save; a note in the widget explains it. */
+      .ped-modes button, .ped-presets button, .ped-inner > button { display: none; }
     </style>
   </noscript>
 </head>
@@ -55,34 +60,43 @@
           data-stale="{{ self.t("common.sse_stale") }}">{{ self.t("common.sse_stale") }}</span>
     {# Theme switcher (day/night): the choice is stored in the fumox_theme
        cookie and rendered server-side as data-theme on <html>, so it works
-       without JavaScript. The link carries `data-next`: the panel's script
-       appends the current path as `next`, same as the language switcher
-       below. On narrow screens CSS swaps the text labels for the inline
-       SVG sun/moon icons so the whole first topbar row fits. #}
-    <span class="lang-switch theme-switch" role="group" aria-label="{{ self.t("nav.theme") }}">
-      <a href="/admin/set-theme?theme=light" data-next
-         aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
-         {% if theme.is_light() %}class="active" aria-current="true"{% endif %}>
+       without JavaScript. The switcher is a POST form under the auth+CSRF
+       nest like every state-changing control (see the route group in
+       admin::router): a cross-site page must not be able to make the
+       browser store a preference cookie. Each button submits its own
+       value. The hidden `next` input is filled by the panel's script with
+       the current path (`data-next-input`); without JavaScript the
+       redirect falls back to the dashboard. On narrow screens CSS swaps
+       the text labels for the inline SVG sun/moon icons so the whole
+       first topbar row fits. #}
+    <form method="post" action="/admin/set-theme" class="lang-switch theme-switch" role="group" aria-label="{{ self.t("nav.theme") }}">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <input type="hidden" name="next" value="" data-next-input>
+      <button type="submit" name="theme" value="light"
+              aria-label="{{ self.t("theme.light") }}" title="{{ self.t("theme.light") }}"
+              {% if theme.is_light() %}class="active" aria-current="true"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
         <span class="theme-label">{{ self.t("theme.light") }}</span>
-      </a>
-      <a href="/admin/set-theme?theme=dark" data-next
-         aria-label="{{ self.t("theme.dark") }}" title="{{ self.t("theme.dark") }}"
-         {% if theme.is_dark() %}class="active" aria-current="true"{% endif %}>
+      </button>
+      <button type="submit" name="theme" value="dark"
+              aria-label="{{ self.t("theme.dark") }}" title="{{ self.t("theme.dark") }}"
+              {% if theme.is_dark() %}class="active" aria-current="true"{% endif %}>
         <svg class="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
         <span class="theme-label">{{ self.t("theme.dark") }}</span>
-      </a>
-    </span>
+      </button>
+    </form>
     {# Language switcher: iterates every loaded catalog (`langs`), so new
-       languages appear automatically. The link carries `data-next` too: the
-       panel's script appends the current path so the user lands back on
-       the same page; without JS the redirect falls back to the dashboard. #}
-    <span class="lang-switch" role="group" aria-label="{{ self.t("nav.language") }}">
+       languages appear automatically. POST form under the same auth+CSRF
+       envelope as the theme switcher above; the hidden `next` input works
+       the same way, so the user lands back on the page they came from. #}
+    <form method="post" action="/admin/set-lang" class="lang-switch" role="group" aria-label="{{ self.t("nav.language") }}">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <input type="hidden" name="next" value="" data-next-input>
       {% for (code, _label) in langs %}
-      <a href="/admin/set-lang?lang={{ code }}" data-next
-         {% if self.lang_code() == code.as_str() %}class="active" aria-current="true"{% endif %}>{{ code | upper }}</a>
+      <button type="submit" name="lang" value="{{ code }}"
+              {% if self.lang_code() == code.as_str() %}class="active" aria-current="true"{% endif %}>{{ code | upper }}</button>
       {% endfor %}
-    </span>
+    </form>
     <form method="post" action="/admin/logout" class="inline">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
       <button class="btn small" type="submit">{{ self.t("nav.logout") }}</button>

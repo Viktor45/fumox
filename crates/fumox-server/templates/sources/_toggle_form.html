@@ -3,14 +3,8 @@
     the swap response `swap_oob` adds the hx-swap-oob attribute so the
     form replaces itself out-of-band; the page renders it plain.
 
-    The button carries the action, not the state ("Disable" on an
-    enabled source), and the state lives in the badge next to it, so the
-    button has no aria-pressed. The button is disabled while the request
-    runs, so a second click cannot flip the flag twice, and the response
-    error is printed into the slot the page keeps next to the badge. -#}
-<form id="toggle-form" method="post" action="/admin/sources/{{ source.id }}/toggle"
-      hx-post="/admin/sources/{{ source.id }}/toggle" hx-target="#enabled-badge" hx-swap="innerHTML"
-      hx-disabled-elt="find button" data-error-target="toggle-error"{% if swap_oob %} hx-swap-oob="outerHTML:#toggle-form"{% endif %}>
-  <input type="hidden" name="_csrf" value="{{ csrf }}">
-  <button class="btn" type="submit">{% if source.enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}<span class="htmx-indicator">&nbsp;…</span></button>
-</form>
+    The markup lives once in the shared `_toggle_form.html`: this wrapper
+    provides `toggle_url` / `enabled` / `csrf` / `swap_oob` as flat
+    context fields, and the POST form carries the CSRF token in the
+    hidden `_csrf` field taken from the `csrf` field of that context. -#}
+{% include "../_toggle_form.html" %}

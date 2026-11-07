@@ -10,6 +10,13 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "test-admin-token";
 
+/// An allowlist canonicalized the way the config loaders do: the free
+/// `serve_base` and the host gate take the ready list, never raw entries.
+fn allowlist(entries: &[&str]) -> host_gate::HostAllowlist {
+    let owned: Vec<String> = entries.iter().map(|entry| entry.to_string()).collect();
+    host_gate::HostAllowlist::new(&owned)
+}
+
 #[test]
 fn serve_base_uses_host_header_and_public_port() {
     let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -17,7 +24,15 @@ fn serve_base_uses_host_header_and_public_port() {
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com:8081".parse().unwrap());
     assert_eq!(
-        serve_base(bind, peer, &h, &[], TrustedHeader::None, &[]).unwrap(),
+        serve_base(
+            bind,
+            peer,
+            &h,
+            &[],
+            TrustedHeader::None,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://vpn.example.com:8080"
     );
 
@@ -25,7 +40,15 @@ fn serve_base_uses_host_header_and_public_port() {
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     assert_eq!(
-        serve_base(bind, peer, &h, &[], TrustedHeader::None, &[]).unwrap(),
+        serve_base(
+            bind,
+            peer,
+            &h,
+            &[],
+            TrustedHeader::None,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://vpn.example.com:8080"
     );
 
@@ -33,19 +56,43 @@ fn serve_base_uses_host_header_and_public_port() {
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "[::1]:8081".parse().unwrap());
     assert_eq!(
-        serve_base(bind, peer, &h, &[], TrustedHeader::None, &[]).unwrap(),
+        serve_base(
+            bind,
+            peer,
+            &h,
+            &[],
+            TrustedHeader::None,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://[::1]:8080"
     );
 
     // No Host header: loopback for an unspecified bind address,
     // the bound IP itself when it is specific.
     assert_eq!(
-        serve_base(bind, peer, &HeaderMap::new(), &[], TrustedHeader::None, &[]).unwrap(),
+        serve_base(
+            bind,
+            peer,
+            &HeaderMap::new(),
+            &[],
+            TrustedHeader::None,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://127.0.0.1:8080"
     );
     let bind: SocketAddr = "192.168.1.5:8080".parse().unwrap();
     assert_eq!(
-        serve_base(bind, peer, &HeaderMap::new(), &[], TrustedHeader::None, &[]).unwrap(),
+        serve_base(
+            bind,
+            peer,
+            &HeaderMap::new(),
+            &[],
+            TrustedHeader::None,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://192.168.1.5:8080"
     );
 }
@@ -66,12 +113,22 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "https".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &[], TrustedHeader::Xff, &[]).unwrap(),
+        serve_base(
+            bind,
+            trusted_peer,
+            &h,
+            &[],
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://vpn.example.com:8080",
         "no trusted proxy must not honor forwarded headers"
     );
 
-    // Trusted peer + X-Forwarded-Proto: https ⇒ https.
+    // Trusted peer + X-Forwarded-Proto: https ⇒ https. The Host header
+    // is the public authority and spells no port, so the scheme's
+    // default (443, omitted) applies — not the panel's bind port.
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -79,9 +136,17 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "https".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
-        "https://vpn.example.com:8080",
-        "trusted peer + XFP=https ⇒ https"
+        serve_base(
+            bind,
+            trusted_peer,
+            &h,
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
+        "https://vpn.example.com",
+        "trusted peer + XFP=https ⇒ https on the Host authority's default port"
     );
 
     // Untrusted peer: the forwarded header is dropped, scheme is http.
@@ -92,7 +157,15 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "https".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, untrusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
+        serve_base(
+            bind,
+            untrusted_peer,
+            &h,
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://vpn.example.com:8080",
         "untrusted peer + XFP=https ⇒ http (header dropped)"
     );
@@ -111,14 +184,16 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
             &h,
             &trusted,
             TrustedHeader::Forwarded,
-            &[]
+            &host_gate::HostAllowlist::default()
         )
         .unwrap(),
-        "https://vpn.example.com:8080",
+        "https://vpn.example.com",
         "trusted peer + RFC 7239 Forwarded proto=https ⇒ https"
     );
 
-    // Trusted peer + explicit X-Forwarded-Proto: http ⇒ http wins.
+    // Trusted peer + explicit X-Forwarded-Proto: http ⇒ http wins; the
+    // Host authority spells no port, so the default (80, omitted)
+    // applies.
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "vpn.example.com".parse().unwrap());
     h.insert(
@@ -126,8 +201,16 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
         "http".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
-        "http://vpn.example.com:8080",
+        serve_base(
+            bind,
+            trusted_peer,
+            &h,
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
+        "http://vpn.example.com",
         "explicit XFP=http wins"
     );
 
@@ -147,7 +230,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
             &h,
             &trusted,
             TrustedHeader::Xff,
-            &[]
+            &host_gate::HostAllowlist::default()
         )
         .unwrap(),
         "https://vpn.example.com",
@@ -155,7 +238,7 @@ fn serve_base_switches_to_https_behind_tls_proxy() {
     );
 
     // Allowlist set: non-matching host ⇒ Err.
-    let allowed = vec!["vpn.example.com".to_string()];
+    let allowed = allowlist(&["vpn.example.com"]);
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "evil.example".parse().unwrap());
     assert!(
@@ -187,8 +270,16 @@ fn serve_base_ignores_forwarded_headers_without_a_declaration() {
         "https".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::None, &[]).unwrap(),
-        "http://vpn.example.com:8080",
+        serve_base(
+            bind,
+            trusted_peer,
+            &h,
+            &trusted,
+            TrustedHeader::None,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
+        "http://vpn.example.com",
         "no declared header ⇒ the proxy's hint is ignored"
     );
 
@@ -201,8 +292,16 @@ fn serve_base_ignores_forwarded_headers_without_a_declaration() {
         "for=10.0.0.1;proto=https".parse().unwrap(),
     );
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
-        "http://vpn.example.com:8080",
+        serve_base(
+            bind,
+            trusted_peer,
+            &h,
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
+        "http://vpn.example.com",
         "an undeclared family is never read"
     );
 }
@@ -226,7 +325,15 @@ fn the_serve_link_prefers_the_request_port_behind_a_trusted_proxy() {
     // Behind the trusted proxy the request's authority is the public
     // one, so its port is the port of the link.
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
+        serve_base(
+            bind,
+            trusted_peer,
+            &h,
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://vpn.example.com:8443",
         "the request's port is the public authority's port"
     );
@@ -234,7 +341,15 @@ fn the_serve_link_prefers_the_request_port_behind_a_trusted_proxy() {
     // An untrusted peer is just a client: its `Host` header is text the
     // client wrote, so the bind port wins.
     assert_eq!(
-        serve_base(bind, untrusted_peer, &h, &trusted, TrustedHeader::Xff, &[]).unwrap(),
+        serve_base(
+            bind,
+            untrusted_peer,
+            &h,
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://vpn.example.com:8080",
         "a client cannot move the link to a port of its choosing"
     );
@@ -243,9 +358,103 @@ fn the_serve_link_prefers_the_request_port_behind_a_trusted_proxy() {
     // governs the *forwarded* headers (the scheme hint, the forwarded
     // host), the `Host` header of the request is read either way.
     assert_eq!(
-        serve_base(bind, trusted_peer, &h, &trusted, TrustedHeader::None, &[]).unwrap(),
+        serve_base(
+            bind,
+            trusted_peer,
+            &h,
+            &trusted,
+            TrustedHeader::None,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
         "http://vpn.example.com:8443",
         "the request's own authority still names the public port"
+    );
+}
+
+/// The scheme and the port of a serve link describe one authority. Behind
+/// a trusted reverse proxy that authority is the `Host` header: a Host
+/// without a port is the scheme's default (80/443, omitted), not the
+/// panel's own `[server].bind` port — the old fallback produced
+/// `https://vpn.example.com:8080` for a TLS-terminated proxy, an
+/// authority nobody answers on.
+#[test]
+fn serve_base_scheme_and_port_come_from_one_authority() {
+    let bind: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+    let trusted_peer: SocketAddr = "2.2.2.2:41000".parse().unwrap();
+    let untrusted_peer: SocketAddr = "9.9.9.9:41000".parse().unwrap();
+    let trusted: Vec<ipnet::IpNet> = vec!["2.2.2.2/32".parse().unwrap()];
+    let host_without_port = || {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "vpn.example.com".parse().unwrap());
+        h
+    };
+
+    // Trusted proxy, https: the Host authority's default port (443) is
+    // omitted instead of the bind port appearing.
+    let mut h = host_without_port();
+    h.insert(
+        header::HeaderName::from_static("x-forwarded-proto"),
+        "https".parse().unwrap(),
+    );
+    assert_eq!(
+        serve_base(
+            bind,
+            trusted_peer,
+            &h,
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
+        "https://vpn.example.com",
+        "a Host without a port behind a trusted proxy is the scheme default"
+    );
+
+    // Same authority over plain http: default port 80, also omitted.
+    assert_eq!(
+        serve_base(
+            bind,
+            trusted_peer,
+            &host_without_port(),
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
+        "http://vpn.example.com",
+        "the http default port is omitted on the Host authority too"
+    );
+
+    // No Host header at all: the authority is the bound address itself,
+    // so the bind port applies even behind a trusted proxy.
+    assert_eq!(
+        serve_base(
+            bind,
+            trusted_peer,
+            &HeaderMap::new(),
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
+        "http://127.0.0.1:8080",
+        "the bind fallback keeps the bind port"
+    );
+
+    // An untrusted peer cannot move the link: bind port, as before.
+    assert_eq!(
+        serve_base(
+            bind,
+            untrusted_peer,
+            &host_without_port(),
+            &trusted,
+            TrustedHeader::Xff,
+            &host_gate::HostAllowlist::default()
+        )
+        .unwrap(),
+        "http://vpn.example.com:8080",
+        "a client's Host without a port still gets the bind port"
     );
 }
 
@@ -514,35 +723,14 @@ async fn serve_link_pages_render_for_an_admin_allowlisted_host() {
         r
     };
 
-    let response = app
-        .clone()
-        .oneshot(with_host(
-            "POST",
-            "/admin/login",
-            &format!("token={TOKEN}"),
-            None,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    let cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = login_with_host(&app, "panel.example.com").await;
 
     let response = app
         .oneshot(with_host("GET", "/admin/import", "", Some(&cookie)))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         html.contains("http://panel.example.com:8080/export/alive/"),
         "the export link must be built from the panel's own host: {html:.400}"
@@ -587,28 +775,7 @@ async fn the_export_link_points_at_a_host_the_public_listener_accepts() {
         r
     };
 
-    let response = app
-        .clone()
-        .oneshot(with_host(
-            "POST",
-            "/admin/login",
-            &format!("token={TOKEN}"),
-            "panel.example.com",
-            None,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    let cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = login_with_host(&app, "panel.example.com").await;
 
     let response = app
         .clone()
@@ -622,8 +789,7 @@ async fn the_export_link_points_at_a_host_the_public_listener_accepts() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
 
     // The link carries the panel's own host and the public port.
     assert!(
@@ -650,8 +816,7 @@ async fn the_export_link_points_at_a_host_the_public_listener_accepts() {
         Vec::new(),
         TrustedHeader::None,
         server.allowed_hosts.clone(),
-        server.export_max_rows,
-        state.export_token.clone(),
+        crate::alive_export::ExportState::new(server.export_max_rows, state.export_token.clone()),
     ));
 
     let response = public
@@ -724,6 +889,28 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8(out).expect("decoded payload is utf-8")
 }
 
+/// A response body as text (lossy UTF-8), the form every HTML
+/// assertion in this file reads it in.
+async fn body_text(response: axum::response::Response) -> String {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The `name=value` pair of a `Set-Cookie` header: everything up to the
+/// first attribute separator.
+fn cookie_from_set_cookie(response: &axum::response::Response) -> String {
+    response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("the response must set a cookie")
+        .to_str()
+        .expect("the cookie is header-safe")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
 async fn login(app: &axum::Router) -> String {
     let response = app
         .clone()
@@ -745,8 +932,28 @@ async fn login(app: &axum::Router) -> String {
         .to_string();
     assert!(set_cookie.starts_with(&format!("{}=", auth::SESSION_COOKIE)));
     assert!(set_cookie.contains("HttpOnly"));
-    // The cookie value is everything up to the first ';'.
-    set_cookie.split(';').next().unwrap().to_string()
+    cookie_from_set_cookie(&response)
+}
+
+/// [`login`] on a request that names a specific `Host`: the allowlist
+/// gates and the serve links key on it, so the allowlist tests log in
+/// through the same gate their pages use.
+async fn login_with_host(app: &axum::Router, host: &str) -> String {
+    let mut req = request("POST", "/admin/login", &format!("token={TOKEN}"), None);
+    req.headers_mut()
+        .insert(header::HOST, host.parse().unwrap());
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.starts_with(&format!("{}=", auth::SESSION_COOKIE)));
+    assert!(set_cookie.contains("HttpOnly"));
+    cookie_from_set_cookie(&response)
 }
 
 fn csrf_for(state: &AdminState, cookie: &str) -> String {
@@ -831,6 +1038,96 @@ async fn unauthenticated_htmx_gets_hx_redirect() {
     );
 }
 
+/// The optional columns of a fixture proxy row: `None` leaves the
+/// column at the row most fixtures seed (port 443, credential `c`,
+/// timestamps 1).
+#[derive(Default)]
+struct ProxySeed {
+    host: Option<String>,
+    port: Option<i64>,
+    credential: Option<String>,
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
+    quarantined_at: Option<i64>,
+    ladder_at: Option<i64>,
+    latency_ms: Option<i64>,
+    geo_country: Option<String>,
+    geo_asn: Option<String>,
+    resolved_ip: Option<String>,
+}
+
+/// One fixture proxy row: the base `INSERT INTO proxies` every fixture
+/// in this file repeats, returning the rowid the follow-up queries
+/// used to look up by fingerprint. The optional columns ride in
+/// [`ProxySeed`].
+async fn insert_proxy(
+    pool: &fumox_core::db::DbPool,
+    fingerprint: &str,
+    scheme: &str,
+    name: &str,
+    status: &str,
+) -> sqlx::Result<i64> {
+    insert_proxy_seeded(
+        pool,
+        fingerprint,
+        scheme,
+        name,
+        status,
+        ProxySeed::default(),
+    )
+    .await
+}
+
+/// [`insert_proxy`] with the optional columns overridden.
+async fn insert_proxy_seeded(
+    pool: &fumox_core::db::DbPool,
+    fingerprint: &str,
+    scheme: &str,
+    name: &str,
+    status: &str,
+    seed: ProxySeed,
+) -> sqlx::Result<i64> {
+    let ProxySeed {
+        host,
+        port,
+        credential,
+        created_at,
+        updated_at,
+        quarantined_at,
+        ladder_at,
+        latency_ms,
+        geo_country,
+        geo_asn,
+        resolved_ip,
+    } = seed;
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO proxies
+             (fingerprint, scheme, name, host, port, credential, status,
+              created_at, updated_at, quarantined_at, ladder_at, latency_ms,
+              geo_country, geo_asn, resolved_ip)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(fingerprint)
+    .bind(scheme)
+    .bind(name)
+    .bind(host.unwrap_or_else(|| format!("{fingerprint}.example.com")))
+    .bind(port.unwrap_or(443))
+    .bind(credential.unwrap_or_else(|| "c".to_string()))
+    .bind(status)
+    .bind(created_at.unwrap_or(1))
+    .bind(updated_at.unwrap_or(1))
+    .bind(quarantined_at)
+    .bind(ladder_at)
+    .bind(latency_ms)
+    .bind(geo_country)
+    .bind(geo_asn)
+    .bind(resolved_ip)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
 /// A row that is not there and a database that failed must not answer
 /// alike: the first is a 404, the second a 500.
 ///
@@ -869,6 +1166,93 @@ async fn a_missing_row_and_a_broken_database_answer_differently() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// The source page shows the computed time of the next attempt right under
+/// the last error: consecutive failed fetches put the retry a growing
+/// backoff out (capped, see the scheduler), a success clears the hint.
+/// The card renders in the default locale (ru); the assertion pins that
+/// the hint appears at all and carries a `<time>` element.
+#[tokio::test]
+async fn the_source_page_shows_the_next_retry_next_to_the_last_error() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let now = fumox_core::models::now_ts();
+    fumox_core::repo::sources::create(&pool, &test_source("srcRetryV00", "retry-src"))
+        .await
+        .unwrap();
+    // Two failed attempts, journalled the way a failed fetch leaves its
+    // rows, with the row's own last_error mirroring the journal.
+    for fetched_at in [now - 200, now - 100] {
+        fumox_core::repo::fetch_log::insert(
+            &pool,
+            &fumox_core::repo::fetch_log::FetchLogEntry {
+                source_id: "srcRetryV00",
+                fetched_at,
+                ok: false,
+                http_status: Some(401),
+                bytes: None,
+                proxies_found: None,
+                error: Some("401 unauthorized"),
+                error_class: Some(fumox_core::models::ErrorClass::HttpClient),
+            },
+            fumox_core::repo::fetch_log::FetchTiming::default(),
+        )
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "UPDATE sources SET error_class = 'http_client', last_error = '401 unauthorized'
+         WHERE id = 'srcRetryV00'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let detail = |state: &AdminState| {
+        handlers::source_detail(
+            State(state.clone()),
+            Path("srcRetryV00".to_string()),
+            ConnectInfo("127.0.0.1:41000".parse().unwrap()),
+            HeaderMap::new(),
+            Query(HashMap::new()),
+        )
+    };
+    let response = detail(&state).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("Следующая попытка"),
+        "the next-retry hint renders next to the last error: {html}"
+    );
+    assert!(
+        html.contains("<time class=\"ts\""),
+        "the hint carries the computed timestamp: {html}"
+    );
+
+    // A success newer than the failures resets the streak: no retry is
+    // pending, the hint disappears.
+    fumox_core::repo::fetch_log::insert(
+        &pool,
+        &fumox_core::repo::fetch_log::FetchLogEntry {
+            source_id: "srcRetryV00",
+            fetched_at: now - 50,
+            ok: true,
+            http_status: Some(200),
+            bytes: Some(1024),
+            proxies_found: Some(3),
+            error: None,
+            error_class: None,
+        },
+        fumox_core::repo::fetch_log::FetchTiming::default(),
+    )
+    .await
+    .unwrap();
+    let html = body_text(detail(&state).await).await;
+    assert!(
+        !html.contains("Следующая попытка"),
+        "a success clears the hint: {html}"
+    );
 }
 
 /// With the database down the authentication layer itself fails closed:
@@ -915,43 +1299,11 @@ async fn login_flow_grants_access_and_wrong_token_does_not() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
-    assert!(html.contains("Обзор"));
-
-    // Security headers are present on every admin response.
-    let response = app
-        .oneshot(request("GET", "/admin/login", "", None))
-        .await
-        .unwrap();
-    assert_eq!(
-        response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
-        "DENY"
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get(header::X_CONTENT_TYPE_OPTIONS)
-            .unwrap(),
-        "nosniff"
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CONTENT_SECURITY_POLICY)
-            .unwrap(),
-        security::CONTENT_SECURITY_POLICY
-    );
-    // The referrer policy must stay off `no-referrer`: per Fetch, that
-    // policy stamps `Origin: null` on the request, which
-    // `cross_site_context` rejects, so the login form's own navigation
-    // POST could never pass the gate (`403 err.cross_site`). `same-origin`
-    // keeps the panel URL from third-party origins and lets the browser
-    // send the real Origin.
-    assert_eq!(
-        response.headers().get(header::REFERRER_POLICY).unwrap(),
-        "same-origin"
-    );
+    let html = body_text(response).await;
+    // The heading resolved from the locale the panel serves by default,
+    // not a string pinned in the test.
+    let lang = state.locales.resolve("ru");
+    assert!(html.contains(lang.t("nav.dashboard")));
 }
 
 #[tokio::test]
@@ -987,6 +1339,12 @@ async fn every_panel_page_carries_the_security_headers() {
             "nosniff",
             "{path}"
         );
+        // The referrer policy must stay off `no-referrer`: per Fetch, that
+        // policy stamps `Origin: null` on the request, which
+        // `cross_site_context` rejects, so the login form's own navigation
+        // POST could never pass the gate (`403 err.cross_site`). `same-origin`
+        // keeps the panel URL from third-party origins and lets the browser
+        // send the real Origin.
         assert_eq!(
             headers.get(header::REFERRER_POLICY).unwrap(),
             "same-origin",
@@ -1051,6 +1409,7 @@ async fn post_without_csrf_is_rejected() {
     let source = fumox_core::models::Source {
         id: "srcA0000000".into(),
         slug: None,
+        access_token: None,
         name: "s".into(),
         url: "https://example.com".into(),
         enabled: true,
@@ -1184,10 +1543,10 @@ async fn oversized_binary_body_is_rejected_before_csrf() {
     let (_dir, state) = test_state(1000).await;
     let app = router(state.clone());
     let cookie = login(&app).await;
-    let csrf = csrf_for(&state, &cookie);
 
-    // 1 MiB + 1 byte of arbitrary binary, invalid UTF-8 too, so even
-    // if the CSRF layer ran, it could not match `_csrf` against it.
+    // 1 MiB + 1 byte of arbitrary binary, invalid UTF-8 too: the body
+    // consists of binary bytes only, no CSRF token in it, so even if
+    // the CSRF layer ran, it could not match `_csrf` against it.
     let mut body = Vec::with_capacity((1 << 20) + 1);
     body.extend_from_slice(&vec![0xFFu8; (1 << 20) + 1]);
 
@@ -1208,16 +1567,6 @@ async fn oversized_binary_body_is_rejected_before_csrf() {
         status == StatusCode::PAYLOAD_TOO_LARGE || status == StatusCode::BAD_REQUEST,
         "oversized binary body must be rejected before CSRF, got {status}"
     );
-    assert_ne!(
-        status,
-        StatusCode::FORBIDDEN,
-        "binary body must not be parsed as urlencoded and silently fail CSRF"
-    );
-
-    // The genuine CSRF token is in the body already, even if a
-    // hypothetical parser guessed it, the body cap is the only
-    // load-bearing protection.
-    let _ = csrf;
 }
 
 #[tokio::test]
@@ -1535,6 +1884,132 @@ async fn list_screens_render_for_an_authenticated_session() {
     }
 }
 
+/// The fetch journal page clamps its page number: `page=0`, a negative
+/// one, a non-numeric one and a page past the end all render exactly
+/// page 1 (same status, same body), not an empty table a stale link
+/// could dress up as "the journal is empty".
+#[tokio::test]
+async fn the_fetch_journal_clamps_a_broken_page_to_the_first_page() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let now = fumox_core::models::now_ts();
+    let source = test_source("srcJ0000000", "journal-src");
+    fumox_core::repo::sources::create(&pool, &source)
+        .await
+        .unwrap();
+    for (ok, error) in [(true, None), (false, Some("journal boom"))] {
+        fumox_core::repo::fetch_log::insert(
+            &pool,
+            &fumox_core::repo::fetch_log::FetchLogEntry {
+                source_id: "srcJ0000000",
+                fetched_at: now,
+                ok,
+                http_status: Some(200),
+                bytes: Some(1024),
+                proxies_found: Some(3),
+                error,
+                error_class: None,
+            },
+            fumox_core::repo::fetch_log::FetchTiming::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    async fn fetch_page(app: &axum::Router, cookie: &str, query: &str) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/admin/logs/fetch{query}"),
+                "",
+                Some(cookie),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_text(response).await;
+        (status, body)
+    }
+
+    let (status, baseline) = fetch_page(&app, &cookie, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        baseline.contains("journal boom"),
+        "the journal rows must be on the page: {baseline:.600}"
+    );
+
+    for query in ["?page=0", "?page=abc", "?page=-3", "?page=999"] {
+        let (status, html) = fetch_page(&app, &cookie, query).await;
+        assert_eq!(status, StatusCode::OK, "query {query}");
+        assert_eq!(
+            html, baseline,
+            "query {query} must render exactly like page 1"
+        );
+    }
+}
+
+/// The fetch journal's error-class select offers every class the schema
+/// records (`ErrorClass::all()`, storage included — a class the fetcher
+/// can write must be filterable), and the `class` filter actually
+/// selects the rows recorded with it.
+#[tokio::test]
+async fn the_fetch_journal_offers_and_filters_the_storage_error_class() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let now = fumox_core::models::now_ts();
+    let source = test_source("srcJst00000", "journal-storage");
+    fumox_core::repo::sources::create(&pool, &source)
+        .await
+        .unwrap();
+    fumox_core::repo::fetch_log::insert(
+        &pool,
+        &fumox_core::repo::fetch_log::FetchLogEntry {
+            source_id: "srcJst00000",
+            fetched_at: now,
+            ok: false,
+            http_status: None,
+            bytes: None,
+            proxies_found: None,
+            error: Some("database is locked"),
+            error_class: Some(fumox_core::models::ErrorClass::Storage),
+        },
+        fumox_core::repo::fetch_log::FetchTiming::default(),
+    )
+    .await
+    .unwrap();
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    async fn fetch_page(app: &axum::Router, cookie: &str, query: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/admin/logs/fetch{query}"),
+                "",
+                Some(cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    // The class options are generated from the schema, storage included.
+    let page = fetch_page(&app, &cookie, "").await;
+    assert!(page.contains(r#"<option value="storage""#), "{page:.600}");
+
+    // The recorded storage row answers to its own class filter…
+    let filtered = fetch_page(&app, &cookie, "?class=storage").await;
+    assert!(filtered.contains("database is locked"), "{filtered:.600}");
+    // …and to no other.
+    let other = fetch_page(&app, &cookie, "?class=network").await;
+    assert!(!other.contains("database is locked"), "{other:.600}");
+}
+
 #[tokio::test]
 async fn source_headers_with_control_characters_are_rejected() {
     let (_dir, state) = test_state(1000).await;
@@ -1644,8 +2119,7 @@ async fn source_form_validation_rejects_bad_input() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("обязательное поле"), "{html:.400}");
 
     // An unknown IP family is rejected as well.
@@ -1948,8 +2422,7 @@ async fn a_profile_token_is_stored_hashed_and_survives_the_placeholder() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(!html.contains(secret), "the form must not carry the secret");
     assert!(html.contains("••••••"), "{html}");
 
@@ -2006,8 +2479,7 @@ async fn url_validation_errors_follow_the_panel_language() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let html = body_text(response).await;
     assert!(html.contains("поддерживаются только http/https"), "{html}");
 
     // Same submission with the panel switched to English via the
@@ -2023,8 +2495,7 @@ async fn url_validation_errors_follow_the_panel_language() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let html = body_text(response).await;
     assert!(
         html.contains("only http/https URLs are supported"),
         "{html}"
@@ -2053,8 +2524,7 @@ async fn import_page_shows_alive_link_and_rotation_replaces_it() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html).into_owned();
+    let html = body_text(response).await;
     let token = html
         .split("/export/alive/")
         .nth(1)
@@ -2100,8 +2570,7 @@ async fn profile_form_persists_and_validates_country_filter() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("XX1"), "bad code must be reported: {html:?}");
     assert!(
         fumox_core::repo::profiles::list(&state.pool, false)
@@ -2140,27 +2609,36 @@ async fn profile_form_persists_and_validates_country_filter() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("DE, US"), "card shows the filter: {html:?}");
 }
 
 /// The `ready` tier surfaces everywhere the statuses are listed:
-/// the proxy browser filter, the stats
-/// splits and the export screen's ready link.
+/// the proxy browser filter, the dashboard's scheme split, the export
+/// screen's ready link and the proxy card's badge chain.
 #[tokio::test]
-async fn ready_tier_is_filterable_and_exported() {
+async fn ready_tier_surfaces_in_filter_dashboard_export_and_card_badge() {
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
 
-    sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-             VALUES ('fp-ready-1', 'vless', 'verified-one', 'r1.example.com', 443, 'c', 'ready', 1, 1),
-                    ('fp-alive-1', 'vless', 'plain-one', 'r2.example.com', 443, 'c', 'alive', 1, 1)",
+    for (fp, name, host, status) in [
+        ("fp-ready-1", "verified-one", "r1.example.com", "ready"),
+        ("fp-alive-1", "plain-one", "r2.example.com", "alive"),
+    ] {
+        insert_proxy_seeded(
+            &pool,
+            fp,
+            "vless",
+            name,
+            status,
+            ProxySeed {
+                host: Some(host.to_string()),
+                ..Default::default()
+            },
         )
-        .execute(&pool)
         .await
         .unwrap();
+    }
 
     let app = router(state);
     let cookie = login(&app).await;
@@ -2177,8 +2655,7 @@ async fn ready_tier_is_filterable_and_exported() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("verified-one"), "{html}");
     assert!(!html.contains("plain-one"), "{html}");
     // The filter dropdown carries the ready checkbox.
@@ -2191,8 +2668,7 @@ async fn ready_tier_is_filterable_and_exported() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("status=ready"), "{html}");
 
     // The export screen shows the ready link with the shared token and
@@ -2203,8 +2679,7 @@ async fn ready_tier_is_filterable_and_exported() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("/export/ready/"), "{html}");
     assert!(html.contains("готовые"), "the ready column title: {html}");
 
@@ -2225,12 +2700,68 @@ async fn ready_tier_is_filterable_and_exported() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("badge ready"), "card badge: {html}");
     assert!(
         !html.contains("badge unknown"),
         "a ready proxy must not render the unknown badge: {html}"
+    );
+}
+
+/// The proxy browser's status filter keeps duplicates (`QueryPairs`, not
+/// a `HashMap`), so one request naming two statuses lists rows of both
+/// — a collapsing extractor used to keep only the last value and
+/// silently drop a whole tier from the answer.
+#[tokio::test]
+async fn the_proxy_browser_lists_two_statuses_in_one_request() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+
+    for (fp, name, host, status) in [
+        ("fp-two-1", "alive-one", "a1.example.com", "alive"),
+        (
+            "fp-two-2",
+            "quarantined-one",
+            "q1.example.com",
+            "quarantine",
+        ),
+    ] {
+        insert_proxy_seeded(
+            &pool,
+            fp,
+            "vless",
+            name,
+            status,
+            ProxySeed {
+                host: Some(host.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let app = router(state);
+    let cookie = login(&app).await;
+
+    let response = app
+        .oneshot(request(
+            "GET",
+            "/admin/proxies?status=alive&status=quarantine",
+            "",
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("alive-one"),
+        "the alive row is listed: {html}"
+    );
+    assert!(
+        html.contains("quarantined-one"),
+        "the quarantined row is listed too: {html}"
     );
 }
 
@@ -2260,15 +2791,19 @@ async fn the_proxy_browser_pages_with_a_cursor() {
     // Seven rows with distinct update times: the default order shows
     // them from the newest to the oldest.
     for index in 1..=7 {
-        sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, created_at, updated_at)
-             VALUES (?1, 'vless', ?2, ?3, 443, 'c', ?4, ?4)",
+        insert_proxy_seeded(
+            &pool,
+            &format!("fp-page-{index}"),
+            "vless",
+            &format!("row-{index}"),
+            "unknown",
+            ProxySeed {
+                host: Some(format!("h{index}.example.com")),
+                created_at: Some(index * 10),
+                updated_at: Some(index * 10),
+                ..Default::default()
+            },
         )
-        .bind(format!("fp-page-{index}"))
-        .bind(format!("row-{index}"))
-        .bind(format!("h{index}.example.com"))
-        .bind(index * 10)
-        .execute(&pool)
         .await
         .unwrap();
     }
@@ -2284,8 +2819,7 @@ async fn the_proxy_browser_pages_with_a_cursor() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        String::from_utf8_lossy(&body).to_string()
+        body_text(response).await
     }
 
     // The first page holds the three newest rows and offers a way
@@ -2406,44 +2940,62 @@ async fn profiles_list_shows_ready_proxy_count_per_row() {
         ("fp-u1", 5, "unknown"),
         ("fp-m1", 6, "removed"),
     ] {
-        sqlx::query(
-                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-                 VALUES (?, 'vless', ?, ?, 1, 'c', ?, ?, ?)",
-            )
-            .bind(fp)
-            .bind(fp)            // name reuses the fingerprint for the row label
-            .bind(format!("h{host_no}.example"))
-            .bind(status)
-            .bind(now)
-            .bind(now)
-            .execute(&pool)
-            .await
-            .unwrap();
+        // The name reuses the fingerprint for the row label.
+        insert_proxy_seeded(
+            &pool,
+            fp,
+            "vless",
+            fp,
+            status,
+            ProxySeed {
+                host: Some(format!("h{host_no}.example")),
+                port: Some(1),
+                created_at: Some(now),
+                updated_at: Some(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     }
 
     // One extra ready proxy reachable only through `s-out` (not in the
     // profile). Must not count toward the profile's total.
-    sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-             VALUES ('fp-x1', 'vless', 'x1', 'hx.example', 1, 'c', 'ready', ?, ?)",
-        )
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
+    insert_proxy_seeded(
+        &pool,
+        "fp-x1",
+        "vless",
+        "x1",
+        "ready",
+        ProxySeed {
+            host: Some("hx.example".to_string()),
+            port: Some(1),
+            created_at: Some(now),
+            updated_at: Some(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     // And one ready proxy reachable through **both** sources, it must
     // be counted once (DISTINCT px.id).
-    sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-             VALUES ('fp-both', 'vless', 'both', 'hb.example', 1, 'c', 'ready', ?, ?)",
-        )
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
+    insert_proxy_seeded(
+        &pool,
+        "fp-both",
+        "vless",
+        "both",
+        "ready",
+        ProxySeed {
+            host: Some("hb.example".to_string()),
+            port: Some(1),
+            created_at: Some(now),
+            updated_at: Some(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     sqlx::query(
         "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
@@ -2469,8 +3021,7 @@ async fn profiles_list_shows_ready_proxy_count_per_row() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
 
     // Profile "ready-count" row: 2 ready + 1 ready (in both sources,
     // counted once) = 3. The alive/quarantine/unknown/removed rows
@@ -2480,13 +3031,29 @@ async fn profiles_list_shows_ready_proxy_count_per_row() {
         "profile row missing: {html}"
     );
     // Sources count is 1 (only `s-in` is attached). Proxies count is
-    // 3 (the ready-only count). They sit in two adjacent
-    // `<td class="num">` cells, the same pattern the rest of the
-    // table uses.
-    let needle = "<td class=\"num\">1</td>\n            <td class=\"num\">3</td>";
-    assert!(
-        html.contains(needle),
-        "expected sources_count=1 and proxies_count=3 adjacent: {html}"
+    // 3 (the ready-only count). The row is read cell by cell, not
+    // matched against a whitespace-exact HTML fragment.
+    let row = html
+        .split("<tr")
+        .find(|row| row.contains(">ready-count<"))
+        .expect("the profile row is rendered");
+    let num_cells: Vec<String> = row
+        .split("<td")
+        .skip(1)
+        .filter(|cell| cell.starts_with(" class=\"num\""))
+        .map(|cell| {
+            let body = cell.split("</td>").next().unwrap_or_default();
+            body.split('>')
+                .nth(1)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        num_cells,
+        vec!["1".to_string(), "3".to_string()],
+        "sources_count=1 and proxies_count=3 expected in the numeric cells: {num_cells:?}"
     );
 }
 
@@ -2511,15 +3078,19 @@ async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
     // One quarantined proxy with a scheduled second chance: the
     // ladder stamp is `quarantined_at + 12 h + [0, 4 h) jitter`
     // (proxies.rs), so 1 h in quarantine puts it ~13 h out.
-    sqlx::query(
-        "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
-                                  quarantined_at, ladder_at, created_at, updated_at)
-             VALUES ('fp-q1', 'vless', 'sick-proxy', 'q.example.com', 443, 'c', 'quarantine',
-                     ?, ?, 1, 1)",
+    insert_proxy_seeded(
+        &pool,
+        "fp-q1",
+        "vless",
+        "sick-proxy",
+        "quarantine",
+        ProxySeed {
+            host: Some("q.example.com".to_string()),
+            quarantined_at: Some(now - 3600),
+            ladder_at: Some(now + 43_200),
+            ..Default::default()
+        },
     )
-    .bind(now - 3600)
-    .bind(now + 43_200)
-    .execute(&pool)
     .await
     .unwrap();
 
@@ -2530,8 +3101,7 @@ async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("Тестер"));
     assert!(html.contains("4242")); // pid from the heartbeat
     assert!(html.contains("sick-proxy")); // quarantine queue row
@@ -2551,6 +3121,56 @@ async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
     );
 }
 
+/// The alive verdicts read the periods the daemon publishes in its own
+/// heartbeat, not this server's `[probe]` config copy. Seeded: beat
+/// interval 5 s, cycle 300 s. At the exact boundary
+/// `now - ts == 3 × interval` the daemon is still alive (`<=`), and a
+/// ~100 s old meow contact is alive against its 3 × cycle window — a
+/// threshold taken from the config copy could disagree with both.
+#[tokio::test]
+async fn probe_alive_verdicts_use_the_reported_periods() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let now = fumox_core::models::now_ts();
+
+    // Heartbeat age exactly 3 × the reported 5 s interval: the boundary
+    // itself counts as alive.
+    fumox_core::repo::meta_set(
+        &pool,
+        "probe_heartbeat",
+        &format!(
+            r#"{{"ts":{ts},"pid":7,"version":"0.1.0","interval_secs":5,"cycle_interval_secs":300}}"#,
+            ts = now - 15
+        ),
+    )
+    .await
+    .unwrap();
+    // Meow contact ~100 s old, well inside 3 × the reported 300 s cycle.
+    fumox_core::repo::meta_set(&pool, "meow_last_ok", &(now - 100).to_string())
+        .await
+        .unwrap();
+
+    let app = router(state);
+    let cookie = login(&app).await;
+    let response = app
+        .oneshot(request("GET", "/admin/probe", "", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    // Exactly the two alive badges the page can carry: the daemon's and
+    // the meow contact's. The boundary age must not read as dead.
+    assert_eq!(
+        html.matches(r#"<span class="badge alive">"#).count(),
+        2,
+        "daemon and meow contact must both read alive at the boundary: {html}"
+    );
+    assert!(
+        !html.contains(r#"<span class="badge error">"#),
+        "no probe card may read dead or stale here: {html}"
+    );
+}
+
 /// Regression: the quarantine card must show the true population count
 /// even when the on-screen queue is truncated to 50 rows. Previously
 /// the card showed `queue.len()` (always <= 50), which underreported
@@ -2564,18 +3184,19 @@ async fn probe_quarantine_card_reflects_true_count_not_queue_len() {
     // 60 quarantined proxies, enough to overflow the LIMIT 50 on the
     // queue view. The card must still read 60.
     for i in 0..60 {
-        sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
-                                      quarantined_at, ladder_at, created_at, updated_at)
-                 VALUES (?, 'vless', ?, ?, 443, 'c', 'quarantine',
-                         ?, ?, 1, 1)",
+        insert_proxy_seeded(
+            &pool,
+            &format!("fp-q-{i}"),
+            "vless",
+            &format!("q{i}"),
+            "quarantine",
+            ProxySeed {
+                host: Some(format!("h{i}.example.com")),
+                quarantined_at: Some(now - 3600),
+                ladder_at: Some(now + 43_200 + i),
+                ..Default::default()
+            },
         )
-        .bind(format!("fp-q-{i}"))
-        .bind(format!("q{i}"))
-        .bind(format!("h{i}.example.com"))
-        .bind(now - 3600)
-        .bind(now + 43_200 + i)
-        .execute(&pool)
         .await
         .unwrap();
     }
@@ -2587,8 +3208,7 @@ async fn probe_quarantine_card_reflects_true_count_not_queue_len() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     // True population (60) wins over the truncated queue (50).
     assert!(
         html.contains("\"num\">60</div>"),
@@ -2621,15 +3241,26 @@ async fn probe_screen_shows_check_coverage() {
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
 
-    sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-             VALUES ('fp-cv-none', 'vless', 'never-probed', 'h0.example.com', 443, 'c', 'unknown', 1, 1),
-                    ('fp-cv-t1', 'vless', 'tcp-only', 'h1.example.com', 443, 'c', 'alive', 1, 1),
-                    ('fp-cv-both', 'vless', 'fully-checked', 'h2.example.com', 443, 'c', 'alive', 1, 1)",
+    // Rowid order matters: the probe attempt below keys on it.
+    for (fp, name, host, status) in [
+        ("fp-cv-none", "never-probed", "h0.example.com", "unknown"),
+        ("fp-cv-t1", "tcp-only", "h1.example.com", "alive"),
+        ("fp-cv-both", "fully-checked", "h2.example.com", "alive"),
+    ] {
+        insert_proxy_seeded(
+            &pool,
+            fp,
+            "vless",
+            name,
+            status,
+            ProxySeed {
+                host: Some(host.to_string()),
+                ..Default::default()
+            },
         )
-        .execute(&pool)
         .await
         .unwrap();
+    }
     // One T1 attempt for tcp-only, T1 + T2 for fully-checked; a probe
     // attempt needs its proxy id (rowid order of the insert above).
     sqlx::query(
@@ -2657,8 +3288,7 @@ async fn probe_screen_shows_check_coverage() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     // Panel title, bucket labels and one link per bucket.
     assert!(html.contains("Покрытие проверками"), "{html}");
     for label in ["Без проверок", "Только T1", "Только T2", "T1 и T2"] {
@@ -2689,17 +3319,19 @@ async fn probe_screen_shows_ok_banner_when_queue_fits_target() {
     // 15 h in quarantine with the check just past is a pair the
     // daemon produces, where `now - 3600` / `now - 1` is not.
     for i in 0..5 {
-        sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
-                                      quarantined_at, ladder_at, created_at, updated_at)
-                 VALUES (?, 'vless', ?, ?, 443, 'c', 'quarantine', ?, ?, 1, 1)",
+        insert_proxy_seeded(
+            &pool,
+            &format!("fp-ok-{i}"),
+            "vless",
+            &format!("q{i}"),
+            "quarantine",
+            ProxySeed {
+                host: Some(format!("h{i}.example")),
+                quarantined_at: Some(now - 54_000),
+                ladder_at: Some(now - 1),
+                ..Default::default()
+            },
         )
-        .bind(format!("fp-ok-{i}"))
-        .bind(format!("q{i}"))
-        .bind(format!("h{i}.example"))
-        .bind(now - 54_000)
-        .bind(now - 1)
-        .execute(&pool)
         .await
         .unwrap();
     }
@@ -2748,20 +3380,15 @@ async fn probe_screen_warns_when_drain_exceeds_target() {
     let (_dir, state) = test_state(1000).await;
     // The backlog target now lives in the single live config view:
     // write a file that tightens it and refresh, the same path a
-    // settings save takes.
-    let dir = fumox_core::tempdir_lite::TempDir::new("probe-drain");
-    let path = dir.path().join("app.toml");
-    // The login check reads the live config, so the refreshed file
-    // must carry the test token: a config file without `[admin]`
-    // loads the built-in default and the login below would 422.
-    std::fs::write(
-        &path,
-        format!("[probe]\nbacklog_target_drain_minutes = 5\n\n[admin]\ntoken = \"{TOKEN}\"\n"),
-    )
-    .unwrap();
-    state
-        .refresh_live_config(&path)
-        .expect("file we just wrote must load cleanly");
+    // settings save takes. The login check reads the live config, so
+    // the refreshed file must carry the test token: a config file
+    // without `[admin]` loads the built-in default and the login below
+    // would 422.
+    let _config_dir = refresh_from_written_config(
+        &state,
+        "probe-drain",
+        &format!("[probe]\nbacklog_target_drain_minutes = 5\n\n[admin]\ntoken = \"{TOKEN}\"\n"),
+    );
     let pool = state.pool.clone();
     let now = fumox_core::models::now_ts();
 
@@ -2772,17 +3399,19 @@ async fn probe_screen_warns_when_drain_exceeds_target() {
     // below 50x20 and below 50x5), so the banner is driven by the soft
     // drain-vs-target check.
     for i in 0..151 {
-        sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
-                                      quarantined_at, ladder_at, created_at, updated_at)
-                 VALUES (?, 'vless', ?, ?, 443, 'c', 'quarantine', ?, ?, 1, 1)",
+        insert_proxy_seeded(
+            &pool,
+            &format!("fp-tight-{i}"),
+            "vless",
+            &format!("t{i}"),
+            "quarantine",
+            ProxySeed {
+                host: Some(format!("h{i}.example")),
+                quarantined_at: Some(now - 54_000),
+                ladder_at: Some(now - 1),
+                ..Default::default()
+            },
         )
-        .bind(format!("fp-tight-{i}"))
-        .bind(format!("t{i}"))
-        .bind(format!("h{i}.example"))
-        .bind(now - 54_000)
-        .bind(now - 1)
-        .execute(&pool)
         .await
         .unwrap();
     }
@@ -2886,15 +3515,21 @@ async fn probe_screen_danger_on_stale_oldest_row() {
     let pool = state.pool.clone();
     let now = fumox_core::models::now_ts();
 
-    sqlx::query(
-        "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status,
-                                  quarantined_at, ladder_at, created_at, updated_at)
-             VALUES ('fp-stale-1', 'vless', 'stale', 's.example', 443, 'c', 'quarantine',
-                     ?, ?, 1, 1)",
+    insert_proxy_seeded(
+        &pool,
+        "fp-stale-1",
+        "vless",
+        "stale",
+        "quarantine",
+        ProxySeed {
+            host: Some("s.example".to_string()),
+            // 30 days ago; its check came due long ago, the ladder
+            // re-stamps it.
+            quarantined_at: Some(now - 30 * 86_400),
+            ladder_at: Some(now - 1),
+            ..Default::default()
+        },
     )
-    .bind(now - 30 * 86_400) // 30 days ago
-    .bind(now - 1) // its check came due long ago; the ladder re-stamps it
-    .execute(&pool)
     .await
     .unwrap();
 
@@ -2949,11 +3584,32 @@ async fn probe_screen_warns_on_due_overflow() {
         html.contains("за цикл берётся 50"),
         "sample value in due_overflow missing: {html}"
     );
-    // Drain time at 300/50 × 60s = 6 min, comfortably below the
-    // 60-min target, no recommendations block.
+    // Drain time at 300/50 × 140s ≈ 14 min: six full samples, and a
+    // sample of 50 takes ceil(50/8) × 20s = 140s, so the probe period
+    // stretches to 140s too. The hard due_overflow factor suppresses
+    // the drain-bearing banner wordings (all_ok / drain_over_target),
+    // so the concrete figure is asserted on the model the page reads
+    // it from, not on the page text.
+    let backlog = fumox_core::probe_backlog::compute_backlog(
+        &fumox_core::probe_backlog::BacklogInputs {
+            quarantine_count: 300,
+            due_count: 300,
+            oldest_quarantined_age_secs: Some(54_000),
+            heartbeat_age_secs: None,
+            reported_heartbeat_secs: None,
+            heartbeat_unreadable: false,
+        },
+        &fumox_core::config::ProbeConfig::default(),
+    );
+    assert_eq!(
+        backlog.drain_minutes,
+        Some(14),
+        "the modelled drain of this queue: {backlog:?}"
+    );
+    assert_eq!(backlog.target_drain_minutes, 60, "{backlog:?}");
     assert!(
         !html.contains("Рекомендации"),
-        "no recs expected at this depth: {html}"
+        "no recs expected below the target: {html}"
     );
 }
 
@@ -3057,8 +3713,7 @@ async fn render_get_html(app: &axum::Router, uri: &str, cookie: &str) -> String 
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    String::from_utf8_lossy(&body).into_owned()
+    body_text(response).await
 }
 
 /// The proxy browser filters by check-coverage bucket and renders the
@@ -3069,16 +3724,16 @@ async fn proxies_list_filters_by_check_coverage() {
     let pool = state.pool.clone();
 
     // Four proxies, one per bucket.
-    sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-             VALUES ('fp-l-none', 'vless', 'untouched', 'h0.example.com', 443, 'c', 'unknown', 1, 1),
-                    ('fp-l-t1', 'vless', 'tcp-only', 'h1.example.com', 443, 'c', 'unknown', 1, 1),
-                    ('fp-l-t2', 'vless', 'tunnel-only', 'h2.example.com', 443, 'c', 'unknown', 1, 1),
-                    ('fp-l-both', 'vless', 'fully-checked', 'h3.example.com', 443, 'c', 'unknown', 1, 1)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+    for (fp, name) in [
+        ("fp-l-none", "untouched"),
+        ("fp-l-t1", "tcp-only"),
+        ("fp-l-t2", "tunnel-only"),
+        ("fp-l-both", "fully-checked"),
+    ] {
+        insert_proxy(&pool, fp, "vless", name, "unknown")
+            .await
+            .unwrap();
+    }
     for (fingerprint, kind) in [
         ("fp-l-t1", "tcp"),
         ("fp-l-t2", "t2"),
@@ -3119,8 +3774,7 @@ async fn proxies_list_filters_by_check_coverage() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "query {query}");
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let html = String::from_utf8_lossy(&bytes);
+        let html = body_text(response).await;
         assert!(html.contains(expect), "{expect} missing for {query}");
         assert!(!html.contains(absent), "{absent} leaked into {query}");
     }
@@ -3135,8 +3789,7 @@ async fn proxies_list_filters_by_check_coverage() {
         ))
         .await
         .unwrap();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
+    let html = body_text(response).await;
     assert!(html.contains("T1+T2"), "the Checks column: {html}");
 }
 
@@ -3160,8 +3813,7 @@ async fn settings_screen_shows_effective_config_sections() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     // Owner-process badges and the config-file banner.
     assert!(html.contains("config/app.toml"), "{html}");
     assert!(html.contains("probe"), "{html}");
@@ -3238,6 +3890,7 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
         let source = fumox_core::models::Source {
             id: id.into(),
             slug: None,
+            access_token: None,
             name: format!("source {id}"),
             url: "https://example.com/sub".into(),
             enabled: true,
@@ -3274,7 +3927,10 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
             "fp-veteran-ready",
             "srcS0000001",
             "ready",
-            500_000,
+            // 1000 s older than the alive veteran: the top list orders
+            // by created_at, and two same-aged rows would order by
+            // rowid, a detail no assertion should lean on.
+            501_000,
             Some(80),
             Some("DE"),
         ),
@@ -3306,29 +3962,29 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
         ("fp-tuic", "srcS0000002", "unknown", 50_000, None, None),
     ];
     for (fp, source, status, age, latency, country) in rows {
-        sqlx::query(
-            "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
-                                      status, latency_ms, geo_country, created_at, updated_at)
-                 VALUES (?, ?, ?, 'h.example.com', 443, 'c', ?, ?, ?, ?, ?)",
+        let id = insert_proxy_seeded(
+            &pool,
+            fp,
+            if fp == "fp-tuic" { "tuic" } else { "vless" },
+            fp,
+            status,
+            ProxySeed {
+                host: Some("h.example.com".to_string()),
+                latency_ms: latency,
+                geo_country: country.map(str::to_string),
+                created_at: Some(now - age),
+                updated_at: Some(now),
+                ..Default::default()
+            },
         )
-        .bind(fp)
-        .bind(if fp == "fp-tuic" { "tuic" } else { "vless" })
-        .bind(fp)
-        .bind(status)
-        .bind(latency)
-        .bind(country)
-        .bind(now - age)
-        .bind(now)
-        .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
-                 SELECT id, ?, ? FROM proxies WHERE fingerprint = ?",
+            "INSERT INTO proxy_source_links (proxy_id, source_id, seen_at) VALUES (?, ?, ?)",
         )
+        .bind(id)
         .bind(source)
         .bind(now)
-        .bind(fp)
         .execute(&pool)
         .await
         .unwrap();
@@ -3362,8 +4018,7 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html).into_owned();
+    let html = body_text(response).await;
 
     // The merged page renders every former stats panel.
     assert!(html.contains("Обзор"), "{html}");
@@ -3389,8 +4044,19 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
     assert!(html.contains("source srcS0000002"), "{html}");
     // Probe success rate: 2/3.
     assert!(html.contains("2 / 3"), "{html}");
-    // The veteran (oldest alive) tops the longevity list.
-    assert!(html.contains("fp-veteran"), "{html}");
+    // The oldest ready proxy tops the longevity list: the panel's first
+    // rank cell and the row's name sit in one `<tr>`, the ready veteran
+    // 1000 s older than every other row. An assertion on the bare
+    // `fp-veteran` substring would also match `fp-veteran-ready`.
+    let top_at = html.find("Самые готовые прокси").expect("top panel");
+    let panel = &html[top_at..];
+    let rank_at = panel
+        .find(r#"class="muted rank">1</td>"#)
+        .expect("the first rank cell");
+    let ready_at = panel
+        .find("fp-veteran-ready")
+        .expect("the veteran ready row in the top list");
+    assert!(rank_at < ready_at, "fp-veteran-ready must hold rank 1");
     // Unprobeable counter includes the tuic proxy.
     assert!(html.contains("непроверяемых (tuic/mieru): 1"), "{html}");
     // The latency card covers the live pool (`alive` and `ready`): the
@@ -3412,65 +4078,34 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
         .join("../../config")
         .canonicalize()
         .unwrap();
-    let geo_cfg = fumox_core::config::GeoConfig {
-        enabled: false, // pipeline resolver stays inactive, irrelevant here
-        db_dir: db_dir.clone(),
-        ..Default::default()
-    };
-
-    // Build the state directly (test_state pins db_dir to "config"
+    // The shared fixture wiring with the card resolver pointed at the
+    // workspace directory (`test_state` pins db_dir to "config"
     // relative to the crate working directory).
-    let dir = fumox_core::tempdir_lite::TempDir::new("admin-geo");
-    let db_cfg = fumox_core::config::DatabaseConfig {
-        path: dir.path().join("test.db"),
-        ..Default::default()
-    };
-    let pool = fumox_core::db::connect_pool(&db_cfg).await.unwrap();
-    fumox_core::db::migrate(&pool).await.unwrap();
-    let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
-    std::mem::forget(refresh_rx);
-    let config = fumox_core::AppConfig {
-        admin: admin_config(1000),
-        geo: geo_cfg,
-        ..Default::default()
-    };
-    let fetcher = Fetcher::new(
-        config.fetch.clone(),
-        config.admin.allow_private_urls,
-        config.ssrf_dns_timeout(),
-    );
-    let state = AdminState::new(
-        pool.clone(),
-        crate::cache::Caches::new(),
-        Arc::new(GeoResolver::new(&fumox_core::config::GeoConfig {
-            enabled: false,
-            ..Default::default()
-        })),
-        refresh_tx,
-        SchedulerState::new(1),
-        EventBus::new(),
-        fetcher,
-        config,
-        ResolvedConfigPath::Missing,
-        crate::alive_export::TokenCache::new(),
-    );
+    let (_dir, state) =
+        test_admin_state_with_geo(admin_config(1000), Default::default(), Some(db_dir)).await;
+    let pool = state.pool.clone();
     let has_dbs = state.geo_full.is_active();
 
     let now = fumox_core::models::now_ts();
-    sqlx::query(
-        "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
-                                  status, created_at, updated_at)
-             VALUES ('fp-geo-8.8.8.8', 'vless', 'geo-test', '8.8.8.8', 443, 'c', 'unknown', ?, ?)",
+    // Stored facts the card must keep when nothing better arrives.
+    let id = insert_proxy_seeded(
+        &pool,
+        "fp-geo-8.8.8.8",
+        "vless",
+        "geo-test",
+        "unknown",
+        ProxySeed {
+            host: Some("8.8.8.8".to_string()),
+            created_at: Some(now),
+            updated_at: Some(now),
+            geo_country: Some("DE".to_string()),
+            geo_asn: Some("AS1".to_string()),
+            resolved_ip: Some("1.2.3.4".to_string()),
+            ..Default::default()
+        },
     )
-    .bind(now)
-    .bind(now)
-    .execute(&pool)
     .await
     .unwrap();
-    let id: i64 = sqlx::query_scalar("SELECT id FROM proxies WHERE host = '8.8.8.8'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
 
     // Opening the card is the whole interaction, no button, no POST.
     let app = router(state);
@@ -3486,8 +4121,7 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html).into_owned();
+    let html = body_text(response).await;
     // The geography block renders (the card, not a swap fragment).
     assert!(
         html.contains("px.geography") || html.contains("География"),
@@ -3520,22 +4154,26 @@ async fn proxy_card_refreshes_geo_facts_on_open() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let html = response.into_body().collect().await.unwrap().to_bytes();
-        let html = String::from_utf8_lossy(&html);
+        let html = body_text(response).await;
         assert!(html.contains("AS"), "card shows the ASN: {html}");
         assert!(html.contains("8.8.8.8"), "card shows the IP: {html}");
     } else {
-        // Without the databases the card renders the stored facts
-        // (none here) and never wipes anything.
+        // Without the databases the card renders the stored facts and
+        // never wipes anything: all three seeded values survive the
+        // open, a lookup that yields nothing erases nothing.
         let row = fumox_core::repo::proxies::get_by_id(&pool, id)
             .await
             .unwrap()
             .expect("proxy row");
-        assert_eq!(row.geo_country, None);
+        assert_eq!(row.geo_country.as_deref(), Some("DE"));
+        assert_eq!(row.resolved_ip.as_deref(), Some("1.2.3.4"));
+        assert_eq!(row.geo_asn.as_deref(), Some("AS1"));
     }
 }
 
-/// Wait for the background geo refresh of a card to land on the row.
+/// Wait for the background geo refresh of a card to land on the row:
+/// the refresh stamps the address it resolved, so the seeded
+/// `1.2.3.4` is gone once the fresh facts arrive.
 async fn wait_for_geo_facts(
     pool: &fumox_core::db::DbPool,
     id: i64,
@@ -3545,7 +4183,7 @@ async fn wait_for_geo_facts(
             .await
             .unwrap()
             .expect("proxy row");
-        if row.geo_country.is_some() {
+        if row.resolved_ip.as_deref() == Some("8.8.8.8") {
             return row;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3561,15 +4199,19 @@ async fn purge_removed_deletes_only_removed_proxies() {
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
     for (fp, status) in [("fp-dead", "removed"), ("fp-live", "alive")] {
-        sqlx::query(
-                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential, status, created_at, updated_at)
-                 VALUES (?, 'vless', 'n', 'h.example.com', 443, 'c', ?, 1, 1)",
-            )
-            .bind(fp)
-            .bind(status)
-            .execute(&pool)
-            .await
-            .unwrap();
+        insert_proxy_seeded(
+            &pool,
+            fp,
+            "vless",
+            "n",
+            status,
+            ProxySeed {
+                host: Some("h.example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     }
 
     let app = router(state.clone());
@@ -3678,19 +4320,20 @@ async fn reset_of_a_row_no_probe_lane_can_reach_is_reported_not_called_missing()
     let pool = state.pool.clone();
     // No proxy_source_links row: reconciliation retired it, so every
     // lane's link predicate filters it out.
-    sqlx::query(
-        "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
-                                  status, quarantined_at, created_at, updated_at)
-             VALUES ('fp-orphan', 'vless', 'n', 'orphan.example.com', 443, 'c',
-                     'quarantine', 111, 1, 1)",
+    let id = insert_proxy_seeded(
+        &pool,
+        "fp-orphan",
+        "vless",
+        "n",
+        "quarantine",
+        ProxySeed {
+            host: Some("orphan.example.com".to_string()),
+            quarantined_at: Some(111),
+            ..Default::default()
+        },
     )
-    .execute(&pool)
     .await
     .unwrap();
-    let id: i64 = sqlx::query_scalar("SELECT id FROM proxies WHERE fingerprint = 'fp-orphan'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
 
     let app = router(state.clone());
     let cookie = login(&app).await;
@@ -3720,8 +4363,7 @@ async fn reset_of_a_row_no_probe_lane_can_reach_is_reported_not_called_missing()
     assert!(toast.contains(en.t("px.reset_unreachable")), "{toast}");
     assert!(!toast.contains("proxy not found"), "{toast}");
     // The status the click was refused for is the one that stays.
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let body = String::from_utf8_lossy(&body).into_owned();
+    let body = body_text(response).await;
     assert!(body.contains("badge quarantine"), "{body}");
     let (status, quarantined_at): (String, Option<i64>) =
         sqlx::query_as("SELECT status, quarantined_at FROM proxies WHERE id = ?")
@@ -3771,8 +4413,7 @@ async fn cleanup_htmx_answer_carries_toast_and_fragment() {
         .unwrap_or_default()
         .to_string();
     assert!(trigger.contains("\"level\": \"ok\""), "{trigger}");
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let body = String::from_utf8_lossy(&body).into_owned();
+    let body = body_text(response).await;
     assert!(body.contains("badge removed"), "{body}");
 
     assert_eq!(status_by_fp(&pool, "fp-q").await, "removed");
@@ -3825,8 +4466,28 @@ async fn cleanup_by_asn_validates_input_and_matches_stored_format() {
     assert!(trigger.contains("\"level\": \"error\""), "{trigger}");
     assert_eq!(status_by_fp(&pool, "fp-ashet").await, "alive");
 
-    // Bare number and AS prefix both work.
-    for asn in ["24940", "AS24940"] {
+    // Bare number and AS prefix both work: each spelling is checked
+    // against its own proxy, so a spelling that silently matched
+    // nothing cannot ride on the other's success.
+    seed_cleanup_proxy(
+        &pool,
+        "fp-asbare",
+        "vless",
+        "alive",
+        Some("DE"),
+        Some("AS24940"),
+    )
+    .await;
+    seed_cleanup_proxy(
+        &pool,
+        "fp-asprefix",
+        "vless",
+        "alive",
+        Some("DE"),
+        Some("AS3333"),
+    )
+    .await;
+    for (asn, fp) in [("24940", "fp-asbare"), ("AS3333", "fp-asprefix")] {
         let response = app
             .clone()
             .oneshot(request(
@@ -3838,7 +4499,11 @@ async fn cleanup_by_asn_validates_input_and_matches_stored_format() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(status_by_fp(&pool, fp).await, "removed", "asn={asn}");
     }
+    // The transition is per ASN, not per row: the bare-number request
+    // removed both AS24940 rows (the earlier fixture shares the ASN),
+    // and the AS9009 row is untouched by both requests.
     assert_eq!(status_by_fp(&pool, "fp-ashet").await, "removed");
     assert_eq!(status_by_fp(&pool, "fp-asno").await, "alive");
 
@@ -3861,16 +4526,7 @@ async fn cleanup_by_asn_validates_input_and_matches_stored_format() {
     req.headers_mut()
         .insert("HX-Request", "true".parse().unwrap());
     let response = app.oneshot(req).await.unwrap();
-    let body = String::from_utf8_lossy(
-        response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .as_ref(),
-    )
-    .into_owned();
+    let body = body_text(response).await;
     assert!(
         body.contains("AS3333"),
         "fragment must name the ASN: {body}"
@@ -3985,27 +4641,11 @@ async fn dry_run_parses_source_without_writing_anything() {
 
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
-    let now = fumox_core::models::now_ts();
-    let source = fumox_core::models::Source {
-        id: "srcD0000000".into(),
-        slug: None,
-        name: "dry".into(),
-        url: format!("http://{addr}/sub"),
-        enabled: true,
-        encoding: Default::default(),
-        input_format: None,
-        protocols: None,
-        cache_ttl_seconds: 3600,
-        tags: None,
-        pipeline: None,
-        headers: None,
-        ip_family: None,
-        created_at: now,
-        updated_at: now,
-        last_fetched_at: None,
-        last_error: None,
-        error_class: None,
-    };
+    // The shared source fixture, only the URL points at the mock (and
+    // the dry-run row carries no slug).
+    let mut source = test_source("srcD0000000", "dry");
+    source.slug = None;
+    source.url = format!("http://{addr}/sub");
     fumox_core::repo::sources::create(&pool, &source)
         .await
         .unwrap();
@@ -4034,13 +4674,7 @@ async fn dry_run_parses_source_without_writing_anything() {
         .await
         .unwrap();
     assert_eq!(htmx_response.status(), StatusCode::OK);
-    let html = htmx_response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(htmx_response).await;
     assert!(html.contains("успех"));
     assert!(html.contains("1.2.3.4")); // sample line preview
 
@@ -4123,7 +4757,7 @@ async fn sse_stream_forwards_bus_events() {
 
     // A published fetch event reaches the open stream.
     events.publish(
-        "fetch.done",
+        crate::events::FETCH_DONE,
         serde_json::json!({"source_id": "srcA0000000", "ok": true}),
     );
     loop {
@@ -4157,8 +4791,7 @@ async fn dashboard_defaults_to_russian_and_follows_the_language_cookie() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("lang=\"ru\""));
     assert!(html.contains("Обзор"));
 
@@ -4173,8 +4806,7 @@ async fn dashboard_defaults_to_russian_and_follows_the_language_cookie() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("lang=\"en\""));
     assert!(html.contains("Dashboard"));
     assert!(!html.contains("Обзор"));
@@ -4201,8 +4833,7 @@ async fn login_screen_language_selection_sets_the_cookie() {
         .to_string();
     assert!(set_cookie.starts_with("fumox_lang=en;"));
     assert!(set_cookie.contains("HttpOnly"));
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("lang=\"en\""));
     assert!(html.contains("Access token"));
 
@@ -4221,8 +4852,7 @@ async fn login_screen_language_selection_sets_the_cookie() {
         .unwrap()
         .to_string();
     assert!(set_cookie.starts_with("fumox_lang=ru;"));
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("Токен доступа"));
 
     // Without a parameter or cookie the screen stays Russian and sets
@@ -4233,24 +4863,25 @@ async fn login_screen_language_selection_sets_the_cookie() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().get(header::SET_COOKIE).is_none());
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("lang=\"ru\""));
 }
 
 #[tokio::test]
 async fn set_lang_redirects_with_cookie_and_guards_the_next_param() {
     let (_dir, state) = test_state(1000).await;
-    let app = router(state);
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
 
     // Valid next: back to the requested admin page with the new cookie.
     let response = app
         .clone()
         .oneshot(request(
-            "GET",
-            "/admin/set-lang?lang=en&next=/admin/proxies",
-            "",
-            None,
+            "POST",
+            "/admin/set-lang",
+            &format!("lang=en&next=/admin/proxies&_csrf={csrf}"),
+            Some(&cookie),
         ))
         .await
         .unwrap();
@@ -4273,10 +4904,10 @@ async fn set_lang_redirects_with_cookie_and_guards_the_next_param() {
     let response = app
         .clone()
         .oneshot(request(
-            "GET",
-            "/admin/set-lang?lang=ru&next=https://evil.example.com",
-            "",
-            None,
+            "POST",
+            "/admin/set-lang",
+            &format!("lang=ru&next=https://evil.example.com&_csrf={csrf}"),
+            Some(&cookie),
         ))
         .await
         .unwrap();
@@ -4285,7 +4916,12 @@ async fn set_lang_redirects_with_cookie_and_guards_the_next_param() {
 
     // Unknown language values fall back to Russian.
     let response = app
-        .oneshot(request("GET", "/admin/set-lang?lang=fr", "", None))
+        .oneshot(request(
+            "POST",
+            "/admin/set-lang",
+            &format!("lang=fr&_csrf={csrf}"),
+            Some(&cookie),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -4308,20 +4944,26 @@ async fn set_lang_redirects_with_cookie_and_guards_the_next_param() {
 #[tokio::test]
 async fn attacker_controlled_lang_does_not_leak_into_any_response_header() {
     let (_dir, state) = test_state(1000).await;
-    let app = router(state);
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
 
-    // Every value is percent-encoded so the request URI stays valid;
-    // the server still sees the raw bytes after decoding.
-    for uri in [
-        "/admin/set-lang?lang=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
-        "/admin/set-lang?lang=foo%0D%0ASet-Cookie:%20pwned",
-        "/admin/login?lang=en%00%2Fadmin%2Fexport",
-        "/admin/login?lang=..%2F..%2Fetc%2Fpasswd",
-        "/admin/set-lang?lang=&next=https://evil.example.com",
+    // Every value is percent-encoded so the form body stays valid; the
+    // server still sees the raw bytes after decoding. The setter is an
+    // authenticated POST now, so the hostile value rides in its body.
+    for body in [
+        "lang=%3Cscript%3Ealert(1)%3C%2Fscript%3E".to_string(),
+        "lang=foo%0D%0ASet-Cookie:%20pwned".to_string(),
+        "lang=&next=https://evil.example.com".to_string(),
     ] {
         let response = app
             .clone()
-            .oneshot(request("GET", uri, "", None))
+            .oneshot(request(
+                "POST",
+                "/admin/set-lang",
+                &format!("{body}&_csrf={csrf}"),
+                Some(&cookie),
+            ))
             .await
             .unwrap();
         // The cookie must always be a fixed catalog code with the
@@ -4336,44 +4978,69 @@ async fn attacker_controlled_lang_does_not_leak_into_any_response_header() {
             set_cookie.is_empty()
                 || set_cookie.starts_with("fumox_lang=ru;")
                 || set_cookie.starts_with("fumox_lang=en;"),
-            "untrusted value leaked into Set-Cookie for {uri}: {set_cookie:?}"
+            "untrusted value leaked into Set-Cookie for {body}: {set_cookie:?}"
         );
         assert!(
             !set_cookie.contains("<script>"),
-            "raw input reached the cookie for {uri}: {set_cookie:?}"
+            "raw input reached the cookie for {body}: {set_cookie:?}"
         );
         assert!(
             !set_cookie.contains("pwned"),
-            "header injection reached the cookie for {uri}: {set_cookie:?}"
+            "header injection reached the cookie for {body}: {set_cookie:?}"
         );
         if let Some(location) = response.headers().get(header::LOCATION) {
             let value = location.to_str().unwrap();
             assert!(
                 !value.contains("evil.example.com"),
-                "open redirect via next for {uri}: {value:?}"
+                "open redirect via next for {body}: {value:?}"
             );
         }
     }
+
+    // The same hostile shapes against the login screen's `?lang=` (the
+    // pre-auth path): the rendered language stays the catalog code.
+    for uri in [
+        "/admin/login?lang=en%00%2Fadmin%2Fexport",
+        "/admin/login?lang=..%2F..%2Fetc%2Fpasswd",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", uri, "", None))
+            .await
+            .unwrap();
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        assert!(
+            set_cookie.is_empty()
+                || set_cookie.starts_with("fumox_lang=ru;")
+                || set_cookie.starts_with("fumox_lang=en;"),
+            "untrusted value leaked into Set-Cookie for {uri}: {set_cookie:?}"
+        );
+    }
 }
 
-// Interface theme (day/night)
+// Interface theme (day/night/auto)
 
+/// No theme cookie means `auto` (the OS preference, rendered as
+/// `data-theme="auto"`); an explicit cookie choice pins the palette.
 #[tokio::test]
-async fn pages_default_to_light_and_follow_the_theme_cookie() {
+async fn pages_default_to_auto_and_follow_the_theme_cookie() {
     let (_dir, state) = test_state(1000).await;
     let app = router(state);
     let cookie = login(&app).await;
 
-    // No theme cookie: the day theme.
+    // No theme cookie: the system preference.
     let response = app
         .clone()
         .oneshot(request("GET", "/admin", "", Some(&cookie)))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
-    assert!(html.contains("data-theme=\"light\""));
+    let html = body_text(response).await;
+    assert!(html.contains("data-theme=\"auto\""));
 
     // With fumox_theme=dark the same page renders the night theme.
     let response = app
@@ -4387,34 +5054,65 @@ async fn pages_default_to_light_and_follow_the_theme_cookie() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("data-theme=\"dark\""));
+
+    // An explicit light choice pins the day theme over the OS setting.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/admin",
+            "",
+            Some(&format!("{cookie}; fumox_theme=light")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("data-theme=\"light\""));
 
     // The login screen honors the same cookie.
     let response = app
+        .clone()
         .oneshot(request("GET", "/admin/login", "", Some("fumox_theme=dark")))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("data-theme=\"dark\""));
+
+    // The login screen's pre-auth switcher: `?theme=` pins the choice in
+    // the cookie (the server-side equivalent of the topbar's POST).
+    let response = app
+        .oneshot(request("GET", "/admin/login?theme=dark", "", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(set_cookie.starts_with("fumox_theme=dark;"), "{set_cookie}");
 }
 
 #[tokio::test]
 async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
     let (_dir, state) = test_state(1000).await;
-    let app = router(state);
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
 
     // Valid next: back to the requested admin page with the new cookie.
     let response = app
         .clone()
         .oneshot(request(
-            "GET",
-            "/admin/set-theme?theme=dark&next=/admin/proxies",
-            "",
-            None,
+            "POST",
+            "/admin/set-theme",
+            &format!("theme=dark&next=/admin/proxies&_csrf={csrf}"),
+            Some(&cookie),
         ))
         .await
         .unwrap();
@@ -4437,19 +5135,25 @@ async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
     let response = app
         .clone()
         .oneshot(request(
-            "GET",
-            "/admin/set-theme?theme=light&next=https://evil.example.com",
-            "",
-            None,
+            "POST",
+            "/admin/set-theme",
+            &format!("theme=light&next=https://evil.example.com&_csrf={csrf}"),
+            Some(&cookie),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
 
-    // Unknown theme values fall back to the light theme.
+    // Unknown theme values fall back to the system preference.
     let response = app
-        .oneshot(request("GET", "/admin/set-theme?theme=neon", "", None))
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/set-theme",
+            &format!("theme=neon&_csrf={csrf}"),
+            Some(&cookie),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -4460,8 +5164,25 @@ async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("fumox_theme=light;")
+            .starts_with("fumox_theme=auto;")
     );
+
+    // A submit without the value pins nothing at all.
+    let response = app
+        .oneshot(request(
+            "POST",
+            "/admin/set-theme",
+            &format!("next=/admin/proxies&_csrf={csrf}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/admin/proxies"
+    );
+    assert!(response.headers().get(header::SET_COOKIE).is_none());
 }
 
 /// L-105: the `next` parameter of the preference setters points back
@@ -4470,59 +5191,75 @@ async fn set_theme_redirects_with_cookie_and_guards_the_next_param() {
 #[tokio::test]
 async fn the_next_parameter_stays_inside_the_panel() {
     let (_dir, state) = test_state(1000).await;
-    let app = router(state);
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
 
-    for (uri, expected) in [
+    for (path, body, expected) in [
         (
-            "/admin/set-lang?lang=en&next=/admin/proxies",
+            "/admin/set-lang",
+            "lang=en&next=/admin/proxies",
             "/admin/proxies",
         ),
         (
-            "/admin/set-theme?theme=dark&next=/admin/proxies",
+            "/admin/set-theme",
+            "theme=dark&next=/admin/proxies",
             "/admin/proxies",
         ),
         (
-            "/admin/set-lang?lang=en&next=/admin/sources/src00000001",
+            "/admin/set-lang",
+            "lang=en&next=/admin/sources/src00000001",
             "/admin/sources/src00000001",
         ),
         (
-            "/admin/set-theme?theme=dark&next=/admin/proxies/p00000001",
+            "/admin/set-theme",
+            "theme=dark&next=/admin/proxies/p00000001",
             "/admin/proxies/p00000001",
         ),
     ] {
         let response = app
             .clone()
-            .oneshot(request("GET", uri, "", None))
+            .oneshot(request(
+                "POST",
+                path,
+                &format!("{body}&_csrf={csrf}"),
+                Some(&cookie),
+            ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{uri}");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{body}");
         assert_eq!(
             response.headers().get(header::LOCATION).unwrap(),
             expected,
-            "{uri}"
+            "{body}"
         );
     }
 
     // Everything else falls back to the panel root: an absolute URL, a
     // protocol-relative one, a path outside the panel, and an empty
     // value.
-    for uri in [
-        "/admin/set-lang?lang=en&next=https://evil.example.com",
-        "/admin/set-lang?lang=en&next=//evil.example.com",
-        "/admin/set-lang?lang=en&next=/etc/passwd",
-        "/admin/set-lang?lang=en&next=",
-        "/admin/set-lang?lang=en",
+    for (path, body) in [
+        ("/admin/set-lang", "lang=en&next=https://evil.example.com"),
+        ("/admin/set-lang", "lang=en&next=//evil.example.com"),
+        ("/admin/set-lang", "lang=en&next=/etc/passwd"),
+        ("/admin/set-lang", "lang=en&next="),
+        ("/admin/set-lang", "lang=en"),
     ] {
         let response = app
             .clone()
-            .oneshot(request("GET", uri, "", None))
+            .oneshot(request(
+                "POST",
+                path,
+                &format!("{body}&_csrf={csrf}"),
+                Some(&cookie),
+            ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{uri}");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{body}");
         assert_eq!(
             response.headers().get(header::LOCATION).unwrap(),
             "/admin",
-            "{uri}"
+            "{body}"
         );
     }
 }
@@ -4535,32 +5272,39 @@ async fn the_next_parameter_stays_inside_the_panel() {
 #[tokio::test]
 async fn a_control_character_in_next_reaches_no_header() {
     let (_dir, state) = test_state(1000).await;
-    let app = router(state);
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
 
-    for uri in [
-        "/admin/set-lang?lang=en&next=%0D%0AX",
-        "/admin/set-lang?lang=en&next=%2Fadmin%0D%0AX",
-        "/admin/set-theme?theme=dark&next=%0D%0AX",
-        "/admin/set-theme?theme=dark&next=%2Fadmin%0D%0AX",
-        "/admin/set-dash-top-n?n=10&next=%0D%0AX",
+    for (path, form_body) in [
+        ("/admin/set-lang", "lang=en&next=%0D%0AX"),
+        ("/admin/set-lang", "lang=en&next=%2Fadmin%0D%0AX"),
+        ("/admin/set-theme", "theme=dark&next=%0D%0AX"),
+        ("/admin/set-theme", "theme=dark&next=%2Fadmin%0D%0AX"),
+        ("/admin/set-dash-top-n", "n=10&next=%0D%0AX"),
     ] {
         let response = app
             .clone()
-            .oneshot(request("GET", uri, "", None))
+            .oneshot(request(
+                "POST",
+                path,
+                &format!("{form_body}&_csrf={csrf}"),
+                Some(&cookie),
+            ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{uri}");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{form_body}");
         for (name, value) in response.headers() {
             let value = value.to_str().unwrap_or("<binary>");
             assert!(
                 !value.chars().any(|c| c.is_ascii_control()),
-                "{uri}: header {name} carries a control character: {value:?}"
+                "{form_body}: header {name} carries a control character: {value:?}"
             );
         }
-        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert!(
-            !body.contains(&b'\r') && !body.contains(&b'\n'),
-            "{uri}: the body carries a control character"
+            !bytes.contains(&b'\r') && !bytes.contains(&b'\n'),
+            "{form_body}: the body carries a control character"
         );
     }
 
@@ -4577,8 +5321,7 @@ async fn a_control_character_in_next_reaches_no_header() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let body = String::from_utf8_lossy(&body);
+    let body = body_text(response).await;
     assert!(
         !body.contains("<script>alert(1)"),
         "the hostile language value reached the body"
@@ -4590,22 +5333,24 @@ async fn a_control_character_in_next_reaches_no_header() {
 #[tokio::test]
 async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
     let (_dir, state) = test_state(1000).await;
-    let app = router(state);
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
 
     // Valid next: back to the requested admin page with the new cookie.
     let response = app
         .clone()
         .oneshot(request(
-            "GET",
-            "/admin/set-dash-top-n?n=25&next=/admin",
-            "",
-            None,
+            "POST",
+            "/admin/set-dash-top-n",
+            &format!("n=25&next=/admin&_csrf={csrf}"),
+            Some(&cookie),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/admin");
-    let cookie = response
+    let cookie_value = response
         .headers()
         .get(header::SET_COOKIE)
         .unwrap()
@@ -4613,18 +5358,18 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
         .unwrap()
         .to_string();
     assert!(
-        cookie.starts_with("fumox_dash_top_n=25;"),
-        "cookie: {cookie}"
+        cookie_value.starts_with("fumox_dash_top_n=25;"),
+        "cookie: {cookie_value}"
     );
 
     // External `next` values are dropped: redirect stays inside /admin.
     let response = app
         .clone()
         .oneshot(request(
-            "GET",
-            "/admin/set-dash-top-n?n=15&next=https://evil.example.com",
-            "",
-            None,
+            "POST",
+            "/admin/set-dash-top-n",
+            &format!("n=15&next=https://evil.example.com&_csrf={csrf}"),
+            Some(&cookie),
         ))
         .await
         .unwrap();
@@ -4636,10 +5381,10 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
     let response = app
         .clone()
         .oneshot(request(
-            "GET",
-            "/admin/set-dash-top-n?n=10&next=%2Fadmin%0D%0Ax",
-            "",
-            None,
+            "POST",
+            "/admin/set-dash-top-n",
+            &format!("n=10&next=%2Fadmin%0D%0Ax&_csrf={csrf}"),
+            Some(&cookie),
         ))
         .await
         .unwrap();
@@ -4651,15 +5396,15 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
         let response = app
             .clone()
             .oneshot(request(
-                "GET",
-                &format!("/admin/set-dash-top-n?n={bad}"),
-                "",
-                None,
+                "POST",
+                "/admin/set-dash-top-n",
+                &format!("n={bad}&_csrf={csrf}"),
+                Some(&cookie),
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        let cookie = response
+        let cookie_value = response
             .headers()
             .get(header::SET_COOKIE)
             .unwrap()
@@ -4667,10 +5412,140 @@ async fn set_dash_top_n_redirects_with_cookie_and_guards_next() {
             .unwrap()
             .to_string();
         assert!(
-            cookie.starts_with("fumox_dash_top_n=10;"),
-            "bad={bad} cookie: {cookie}"
+            cookie_value.starts_with("fumox_dash_top_n=10;"),
+            "bad={bad} cookie: {cookie_value}"
         );
     }
+
+    // A submit without the `n` field pins nothing at all.
+    let response = app
+        .oneshot(request(
+            "POST",
+            "/admin/set-dash-top-n",
+            &format!("next=/admin&_csrf={csrf}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(response.headers().get(header::SET_COOKIE).is_none());
+}
+
+/// The preference setters are state-changing POSTs under the auth+CSRF
+/// nest like every other route: an unauthenticated request is bounced to
+/// the login screen, and an authenticated POST without (or with a wrong)
+/// CSRF token is refused — a cross-site page must not be able to make
+/// the browser store a preference cookie.
+#[tokio::test]
+async fn the_preference_setters_are_authenticated_posts_with_csrf() {
+    let (_dir, state) = test_state(1000).await;
+    let app = router(state.clone());
+
+    // Unauthenticated: the auth layer answers before any cookie is set.
+    for path in [
+        "/admin/set-lang",
+        "/admin/set-theme",
+        "/admin/set-dash-top-n",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("POST", path, "lang=en&theme=dark&n=25", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/login",
+            "{path}"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "{path}: an unauthenticated request must not set a preference cookie"
+        );
+    }
+
+    // Authenticated but without the CSRF field: refused, no cookie.
+    let cookie = login(&app).await;
+    for (path, body) in [
+        ("/admin/set-lang", "lang=en"),
+        ("/admin/set-theme", "theme=dark"),
+        ("/admin/set-dash-top-n", "n=25"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("POST", path, body, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "{path}: a forged submit must not set a preference cookie"
+        );
+    }
+
+    // With the token the panel's own forms ship, the same POST succeeds.
+    let csrf = csrf_for(&state, &cookie);
+    let response = app
+        .oneshot(request(
+            "POST",
+            "/admin/set-theme",
+            &format!("theme=dark&_csrf={csrf}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let set_cookie = response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(set_cookie.starts_with("fumox_theme=dark;"), "{set_cookie}");
+}
+
+/// The vendored assets are the panel's one cacheable response class
+/// (`private, max-age=...` set by their handlers, never by a shared
+/// cache); every dynamic answer keeps the middleware's `no-store`.
+#[tokio::test]
+async fn static_assets_are_privately_cacheable_and_pages_stay_no_store() {
+    let (_dir, state) = test_state(1000).await;
+    let app = router(state);
+    let cookie = login(&app).await;
+
+    for path in [
+        "/admin/static/app.css",
+        "/admin/static/app.js",
+        "/admin/static/htmx.min.js",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", path, "", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let cache = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cache, "private, max-age=3600", "{path}");
+    }
+
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/admin", "", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cache = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(cache, "no-store");
 }
 
 #[tokio::test]
@@ -4711,16 +5586,7 @@ async fn dashboard_top_n_cookie_is_respected_by_widgets() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = String::from_utf8_lossy(
-        response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .as_ref(),
-    )
-    .into_owned();
+    let html = body_text(response).await;
     assert!(html.contains("Источники с ошибками"));
     let errors_panel_end = html
         .find("Прокси по источникам")
@@ -4756,16 +5622,7 @@ async fn dashboard_top_n_cookie_is_respected_by_widgets() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = String::from_utf8_lossy(
-        response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .as_ref(),
-    )
-    .into_owned();
+    let html = body_text(response).await;
     assert!(
         html.contains(r#"<option value="10" selected"#),
         "10 should be the selected option when the cookie is absent"
@@ -4782,16 +5639,7 @@ async fn dashboard_renders_top_failures_panel() {
         .oneshot(request("GET", "/admin", "", Some(&cookie)))
         .await
         .unwrap();
-    let html = String::from_utf8_lossy(
-        response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .as_ref(),
-    )
-    .into_owned();
+    let html = body_text(response).await;
     assert!(
         html.contains("Топ причин отказов"),
         "panel heading must render"
@@ -4856,25 +5704,19 @@ async fn dashboard_top_failures_panel_aggregates_the_fresh_failures_only() {
         .oneshot(request("GET", "/admin", "", Some(&cookie)))
         .await
         .unwrap();
-    let html = String::from_utf8_lossy(
-        response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .as_ref(),
-    )
-    .into_owned();
+    let html = body_text(response).await;
 
-    // The panel section alone: the rest of the page repeats names.
+    // The panel's own rows alone: the rest of the page repeats names.
+    // The section is bounded by the failures table the panel renders
+    // (the only one on the page), not by the header of whatever panel
+    // happens to follow it.
     let panel = html
-        .split("Топ причин отказов")
+        .split(r#"table class="data failures""#)
         .nth(1)
-        .expect("the panel heading")
-        .split("Новые прокси за 7 дней")
+        .expect("the failures table")
+        .split("</table>")
         .next()
-        .expect("the panel section");
+        .expect("the failures table closes");
 
     // The failures older than the window the panel names do not count.
     assert!(
@@ -4904,6 +5746,7 @@ fn test_source(id: &str, slug: &str) -> fumox_core::models::Source {
     fumox_core::models::Source {
         id: id.into(),
         slug: Some(slug.into()),
+        access_token: None,
         name: format!("source {slug}"),
         url: "https://example.com/sub".into(),
         enabled: true,
@@ -4941,26 +5784,11 @@ fn urlencoded(pairs: &[(&str, &str)]) -> String {
 /// One source + one profile that references it (both with slugs).
 async fn io_fixture(state: &AdminState) {
     let now = fumox_core::models::now_ts();
-    let source = fumox_core::models::Source {
-        id: "srcX0000000".into(),
-        slug: Some("exp-src".into()),
-        name: "export source".into(),
-        url: "https://example.com/sub".into(),
-        enabled: true,
-        encoding: Default::default(),
-        input_format: None,
-        protocols: None,
-        cache_ttl_seconds: 3600,
-        tags: Some(vec!["tag1".into()]),
-        pipeline: None,
-        headers: None,
-        ip_family: None,
-        created_at: now,
-        updated_at: now,
-        last_fetched_at: None,
-        last_error: None,
-        error_class: None,
-    };
+    // The shared source fixture; the export asserts on its tags, so
+    // only that difference rides on top of the base row.
+    let mut source = test_source("srcX0000000", "exp-src");
+    source.name = "export source".into();
+    source.tags = Some(vec!["tag1".into()]);
     fumox_core::repo::sources::create(&state.pool, &source)
         .await
         .unwrap();
@@ -5036,7 +5864,9 @@ async fn export_downloads_configuration_as_attachment() {
         "{disposition}"
     );
 
-    let payload = export_body(&app, &cookie).await;
+    // One response carries both the headers and the payload: the body of
+    // the request above is parsed, no second download.
+    let payload = body_text(response).await;
     let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(parsed["version"], 1);
     assert_eq!(parsed["sources"][0]["ref"], "srcX0000000");
@@ -5210,8 +6040,7 @@ async fn import_rejects_a_malformed_body_and_a_document_without_a_version() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("ошибка разбора JSON"), "{html}");
 
     // Valid JSON, but the required `version` field is missing.
@@ -5225,8 +6054,7 @@ async fn import_rejects_a_malformed_body_and_a_document_without_a_version() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         html.contains("version"),
         "the missing field is named: {html}"
@@ -5269,8 +6097,7 @@ async fn import_refuses_a_document_over_the_size_cap() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("слишком большой"), "{html}");
     assert!(
         fumox_core::repo::sources::list(&pool, false)
@@ -5368,7 +6195,7 @@ async fn pipeline_builder_endpoints_require_auth_and_csrf() {
     let (_dir, state) = test_state(1000).await;
     let app = router(state.clone());
     let cookie = login(&app).await;
-    let body = urlencoded(&[("ped_sort", "1"), ("ped_sort_by", "name")]);
+    let body = urlencoded(&[("ped_sort", "set"), ("ped_sort_by", "name")]);
 
     for uri in [
         "/admin/pipeline/preview",
@@ -5405,11 +6232,11 @@ async fn pipeline_preview_generates_and_validates_json() {
     // the ok badge.
     let body = urlencoded(&[
         ("_csrf", &csrf),
-        ("ped_filter", "1"),
+        ("ped_filter", "set"),
         ("ped_filter_protocols", "vless"),
         ("ped_filter_protocols", "trojan"),
         ("ped_forbid_insecure", "1"),
-        ("ped_sort", "1"),
+        ("ped_sort", "set"),
         ("ped_sort_by", "latency"),
         ("ped_sort_desc", "1"),
     ]);
@@ -5424,8 +6251,7 @@ async fn pipeline_preview_generates_and_validates_json() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("&#34;version&#34;: 1"), "{html}");
     assert!(html.contains("&#34;filter&#34;"), "{html}");
     assert!(html.contains("&#34;latency&#34;"), "{html}");
@@ -5448,8 +6274,7 @@ async fn pipeline_preview_generates_and_validates_json() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("некорректный regex"), "{html}");
     assert!(!html.contains("JSON валиден"), "{html}");
 
@@ -5464,8 +6289,7 @@ async fn pipeline_preview_generates_and_validates_json() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("invalid regex"), "{html}");
     assert!(!html.contains("некорректный"), "{html}");
 }
@@ -5488,8 +6312,7 @@ async fn pipeline_preview_shows_the_empty_state() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("конвейер останется пустым"), "{html}");
 }
 
@@ -5504,7 +6327,7 @@ async fn pipeline_mode_switches_between_builder_and_raw() {
     // field flips to "raw" so the save reads the textarea.
     let body = urlencoded(&[
         ("_csrf", &csrf),
-        ("ped_filter", "1"),
+        ("ped_filter", "set"),
         ("ped_filter_protocols", "vless"),
     ]);
     let response = app
@@ -5518,8 +6341,7 @@ async fn pipeline_mode_switches_between_builder_and_raw() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         html.contains(r#"name="pipeline_mode" value="raw""#),
         "{html}"
@@ -5548,8 +6370,7 @@ async fn pipeline_mode_switches_between_builder_and_raw() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         html.contains(r#"name="pipeline_mode" value="builder""#),
         "{html}"
@@ -5575,8 +6396,7 @@ async fn pipeline_mode_switches_between_builder_and_raw() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         html.contains(r#"name="pipeline_mode" value="raw""#),
         "{html}"
@@ -5608,8 +6428,7 @@ async fn pipeline_preset_renders_the_ready_made_state() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains(r#"value="builder""#), "{html}");
     assert!(
         html.contains(r#"id="ped-status-unknown" checked"#),
@@ -5633,8 +6452,7 @@ async fn pipeline_preset_renders_the_ready_made_state() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("конвейер останется пустым"), "{html}");
 
     // The profile flavor keeps the tri-state radios.
@@ -5648,8 +6466,7 @@ async fn pipeline_preset_renders_the_ready_made_state() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains(r#"name="ped_health" value="set""#), "{html}");
     assert!(html.contains("наследовать"), "{html}");
 }
@@ -5673,8 +6490,7 @@ async fn pipeline_rows_add_and_drop_keep_the_other_lines() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("ped_rename_0_match"), "{html}");
 
     // Adding a line re-renders both; dropping the first renumbers the
@@ -5694,8 +6510,7 @@ async fn pipeline_rows_add_and_drop_keep_the_other_lines() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("ped_rename_0_match"), "{html}");
     assert!(html.contains("ped_rename_1_match"), "{html}");
 
@@ -5712,8 +6527,7 @@ async fn pipeline_rows_add_and_drop_keep_the_other_lines() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("ped_rename_0_match"), "{html}");
     assert!(!html.contains("ped_rename_1_"), "{html}");
     assert!(html.contains(r#"value="second""#), "{html}");
@@ -5735,8 +6549,7 @@ async fn pipeline_rows_add_and_drop_keep_the_other_lines() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains(r#"value="\.cn$""#), "{html}");
     assert!(html.contains("section=drop&amp;remove=0"), "{html}");
     assert!(!html.contains("ped_rename_"), "{html}");
@@ -5770,8 +6583,7 @@ async fn pipeline_rows_renders_asn_mode_when_target_changes() {
         ))
         .await
         .unwrap();
-    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let html = body_text(response).await;
     assert!(html.contains(r#"name="ped_drop_0_match""#), "{html}");
     assert!(!html.contains(r#"name="ped_drop_0_asns""#), "{html}");
 
@@ -5793,8 +6605,7 @@ async fn pipeline_rows_renders_asn_mode_when_target_changes() {
         ))
         .await
         .unwrap();
-    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let html = body_text(response).await;
     assert!(
         html.contains(r#"name="ped_drop_0_asns" value="24940""#),
         "{html}"
@@ -5831,8 +6642,7 @@ async fn pipeline_rows_renders_asn_mode_when_target_changes() {
         ))
         .await
         .unwrap();
-    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let html = body_text(response).await;
     assert!(html.contains(r#"name="ped_drop_0_asns""#), "{html}");
     assert!(
         html.contains(r#"name="ped_drop_1_match" value="\.cn$""#),
@@ -5869,8 +6679,7 @@ async fn pipeline_rows_render_query_does_not_append() {
         ))
         .await
         .unwrap();
-    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let html = body_text(response).await;
     assert!(
         html.contains(r#"name="ped_drop_1_match""#),
         "expected an appended row: {html}"
@@ -5887,8 +6696,7 @@ async fn pipeline_rows_render_query_does_not_append() {
         ))
         .await
         .unwrap();
-    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
-        .into_owned();
+    let html = body_text(response).await;
     assert!(html.contains(r#"name="ped_drop_0_match""#), "{html}");
     assert!(
         !html.contains(r#"name="ped_drop_1_match""#),
@@ -5913,11 +6721,11 @@ async fn source_form_saves_the_builder_state_as_pipeline_json() {
         ("url", "https://example.com/sub"),
         ("cache_ttl_seconds", "3600"),
         ("pipeline_mode", "builder"),
-        ("ped_filter", "1"),
+        ("ped_filter", "set"),
         ("ped_filter_protocols", "vless"),
         ("ped_forbid_insecure", "1"),
         ("ped_geo_enabled", "1"),
-        ("ped_sort", "1"),
+        ("ped_sort", "set"),
         ("ped_sort_by", "name"),
         ("pipeline", "{ \"version\": 1, \"bogus\": true }"),
     ]);
@@ -5974,7 +6782,7 @@ async fn source_form_saves_the_builder_state_as_pipeline_json() {
         ("url", "https://example.com/sub"),
         ("cache_ttl_seconds", "3600"),
         ("pipeline_mode", "builder"),
-        ("ped_filter", "1"),
+        ("ped_filter", "set"),
         ("ped_filter_protocols", "quantum"),
     ]);
     let response = app
@@ -5983,8 +6791,7 @@ async fn source_form_saves_the_builder_state_as_pipeline_json() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("неизвестный протокол"), "{html}");
     assert!(
         html.contains(r#"name="pipeline_mode" value="builder""#),
@@ -6054,8 +6861,7 @@ async fn profile_form_saves_tri_state_sections() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains(r#"id="ped-geo-defaults" checked"#), "{html}");
     assert!(html.contains(r#"id="ped-health-set" checked"#), "{html}");
     assert!(html.contains(r#"id="ped-status-alive" checked"#), "{html}");
@@ -6123,8 +6929,7 @@ async fn source_edit_form_prefills_the_builder_from_the_pipeline() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     // Builder mode by default, filter section set, vless selected (but
     // not trojan), sort by name descending. The filter section now uses
     // the tri-state radios (post-fix); `ped-filter-set` carries the
@@ -6165,8 +6970,7 @@ async fn source_edit_form_prefills_the_builder_from_the_pipeline() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         html.contains("невозможно представить в конструкторе"),
         "{html}"
@@ -6229,10 +7033,10 @@ async fn fetch_journal_tables_keep_columns_single_line() {
     let app = router(state.clone());
     let cookie = login(&app).await;
     // Every page below renders the journal table, so the wrapping error cell is asserted on each.
-    for (path, check_error_cell) in [
-        ("/admin/logs/fetch", true),
-        (&format!("/admin/sources/{}/log", source.id), true),
-        (&format!("/admin/sources/{}", source.id), true),
+    for path in [
+        "/admin/logs/fetch",
+        &format!("/admin/sources/{}/log", source.id),
+        &format!("/admin/sources/{}", source.id),
     ] {
         let response = app
             .clone()
@@ -6240,8 +7044,7 @@ async fn fetch_journal_tables_keep_columns_single_line() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "path {path}");
-        let html = response.into_body().collect().await.unwrap().to_bytes();
-        let html = String::from_utf8_lossy(&html);
+        let html = body_text(response).await;
         assert!(
             html.contains(r#"<table class="data journal">"#),
             "journal table missing on {path}"
@@ -6254,12 +7057,10 @@ async fn fetch_journal_tables_keep_columns_single_line() {
         );
         // The error column keeps its wrapping cell; other columns are
         // single-line through the table class.
-        if check_error_cell {
-            assert!(
-                html.contains(r#"<span class="cell-wrap">"#),
-                "wrapping error cell missing on {path}"
-            );
-        }
+        assert!(
+            html.contains(r#"<span class="cell-wrap">"#),
+            "wrapping error cell missing on {path}"
+        );
     }
 
     // The source card's log is live: it polls the same fragment the
@@ -6273,8 +7074,7 @@ async fn fetch_journal_tables_keep_columns_single_line() {
         ))
         .await
         .unwrap();
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         html.contains(&format!(r#"hx-get="/admin/sources/{}/log""#, source.id)),
         "log-live polling missing on the source card"
@@ -6300,48 +7100,96 @@ async fn live_config_refresh_picks_up_post_save_state() {
     // the public listener. The file is missing fields the defaults
     // supply (`probe.*`, `meow.*`, `database.*`, …), `figment`
     // fills them in via the `Serialized::defaults` layer.
-    let dir = fumox_core::tempdir_lite::TempDir::new("live-refresh");
-    let path = dir.path().join("app.toml");
-    std::fs::write(
-        &path,
+    let _config_dir = refresh_from_written_config(
+        &state,
+        "live-refresh",
         "[ingest]\ndrop_gate = false\n[server]\nbind = \"127.0.0.1:9999\"\n",
-    )
-    .unwrap();
-
-    state
-        .refresh_live_config(&path)
-        .expect("file we just wrote must load cleanly");
+    );
 
     // The live figment-merged view reflects the file.
     let live = state.live();
-    assert!(!live.ingest.drop_gate, "live.ingest.drop_gate");
-    assert_eq!(live.server.bind.port(), 9999, "live.server.bind");
+    assert!(
+        !live.ingest.drop_gate,
+        "live.ingest.drop_gate must be false after refresh"
+    );
+    assert_eq!(
+        live.server.bind,
+        "127.0.0.1:9999".parse().unwrap(),
+        "live.server.bind must be 127.0.0.1:9999 after refresh"
+    );
     // Figment-merged defaults are written back into the in-memory view.
     assert_eq!(
         live.probe.fail_limit,
-        fumox_core::config::ProbeConfig::default().fail_limit
+        fumox_core::config::ProbeConfig::default().fail_limit,
+        "live.probe.fail_limit must keep the default after refresh"
     );
     assert_eq!(
         live.fetch.user_agent,
-        fumox_core::config::FetchConfig::default().user_agent
+        fumox_core::config::FetchConfig::default().user_agent,
+        "live.fetch.user_agent must keep the default after refresh"
     );
 
     // The typed accessors read the same live view: there is no
     // second, frozen copy for a handler to read by mistake, so every
     // consumer sees the post-save state.
-    assert!(!state.ingest().drop_gate, "state.ingest().drop_gate");
-    assert_eq!(state.server().bind.port(), 9999, "state.server().bind");
+    assert!(
+        !state.ingest().drop_gate,
+        "state.ingest().drop_gate must be false after refresh"
+    );
+    assert_eq!(
+        state.server().bind,
+        "127.0.0.1:9999".parse().unwrap(),
+        "state.server().bind must be 127.0.0.1:9999 after refresh"
+    );
+    assert_eq!(
+        state.probe().fail_limit,
+        fumox_core::config::ProbeConfig::default().fail_limit,
+        "state.probe().fail_limit must keep the default after refresh"
+    );
+    assert_eq!(
+        state.fetch().user_agent,
+        fumox_core::config::FetchConfig::default().user_agent,
+        "state.fetch().user_agent must keep the default after refresh"
+    );
+    assert_eq!(
+        state.meow().api_addr,
+        fumox_core::config::MeowConfig::default().api_addr,
+        "state.meow().api_addr must keep the default after refresh"
+    );
+    assert_eq!(
+        state.retention().probe_results_days,
+        fumox_core::config::RetentionConfig::default().probe_results_days,
+        "state.retention().probe_results_days must keep the default after refresh"
+    );
 
-    // The genuinely startup-frozen values stay put: the socket is
-    // still bound to 8080, and the HMAC keys/limiters derived at
-    // startup are plain fields, not config reads. Re-binding the
-    // listener and silently invalidating sessions would be a
-    // footgun, which is why they are explicit.
+    // The genuinely startup-frozen value stays put: the public socket
+    // is still the one bound at startup (8080) even though the
+    // refreshed live config now names 9999 — the listener cannot be
+    // rebound mid-run, which is why `server_bind` is an explicit
+    // startup field and the only assertion here.
     assert_eq!(
         state.server_bind.port(),
         8080,
         "server_bind stays startup-frozen"
     );
+}
+
+/// A config file dropped on disk and swapped into the single live view
+/// (`refresh_live_config`, the same path a settings save takes): the
+/// shared tail of the tests that exercise a refreshed live config. The
+/// returned guard keeps the file alive for the state that points at it.
+fn refresh_from_written_config(
+    state: &AdminState,
+    label: &str,
+    contents: &str,
+) -> fumox_core::tempdir_lite::TempDir {
+    let dir = fumox_core::tempdir_lite::TempDir::new(label);
+    let path = dir.path().join("app.toml");
+    std::fs::write(&path, contents).unwrap();
+    state
+        .refresh_live_config(&path)
+        .expect("file we just wrote must load cleanly");
+    dir
 }
 
 /// A config file the panel writes to, on disk and pointed at by the
@@ -6408,8 +7256,7 @@ async fn a_settings_save_over_a_file_that_changed_is_refused() {
         StatusCode::CONFLICT,
         "a save over a file that changed must be refused"
     );
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     // The panel answers in the operator's language, so the message is
     // looked up in the catalog rather than spelled out here.
     let lang = state.locales.default_lang();
@@ -6581,8 +7428,7 @@ async fn the_edit_page_explains_a_config_it_could_not_read() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     // The banner names the file and the reason. The template is
     // looked up in the catalog, so the assertion compares against the
     // rendered prefix of the same message rather than an English
@@ -6758,8 +7604,21 @@ async fn the_create_from_defaults_button_refuses_a_read_only_directory() {
             .unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::SEE_OTHER,
             "a directory that cannot be written to must be refused"
+        );
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/admin/settings",
+            "the refusal lands back on the overview the button lives on"
+        );
+        let (message, level) = pending_flash(&app, &cookie)
+            .await
+            .expect("the refusal must leave a toast");
+        assert_eq!(level, "error", "the toast must carry the error level");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the toast must name the file it could not create: {message}"
         );
         assert!(
             !path.exists(),
@@ -6769,6 +7628,103 @@ async fn the_create_from_defaults_button_refuses_a_read_only_directory() {
         // Restore the mode so the temp directory can be cleaned up.
         std::fs::set_permissions(cfg_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+/// The edit form is the view of the FILE: a config written outside the
+/// panel (a hand edit, a deploy) shows its values on the next GET, the
+/// handler reads the file fresh instead of replaying a startup snapshot.
+#[tokio::test]
+async fn the_edit_page_renders_the_values_of_the_config_file() {
+    let (_dir, _cfg_dir, _path, state) = state_with_config_file(
+        "settings-edit-values",
+        "[server]\nbind = \"127.0.0.1:9443\"\n[probe]\nfail_limit = 7\n",
+    )
+    .await;
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/admin/settings/edit", "", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    // The inputs of the two file values carry what the file says.
+    let bind_input = html
+        .lines()
+        .find(|line| line.contains(r#"name="server.bind""#))
+        .expect("the edit form must render the bind input");
+    assert!(
+        bind_input.contains(r#"value="127.0.0.1:9443""#),
+        "the form must show the file's bind: {bind_input}"
+    );
+    let fail_input = html
+        .lines()
+        .find(|line| line.contains(r#"name="probe.fail_limit""#))
+        .expect("the edit form must render the fail_limit input");
+    assert!(
+        fail_input.contains(r#"value="7""#),
+        "the form must show the file's fail_limit: {fail_input}"
+    );
+}
+
+/// A read-only deployment (the config file is not writable) is
+/// first-class: the real handlers must show the banner on both settings
+/// pages and disable the edit form, not only the templates in isolation.
+#[tokio::test]
+async fn the_settings_pages_report_a_read_only_deployment() {
+    let (_dir, mut state) = test_state(1000).await;
+    state.config_path =
+        ResolvedConfigPath::Loaded(std::path::PathBuf::from("/unwritable/app.toml"));
+    state.config_writable = false;
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let banner = state.locales.default_lang().t_named(
+        "set.edit_unwritable",
+        &[("path", "/unwritable/app.toml".to_string())],
+    );
+    let banner = askama_html_escape(&banner);
+
+    // The overview: the banner the editor shows appears here too
+    // (USERGUIDE: "the same banner appears on the overview").
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/admin/settings", "", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(&banner),
+        "the overview must show the not-writable banner: {html:.400}"
+    );
+    assert!(
+        html.contains("<div class=\"flash error\" role=\"alert\">"),
+        "the banner must be announced as an alert: {html:.400}"
+    );
+
+    // The edit page: the banner and the disabled form.
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/admin/settings/edit", "", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.contains(&banner),
+        "the edit page must show the not-writable banner: {html:.400}"
+    );
+    assert!(
+        html.contains("<fieldset class=\"settings-panes\" disabled>"),
+        "a read-only config must disable the whole form: {html:.400}"
+    );
+    assert!(
+        html.contains("<button class=\"btn primary\" type=\"submit\" disabled>"),
+        "a read-only config must disable the submit button: {html:.400}"
+    );
 }
 
 /// L-175: the panel's save route is what invalidates the public
@@ -6782,6 +7738,7 @@ async fn saving_a_profile_in_the_panel_refreshes_the_public_subscription() {
     let source = fumox_core::models::Source {
         id: "srcS0000000".into(),
         slug: None,
+        access_token: None,
         name: "source".into(),
         url: "https://example.com/sub".into(),
         enabled: true,
@@ -6835,10 +7792,12 @@ async fn saving_a_profile_in_the_panel_refreshes_the_public_subscription() {
         Vec::new(),
         TrustedHeader::None,
         Vec::new(),
-        state.server().export_max_rows,
-        state.export_token.clone(),
+        crate::alive_export::ExportState::new(
+            state.server().export_max_rows,
+            state.export_token.clone(),
+        ),
     );
-    let public = crate::serve::public_app(public_state, state.pool.clone());
+    let public = crate::serve::router(public_state);
     let title = async |uri: &'static str| {
         let response = public
             .clone()
@@ -6850,8 +7809,7 @@ async fn saving_a_profile_in_the_panel_refreshes_the_public_subscription() {
             .headers()
             .get("profile-title")
             .map(|v| v.to_str().unwrap().to_string());
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let body = body_text(response).await;
         assert_eq!(status, StatusCode::OK, "{body:?}");
         title.expect("the subscription must carry a title header")
     };
@@ -6925,6 +7883,188 @@ async fn delete_source(app: &axum::Router, cookie: &str, csrf: &str, id: &str) -
         .await
         .unwrap();
     response.status()
+}
+
+/// The processed cache of `src:<id>` the way a public render left it:
+/// fresh for another hour, so only an invalidation can remove it.
+async fn warm_processed_cache(state: &AdminState, id: &str) {
+    let rendered = crate::cache::Rendered {
+        status: 200,
+        body: axum::body::Bytes::from_static(b"stale rendered body"),
+        content_type: "text/plain; charset=utf-8".into(),
+        extra_headers: Vec::new(),
+        fresh_until: fumox_core::models::now_ts() + 3600,
+        source_ids: vec![id.to_string()],
+    };
+    state
+        .caches
+        .processed_put_unguarded(&format!("src:{id}"), rendered)
+        .await;
+}
+
+/// L-424: a source mutation must reach the public side immediately. The
+/// rendered outputs of the source are cached, so toggle, edit and delete
+/// each drop the `src:<id>` entry on the spot — while it is still fresh —
+/// and the deleted source answers nothing at all, instead of serving the
+/// stale body for a whole TTL.
+#[tokio::test]
+async fn source_mutations_drop_the_cached_rendered_output() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let source = seed_source(&state, "srcM0000000", "cached-src").await;
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+
+    // The toggle drops the entry.
+    warm_processed_cache(&state, &source.id).await;
+    assert!(
+        state
+            .caches
+            .processed_get("src:srcM0000000")
+            .await
+            .is_some(),
+        "the fixture must warm the cache"
+    );
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/sources/srcM0000000/toggle",
+            &format!("_csrf={csrf}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        state
+            .caches
+            .processed_get("src:srcM0000000")
+            .await
+            .is_none(),
+        "the toggle must drop the cached rendering while it is still fresh"
+    );
+
+    // The edit drops it too.
+    warm_processed_cache(&state, &source.id).await;
+    let body = urlencoded(&[
+        ("_csrf", &csrf),
+        ("name", "renamed source"),
+        ("url", "https://example.com/sub"),
+        ("cache_ttl_seconds", "3600"),
+    ]);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/sources/srcM0000000/edit",
+            &body,
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        state
+            .caches
+            .processed_get("src:srcM0000000")
+            .await
+            .is_none(),
+        "the edit must drop the cached rendering while it is still fresh"
+    );
+
+    // And the delete: the entry is gone and the source answers nothing.
+    warm_processed_cache(&state, &source.id).await;
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/sources/srcM0000000/delete",
+            &format!("_csrf={csrf}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        state
+            .caches
+            .processed_get("src:srcM0000000")
+            .await
+            .is_none(),
+        "the delete must drop the cached rendering while it is still fresh"
+    );
+    assert!(
+        fumox_core::repo::sources::get(&pool, "srcM0000000")
+            .await
+            .unwrap()
+            .is_none(),
+        "the deleted source must be gone from the database"
+    );
+}
+
+/// The edit POST answers an HTMX submission with `HX-Redirect` (the
+/// client performs the navigation) and a plain browser with a bare 303:
+/// an HX-Redirect header on the browser path would be dead weight, and
+/// its absence on the HTMX path would leave the widget stuck on the old
+/// page.
+#[tokio::test]
+async fn source_update_redirects_an_htmx_call_and_a_browser_differently() {
+    let (_dir, state) = test_state(1000).await;
+    seed_source(&state, "srcR0000000", "redirect-src").await;
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+    let body = urlencoded(&[
+        ("_csrf", &csrf),
+        ("name", "renamed source"),
+        ("url", "https://example.com/sub"),
+        ("cache_ttl_seconds", "3600"),
+    ]);
+
+    // HTMX path: 303 plus HX-Redirect at the source card.
+    let mut req = request(
+        "POST",
+        "/admin/sources/srcR0000000/edit",
+        &body,
+        Some(&cookie),
+    );
+    req.headers_mut()
+        .insert("HX-Request", header::HeaderValue::from_static("true"));
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response
+            .headers()
+            .get("HX-Redirect")
+            .map(|v| v.to_str().unwrap()),
+        Some("/admin/sources/srcR0000000"),
+        "the HTMX answer must carry the redirect target"
+    );
+
+    // Plain-browser path: the bare 303, no HX-Redirect.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/sources/srcR0000000/edit",
+            &body,
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/admin/sources/srcR0000000"
+    );
+    assert!(
+        response.headers().get("HX-Redirect").is_none(),
+        "a plain browser must not be handed an HX-Redirect header"
+    );
 }
 
 /// L-139: the delete of a source retires the proxies it fed — but only
@@ -7049,8 +8189,7 @@ async fn a_duplicate_header_key_is_reported() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(html.contains("задан дважды"), "{html:.400}");
     assert!(html.contains("X-Token"), "{html:.400}");
     assert!(
@@ -7089,8 +8228,7 @@ async fn the_url_password_is_masked_on_the_screens_and_restored_on_save() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
-        let html = response.into_body().collect().await.unwrap().to_bytes();
-        let html = String::from_utf8_lossy(&html);
+        let html = body_text(response).await;
         assert!(html.contains("sec…••••"), "{uri}: {html:.400}");
         assert!(
             !html.contains("secret123"),
@@ -7161,8 +8299,7 @@ async fn the_url_token_is_redacted_on_the_screens_and_restored_on_save() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
-        let html = response.into_body().collect().await.unwrap().to_bytes();
-        let html = String::from_utf8_lossy(&html);
+        let html = body_text(response).await;
         assert!(html.contains("token=[redacted]"), "{uri}: {html:.400}");
         assert!(
             !html.contains("SECRET-TOKEN"),
@@ -7231,8 +8368,7 @@ async fn the_token_rotation_is_confirmed_on_a_page_of_its_own() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         html.contains(r#"href="/admin/import/alive-token""#),
         "{html:.400}"
@@ -7254,8 +8390,7 @@ async fn the_token_rotation_is_confirmed_on_a_page_of_its_own() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         html.contains(r#"<form method="post" action="/admin/import/alive-token""#),
         "{html:.400}"
@@ -7396,9 +8531,11 @@ async fn the_refresh_answer_renders_the_polled_status_fragment() {
         .insert("HX-Request", "true".parse().unwrap());
     let response = app.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
-    assert!(html.contains(r#"id="refresh-status""#), "{html}");
+    let html = body_text(response).await;
+    // The fragment carries the content only: the `#refresh-status` live
+    // region is owned by detail.html and the swaps target it from
+    // inside (innerHTML), so it is never torn down and re-created.
+    assert!(!html.contains(r#"id="refresh-status""#), "{html}");
     assert!(html.contains(r#"data-busy="1""#), "{html}");
     assert!(
         html.contains(&format!(
@@ -7407,6 +8544,8 @@ async fn the_refresh_answer_renders_the_polled_status_fragment() {
         )),
         "{html}"
     );
+    assert!(html.contains(r##"hx-target="#refresh-status""##), "{html}");
+    assert!(html.contains(r#"hx-swap="innerHTML""#), "{html}");
 }
 
 /// M-183/M-184: a settings save the server refuses must show the
@@ -7440,8 +8579,7 @@ async fn a_refused_settings_save_marks_the_field_it_refuses() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
 
     let lang = state.locales.default_lang();
     assert!(
@@ -7472,6 +8610,61 @@ async fn a_refused_settings_save_marks_the_field_it_refuses() {
     assert!(
         marked.contains(r#"name="server.bind""#),
         "the wrong control is marked: {marked:.400}"
+    );
+}
+
+/// A refused save must not echo the submitted admin token back into
+/// the 422 page: the replay would pin the typed secret into markup
+/// that proxies, logs and browsers see. The field comes back empty and
+/// the message under it says the token was not applied.
+#[tokio::test]
+async fn a_refused_settings_save_does_not_echo_the_submitted_token() {
+    let (_dir, _cfg_dir, path, state) =
+        state_with_config_file("settings-token-echo", "[ingest]\ndrop_gate = false\n").await;
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+    let rendered = fumox_core::config_writer::fingerprint(&path);
+
+    // `server.bind` is invalid, and a fresh token travels along: the
+    // save is refused as a whole, so the token was never applied.
+    let submitted_token = "typed-secret-422";
+    let body = format!(
+        "_csrf={csrf}&cfg_fingerprint={rendered}&server.bind=not-an-address&ingest.drop_gate=on&admin.token={submitted_token}"
+    );
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/admin/settings/update",
+            &body,
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let html = body_text(response).await;
+    assert!(
+        !html.contains(submitted_token),
+        "the refused save must not render the submitted token: {html:.400}"
+    );
+
+    // The operator is told the token was not applied, next to an empty
+    // field: without the message the emptied input looks like the panel
+    // lost the value silently.
+    let lang = state.locales.default_lang();
+    assert!(
+        html.contains(lang.t("set.edit_token_not_saved")),
+        "the not-saved hint must be rendered under the token field: {html:.400}"
+    );
+    let token_input = html
+        .split("<input")
+        .find(|chunk| chunk.contains(r#"name="admin.token""#))
+        .unwrap_or_else(|| panic!("the token input is missing: {html:.400}"));
+    assert!(
+        token_input.contains(r#"value="""#),
+        "the token field must come back empty: {token_input:.400}"
     );
 }
 
@@ -7513,8 +8706,7 @@ async fn a_refused_settings_save_opens_the_tab_that_holds_the_error() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         checked(&html, "probe"),
         "the pane that holds the error must be the open one: {html:.400}"
@@ -7540,8 +8732,7 @@ async fn a_refused_settings_save_opens_the_tab_that_holds_the_error() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         checked(&html, "server"),
         "the pane that holds the first error must be the open one: {html:.400}"
@@ -7571,8 +8762,7 @@ async fn a_valid_settings_page_marks_nothing_invalid() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     assert!(
         !html.contains(r#"aria-invalid="true""#),
         "a form that validated marks nothing: {html:.400}"
@@ -7599,8 +8789,7 @@ async fn a_refused_source_save_marks_the_field_it_refuses() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
 
     assert!(
         html.contains(r#"id="err-url""#),
@@ -7633,8 +8822,7 @@ async fn a_refused_import_links_to_the_error_list() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
 
     assert!(
         html.contains(r#"id="io-errors""#),
@@ -7679,8 +8867,7 @@ async fn the_toggle_keeps_its_live_region_across_the_swap() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
 
     assert!(
         html.contains(r#"<span id="enabled-badge" aria-live="polite" aria-atomic="true">"#),
@@ -7716,8 +8903,7 @@ async fn the_toggle_locks_its_button_and_has_a_slot_for_a_failure() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
 
     assert!(
         html.contains(r#"hx-disabled-elt="find button""#),
@@ -7762,8 +8948,7 @@ async fn a_refreshing_table_announces_only_the_new_rows() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "path {path}");
-        let html = response.into_body().collect().await.unwrap().to_bytes();
-        let html = String::from_utf8_lossy(&html);
+        let html = body_text(response).await;
 
         let start = html
             .find(&format!(r#"id="{container}""#))
@@ -7842,8 +9027,7 @@ async fn the_opened_dialog_puts_the_focus_on_its_heading() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "path {path}");
-        let html = response.into_body().collect().await.unwrap().to_bytes();
-        let html = String::from_utf8_lossy(&html);
+        let html = body_text(response).await;
         for snippet in snippets {
             assert!(
                 html.contains(snippet),
@@ -7867,8 +9051,7 @@ async fn a_preset_asks_before_it_replaces_the_rules() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = response.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&html);
+    let html = body_text(response).await;
     let lang = state.locales.default_lang();
 
     let confirm = lang

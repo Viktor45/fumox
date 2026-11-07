@@ -22,6 +22,37 @@ pub(crate) const STATUS_KEYS: &[(&str, &str)] = &[
 /// The key a status value outside [`STATUS_KEYS`] falls back to.
 pub(crate) const UNKNOWN_STATUS_KEY: &str = "common.status_unknown";
 
+/// The stored error-class value (the wire names of
+/// `fumox_core::models::ErrorClass`) and the catalog key that renders it.
+/// Same contract as [`STATUS_KEYS`]: every key named here must exist in
+/// every catalog.
+pub(crate) const ERROR_CLASS_KEYS: &[(&str, &str)] = &[
+    ("network", "log.class.network"),
+    ("http_server", "log.class.http_server"),
+    ("http_client", "log.class.http_client"),
+    ("parse_error", "log.class.parse_error"),
+    ("storage", "log.class.storage"),
+];
+
+/// The key an error class outside [`ERROR_CLASS_KEYS`] falls back to: a
+/// value the running build does not know (recorded by a newer schema)
+/// has no translation of its own.
+pub(crate) const UNKNOWN_ERROR_CLASS_KEY: &str = "log.class.unknown";
+
+/// The catalog key of a known status value (`STATUS_KEYS` plus the
+/// unknown fallback), `None` for a value outside the schema. Callers
+/// decide what an outsider shows: the badges fall back to *unknown*,
+/// the pipeline editor keeps the raw wire token visible.
+pub(crate) fn known_status_key(status: &str) -> Option<&'static str> {
+    if status == "unknown" {
+        return Some(UNKNOWN_STATUS_KEY);
+    }
+    STATUS_KEYS
+        .iter()
+        .find(|(value, _)| *value == status)
+        .map(|(_, key)| *key)
+}
+
 /// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (the no-JS
 /// fallback). This text is the no-JS fallback inside [`fmt_ts_element`].
 pub(crate) fn fmt_ts(ts: i64) -> String {
@@ -104,6 +135,32 @@ macro_rules! impl_presentation {
                     .unwrap_or(crate::admin::presentation::UNKNOWN_STATUS_KEY);
                 self.lang.t(key).to_string()
             }
+            /// Localized display label of a fetch-log error class (e.g.
+            /// *network*), so the badges and the filter options render in
+            /// the page language, machine token included in neither. A
+            /// value outside the schema falls back to the *other error*
+            /// wording.
+            #[allow(dead_code)]
+            fn error_class_label(&self, class: &str) -> String {
+                let key = crate::admin::presentation::ERROR_CLASS_KEYS
+                    .iter()
+                    .find(|(value, _)| *value == class)
+                    .map(|(_, key)| *key)
+                    .unwrap_or(crate::admin::presentation::UNKNOWN_ERROR_CLASS_KEY);
+                self.lang.t(key).to_string()
+            }
+            /// CSS modifier of an error-class badge: the schema's own
+            /// name, which the stylesheet styles one rule per variant
+            /// (`.badge.network` …). A value outside the schema renders
+            /// as a plain error badge instead of an unstyled chip.
+            #[allow(dead_code)]
+            fn error_class_badge_class(&self, class: &str) -> &'static str {
+                crate::admin::presentation::ERROR_CLASS_KEYS
+                    .iter()
+                    .find(|(value, _)| *value == class)
+                    .map(|(value, _)| *value)
+                    .unwrap_or("error")
+            }
             /// Display name of a proxy: the source-provided name, or the
             /// server address when the source sent none, an empty name
             /// would render an empty, unclickable-looking link. Whitespace
@@ -114,6 +171,22 @@ macro_rules! impl_presentation {
                     format!("{host}:{port}")
                 } else {
                     name.to_string()
+                }
+            }
+            /// Human-readable label of a probe kind (the probe history
+            /// table, `_history.html`): the localized tier + lane wording,
+            /// the column header's tooltip carries the legend. A kind
+            /// outside the schema falls back to the raw wire token.
+            #[allow(dead_code)]
+            fn kind_label(&self, kind: &str) -> String {
+                match kind {
+                    "tcp" => self.lang.t("px.kind_tcp").to_string(),
+                    "tls" => self.lang.t("px.kind_tls").to_string(),
+                    fumox_core::repo::probe::T2_KIND => self.lang.t("px.kind_t2").to_string(),
+                    fumox_core::repo::probe::T2_UNVERIFIED_KIND => {
+                        self.lang.t("px.kind_t2_unverified").to_string()
+                    }
+                    _ => kind.to_string(),
                 }
             }
             /// Render a Unix timestamp as a `<time class="ts">` element

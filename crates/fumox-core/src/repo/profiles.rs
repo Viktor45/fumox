@@ -3,6 +3,7 @@
 use crate::db::DbPool;
 use crate::models::Profile;
 use sqlx::{FromRow, Sqlite};
+use std::collections::HashMap;
 
 #[derive(FromRow)]
 struct ProfileRow {
@@ -262,6 +263,17 @@ pub async fn list(pool: &DbPool, enabled_only: bool) -> crate::Result<Vec<Profil
     rows.into_iter().map(Profile::try_from).collect()
 }
 
+/// Every slug of the table (`None` for a row without one), one column.
+/// The import's collision check reads only these: mapping whole rows
+/// would fetch every stored pipeline just to throw it away.
+pub async fn list_slugs(pool: &DbPool) -> crate::Result<Vec<Option<String>>> {
+    let rows: Vec<(Option<String>,)> =
+        sqlx::query_as("SELECT slug FROM profiles ORDER BY created_at")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(slug,)| slug).collect())
+}
+
 pub async fn delete(pool: &DbPool, id: &str) -> crate::Result<bool> {
     let affected = sqlx::query("DELETE FROM profiles WHERE id = ?")
         .bind(id)
@@ -353,6 +365,29 @@ pub async fn get_sources(pool: &DbPool, profile_id: &str) -> crate::Result<Vec<(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// Every profile's composition in one read, keyed by profile id, each
+/// list in position order (the same `ORDER BY` [`get_sources`] applies).
+/// The configuration export builds all compositions from this one query
+/// instead of one indexed read per profile.
+pub async fn sources_by_profile(
+    pool: &DbPool,
+) -> crate::Result<HashMap<String, Vec<(String, i64)>>> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT profile_id, source_id, position FROM profile_sources
+         ORDER BY profile_id, position, source_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut by_profile: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+    for (profile_id, source_id, position) in rows {
+        by_profile
+            .entry(profile_id)
+            .or_default()
+            .push((source_id, position));
+    }
+    Ok(by_profile)
 }
 
 // Admin profile screens
@@ -490,6 +525,7 @@ mod tests {
         Source {
             id: id.to_string(),
             slug: None,
+            access_token: None,
             name: "s".into(),
             url: "https://example.com".into(),
             enabled: true,
@@ -778,6 +814,70 @@ mod tests {
                 total: 3,
                 unique: 2
             }
+        );
+    }
+
+    /// The export's batched reads: one query groups the whole
+    /// `profile_sources` table by profile (each list in position order,
+    /// profiles without sources absent), and the slug column reads back
+    /// on its own, `None` for a row without one.
+    #[tokio::test]
+    async fn sources_by_profile_and_list_slugs_cover_the_whole_table() {
+        let (_dir, pool) = temp_pool().await;
+        create(&pool, &sample_profile("prfAaaaaaaa")).await.unwrap();
+        create(&pool, &sample_profile("prfBaaaaaaa")).await.unwrap();
+        sources_repo::create(&pool, &sample_source("srcA0000000"))
+            .await
+            .unwrap();
+        sources_repo::create(&pool, &sample_source("srcB0000000"))
+            .await
+            .unwrap();
+        // Written out of order on purpose: the read must restore the
+        // position order.
+        replace_sources(
+            &pool,
+            "prfAaaaaaaa",
+            &[("srcB0000000".into(), 1), ("srcA0000000".into(), 0)],
+        )
+        .await
+        .unwrap();
+        replace_sources(&pool, "prfBaaaaaaa", &[("srcA0000000".into(), 0)])
+            .await
+            .unwrap();
+
+        let map = sources_by_profile(&pool).await.unwrap();
+        assert_eq!(
+            map.get("prfAaaaaaaa").unwrap(),
+            &[
+                ("srcA0000000".to_string(), 0),
+                ("srcB0000000".to_string(), 1)
+            ]
+        );
+        assert_eq!(
+            map.get("prfBaaaaaaa").unwrap(),
+            &[("srcA0000000".to_string(), 0)]
+        );
+
+        let mut slugs = list_slugs(&pool).await.unwrap();
+        slugs.sort();
+        assert_eq!(
+            slugs,
+            vec![
+                Some("slug-prfAaaaaaaa".into()),
+                Some("slug-prfBaaaaaaa".into())
+            ]
+        );
+
+        // A row without a slug reads back as `None`.
+        let mut bare = sample_profile("prfCaaaaaaa");
+        bare.slug = None;
+        create(&pool, &bare).await.unwrap();
+        let slugs = list_slugs(&pool).await.unwrap();
+        assert!(slugs.contains(&None), "the bare row is a None: {slugs:?}");
+        assert_eq!(
+            sources_by_profile(&pool).await.unwrap().get("prfCaaaaaaa"),
+            None,
+            "a profile without sources is absent from the map"
         );
     }
 }

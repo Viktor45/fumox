@@ -1,11 +1,16 @@
 //! Source fetcher: HTTP download with SSRF protection, size caps and
 //! retries with exponential backoff.
 //!
-//! Error classification follows the single `error_class` vocabulary:
-//! `network` / `http_server` are recoverable and retried;
-//! `http_client` is not. An SSRF-blocked URL is reported as `http_client`
-//! with status 403, the source configuration is at fault and retrying
-//! cannot help.
+//! Every failure carries a class from the single `error_class` vocabulary
+//! (`network` / `http_server` / `http_client`): the coarse bucket the
+//! journal and the admin panel group failures by, not a retry verdict —
+//! retryability is answered separately by [`FetchFailure::is_recoverable`],
+//! which retries everything except the two terminal cases: a `permanent`
+//! network failure (the URL itself is unusable, e.g. an unparseable or
+//! unsupported-scheme address) and [`FetchFailure::ResponseTooLarge`] (a
+//! body over the cap is over it on every attempt). An SSRF-blocked URL is
+//! reported as `http_client` with status 403, the source configuration is
+//! at fault and retrying cannot help.
 //!
 //! Two paths have to stay the same path: the address that was vetted and
 //! the address that is connected to. The client ignores the environment
@@ -116,18 +121,12 @@ fn detail(reason: Option<&str>) -> String {
 }
 
 impl FetchFailure {
-    /// A client error without a cause beyond the status code.
-    fn http_client(status: u16) -> Self {
-        FetchFailure::HttpClient {
-            status,
-            reason: None,
-            attempts: 1,
-        }
-    }
-
     /// A client error with an optional human-readable cause; the text is
     /// what the operator reads in `fetch_log` and in the source's
-    /// `last_error`.
+    /// `last_error`. Synthesized client errors (SSRF 403, oversized-URL
+    /// 414, redirect-loop 508) always pass a reason — the status alone
+    /// would leave the operator guessing at a failure no upstream ever
+    /// answered.
     fn http_client_why(status: u16, reason: Option<&str>) -> Self {
         FetchFailure::HttpClient {
             status,
@@ -416,7 +415,9 @@ impl Fetcher {
                     if tokio::time::Instant::now() + delay >= deadline {
                         return Err(budget_exhausted(self.budget, &failure));
                     }
+                    // The URL may carry userinfo credentials, never log it raw.
                     tracing::warn!(
+                        url = %redact_url(url),
                         attempt = attempt + 1,
                         backoff_ms = %delay.as_millis(),
                         error = %failure,
@@ -474,7 +475,12 @@ impl Fetcher {
                 ));
             }
             if current.len() > MAX_URL_LEN {
-                return Err(FetchFailure::http_client(414));
+                return Err(FetchFailure::http_client_why(
+                    414,
+                    Some(&format!(
+                        "URL grew past {MAX_URL_LEN} bytes after redirects"
+                    )),
+                ));
             }
             let parsed = Url::parse(&current).map_err(|e| FetchFailure::Network {
                 message: format!("invalid URL: {e}"),
@@ -507,7 +513,7 @@ impl Fetcher {
                 .map_err(|e| {
                     // The URL may carry userinfo credentials, never log it raw.
                     tracing::warn!(url = %redact_url(&current), reason = %e, "SSRF protection blocked the fetch");
-                    FetchFailure::http_client_why(403, withheld)
+                    FetchFailure::http_client_why(403, Some("SSRF policy blocked the resolved address"))
                 })?;
             let port = parsed
                 .port_or_known_default()
@@ -556,6 +562,11 @@ impl Fetcher {
                 continue;
             }
 
+            // 408 (request timeout) and 429 (throttling) are 4xx by class
+            // but transient by nature: the server itself says "try again",
+            // so they are retried like the 5xx and journaled as
+            // `http_server` (the class is the journal's coarse grouping,
+            // not a retry verdict — [`FetchFailure::is_recoverable`] is).
             if status >= 500 || status == 408 || status == 429 {
                 return Err(FetchFailure::HttpServer {
                     status,
@@ -590,7 +601,10 @@ impl Fetcher {
         }
         // Redirect chain longer than MAX_REDIRECTS, a persistent server
         // misconfiguration, reported as 508 Loop Detected.
-        Err(FetchFailure::http_client_why(508, withheld))
+        Err(FetchFailure::http_client_why(
+            508,
+            Some(&format!("redirect chain longer than {MAX_REDIRECTS} hops")),
+        ))
     }
 }
 
@@ -735,46 +749,43 @@ pub async fn vet_host(
     })
 }
 
-/// A static URL-validation problem: a catalog key plus positional `{0}`,
-/// `{1}`… arguments. The admin layer renders it with `Lang::t_args` in the
-/// panel language; embedded diagnostics (URL-parser and SSRF-rejection
-/// details) stay technical English, only the sentence around them is
-/// localized.
+/// A static URL-validation problem, typed so this layer stays free of
+/// i18n concerns: the admin layer maps each variant onto its `val.url_*`
+/// catalog key and renders it with `Lang::t_args` in the panel language;
+/// embedded diagnostics (URL-parser and SSRF-rejection details) stay
+/// technical English, only the sentence around them is localized.
 #[derive(Debug, Clone)]
-pub struct UrlIssue {
-    /// Catalog key (`val.url_*` section of `locales/*.toml`).
-    pub key: &'static str,
-    /// Positional arguments: limits, offending values, technical details.
-    pub args: Vec<String>,
-    /// What the problem is, so the caller does not have to read the
-    /// message to tell a broken URL from a name that did not resolve.
-    pub kind: UrlIssueKind,
+pub enum UrlProblem {
+    /// The URL is longer than the limit (the argument, in characters).
+    TooLong(usize),
+    /// The URL is malformed; the argument is the parser's message.
+    Invalid(String),
+    /// The URL uses a scheme other than http/https (the argument).
+    Scheme(String),
+    /// The URL has no host.
+    NoHost,
+    /// SSRF protection refused the target: the reason plus whether the
+    /// refusal is a property of the address (policy) or of this moment
+    /// (the name did not resolve).
+    Ssrf {
+        reason: String,
+        kind: SsrfRejectionKind,
+    },
 }
 
-/// The class of a URL problem.
-///
-/// The caller decides what it may do with it: a malformed URL and a
-/// blocked address hold on every retry, a name that did not resolve says
-/// nothing about the target and the fetch path re-checks it on every
-/// request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UrlIssueKind {
-    /// The URL is malformed: no scheme, no host, or too long.
-    Invalid,
-    /// The URL points at an address the policy refuses (private,
-    /// loopback, link-local, …), or at a host that cannot serve the
-    /// requested address family.
-    Policy,
-    /// The URL could not be checked right now: the name did not resolve
-    /// or the lookup timed out.
-    Transient,
-}
-
-impl UrlIssueKind {
+impl UrlProblem {
     /// Whether the problem is a property of the URL itself, so a caller
-    /// that retries gets the same answer.
-    pub fn is_permanent(self) -> bool {
-        !matches!(self, UrlIssueKind::Transient)
+    /// that retries gets the same answer. A name that did not resolve (an
+    /// SSRF rejection of the transient kind) says nothing about the
+    /// target and the fetch path re-checks it on every request.
+    pub fn is_permanent(&self) -> bool {
+        !matches!(
+            self,
+            UrlProblem::Ssrf {
+                kind: SsrfRejectionKind::Transient,
+                ..
+            }
+        )
     }
 }
 
@@ -782,82 +793,54 @@ impl UrlIssueKind {
 ///
 /// The DNS-level SSRF vetting happens at fetch time (addresses can change
 /// between save and fetch), but scheme, length and host shape are checked
-/// up front so that obviously bad URLs never reach the scheduler.
-pub fn validate_url(url: &str) -> Result<(), UrlIssue> {
+/// up front so that obviously bad URLs never reach the scheduler. The
+/// parsed [`Url`] comes back with the verdict, so a caller that vetts the
+/// host next does not parse the same string a second time.
+pub fn validate_url(url: &str) -> Result<Url, UrlProblem> {
     if url.len() > MAX_URL_LEN {
-        return Err(UrlIssue {
-            key: "val.url_too_long",
-            args: vec![MAX_URL_LEN.to_string()],
-            kind: UrlIssueKind::Invalid,
-        });
+        return Err(UrlProblem::TooLong(MAX_URL_LEN));
     }
-    let parsed = Url::parse(url).map_err(|e| UrlIssue {
-        key: "val.url_invalid",
-        args: vec![e.to_string()],
-        kind: UrlIssueKind::Invalid,
-    })?;
+    let parsed = Url::parse(url).map_err(|e| UrlProblem::Invalid(e.to_string()))?;
     match parsed.scheme() {
         "http" | "https" => {}
-        other => {
-            return Err(UrlIssue {
-                key: "val.url_scheme",
-                args: vec![other.to_string()],
-                kind: UrlIssueKind::Invalid,
-            });
-        }
+        other => return Err(UrlProblem::Scheme(other.to_string())),
     }
     if parsed.host_str().is_none() {
-        return Err(UrlIssue {
-            key: "val.url_no_host",
-            args: Vec::new(),
-            kind: UrlIssueKind::Invalid,
-        });
+        return Err(UrlProblem::NoHost);
     }
-    Ok(())
+    Ok(parsed)
 }
 
 /// Save-time SSRF check: static validation plus DNS
 /// resolution and address vetting. The fetch path re-vets on every request
 /// to defend against DNS rebinding, so a failure here is fast feedback for
-/// the form, not the last line of defense. Skips DNS when private URLs are
-/// allowed (nothing to reject). `family` is the source's effective IP
-/// family (after resolving `None` against `[fetch] ip_family`), so the form
-/// flags hosts that can never be reached under the strict constraint.
+/// the form, not the last line of defense. Private URLs are allowed by the
+/// flag, but the DNS vetting still runs: `check_ip` passes every address
+/// under `allow_private = true`, yet the family check of an IP literal and
+/// the family filtering of the resolved addresses stay in force, so the
+/// form flags a host that can never be reached. `family` is the source's
+/// effective IP family (after resolving `None` against
+/// `[fetch] ip_family`), so the form flags hosts that can never be reached
+/// under the strict constraint.
 ///
-/// The failure carries its class ([`UrlIssueKind`]): a caller that may
-/// treat an unresolvable name as a warning (the import path, where the
-/// file is vetted again at fetch time) reads `kind` instead of parsing
-/// the message.
+/// The failure carries its kind ([`UrlProblem::is_permanent`]): a caller
+/// that may treat an unresolvable name as a warning (the import path,
+/// where the file is vetted again at fetch time) reads that instead of
+/// parsing the message.
 pub async fn vet_url_with_policy(
     url: &str,
     allow_private_urls: bool,
     family: IpFamily,
     dns_timeout: Duration,
-) -> Result<(), UrlIssue> {
-    validate_url(url)?;
-    if allow_private_urls {
-        return Ok(());
-    }
-    let parsed = Url::parse(url).map_err(|e| UrlIssue {
-        key: "val.url_invalid",
-        args: vec![e.to_string()],
-        kind: UrlIssueKind::Invalid,
-    })?;
-    let host = parsed.host_str().ok_or(UrlIssue {
-        key: "val.url_no_host",
-        args: Vec::new(),
-        kind: UrlIssueKind::Invalid,
-    })?;
-    vet_host(host, false, family, dns_timeout)
+) -> Result<(), UrlProblem> {
+    let parsed = validate_url(url)?;
+    let host = parsed.host_str().ok_or(UrlProblem::NoHost)?;
+    vet_host(host, allow_private_urls, family, dns_timeout)
         .await
         .map(|_| ())
-        .map_err(|e| UrlIssue {
-            key: "val.url_ssrf",
-            args: vec![e.reason],
-            kind: match e.kind {
-                SsrfRejectionKind::Policy => UrlIssueKind::Policy,
-                SsrfRejectionKind::Transient => UrlIssueKind::Transient,
-            },
+        .map_err(|e| UrlProblem::Ssrf {
+            reason: e.reason,
+            kind: e.kind,
         })
 }
 
@@ -947,7 +930,7 @@ mod tests {
             ErrorClass::HttpServer
         );
         assert_eq!(
-            FetchFailure::http_client(404).error_class(),
+            FetchFailure::http_client_why(404, None).error_class(),
             ErrorClass::HttpClient
         );
         assert_eq!(
@@ -990,13 +973,19 @@ mod tests {
             }
             .is_recoverable()
         );
-        assert!(!FetchFailure::http_client(404).is_recoverable());
-        assert_eq!(FetchFailure::http_client(404).http_status(), Some(404));
+        assert!(!FetchFailure::http_client_why(404, None).is_recoverable());
+        assert_eq!(
+            FetchFailure::http_client_why(404, None).http_status(),
+            Some(404)
+        );
     }
 
     #[test]
     fn url_validation() {
-        assert!(validate_url("https://example.com/sub").is_ok());
+        // The Ok value is the parsed URL, so a caller that vetts the host
+        // next does not parse the same string twice.
+        let parsed = validate_url("https://example.com/sub").unwrap();
+        assert_eq!(parsed.host_str(), Some("example.com"));
         assert!(validate_url("http://example.com").is_ok());
         assert!(validate_url("ftp://example.com").is_err());
         assert!(validate_url("not a url").is_err());
@@ -1070,44 +1059,13 @@ mod tests {
     }
 
     /// Minimal HTTP/1.1 responder on 127.0.0.1; serves any number of
-    /// requests while the test runtime lives.
-    async fn spawn_v4_listener() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                    .await;
-            }
-        });
-        addr
-    }
-
-    /// Responder that answers every request with `302 Location: <target>`.
-    async fn spawn_redirector(target: String) -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                let response = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: {target}\r\ncontent-length: 0\r\n\r\n"
-                );
-                let _ = sock.write_all(response.as_bytes()).await;
-            }
-        });
-        addr
-    }
-
-    /// Responder that echoes back which of the request's headers it saw,
-    /// so a test can assert what survived a redirect.
-    async fn spawn_header_echo() -> std::net::SocketAddr {
+    /// requests while the test runtime lives. One shape for every test
+    /// endpoint: `make` builds each response from the request bytes it
+    /// receives, a counter it needs lives in an `Arc` the test owns and
+    /// the closure captures.
+    async fn spawn_responder(
+        make: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1115,20 +1073,45 @@ mod tests {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = [0u8; 4096];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
-                let body = if request.contains("x-subscription-token:") {
-                    "LEAKED"
-                } else {
-                    "clean"
-                };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = sock.write_all(response.as_bytes()).await;
+                let response = make(&buf[..n]);
+                let _ = sock.write_all(&response).await;
             }
         });
         addr
+    }
+
+    /// Minimal HTTP/1.1 responder on 127.0.0.1; serves any number of
+    /// requests while the test runtime lives.
+    async fn spawn_v4_listener() -> std::net::SocketAddr {
+        spawn_responder(|_| b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec()).await
+    }
+
+    /// Responder that answers every request with `302 Location: <target>`.
+    async fn spawn_redirector(target: String) -> std::net::SocketAddr {
+        spawn_responder(move |_| {
+            format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\ncontent-length: 0\r\n\r\n")
+                .into_bytes()
+        })
+        .await
+    }
+
+    /// Responder that echoes back which of the request's headers it saw,
+    /// so a test can assert what survived a redirect.
+    async fn spawn_header_echo() -> std::net::SocketAddr {
+        spawn_responder(|request| {
+            let request = String::from_utf8_lossy(request).to_ascii_lowercase();
+            let body = if request.contains("x-subscription-token:") {
+                "LEAKED"
+            } else {
+                "clean"
+            };
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+        })
+        .await
     }
 
     /// The manual redirect loop follows the redirect itself: a strict
@@ -1268,65 +1251,45 @@ mod tests {
     async fn spawn_canned_listener(
         status: u16,
     ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = hits.clone();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                use std::sync::atomic::Ordering;
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                counter.fetch_add(1, Ordering::SeqCst);
-                let response = format!("HTTP/1.1 {status} canned\r\ncontent-length: 2\r\n\r\nno");
-                let _ = sock.write_all(response.as_bytes()).await;
-            }
-        });
+        let counter = Arc::clone(&hits);
+        let addr = spawn_responder(move |_| {
+            use std::sync::atomic::Ordering;
+            counter.fetch_add(1, Ordering::SeqCst);
+            format!("HTTP/1.1 {status} canned\r\ncontent-length: 2\r\n\r\nno").into_bytes()
+        })
+        .await;
         (addr, hits)
     }
 
     /// 503 on the first request, 200 `ok` on every later one.
     async fn spawn_recovering_listener()
     -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = hits.clone();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                use std::sync::atomic::Ordering;
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                let nth = counter.fetch_add(1, Ordering::SeqCst);
-                let response = if nth == 0 {
-                    "HTTP/1.1 503 later\r\ncontent-length: 0\r\n\r\n".to_string()
-                } else {
-                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_string()
-                };
-                let _ = sock.write_all(response.as_bytes()).await;
+        let counter = Arc::clone(&hits);
+        let addr = spawn_responder(move |_| {
+            use std::sync::atomic::Ordering;
+            let nth = counter.fetch_add(1, Ordering::SeqCst);
+            if nth == 0 {
+                b"HTTP/1.1 503 later\r\ncontent-length: 0\r\n\r\n".to_vec()
+            } else {
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec()
             }
-        });
+        })
+        .await;
         (addr, hits)
     }
 
     /// Responder serving a deterministic 64 KiB body.
     async fn spawn_body_listener() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        spawn_responder(|_| {
             let body = vec![b'x'; 64 * 1024];
-            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
-            while let Ok((mut sock, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(&body).await;
-            }
-        });
-        addr
+            let mut response =
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len()).into_bytes();
+            response.extend_from_slice(&body);
+            response
+        })
+        .await
     }
 
     /// The retry loop exists for transient upstream failures: a 503
@@ -1380,13 +1343,45 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, FetchFailure::HttpClient { status: 403, .. }));
         assert_eq!(hits.load(Ordering::SeqCst), 1, "403 is terminal");
+
+        // 408 and 429 are 4xx by class but transient by nature: the server
+        // itself says "try again", so they are retried like the 5xx and
+        // journaled as `http_server`.
+        for status in [408u16, 429] {
+            let (addr, hits) = spawn_canned_listener(status).await;
+            let config = FetchConfig {
+                retry_base_backoff_ms: 1,
+                ..FetchConfig::default()
+            };
+            let fetcher = Fetcher::new(config, true, Duration::from_secs(5));
+            let err = fetcher
+                .fetch(&format!("http://{addr}/sub"), &Default::default(), None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, FetchFailure::HttpServer { .. }),
+                "HTTP {status} must be classified as a server error, got {err:?}"
+            );
+            assert!(
+                err.attempts() > 1,
+                "HTTP {status} must be retried, attempts: {}",
+                err.attempts()
+            );
+            assert!(
+                hits.load(Ordering::SeqCst) > 1,
+                "HTTP {status} must reach the listener more than once"
+            );
+        }
     }
 
     /// The body cap is the decompression-bomb guard: a response larger
     /// than `max_response_bytes` fails as `ResponseTooLarge` instead of
-    /// being buffered to completion. The class is `http_server` (an
-    /// upstream misbehaviour) and recoverable, so a fluke oversized
-    /// payload may be retried; the same body under a bigger cap passes.
+    /// being buffered to completion. The class is `http_server` — the
+    /// `error_class` vocabulary is the journal's coarse grouping, not a
+    /// retry verdict — while [`FetchFailure::is_recoverable`] says false:
+    /// the same body is over the cap on every attempt, so retrying reads
+    /// the whole oversized body again. The same body under a bigger cap
+    /// passes.
     #[tokio::test]
     async fn oversized_bodies_stop_at_the_configured_cap() {
         let addr = spawn_body_listener().await;
@@ -1477,22 +1472,16 @@ mod tests {
     /// Responder serving a gzip-compressed body with the matching
     /// `content-encoding` header, so the client decompresses it.
     async fn spawn_gzip_listener(body: &'static [u8]) -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let head = format!(
+        spawn_responder(move |_| {
+            let mut response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
                 body.len()
-            );
-            while let Ok((mut sock, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body).await;
-            }
-        });
-        addr
+            )
+            .into_bytes();
+            response.extend_from_slice(body);
+            response
+        })
+        .await
     }
 
     /// Responder that accepts the connection and closes it at once, so the

@@ -38,15 +38,18 @@ use std::time::{Duration, SystemTime};
 const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Connect timeout for one download.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Overall budget for one download, the City database is ~70 MB.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Overall budget for one download. The City database is ~70 MB and the
+/// mirrors throttle, so the ceiling has to cover a slow link: a download
+/// that runs past it simply retries on the next start (the partial
+/// temporary file is removed, nothing partial is ever installed).
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Redirect hops allowed between the shortlink and the release asset.
 const MAX_REDIRECTS: usize = 5;
 /// Upper bound on one database download: the City database is ~70 MB, so
 /// anything larger is a broken or hostile mirror, not a database. The
 /// stream is cut as soon as the running total passes the cap, so a rogue
 /// endpoint cannot fill the disk (the response is streamed to a temp file
-/// and would otherwise be bounded only by the 5-minute budget).
+/// and would otherwise be bounded only by the download budget).
 const MAX_MMDB_BYTES: u64 = 512 * 1024 * 1024;
 /// The MaxMind metadata marker; a real `.mmdb` ends with its metadata block.
 const METADATA_MARKER: &[u8] = b"\xab\xcd\xefMaxMind.com";
@@ -115,10 +118,11 @@ pub async fn ensure_geo_databases(config: &AppConfig) {
         tracing::debug!("[geo].db_dir is empty, skipping GeoLite2 database download");
         return;
     }
-    if !ensure_writable_dir(&geo.db_dir) {
+    if let Err(reason) = ensure_writable_dir(&geo.db_dir) {
         tracing::warn!(
             dir = %geo.db_dir.display(),
-            "directory is not writable, skipping GeoLite2 database download; \
+            reason,
+            "db_dir is not writable, skipping GeoLite2 database download; \
              provide the .mmdb files manually"
         );
         return;
@@ -144,7 +148,8 @@ pub async fn ensure_geo_databases(config: &AppConfig) {
                 tracing::warn!(
                     file = name,
                     reason,
-                    "GeoLite2 database download failed; will retry on next start"
+                    "GeoLite2 database download failed; will retry on next start; \
+                     provide the .mmdb file in [geo].db_dir manually or change [geo].download_urls"
                 );
             }
         }
@@ -204,16 +209,53 @@ async fn ensure_one(
     user_agent: &str,
 ) -> Outcome {
     let path = dir.join(file.kind.file_name());
-    if !needs_download(&path, file.db_type) {
+    let freshness = freshness(&path, file.db_type);
+    if freshness == Freshness::Fresh {
         return Outcome::Fresh;
     }
+    // The reason travels with the start of the download, so the log tells a
+    // first install (file is absent) from a routine refresh (stale) and
+    // from a repair (failed the content check).
+    tracing::info!(
+        file = file.kind.file_name(),
+        reason = freshness.label(),
+        "the installed file is {}; re-downloading",
+        freshness.label()
+    );
     match download_and_install(&path, url, file.db_type, checksum, user_agent).await {
         Ok(bytes) => Outcome::Downloaded { bytes },
         Err(reason) => Outcome::Failed { reason },
     }
 }
 
-/// Whether the file must be (re-)downloaded.
+/// Why the file in a slot must be (re-)downloaded, or `Fresh` when it must
+/// not. The reason is what the pre-download log line names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Freshness {
+    /// A plausible file, younger than [`MAX_AGE`].
+    Fresh,
+    /// Nothing (or something that is not a regular file) in the slot.
+    Absent,
+    /// The file carries no MaxMind metadata block: empty, unreadable, an
+    /// HTML error page served with HTTP 200, a truncated download.
+    NotADatabase,
+    /// A database older than [`MAX_AGE`].
+    Stale,
+}
+
+impl Freshness {
+    /// The phrase the pre-download log line uses.
+    fn label(self) -> &'static str {
+        match self {
+            Freshness::Fresh => "fresh",
+            Freshness::Absent => "absent",
+            Freshness::NotADatabase => "failed the content check",
+            Freshness::Stale => "stale",
+        }
+    }
+}
+
+/// Whether the file in a slot must be (re-)downloaded, and why.
 ///
 /// A missing, empty or markerless file (an HTML error page served with
 /// HTTP 200, a truncated download) is replaced whatever its age. A file
@@ -223,31 +265,31 @@ async fn ensure_one(
 /// would silently drop the operator's choice. Age is only consulted for a
 /// file that passes the content check, so a stale database is refreshed
 /// instead of being kept for another month.
-fn needs_download(path: &Path, db_type: &str) -> bool {
+fn freshness(path: &Path, db_type: &str) -> Freshness {
     let Ok(meta) = std::fs::metadata(path) else {
-        return true; // absent
+        return Freshness::Absent;
     };
     if !meta.is_file() {
-        return true;
+        return Freshness::Absent;
     }
     let Some(tail) = read_tail(path) else {
-        return true; // empty or unreadable
+        return Freshness::NotADatabase; // empty or unreadable
     };
-    let Some(marker) = twoway_find(&tail, METADATA_MARKER) else {
-        return true; // no metadata block: not a database
+    let Some(marker) = naive_find(&tail, METADATA_MARKER) else {
+        return Freshness::NotADatabase; // no metadata block: not a database
     };
-    if twoway_find(&tail[marker..], db_type.as_bytes()).is_none() {
+    if naive_find(&tail[marker..], db_type.as_bytes()).is_none() {
         tracing::info!(
             path = %path.display(),
             expected = db_type,
             "the installed database declares another type; keeping it"
         );
-        return false;
+        return Freshness::Fresh;
     }
     // A future mtime (clock skew) counts as fresh: it cannot be a month old.
     match SystemTime::now().duration_since(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)) {
-        Ok(age) => age > MAX_AGE,
-        Err(_) => false,
+        Ok(age) if age > MAX_AGE => Freshness::Stale,
+        _ => Freshness::Fresh,
     }
 }
 
@@ -263,11 +305,11 @@ fn verified_mmdb(path: &Path, db_type: &str) -> bool {
     let Some(tail) = read_tail(path) else {
         return false;
     };
-    match twoway_find(&tail, METADATA_MARKER) {
+    match naive_find(&tail, METADATA_MARKER) {
         // The type only counts when it sits in the metadata block, i.e.
         // after the marker: a city name appearing in the data section is
         // not a declaration of what the file is.
-        Some(marker) => twoway_find(&tail[marker..], db_type.as_bytes()).is_some(),
+        Some(marker) => naive_find(&tail[marker..], db_type.as_bytes()).is_some(),
         None => false,
     }
 }
@@ -292,8 +334,12 @@ fn read_tail(path: &Path) -> Option<Vec<u8>> {
     Some(tail)
 }
 
-/// Find `needle` in a buffer (naive scan; the window is small).
-fn twoway_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+/// Find `needle` in a buffer with a naive sliding-window scan: no Two-Way
+/// or other linear-time algorithm behind the name, the worst case is
+/// O(n·m), which is safe only because the haystack is the last
+/// [`MARKER_WINDOW`] (128 KiB) bytes of a file and the needle is a fixed
+/// 15-byte marker.
+fn naive_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
@@ -342,21 +388,19 @@ fn host_allowed_for_redirect(host: &str, mirror_host: Option<&str>) -> bool {
 
 /// Create `dir` when missing and probe that we can actually write to it
 /// (mode bits alone do not decide, ACLs, read-only mounts and root do).
-fn ensure_writable_dir(dir: &Path) -> bool {
+/// The error text comes back with `Err`; the caller owns the single log
+/// line, so the reason and the action are reported in one place.
+fn ensure_writable_dir(dir: &Path) -> Result<(), String> {
     if let Err(err) = std::fs::create_dir_all(dir) {
-        tracing::warn!(dir = %dir.display(), error = %err, "cannot create db_dir");
-        return false;
+        return Err(format!("cannot create the directory: {err}"));
     }
     let probe = dir.join(format!(".fumox-write-probe-{}", std::process::id()));
     match std::fs::File::create(&probe) {
         Ok(_) => {
             drop(std::fs::remove_file(&probe));
-            true
+            Ok(())
         }
-        Err(err) => {
-            tracing::warn!(dir = %dir.display(), error = %err, "db_dir is not writable");
-            false
-        }
+        Err(err) => Err(format!("cannot write to the directory: {err}")),
     }
 }
 
@@ -376,6 +420,16 @@ async fn download_and_install(
     user_agent: &str,
 ) -> Result<u64, String> {
     let tmp = tmp_path(dest);
+    // The download runs unattended for minutes, so the start is an info
+    // event, not silence until the outcome: `bytes_hint` is the ceiling
+    // the stream is cut at ([`MAX_MMDB_BYTES`]), the size the operator
+    // should expect to move, not the exact file size.
+    tracing::info!(
+        file = %dest.display(),
+        url,
+        bytes_hint = MAX_MMDB_BYTES,
+        "downloading GeoLite2 database, this may take a few minutes"
+    );
     let bytes = match download_body(url, &tmp, user_agent).await {
         Ok(bytes) => bytes,
         Err(reason) => {
@@ -588,12 +642,12 @@ mod tests {
     #[test]
     fn marker_scan_finds_the_metadata_tail() {
         let tail = fake_mmdb(b"proxies", CITY);
-        assert!(twoway_find(&tail, METADATA_MARKER).is_some());
-        assert!(twoway_find(b"no marker here", METADATA_MARKER).is_none());
-        assert!(twoway_find(b"", METADATA_MARKER).is_none());
+        assert!(naive_find(&tail, METADATA_MARKER).is_some());
+        assert!(naive_find(b"no marker here", METADATA_MARKER).is_none());
+        assert!(naive_find(b"", METADATA_MARKER).is_none());
         // A needle longer than the haystack never matches.
-        assert!(twoway_find(METADATA_MARKER, b"\xab\xcd\xefMaxMind.com!!").is_none());
-        assert!(twoway_find(b"ab", b"").is_none());
+        assert!(naive_find(METADATA_MARKER, b"\xab\xcd\xefMaxMind.com!!").is_none());
+        assert!(naive_find(b"ab", b"").is_none());
     }
 
     #[test]
@@ -602,19 +656,19 @@ mod tests {
         let path = dir.join("x.mmdb");
 
         // Absent file.
-        assert!(needs_download(&path, CITY));
+        assert_eq!(freshness(&path, CITY), Freshness::Absent);
 
         // Empty file (a broken download).
         std::fs::write(&path, b"").unwrap();
-        assert!(needs_download(&path, CITY));
+        assert_eq!(freshness(&path, CITY), Freshness::NotADatabase);
 
         // Markerless content (an HTML error page served with HTTP 200).
         std::fs::write(&path, b"<html>not a database</html>").unwrap();
-        assert!(needs_download(&path, CITY));
+        assert_eq!(freshness(&path, CITY), Freshness::NotADatabase);
 
         // A plausible, fresh file stays.
         std::fs::write(&path, fake_mmdb(b"db-body", CITY)).unwrap();
-        assert!(!needs_download(&path, CITY));
+        assert_eq!(freshness(&path, CITY), Freshness::Fresh);
 
         // Older than a month, refresh.
         let month_ago = SystemTime::now() - Duration::from_secs(31 * 24 * 3600);
@@ -624,7 +678,7 @@ mod tests {
             .unwrap()
             .set_modified(month_ago)
             .unwrap();
-        assert!(needs_download(&path, CITY));
+        assert_eq!(freshness(&path, CITY), Freshness::Stale);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -640,11 +694,12 @@ mod tests {
 
         // ASN content sitting in the City slot.
         std::fs::write(&path, fake_mmdb(b"asn-body", ASN)).unwrap();
-        assert!(
-            !needs_download(&path, CITY),
+        assert_eq!(
+            freshness(&path, CITY),
+            Freshness::Fresh,
             "a database of another kind is kept"
         );
-        assert!(!needs_download(&path, ASN));
+        assert_eq!(freshness(&path, ASN), Freshness::Fresh);
 
         // The type string before the marker is data-section text, not a
         // declaration, and does not satisfy the check: the file declares
@@ -652,12 +707,12 @@ mod tests {
         let mut smuggled = b"GeoLite2-City".to_vec();
         smuggled.extend_from_slice(&fake_mmdb(b"body", ASN));
         std::fs::write(&path, smuggled).unwrap();
-        assert!(!needs_download(&path, CITY));
+        assert_eq!(freshness(&path, CITY), Freshness::Fresh);
 
         // A file without the metadata block is not a database at all (an
         // HTML error page, a truncated download) and is replaced.
         std::fs::write(&path, b"<html>not a database</html>").unwrap();
-        assert!(needs_download(&path, CITY));
+        assert_eq!(freshness(&path, CITY), Freshness::NotADatabase);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -739,17 +794,19 @@ mod tests {
     #[test]
     fn writable_dir_requires_a_real_writable_directory() {
         let dir = scratch_dir();
-        assert!(ensure_writable_dir(&dir));
+        assert!(ensure_writable_dir(&dir).is_ok());
 
         // Missing directories are created (the default db_dir is relative).
         let nested = dir.join("a/b");
-        assert!(ensure_writable_dir(&nested));
+        assert!(ensure_writable_dir(&nested).is_ok());
         assert!(nested.is_dir());
 
-        // A regular file in the place of the directory is not writable.
+        // A regular file in the place of the directory is not writable, and
+        // the error text names what went wrong (the caller's log line).
         let as_file = dir.join("occupied");
         std::fs::write(&as_file, b"x").unwrap();
-        assert!(!ensure_writable_dir(&as_file));
+        let reason = ensure_writable_dir(&as_file).unwrap_err();
+        assert!(reason.contains("directory"), "{reason}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

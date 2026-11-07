@@ -2,6 +2,22 @@
 
 {% block title %}{{ self.t("set.edit_title") }}{% endblock %}
 
+{#- The unit half of a rate-limit pair: one select with the four
+    canonical windows, rendered for every rate-limit setting. A window
+    the four units cannot spell renders as its exact seconds (`90sec`);
+    the select carries it as an extra option so the untouched pair
+    round-trips instead of the browser falling back to the first
+    option. -#}
+{% macro unit_select(field) %}
+<select name="{{ field }}" aria-label="{{ self.t("common.unit_label") }}"{{ self.field_disabled(field) }}{{ self.error_attrs(field) | safe }}>
+  {% if !self.unit_is_canonical(field) %}<option value="{{ self.raw_value(field) }}" selected>{{ self.raw_value(field) }}</option>{% endif %}
+  <option value="sec" {% if self.raw_value(field) == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
+  <option value="min" {% if self.raw_value(field) == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>
+  <option value="hour" {% if self.raw_value(field) == "hour" %}selected{% endif %}>{{ self.t("common.unit_hour") }}</option>
+  <option value="day" {% if self.raw_value(field) == "day" %}selected{% endif %}>{{ self.t("common.unit_day") }}</option>
+</select>
+{% endmacro %}
+
 {% block content %}
 <div class="page-head">
   <h1>{{ self.t("set.edit_title") }} <span class="muted small">{{ self.editing_path_str() }}</span></h1>
@@ -97,12 +113,7 @@
         <label for="server-rate-limit">{{ self.t("set.rate_limit") }}</label>
         <div class="inline-controls">
           <input type="number" id="server-rate-limit" name="server.rate_limit.limit" min="{{ self.range_min("server.rate_limit.limit") }}" max="{{ self.range_max("server.rate_limit.limit") }}" value="{{ self.raw_value("server.rate_limit.limit") }}"{{ self.field_disabled("server.rate_limit.limit") }}{{ self.error_attrs("server.rate_limit.limit") | safe }}>
-          <select name="server.rate_limit.unit" aria-label="{{ self.t("common.unit_label") }}"{{ self.field_disabled("server.rate_limit.unit") }}{{ self.error_attrs("server.rate_limit.unit") | safe }}>
-            <option value="sec" {% if self.raw_value("server.rate_limit.unit") == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
-            <option value="min" {% if self.raw_value("server.rate_limit.unit") == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>
-            <option value="hour" {% if self.raw_value("server.rate_limit.unit") == "hour" %}selected{% endif %}>{{ self.t("common.unit_hour") }}</option>
-            <option value="day" {% if self.raw_value("server.rate_limit.unit") == "day" %}selected{% endif %}>{{ self.t("common.unit_day") }}</option>
-          </select>
+          {{ unit_select("server.rate_limit.unit") }}
         </div>
         {% match self.range_text("server.rate_limit.limit") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("server.rate_limit.limit") %}{% when Some with (msg) %}<div class="error-text" id="err-server.rate_limit.limit" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
@@ -112,12 +123,7 @@
         <label for="server-auth-fail-limit">{{ self.t("set.auth_fail_limit") }}</label>
         <div class="inline-controls">
           <input type="number" id="server-auth-fail-limit" name="server.auth_fail_rate_limit.limit" min="{{ self.range_min("server.auth_fail_rate_limit.limit") }}" max="{{ self.range_max("server.auth_fail_rate_limit.limit") }}" value="{{ self.raw_value("server.auth_fail_rate_limit.limit") }}"{{ self.field_disabled("server.auth_fail_rate_limit.limit") }}{{ self.error_attrs("server.auth_fail_rate_limit.limit") | safe }}>
-          <select name="server.auth_fail_rate_limit.unit" aria-label="{{ self.t("common.unit_label") }}"{{ self.field_disabled("server.auth_fail_rate_limit.unit") }}{{ self.error_attrs("server.auth_fail_rate_limit.unit") | safe }}>
-            <option value="sec" {% if self.raw_value("server.auth_fail_rate_limit.unit") == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
-            <option value="min" {% if self.raw_value("server.auth_fail_rate_limit.unit") == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>
-            <option value="hour" {% if self.raw_value("server.auth_fail_rate_limit.unit") == "hour" %}selected{% endif %}>{{ self.t("common.unit_hour") }}</option>
-            <option value="day" {% if self.raw_value("server.auth_fail_rate_limit.unit") == "day" %}selected{% endif %}>{{ self.t("common.unit_day") }}</option>
-          </select>
+          {{ unit_select("server.auth_fail_rate_limit.unit") }}
         </div>
         {% match self.range_text("server.auth_fail_rate_limit.limit") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("server.auth_fail_rate_limit.limit") %}{% when Some with (msg) %}<div class="error-text" id="err-server.auth_fail_rate_limit.limit" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
@@ -278,12 +284,7 @@
         <label for="admin-rate-limit">{{ self.t("set.rate_limit") }}</label>
         <div class="inline-controls">
           <input type="number" id="admin-rate-limit" name="admin.rate_limit.limit" min="{{ self.range_min("admin.rate_limit.limit") }}" max="{{ self.range_max("admin.rate_limit.limit") }}" value="{{ self.raw_value("admin.rate_limit.limit") }}"{{ self.field_disabled("admin.rate_limit.limit") }}{{ self.error_attrs("admin.rate_limit.limit") | safe }}>
-          <select name="admin.rate_limit.unit" aria-label="{{ self.t("common.unit_label") }}"{{ self.field_disabled("admin.rate_limit.unit") }}{{ self.error_attrs("admin.rate_limit.unit") | safe }}>
-            <option value="sec" {% if self.raw_value("admin.rate_limit.unit") == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
-            <option value="min" {% if self.raw_value("admin.rate_limit.unit") == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>
-            <option value="hour" {% if self.raw_value("admin.rate_limit.unit") == "hour" %}selected{% endif %}>{{ self.t("common.unit_hour") }}</option>
-            <option value="day" {% if self.raw_value("admin.rate_limit.unit") == "day" %}selected{% endif %}>{{ self.t("common.unit_day") }}</option>
-          </select>
+          {{ unit_select("admin.rate_limit.unit") }}
         </div>
         {% match self.range_text("admin.rate_limit.limit") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("admin.rate_limit.limit") %}{% when Some with (msg) %}<div class="error-text" id="err-admin.rate_limit.limit" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
@@ -293,12 +294,7 @@
         <label for="admin-login-rate-limit">{{ self.t("set.login_rate_limit") }}</label>
         <div class="inline-controls">
           <input type="number" id="admin-login-rate-limit" name="admin.login_rate_limit.limit" min="{{ self.range_min("admin.login_rate_limit.limit") }}" max="{{ self.range_max("admin.login_rate_limit.limit") }}" value="{{ self.raw_value("admin.login_rate_limit.limit") }}"{{ self.field_disabled("admin.login_rate_limit.limit") }}{{ self.error_attrs("admin.login_rate_limit.limit") | safe }}>
-          <select name="admin.login_rate_limit.unit" aria-label="{{ self.t("common.unit_label") }}"{{ self.field_disabled("admin.login_rate_limit.unit") }}{{ self.error_attrs("admin.login_rate_limit.unit") | safe }}>
-            <option value="sec" {% if self.raw_value("admin.login_rate_limit.unit") == "sec" %}selected{% endif %}>{{ self.t("common.unit_sec") }}</option>
-            <option value="min" {% if self.raw_value("admin.login_rate_limit.unit") == "min" %}selected{% endif %}>{{ self.t("common.unit_min") }}</option>
-            <option value="hour" {% if self.raw_value("admin.login_rate_limit.unit") == "hour" %}selected{% endif %}>{{ self.t("common.unit_hour") }}</option>
-            <option value="day" {% if self.raw_value("admin.login_rate_limit.unit") == "day" %}selected{% endif %}>{{ self.t("common.unit_day") }}</option>
-          </select>
+          {{ unit_select("admin.login_rate_limit.unit") }}
         </div>
         {% match self.range_text("admin.login_rate_limit.limit") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("admin.login_rate_limit.limit") %}{% when Some with (msg) %}<div class="error-text" id="err-admin.login_rate_limit.limit" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
@@ -586,7 +582,7 @@
   </fieldset>
 
   <div class="form-actions">
-    <button class="btn primary" type="submit" {% if !state.config_writable %}disabled{% endif %}>{{ self.t("set.edit_save") }}</button>
+    <button class="btn primary" type="submit" {% if !self.config_writable %}disabled{% endif %}>{{ self.t("set.edit_save") }}</button>
     <a class="btn" href="/admin/settings">{{ self.t("set.edit_cancel") }}</a>
   </div>
 </form>

@@ -151,4 +151,25 @@ mod tests {
         assert!(!ct_eq("supersecret", "superdsecret"));
         assert!(ct_eq("supersecret", "supersecret"));
     }
+
+    /// Direct unit tests of [`ct_eq`], the comparison every secret check
+    /// (cookie/CSRF, capability tokens, this module's [`verify`]) goes
+    /// through: equal strings are equal, everything else — a different
+    /// length on either side, one differing character at equal length, an
+    /// empty string against a non-empty one — is not.
+    #[test]
+    fn ct_eq_verdicts() {
+        // Equal strings, including two empty ones.
+        assert!(ct_eq("", ""));
+        assert!(ct_eq("supersecret", "supersecret"));
+        // Different lengths, either side the longer one.
+        assert!(!ct_eq("supersecret", "supersecret2"));
+        assert!(!ct_eq("supersecret2", "supersecret"));
+        // Empty against non-empty, both directions.
+        assert!(!ct_eq("", "supersecret"));
+        assert!(!ct_eq("supersecret", ""));
+        // Equal length, one differing character, at the head and at the tail.
+        assert!(!ct_eq("supersecret", "dupersecret"));
+        assert!(!ct_eq("supersecret", "supersecreD"));
+    }
 }

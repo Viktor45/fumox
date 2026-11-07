@@ -1,0 +1,21 @@
+{#- Fragment: the toggle form of a card (source or profile), the markup
+    shared by sources/_toggle_form.html and profiles/_toggle_form.html.
+    An include shares the including template's context, so the host
+    provides the four fields as flat context fields: `toggle_url` (the
+    POST endpoint of the card), `enabled` (the state the form flips),
+    `csrf` and `swap_oob`.
+
+    The POST form carries the CSRF token in the hidden `_csrf` field,
+    taken from the `csrf` field of the template context.
+
+    The button carries the action, not the state ("Disable" on an
+    enabled card), and the state lives in the badge next to it, so the
+    button has no aria-pressed. The button is disabled while the request
+    runs, so a second click cannot flip the flag twice, and the response
+    error is printed into the slot the page keeps next to the badge. -#}
+<form id="toggle-form" method="post" action="{{ toggle_url }}"
+      hx-post="{{ toggle_url }}" hx-target="#enabled-badge" hx-swap="innerHTML"
+      hx-disabled-elt="find button" data-error-target="toggle-error"{% if swap_oob %} hx-swap-oob="outerHTML:#toggle-form"{% endif %}>
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <button class="btn" type="submit">{% if enabled %}{{ self.t("common.disable") }}{% else %}{{ self.t("common.enable") }}{% endif %}<span class="htmx-indicator">&nbsp;…</span></button>
+</form>

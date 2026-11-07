@@ -60,6 +60,13 @@ pub mod meta {
     pub const MEOW_MEMORY_KEY: &str = "meow_memory";
     /// `meta` key of the probe retention stamp ([`LastRotation`], JSON).
     pub const LAST_ROTATION_KEY: &str = "last_rotation";
+    /// `meta` key of the server scheduler's own journal-retention stamp
+    /// ([`ServerRetentionStamp`], JSON). A separate key on purpose: the
+    /// server's sweep covers the two tables the *server* writes, and a
+    /// server-side pass overwriting [`LAST_ROTATION_KEY`] used to zero the
+    /// daemon's `probe_results` counter and read as "the daemon rotated"
+    /// in a deployment that has none.
+    pub const SERVER_RETENTION_KEY: &str = "server_retention";
     /// `meta` key of the server scheduler sweep stamp (unix seconds as
     /// plain text; deliberately not JSON, the reader only needs the age).
     pub const SERVER_CYCLE_KEY: &str = "server_cycle";
@@ -136,6 +143,29 @@ pub mod meta {
         true
     }
 
+    /// `server_retention`: one server-side retention pass over the two
+    /// journals the server itself writes (`fetch_log`, `probe_requests`).
+    /// Same reporting contract as [`LastRotation`] minus the daemon-only
+    /// `probe_results` counter: a failed pass keeps the `ts` of the last
+    /// *successful* one and carries `ok: false` with the error text, so a
+    /// stale stamp reads as "the sweep has not succeeded lately", not as
+    /// "it ran and died silently".
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ServerRetentionStamp {
+        pub ts: i64,
+        #[serde(default)]
+        pub fetch_log: u64,
+        #[serde(default)]
+        pub probe_requests: u64,
+        /// Whether the pass ran to completion; a stamp written before the
+        /// field existed parses as successful.
+        #[serde(default = "default_rotation_ok")]
+        pub ok: bool,
+        /// The failure of a pass that ended early, `None` on success.
+        #[serde(default)]
+        pub error: Option<String>,
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -198,6 +228,32 @@ pub mod meta {
             };
             let raw = serde_json::to_string(&full).unwrap();
             assert_eq!(serde_json::from_str::<LastRotation>(&raw).unwrap(), full);
+        }
+
+        /// The server-side retention stamp round-trips, and a hand-written
+        /// fixture without the outcome pair (a stamp from before the field
+        /// existed) reads as a successful pass.
+        #[test]
+        fn server_retention_stamp_round_trips() {
+            let minimal: ServerRetentionStamp = serde_json::from_str(r#"{"ts":5}"#).unwrap();
+            assert_eq!(minimal.ts, 5);
+            assert_eq!(minimal.fetch_log, 0);
+            assert_eq!(minimal.probe_requests, 0);
+            assert!(minimal.ok, "a legacy stamp has no failure on record");
+            assert_eq!(minimal.error, None);
+
+            let full = ServerRetentionStamp {
+                ts: 5,
+                fetch_log: 12,
+                probe_requests: 3,
+                ok: false,
+                error: Some("fetch_log: database is locked".to_string()),
+            };
+            let raw = serde_json::to_string(&full).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ServerRetentionStamp>(&raw).unwrap(),
+                full
+            );
         }
 
         /// The on-wire JSON keeps the key names the hand-built payload
@@ -395,6 +451,24 @@ pub async fn count_all(pool: &DbPool) -> crate::Result<i64> {
         .fetch_one(pool)
         .await?;
     Ok(count)
+}
+
+/// `(total, ok)` health-check counts over a rolling window, the
+/// dashboard's success-rate card. One grouped pass, so the two figures
+/// cannot disagree. Speed probes are excluded: they measure transfer
+/// bandwidth, not liveness, so they are not a check that can succeed.
+pub async fn success_counts_since<'e, E>(executor: E, since_ts: i64) -> crate::Result<(i64, i64)>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(ok), 0) FROM probe_results
+         WHERE checked_at > ? AND probe_kind != 'speed'",
+    )
+    .bind(since_ts)
+    .fetch_one(executor)
+    .await?;
+    Ok(row)
 }
 
 /// The `probe_kind` of the most recent failed attempt for a proxy, or `None`

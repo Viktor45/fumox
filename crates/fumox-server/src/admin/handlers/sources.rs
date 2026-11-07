@@ -2,11 +2,12 @@
 //! validation, card with aggregates and fetch log,
 //! toggle / *Refresh now* / delete actions.
 
+use super::profiles::token_placeholder;
 use super::{
-    FormError, FormMap, action_response, action_response_err, caps, flash_redirect, fmt_bytes,
+    FormError, FormMap, action_response, action_response_err, caps, flash_redirect, fmt_opt_bytes,
     is_htmx, mask_secret, not_found, page_offset, pagination_pages, pipeline_from_form,
-    row_error_response, server_error, validate_header_map, validate_name, validate_slug,
-    validate_tags, validate_ttl,
+    row_error_response, server_error, ttl_range_message, url_problem_message, validate_header_map,
+    validate_name, validate_slug, validate_tags, validate_token, validate_ttl,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -54,6 +55,9 @@ struct SourceCard {
     last_error: Option<String>,
     error_class: Option<ErrorClass>,
     enabled: bool,
+    /// Whether `/src` requires the source's own access token (the model's
+    /// token is a hash, so the card shows the fact, not the secret).
+    token_protected: bool,
 }
 
 impl SourceCard {
@@ -73,6 +77,7 @@ impl SourceCard {
             last_error: source.last_error.clone(),
             error_class: source.error_class,
             enabled: source.enabled,
+            token_protected: source.access_token.is_some(),
         }
     }
 }
@@ -97,6 +102,18 @@ struct SourcesListTemplate {
 
 impl_i18n!(SourcesListTemplate);
 
+/// The `enabled` filter of the list. The select sends `on`/`off`; the
+/// boolean synonyms mean the same, so a hand-typed `?enabled=1` or
+/// `?enabled=false` filters instead of being dropped on the floor.
+/// Any other value filters nothing, like the empty "all" option.
+fn enabled_filter_value(raw: &str) -> Option<bool> {
+    match raw {
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 pub async fn sources_list(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -112,11 +129,7 @@ pub async fn sources_list(
     // The filter clause set lives once in the repo (`SourceListFilter`);
     // every value flows through a bind.
     let filter = sources::SourceListFilter {
-        enabled: match f_enabled.as_str() {
-            "on" => Some(true),
-            "off" => Some(false),
-            _ => None,
-        },
+        enabled: enabled_filter_value(&f_enabled),
         with_errors: f_error,
         tag: f_tag.clone(),
         query: f_q.clone(),
@@ -132,7 +145,7 @@ pub async fn sources_list(
                 row
             })
             .collect(),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.list", &err),
     };
 
     let tags: Vec<String> = sources::distinct_tags(&state.pool)
@@ -141,6 +154,7 @@ pub async fn sources_list(
 
     render_html(
         lang.clone(),
+        "sources/list.html",
         &SourcesListTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -166,6 +180,9 @@ pub async fn sources_list(
 struct SourceFormValues {
     name: String,
     slug: String,
+    /// The endpoint token as the field shows it: empty, or the
+    /// placeholder of a stored token (never the secret itself).
+    access_token: String,
     url: String,
     /// Whether the URL field carries a mask: the note about the restore
     /// is only shown when there is a secret to restore.
@@ -194,6 +211,9 @@ struct SourceFormTemplate {
     errors: Vec<(String, String)>,
     all_protocols: Vec<(String, bool)>,
     headers_masked_note: bool,
+    /// Whether the token field shows a placeholder of a stored token: the
+    /// note that explains the placeholder is only shown then.
+    token_masked_note: bool,
     /// Pipeline widget HTML (builder ⇄ raw), rendered by the
     /// editor module; prefilled from the stored pipeline on GET, from the
     /// posted fields on validation errors.
@@ -211,6 +231,52 @@ fn all_protocols_with_selection(selected: &[String]) -> Vec<(String, bool)> {
             (name, is_selected)
         })
         .collect()
+}
+
+/// Render one screen of the source editor. The four call sites — the two
+/// GET renders and the two validation-error replays — share the chrome
+/// and the response shape here; what differs between them (the form id,
+/// the action, the values, the protocol selection, the errors, the
+/// status, the header-note flag) rides in the arguments. A caller that
+/// re-renders a posted submission parses the form once
+/// ([`form_values_from`]) and hands the parsed value over, so the values
+/// and the protocol selection cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+fn render_source_form(
+    state: &AdminState,
+    headers: &HeaderMap,
+    lang: Lang,
+    theme: Theme,
+    status: StatusCode,
+    form_id: Option<String>,
+    action: String,
+    values: SourceFormValues,
+    selected_protocols: &[String],
+    errors: Vec<(String, String)>,
+    headers_masked_note: bool,
+    token_masked_note: bool,
+    widget_html: String,
+) -> Response {
+    render_html(
+        lang.clone(),
+        "sources/form.html",
+        &SourceFormTemplate {
+            lang,
+            langs: state.locales.choices().to_vec(),
+            theme,
+            active: "sources",
+            csrf: state.csrf_for(headers),
+            form_id,
+            action,
+            values,
+            errors,
+            all_protocols: all_protocols_with_selection(selected_protocols),
+            headers_masked_note,
+            token_masked_note,
+            widget_html,
+        },
+        status,
+    )
 }
 
 pub async fn source_form(State(state): State<AdminState>, headers: HeaderMap) -> Response {
@@ -231,23 +297,20 @@ pub async fn source_form(State(state): State<AdminState>, headers: HeaderMap) ->
         String::new(),
         false,
     );
-    render_html(
-        lang.clone(),
-        &SourceFormTemplate {
-            lang,
-            langs: state.locales.choices().to_vec(),
-            theme,
-            active: "sources",
-            csrf: state.csrf_for(&headers),
-            form_id: None,
-            action: "/admin/sources/new".into(),
-            values,
-            errors: Vec::new(),
-            all_protocols: all_protocols_with_selection(&[]),
-            headers_masked_note: false,
-            widget_html,
-        },
+    render_source_form(
+        &state,
+        &headers,
+        lang,
+        theme,
         StatusCode::OK,
+        None,
+        "/admin/sources/new".into(),
+        values,
+        &[],
+        Vec::new(),
+        false,
+        false,
+        widget_html,
     )
 }
 
@@ -261,7 +324,7 @@ pub async fn source_edit_form(
     let source = match sources::get(&state.pool, &id).await {
         Ok(Some(source)) => source,
         Ok(None) => return not_found(lang, "err.source_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.edit_row", &err),
     };
     // The widget is prefilled from the stored pipeline when the builder can
     // represent it; otherwise it opens in raw mode with the stored JSON and
@@ -281,6 +344,8 @@ pub async fn source_edit_form(
     let values = SourceFormValues {
         name: source.name.clone(),
         slug: source.slug.clone().unwrap_or_default(),
+        // The stored token is a hash, so the field shows a placeholder.
+        access_token: token_placeholder(source.access_token.as_deref()),
         // The secrets of the URL are masked: the form hands the masks
         // back on submit, and the save puts the stored values under them.
         url: mask_url_secrets(&source.url),
@@ -317,23 +382,21 @@ pub async fn source_edit_form(
             })
             .unwrap_or_default(),
     };
-    render_html(
-        lang.clone(),
-        &SourceFormTemplate {
-            lang,
-            langs: state.locales.choices().to_vec(),
-            theme,
-            active: "sources",
-            csrf: state.csrf_for(&headers),
-            form_id: Some(source.id.clone()),
-            action: format!("/admin/sources/{}/edit", source.id),
-            values,
-            errors: Vec::new(),
-            all_protocols: all_protocols_with_selection(&values_for_select(&source)),
-            headers_masked_note: source.headers.as_ref().is_some_and(|map| !map.is_empty()),
-            widget_html,
-        },
+    let headers_masked_note = source.headers.as_ref().is_some_and(|map| !map.is_empty());
+    render_source_form(
+        &state,
+        &headers,
+        lang,
+        theme,
         StatusCode::OK,
+        Some(source.id.clone()),
+        format!("/admin/sources/{}/edit", source.id),
+        values,
+        &values_for_select(&source),
+        Vec::new(),
+        headers_masked_note,
+        source.access_token.is_some(),
+        widget_html,
     )
 }
 
@@ -473,15 +536,31 @@ fn restore_url_secrets(submitted: &str, stored: &str) -> String {
     restore_url_query(&restore_url_password(submitted, stored), stored)
 }
 
-/// Validate + assemble a `Source` from form fields. Returns the model or
-/// the reason it could not be built: per-field errors (translated, shown
+/// Whether the edit leaves the URL and its preferred family alone. Both
+/// go into the save-time SSRF vet, so only the unchanged pair lets the
+/// stored row's existing verdict stand; a create (no stored row) always
+/// vets.
+fn url_and_family_unchanged(
+    existing: Option<&Source>,
+    url: &str,
+    ip_family: Option<IpFamily>,
+) -> bool {
+    match existing {
+        Some(stored) => stored.url == url && stored.ip_family == ip_family,
+        None => false,
+    }
+}
+
+/// Validate + assemble a `Source` from form fields. Returns the model
+/// with the stored row it was built over (`None` for a create), or the
+/// reason it could not be built: per-field errors (translated, shown
 /// next to fields) or a row that could not be read.
 async fn build_source_from_form(
     state: &AdminState,
     lang: &Lang,
     form: &[(String, String)],
     existing_id: Option<&str>,
-) -> Result<Source, FormError> {
+) -> Result<(Source, Option<Source>), FormError> {
     let get = |key: &str| -> String {
         form.iter()
             .rev()
@@ -536,6 +615,35 @@ async fn build_source_from_form(
     )
     .await;
 
+    // The source's own access token guards `/src` (the profile token does
+    // not extend there). Same contract as the profile form: the stored
+    // token is a hash, so the field shows a placeholder, an unchanged
+    // placeholder keeps the stored token, and an empty field clears it.
+    let token_raw = get("access_token");
+    let stored_token = existing.as_ref().and_then(|s| s.access_token.as_deref());
+    let unchanged = stored_token.is_some() && token_raw == token_placeholder(stored_token);
+    let access_token = if unchanged {
+        stored_token.map(str::to_string)
+    } else if token_raw.is_empty() {
+        None
+    } else {
+        Some(token_raw.clone())
+    };
+    // Token format cap: the token guards a public endpoint, so it is
+    // URL-safe and bounded like the profile one.
+    if !unchanged && let Some(token) = access_token.as_ref() {
+        if token.chars().count() < caps::TOKEN_MIN {
+            errors.push((
+                "access_token".into(),
+                lang.t("val.token_too_short")
+                    .replace("{}", &caps::TOKEN_MIN.to_string()),
+            ));
+        }
+        if let Err(message) = validate_token(token, lang) {
+            errors.push(("access_token".into(), message));
+        }
+    }
+
     // The preferred family is parsed before the URL so the save-time SSRF
     // check can vet the host under the source's own constraint.
     let ip_family_raw = get("ip_family");
@@ -567,15 +675,20 @@ async fn build_source_from_form(
             lang.t("val.field_too_long")
                 .replace("{}", &caps::URL.to_string()),
         ));
-    } else if let Err(issue) = fetcher::vet_url_with_policy(
-        &url,
-        state.admin().allow_private_urls,
-        ip_family.unwrap_or_else(|| state.fetcher.default_family()),
-        state.fetcher.dns_timeout,
-    )
-    .await
+    // The stored row was vetted when it was saved: an edit that leaves
+    // the URL and its preferred family alone skips the vet, so saving a
+    // renamed source does not depend on the feed host's DNS answering
+    // this time too.
+    } else if !url_and_family_unchanged(existing.as_ref(), &url, ip_family)
+        && let Err(issue) = fetcher::vet_url_with_policy(
+            &url,
+            state.admin().allow_private_urls,
+            ip_family.unwrap_or_else(|| state.fetcher.default_family()),
+            state.fetcher.dns_timeout,
+        )
+        .await
     {
-        errors.push(("url".into(), lang.t_args(issue.key, &issue.args)));
+        errors.push(("url".into(), url_problem_message(lang, &issue)));
     }
 
     let encoding_raw = get("encoding");
@@ -631,7 +744,7 @@ async fn build_source_from_form(
             }
         },
         Err(_) => {
-            errors.push(("cache_ttl_seconds".into(), lang.t("val.ttl_range").into()));
+            errors.push(("cache_ttl_seconds".into(), ttl_range_message(lang)));
             3600
         }
     };
@@ -716,33 +829,90 @@ async fn build_source_from_form(
 
     let now = now_ts();
 
-    Ok(Source {
-        id: existing_id.map(str::to_string).unwrap_or_else(new_id),
-        slug,
-        name,
-        url,
-        enabled: form.iter().any(|(k, _)| k == "enabled"),
-        encoding,
-        input_format,
-        protocols,
-        cache_ttl_seconds,
-        tags,
-        pipeline,
-        headers: if headers_map.is_empty() {
-            None
-        } else {
-            Some(headers_map)
+    Ok((
+        Source {
+            id: existing_id.map(str::to_string).unwrap_or_else(new_id),
+            slug,
+            access_token,
+            name,
+            url,
+            // HTML checkbox semantics: an unchecked checkbox submits nothing,
+            // a checked one submits its value (`1` in the source form), so
+            // the flag is read from the value, not from the field's presence.
+            enabled: is_checkbox_on(form, "enabled"),
+            encoding,
+            input_format,
+            protocols,
+            cache_ttl_seconds,
+            tags,
+            pipeline,
+            headers: if headers_map.is_empty() {
+                None
+            } else {
+                Some(headers_map)
+            },
+            ip_family,
+            created_at: existing.as_ref().map(|s| s.created_at).unwrap_or(now),
+            updated_at: now,
+            // The fetcher owns these three columns: the admin write path
+            // does not carry them (`sources::update_settings` leaves the
+            // stored values alone), so the assembled row leaves them empty.
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
         },
-        ip_family,
-        created_at: existing.as_ref().map(|s| s.created_at).unwrap_or(now),
-        updated_at: now,
-        // The fetcher owns these three columns: the admin write path
-        // does not carry them (`sources::update_settings` leaves the
-        // stored values alone), so the assembled row leaves them empty.
-        last_fetched_at: None,
-        last_error: None,
-        error_class: None,
-    })
+        existing,
+    ))
+}
+
+/// Names of the settings fields the assembled row changes relative to
+/// the stored one. Names only: the values carry the URL's secrets and
+/// the header values, and neither belongs in the log.
+fn changed_fields(existing: Option<&Source>, updated: &Source) -> Vec<&'static str> {
+    let Some(existing) = existing else {
+        return Vec::new();
+    };
+    let mut changed = Vec::new();
+    if existing.slug != updated.slug {
+        changed.push("slug");
+    }
+    if existing.access_token != updated.access_token {
+        changed.push("access_token");
+    }
+    if existing.name != updated.name {
+        changed.push("name");
+    }
+    if existing.url != updated.url {
+        changed.push("url");
+    }
+    if existing.enabled != updated.enabled {
+        changed.push("enabled");
+    }
+    if existing.encoding != updated.encoding {
+        changed.push("encoding");
+    }
+    if existing.input_format != updated.input_format {
+        changed.push("input_format");
+    }
+    if existing.protocols != updated.protocols {
+        changed.push("protocols");
+    }
+    if existing.cache_ttl_seconds != updated.cache_ttl_seconds {
+        changed.push("cache_ttl_seconds");
+    }
+    if existing.tags != updated.tags {
+        changed.push("tags");
+    }
+    if existing.pipeline != updated.pipeline {
+        changed.push("pipeline");
+    }
+    if existing.headers != updated.headers {
+        changed.push("headers");
+    }
+    if existing.ip_family != updated.ip_family {
+        changed.push("ip_family");
+    }
+    changed
 }
 
 /// Put the stored secret back where the form still carries the mask
@@ -790,6 +960,19 @@ fn url_carries_mask(url: &str) -> bool {
     url.contains(REDACTED) || url.contains(super::MASK_TAIL)
 }
 
+/// The state of an HTML checkbox field in a posted form. An unchecked
+/// checkbox submits nothing at all; a checked one submits its `value`
+/// (`1` for the source form). The truthy synonyms are read the same way
+/// so a hand-built post means what it says, and any other value — an
+/// `enabled=false` included — counts as unchecked instead of flipping
+/// the flag on by mere presence.
+fn is_checkbox_on(form: &[(String, String)], key: &str) -> bool {
+    form.iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .is_some_and(|(_, v)| matches!(v.trim(), "1" | "on" | "true"))
+}
+
 fn form_values_from(form: &[(String, String)]) -> SourceFormValues {
     let get = |key: &str| -> String {
         form.iter()
@@ -802,9 +985,12 @@ fn form_values_from(form: &[(String, String)]) -> SourceFormValues {
     SourceFormValues {
         name: get("name"),
         slug: get("slug"),
+        access_token: get("access_token"),
         url_masked: url_carries_mask(&url),
         url,
-        enabled: form.iter().any(|(k, _)| k == "enabled"),
+        // Same read as the save (`is_checkbox_on`): the replayed form
+        // shows the checkbox exactly the way the row would be saved.
+        enabled: is_checkbox_on(form, "enabled"),
         encoding: get("encoding"),
         input_format: get("input_format"),
         ip_family: get("ip_family"),
@@ -826,7 +1012,7 @@ pub async fn source_create(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
-    let source = match build_source_from_form(&state, &lang, &form, None).await {
+    let (source, _) = match build_source_from_form(&state, &lang, &form, None).await {
         Ok(source) => source,
         Err(FormError::Validation(errors)) => {
             let pipeline_error = errors
@@ -840,31 +1026,31 @@ pub async fn source_create(
                 false,
                 pipeline_error,
             );
-            return render_html(
-                lang.clone(),
-                &SourceFormTemplate {
-                    lang,
-                    langs: state.locales.choices().to_vec(),
-                    theme,
-                    active: "sources",
-                    csrf: state.csrf_for(&headers),
-                    form_id: None,
-                    action: "/admin/sources/new".into(),
-                    all_protocols: all_protocols_with_selection(&form_values_from(&form).protocols),
-                    values: form_values_from(&form),
-                    errors,
-                    headers_masked_note: false,
-                    widget_html,
-                },
+            // The posted form is parsed once; the values and the protocol
+            // selection come from the same parse.
+            let values = form_values_from(&form);
+            return render_source_form(
+                &state,
+                &headers,
+                lang,
+                theme,
                 StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+                "/admin/sources/new".into(),
+                values.clone(),
+                &values.protocols,
+                errors,
+                false,
+                false,
+                widget_html,
             );
         }
         Err(FormError::Server(err)) => {
-            return row_error_response(lang, &err, "err.source_not_found");
+            return row_error_response(&state, &headers, &err, "err.source_not_found");
         }
     };
     if let Err(err) = sources::create(&state.pool, &source).await {
-        return server_error(lang, &err);
+        return server_error(&state, &headers, "sources.create", &err);
     }
     tracing::info!(source = %source.id, "source created");
     Redirect::to(&format!("/admin/sources/{}", source.id)).into_response()
@@ -878,7 +1064,7 @@ pub async fn source_update(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
-    let source = match build_source_from_form(&state, &lang, &form, Some(&id)).await {
+    let (source, existing) = match build_source_from_form(&state, &lang, &form, Some(&id)).await {
         Ok(source) => source,
         Err(FormError::Validation(errors)) => {
             let action = format!("/admin/sources/{id}/edit");
@@ -893,31 +1079,48 @@ pub async fn source_update(
                 false,
                 pipeline_error,
             );
-            return render_html(
-                lang.clone(),
-                &SourceFormTemplate {
-                    lang,
-                    langs: state.locales.choices().to_vec(),
-                    theme,
-                    active: "sources",
-                    csrf: state.csrf_for(&headers),
-                    form_id: Some(id),
-                    action,
-                    all_protocols: all_protocols_with_selection(&form_values_from(&form).protocols),
-                    values: form_values_from(&form),
-                    errors,
-                    headers_masked_note: true,
-                    widget_html,
-                },
+            // The posted form is parsed once; the values and the protocol
+            // selection come from the same parse.
+            let values = form_values_from(&form);
+            // The header note follows the stored row, computed the same
+            // way as the GET render: it is about the values the form
+            // shows masked, not about what was posted. The assembled row
+            // does not exist here (validation failed), so the row is
+            // read again; a row that cannot be read keeps the note on,
+            // the previous render's assumption.
+            let headers_masked_note = match sources::get(&state.pool, &id).await {
+                Ok(Some(stored)) => stored.headers.as_ref().is_some_and(|m| !m.is_empty()),
+                Ok(None) | Err(_) => true,
+            };
+            // The token note follows the stored row the same way: the
+            // placeholder note is about the value the form shows, which is
+            // the stored token's stand-in, not what was posted.
+            let token_masked_note = match sources::get(&state.pool, &id).await {
+                Ok(Some(stored)) => stored.access_token.is_some(),
+                Ok(None) | Err(_) => true,
+            };
+            return render_source_form(
+                &state,
+                &headers,
+                lang,
+                theme,
                 StatusCode::UNPROCESSABLE_ENTITY,
+                Some(id),
+                action,
+                values.clone(),
+                &values.protocols,
+                errors,
+                headers_masked_note,
+                token_masked_note,
+                widget_html,
             );
         }
         Err(FormError::Server(err)) => {
-            return row_error_response(lang, &err, "err.source_not_found");
+            return row_error_response(&state, &headers, &err, "err.source_not_found");
         }
     };
     if let Err(err) = sources::update_settings(&state.pool, &source).await {
-        return row_error_response(lang, &err, "err.source_not_found");
+        return row_error_response(&state, &headers, &err, "err.source_not_found");
     }
     // Saved → effective immediately. The freshness stamp lives on the
     // source row (`sources::update_settings` resets it when a
@@ -927,7 +1130,11 @@ pub async fn source_update(
         .caches
         .invalidate_processed_for_source(&source.id)
         .await;
-    tracing::info!(source = %source.id, "source updated");
+    tracing::info!(
+        source = %source.id,
+        changed = ?changed_fields(existing.as_ref(), &source),
+        "source updated"
+    );
     if is_htmx(&headers) {
         let target = format!("/admin/sources/{}", source.id);
         let mut response = Redirect::to(&target).into_response();
@@ -961,7 +1168,17 @@ struct SourceDetailTemplate {
     serve_url: String,
     counts: Vec<(String, i64)>,
     log: Vec<fetch_log::FetchLogRow>,
-    pages: Vec<(i64, bool)>,
+    /// The computed time of the source's next attempt; `None` when the
+    /// last attempt succeeded (see [`SourceCardView::next_retry_at`]).
+    /// Rendered inside the last-error row.
+    next_retry_at: Option<i64>,
+    pages: Vec<super::PageLink>,
+    /// The toggle endpoint of this source and its current state, as flat
+    /// fields: the markup lives once in the shared `_toggle_form.html`,
+    /// which the page includes directly (sources and profiles render the
+    /// same fragment).
+    toggle_url: String,
+    enabled: bool,
     /// The card includes `sources/_toggle_form.html`, whose standalone
     /// variant marks the form as an out-of-band swap in the toggle
     /// response; the page itself always renders it plain.
@@ -969,6 +1186,23 @@ struct SourceDetailTemplate {
 }
 
 impl_i18n!(SourceDetailTemplate);
+
+/// Everything the source card renders, gathered by the endpoint: the
+/// stored row plus the aggregates of the card. One argument instead of
+/// five parallel ones.
+struct SourceCardView {
+    source: Source,
+    counts: Vec<(String, i64)>,
+    log: Vec<fetch_log::FetchLogRow>,
+    /// The computed time of the source's next attempt (newest journal
+    /// attempt plus the backoff its consecutive failures earned, see
+    /// [`crate::scheduler::next_retry_at`]); `None` when the last attempt
+    /// succeeded. Rendered next to the last error, so a dead feed reads
+    /// as "retry scheduled", not as "the scheduler gave up".
+    next_retry_at: Option<i64>,
+    page: i64,
+    total: i64,
+}
 
 pub async fn source_detail(
     State(state): State<AdminState>,
@@ -981,7 +1215,7 @@ pub async fn source_detail(
     let source = match sources::get(&state.pool, &id).await {
         Ok(Some(source)) => source,
         Ok(None) => return not_found(lang, "err.source_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.detail", &err),
     };
     let page: i64 = params
         .get("page")
@@ -991,7 +1225,7 @@ pub async fn source_detail(
 
     let total: i64 = match fetch_log::count_for_source(&state.pool, &id).await {
         Ok(total) => total,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.detail", &err),
     };
     let log: Vec<fetch_log::FetchLogRow> = match fetch_log::list_for_source(
         &state.pool,
@@ -1002,31 +1236,46 @@ pub async fn source_detail(
     .await
     {
         Ok(rows) => rows,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.detail", &err),
     };
 
     let counts = match proxies::count_by_status_for_source(&state.pool, &id).await {
         Ok(counts) => counts,
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.detail", &err),
     };
+    let next_retry_at = crate::scheduler::next_retry_at(&state.pool, &id).await;
 
     render_source_detail(
-        &state, lang, peer, &headers, source, counts, log, page, total,
+        &state,
+        lang,
+        peer,
+        &headers,
+        SourceCardView {
+            source,
+            counts,
+            log,
+            next_retry_at,
+            page,
+            total,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_source_detail(
     state: &AdminState,
     lang: Lang,
     peer: SocketAddr,
     headers: &HeaderMap,
-    source: Source,
-    counts: Vec<(String, i64)>,
-    log: Vec<fetch_log::FetchLogRow>,
-    page: i64,
-    total: i64,
+    view: SourceCardView,
 ) -> Response {
+    let SourceCardView {
+        source,
+        counts,
+        log,
+        next_retry_at,
+        page,
+        total,
+    } = view;
     let serve_path = format!(
         "/src/{}",
         source.slug.clone().unwrap_or_else(|| source.id.clone())
@@ -1035,7 +1284,14 @@ fn render_source_detail(
     // public port from [server].bind.
     let base = match state.serve_base(peer, headers) {
         Ok(b) => b,
-        Err(err) => return super::server_error(lang, &fumox_core::Error::Config(err.to_string())),
+        Err(err) => {
+            return super::server_error(
+                state,
+                headers,
+                "sources.serve_base",
+                &fumox_core::Error::Config(err.to_string()),
+            );
+        }
     };
     let serve_url = format!("{base}{serve_path}");
     let headers_display: Vec<(String, String)> = source
@@ -1065,6 +1321,7 @@ fn render_source_detail(
 
     render_html(
         lang.clone(),
+        "sources/detail.html",
         &SourceDetailTemplate {
             lang,
             langs: state.locales.choices().to_vec(),
@@ -1082,7 +1339,10 @@ fn render_source_detail(
             serve_url,
             counts,
             log,
+            next_retry_at,
             pages: pagination_pages(page, total, LOG_PAGE_SIZE),
+            toggle_url: format!("/admin/sources/{}/toggle", source.id),
+            enabled: source.enabled,
             swap_oob: false,
         },
         StatusCode::OK,
@@ -1105,13 +1365,21 @@ pub async fn source_log(
     headers: HeaderMap,
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
+    // The fragment belongs to a card: a source that is gone gets the
+    // same not-found the detail page returns, not an empty log.
+    match sources::get(&state.pool, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found(lang, "err.source_not_found"),
+        Err(err) => return server_error(&state, &headers, "sources.log", &err),
+    }
     let log: Vec<fetch_log::FetchLogRow> =
         match fetch_log::recent_for_source(&state.pool, &id, LOG_PAGE_SIZE).await {
             Ok(rows) => rows,
-            Err(err) => return server_error(lang, &err),
+            Err(err) => return server_error(&state, &headers, "sources.log", &err),
         };
     render_html(
         lang.clone(),
+        "sources/_log.html",
         &SourceLogFragment { lang, log },
         StatusCode::OK,
     )
@@ -1132,14 +1400,18 @@ struct EnabledBadgeFragment {
 impl_i18n!(EnabledBadgeFragment);
 
 /// The toggle form of the source card, same include-as-initial-render
-/// pattern as [`EnabledBadgeFragment`]. `swap_oob` adds the
-/// `hx-swap-oob` attribute that makes the form in a toggle response
-/// replace itself out-of-band; the initial page renders it plain.
+/// pattern as [`EnabledBadgeFragment`]. The markup lives in the shared
+/// `_toggle_form.html` (sources and profiles render the same fragment);
+/// this wrapper binds the source context to it as flat fields.
+/// `swap_oob` adds the `hx-swap-oob` attribute that makes the form in a
+/// toggle response replace itself out-of-band; the initial page renders
+/// it plain.
 #[derive(Template)]
 #[template(path = "sources/_toggle_form.html")]
 struct ToggleFormFragment {
     lang: Lang,
-    source: SourceCard,
+    toggle_url: String,
+    enabled: bool,
     csrf: String,
     swap_oob: bool,
 }
@@ -1160,7 +1432,8 @@ fn toggle_swap_fragment(lang: &Lang, source: &Source, csrf: &str) -> String {
     .expect("badge fragment renders");
     let form = ToggleFormFragment {
         lang: lang.clone(),
-        source: card,
+        toggle_url: format!("/admin/sources/{}/toggle", card.id),
+        enabled: card.enabled,
         csrf: csrf.to_string(),
         swap_oob: true,
     }
@@ -1178,7 +1451,7 @@ pub async fn source_toggle(
     let mut source = match sources::get(&state.pool, &id).await {
         Ok(Some(source)) => source,
         Ok(None) => return not_found(lang, "err.source_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.toggle", &err),
     };
     let enabled = !source.enabled;
     // The toggle writes the flag and nothing else: the settings columns
@@ -1186,7 +1459,7 @@ pub async fn source_toggle(
     match sources::set_enabled(&state.pool, &id, enabled).await {
         Ok(true) => {}
         Ok(false) => return not_found(lang, "err.source_not_found"),
-        Err(err) => return row_error_response(lang, &err, "err.source_not_found"),
+        Err(err) => return row_error_response(&state, &headers, &err, "err.source_not_found"),
     }
     source.enabled = enabled;
     source.updated_at = now_ts();
@@ -1224,15 +1497,40 @@ pub async fn source_refresh(
     match sources::get(&state.pool, &id).await {
         Ok(Some(_)) => {}
         Ok(None) => return not_found(lang, "err.source_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.refresh", &err),
     }
-    if state.refresh_tx.send(id.clone()).is_err() {
-        return action_response(
-            is_htmx(&headers),
-            &format!("/admin/sources/{id}"),
-            String::new(),
-            lang.t("src.scheduler_unavailable"),
-        );
+    match state.refresh_tx.try_send(id.clone()) {
+        Ok(()) => {}
+        // The bounded queue is full: the loop is behind on its dispatches.
+        // The click is dropped here instead of piling up behind it; the
+        // operator gets the "busy" toast, the log names the dropped one.
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(
+                source = %id,
+                "refresh enqueue failed: scheduler channel full"
+            );
+            return action_response(
+                is_htmx(&headers),
+                &format!("/admin/sources/{id}"),
+                String::new(),
+                lang.t("src.scheduler_busy"),
+            );
+        }
+        // The scheduler is gone (shutdown or a wedged loop): the operator
+        // gets the "unavailable" toast, the log names the failed enqueue.
+        Err(err) => {
+            tracing::warn!(
+                source = %id,
+                error = %err,
+                "refresh enqueue failed: scheduler channel closed"
+            );
+            return action_response(
+                is_htmx(&headers),
+                &format!("/admin/sources/{id}"),
+                String::new(),
+                lang.t("src.scheduler_unavailable"),
+            );
+        }
     }
     tracing::info!(source = %id, "immediate refresh queued");
     if is_htmx(&headers) {
@@ -1241,10 +1539,12 @@ pub async fn source_refresh(
         // carry the same markup and the same polling contract.
         render_html(
             lang.clone(),
+            "sources/_status.html",
             &RefreshStatusFragment {
                 lang: lang.clone(),
                 source_id: id.clone(),
                 busy: true,
+                pending: false,
                 done_at: None,
                 error_message: None,
                 ok: true,
@@ -1256,7 +1556,14 @@ pub async fn source_refresh(
             StatusCode::ACCEPTED,
         )
     } else {
-        Redirect::to(&format!("/admin/sources/{id}")).into_response()
+        // Plain-browser path: the queued refresh is announced with a
+        // flash toast, like every other action's fallback — a bare
+        // redirect would land silently.
+        flash_redirect(
+            &format!("/admin/sources/{id}"),
+            lang.t("common.refreshing"),
+            "ok",
+        )
     }
 }
 
@@ -1268,11 +1575,15 @@ struct RefreshStatusFragment {
     lang: Lang,
     source_id: String,
     busy: bool,
+    /// The source has never been fetched: a neutral state, not an error
+    /// and not busy — there is no outcome to show yet.
+    pending: bool,
     /// Unix timestamp of the completed fetch, rendered by the template as a
     /// `<time>` element next to the `src.refresh_done` label; `None` while
     /// busy or on error.
     done_at: Option<i64>,
-    /// Escaped human-readable fetch error; `None` while busy or on success.
+    /// Escaped human-readable fetch error; `None` while busy, pending or
+    /// on success.
     error_message: Option<String>,
     ok: bool,
     /// Seconds since the running refresh started; `None` when no refresh
@@ -1298,6 +1609,16 @@ fn refresh_budget_hint(lang: &Lang) -> String {
     )
 }
 
+/// Polled refresh status: keeps `data-busy="1"` while the fetch is in
+/// flight, then shows the outcome and stops polling.
+///
+/// The endpoint reports the source's *current* state, not the outcome
+/// of one particular click of *Refresh now*: the per-source scheduler
+/// deduplicates fetches, and a scheduled fetch or another operator's
+/// refresh may complete between the press and a poll, so the poll then
+/// shows that outcome. The fragment reads as "the latest known outcome
+/// for this source" — the same state the card shows everywhere else;
+/// nothing here claims to attribute it to the pressed button.
 pub async fn source_refresh_status(
     State(state): State<AdminState>,
     Path(id): Path<String>,
@@ -1313,19 +1634,24 @@ pub async fn source_refresh_status(
         .in_flight_since(&id)
         .await
         .map(|started_at| now_ts().saturating_sub(started_at).max(0));
-    let (done_at, error_message, ok) = if busy {
-        (None, None, true)
+    let (pending, done_at, error_message, ok) = if busy {
+        (false, None, None, true)
     } else {
         let source = match sources::get(&state.pool, &id).await {
             Ok(Some(source)) => source,
             // The source is gone: the poll has nothing left to report.
             Ok(None) => return not_found(lang, "err.source_not_found"),
-            Err(err) => return server_error(lang, &err),
+            Err(err) => return server_error(&state, &headers, "sources.refresh_status", &err),
         };
         if source.error_class.is_none() && source.last_fetched_at.is_some() {
-            (source.last_fetched_at, None, true)
+            (false, source.last_fetched_at, None, true)
+        } else if source.error_class.is_none() {
+            // Never fetched: there is no outcome yet, and "unknown
+            // error" would describe a fetch that never happened.
+            (true, None, None, false)
         } else {
             (
+                false,
                 None,
                 Some(
                     lang.t("src.refresh_error").replace(
@@ -1342,10 +1668,12 @@ pub async fn source_refresh_status(
     };
     render_html(
         lang.clone(),
+        "sources/_status.html",
         &RefreshStatusFragment {
             lang: lang.clone(),
             source_id: id,
             busy,
+            pending,
             done_at,
             error_message,
             ok,
@@ -1383,7 +1711,7 @@ pub async fn source_delete(
     match sources::delete(&state.pool, &id).await {
         Ok(true) => {}
         Ok(false) => return not_found(lang, "err.source_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.delete", &err),
     }
     // The row is gone; the rendered outputs that still name it go here.
     state.caches.invalidate_processed_for_source(&id).await;
@@ -1391,12 +1719,17 @@ pub async fn source_delete(
     match sweep {
         Ok(sweep) => {
             if sweep.retired > 0 {
-                tracing::info!(retired = sweep.retired, "orphaned proxies marked removed");
+                tracing::info!(
+                    source = %id,
+                    retired = sweep.retired,
+                    "orphaned proxies marked removed"
+                );
             }
             if sweep.protected > 0 {
                 // The rows the sweep left alone on purpose: they have no
                 // source link any more, so no probe lane can reach them.
                 tracing::info!(
+                    source = %id,
                     protected = sweep.protected,
                     "orphaned proxies left detached by the protected statuses"
                 );
@@ -1412,7 +1745,11 @@ pub async fn source_delete(
             // The source is gone, but the proxies it fed are not
             // flagged: the operator has to hear it, the toast is the
             // only place they will see it.
-            tracing::error!(error = %err, "failed to mark orphans removed");
+            tracing::error!(
+                source = %id,
+                error = %err,
+                "failed to mark orphans removed"
+            );
             action_response_err(
                 is_htmx(&headers),
                 "/admin/sources",
@@ -1443,10 +1780,11 @@ struct DryRunFragment {
 }
 
 impl DryRunFragment {
-    fn fmt_bytes(&self, bytes: &Option<u64>) -> String {
-        bytes
-            .map(|b| fmt_bytes(&self.lang, b as i64))
-            .unwrap_or_else(|| ",".into())
+    /// The rendered size of the response body: the template only asks
+    /// for it when the fetch reported one (`bytes` is `Some` there), so
+    /// the `None` placeholder never shows up in the table.
+    fn fmt_bytes(&self, bytes: &u64) -> String {
+        fmt_opt_bytes(&self.lang, Some(*bytes as i64))
     }
 }
 
@@ -1464,10 +1802,33 @@ pub async fn source_dry_run(
     let source = match sources::get(&state.pool, &id).await {
         Ok(Some(source)) => source,
         Ok(None) => return not_found(lang, "err.source_not_found"),
-        Err(err) => return server_error(lang, &err),
+        Err(err) => return server_error(&state, &headers, "sources.dry_run", &err),
     };
 
     let outcome = crate::ingest::dry_run_source(&state.fetcher, &state.geo, &source).await;
+    // One event per outcome, without the URL or the headers: the log
+    // tail names the source and the verdict, the secrets stay in the
+    // database.
+    match &outcome {
+        crate::ingest::DryRunOutcome::Ok {
+            http_status,
+            bytes,
+            proxies_found,
+            ..
+        } => {
+            tracing::info!(source = %id, http_status, bytes, proxies_found, "dry run ok");
+        }
+        crate::ingest::DryRunOutcome::FetchFailed { failure } => {
+            tracing::warn!(
+                source = %id,
+                error_class = %failure.error_class().as_str(),
+                "dry run failed"
+            );
+        }
+        crate::ingest::DryRunOutcome::ParseFailed { .. } => {
+            tracing::warn!(source = %id, error_class = "parse", "dry run failed");
+        }
+    }
     let fragment = match outcome {
         crate::ingest::DryRunOutcome::Ok {
             http_status,
@@ -1513,7 +1874,12 @@ pub async fn source_dry_run(
         },
     };
     if is_htmx(&headers) {
-        render_html(fragment.lang.clone(), &fragment, StatusCode::OK)
+        render_html(
+            fragment.lang.clone(),
+            "sources/_dryrun.html",
+            &fragment,
+            StatusCode::OK,
+        )
     } else {
         // Plain-browser path: this fragment is the HTMX swap target inside
         // the source card, so a plain POST would land on a chrome-less
@@ -1538,15 +1904,29 @@ impl SourcesListTemplate {
 
 impl SourceDetailTemplate {
     fn bytes(&self, n: &Option<i64>) -> String {
-        n.map(|n| fmt_bytes(&self.lang, n))
-            .unwrap_or_else(|| ",".into())
+        fmt_opt_bytes(&self.lang, *n)
+    }
+
+    /// The next-retry hint for the last-error row, or an empty string when
+    /// the last attempt succeeded (no backoff applies): the computed time
+    /// of the next attempt, so a dead feed reads as "retry scheduled"
+    /// rather than "the scheduler gave up". Rendered through `| safe`,
+    /// like the other `<time>` elements.
+    fn next_retry_line(&self) -> String {
+        let Some(ts) = self.next_retry_at else {
+            return String::new();
+        };
+        format!(
+            "<div class=\"hint\">{} {}</div>",
+            self.lang.t("src.next_retry"),
+            self.opt_ts(&Some(ts))
+        )
     }
 }
 
 impl SourceLogFragment {
     fn bytes(&self, n: &Option<i64>) -> String {
-        n.map(|n| fmt_bytes(&self.lang, n))
-            .unwrap_or_else(|| ",".into())
+        fmt_opt_bytes(&self.lang, *n)
     }
 }
 
@@ -1783,6 +2163,7 @@ mod tests {
             lang: lang.clone(),
             source_id: "src1".into(),
             busy: true,
+            pending: false,
             done_at: None,
             error_message: None,
             ok: true,
@@ -1796,10 +2177,13 @@ mod tests {
         // fetch and the number of requests it may make.
         assert!(html.contains(&refresh_budget_hint(&lang)), "{html}");
         // The polled element stays the one that carries the polling
-        // contract: everything the busy state shows lives inside it, or
-        // the swap would leave the rest behind on every poll.
-        assert!(html.contains(r#"id="refresh-status""#), "{html}");
+        // contract, and it swaps its content into the page's permanent
+        // `#refresh-status` live region instead of re-rendering the
+        // region itself (a recreated live region is never announced).
+        assert!(!html.contains(r#"id="refresh-status""#), "{html}");
         assert!(html.contains(r#"data-busy="1""#), "{html}");
+        assert!(html.contains(r##"hx-target="#refresh-status""##), "{html}");
+        assert!(html.contains(r#"hx-swap="innerHTML""#), "{html}");
     }
 
     /// A finished refresh has no elapsed time: the moment it ended is
@@ -1811,6 +2195,7 @@ mod tests {
             lang: lang.clone(),
             source_id: "src1".into(),
             busy: false,
+            pending: false,
             done_at: Some(1_700_000_000),
             error_message: None,
             ok: true,
@@ -1822,12 +2207,98 @@ mod tests {
         assert!(!html.contains("data-busy"), "{html}");
     }
 
+    /// A source that has never been fetched has no outcome to show: the
+    /// fragment renders the neutral pending badge, neither the error
+    /// badge nor the busy marker of a fetch in flight.
+    #[test]
+    fn a_never_fetched_source_renders_the_pending_state() {
+        let lang = test_lang();
+        let fragment = RefreshStatusFragment {
+            lang: lang.clone(),
+            source_id: "src1".into(),
+            busy: false,
+            pending: true,
+            done_at: None,
+            error_message: None,
+            ok: false,
+            elapsed_seconds: None,
+            budget_hint: refresh_budget_hint(&lang),
+        };
+        let html = fragment.render().unwrap();
+        assert!(html.contains(lang.t("src.refresh_pending")), "{html}");
+        assert!(!html.contains("data-busy"), "{html}");
+        assert!(!html.contains(lang.t("common.error")), "{html}");
+    }
+
+    /// The replayed form is parsed once: multi-valued `protocols` keep
+    /// every value in order, a repeated single field takes the last
+    /// value (the browser sends them in document order), and empty or
+    /// absent fields stay that way.
+    #[test]
+    fn form_values_from_parses_the_posted_pairs() {
+        let form = vec![
+            ("name".to_string(), "feed".to_string()),
+            ("name".to_string(), "feed 2".to_string()),
+            ("url".to_string(), "https://example.com/sub".to_string()),
+            ("protocols".to_string(), "http".to_string()),
+            ("protocols".to_string(), "socks5".to_string()),
+            ("cache_ttl_seconds".to_string(), String::new()),
+        ];
+        let values = form_values_from(&form);
+        assert_eq!(
+            values.name, "feed 2",
+            "a repeated field takes the last value"
+        );
+        assert_eq!(values.url, "https://example.com/sub");
+        assert_eq!(values.protocols, ["http", "socks5"]);
+        assert_eq!(values.cache_ttl_seconds, "", "an empty field stays empty");
+        assert!(!values.enabled, "an absent checkbox is unchecked");
+    }
+
+    /// The `enabled` checkbox follows HTML semantics: a checked box
+    /// submits the field with its value, and the truthy synonyms read
+    /// as checked; everything else, an explicit `false` included, is
+    /// unchecked — presence alone must not flip the flag on.
+    #[test]
+    fn the_enabled_checkbox_is_read_from_its_value() {
+        for checked in ["1", "on", "true"] {
+            let form = vec![("enabled".to_string(), checked.to_string())];
+            assert!(
+                form_values_from(&form).enabled,
+                "{checked} must read as checked"
+            );
+        }
+        for unchecked in ["0", "false", "off", ""] {
+            let form = vec![("enabled".to_string(), unchecked.to_string())];
+            assert!(
+                !form_values_from(&form).enabled,
+                "{unchecked} must read as unchecked"
+            );
+        }
+    }
+
+    /// The list filter reads the select's `on`/`off` plus their boolean
+    /// synonyms; anything else filters nothing, like the empty "all"
+    /// option.
+    #[test]
+    fn the_enabled_filter_reads_the_boolean_synonyms() {
+        assert_eq!(enabled_filter_value("on"), Some(true));
+        assert_eq!(enabled_filter_value("true"), Some(true));
+        assert_eq!(enabled_filter_value("1"), Some(true));
+        assert_eq!(enabled_filter_value("off"), Some(false));
+        assert_eq!(enabled_filter_value("false"), Some(false));
+        assert_eq!(enabled_filter_value("0"), Some(false));
+        assert_eq!(enabled_filter_value(""), None);
+        assert_eq!(enabled_filter_value("nonsense"), None);
+    }
+
     /// A source row as the toggle action holds it after the flip.
     fn sample_source(enabled: bool) -> Source {
         let now = now_ts();
         Source {
             id: new_id(),
             slug: Some("s1".into()),
+            access_token: None,
             name: "s1".into(),
             url: "https://example.com/sub".into(),
             enabled,
@@ -1923,7 +2394,8 @@ mod tests {
         let source = sample_source(true);
         let page_form = ToggleFormFragment {
             lang: lang.clone(),
-            source: SourceCard::from_source(&source),
+            toggle_url: format!("/admin/sources/{}/toggle", source.id),
+            enabled: source.enabled,
             csrf: "csrf-token".into(),
             swap_oob: false,
         }
@@ -1931,7 +2403,8 @@ mod tests {
         .unwrap();
         let swap_form = ToggleFormFragment {
             lang: lang.clone(),
-            source: SourceCard::from_source(&source),
+            toggle_url: format!("/admin/sources/{}/toggle", source.id),
+            enabled: source.enabled,
             csrf: "csrf-token".into(),
             swap_oob: true,
         }

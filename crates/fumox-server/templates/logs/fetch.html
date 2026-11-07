@@ -18,12 +18,15 @@
   </div>
   <div class="field">
     <label for="log-class">{{ self.t("log.error_class_label") }}</label>
+    {#- The options are the schema's error classes, not a hand-kept
+        list: a class the fetcher can record is filterable here the
+        moment it exists (the filter itself accepts any class the rows
+        carry, via FetchLogFilter). -#}
     <select id="log-class" name="class">
       <option value="">{{ self.t("common.all") }}</option>
-      <option value="network" {% if f_class == "network" %}selected{% endif %}>network</option>
-      <option value="http_server" {% if f_class == "http_server" %}selected{% endif %}>http_server</option>
-      <option value="http_client" {% if f_class == "http_client" %}selected{% endif %}>http_client</option>
-      <option value="parse_error" {% if f_class == "parse_error" %}selected{% endif %}>parse_error</option>
+      {% for (class, selected) in error_classes %}
+      <option value="{{ class }}" {% if selected %}selected{% endif %}>{{ self.error_class_label(class) }}</option>
+      {% endfor %}
     </select>
   </div>
   <div class="field">
@@ -70,7 +73,7 @@
                 <span class="badge alive">{{ self.t("common.ok") }}</span>
               {% else %}
                 {% match row.error_class %}
-                  {% when Some with (class) %}<span class="badge {{ class }}">{{ class }}</span>
+                  {% when Some with (class) %}<span class="badge {{ self.error_class_badge_class(class) }}">{{ self.error_class_label(class) }}</span>
                   {% when None %}<span class="badge error">{{ self.t("common.error") }}</span>
                 {% endmatch %}
               {% endif %}

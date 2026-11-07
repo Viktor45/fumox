@@ -10,6 +10,7 @@ use std::collections::HashMap;
 struct SourceRow {
     id: String,
     slug: Option<String>,
+    access_token: Option<String>,
     name: String,
     url: String,
     enabled: i64,
@@ -37,6 +38,7 @@ impl TryFrom<SourceRow> for Source {
             // errors the field mappings below may raise.
             id: row.id.clone(),
             slug: row.slug,
+            access_token: row.access_token,
             name: row.name,
             url: row.url,
             enabled: row.enabled != 0,
@@ -119,7 +121,8 @@ fn pipeline_json(pipeline: &Option<serde_json::Value>) -> crate::Result<Option<S
     pipeline.as_ref().map(super::json_to_text).transpose()
 }
 
-const COLUMNS: &str = "id, slug, name, url, enabled, encoding, input_format, protocols,
+const COLUMNS: &str =
+    "id, slug, access_token, name, url, enabled, encoding, input_format, protocols,
     cache_ttl_seconds, tags, pipeline, headers, ip_family, created_at, updated_at,
     last_fetched_at, last_error, error_class";
 
@@ -137,10 +140,14 @@ where
     // flows through .bind().
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO sources ({COLUMNS})
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )))
     .bind(source.id.clone())
     .bind(source.slug.clone())
+    // The endpoint token is stored as a hash, like the profile one: the
+    // write is idempotent for an already-hashed value (an import carrying
+    // the stored form), so the admin form and the import share the path.
+    .bind(crate::token::stored(source.access_token.clone()))
     .bind(source.name.clone())
     .bind(source.url.clone())
     .bind(source.enabled)
@@ -262,13 +269,17 @@ pub async fn update_settings(pool: &DbPool, source: &Source) -> crate::Result<()
     };
     let affected = sqlx::query(
         "UPDATE sources SET
-            slug = ?, name = ?, url = ?, enabled = ?, encoding = ?, input_format = ?,
+            slug = ?, access_token = ?, name = ?, url = ?, enabled = ?, encoding = ?, input_format = ?,
             protocols = ?, cache_ttl_seconds = ?, tags = ?, pipeline = ?, headers = ?,
             ip_family = ?, updated_at = ?,
             last_fetched_at = CASE WHEN ? THEN NULL ELSE last_fetched_at END
          WHERE id = ?",
     )
     .bind(&source.slug)
+    // Admin-owned, like the profile token: hashed on the way in (idempotent
+    // for the stored hash the edit form hands back), and not fetch-relevant
+    // — an endpoint-token change must not reset the freshness stamp.
+    .bind(crate::token::stored(source.access_token.clone()))
     .bind(&source.name)
     .bind(&source.url)
     .bind(source.enabled)
@@ -415,6 +426,17 @@ pub async fn list(pool: &DbPool, enabled_only: bool) -> crate::Result<Vec<Source
         }
     }
     Ok(sources)
+}
+
+/// Every slug of the table (`None` for a row without one), one column.
+/// The import's collision check reads only these: mapping whole rows
+/// would fetch every stored header and pipeline just to throw it away.
+pub async fn list_slugs(pool: &DbPool) -> crate::Result<Vec<Option<String>>> {
+    let rows: Vec<(Option<String>,)> =
+        sqlx::query_as("SELECT slug FROM sources ORDER BY created_at")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(slug,)| slug).collect())
 }
 
 // Admin sources list
@@ -612,6 +634,7 @@ mod tests {
         Source {
             id: id.to_string(),
             slug: Some(format!("slug-{id}")),
+            access_token: None,
             name: "Test source".into(),
             url: "https://example.com/sub".into(),
             enabled: true,

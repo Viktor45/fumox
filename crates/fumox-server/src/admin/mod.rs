@@ -55,8 +55,9 @@ pub struct AdminState {
     /// in `[geo].db_dir`, an instance independent of the pipeline resolver
     /// (own cache), unaffected by `[geo].enabled` gating the pipeline.
     pub geo_full: Arc<fumox_core::geo::FullResolver>,
-    /// Immediate-refresh channel into the scheduler (source ids).
-    pub refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Immediate-refresh channel into the scheduler (source ids). Bounded:
+    /// a send that does not fit is refused (`try_send`), not parked.
+    pub refresh_tx: tokio::sync::mpsc::Sender<String>,
     /// Scheduler handle: in-flight status for *Refresh now* fragments.
     pub scheduler: SchedulerState,
     /// Event bus feeding the SSE endpoint (`/admin/events`).
@@ -81,6 +82,13 @@ pub struct AdminState {
     /// header is read; `None` honors none, so the peer address is the
     /// client even when a trusted proxy is configured.
     pub trusted_header: TrustedHeader,
+    /// The panel's Host allowlist (`[admin].allowed_hosts`), canonicalized
+    /// once per config load — at startup and on every save that swaps the
+    /// live view — never per request. Behind a shared lock like
+    /// `live_config`: the Host gate follows the config the operator saved
+    /// ([`AdminState::refresh_live_config`] rebuilds this snapshot), while
+    /// each request only borrows the ready list.
+    pub host_allowlist: Arc<std::sync::RwLock<host_gate::HostAllowlist>>,
     /// UI message catalogs, loaded once at startup from `[admin].locales_dir`
     /// with the shipped ru/en catalogs embedded as fallback.
     pub locales: Arc<i18n::Locales>,
@@ -124,7 +132,7 @@ impl AdminState {
         pool: DbPool,
         caches: Caches,
         geo: Arc<GeoResolver>,
-        refresh_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        refresh_tx: tokio::sync::mpsc::Sender<String>,
         scheduler: SchedulerState,
         events: EventBus,
         fetcher: Fetcher,
@@ -175,6 +183,9 @@ impl AdminState {
             admin_limiter,
             trusted_cidrs,
             trusted_header: config.admin.trust_proxy_header,
+            host_allowlist: Arc::new(std::sync::RwLock::new(host_gate::HostAllowlist::new(
+                &config.admin.allowed_hosts,
+            ))),
             locales,
             config_path,
             config_writable,
@@ -186,9 +197,8 @@ impl AdminState {
     }
 
     /// Snapshot of the latest figment-merged config. Cheap: clones the
-    /// held `AppConfig`. Handlers that need several blocks at once read
-    /// from this; for a single block the typed accessors below clone
-    /// less.
+    /// held `AppConfig`. The typed accessors below read their block out of
+    /// this same clone, so they cost the same as an explicit `live()` call.
     pub fn live(&self) -> fumox_core::AppConfig {
         self.live_config
             .read()
@@ -205,6 +215,15 @@ impl AdminState {
     /// The live `[admin]` block (token, rate limits, TTL).
     pub fn admin(&self) -> AdminConfig {
         self.live().admin
+    }
+
+    /// Borrow the canonicalized admin allowlist for the duration of the
+    /// call: the request path never re-canonicalizes the list and never
+    /// clones it.
+    pub fn host_allowlist(&self) -> std::sync::RwLockReadGuard<'_, host_gate::HostAllowlist> {
+        self.host_allowlist
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The live admin token, read without cloning the whole config.
@@ -305,11 +324,21 @@ impl AdminState {
                  address: the session token travels in clear text"
             );
         }
+        // The Host gate reads its allowlist from the canonicalized
+        // snapshot, not from the raw config: rebuild it with the values
+        // just loaded, so the gate follows the save without
+        // re-canonicalizing the list on every request.
+        let allowlist = host_gate::HostAllowlist::new(&loaded.config.admin.allowed_hosts);
         let mut guard = self
             .live_config
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = loaded.config;
+        drop(guard);
+        *self
+            .host_allowlist
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = allowlist;
         Ok(())
     }
 
@@ -345,7 +374,7 @@ impl AdminState {
             headers,
             &self.trusted_cidrs,
             self.trusted_header,
-            &self.admin().allowed_hosts,
+            &self.host_allowlist(),
         )
     }
 
@@ -361,6 +390,39 @@ impl AdminState {
     }
 }
 
+/// Lifetime of the UI-preference cookies (`fumox_lang`, `fumox_theme`,
+/// `fumox_dash_top_n`): one year. One constant for all three, so the
+/// cookies cannot drift apart (they are the same kind of choice).
+pub(crate) const PREF_COOKIE_MAX_AGE_SECS: u64 = 365 * 24 * 3600;
+
+/// Value of the first cookie named `name` across the `Cookie` headers:
+/// each header splits on `;`, each pair on the first `=`. `None` when no
+/// header carries the name. The one cookie scanner of the panel — the
+/// language, theme and Top-N readers parse only their own value on top of
+/// it.
+pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    for header_value in headers.get_all(header::COOKIE) {
+        let Ok(text) = header_value.to_str() else {
+            continue;
+        };
+        for pair in text.split(';') {
+            if let Some((candidate, value)) = pair.trim().split_once('=')
+                && candidate.trim() == name
+            {
+                return Some(value.trim());
+            }
+        }
+    }
+    None
+}
+
+/// `Set-Cookie` value persisting a UI preference: panel-wide path, closed
+/// to scripts and other sites, one-year lifetime
+/// ([`PREF_COOKIE_MAX_AGE_SECS`]).
+pub(crate) fn preference_cookie(name: &str, value: &str) -> String {
+    format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={PREF_COOKIE_MAX_AGE_SECS}")
+}
+
 /// Validated `?next=` target shared by the preference setters (`set-lang`,
 /// `set-theme`, `set-dash-top-n`): the redirect must stay on the admin
 /// surface and must not carry control characters, a percent-decoded CR/LF
@@ -368,10 +430,14 @@ impl AdminState {
 /// invalid and axum answers 500 instead of redirecting. Anything invalid
 /// falls back to `/admin`.
 pub(crate) fn admin_next(params: &std::collections::HashMap<String, String>) -> String {
-    params
-        .get("next")
-        .map(String::as_str)
-        .filter(|next| next.starts_with("/admin") && !next.chars().any(|c| c.is_ascii_control()))
+    admin_next_value(params.get("next").map(String::as_str))
+}
+
+/// The same validation for a `next` value that arrived outside a query map
+/// (the login form's hidden field): admin-surface paths only, no control
+/// characters, `/admin` as the fallback.
+pub(crate) fn admin_next_value(next: Option<&str>) -> String {
+    next.filter(|next| next.starts_with("/admin") && !next.chars().any(|c| c.is_ascii_control()))
         .unwrap_or("/admin")
         .to_string()
 }
@@ -442,32 +508,65 @@ async fn enforce_allowed_hosts(
     req: Request,
     next: Next,
 ) -> Response {
-    let allowed = state.admin().allowed_hosts;
-    if !allowed.is_empty() {
-        let peer = req
-            .extensions()
-            .get::<axum::extract::ConnectInfo<SocketAddr>>()
-            .map(|info| info.0);
-        let trusted_peer = peer.is_some_and(|peer| {
-            state
-                .trusted_cidrs
-                .iter()
-                .any(|net| net.contains(&peer.ip()))
-        });
-        let forwarded_ok = trusted_peer
-            && host_gate::validate_forwarded_host(req.headers(), &allowed, state.trusted_header)
+    // The whole judgment happens under the allowlist guard, and the guard
+    // is dropped before the `await` below: a std `RwLock` guard is not
+    // `Send`, and holding it across the next middleware's future would
+    // make this middleware's future non-`Send` too (axum refuses to
+    // layer it). Only the outcome crosses the boundary.
+    let rejected: Option<host_gate::HostRejected> = {
+        let allowed = state.host_allowlist();
+        if allowed.is_empty() {
+            None
+        } else {
+            let peer = req
+                .extensions()
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                .map(|info| info.0);
+            let trusted_peer = peer.is_some_and(|peer| {
+                state
+                    .trusted_cidrs
+                    .iter()
+                    .any(|net| net.contains(&peer.ip()))
+            });
+            let forwarded_ok = trusted_peer
+                && host_gate::validate_forwarded_host(
+                    req.headers(),
+                    &allowed,
+                    state.trusted_header,
+                )
                 .is_ok();
-        if let Err(err) = host_gate::validate_request_host(req.headers(), &allowed)
-            && !forwarded_ok
-        {
-            tracing::warn!(error = %err, path = %req.uri().path(), "admin request host rejected");
-            return (
-                StatusCode::BAD_REQUEST,
-                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                "request Host header is not allowed for the admin panel\n",
-            )
-                .into_response();
+            match host_gate::validate_request_host(req.headers(), &allowed) {
+                Ok(()) => None,
+                Err(_) if forwarded_ok => None,
+                Err(err) => Some(err),
+            }
         }
+    };
+    if let Some(err) = rejected {
+        tracing::warn!(error = %err, path = %req.uri().path(), "admin request host rejected");
+        // The rejection names both the refused host and the setting to
+        // fix: an operator who locked themselves out sees the cause
+        // and the knob, in the UI language their browser asked for.
+        let lang = state.locales.lang_from_headers(req.headers());
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let setting = "[admin].allowed_hosts".to_string();
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            format!(
+                "{}\n",
+                lang.t_named(
+                    "err.host_not_allowed",
+                    &[("host", host), ("setting", setting)]
+                )
+            ),
+        )
+            .into_response();
     }
     next.run(req).await
 }
@@ -637,6 +736,20 @@ pub fn router(state: AdminState) -> axum::Router {
         // The pending toast of the plain-browser path: the page asks for
         // it after the redirect, the answer is handed out once.
         .route("/flash", get(take_flash))
+        // The UI-preference setters (language, theme, dashboard Top-N) are
+        // state-changing POSTs like every other one and sit under the same
+        // auth+CSRF envelope: the cookies they write are the panel's own
+        // rendering choices, and a cross-site page that could auto-issue
+        // the request would pin its choices over the operator's (the
+        // setter answer's `Set-Cookie` is stored by the browser even for a
+        // mere navigation, which SameSite cannot prevent). The forms in
+        // `base.html` and `dashboard.html` ship the `_csrf` field the layer
+        // checks. The login screen has no session yet and chooses through
+        // `?lang=` / `?theme=` on the login form instead, which sets the
+        // same cookies server-side (`auth::login_form`).
+        .route("/set-lang", post(i18n::set_lang))
+        .route("/set-theme", post(theme::set_theme))
+        .route("/set-dash-top-n", post(dash_top_n::set_top_n))
         // Logout is a state-changing POST like every other one: the session
         // it clears is the panel's only authentication, and an attacker
         // page that can auto-submit a cross-site form to `/admin/logout`
@@ -662,9 +775,6 @@ pub fn router(state: AdminState) -> axum::Router {
             "/admin/login",
             get(auth::login_form).post(auth::login_submit),
         )
-        .route("/admin/set-lang", get(auth::set_lang))
-        .route("/admin/set-theme", get(theme::set_theme))
-        .route("/admin/set-dash-top-n", get(dash_top_n::set_top_n))
         .route("/admin/static/app.css", get(static_css))
         .route("/admin/static/app.js", get(static_app_js))
         .route("/admin/static/htmx.min.js", get(static_htmx))
@@ -672,7 +782,7 @@ pub fn router(state: AdminState) -> axum::Router {
         // the CSRF layer already buffers POSTs at 1 MiB; this gives every
         // other extractor the same bound instead of relying on that
         // coincidence.
-        .layer(axum::extract::DefaultBodyLimit::max(1 << 20))
+        .layer(axum::extract::DefaultBodyLimit::max(auth::MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn(security::headers))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -693,9 +803,33 @@ pub fn router(state: AdminState) -> axum::Router {
 }
 
 /// Render an askama template into an HTML response; template errors are a
-/// server bug and become a logged 500.
-pub fn render_html(lang: Lang, template: &impl Template, status: StatusCode) -> Response {
-    match template.render() {
+/// server bug and become a logged 500. `name` is the template path (or the
+/// route that renders it), recorded in the error log so a rendering bug
+/// names its page without the log reader having to guess from the call
+/// stack.
+pub fn render_html(
+    lang: Lang,
+    name: &'static str,
+    template: &impl Template,
+    status: StatusCode,
+) -> Response {
+    html_response(lang, name, status, template.render())
+}
+
+/// Shape a rendered HTML body into a response; a rendering failure is a
+/// server bug and becomes a logged 500 with the minimal error document.
+/// Shared by [`render_html`] and the pipeline fragment endpoints, so the
+/// full pages and the `#ped-*` fragments cannot drift into different
+/// response shapes or error paths. `name` is the template path (or the
+/// route that renders it), recorded in the error log like
+/// [`render_html`]'s.
+pub fn html_response(
+    lang: Lang,
+    name: &str,
+    status: StatusCode,
+    rendered: Result<String, askama::Error>,
+) -> Response {
+    match rendered {
         Ok(html) => (
             status,
             [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -703,21 +837,42 @@ pub fn render_html(lang: Lang, template: &impl Template, status: StatusCode) -> 
         )
             .into_response(),
         Err(err) => {
-            tracing::error!(error = %err, "template rendering failed");
+            tracing::error!(template = %name, error = %err, "template rendering failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                format!("<h1>500</h1><p>{}</p>", lang.t("err.render_failed")),
+                // A minimal but complete document: a bare fragment leaves
+                // the browser in quirks mode with no language or title,
+                // and the operator needs a way back to the panel.
+                format!(
+                    "<!doctype html><html lang=\"{}\"><head><meta charset=\"utf-8\">\
+                     <title>500</title></head><body><h1>500</h1><p>{}</p>\
+                     <p><a href=\"/admin\">{}</a></p></body></html>",
+                    lang.code(),
+                    lang.t("err.render_failed"),
+                    lang.t("err.render_hint"),
+                ),
             )
                 .into_response()
         }
     }
 }
 
+/// `Cache-Control` of the vendored static assets (`/admin/static/*`):
+/// cacheable by the operator's browser, never by a shared intermediary.
+/// The dynamic answers keep the middleware's blanket `no-store`
+/// (`security::headers` skips a response that carries its own value), so
+/// HTML, JSON fragments and exports stay uncacheable while a page reload
+/// does not re-fetch the three files every time.
+const STATIC_CACHE_CONTROL: &str = "private, max-age=3600";
+
 /// Vendored stylesheet.
 async fn static_css() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, STATIC_CACHE_CONTROL),
+        ],
         include_str!("../../static/app.css"),
     )
 }
@@ -726,10 +881,13 @@ async fn static_css() -> impl IntoResponse {
 /// does not have to allow inline scripts.
 async fn static_app_js() -> impl IntoResponse {
     (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, STATIC_CACHE_CONTROL),
+        ],
         include_str!("../../static/app.js"),
     )
 }
@@ -737,17 +895,20 @@ async fn static_app_js() -> impl IntoResponse {
 /// Vendored htmx (fixed version, no CDN, works offline).
 async fn static_htmx() -> impl IntoResponse {
     (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, STATIC_CACHE_CONTROL),
+        ],
         include_str!("../../static/htmx.min.js"),
     )
 }
 
 /// Build the base URL of the public subscription endpoints from the
-/// public listener address and the request's `Host` header: the host the
-/// admin panel was opened on, with the public port from `[server].bind`.
+/// request's authority: the host the admin panel was opened on (`Host`
+/// header, behind a trusted proxy) and the port of that same authority.
 /// The default port (80/443 matching the scheme) is omitted.
 fn serve_base(
     bind: SocketAddr,
@@ -755,7 +916,7 @@ fn serve_base(
     headers: &HeaderMap,
     trusted_cidrs: &[ipnet::IpNet],
     trusted_header: TrustedHeader,
-    allowed_hosts: &[String],
+    allowed_hosts: &host_gate::HostAllowlist,
 ) -> Result<String, host_gate::HostRejected> {
     let scheme = if request_is_https(peer, headers, trusted_cidrs, trusted_header) {
         "https"
@@ -763,20 +924,33 @@ fn serve_base(
         "http"
     };
     let link = host_gate::build_serve_link_host(bind, headers, allowed_hosts)?;
-    // The link points at the *public* listener, so its port is the one in
-    // `[server].bind` — the port the request carried is the panel's own.
-    // Behind a trusted proxy it is the other way round: there the `Host`
-    // header is the public authority the operator reached, and the public
-    // endpoint answers on that very authority.
-    let port = match link.port {
-        Some(port) if trusted_cidrs.iter().any(|net| net.contains(&peer.ip())) => port,
-        _ => bind.port(),
-    };
-    let default_port = (scheme == "http" && port == 80) || (scheme == "https" && port == 443);
-    Ok(if default_port {
-        format!("{scheme}://{}", link.host)
+    if !link.from_header {
+        // The link names the bind address, not an authority the request
+        // spelled: worth a line, it means the panel was reached without a
+        // `Host` header the builder can use (a proxy that strips it, an
+        // HTTP/1.0 client) — the link may still work, the operator just
+        // cannot tell where it points until they see one of these.
+        tracing::warn!("serve-link built from bind fallback, Host header unusable");
+    }
+    // Scheme and port must describe one authority. Behind a trusted
+    // proxy the `Host` header is that public authority: its port when it
+    // spells one, the scheme's default (omitted below) when it does not
+    // — a `https` link to a Host without a port must not grow the
+    // panel's own `[server].bind` port. Without a trusted proxy, or
+    // without a usable Host header (the authority is then the bound
+    // address itself), the public listener is the panel: `[server].bind`
+    // port.
+    let trusted = trusted_cidrs.iter().any(|net| net.contains(&peer.ip()));
+    let port = if trusted && link.from_header {
+        link.port
     } else {
-        format!("{scheme}://{}:{}", link.host, port)
+        Some(bind.port())
+    };
+    let default_port =
+        |port: u16| (scheme == "http" && port == 80) || (scheme == "https" && port == 443);
+    Ok(match port {
+        Some(port) if !default_port(port) => format!("{scheme}://{}:{}", link.host, port),
+        _ => format!("{scheme}://{}", link.host),
     })
 }
 
@@ -828,37 +1002,6 @@ fn request_is_https(
                 }))
 }
 
-/// Keep ≥2 dispatchers permanently alive in tracing's global dispatcher
-/// registry, for the log-capturing test modules (auth, scheduler): a call
-/// site's interest is cached against the dispatchers live at its FIRST
-/// execution, and when the registry holds fewer than two, tracing consults
-/// the *registering thread's* thread-local default (in a parallel test
-/// suite usually no subscriber at all) so call sites get cached as
-/// `Interest::never` and their events go silently nowhere for the rest of
-/// the process (an intermittent failure that depends purely on test
-/// scheduling). With the registry permanently multi-dispatcher, every
-/// registration is evaluated against all live dispatchers and lands on
-/// `Interest::sometimes`, so capture tests always see their lines. Runtime
-/// dispatch is unaffected: threads without a scoped default still resolve
-/// to the empty global default and drop their events as before.
-///
-/// Call once before the first capture; the two subscribers leak on
-/// purpose: the permanently-live registrars are the point.
-#[cfg(test)]
-pub(crate) fn stabilize_callsite_interests() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        for _ in 0..2 {
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::INFO)
-                .with_writer(std::io::sink)
-                .finish();
-            std::mem::forget(tracing::Dispatch::new(subscriber));
-        }
-    });
-}
-
 /// Admin state on a throwaway migrated database, for the admin test
 /// modules (this file, handlers/profiles, handlers/import_export): they all
 /// need the same wiring, an empty dependency set on a fresh pool, and
@@ -871,6 +1014,43 @@ pub(crate) async fn test_admin_state(
     admin: AdminConfig,
     server: ServerConfig,
 ) -> (fumox_core::tempdir_lite::TempDir, AdminState) {
+    test_admin_state_with_geo(admin, server, None).await
+}
+
+/// [`test_admin_state`] with the card resolver pointed at a specific
+/// GeoLite2 directory (`None` keeps the built-in default): the geo-card
+/// fixtures read the workspace `.mmdb` files the default path misses.
+#[cfg(test)]
+pub(crate) async fn test_admin_state_with_geo(
+    admin: AdminConfig,
+    server: ServerConfig,
+    geo_db_dir: Option<std::path::PathBuf>,
+) -> (fumox_core::tempdir_lite::TempDir, AdminState) {
+    let mut geo = GeoConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    if let Some(db_dir) = geo_db_dir {
+        geo.db_dir = db_dir;
+    }
+    admin_state_on_tmp_db(fumox_core::AppConfig {
+        admin,
+        server,
+        geo,
+        ..Default::default()
+    })
+    .await
+}
+
+/// The wiring of [`test_admin_state`] on a caller-supplied config: the
+/// fixtures that need a non-default knob (a disabled ingest queue, a geo
+/// database directory) build the config and hand it over, everything
+/// else here is shared. Keep the returned guard in scope while the
+/// state's pool is in use.
+#[cfg(test)]
+pub(crate) async fn admin_state_on_tmp_db(
+    config: fumox_core::AppConfig,
+) -> (fumox_core::tempdir_lite::TempDir, AdminState) {
     let dir = fumox_core::tempdir_lite::TempDir::new("admin");
     let pool = fumox_core::db::connect_pool(&DatabaseConfig {
         path: dir.path().join("test.db"),
@@ -879,17 +1059,9 @@ pub(crate) async fn test_admin_state(
     .await
     .unwrap();
     fumox_core::db::migrate(&pool).await.unwrap();
-    let (refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (refresh_tx, refresh_rx) =
+        tokio::sync::mpsc::channel(crate::scheduler::REFRESH_CHANNEL_CAP);
     std::mem::forget(refresh_rx); // keep the channel open for sends
-    let geo_cfg = GeoConfig {
-        enabled: false,
-        ..Default::default()
-    };
-    let config = fumox_core::AppConfig {
-        admin,
-        server,
-        ..Default::default()
-    };
     let fetcher = Fetcher::new(
         config.fetch.clone(),
         config.admin.allow_private_urls,
@@ -900,7 +1072,7 @@ pub(crate) async fn test_admin_state(
         AdminState::new(
             pool,
             crate::cache::Caches::new(),
-            std::sync::Arc::new(GeoResolver::new(&geo_cfg)),
+            std::sync::Arc::new(GeoResolver::new(&config.geo)),
             refresh_tx,
             SchedulerState::new(1),
             EventBus::new(),
@@ -912,6 +1084,21 @@ pub(crate) async fn test_admin_state(
     )
 }
 
+/// A string the way askama's HTML escaper renders it — the escaper the
+/// templates apply to every interpolation. A test that compares rendered
+/// text compares against this form, so a value carrying a markup
+/// character (`&`, `<`, quotes) is asserted the way the page actually
+/// shows it instead of the raw form the page must never print.
+#[cfg(test)]
+pub(crate) fn askama_html_escape(text: &str) -> String {
+    askama::filters::escape(text, askama::filters::Html)
+        .expect("askama's escape filter is infallible")
+        .to_string()
+}
+
 #[cfg(test)]
 #[path = "admin_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod template_contracts;

@@ -592,7 +592,7 @@ All public endpoints live on the public listener (default port **8080**).
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `GET /sub/{id}`            | Merged subscription for a **profile**. `{id}` is the profile id or its slug.                                                                     |
 | `GET /src/{id}`            | Parsed proxies of a **single source**. The health filter applies here too: only the live tiers `alive` and `ready` are served — never-probed (`unknown`), quarantined and removed proxies are left out even when the pipeline's health filter would have let them through. `{id}` is the source id or slug. A source can carry its **own access token** (see below); a profile's token does not extend to `/src`. |
-| `GET /export/alive/{token}` | Every proxy in the `alive` tier as a plain `url_list` — that tier exactly, not "every proxy that is alive": a `ready` proxy belongs to the other tier and is served by `/export/ready`. `{token}` is the capability token of the export links. |
+| `GET /export/alive/{token}` | Every proxy in the `alive` tier as a plain `uri_list` — that tier exactly, not "every proxy that is alive": a `ready` proxy belongs to the other tier and is served by `/export/ready`. `{token}` is the capability token of the export links. |
 | `GET /export/ready/{token}` | The `ready` tier only (proxies whose latest T2 tunnel check succeeded, hysteria2 included). Same token, same shape.                                  |
 | `GET /healthz`             | Liveness probe, returns `ok`.                                                                                                                    |
 
@@ -609,7 +609,7 @@ rotation, both links die at the same time. A wrong token answers
 `[server].allowed_hosts` gets, so the two cannot be told apart from
 outside.
 
-Their format is fixed: a plain `url_list` (`text/plain`) with the metadata
+Their format is fixed: a plain `uri_list` (`text/plain`) with the metadata
 comment block — never base64, never Clash, never sing-box. A `?format=`
 parameter is refused with `400`. `?download` turns the answer into a file
 download (`fumox-alive-YYYY-MM-DD.txt` / `fumox-ready-YYYY-MM-DD.txt`).
@@ -947,7 +947,7 @@ together with the live proxy counts. Both links share the same random
 token:
 
 - `GET /export/alive/{token}`: every currently-alive proxy as a plain
-  `url_list`. Title in the metadata block: `export/alive`, update
+  `uri_list`. Title in the metadata block: `export/alive`, update
   interval `1` hour.
 - `GET /export/ready/{token}`: the `ready` tier only (proxies that
   successfully completed both T1 and T2 checks). Same metadata shape,
@@ -1430,8 +1430,12 @@ The rules in plain language:
 - **Removed is not deleted.** Removed proxies stay in the database (purge them
   from the admin panel if you want). A removed proxy is terminal: if a source
   lists it again, its state is *not* reset: reconciliation never touches the
-  state machine (only the probe does). Ways back: *Reset status* on the proxy
-  card, or *Purge removed* followed by the next fetch inserting it as new.
+  state machine (only the probe does) — while `[ingest].removed_as_unknown`
+  is `false`, the default. With `true`, a re-appearance in a feed resets the
+  node to the pristine `unknown` state and hands it back to the check queue;
+  see `[ingest].removed_as_unknown` in the parameter table below. Ways back:
+  *Reset status* on the proxy card, or *Purge removed* followed by the next
+  fetch inserting it as new.
 - **Reset status only resets what the probe can pick up.** It puts the row
   back to a pristine `unknown` and hands it to the priority queue, so it only
   does anything for a proxy the probe will actually look at. For a row that
@@ -1705,12 +1709,13 @@ Manual installation (e.g. with your own MaxMind license) goes like this:
    You can skip this step entirely: Fumox downloads the databases itself
    (see below), and under Compose that download already targets `/shared/geo`.
 
-Fumox opens **every** database it finds in `[geo].db_dir` and merges their
-facts, so country, city and ASN data combine in one name template. The
-Country database is not used: City carries every fact it has (an existing
-`GeoLite2-Country.mmdb` is simply ignored). If no database file can be
-opened, geo enrichment quietly disables itself (a warning is logged) and
-everything else keeps working. MaxMind updates their databases weekly.
+Fumox opens the **City** database (country/city facts) and the **ASN**
+database (AS number/organization) from `[geo].db_dir` and merges their
+facts in one name template. `GeoLite2-Country.mmdb` is not read and is
+ignored: City carries every fact the Country database has. If no database
+file can be opened, geo enrichment quietly disables itself (a warning is
+logged) and everything else keeps working. MaxMind updates their databases
+weekly.
 
 Fumox fetches the databases itself: at startup the server checks
 `[geo].db_dir` and downloads any GeoLite2 database that is missing, broken

@@ -60,9 +60,10 @@ cargo run -p fumox-probe    # демон проверки живучести п�
 
 1. Скачайте нужные базы через
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/):
-   `GeoLite2-City.mmdb` это флаги/названия стран и города (`GeoLite2-ASN.mmdb`
-   добавляет номера/организации автономных систем; все найденные базы
-   объединяются и сочетаются в одном шаблоне имени).
+   Fumox читает базу **City** (`GeoLite2-City.mmdb`, факты о стране/городе)
+   и базу **ASN** (`GeoLite2-ASN.mmdb`, номера/организации автономных систем)
+   и объединяет их факты в одном шаблоне имени; `GeoLite2-Country.mmdb`
+   не читается и игнорируется (City несет все её факты).
 2. Положите файлы под каноническими именами в `[geo].db_dir` — для запуска из
    исходников это `config/`. **Поставляемый Compose-стек переопределяет каталог
    на `/shared/geo`** (`FUMOX_GEO__DB_DIR` в `docker-compose.yml`, отдельный

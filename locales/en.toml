@@ -1,6 +1,8 @@
 # Fumox: admin panel messages (English).
 # Format: flat "domain.name" = "text" pairs.
-# The file name is the language code; {} in values are placeholders.
+# The file name is the language code. Placeholders in values: {} —
+# positional, substituted by the caller via .replace("{}", …); {0}/{1} —
+# positional, via t_args; {name} — named, via t_named.
 
 "common.action_failed" = "The action failed"
 "common.admin" = "Admin"
@@ -162,7 +164,7 @@
 "login.not_revoked" = "The sessions were not revoked: the database refused the change. Repeat the logout or change [admin].token — a copy of the old cookie may still work."
 "login.submit" = "Sign in"
 "login.title" = "Sign in"
-"login.token_hint" = "The [admin].token value from config/app.toml"
+"login.token_hint" = "The [admin].token value from config/app.toml; FUMOX_ADMIN__TOKEN, when set, overrides the file value"
 "login.token_label" = "Access token"
 "nav.dashboard" = "Dashboard"
 "nav.import" = "Import/Export"
@@ -723,7 +725,7 @@
 "set.fail_limit" = "Failure threshold"
 "set.second_chance_min" = "Second chance: minimum delay"
 "set.second_chance_spread" = "Second chance: jitter spread"
-"set.ladder_hint" = "one delay (seconds) per line, in ascending order. To disable the quarantine ladder, set recheck_delays_secs = [] in the file directly."
+"set.ladder_hint" = "one delay (seconds) per line. To disable the quarantine ladder, set recheck_delays_secs = [] in the file directly."
 "set.range_label" = "Range:"
 "set.range_ladder" = "up to {steps} steps, each 1..={delay} s"
 "set.cycle_period" = "Cycle interval"

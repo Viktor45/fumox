@@ -60,9 +60,11 @@ at <https://www.maxmind.com/en/geolite2/signup>):
 
 1. Download the databases you need via
    [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/):
-   `GeoLite2-City.mmdb` for country flags/names and city names
-   (`GeoLite2-ASN.mmdb` adds AS numbers/organizations; every database
-   present is merged, so they combine in one name template).
+   Fumox opens the **City** database (`GeoLite2-City.mmdb`, country/city
+   facts) and the **ASN** database (`GeoLite2-ASN.mmdb`, AS
+   numbers/organizations) and merges their facts in one name template;
+   `GeoLite2-Country.mmdb` is not read and is ignored (City carries every
+   fact it has).
 2. Place each file under its canonical name in `[geo].db_dir` (`config/` for
    source runs). **The shipped Compose stack overrides the
    directory to `/shared/geo`** (`FUMOX_GEO__DB_DIR` in `docker-compose.yml`,

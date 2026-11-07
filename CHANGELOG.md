@@ -8,12 +8,15 @@ draft is oldest-first. Match the `sha-` tag of the image you pulled
 date against the section dates.
 
 The categories follow [Keep a Changelog](https://keepachangelog.com/);
-`Docs` covers the user guide and READMEs, `Internal` (dependency bumps,
-CI plumbing) is omitted: it never changes the shipped image.
+`Docs` covers the user guide and READMEs, `Internal` is a drop bucket for
+`chore` and merge commits; CI-plumbing and script-only commits that are
+part of a published batch are recorded under their Conventional-Commits
+category (`Added`/`Fixed`/`Changed`), like any other change in the batch.
 
-## Unreleased (2026-10-19)
+## Unreleased
 
-Changes in the working tree, not yet on a published image.
+Not yet shipped in a published image; the date and the `sha-<hash>` suffix
+are stamped when the batch is published.
 
 ### Added
 

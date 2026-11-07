@@ -495,7 +495,8 @@ second_chance_spread_hours = 1
 # между последовательными ретраями после провала второго шанса. Провал ретрая
 # N назначает ретрай N+1 через recheck_delays_secs[N-1]; провал последней
 # ступени удаляет прокси. Длина произвольная (до 16 ступеней, каждая до 30
-# дней); пустой массив = удалять сразу после провала второго шанса.
+# дней); пустой массив = удалять сразу после провала второго шанса. Порядок
+# значений не проверяется: ретрай N берет задержку из N-й записи списка как есть.
 # Range: at most 16 steps, each 1..=2592000 seconds (30 days). Beyond that the
 # config fails to load rather than being silently trimmed. An empty list is
 # legal.
@@ -503,7 +504,9 @@ second_chance_spread_hours = 1
 # consecutive rechecks after a failed second chance. Failing recheck N
 # schedules recheck N+1 after recheck_delays_secs[N-1]; failing the last
 # entry removes the proxy. Arbitrary length (up to 16 steps of at most 30
-# days); an empty list removes right after the failed second chance.
+# days); an empty list removes right after the failed second chance. The
+# order of the entries is not validated: failing recheck N takes the delay
+# from the Nth entry as is.
 recheck_delays_secs = [900]   # 15 мин / 15m
 # Диапазон: 0..=365 дней (форма), 0 читается как 1 день.
 # Записи очереди приоритетных проверок (probe_requests) старше этого срока

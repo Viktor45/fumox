@@ -13,7 +13,10 @@
 //! same concurrency cap as the rest of the process, and the address it
 //! looks up is the one the dial path would pick
 //! ([`crate::ssrf::pick_vetted`]): the facts then describe the server that
-//! is actually contacted, not a sibling address of the same name.
+//! is actually contacted, not a sibling address of the same name. Every
+//! candidate address is vetted by the shared policy first
+//! ([`crate::ssrf::vet_addr`]), a non-global address never becomes the
+//! lookup address.
 //!
 //! Facts are cached per host (hosts repeat heavily in subscription feeds).
 //! The three outcomes are kept apart, because they say different things
@@ -722,8 +725,9 @@ impl GeoResolver {
     }
 
     /// Resolve geo information for a proxy host (domain or literal IP).
-    /// Returns `None` when the resolver is inactive, DNS fails, or no loaded
-    /// database has data for the address.
+    /// Returns `None` when the resolver is inactive, the host is refused by
+    /// the SSRF policy, DNS fails, or no loaded database has data for the
+    /// address.
     pub async fn resolve(&self, host: &str) -> Option<Arc<GeoInfo>> {
         match self.resolve_detailed(host).await {
             GeoOutcome::Facts(info) => Some(info),
@@ -862,9 +866,36 @@ enum Resolved {
 /// contributes country + city, ASN the autonomous system on top.
 async fn resolve_uncached(backends: &Backends, host: &str, dns_timeout: Duration) -> Resolved {
     let ip = match ssrf::parse_ip_literal(host) {
-        Some(ip) => ip,
-        None => match ssrf::lookup_with_timeout(host, dns_timeout).await {
-            Ok(addrs) => match ssrf::pick_vetted(&addrs, IpFamily::Any) {
+        Some(ip) => match ssrf::vet_addr(ip, false) {
+            Ok(vetted) => vetted.ip(),
+            Err(reason) => {
+                NO_DATA.fetch_add(1, Ordering::Relaxed);
+                if NO_DATA_LOG.allow() {
+                    tracing::debug!(host, %reason, "geo: the literal address is not a global one");
+                }
+                return Resolved::NoRecord { ip: None };
+            }
+        },
+        None => {
+            let addrs = match ssrf::lookup_with_timeout(host, dns_timeout).await {
+                Ok(addrs) => addrs,
+                Err(reason) => {
+                    DNS_FAILED.fetch_add(1, Ordering::Relaxed);
+                    if DNS_LOG.allow() {
+                        tracing::warn!(host, reason, "geo: the host name did not resolve");
+                    }
+                    return Resolved::DnsFailed(reason);
+                }
+            };
+            // `pick_vetted` picks from an already-vetted list: every
+            // resolved address goes through the shared policy first, a
+            // non-global answer must not become the lookup address.
+            let vetted: Vec<IpAddr> = addrs
+                .into_iter()
+                .filter_map(|addr| ssrf::vet_addr(addr, false).ok())
+                .map(|vetted| vetted.ip())
+                .collect();
+            match ssrf::pick_vetted(&vetted, IpFamily::Any) {
                 Some(ip) => ip,
                 None => {
                     NO_DATA.fetch_add(1, Ordering::Relaxed);
@@ -876,15 +907,8 @@ async fn resolve_uncached(backends: &Backends, host: &str, dns_timeout: Duration
                     }
                     return Resolved::NoRecord { ip: None };
                 }
-            },
-            Err(reason) => {
-                DNS_FAILED.fetch_add(1, Ordering::Relaxed);
-                if DNS_LOG.allow() {
-                    tracing::warn!(host, reason, "geo: the host name did not resolve");
-                }
-                return Resolved::DnsFailed(reason);
             }
-        },
+        }
     };
     let mut info = GeoInfo {
         ip: ip.to_string(),
@@ -1355,13 +1379,14 @@ mod tests {
             db_dir: fixture_db_dir("norecord"),
             ..Default::default()
         });
-        // TEST-NET-1: a valid address the fixture databases do not know.
+        // A global address the fixture databases do not know (TEST-NET-1
+        // would be refused by the SSRF vetting before it reaches a lookup).
         for attempt in 0..2 {
-            match resolver.resolve_detailed("192.0.2.1").await {
+            match resolver.resolve_detailed("192.0.1.1").await {
                 GeoOutcome::NoRecord { ip } => {
                     assert_eq!(
                         ip.as_deref(),
-                        Some("192.0.2.1"),
+                        Some("192.0.1.1"),
                         "the resolved ip survives, attempt {attempt}"
                     );
                 }
@@ -1383,10 +1408,10 @@ mod tests {
             Duration::from_millis(50),
         );
         resolver.resolve("81.19.44.10").await.expect("known");
-        resolver.resolve("192.0.2.1").await;
+        resolver.resolve("192.0.1.1").await;
         assert!(resolver.facts.get("81.19.44.10").await.is_some());
         assert!(
-            resolver.dns_failures.get("192.0.2.1").await.is_none(),
+            resolver.dns_failures.get("192.0.1.1").await.is_none(),
             "a no-record verdict is a fact, not a DNS failure"
         );
 
@@ -1668,6 +1693,47 @@ mod tests {
         );
     }
 
+    /// A non-global address never becomes the geo lookup address: the
+    /// literal path is vetted by the shared policy exactly like the
+    /// resolved path, so a loopback literal comes back without an address
+    /// while a global one keeps the ordinary no-record shape (the empty
+    /// backends make the two outcomes distinguishable by the `ip` they
+    /// carry).
+    #[tokio::test]
+    async fn a_non_global_address_never_becomes_the_lookup_address() {
+        let backends = Backends {
+            city: None,
+            asn: None,
+        };
+        let timeout = Duration::from_secs(1);
+        let refused = resolve_uncached(&backends, "127.0.0.1", timeout).await;
+        assert!(
+            matches!(refused, Resolved::NoRecord { ip: None }),
+            "a refused literal must come back without an address"
+        );
+        let global = resolve_uncached(&backends, "8.8.8.8", timeout).await;
+        assert!(
+            matches!(
+                global,
+                Resolved::NoRecord { ip: Some(ref ip) } if ip == "8.8.8.8"
+            ),
+            "a global literal keeps the no-record outcome with its address"
+        );
+        // The resolved path vetts the same way: when this machine answers
+        // `localhost` with only non-global addresses, none of them may
+        // become the lookup address.
+        if let Ok(addrs) = ssrf::lookup_with_timeout("localhost", timeout).await
+            && !addrs.is_empty()
+            && addrs.iter().all(|ip| ssrf::vet_addr(*ip, false).is_err())
+        {
+            let refused = resolve_uncached(&backends, "localhost", timeout).await;
+            assert!(
+                matches!(refused, Resolved::NoRecord { ip: None }),
+                "a name resolving only into private space must come back without an address"
+            );
+        }
+    }
+
     #[test]
     fn flag_emoji_from_iso_codes() {
         assert_eq!(flag_emoji("DE").as_deref(), Some("🇩🇪"));
@@ -1883,13 +1949,16 @@ mod tests {
     /// A name that does not resolve and an address no database knows are
     /// different facts, and the resolver keeps them apart: the first is a
     /// transient condition of the name, the second a verdict about the
+    /// address. The fixture databases make "no database knows the
+    /// address" deterministic, the real GeoLite2 files cover every IPv4
     /// address.
     #[tokio::test]
     async fn a_failed_name_and_an_unknown_address_are_different_outcomes() {
-        let Some(resolver) = resolver_for(GeoDbKind::City) else {
-            eprintln!("skipped: GeoLite2-City.mmdb not present");
-            return;
-        };
+        let resolver = GeoResolver::new(&GeoConfig {
+            enabled: true,
+            db_dir: fixture_db_dir("outcomes"),
+            ..Default::default()
+        });
         // A name that cannot resolve.
         let failed = resolver.resolve_detailed("nx.invalid").await;
         assert!(
@@ -1897,9 +1966,12 @@ mod tests {
             "a name that does not resolve is a DNS failure, got {failed:?}"
         );
         // An address that resolves but that no database knows.
-        let unknown = resolver.resolve_detailed("192.0.2.1").await;
+        let unknown = resolver.resolve_detailed("192.0.1.1").await;
         assert!(
-            matches!(unknown, GeoOutcome::NoRecord { .. }),
+            matches!(
+                unknown,
+                GeoOutcome::NoRecord { ip: Some(ref ip) } if ip == "192.0.1.1"
+            ),
             "an address without a record is no record, got {unknown:?}"
         );
     }
@@ -2020,15 +2092,17 @@ mod tests {
 
     #[tokio::test]
     async fn results_are_cached_including_negative() {
-        let Some(resolver) = resolver_for(GeoDbKind::City) else {
-            eprintln!("skipped: GeoLite2-City.mmdb not present");
-            return;
-        };
-        // TEST-NET-1 address: valid IP, typically without geo data, the
-        // negative result must be cached and stable across calls.
-        let first = resolver.resolve("192.0.2.1").await;
-        let second = resolver.resolve("192.0.2.1").await;
+        let resolver = GeoResolver::new(&GeoConfig {
+            enabled: true,
+            db_dir: fixture_db_dir("negative-cache"),
+            ..Default::default()
+        });
+        // An address the fixture databases do not know: the negative
+        // result must be cached and stable across calls.
+        let first = resolver.resolve("192.0.1.1").await;
+        let second = resolver.resolve("192.0.1.1").await;
         assert_eq!(first, second);
+        assert!(first.is_none(), "the fixture address has no record");
 
         // Positive results are cached identically (case-insensitive keys).
         let a = resolver.resolve("8.8.8.8").await;

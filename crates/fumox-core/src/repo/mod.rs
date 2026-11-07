@@ -390,7 +390,7 @@ mod tests {
             "idx_proxies_t2_block",
             "idx_speed_proxy_time",
             "idx_fetch_source_time",
-            "idx_fetch_time",
+            "idx_fetch_time_id",
             "idx_fetch_fail",
             "idx_fetch_error_class",
             "idx_proxies_updated_at",
@@ -412,11 +412,12 @@ mod tests {
             "the proxy row must carry the T2 recency stamp"
         );
 
-        // Schema version is stamped into meta by db::migrate. Bumped to 19
-        // by migration 0019 (the sources access token; 0018 was the proxies
-        // rebuild that installs the port range CHECK).
+        // Schema version is stamped into meta by db::migrate. Bumped to 20
+        // by migration 0020 (the fetch journal keyset index, which replaces
+        // idx_fetch_time — a strict prefix of the new composite; 0019 was
+        // the sources access token).
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("19"));
+        assert_eq!(version.as_deref(), Some("20"));
 
         // The fetch-attempt stamp of migration 0015 is on the source row.
         let source_columns: Vec<(String,)> =

@@ -103,9 +103,10 @@
         </tbody>
       </table>
     </div>
-
-    {% let page_base = "/admin/logs/fetch" %}
-    {% include "_pagination.html" %}
   {% endif %}
+
+  {# Outside the empty check: a page a stale cursor emptied still shows
+     the way back to the first one. #}
+  {% include "_cursor_nav.html" %}
 </div>
 {% endblock %}

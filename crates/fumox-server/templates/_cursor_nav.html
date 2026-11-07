@@ -1,0 +1,16 @@
+{#- Shared keyset navigation for the fetch-journal screens. The including
+    template binds `nav_first`, `nav_prev` and `nav_next` (the link to
+    that page, `None` when it does not exist; the strip renders only when
+    at least one does).
+
+    The strip is a nav landmark; the step links carry rel="prev"/"next",
+    and the first-page link is also the way out of a page a stale cursor
+    emptied — cursor links are relative to the rows they were made from,
+    so a page gone stale renders empty rather than wrong. -#}
+{% if nav_first.is_some() || nav_prev.is_some() || nav_next.is_some() %}
+  <nav class="pagination" aria-label="{{ self.t("log.pagination_label") }}">
+    {% if let Some(link) = nav_first %}<a class="page" href="{{ link }}">{{ self.t("log.page_first") }}</a>{% endif %}
+    {% if let Some(link) = nav_prev %}<a class="page" href="{{ link }}" rel="prev">{{ self.t("log.page_prev") }}</a>{% endif %}
+    {% if let Some(link) = nav_next %}<a class="page" href="{{ link }}" rel="next">{{ self.t("log.page_next") }}</a>{% endif %}
+  </nav>
+{% endif %}

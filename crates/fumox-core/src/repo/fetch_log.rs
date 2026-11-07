@@ -104,7 +104,7 @@ pub async fn recent_for_source(
     source_id: &str,
     limit: i64,
 ) -> crate::Result<Vec<FetchLogRow>> {
-    list_for_source(pool, source_id, limit, 0).await
+    list_for_source(pool, source_id, limit, None).await
 }
 
 /// Global journal across all sources, newest first (admin screen).
@@ -130,6 +130,7 @@ pub async fn recent_global(pool: &DbPool, limit: i64) -> crate::Result<Vec<Fetch
 /// display name (`source_name` is NULL when the source row is gone).
 #[derive(Debug, Clone, FromRow)]
 pub struct FetchLogListRow {
+    pub id: i64,
     pub source_id: String,
     pub source_name: Option<String>,
     pub fetched_at: i64,
@@ -149,8 +150,10 @@ pub struct FetchLogListRow {
 
 /// The projected columns of [`FetchLogListRow`], alias-qualified and
 /// shared by the one query that reads them (`list_page`): the SELECT
-/// list and the struct it feeds cannot drift apart.
-const LIST_COLUMNS: &str = "f.source_id, s.name AS source_name, f.fetched_at, f.ok,
+/// list and the struct it feeds cannot drift apart. `f.id` travels too:
+/// the keyset cursor of the journal screens needs it to break ties
+/// between rows written in the same second.
+const LIST_COLUMNS: &str = "f.id, f.source_id, s.name AS source_name, f.fetched_at, f.ok,
     f.http_status, f.bytes, f.proxies_found, f.error, f.error_class, f.duration_ms, f.attempts";
 
 /// Filter parameters of the global fetch journal ([`count_filtered`] /
@@ -192,6 +195,55 @@ impl FetchLogFilter {
     }
 }
 
+/// The sort key of one journal row: the position the journal screens
+/// page by. Rows written in the same second share `fetched_at`, so the
+/// `id` breaks the tie — a page boundary inside one second neither
+/// repeats nor drops a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchLogCursor {
+    pub fetched_at: i64,
+    pub id: i64,
+}
+
+/// The side of the cursor a page takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchLogDirection {
+    /// Rows older than the cursor (the natural direction, newest first).
+    Forward,
+    /// Rows newer than the cursor, read backwards and re-reversed, so
+    /// the rows still arrive newest first.
+    Backward,
+}
+
+/// Where and which way one journal page reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchLogPage {
+    pub cursor: FetchLogCursor,
+    pub direction: FetchLogDirection,
+}
+
+/// The keyset predicate shared by the journal's paged reads: seek to the
+/// cursor's `(fetched_at, id)` instead of skipping an SQL `OFFSET`.
+///
+/// `column` prefixes every column (`"f."` for the reads that join another
+/// table, `""` for the plain ones); the predicate is empty for the first
+/// page (`page` is `None`). The caller joins it into the WHERE — an
+/// `AND` with no filter clauses before it would land in a JOIN's `ON`
+/// and stop filtering. The backwards page reads the rows on the newer
+/// side of the cursor in ascending order — the caller re-reverses them
+/// into display order.
+fn keyset_predicate(page: Option<&FetchLogPage>, backwards: bool, column: &str) -> String {
+    if page.is_none() {
+        return String::new();
+    }
+    let predicate = if backwards {
+        "({c}fetched_at > ? OR ({c}fetched_at = ? AND {c}id > ?))"
+    } else {
+        "({c}fetched_at < ? OR ({c}fetched_at = ? AND {c}id < ?))"
+    };
+    predicate.replace("{c}", column)
+}
+
 /// Count the journal rows the admin screen would show for `filter`: the
 /// same clause set [`list_page`] applies.
 pub async fn count_filtered(pool: &DbPool, filter: &FetchLogFilter) -> crate::Result<i64> {
@@ -205,62 +257,109 @@ pub async fn count_filtered(pool: &DbPool, filter: &FetchLogFilter) -> crate::Re
 }
 
 /// One page of the global journal for `filter`, newest first, joined with
-/// the source display name. `offset` is the plain SQL OFFSET.
+/// the source display name.
+///
+/// Keyset paging: the page seeks to the `(fetched_at, id)` of the row it
+/// continues from ([`FetchLogPage`]) instead of skipping an SQL `OFFSET`,
+/// so a deep page costs a seek, not a walk over every row before it.
+/// `None` is the first page. Rows arrive in display order either way;
+/// callers over-fetch by one to learn whether a further page exists.
 pub async fn list_page(
     pool: &DbPool,
     filter: &FetchLogFilter,
     limit: i64,
-    offset: i64,
+    page: Option<&FetchLogPage>,
 ) -> crate::Result<Vec<FetchLogListRow>> {
     let wf = filter.where_filter();
+    let backwards = page.is_some_and(|page| page.direction == FetchLogDirection::Backward);
+    let order = if backwards {
+        "ORDER BY f.fetched_at ASC, f.id ASC".to_string()
+    } else {
+        order_newest_first(Some("f"))
+    };
+    // The keyset predicate rides on the filter's WHERE; with no filter
+    // clauses it is the WHERE itself — an `AND` with nothing before it
+    // would land in the LEFT JOIN's ON and stop filtering the journal.
+    let filter_sql = wf.sql();
+    let keyset = keyset_predicate(page, backwards, "f.");
+    let clause = if keyset.is_empty() {
+        filter_sql
+    } else if filter_sql.is_empty() {
+        format!(" WHERE {keyset}")
+    } else {
+        format!("{filter_sql} AND {keyset}")
+    };
+    // sqlx 0.9 SqlSafeStr: the clauses are compile-time constants of this
+    // module; every data value flows through a bind.
     let sql = format!(
         "SELECT {LIST_COLUMNS}
          FROM fetch_log f LEFT JOIN sources s ON s.id = f.source_id
          {}
          {}
-         LIMIT ? OFFSET ?",
-        wf.sql(),
-        order_newest_first(Some("f"))
+         LIMIT ?",
+        clause, order
     );
-    let rows = sqlx::query_as::<_, FetchLogListRow>(sqlx::AssertSqlSafe(sql))
-        .bind_where_filter(wf.values())
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+    let mut query = sqlx::query_as::<_, FetchLogListRow>(sqlx::AssertSqlSafe(sql))
+        .bind_where_filter(wf.values());
+    if let Some(page) = page {
+        query = query
+            .bind(page.cursor.fetched_at)
+            .bind(page.cursor.fetched_at)
+            .bind(page.cursor.id);
+    }
+    let mut rows = query.bind(limit).fetch_all(pool).await?;
+    if backwards {
+        rows.reverse();
+    }
     Ok(rows)
 }
 
-/// Total journal rows of one source (source-card pagination).
-pub async fn count_for_source(pool: &DbPool, source_id: &str) -> crate::Result<i64> {
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fetch_log WHERE source_id = ?")
-        .bind(source_id)
-        .fetch_one(pool)
-        .await?;
-    Ok(count)
-}
-
 /// One page of one source's journal, newest first (source-card log).
-/// `offset` is the plain SQL OFFSET.
+///
+/// Keyset paging like [`list_page`]: the page seeks to the
+/// `(fetched_at, id)` of the row it continues from instead of skipping an
+/// SQL `OFFSET`. `None` is the first page; rows arrive in display order.
 pub async fn list_for_source(
     pool: &DbPool,
     source_id: &str,
     limit: i64,
-    offset: i64,
+    page: Option<&FetchLogPage>,
 ) -> crate::Result<Vec<FetchLogRow>> {
-    // sqlx 0.9 SqlSafeStr: {order_newest_first} is a compile-time constant
-    // of this module; all data flows through .bind().
+    let backwards = page.is_some_and(|page| page.direction == FetchLogDirection::Backward);
+    let order = if backwards {
+        "ORDER BY fetched_at ASC, id ASC".to_string()
+    } else {
+        order_newest_first(None)
+    };
+    // The read always carries `WHERE source_id = ?`, the predicate rides
+    // on it.
+    let keyset = keyset_predicate(page, backwards, "");
+    let keyset_sql = if keyset.is_empty() {
+        String::new()
+    } else {
+        format!("AND {keyset}")
+    };
+    // sqlx 0.9 SqlSafeStr: {keyset_sql} and {order} are compile-time
+    // constants of this module; all data flows through .bind().
     let sql = sqlx::AssertSqlSafe(format!(
         "SELECT * FROM fetch_log WHERE source_id = ?
-         {} LIMIT ? OFFSET ?",
-        order_newest_first(None)
+         {}
+         {}
+         LIMIT ?",
+        keyset_sql, order
     ));
-    let rows: Vec<FetchLogRow> = sqlx::query_as(sql)
-        .bind(source_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+    let mut query: sqlx::query::QueryAs<'_, sqlx::Sqlite, FetchLogRow, _> =
+        sqlx::query_as(sql).bind(source_id);
+    if let Some(page) = page {
+        query = query
+            .bind(page.cursor.fetched_at)
+            .bind(page.cursor.fetched_at)
+            .bind(page.cursor.id);
+    }
+    let mut rows: Vec<FetchLogRow> = query.bind(limit).fetch_all(pool).await?;
+    if backwards {
+        rows.reverse();
+    }
     Ok(rows)
 }
 
@@ -431,7 +530,7 @@ mod tests {
         assert_eq!(rows[1].duration_ms, None);
         assert_eq!(rows[1].attempts, None);
 
-        let page = list_page(&pool, &FetchLogFilter::default(), 10, 0)
+        let page = list_page(&pool, &FetchLogFilter::default(), 10, None)
             .await
             .unwrap();
         assert_eq!(page.len(), 2);
@@ -507,7 +606,7 @@ mod tests {
         // Unfiltered: count and page agree, newest first, names resolved.
         let filter = FetchLogFilter::default();
         assert_eq!(count_filtered(&pool, &filter).await.unwrap(), 4);
-        let page = list_page(&pool, &filter, 10, 0).await.unwrap();
+        let page = list_page(&pool, &filter, 10, None).await.unwrap();
         assert_eq!(
             page.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
             vec![1003, 1002, 1001, 1000]
@@ -520,7 +619,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(count_filtered(&pool, &filter).await.unwrap(), 1);
-        let page = list_page(&pool, &filter, 10, 0).await.unwrap();
+        let page = list_page(&pool, &filter, 10, None).await.unwrap();
         assert_eq!(page[0].fetched_at, 1001);
         let filter = FetchLogFilter {
             ok: Some(true),
@@ -546,28 +645,134 @@ mod tests {
         };
         assert_eq!(count_filtered(&pool, &filter).await.unwrap(), 1);
 
-        // Pagination windows.
-        let page = list_page(&pool, &FetchLogFilter::default(), 2, 0)
+        // Pagination windows: the first page, then the page the cursor of
+        // its last row leads to — the keyset seek replaces the offset walk.
+        let first = list_page(&pool, &FetchLogFilter::default(), 2, None)
             .await
             .unwrap();
         assert_eq!(
-            page.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+            first.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
             vec![1003, 1002]
         );
-        let page = list_page(&pool, &FetchLogFilter::default(), 2, 2)
-            .await
-            .unwrap();
+        let last = first.last().unwrap();
+        let next = list_page(
+            &pool,
+            &FetchLogFilter::default(),
+            2,
+            Some(&FetchLogPage {
+                cursor: FetchLogCursor {
+                    fetched_at: last.fetched_at,
+                    id: last.id,
+                },
+                direction: FetchLogDirection::Forward,
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            page.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+            next.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
             vec![1001, 1000]
         );
 
+        // A backwards page re-reads the rows on the newer side of the
+        // cursor, still newest first.
+        let back = list_page(
+            &pool,
+            &FetchLogFilter::default(),
+            2,
+            Some(&FetchLogPage {
+                cursor: FetchLogCursor {
+                    fetched_at: next[0].fetched_at,
+                    id: next[0].id,
+                },
+                direction: FetchLogDirection::Backward,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            back.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+            vec![1003, 1002]
+        );
+
         // Source-card pagination.
-        assert_eq!(count_for_source(&pool, "srcA0000000").await.unwrap(), 3);
-        let page = list_for_source(&pool, "srcA0000000", 2, 0).await.unwrap();
+        let page = list_for_source(&pool, "srcA0000000", 2, None)
+            .await
+            .unwrap();
         assert_eq!(
             page.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
             vec![1002, 1001]
+        );
+        let last = page.last().unwrap();
+        let next = list_for_source(
+            &pool,
+            "srcA0000000",
+            2,
+            Some(&FetchLogPage {
+                cursor: FetchLogCursor {
+                    fetched_at: last.fetched_at,
+                    id: last.id,
+                },
+                direction: FetchLogDirection::Forward,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+            vec![1000]
+        );
+    }
+
+    /// Rows written in the same second share `fetched_at`, so the keyset
+    /// tie is broken by `id`: a walk through the cursors covers every row
+    /// exactly once, in write order reversed — no gaps, no overlaps.
+    #[tokio::test]
+    async fn keyset_pages_partition_a_tied_second() {
+        let (_dir, pool) = temp_pool().await;
+        seed_source(&pool, "srcA0000000", "s").await;
+        for i in 0..6 {
+            insert(
+                &pool,
+                &FetchLogEntry {
+                    source_id: "srcA0000000",
+                    fetched_at: 1000,
+                    ok: true,
+                    http_status: Some(200),
+                    bytes: None,
+                    proxies_found: Some(i),
+                    error: None,
+                    error_class: None,
+                },
+                FetchTiming::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut seen: Vec<Option<i64>> = Vec::new();
+        let mut page: Option<FetchLogPage> = None;
+        loop {
+            let rows = list_page(&pool, &FetchLogFilter::default(), 2, page.as_ref())
+                .await
+                .unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            seen.extend(rows.iter().map(|r| r.proxies_found));
+            let last = rows.last().unwrap();
+            page = Some(FetchLogPage {
+                cursor: FetchLogCursor {
+                    fetched_at: last.fetched_at,
+                    id: last.id,
+                },
+                direction: FetchLogDirection::Forward,
+            });
+        }
+        // Newest first is write order reversed; the walk saw every row.
+        assert_eq!(
+            seen,
+            vec![Some(5), Some(4), Some(3), Some(2), Some(1), Some(0)]
         );
     }
 }

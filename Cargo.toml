@@ -111,8 +111,17 @@ rcgen = { version = "0.14", default-features = false, features = [
     "ring",
 ] }
 
-# Admin UI (SSR templates)
-askama = "0.16"
+# Admin UI (SSR templates). The `config` default feature is off: it only
+# teaches the derive to read an `askama.toml`, this repo has none, and its
+# parser is the unmaintained `basic-toml` (RUSTSEC-2026-0374) — the sole
+# reason the crate sat in the tree. `urlencode` stays: it is in the
+# default set, costs nothing (`percent-encoding` is already a dependency),
+# and keeps the `|urlencode` filter available to templates.
+askama = { version = "0.16", default-features = false, features = [
+    "derive",
+    "std",
+    "urlencode",
+] }
 
 [profile.release]
 lto = "thin"

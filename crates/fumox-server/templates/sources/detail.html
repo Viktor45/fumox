@@ -147,21 +147,7 @@
        hx-trigger="every 15s, fumox:refresh" hx-swap="innerHTML">
     {% include "sources/_log.html" %}
   </div>
-  {% if pages.len() > 1 %}
-    <div class="pagination">
-      {% for link in pages %}
-        {% if link.gap %}
-          {#- The dots lead to the first page the window hides (the
-              marker carries it), same as the shared strip. -#}
-          <a class="page gap" href="/admin/sources/{{ source.id }}?page={{ link.page }}">…</a>
-        {% else if link.current %}
-          <span class="page current" aria-current="page">{{ link.page }}</span>
-        {% else %}
-          <a class="page" href="/admin/sources/{{ source.id }}?page={{ link.page }}">{{ link.page }}</a>
-        {% endif %}
-      {% endfor %}
-    </div>
-  {% endif %}
+  {% include "_cursor_nav.html" %}
 </div>
 
 <dialog id="delete-dialog" aria-labelledby="delete-dialog-title">

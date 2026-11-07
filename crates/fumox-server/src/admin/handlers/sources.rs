@@ -2,12 +2,13 @@
 //! validation, card with aggregates and fetch log,
 //! toggle / *Refresh now* / delete actions.
 
+use super::logs::{decode_fetch_cursor, journal_page_link};
 use super::profiles::token_placeholder;
 use super::{
     FormError, FormMap, action_response, action_response_err, caps, flash_redirect, fmt_opt_bytes,
-    is_htmx, mask_secret, not_found, page_offset, pagination_pages, pipeline_from_form,
-    row_error_response, server_error, ttl_range_message, url_problem_message, validate_header_map,
-    validate_name, validate_slug, validate_tags, validate_token, validate_ttl,
+    is_htmx, mask_secret, not_found, pipeline_from_form, row_error_response, server_error,
+    ttl_range_message, url_problem_message, validate_header_map, validate_name, validate_slug,
+    validate_tags, validate_token, validate_ttl,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -1172,7 +1173,13 @@ struct SourceDetailTemplate {
     /// last attempt succeeded (see [`SourceCardView::next_retry_at`]).
     /// Rendered inside the last-error row.
     next_retry_at: Option<i64>,
-    pages: Vec<super::PageLink>,
+    /// The keyset navigation of the journal panel: the links to the
+    /// first, the previous and the next page of the log; `None` when
+    /// that page does not exist (the shared `_cursor_nav.html` renders
+    /// the strip only then).
+    nav_first: Option<String>,
+    nav_prev: Option<String>,
+    nav_next: Option<String>,
     /// The toggle endpoint of this source and its current state, as flat
     /// fields: the markup lives once in the shared `_toggle_form.html`,
     /// which the page includes directly (sources and profiles render the
@@ -1200,8 +1207,9 @@ struct SourceCardView {
     /// succeeded. Rendered next to the last error, so a dead feed reads
     /// as "retry scheduled", not as "the scheduler gave up".
     next_retry_at: Option<i64>,
-    page: i64,
-    total: i64,
+    nav_first: Option<String>,
+    nav_prev: Option<String>,
+    nav_next: Option<String>,
 }
 
 pub async fn source_detail(
@@ -1217,27 +1225,78 @@ pub async fn source_detail(
         Ok(None) => return not_found(lang, "err.source_not_found"),
         Err(err) => return server_error(&state, &headers, "sources.detail", &err),
     };
-    let page: i64 = params
-        .get("page")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
-        .max(1);
 
-    let total: i64 = match fetch_log::count_for_source(&state.pool, &id).await {
-        Ok(total) => total,
-        Err(err) => return server_error(&state, &headers, "sources.detail", &err),
-    };
-    let log: Vec<fetch_log::FetchLogRow> = match fetch_log::list_for_source(
+    // The cursor of the requested page: the same journal token the global
+    // screen pages by. A token of another sort is not a position in this
+    // one, so the log falls back to its first page.
+    let page = params
+        .get("cur")
+        .and_then(|token| decode_fetch_cursor(token))
+        .map(|(cursor, direction)| fetch_log::FetchLogPage { cursor, direction });
+
+    // The rows over-fetch by one: the extra row says whether a further
+    // page exists without a second count.
+    let mut log: Vec<fetch_log::FetchLogRow> = match fetch_log::list_for_source(
         &state.pool,
         &id,
-        LOG_PAGE_SIZE,
-        page_offset(page, LOG_PAGE_SIZE),
+        LOG_PAGE_SIZE + 1,
+        page.as_ref(),
     )
     .await
     {
         Ok(rows) => rows,
         Err(err) => return server_error(&state, &headers, "sources.detail", &err),
     };
+
+    // The navigation of the log, assembled exactly like the global
+    // journal screen's: the over-fetched row dropped on a backwards page,
+    // then the neighbours of the page.
+    let backward = page
+        .as_ref()
+        .is_some_and(|page| page.direction == fetch_log::FetchLogDirection::Backward);
+    let has_more = log.len() as i64 > LOG_PAGE_SIZE;
+    if backward && has_more {
+        // The rows closest to the cursor come last: the over-fetched row
+        // is the farthest one, the page keeps the rows right before the
+        // cursor.
+        log.remove(0);
+    }
+    log.truncate(LOG_PAGE_SIZE as usize);
+    let cursor_of = |row: &fetch_log::FetchLogRow| fetch_log::FetchLogCursor {
+        fetched_at: row.fetched_at,
+        id: row.id,
+    };
+    let first_cursor = log.first().map(cursor_of);
+    let last_cursor = log.last().map(cursor_of);
+    let (prev, next) = if backward {
+        (
+            if has_more {
+                first_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Backward))
+            } else {
+                None
+            },
+            last_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Forward)),
+        )
+    } else {
+        (
+            if page.is_some() {
+                first_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Backward))
+            } else {
+                None
+            },
+            if has_more {
+                last_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Forward))
+            } else {
+                None
+            },
+        )
+    };
+    let base = format!("/admin/sources/{id}");
+    let nav_first = page
+        .is_some()
+        .then(|| journal_page_link(&base, LOG_PAGE_SIZE, "", None));
+    let nav_prev = prev.map(|page| journal_page_link(&base, LOG_PAGE_SIZE, "", Some(page)));
+    let nav_next = next.map(|page| journal_page_link(&base, LOG_PAGE_SIZE, "", Some(page)));
 
     let counts = match proxies::count_by_status_for_source(&state.pool, &id).await {
         Ok(counts) => counts,
@@ -1255,8 +1314,9 @@ pub async fn source_detail(
             counts,
             log,
             next_retry_at,
-            page,
-            total,
+            nav_first,
+            nav_prev,
+            nav_next,
         },
     )
 }
@@ -1273,8 +1333,9 @@ fn render_source_detail(
         counts,
         log,
         next_retry_at,
-        page,
-        total,
+        nav_first,
+        nav_prev,
+        nav_next,
     } = view;
     let serve_path = format!(
         "/src/{}",
@@ -1340,7 +1401,9 @@ fn render_source_detail(
             counts,
             log,
             next_retry_at,
-            pages: pagination_pages(page, total, LOG_PAGE_SIZE),
+            nav_first,
+            nav_prev,
+            nav_next,
             toggle_url: format!("/admin/sources/{}/toggle", source.id),
             enabled: source.enabled,
             swap_oob: false,

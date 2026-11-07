@@ -1884,12 +1884,12 @@ async fn list_screens_render_for_an_authenticated_session() {
     }
 }
 
-/// The fetch journal page clamps its page number: `page=0`, a negative
-/// one, a non-numeric one and a page past the end all render exactly
-/// page 1 (same status, same body), not an empty table a stale link
-/// could dress up as "the journal is empty".
+/// A cursor token this browser did not write is not a position in the
+/// journal: garbage, an empty one and a damaged one all render exactly
+/// the first page (same status, same body), not an empty table a crafted
+/// link could dress up as "the journal is empty".
 #[tokio::test]
-async fn the_fetch_journal_clamps_a_broken_page_to_the_first_page() {
+async fn the_fetch_journal_falls_back_to_its_first_page_on_a_broken_cursor() {
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
     let now = fumox_core::models::now_ts();
@@ -1941,14 +1941,116 @@ async fn the_fetch_journal_clamps_a_broken_page_to_the_first_page() {
         "the journal rows must be on the page: {baseline:.600}"
     );
 
-    for query in ["?page=0", "?page=abc", "?page=-3", "?page=999"] {
+    for query in ["?cur=", "?cur=garbage", "?cur=!!!", "?cur=f|1"] {
         let (status, html) = fetch_page(&app, &cookie, query).await;
         assert_eq!(status, StatusCode::OK, "query {query}");
         assert_eq!(
             html, baseline,
-            "query {query} must render exactly like page 1"
+            "query {query} must render exactly like the first page"
         );
     }
+}
+
+/// The journal pages with a cursor: the next link carries the last row's
+/// `(fetched_at, id)` and the page it leads to holds the older rows, the
+/// walk through the links reaches every row, and the strip disappears
+/// when the journal ends.
+#[tokio::test]
+async fn the_fetch_journal_pages_through_the_cursor_links() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let now = fumox_core::models::now_ts();
+    let source = test_source("srcWalk0000", "journal-walk");
+    fumox_core::repo::sources::create(&pool, &source)
+        .await
+        .unwrap();
+    // Five attempts a second apart, each named by its error (row 0 is the
+    // newest); two-digit names keep one from being a substring of another.
+    for i in 0..5 {
+        fumox_core::repo::fetch_log::insert(
+            &pool,
+            &fumox_core::repo::fetch_log::FetchLogEntry {
+                source_id: "srcWalk0000",
+                fetched_at: now - i,
+                ok: false,
+                http_status: None,
+                bytes: None,
+                proxies_found: None,
+                error: Some(&format!("attempt {:02}", i)),
+                error_class: None,
+            },
+            fumox_core::repo::fetch_log::FetchTiming::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    async fn fetch_page(app: &axum::Router, cookie: &str, query: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/admin/logs/fetch{query}"),
+                "",
+                Some(cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+    /// The `cur` token of the next-page link: the `href` of the anchor
+    /// that carries `rel="next"` (it opens before the rel attribute).
+    fn next_token(html: &str) -> Option<String> {
+        let at = html.find("rel=\"next\"")?;
+        let head = &html[..at];
+        let href_at = head.rfind("href=\"")? + "href=\"".len();
+        let rest = &html[href_at..];
+        let end = rest.find('"')?;
+        let href = &rest[..end];
+        let cur_at = href.find("cur=")?;
+        Some(href[cur_at + "cur=".len()..].to_string())
+    }
+
+    // Page 1 at two rows per page: the two newest attempts and a next link.
+    let first = fetch_page(&app, &cookie, "?per_page=2").await;
+    assert!(first.contains("attempt 00"), "{first:.600}");
+    assert!(first.contains("attempt 01"), "{first:.600}");
+    assert!(!first.contains("attempt 04"), "{first:.600}");
+    assert!(first.contains("rel=\"next\""), "{first:.600}");
+    assert!(!first.contains("rel=\"prev\""), "{first:.600}");
+
+    // The walk through the next links reaches the oldest row exactly at
+    // the end, where the strip offers no further page.
+    let mut seen = vec![first.clone()];
+    let mut token = next_token(&first);
+    while let Some(cur) = token {
+        let page = fetch_page(&app, &cookie, &format!("?per_page=2&cur={cur}")).await;
+        seen.push(page.clone());
+        token = next_token(&page);
+    }
+    assert_eq!(seen.len(), 3, "five rows at two per page need three pages");
+    let last = seen.last().unwrap();
+    assert!(last.contains("attempt 04"), "{last:.600}");
+    assert!(!last.contains("rel=\"next\""), "{last:.600}");
+    // Every row renders on exactly one page of the walk: no gaps, no
+    // repeats — the tie-breaker by id holds the partition tight.
+    for name in [
+        "attempt 00",
+        "attempt 01",
+        "attempt 02",
+        "attempt 03",
+        "attempt 04",
+    ] {
+        let marker = format!(">{name}</span>");
+        let pages_with = seen.iter().filter(|page| page.contains(&marker)).count();
+        assert_eq!(pages_with, 1, "{name} must render on exactly one page");
+    }
+
+    // Every cursor page offers the way back to the first one.
+    assert!(seen[1].contains("rel=\"prev\""), "{:#.400}", seen[1]);
 }
 
 /// The fetch journal's error-class select offers every class the schema
@@ -7079,6 +7181,94 @@ async fn fetch_journal_tables_keep_columns_single_line() {
         html.contains(&format!(r#"hx-get="/admin/sources/{}/log""#, source.id)),
         "log-live polling missing on the source card"
     );
+}
+
+/// The source card's journal pages with the same cursor token the global
+/// screen pages by: a log longer than one page offers the strip, the next
+/// page holds the older attempts, the first page carries no strip at all,
+/// and the live fragment keeps showing the newest page regardless.
+#[tokio::test]
+async fn the_source_card_log_pages_through_the_cursor() {
+    let (_dir, state) = test_state(1000).await;
+    let pool = state.pool.clone();
+    let now = fumox_core::models::now_ts();
+    let source = test_source("srcCardLog0", "card-log");
+    fumox_core::repo::sources::create(&pool, &source)
+        .await
+        .unwrap();
+    // 25 attempts a second apart against the 20-row page; two-digit error
+    // names keep one from being a substring of another.
+    for i in 0..25 {
+        fumox_core::repo::fetch_log::insert(
+            &pool,
+            &fumox_core::repo::fetch_log::FetchLogEntry {
+                source_id: "srcCardLog0",
+                fetched_at: now - i,
+                ok: false,
+                http_status: None,
+                bytes: None,
+                proxies_found: None,
+                error: Some(&format!("attempt {:02}", i)),
+                error_class: None,
+            },
+            fumox_core::repo::fetch_log::FetchTiming::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    async fn get(app: &axum::Router, cookie: &str, path: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(request("GET", path, "", Some(cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "path {path}");
+        body_text(response).await
+    }
+
+    // The first page: the newest twenty attempts and the way to the next
+    // one — there is nothing before it, so no prev and no first link.
+    let first = get(&app, &cookie, &format!("/admin/sources/{}", source.id)).await;
+    assert!(first.contains("attempt 00"), "{first:.600}");
+    assert!(first.contains("attempt 19"), "{first:.600}");
+    assert!(!first.contains("attempt 20"), "{first:.600}");
+    assert!(first.contains("rel=\"next\""), "{first:.600}");
+    assert!(!first.contains("rel=\"prev\""), "{first:.600}");
+
+    // A cursor token this browser did not write (`?cur=`, an empty one)
+    // renders exactly the first page, broken link or not.
+    let empty = get(&app, &cookie, &format!("/admin/sources/{}?cur=", source.id)).await;
+    assert_eq!(
+        empty, first,
+        "a broken cursor renders exactly the first page"
+    );
+
+    // The next page: the five oldest attempts, the way back to the first.
+    use base64::Engine as _;
+    let newest = fumox_core::repo::fetch_log::recent_for_source(&pool, "srcCardLog0", 20)
+        .await
+        .unwrap();
+    let last = newest.last().unwrap();
+    let cursor = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(format!("f|{}|{}", last.fetched_at, last.id));
+    let second = get(
+        &app,
+        &cookie,
+        &format!("/admin/sources/{}?per_page=20&cur={cursor}", source.id),
+    )
+    .await;
+    assert!(second.contains("attempt 24"), "{second:.600}");
+    assert!(!second.contains("attempt 00"), "{second:.600}");
+    assert!(second.contains("rel=\"prev\""), "{second:.600}");
+
+    // The live fragment stays on the newest page: the poll does not
+    // travel with the card's cursor.
+    let fragment = get(&app, &cookie, &format!("/admin/sources/{}/log", source.id)).await;
+    assert!(fragment.contains("attempt 00"), "{fragment:.600}");
+    assert!(!fragment.contains("rel=\"next\""), "{fragment:.600}");
 }
 
 /// Regression: after `settings_update` writes the form,

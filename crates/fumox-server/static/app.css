@@ -776,9 +776,6 @@ pre.mono { white-space: pre-wrap; }
   background: var(--btn-bg);
 }
 .pagination span.current { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
-/* The gap dots are a link to the first page the window hides (see
-   _pagination.html), so the rule covers the anchor too. */
-.pagination .gap { border: none; background: none; color: var(--muted); padding: 4px 4px; }
 
 .filters {
   display: flex;

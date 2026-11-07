@@ -157,6 +157,12 @@ pub mod meta {
         pub fetch_log: u64,
         #[serde(default)]
         pub probe_requests: u64,
+        /// The proxies the pass deleted from the `removed` status past
+        /// the TTL window (`[retention].removed_proxies_days`). Stamps
+        /// from before the field existed and deployments with the window
+        /// off carry 0.
+        #[serde(default)]
+        pub proxies: u64,
         /// Whether the pass ran to completion; a stamp written before the
         /// field existed parses as successful.
         #[serde(default = "default_rotation_ok")]
@@ -239,6 +245,7 @@ pub mod meta {
             assert_eq!(minimal.ts, 5);
             assert_eq!(minimal.fetch_log, 0);
             assert_eq!(minimal.probe_requests, 0);
+            assert_eq!(minimal.proxies, 0);
             assert!(minimal.ok, "a legacy stamp has no failure on record");
             assert_eq!(minimal.error, None);
 
@@ -246,6 +253,7 @@ pub mod meta {
                 ts: 5,
                 fetch_log: 12,
                 probe_requests: 3,
+                proxies: 1,
                 ok: false,
                 error: Some("fetch_log: database is locked".to_string()),
             };

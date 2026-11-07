@@ -463,6 +463,10 @@ pub(crate) struct ServerRetention {
     fetch_log_days: u32,
     /// `[probe].queue_stale_days`.
     queue_stale_days: u64,
+    /// `[retention].removed_proxies_days`: the TTL purge of the `removed`
+    /// proxies, the one pass the daemon must never run (its authorizer
+    /// denies proxy deletion). `0` disables the purge.
+    removed_proxies_days: u32,
     /// `[probe].retention_interval_secs`: how often the sweep runs.
     interval_secs: u64,
 }
@@ -476,6 +480,7 @@ impl ServerRetention {
         Self {
             fetch_log_days: config.retention.fetch_log_days,
             queue_stale_days: config.probe.queue_stale_days,
+            removed_proxies_days: config.retention.removed_proxies_days,
             interval_secs: config.probe.retention_interval_secs,
         }
     }
@@ -495,24 +500,50 @@ async fn retention_sweep(pool: &DbPool, retention: &ServerRetention) {
     };
     let outcome = fumox_core::repo::retention::sweep_shared_journals(pool, &windows, now).await;
 
+    // The TTL purge of the `removed` proxies is the server's alone (see
+    // `retention::purge_stale_removed_proxies`): the delete is content
+    // deletion the daemon's authorizer denies. A zero window leaves the
+    // tier untouched.
+    let mut error = outcome.error;
+    let mut proxies_deleted = 0u64;
+    match fumox_core::repo::retention::purge_stale_removed_proxies(
+        pool,
+        u64::from(retention.removed_proxies_days),
+        now,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(deleted) => {
+            proxies_deleted = deleted;
+            tracing::info!(deleted, "rotated removed proxies");
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "removed-proxies rotation failed");
+            error.get_or_insert(format!("proxies: {err}"));
+        }
+    }
+
     // Stamp the run under the server's own key, so /admin/probe surfaces
     // it even without the daemon. `last_rotation` stays the daemon's: the
     // server never touches `probe_results`, and overwriting the daemon's
     // stamp with a zeroed `probe_results` counter read as "the daemon
     // rotated" in a deployment that has none. A failed pass keeps the
     // stamp of the last successful one (`ok: false` with the error text,
-    // see `ServerRetentionStamp`); the purge failures are collected in
-    // the outcome, so a full wipe-out cannot advance the "last good" ts.
+    // see `ServerRetentionStamp`); the purge failures are collected
+    // across both passes, so a full wipe-out cannot advance the "last
+    // good" ts.
     let stamp = probe::meta::ServerRetentionStamp {
-        ts: if outcome.error.is_none() {
+        ts: if error.is_none() {
             now
         } else {
             previous_retention_ts(pool).await
         },
         fetch_log: outcome.fetch_log,
         probe_requests: outcome.probe_requests,
-        ok: outcome.error.is_none(),
-        error: outcome.error,
+        proxies: proxies_deleted,
+        ok: error.is_none(),
+        error,
     };
     if let Err(error) = fumox_core::repo::meta_set(
         pool,
@@ -1342,11 +1373,14 @@ mod tests {
     }
 
     /// The retention windows the scheduler enforces in the tests: the
-    /// shipped defaults, with a sweep interval the test never waits for.
+    /// shipped defaults, with a sweep interval the test never waits for
+    /// and the `removed`-proxy purge off (its behavior has a dedicated
+    /// test of its own).
     fn test_retention() -> ServerRetention {
         ServerRetention {
             fetch_log_days: 30,
             queue_stale_days: 7,
+            removed_proxies_days: 0,
             interval_secs: 60,
         }
     }
@@ -2042,6 +2076,22 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // Two rows in the `removed` tier: one past the TTL window, one
+        // inside it — the purge takes only the first.
+        let purged_proxy = test_proxy(&pool, "fp-purged").await;
+        let kept_proxy = test_proxy(&pool, "fp-kept").await;
+        sqlx::query("UPDATE proxies SET status = 'removed', removed_at = ? WHERE id = ?")
+            .bind(now - 30 * day)
+            .bind(purged_proxy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE proxies SET status = 'removed', removed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(kept_proxy)
+            .execute(&pool)
+            .await
+            .unwrap();
         for (proxy_id, requested_at) in [
             (fresh_proxy, now),
             (stale_proxy, now - 30 * day),
@@ -2058,6 +2108,7 @@ mod tests {
         let retention = ServerRetention {
             fetch_log_days: 30,
             queue_stale_days: 7,
+            removed_proxies_days: 7,
             interval_secs: 60,
         };
         retention_sweep(&pool, &retention).await;
@@ -2075,6 +2126,22 @@ mod tests {
             queued, 1,
             "the fresh request stays, the stale and the settled ones go"
         );
+        let (removed,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies WHERE id IN (?, ?)")
+            .bind(purged_proxy)
+            .bind(kept_proxy)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            removed, 1,
+            "the removed row past the TTL window is gone, the fresh one stays"
+        );
+        let (alive,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies WHERE id = ?")
+            .bind(settled_proxy)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(alive, 1, "the purge never touches a live row");
 
         let stamp = fumox_core::repo::meta_get(&pool, probe::meta::SERVER_RETENTION_KEY)
             .await
@@ -2083,6 +2150,7 @@ mod tests {
         let stamp: probe::meta::ServerRetentionStamp = serde_json::from_str(&stamp).unwrap();
         assert_eq!(stamp.fetch_log, 1);
         assert_eq!(stamp.probe_requests, 2);
+        assert_eq!(stamp.proxies, 1);
         assert!(stamp.ok, "the pass ran to completion");
 
         // The daemon's stamp is untouched: `last_rotation` stays the
@@ -2136,6 +2204,7 @@ mod tests {
         let retention = ServerRetention {
             fetch_log_days: 0,
             queue_stale_days: 7,
+            removed_proxies_days: 0,
             interval_secs: 60,
         };
         retention_sweep(&pool, &retention).await;

@@ -5228,6 +5228,114 @@ async fn purge_removed_deletes_a_tier_bigger_than_one_batch() {
     );
 }
 
+/// The TTL purge deletes only the `removed` rows stamped before the
+/// cutoff; the unfiltered purge afterwards takes the rest, including a
+/// hypothetical row without a stamp that the `removed_at <= cutoff`
+/// predicate can never match.
+#[tokio::test]
+async fn purge_removed_before_takes_only_the_rows_stamped_past_the_cutoff() {
+    let (_dir, pool) = temp_pool().await;
+    let now = crate::models::now_ts();
+    let day = 86_400i64;
+    let stale = bulk_test_row(
+        &pool,
+        BulkRow {
+            fingerprint: "purge-ttl-stale",
+            scheme: "vless",
+            status: "removed",
+            geo_country: None,
+            geo_asn: None,
+        },
+    )
+    .await;
+    let fresh = bulk_test_row(
+        &pool,
+        BulkRow {
+            fingerprint: "purge-ttl-fresh",
+            scheme: "vless",
+            status: "removed",
+            geo_country: None,
+            geo_asn: None,
+        },
+    )
+    .await;
+    // The unstamped row keeps the NULL `removed_at` the fixture gave it:
+    // the ordinary removal paths always write the stamp, so an unstamped
+    // removed row is a hand-broken one, and the contract says only the
+    // admin's unfiltered purge reaches it.
+    let unstamped = bulk_test_row(
+        &pool,
+        BulkRow {
+            fingerprint: "purge-ttl-nostamp",
+            scheme: "vless",
+            status: "removed",
+            geo_country: None,
+            geo_asn: None,
+        },
+    )
+    .await;
+    let alive = bulk_test_row(
+        &pool,
+        BulkRow {
+            fingerprint: "purge-ttl-alive",
+            scheme: "vless",
+            status: "alive",
+            geo_country: None,
+            geo_asn: None,
+        },
+    )
+    .await;
+    sqlx::query("UPDATE proxies SET removed_at = ? WHERE id = ?")
+        .bind(now - 30 * day)
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE proxies SET removed_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(fresh)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let deleted = purge_removed_before(&pool, Some(now - 7 * day))
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1, "only the row stamped past the cutoff goes");
+
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM proxies WHERE status = 'removed'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 2, "the fresh and the unstamped rows stay");
+    assert!(
+        sqlx::query("SELECT 1 FROM proxies WHERE id = ?")
+            .bind(unstamped)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .is_some(),
+        "the unstamped row survives the TTL purge"
+    );
+
+    let deleted = purge_removed_before(&pool, None).await.unwrap();
+    assert_eq!(deleted, 2, "the unfiltered purge takes the rest");
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM proxies WHERE status = 'removed'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    assert!(
+        sqlx::query("SELECT 1 FROM proxies WHERE id = ?")
+            .bind(alive)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .is_some(),
+        "neither purge touches a live row"
+    );
+}
+
 // Admin proxy browser
 
 /// Fixture for the admin proxy browser: four proxies with distinct

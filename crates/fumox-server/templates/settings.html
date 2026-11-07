@@ -175,6 +175,7 @@
         <tr><th>{{ self.t("set.backoff_max") }}</th><td>{{ state.meow.backoff_max_secs }} {{ self.t("common.sec") }}</td></tr>
         <tr><th>{{ self.t("probe.retention_probe") }}</th><td>{{ state.retention.probe_results_days }} {{ self.t("probe.days_short") }}</td></tr>
         <tr><th>{{ self.t("probe.retention_fetch") }}</th><td>{{ state.retention.fetch_log_days }} {{ self.t("probe.days_short") }}</td></tr>
+        <tr><th>{{ self.t("probe.retention_removed") }}</th><td>{{ state.retention.removed_proxies_days }} {{ self.t("probe.days_short") }}</td></tr>
       </tbody>
     </table>
   </div>

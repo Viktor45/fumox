@@ -2281,25 +2281,57 @@ const PURGE_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 /// is guarded by a confirmation dialog in the admin UI. Returns the
 /// number of deleted proxy rows.
 ///
-/// The delete runs in bounded batches, one transaction each: a single
-/// `DELETE` over the whole `removed` population holds the write lock
-/// until the last cascade is done, which on a large table is long enough
-/// to make the probe daemon's own writes time out. The batch commits
-/// release the lock, and the pause between them lets the other writer in
-/// before the next batch starts.
+/// The unfiltered half of [`purge_removed_before`]: the admin button
+/// wipes the whole `removed` tier, the retention sweep only the rows
+/// past its TTL window.
 pub async fn purge_removed(pool: &DbPool) -> crate::Result<u64> {
+    purge_removed_before(pool, None).await
+}
+
+/// The `removed`-tier delete of [`purge_removed`] with no time filter.
+const PURGE_ALL_SQL: &str = "DELETE FROM proxies WHERE id IN (
+     SELECT id FROM proxies WHERE status = 'removed'
+     ORDER BY id LIMIT ?
+ )";
+
+/// The TTL delete of [`purge_removed_before`]: only the rows stamped
+/// `removed_at` no later than the bound. A hypothetical `removed` row
+/// without the stamp can only reach the unfiltered purge — `NULL`
+/// never compares true.
+const PURGE_STALE_SQL: &str = "DELETE FROM proxies WHERE id IN (
+     SELECT id FROM proxies WHERE status = 'removed' AND removed_at <= ?
+     ORDER BY id LIMIT ?
+ )";
+
+/// Physically delete `removed` proxies in bounded batches, one
+/// transaction each: `None` takes every row in the tier (the admin
+/// «purge removed» button, [`purge_removed`]), `Some(cutoff)` only the
+/// ones stamped `removed_at <= cutoff` (the retention sweep's «wipe
+/// removed proxies older than N days»). Returns the number of deleted
+/// proxy rows.
+///
+/// The delete runs in bounded batches: a single `DELETE` over the whole
+/// `removed` population holds the write lock until the last cascade is
+/// done, which on a large table is long enough to make the probe
+/// daemon's own writes time out. The batch commits release the lock,
+/// and the pause between them lets the other writer in before the next
+/// batch starts.
+pub async fn purge_removed_before(pool: &DbPool, before: Option<i64>) -> crate::Result<u64> {
     let mut total = 0u64;
     loop {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let affected = sqlx::query(
-            "DELETE FROM proxies WHERE id IN (
-                 SELECT id FROM proxies WHERE status = 'removed' ORDER BY id LIMIT ?
-             )",
-        )
-        .bind(PURGE_BATCH_SIZE)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let mut delete = sqlx::query(match before {
+            Some(_) => PURGE_STALE_SQL,
+            None => PURGE_ALL_SQL,
+        });
+        if let Some(cutoff) = before {
+            delete = delete.bind(cutoff);
+        }
+        let affected = delete
+            .bind(PURGE_BATCH_SIZE)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         tx.commit().await?;
         total += affected;
         if affected < PURGE_BATCH_SIZE as u64 {

@@ -137,7 +137,7 @@
       each sweep's source instead of merging two runners into one line. #}
   {% match server_retention %}
     {% when Some with (rot) %}
-      <p class="muted small">{{ self.t("probe.retention_server") }} {{ self.ts(rot.ts) | safe }} · {{ self.t_args("probe.retention_server_deleted", &[rot.fetch_log.to_string(), rot.probe_requests.to_string()][..]) }}</p>
+      <p class="muted small">{{ self.t("probe.retention_server") }} {{ self.ts(rot.ts) | safe }} · {{ self.t_args("probe.retention_server_deleted", &[rot.fetch_log.to_string(), rot.probe_requests.to_string(), rot.proxies.to_string()][..]) }}</p>
       {% if !rot.ok %}
         <p class="muted small">{{ self.t_args("probe.retention_server_failed", &[rot.error.as_deref().unwrap_or("?").to_string()][..]) }}</p>
       {% endif %}
@@ -145,6 +145,11 @@
   {% endmatch %}
   <p class="muted small">{{ self.t_args("probe.retention_rows", &[journal_probe_rows.to_string(), journal_fetch_rows.to_string()][..]) }}</p>
   <p class="muted small">{{ self.t_named("probe.retention_keep", &[("probe", retention_probe_days.to_string()), ("fetch", retention_fetch_days.to_string())][..]) }}</p>
+  {# The removed-proxies TTL is opt-in, so an off purge renders nothing:
+     a "wiped after 0 days" line would read as "wiped immediately". #}
+  {% if retention_removed_days > 0 %}
+    <p class="muted small">{{ self.t_args("probe.retention_removed_ttl", &[retention_removed_days.to_string()][..]) }}</p>
+  {% endif %}
 </div>
 
 <div class="panel">

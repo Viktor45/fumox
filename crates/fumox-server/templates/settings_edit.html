@@ -495,6 +495,12 @@
         {% match self.range_text("retention.fetch_log_days") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
         {% match self.error_for("retention.fetch_log_days") %}{% when Some with (msg) %}<div class="error-text" id="err-retention.fetch_log_days" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
       </div>
+      <div class="field">
+        <label for="ret-removed">{{ self.t("set.retention_removed") }}</label>
+        <input type="number" id="ret-removed" name="retention.removed_proxies_days" min="{{ self.range_min("retention.removed_proxies_days") }}" max="{{ self.range_max("retention.removed_proxies_days") }}" value="{{ self.raw_value("retention.removed_proxies_days") }}"{{ self.field_disabled("retention.removed_proxies_days") }}{{ self.error_attrs("retention.removed_proxies_days") | safe }}>
+        {% match self.range_text("retention.removed_proxies_days") %}{% when Some with (r) %}<div class="hint range">{{ self.t("set.range_label") }} <code>{{ r }}</code></div>{% when None %}{% endmatch %}
+        {% match self.error_for("retention.removed_proxies_days") %}{% when Some with (msg) %}<div class="error-text" id="err-retention.removed_proxies_days" role="alert">{{ msg }}</div>{% when None %}{% endmatch %}
+      </div>
     </div>
   </section>
 

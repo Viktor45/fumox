@@ -618,6 +618,19 @@ probe_results_days = 7
 # Range: same as probe_results_days above.
 # How many days of source-fetch log to keep.
 fetch_log_days = 7
+# Диапазон: 0..=3650 дней (форма). 0 выключает очистку: статус removed
+# остаётся обратимым («сбросить статус» на карточке), пока администратор
+# не нажмёт «стереть удалённые» на панели очистки. Автоматически стирает
+# прокси, пробывшие в статусе removed дольше N дней; делает это сервер
+# в своём retention-свипе, демон тестера такого не делает — его
+# авторайзер не разрешает удалять прокси.
+# Range: 0..=3650 days (form). 0 disables the purge: the removed status
+# stays reversible («reset status» on the card) until the admin presses
+# «purge removed» on the cleanup panel. Wipes proxies that have sat in
+# the removed status for more than N days; the server runs it in its
+# retention sweep, the probe daemon does not — its authorizer forbids
+# deleting proxies.
+removed_proxies_days = 0
 
 [log]
 # Диапазон: error | warn | info | debug | trace, других значений нет.

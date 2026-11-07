@@ -961,6 +961,14 @@ static SETTINGS: &[Setting] = &[
         },
         apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
     },
+    // 0 = the purge is off; the range table says so and the sweep skips.
+    Setting {
+        key: "retention.removed_proxies_days",
+        render: |c, key, raw| {
+            raw.insert(key.into(), c.retention.removed_proxies_days.to_string());
+        },
+        apply: |raw, key, cfg, lang, errors| u32_field(raw, key, cfg, lang, errors),
+    },
     // --- log ---
     Setting {
         key: "log.server",

@@ -8,10 +8,13 @@
 //! "older than the window" means.
 //!
 //! The daemon purges its own `probe_results` table around this sweep; the
-//! server does not, because it has nothing in that table to purge.
+//! server does not, because it has nothing in that table to purge. The
+//! mirror image is [`purge_stale_removed_proxies`], the TTL purge of the
+//! `removed` proxies: the server alone runs it, because the daemon's
+//! authorizer forbids proxy deletion.
 
 use crate::db::DbPool;
-use crate::repo::{fetch_log, probe};
+use crate::repo::{fetch_log, probe, proxies};
 
 /// The retention windows of the journals both binaries write.
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +105,32 @@ pub async fn sweep_shared_journals(
         }
     }
     outcome
+}
+
+/// The TTL half of «purge removed»: physically delete the proxies that
+/// have sat in the `removed` status for more than `days` days
+/// (`[retention].removed_proxies_days`), through the same bounded
+/// batches as the admin button (`proxies::purge_removed_before`).
+///
+/// The server runs this next to [`sweep_shared_journals`], and the
+/// server alone: a proxy delete is content deletion, and the probe
+/// daemon's connections run behind an authorizer that denies
+/// `DELETE FROM proxies` (`sqlite_guard`), so the daemon's retention
+/// loop must not call this — its only reward would be an `ok: false`
+/// stamp on every tick. A daemon-only deployment simply has no
+/// automatic purge; the admin button still does.
+///
+/// A zero window disables the purge outright. The journal windows
+/// inside [`sweep_shared_journals`] clamp a zero to one day, because a
+/// zero window there would wipe the whole table; here zero means the
+/// operator never opted in, and deleting every `removed` proxy would be
+/// the surprise, not the intent — `removed` stays reversible until the
+/// admin presses the button.
+pub async fn purge_stale_removed_proxies(pool: &DbPool, days: u64, now: i64) -> crate::Result<u64> {
+    if days == 0 {
+        return Ok(0);
+    }
+    proxies::purge_removed_before(pool, Some(cutoff(now, days))).await
 }
 
 #[cfg(test)]
@@ -202,6 +231,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queued, 1, "the fresh queue row stays");
+
+        pool.close().await;
+        drop(dir);
+    }
+
+    /// The `removed`-proxy TTL takes only the rows past the window, never
+    /// touches a live row, and the zero window — the opt-out — deletes
+    /// nothing at all.
+    #[tokio::test]
+    async fn the_removed_proxies_ttl_purges_only_the_rows_past_the_window() {
+        let (dir, pool) = super::super::tests::temp_pool().await;
+        let now = crate::models::now_ts();
+        let day = 86_400i64;
+
+        async fn insert_proxy(pool: &DbPool, fingerprint: &str) -> i64 {
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO proxies (fingerprint, scheme, name, host, port, credential,
+                                      created_at, updated_at)
+                 VALUES (?, 'vless', 'n', 'h', 443, 'c', 1, 1) RETURNING id",
+            )
+            .bind(fingerprint)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            id
+        }
+        let stale = insert_proxy(&pool, "fp-ttl-stale").await;
+        let fresh = insert_proxy(&pool, "fp-ttl-fresh").await;
+        let alive = insert_proxy(&pool, "fp-ttl-alive").await;
+        for (id, removed_at) in [(stale, now - 30 * day), (fresh, now)] {
+            sqlx::query("UPDATE proxies SET status = 'removed', removed_at = ? WHERE id = ?")
+                .bind(removed_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE proxies SET status = 'alive' WHERE id = ?")
+            .bind(alive)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The opt-out: a zero window deletes nothing, an off purge must
+        // not read as a zero-days one.
+        let deleted = purge_stale_removed_proxies(&pool, 0, now).await.unwrap();
+        assert_eq!(deleted, 0);
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 3);
+
+        // The window: the row past it goes, the fresh one and the live
+        // one stay.
+        let deleted = purge_stale_removed_proxies(&pool, 7, now).await.unwrap();
+        assert_eq!(deleted, 1);
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "the fresh removed row and the live row stay");
+        let (kept,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies WHERE id = ?")
+            .bind(fresh)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 1);
 
         pool.close().await;
         drop(dir);

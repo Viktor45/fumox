@@ -395,6 +395,10 @@ impl AppConfig {
                 "retention.fetch_log_days",
                 u64::from(self.retention.fetch_log_days),
             ),
+            (
+                "retention.removed_proxies_days",
+                u64::from(self.retention.removed_proxies_days),
+            ),
         ]
     }
 
@@ -1462,6 +1466,14 @@ pub struct RetentionConfig {
     /// Keep `fetch_log` rows for this many days.
     #[serde(default = "defaults::fetch_log_days")]
     pub fetch_log_days: u32,
+    /// Physically delete proxies that have sat in the `removed` status for
+    /// this many days (the server-side retention sweep; the probe daemon's
+    /// authorizer forbids proxy deletion, so the purge is server-only).
+    /// `0` disables it: `removed` stays reversible until the admin presses
+    /// «purge removed», the behavior every deployment had before this
+    /// window existed.
+    #[serde(default = "defaults::removed_proxies_days")]
+    pub removed_proxies_days: u32,
 }
 
 impl Default for RetentionConfig {
@@ -1469,6 +1481,7 @@ impl Default for RetentionConfig {
         Self {
             probe_results_days: defaults::probe_results_days(),
             fetch_log_days: defaults::fetch_log_days(),
+            removed_proxies_days: defaults::removed_proxies_days(),
         }
     }
 }
@@ -1857,6 +1870,10 @@ pub mod bounds {
         ("meow.backoff_max_secs", Range::new(1, 24 * 3600)),
         ("retention.probe_results_days", Range::new(1, 3650)),
         ("retention.fetch_log_days", Range::new(1, 3650)),
+        // 0 = off: the automatic purge of `removed` proxies is opt-in,
+        // unlike the two journal windows above, where 0 would wipe the
+        // whole table and is clamped to one day instead.
+        ("retention.removed_proxies_days", Range::new(0, 3650)),
         ("server.export_max_rows", Range::new(1, 10_000_000)),
         ("server.rate_limit.limit", Range::new(1, 1_000_000)),
         (
@@ -2146,6 +2163,12 @@ mod defaults {
     }
     pub const fn fetch_log_days() -> u32 {
         30
+    }
+    /// The TTL purge of `removed` proxies is opt-in: `0` keeps today's
+    /// semantics, where `removed` is reversible until the admin presses
+    /// «purge removed».
+    pub const fn removed_proxies_days() -> u32 {
+        0
     }
 }
 

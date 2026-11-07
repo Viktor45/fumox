@@ -190,6 +190,10 @@ struct ProbeTemplate {
     /// nothing about whether the daemon is keeping up with the rotation.
     retention_probe_days: u32,
     retention_fetch_days: u32,
+    /// `[retention].removed_proxies_days`: the TTL after which the
+    /// server's own sweep wipes the `removed` tier. `0` renders nothing —
+    /// an off purge must not read as a zero-days one.
+    retention_removed_days: u32,
     /// Kernel RSS as published by the probe daemon (`meow_memory` meta,
     /// parsed through the shared `repo::probe::meta::MeowMemory` contract).
     meow_memory: Option<MeowMemory>,
@@ -579,6 +583,7 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
             journal_fetch_rows,
             retention_probe_days: retention.probe_results_days,
             retention_fetch_days: retention.fetch_log_days,
+            retention_removed_days: retention.removed_proxies_days,
             meow_memory,
             coverage,
             quarantine_count,

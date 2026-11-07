@@ -1194,6 +1194,7 @@ and the first is the one to prefer:
 | -------------------- | ------- | --------------------------------- |
 | `probe_results_days` | `14`    | Keep probe history for N days     |
 | `fetch_log_days`     | `30`    | Keep the fetch journal for N days |
+| `removed_proxies_days` | `0`   | Wipe proxies removed more than N days ago; `0` = off |
 
 ### `[log]` – console log levels
 

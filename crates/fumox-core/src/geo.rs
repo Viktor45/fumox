@@ -2039,19 +2039,32 @@ mod tests {
             "without the City database the country facts are unobtainable"
         );
 
-        // A resolver over the workspace directory: the City database makes
-        // it ready, an ASN-only setup is degraded.
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
-        let resolver = GeoResolver::new(&GeoConfig {
+        // The fixture databases make the remaining states deterministic
+        // (the workspace config/ files are gitignored, CI has none): the
+        // City database makes the resolver ready, ASN-only is degraded.
+        let ready = GeoResolver::new(&GeoConfig {
             enabled: true,
-            db_dir: dir,
+            db_dir: fixture_db_dir("state-ready"),
             ..Default::default()
         });
-        match resolver.state() {
-            GeoState::Ready => assert!(resolver.state().has_country()),
-            GeoState::Degraded => assert!(!resolver.state().has_country()),
-            other => panic!("unexpected state {other:?}"),
-        }
+        assert_eq!(ready.state(), GeoState::Ready);
+        assert_eq!(ready.state().as_str(), "ready");
+        assert!(ready.state().has_country());
+
+        let asn_dir = fixture_db_dir("state-degraded");
+        std::fs::remove_file(asn_dir.join(GeoDbKind::City.file_name()))
+            .expect("the City fixture is removed");
+        let degraded = GeoResolver::new(&GeoConfig {
+            enabled: true,
+            db_dir: asn_dir,
+            ..Default::default()
+        });
+        assert_eq!(degraded.state(), GeoState::Degraded);
+        assert_eq!(degraded.state().as_str(), "degraded");
+        assert!(
+            !degraded.state().has_country(),
+            "without the City database the country facts are unobtainable"
+        );
     }
 
     /// Path to a GeoLite2 database if present in the workspace `config/`

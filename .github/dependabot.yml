@@ -77,14 +77,15 @@ updates:
 
   # The workspace crates (fumox-core, fumox-server, fumox-probe) and
   # Cargo.lock. The manifests declare loose caret ranges ("1", "0.8"), so
-  # increase-if-necessary only touches Cargo.toml when a new version falls
+  # the default strategy only touches Cargo.toml when a new version falls
   # outside the declared range; everything else is a Cargo.lock refresh.
+  # Leave versioning-strategy unset: "increase-if-necessary" is the cargo
+  # default, but naming it explicitly fails the config schema.
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
-    versioning-strategy: "increase-if-necessary"
     cooldown:
       default-days: 7
       semver-major-days: 14

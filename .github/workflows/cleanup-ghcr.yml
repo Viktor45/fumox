@@ -40,12 +40,12 @@ on:
       dry_run:
         description: "If true, list what would be deleted but do not delete"
         required: false
-        default: "true"
+        default: true
         type: boolean
       prune_untagged:
         description: "Also delete untagged orphans not referenced by any kept tag (run a dry_run pass first)"
         required: false
-        default: "false"
+        default: false
         type: boolean
 
 permissions:

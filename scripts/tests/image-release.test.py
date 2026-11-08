@@ -131,6 +131,18 @@ class ImageReleaseTest(unittest.TestCase):
         metadata = next(step for step in fumox["jobs"]["merge"]["steps"] if step.get("id") == "meta")
         self.assertIn("pattern={{version}},enable=${{ env.IS_RELEASE == 'true' }}", metadata["with"]["tags"])
 
+    def test_publishers_move_the_latest_tag_with_a_fresh_build(self):
+        for filename, condition in (
+            ("docker.yml", "github.ref == 'refs/heads/main' || env.IS_LATEST == 'true'"),
+            ("docker-meow.yml", "github.ref == 'refs/heads/main'"),
+        ):
+            with self.subTest(workflow=filename):
+                workflow = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
+                metadata = next(step for step in workflow["jobs"]["merge"]["steps"] if step.get("id") == "meta")
+                rules = [rule.strip() for rule in metadata["with"]["tags"].splitlines()]
+                latest = [rule for rule in rules if rule.startswith("type=raw,value=latest")]
+                self.assertEqual(latest, ["type=raw,value=latest,enable=${{ " + condition + " }}"])
+
     def test_frontend_directives_are_first_and_pinned(self):
         for relative in ("Dockerfile", "docker/meow/Dockerfile", "docker/nginx/Dockerfile"):
             first = (ROOT / relative).read_text().splitlines()[0]

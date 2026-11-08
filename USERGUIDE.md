@@ -393,10 +393,13 @@ Notes:
 CI publishes a multi-arch image (`linux/amd64` + `linux/arm64`, each platform
 attested with build provenance) to GHCR **on `v*` tags and via manual
 dispatch**; see `.github/workflows/docker.yml`: `ghcr.io/viktor45/fumox`. Tags:
-a `v0.2.0` tag adds `0.2.0`, `0.2`, `sha-<short sha>` and `latest`; a manual
-dispatch from another branch only adds the ref/sha tags, not `latest`. There
-is no automatic rebuild on push to `main`. The image ships **both** binaries;
-the server is the default command, the probe is a command override.
+a stable tag push such as `v0.2.0` on a commit reachable from `main` adds
+`0.2.0` and `sha-<short sha>`. It updates `0.2` only for the newest release
+in that series, and `latest` only for the newest stable release. A manual
+dispatch from `main` adds `main`, `sha-<short sha>` and `latest`; a dispatch
+from another branch adds `branch-<branch>` and `sha-<short sha>`, not `latest`.
+There is no automatic rebuild on push to `main`. The image ships **both**
+binaries; the server is the default command, the probe is a command override.
 
 ```bash
 # Server
@@ -440,10 +443,11 @@ The meow-rs wrapper (`docker/meow/Dockerfile`) is on GHCR too,
 `docker-meow.yml` workflow never runs on push or tags; dispatch it from the
 Actions tab (the `meow_version` input takes an explicit tag like `v0.27.0` —
 `latest` is refused — together with the two `meow_sha256_*` sums of the
-release archives). Resulting tags: the `meow_version`
-value, `main` and `sha-<short sha>`; the attestation is the same, per
-platform. The Option A stack already references this image: `docker compose
-up -d` pulls it, `--build` compiles the wrapper locally (the `.env`
+release archives). Every dispatch publishes the `meow_version` value and
+`sha-<short sha>`. A dispatch from `main` also updates `main` and `latest`;
+other branches add `branch-<branch>` without changing `latest`. The attestation
+is the same, per platform. The Option A stack already references this image:
+`docker compose up -d` pulls it, `--build` compiles the wrapper locally (the `.env`
 `MEOW_VERSION` variable and the two sums pick the release in build mode only).
 
 ### Option C – Build from source

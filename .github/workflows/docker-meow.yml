@@ -171,6 +171,7 @@ jobs:
             type=ref,event=branch,prefix=branch-,enable=${{ github.ref != 'refs/heads/main' }}
             type=sha
             type=raw,value=${{ env.MEOW_VERSION }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Create candidate index
         id: manifest

@@ -868,6 +868,10 @@ are stamped when the batch is published.
 
 ### Fixed
 
+- Both image workflows now update `latest` after a verified build from
+  `main`. Previously, `docker.yml` published it only for the newest stable
+  release tag, and `docker-meow.yml` did not publish it. Builds from other
+  branches leave `latest` unchanged; the Fumox release-tag checks still apply.
 - Release tags no longer implicitly publish `latest`: only stable tag
   pushes on main may publish release tags, and moving aliases cannot roll
   back to older versions. Non-main branch tags use a `branch-` prefix to

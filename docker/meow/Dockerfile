@@ -35,9 +35,9 @@
 # is meant to be run from the repository root:
 #
 #   docker build \
-#     --build-arg MEOW_VERSION=v0.27.0 \
-#     --build-arg MEOW_SHA256_AMD64=38343bc0832d36d97967296a5c7d488c0ba9509186b6a7a4deef5355ff45e2d3 \
-#     --build-arg MEOW_SHA256_ARM64=42f12dac9313a3c70bc4e8da7faca863a673d393d6e6f9274274a045d40f431b \
+#     --build-arg MEOW_VERSION=v0.29.0 \
+#     --build-arg MEOW_SHA256_AMD64=92fe902cca5e95799af02a42fcda9a4f9195aa61ec126057b51b15a8d2116ca2 \
+#     --build-arg MEOW_SHA256_ARM64=6fa37f13ddeaafae605e65bc9f2ab0c538b9ab3fad11c8b12180f0a52b4c06b7 \
 #     -t fumox-meow \
 #     -f docker/meow/Dockerfile docker/meow
 #
@@ -48,11 +48,11 @@
 # Nothing meow-rs needs is distro-sensitive (the binary is static musl; the
 # base only contributes ca-certificates and tini).
 
-ARG MEOW_VERSION=v0.27.0
+ARG MEOW_VERSION=v0.29.0
 # sha256 of meow-<version>-<target>.tar.gz, as published in the release's
 # checksum file. Bump together with MEOW_VERSION.
-ARG MEOW_SHA256_AMD64=38343bc0832d36d97967296a5c7d488c0ba9509186b6a7a4deef5355ff45e2d3
-ARG MEOW_SHA256_ARM64=42f12dac9313a3c70bc4e8da7faca863a673d393d6e6f9274274a045d40f431b
+ARG MEOW_SHA256_AMD64=92fe902cca5e95799af02a42fcda9a4f9195aa61ec126057b51b15a8d2116ca2
+ARG MEOW_SHA256_ARM64=6fa37f13ddeaafae605e65bc9f2ab0c538b9ab3fad11c8b12180f0a52b4c06b7
 
 # ---- Stage 1: fetch the release binary ---------------------------------------
 # trixie-slim pinned by digest — the same multi-arch index the fumox image's

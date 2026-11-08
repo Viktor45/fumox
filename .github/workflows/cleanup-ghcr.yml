@@ -49,11 +49,17 @@ on:
         type: boolean
 
 permissions:
+  contents: read
   packages: write
+
+concurrency:
+  group: ghcr-images
+  cancel-in-progress: false
 
 jobs:
   prune-old-versions:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       OWNER: ${{ github.repository_owner }}
       PACKAGES: fumox,fumox-meow

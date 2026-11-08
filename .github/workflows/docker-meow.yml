@@ -1,61 +1,3 @@
-# Builds the fumox-meow image (docker/meow/Dockerfile, a thin wrapper around
-# a meow-rs release binary) for linux/amd64 and linux/arm64 and pushes a
-# combined multi-arch manifest to GHCR (ghcr.io/viktor45/fumox-meow).
-#
-# MANUAL ONLY: this workflow never runs on push or tags, dispatch it from
-# the Actions tab (or `gh workflow run docker-meow.yml -f meow_version=v0.27.0
-#   -f meow_sha256_amd64=<sum> -f meow_sha256_arm64=<sum>`).
-#
-# The MEOW_VERSION input picks the packaged meow-rs release, exactly like the
-# MEOW_VERSION build arg of docker/meow/Dockerfile (and .env for local
-# builds). It MUST be an explicit versioned tag: `latest` is refused,
-# because a wrapper image that silently moves to a new upstream release
-# makes the published tag an unverifiable artefact. The trim + release-tag
-# regex live in scripts/validate-meow-version.sh, called by both jobs and
-# pinned by scripts/tests/validate-meow-version.test.sh, so build and merge
-# cannot drift apart on what they accept. The input value
-# (whitespace-trimmed) is also applied as an image tag, so a pinned build is
-# addressable as ghcr.io/viktor45/fumox-meow:v0.27.0.
-#
-# The two MEOW_SHA256_* inputs carry the sums of the release archives, the
-# ones the upstream release publishes next to the assets. They travel into
-# the build as the MEOW_SHA256_AMD64 / MEOW_SHA256_ARM64 args, and the
-# Dockerfile refuses a download whose hash differs. The sums are part of the
-# workflow input on purpose: they are the reviewable evidence that the
-# binary in the published image is the one the upstream release ships, and
-# a wrong sum fails the build instead of producing an image nobody can
-# verify.
-#
-# Nothing in this workflow talks to the GitHub API: the version is an
-# input, not a lookup. A release therefore cannot break because the API is
-# down or rate-limited.
-#
-# Strategy: same as docker.yml, each architecture is built NATIVELY on a
-# matching GitHub runner (the fetch stage runs apt-get, which is painfully
-# slow under QEMU), pushed by digest, and attested per platform with
-# actions/attest-build-provenance; a merge job stitches the already-attested
-# digests into one manifest list and attests the list itself.
-#
-# Resulting tags:
-#   MEOW_VERSION=v0.27.0 -> v0.27.0, <branch>, sha-<shortsha>
-# There is no `latest` tag: the version in the input is the version.
-#
-# The compose/quadlet stacks use the locally built `fumox-meow:local`; this
-# GHCR image exists for deployments that prefer to pull, point the compose
-# service's `image:` at it and drop its `build:` section.
-#
-# Quality gate: DISABLED. The build job used to pull the image it just
-# pushed back and run scripts/meow-controller-smoke.sh against it — the
-# kernel must refuse to start without a controller secret, and the
-# controller must reject a request that presents none. That stand listens
-# on :9090, and port-listening smoke stands are turned off across the
-# workflows. The step is kept verbatim below for a one-revert restore, and
-# the script still runs locally. What is no longer proved before the image
-# is published: that an unauthenticated controller cannot be started.
-# The build still verifies the downloaded archive against the pinned
-# sha256, and the merge job still verifies the published indexes and their
-# provenance attestations.
-
 name: Docker meow
 
 on:
@@ -76,25 +18,26 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   REGISTRY: ghcr.io
 
-# This workflow is dispatch-only, so there is no tag-push stampede to
-# collapse; the group exists so two manual runs started minutes apart for
-# the same ref do not race each other over the same tags.
 concurrency:
-  group: docker-meow-${{ github.ref }}
+  group: ghcr-images
   cancel-in-progress: false
 
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+    with:
+      skip_image_builds: true
+
   build:
+    needs: quality
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
-      # Required by actions/attest-build-provenance (OIDC token + writing
-      # the attestation to the registry).
       id-token: write
       attestations: write
     strategy:
@@ -107,49 +50,31 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Prepare
+        id: image
         env:
+          REPO: ${{ github.repository }}
+          PLATFORM: ${{ matrix.platform }}
           MEOW_INPUT: ${{ inputs.meow_version }}
           MEOW_SHA256_AMD64_INPUT: ${{ inputs.meow_sha256_amd64 }}
           MEOW_SHA256_ARM64_INPUT: ${{ inputs.meow_sha256_arm64 }}
-          PLATFORM: ${{ matrix.platform }}
         run: |
+          echo "name=${REGISTRY}/${REPO,,}-meow" >> "$GITHUB_OUTPUT"
           echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
-          # The trim + release-tag regex live in one script shared with
-          # the merge job, so the two jobs cannot drift apart on what
-          # they accept (pinned by scripts/tests/validate-meow-version.test.sh).
           MEOW_VERSION="$(scripts/validate-meow-version.sh "$MEOW_INPUT")"
           echo "MEOW_VERSION=${MEOW_VERSION}" >> "$GITHUB_ENV"
-          # The checksums travel with the version: the build compares the
-          # downloaded archive against them and fails on a mismatch, so a
-          # wrong or truncated sum cannot produce a published image.
           for pair in "AMD64:${MEOW_SHA256_AMD64_INPUT}" "ARM64:${MEOW_SHA256_ARM64_INPUT}"; do
             arch="${pair%%:*}"
             sum="${pair#*:}"
             sum="$(printf '%s' "$sum" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-            if ! [[ "$sum" =~ ^[0-9a-f]{64}$ ]]; then
-              echo "::error::meow_sha256_${arch,,} must be a 64-character hex sha256, got: $sum" >&2
-              exit 1
-            fi
+            [[ "$sum" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::expected a 64-character hex sha256' >&2; exit 1; }
             echo "MEOW_SHA256_${arch}=${sum}" >> "$GITHUB_ENV"
           done
 
-      - name: Compute image name
-        id: image
-        env:
-          REPO: ${{ github.repository }}
-        run: |
-          echo "name=${{ env.REGISTRY }}/$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')-meow" \
-            >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -160,13 +85,9 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ steps.image.outputs.name }}
-          tags: |
-            type=ref,event=branch
-            type=sha
-            type=raw,value=${{ env.MEOW_VERSION }}
+          flavor: latest=false
+          tags: type=raw,value=${{ env.MEOW_VERSION }}
 
-      # Push the single-platform image by digest only; tags are attached by
-      # the merge job once both architectures exist.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -183,33 +104,13 @@ jobs:
           cache-to: type=gha,mode=max,scope=fumox-meow-${{ env.PLATFORM_PAIR }}
 
       - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
-      # DISABLED: started the meow kernel, whose controller listens on
-      # :9090. Kept verbatim for a one-revert restore; see the header.
-      #
-      # The controller smoke test runs against the image that was just
-      # pushed: the artefact the release publishes is the artefact the
-      # test proves. The image is pulled back by digest (the job is
-      # already logged in to GHCR), so no second build is needed.
-      #
-      # It proves the property that makes the controller safe to expose at
-      # all: the kernel refuses to start without a secret, and the
-      # controller rejects a request that does not present one.
-      # - name: Controller smoke test
-      #   env:
-      #     IMAGE: ${{ steps.image.outputs.name }}
-      #     DIGEST: ${{ steps.build.outputs.digest }}
-      #   run: |
-      #     docker pull "${IMAGE}@${DIGEST}"
-      #     docker tag "${IMAGE}@${DIGEST}" localhost/fumox-meow:local
-      #     bash scripts/meow-controller-smoke.sh localhost/fumox-meow:local
-
-      # Attest this single-platform image by digest; the merge job only
-      # stitches already-attested digests into the manifest list.
+      # The controller smoke stand remains disabled because it listens on a port.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
@@ -226,161 +127,74 @@ jobs:
           retention-days: 1
 
   merge:
+    needs: [quality, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
-      # The merged index is attested too, so `gh attestation verify` on the
-      # index itself (not only on its per-platform children) succeeds.
       id-token: write
       attestations: write
-    runs-on: ubuntu-24.04
-    needs: build
     steps:
-      # The meow_version validation is the same script the build job ran,
-      # so the merge job needs the repository too.
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Download digests
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp/digests
           pattern: digest-*
           merge-multiple: true
 
-      # GITHUB_ENV does not cross jobs, re-derive the trimmed input for the
-      # tag list (must match the build job's tags exactly).
       - name: Prepare
+        id: image
         env:
+          REPO: ${{ github.repository }}
           MEOW_INPUT: ${{ inputs.meow_version }}
         run: |
+          echo "name=${REGISTRY}/${REPO,,}-meow" >> "$GITHUB_OUTPUT"
           MEOW_VERSION="$(scripts/validate-meow-version.sh "$MEOW_INPUT")"
           echo "MEOW_VERSION=${MEOW_VERSION}" >> "$GITHUB_ENV"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image name
-        id: image
-        env:
-          REPO: ${{ github.repository }}
-        run: |
-          echo "name=${{ env.REGISTRY }}/$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')-meow" \
-            >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
           tags: |
-            type=ref,event=branch
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch,prefix=branch-,enable=${{ github.ref != 'refs/heads/main' }}
             type=sha
             type=raw,value=${{ env.MEOW_VERSION }}
 
-      - name: Create manifest list and push
+      - name: Create candidate index
         id: manifest
-        working-directory: /tmp/digests
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          # The digest is the FILENAME (one empty file per pushed arch).
-          # Quote into an array explicitly, `printf '%s@sha256:%s ' "$IMAGE" *`
-          # reuses its format for every glob element and would emit
-          # "<digest2>@sha256:" for each source after the first.
-          sources=()
-          for d in *; do
-            [ -f "$d" ] || continue
-            sources+=("${IMAGE}@sha256:${d}")
-          done
-          created="$(docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            "${sources[@]}")"
-          # The digest of the merged index, for the attestation below.
-          digest="$(printf '%s' "$created" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)"
-          if [ -z "$digest" ]; then
-            digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
-              --format '{{ .Manifest.Digest }}' 2>/dev/null | tr -d '[:space:]')"
-          fi
-          [ -n "$digest" ] || { echo "::error::could not read the merged index digest" >&2; exit 1; }
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+        run: bash scripts/image-release.sh candidate
 
-      # The per-platform children are attested by the build job; the index
-      # that points at them is attested here, so the tag a user pulls is
-      # covered too.
-      - name: Attest the merged index
+      - name: Attest the candidate index
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
-      # The published tags are what an operator pulls: verify every tag
-      # the merge attached (from DOCKER_METADATA_OUTPUT_JSON, not only
-      # steps.meta.outputs.version) resolves to a two-platform linux
-      # index, and that every digest involved carries the provenance
-      # attestation the build/merge jobs pushed.
-      - name: Verify the published indexes
+      - name: Verify candidate index and provenance
         env:
           IMAGE: ${{ steps.image.outputs.name }}
           INDEX_DIGEST: ${{ steps.manifest.outputs.digest }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mapfile -t tags < <(jq -r '.tags[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
-          [ "${#tags[@]}" -gt 0 ] || { echo "::error::no tags to verify" >&2; exit 1; }
-          for tag in "${tags[@]}"; do
-            docker buildx imagetools inspect "$tag" --raw | jq -e '[.manifests[] | select(.platform.os=="linux" and (.platform.architecture=="amd64" or .platform.architecture=="arm64"))] | length == 2'
-          done
-          # The per-platform children are attested by the build job.
-          for f in /tmp/digests/*; do
-            [ -f "$f" ] || continue
-            gh attestation verify "oci://${IMAGE}@sha256:${f##*/}" -R "$GITHUB_REPOSITORY"
-          done
-          # The merged index is attested by this job.
-          gh attestation verify "oci://${IMAGE}@${INDEX_DIGEST}" -R "$GITHUB_REPOSITORY"
+        run: bash scripts/image-release.sh verify
 
-      # The per-arch images this run pushed are untagged orphans when the
-      # merge failed or was cancelled: nobody can pull them by tag, and
-      # the retention script would keep them for the whole window. Delete
-      # the versions behind the digests in /tmp/digests so a failed run
-      # leaves nothing behind.
-      - name: Delete pushed per-arch images on failure
-        if: failure() || cancelled()
+      - name: Promote verified index
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          pkg="${IMAGE##*/}"
-          [ -n "$pkg" ] || exit 0
-          # The packages API is scoped by owner type; the same detection
-          # scripts/cleanup-ghcr.sh does before every call.
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          api_root="/users"
-          if owner_type="$(gh api "/users/${owner}" --jq .type 2>/dev/null)"; then
-            case "$owner_type" in Organization) api_root="/orgs" ;; esac
-          elif gh api "/orgs/${owner}" --jq .type >/dev/null 2>&1; then
-            api_root="/orgs"
-          fi
-          for f in /tmp/digests/*; do
-            [ -f "$f" ] || continue
-            digest="sha256:${f##*/}"
-            # The digest is the version's `name` on the API side; one
-            # digest, one version id.
-            ids="$(gh api "${api_root}/${owner}/packages/container/${pkg}/versions?per_page=100" \
-              --jq ".[] | select(.name == \"${digest}\") | .id" 2>/dev/null || true)"
-            for id in $ids; do
-              echo "deleting ${pkg}@${digest} (version ${id})"
-              gh api -X DELETE "${api_root}/${owner}/packages/container/${pkg}/versions/${id}" \
-                2>/dev/null || echo "::warning::could not delete version ${id} of ${pkg}" >&2
-            done
-          done
+          INDEX_DIGEST: ${{ steps.manifest.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: bash scripts/image-release.sh promote

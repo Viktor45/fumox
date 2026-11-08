@@ -19,13 +19,32 @@
 #   - the cargo-chef release pin and its two checksums in the Dockerfile.
 #     Same reason; bump CARGO_CHEF_VERSION and the sums by hand.
 #   - the `# syntax=docker/dockerfile:1@sha256:...` frontend directive. The
-#     docker parser only reads FROM lines. Bump it with
+#     Dockerfile parser does not inspect directives. Bump it with
 #     `docker buildx imagetools inspect docker/dockerfile:1`.
 #   - dtolnay/rust-toolchain, ignored below: the pin tracks the `stable`
 #     BRANCH, not a release.
+#   - the actionlint and cargo-audit CLI versions in ci.yml; update those
+#     explicit install-command pins manually.
 
 version: 2
 updates:
+  - package-ecosystem: "pip"
+    directory: "/.github"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    groups:
+      ci-python:
+        patterns:
+          - "*"
+
   # Every `uses:` in .github/workflows is pinned to a commit SHA with a
   # version comment. Dependabot resolves the SHA to a tag itself and
   # rewrites both the SHA and the comment, so the pins stay exact.
@@ -86,9 +105,9 @@ updates:
 
   # The Dockerfiles pin their base images by digest; Dependabot tracks the
   # tag the pin was taken from and proposes a digest bump when the tag
-  # moves. One entry per Dockerfile directory: the docker ecosystem does
-  # not recurse, and it only reads literal FROM lines (the rust base is
-  # inlined in the root Dockerfile for exactly this reason).
+  # moves. Each Dockerfile directory has its own entry. Literal FROM and
+  # supported Compose image fields are tracked; interpolated references
+  # such as ${FUMOX_IMAGE:-...} are not.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:

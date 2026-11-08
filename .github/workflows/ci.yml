@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      skip_image_builds:
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,10 +17,6 @@ env:
 permissions:
   contents: read
 
-# One run per ref: a new push supersedes the previous run on the same
-# branch, so a superseded commit does not keep a runner busy. A pull
-# request has its own ref (refs/pull/<n>/merge), so two PRs never cancel
-# each other.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -23,110 +24,131 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # The YAML that drives the pipeline must parse: a workflow file, the
-      # Dependabot config or an issue-template frontmatter with a syntax
-      # error should fail here, on the author's PR, rather than half-apply
-      # on GitHub's side. The tools run out of a throwaway venv so the
-      # externally-managed system Python never gets touched.
-      - name: Validate YAML configs
+      - name: Install pinned CI tools
         run: |
-          python3 -m venv /tmp/yaml-venv
-          /tmp/yaml-venv/bin/pip install --quiet yamllint check-jsonschema
-          /tmp/yaml-venv/bin/yamllint -d relaxed .github/workflows .github/dependabot.yml .github/ISSUE_TEMPLATE/config.yml
-          /tmp/yaml-venv/bin/check-jsonschema --schemafile https://json.schemastore.org/dependabot-2.0.json .github/dependabot.yml
-          # The issue templates' frontmatter is YAML too: extract what
-          # sits between the --- fences and lint it the same way.
+          python3 -m venv /tmp/ci-venv
+          /tmp/ci-venv/bin/pip install --quiet -r .github/requirements.txt
+          echo /tmp/ci-venv/bin >> "$GITHUB_PATH"
+
+      - name: Validate workflow and dependency configuration
+        run: |
+          yamllint -d relaxed .github/workflows .github/dependabot.yml .github/ISSUE_TEMPLATE/config.yml
+          check-jsonschema --schemafile https://json.schemastore.org/dependabot-2.0.json .github/dependabot.yml
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes= .github/workflows/*.yml
           fm="$(mktemp -d)"
           for md in .github/ISSUE_TEMPLATE/*.md; do
             awk 'NR==1 && $0=="---" {next} $0=="---" {exit} {print}' "$md" >"$fm/$(basename "$md").yaml"
           done
-          /tmp/yaml-venv/bin/yamllint -d relaxed "$fm"/*.yaml
+          yamllint -d relaxed "$fm"/*.yaml
           rm -rf "$fm"
 
-      # sqlx links the system SQLite (not bundled), so headers are required.
       - name: Install SQLite dev package
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev sqlite3
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-
       - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
-      # The compile/test invocations below are --locked, matching the
-      # `--locked` in Dockerfile: without it a drifted Cargo.lock is silently
-      # rewritten here while CI stays green, and the released image then
-      # builds from a different resolution than the one that was tested.
-      # (`cargo fmt` takes no such flag.)
       - name: Format
         run: cargo fmt --check
-
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-
       - name: Test
         run: cargo test --locked
-
-      # Ops-script coverage: `cargo test` never executes scripts/, and these
-      # carry real write paths (revive, adopt, restore), the compose
-      # teardown the smoke stand depends on, and the GHCR retention
-      # rules. All are hermetic — they need only bash and the sqlite3 CLI,
-      # both present on the runner image — and none touches the network or
-      # a real container engine.
       - name: Script tests
         run: |
-          bash scripts/tests/cleanup-ghcr.test.sh
-          bash scripts/tests/published-ports.test.sh
-          bash scripts/tests/repair-geo-stamps.test.sh
-          bash scripts/tests/revive-xhttp-proxies.test.sh
-          bash scripts/tests/smoke-down.test.sh
-          bash scripts/tests/smoke-up.test.sh
-          bash scripts/tests/update-meow-pin.test.sh
-          bash scripts/tests/validate-meow-version.test.sh
+          for test in scripts/tests/*.test.sh; do bash "$test"; done
+          for test in scripts/tests/*.test.py; do python3 "$test"; done
 
-      # The changelog generator runs on a draft git-cliff produces; it
-      # must not drop a category or crash on a malformed line.
-      - name: Changelog generator test
-        run: python3 scripts/tests/make-changelog.test.py
-
-      # The commit_parsers of cliff.toml decide the draft's categories; the
-      # fixture replays a feat/fix/docs/chore/build/Bump/merge subject set
-      # against them. git-cliff ships a prebuilt wheel, so it installs out
-      # of the same kind of throwaway venv the YAML tools above run from.
-      - name: git-cliff configuration test
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Read minimum Rust version
+        id: rust
         run: |
-          python3 -m venv /tmp/cliff-venv
-          /tmp/cliff-venv/bin/pip install --quiet git-cliff
-          PATH="/tmp/cliff-venv/bin:$PATH" bash scripts/tests/cliff-config.test.sh
+          python3 -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
+      - name: Install SQLite dev package
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: msrv
+      - run: cargo check --locked --workspace --all-targets
 
-  # DISABLED: this job ran a real nginx container listening on :80 and
-  # :443. Port-listening smoke stands are turned off across the workflows;
-  # the block below is kept verbatim so the coverage can be restored in one
-  # revert. What is no longer proved on a PR: nginx -t, the ACME webroot
-  # exception to the HTTPS redirect, the TLS handshake, the /export token
-  # masking in the access log, and the SIGHUP certificate reload.
-  # scripts/nginx-smoke.sh still runs locally:
-  #   docker build -t localhost/fumox-nginx:local docker/nginx
-  #   bash scripts/nginx-smoke.sh localhost/fumox-nginx:local
-  #
-  # Smoke test of the nginx TLS-front image (docker/nginx/): the image is
-  # built with the default compose flavour and run with self-signed
-  # certificates mounted at /certs. scripts/nginx-smoke.sh then proves
-  # nginx -t passes, /.well-known/acme-challenge/ is not redirected to
-  # HTTPS while other HTTP requests are (301), a TLS handshake succeeds,
-  # the access log masks the /export tokens, and a SIGHUP reload serves a
-  # replaced certificate. Needs a container engine, hence its own job
-  # (the Script tests above are deliberately hermetic).
-  # nginx-smoke:
-  #   runs-on: ubuntu-24.04
-  #   steps:
-  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-  #
-  #     - name: Build the nginx image
-  #       run: docker build -t localhost/fumox-nginx:local docker/nginx
-  #
-  #     - name: Nginx image smoke test
-  #       run: bash scripts/nginx-smoke.sh localhost/fumox-nginx:local
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: cargo-audit
+      - name: Audit dependencies
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit
+
+  images:
+    if: ${{ !inputs.skip_image_builds }}
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: fumox
+            context: .
+          - name: nginx
+            context: ./docker/nginx
+          - name: meow
+            context: ./docker/meow
+        target:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      # Build-only coverage; no container starts or listening ports.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: ${{ matrix.image.context }}
+          platforms: ${{ matrix.target.platform }}
+          push: false
+          cache-from: type=gha,scope=ci-${{ matrix.image.name }}-${{ matrix.target.runner }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.image.name }}-${{ matrix.target.runner }}
+
+  gate:
+    name: CI gate
+    if: always()
+    needs: [check, msrv, audit, images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all quality checks
+        env:
+          CHECK: ${{ needs.check.result }}
+          MSRV: ${{ needs.msrv.result }}
+          AUDIT: ${{ needs.audit.result }}
+          IMAGES: ${{ needs.images.result }}
+          SKIP_IMAGES: ${{ inputs.skip_image_builds }}
+        run: |
+          test "$CHECK" = success
+          test "$MSRV" = success
+          test "$AUDIT" = success
+          if [ "$SKIP_IMAGES" = true ]; then
+            test "$IMAGES" = skipped
+          else
+            test "$IMAGES" = success
+          fi

@@ -1,88 +1,33 @@
-# Builds the Fumox image for linux/amd64 and linux/arm64 and pushes a
-# combined multi-arch manifest to GHCR (ghcr.io/viktor45/fumox).
-#
-# Strategy: each architecture is compiled NATIVELY on a matching GitHub
-# runner (no QEMU emulation, which is prohibitively slow for Rust), pushed
-# by digest, and a merge job stitches the digests into one manifest list.
-# Requires the `ubuntu-24.04-arm` runner (included for public repos;
-# available on paid plans for private repos).
-#
-# Every single-platform image gets a GitHub build-provenance attestation
-# (actions/attest-build-provenance) pushed to the registry alongside the
-# digest, and the merged index is attested as well, so the tag a user
-# pulls is covered by an attestation of its own.
-#
-# Resulting tags:
-#   push v0.2.0       -> 0.2.0, 0.2, sha-<shortsha>, latest
-#   workflow_dispatch -> ref/sha tags from docker/metadata-action (no
-#                        `latest`: that tag belongs to a released version)
-# There is no automatic rebuild on push to `main`, only `v*` tags and manual
-# dispatch trigger this workflow (see the `on:` block below).
-#
-# `latest` and `major.minor` move only forward: they are published for a
-# strict semver tag whose commit is on `main` and whose version is not
-# older than a version that already exists.
-#
-# Run the image (see Dockerfile header for details; admin stays loopback-only
-# on the host, and the probe runs as the command argument, tini remains the
-# entrypoint):
-#   docker run -d --name fumox \
-#     -e FUMOX_ADMIN__TOKEN=secret \
-#     -v fumox-config:/app/config -v fumox-data:/app/data \
-#     -p 8080:8080 -p 127.0.0.1:8081:8081 ghcr.io/viktor45/fumox
-#   docker run -d --name fumox-probe ... ghcr.io/viktor45/fumox fumox-probe
-#
-# Quality gates before the tags are published:
-#   - the per-architecture build job compiles the workspace and pushes the
-#     image, so a build that does not compile never reaches a tag;
-#   - the merge job verifies what it published: the index is a manifest
-#     list with exactly the two linux children, and every digest involved
-#     (per-platform and the index itself) carries a provenance attestation.
-#     On failure or cancellation it deletes the per-arch versions it
-#     pushed, so a failed run leaves no untagged orphans.
-#
-# DISABLED: the two runtime smoke stands that used to gate the merge.
-# Both started containers that listen on ports, which is turned off across
-# the workflows; the blocks below are kept verbatim so they can be restored
-# in one revert. What is no longer proved before a release:
-#   - scripts/container-smoke.sh — the server comes up with the deployment
-#     mounts, /healthz answers, the database appears in the data mount, and
-#     a read-only data mount fails predictably;
-#   - scripts/kube-coldstart-smoke.sh — the kube manifest on an empty volume
-#     brings the server and the probe up without a restart.
-# Both scripts still run locally against a built image.
-
 name: Docker
 
 on:
   push:
-    #    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
-# The least privilege the workflow needs as a whole; the jobs that push or
-# attest ask for more, explicitly.
 permissions:
   contents: read
 
 env:
   REGISTRY: ghcr.io
 
-# Tag pushes share ONE group: `latest` and `major.minor` are single tags,
-# and two releases published at the same time would race over them. A
-# manual dispatch gets its own group (with the run id) so a pending
-# dispatch is never displaced by a later one.
+# Publishers and retention share the same registry snapshot boundary.
 concurrency:
-  group: ${{ github.event_name == 'push' && 'docker-release' || format('docker-dispatch-{0}', github.run_id) }}
+  group: ghcr-images
   cancel-in-progress: false
 
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+    with:
+      skip_image_builds: true
+
   build:
+    needs: quality
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
-      # Required by actions/attest-build-provenance (OIDC token + writing
-      # the attestation to the registry).
       id-token: write
       attestations: write
     strategy:
@@ -95,28 +40,19 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - name: Prepare
-        env:
-          PLATFORM: ${{ matrix.platform }}
-        run: |
-          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Compute image name
         id: image
         env:
           REPO: ${{ github.repository }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          echo "name=${REGISTRY}/$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')" \
-            >> "$GITHUB_OUTPUT"
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+          echo "name=${REGISTRY}/${REPO,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -127,14 +63,9 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ steps.image.outputs.name }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
+          flavor: latest=false
+          tags: type=sha
 
-      # Push the single-platform image by digest only; tags are attached by
-      # the merge job once both architectures exist.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -147,28 +78,13 @@ jobs:
           cache-to: type=gha,mode=max,scope=fumox-${{ env.PLATFORM_PAIR }}
 
       - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
-      # DISABLED: started the fumox server container, which listens on
-      # :8080/:8081. Kept verbatim for a one-revert restore; see the header.
-      # The container smoke test runs against the image that was just
-      # pushed: the artefact the release publishes is the artefact the
-      # test proves. The image is pulled back by digest (the job is
-      # already logged in to GHCR), so no second build is needed.
-      # - name: Container smoke test
-      #   env:
-      #     IMAGE: ${{ steps.image.outputs.name }}
-      #     DIGEST: ${{ steps.build.outputs.digest }}
-      #   run: |
-      #     docker pull "${IMAGE}@${DIGEST}"
-      #     docker tag "${IMAGE}@${DIGEST}" localhost/fumox:local
-      #     bash scripts/container-smoke.sh localhost/fumox:local
-
-      # Attest this single-platform image by digest; the merge job only
-      # stitches already-attested digests into the manifest list.
+      # Runtime container and Kubernetes smoke stands remain disabled: they listen on ports.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
@@ -184,118 +100,31 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # DISABLED: `podman kube play` brought up the server and the probe, both
-  # of which listen on ports. Kept verbatim for a one-revert restore; see
-  # the header. The merge job no longer waits on it.
-  #
-  # The cold-start e2e test of the kube layout (podman kube play). It runs
-  # on amd64 only: what it proves (the schema race between the server and
-  # the probe on an empty volume) does not depend on the architecture, and
-  # the job builds both images from source, which is expensive.
-  #
-  # The job gates the release: the merge job below waits for it, so a
-  # broken cold start cannot reach the published tags.
-  # kube-smoke:
-  #   permissions:
-  #     contents: read
-  #   runs-on: ubuntu-24.04
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-  #
-  #     - name: Install podman
-  #       run: |
-  #         if ! command -v podman >/dev/null 2>&1; then
-  #           sudo apt-get update
-  #           sudo apt-get install -y podman
-  #         fi
-  #         podman version
-  #
-  #     - name: Build the images
-  #       run: |
-  #         podman build -t localhost/fumox:local .
-  #         podman build -t localhost/fumox-meow:local docker/meow
-  #
-  #     - name: Cold-start e2e test
-  #       run: bash scripts/kube-coldstart-smoke.sh
-
   merge:
+    needs: [quality, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
-      # The merged index is attested too, so `gh attestation verify` on the
-      # index itself (not only on its per-platform children) succeeds.
       id-token: write
       attestations: write
-    runs-on: ubuntu-24.04
-    # kube-smoke is disabled (see above), so the merge waits on the build
-    # alone. Restoring that job means putting it back in this list.
-    needs: build
     steps:
-      # The full history and the tags: which versions exist is what
-      # decides whether `latest` and `major.minor` may move.
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
       - name: Decide the published tags
-        run: |
-          set -euo pipefail
-          # `latest` and `major.minor` name the newest release, so they
-          # are published only for a strict semver tag whose commit is on
-          # main and whose version is not older than a version that
-          # already exists.
-          release=false
-          latest=false
-          series=false
-          current=""
-          if [[ "$GITHUB_REF" =~ ^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            current="${BASH_REMATCH[1]}"
-            release=true
-            if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
-              if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
-                echo "::warning::the tag $GITHUB_REF does not point at a commit on main" >&2
-                release=false
-              fi
-            fi
-          else
-            echo "::notice::$GITHUB_REF is not a strict semver tag: no release tags are published" >&2
-          fi
-          if [ "$release" = "true" ]; then
-            releases="$(git tag --list 'v[0-9]*' --sort=-v:refname | sed 's/^v//')"
-            newest="$(printf '%s\n' "$releases" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
-            if [ -z "$newest" ] || [ "$current" = "$newest" ]; then
-              latest=true
-            else
-              echo "::notice::version $newest already exists; latest is not moved back to $current" >&2
-            fi
-            prefix="${current%.*}"
-            newest_in_series="$(printf '%s\n' "$releases" | grep -E "^${prefix}\.[0-9]+$" | head -1)"
-            if [ -z "$newest_in_series" ] || [ "$current" = "$newest_in_series" ]; then
-              series=true
-            else
-              echo "::notice::version $newest_in_series of the $prefix series already exists; $prefix is not moved back" >&2
-            fi
-          fi
-          {
-            echo "IS_RELEASE=${release}"
-            echo "IS_LATEST=${latest}"
-            echo "IS_SERIES_LATEST=${series}"
-          } >> "$GITHUB_ENV"
+        run: python3 scripts/release-tags.py >> "$GITHUB_ENV"
 
-      - name: Download digests
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp/digests
           pattern: digest-*
           merge-multiple: true
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -305,114 +134,47 @@ jobs:
         id: image
         env:
           REPO: ${{ github.repository }}
-        run: |
-          echo "name=${REGISTRY}/$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')" \
-            >> "$GITHUB_OUTPUT"
+        run: echo "name=${REGISTRY}/${REPO,,}" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
           tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch,prefix=branch-,enable=${{ github.ref != 'refs/heads/main' }}
+            type=semver,pattern={{version}},enable=${{ env.IS_RELEASE == 'true' }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ env.IS_SERIES_LATEST == 'true' }}
             type=sha
             type=raw,value=latest,enable=${{ env.IS_LATEST == 'true' }}
 
-      - name: Create manifest list and push
+      - name: Create candidate index
         id: manifest
-        working-directory: /tmp/digests
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          # The digest is the FILENAME (one empty file per pushed arch).
-          # Quote into an array explicitly, `printf '%s@sha256:%s ' "$IMAGE" *`
-          # reuses its format for every glob element and would emit
-          # "<digest2>@sha256:" for each source after the first.
-          sources=()
-          for d in *; do
-            [ -f "$d" ] || continue
-            sources+=("${IMAGE}@sha256:${d}")
-          done
-          created="$(docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            "${sources[@]}")"
-          # The digest of the merged index, for the attestation below.
-          digest="$(printf '%s' "$created" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)"
-          if [ -z "$digest" ] && [ -n "${VERSION:-}" ]; then
-            digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
-              --format '{{ .Manifest.Digest }}' 2>/dev/null | tr -d '[:space:]')"
-          fi
-          [ -n "$digest" ] || { echo "::error::could not read the merged index digest" >&2; exit 1; }
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+        run: bash scripts/image-release.sh candidate
 
-      # The per-platform children are attested by the build job; the index
-      # that points at them is attested here, so the tag a user pulls is
-      # covered too.
-      - name: Attest the merged index
+      - name: Attest the candidate index
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
-      # The index must be a manifest list with exactly the two linux
-      # children (an amd64-only index or a stray architecture must fail
-      # the run), and every digest involved must carry the provenance
-      # attestation the build/merge jobs pushed.
-      - name: Verify the published index
+      - name: Verify candidate index and provenance
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          VERSION: ${{ steps.meta.outputs.version }}
           INDEX_DIGEST: ${{ steps.manifest.outputs.digest }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          docker buildx imagetools inspect "${IMAGE}:${VERSION}" --raw | jq -e '[.manifests[] | select(.platform.os=="linux" and (.platform.architecture=="amd64" or .platform.architecture=="arm64"))] | length == 2'
-          # The per-platform children are attested by the build job.
-          for f in /tmp/digests/*; do
-            [ -f "$f" ] || continue
-            gh attestation verify "oci://${IMAGE}@sha256:${f##*/}" -R "$GITHUB_REPOSITORY"
-          done
-          # The merged index is attested by this job.
-          gh attestation verify "oci://${IMAGE}@${INDEX_DIGEST}" -R "$GITHUB_REPOSITORY"
+        run: bash scripts/image-release.sh verify
 
-      # The per-arch images this run pushed are untagged orphans when the
-      # merge failed or was cancelled: nobody can pull them by tag, and
-      # the retention script would keep them for the whole window. Delete
-      # the versions behind the digests in /tmp/digests so a failed run
-      # leaves nothing behind.
-      - name: Delete pushed per-arch images on failure
-        if: failure() || cancelled()
+      - name: Promote verified index
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          pkg="${IMAGE##*/}"
-          [ -n "$pkg" ] || exit 0
-          # The packages API is scoped by owner type; the same detection
-          # scripts/cleanup-ghcr.sh does before every call.
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          api_root="/users"
-          if owner_type="$(gh api "/users/${owner}" --jq .type 2>/dev/null)"; then
-            case "$owner_type" in Organization) api_root="/orgs" ;; esac
-          elif gh api "/orgs/${owner}" --jq .type >/dev/null 2>&1; then
-            api_root="/orgs"
-          fi
-          for f in /tmp/digests/*; do
-            [ -f "$f" ] || continue
-            digest="sha256:${f##*/}"
-            # The digest is the version's `name` on the API side; one
-            # digest, one version id.
-            ids="$(gh api "${api_root}/${owner}/packages/container/${pkg}/versions?per_page=100" \
-              --jq ".[] | select(.name == \"${digest}\") | .id" 2>/dev/null || true)"
-            for id in $ids; do
-              echo "deleting ${pkg}@${digest} (version ${id})"
-              gh api -X DELETE "${api_root}/${owner}/packages/container/${pkg}/versions/${id}" \
-                2>/dev/null || echo "::warning::could not delete version ${id} of ${pkg}" >&2
-            done
-          done
+          INDEX_DIGEST: ${{ steps.manifest.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: bash scripts/image-release.sh promote
+
+      # Failed artifacts are handled by reference-aware retention, never eager digest deletion.

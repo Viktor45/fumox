@@ -61,8 +61,11 @@ cat >"$FIX/manifests/$D_LATEST.json" <<JSON
 {"schemaVersion":2,"manifests":[{"digest":"$D_CHILD1"},{"digest":"$D_CHILD2"}]}
 JSON
 
+for digest in "$D_CHILD1" "$D_CHILD2" "$D_SHA" "$D_ORPHAN" "$D_SUBJECT" "$D_RECENT"; do
+    printf '{"schemaVersion":2,"config":{"digest":"%s"},"layers":[]}\n' "$D_CHILD1" >"$FIX/manifests/$digest.json"
+done
 cat >"$FIX/manifests/$D_ATTEST.json" <<JSON
-{"schemaVersion":2,"subject":{"digest":"$D_SUBJECT"},"predicateType":"https://slsa.dev/provenance/v1"}
+{"schemaVersion":2,"config":{"digest":"$D_CHILD1"},"layers":[],"subject":{"digest":"$D_SUBJECT"}}
 JSON
 
 # The version list the API returns. Seven versions, one page.
@@ -103,12 +106,20 @@ done
 case "$path" in
     */packages/container/*/versions/*)
         if [ "$method" = "DELETE" ]; then
+            if [ -n "${STUB_DELETE_ERROR:-}" ]; then
+                echo "gh: HTTP $STUB_DELETE_ERROR" >&2
+                exit 1
+            fi
             printf '%s\n' "$path" >>"$FIX/deleted"
             exit 0
         fi
         ;;
     */packages/container/*/versions*)
         page="${path##*page=}"
+        if [ "$page" = 2 ] && [ -n "${STUB_PAGE_ERROR:-}" ]; then
+            echo "gh: HTTP $STUB_PAGE_ERROR" >&2
+            exit 1
+        fi
         if [ -f "$FIX/page-$page.json" ]; then
             cat "$FIX/page-$page.json"
             exit 0
@@ -148,7 +159,7 @@ cat >"$STUB/docker" <<'STUB'
 # docker stub. Only `buildx imagetools inspect` is used by the script.
 if [ "$1" = "login" ]; then
     cat >/dev/null
-    exit 0
+    exit "${STUB_LOGIN_CODE:-0}"
 fi
 if [ "$1" != "buildx" ] || [ "$2" != "imagetools" ] || [ "$3" != "inspect" ]; then
     exit 0
@@ -307,6 +318,74 @@ CODE=$?
 set -e
 [ "$CODE" -eq 1 ] || fail "a retention of 0 days must be rejected, got $CODE"
 note "the arguments are validated"
+
+assert_refusal() {
+    : >"$FIX/deleted"
+    run --owner viktor45 --packages fumox --no-dry-run --prune-untagged
+    [ "$CODE" -ne 0 ] || fail "incomplete evidence must fail: $OUT"
+    [ ! -s "$FIX/deleted" ] || fail 'incomplete evidence authorized a deletion'
+}
+
+mv "$FIX/manifests/$D_LATEST.json" "$FIX/latest.saved"
+assert_refusal
+mv "$FIX/latest.saved" "$FIX/manifests/$D_LATEST.json"
+note 'a failed live-index inspection prevents all deletions'
+
+cp "$FIX/manifests/$D_LATEST.json" "$FIX/latest.saved"
+printf '{"schemaVersion":2,"manifests":[{}]}\n' >"$FIX/manifests/$D_LATEST.json"
+assert_refusal
+mv "$FIX/latest.saved" "$FIX/manifests/$D_LATEST.json"
+note 'a missing descriptor digest prevents all deletions'
+
+cp "$FIX/manifests/$D_RECENT.json" "$FIX/recent.saved"
+printf '{"schemaVersion":2,"manifests":[{"digest":"%s"}]}\n' "$D_ORPHAN" >"$FIX/manifests/$D_RECENT.json"
+run --owner viktor45 --packages fumox --dry-run --prune-untagged
+[ "$CODE" -eq 0 ] || fail "$OUT"
+assert_not_says 'would delete id=4' "$OUT" 'a child of a fresh sha index'
+cp "$FIX/page-1.json" "$FIX/page.saved"
+jq '.[6].metadata.container.tags = []' "$FIX/page.saved" >"$FIX/page-1.json"
+run --owner viktor45 --packages fumox --dry-run --prune-untagged
+[ "$CODE" -eq 0 ] || fail "$OUT"
+assert_not_says 'would delete id=4' "$OUT" 'a child of a fresh untagged index'
+mv "$FIX/page.saved" "$FIX/page-1.json"
+mv "$FIX/recent.saved" "$FIX/manifests/$D_RECENT.json"
+note 'fresh sha-only and untagged indexes protect their children'
+
+cp "$FIX/manifests/$D_LATEST.json" "$FIX/latest.saved"
+cp "$FIX/manifests/$D_ORPHAN.json" "$FIX/orphan.saved"
+printf '{"schemaVersion":2,"manifests":[{"digest":"%s"}]}\n' "$D_ORPHAN" >"$FIX/manifests/$D_LATEST.json"
+printf '{"schemaVersion":2,"manifests":[{"digest":"%s"}]}\n' "$D_CHILD1" >"$FIX/manifests/$D_ORPHAN.json"
+run --owner viktor45 --packages fumox --dry-run --prune-untagged
+[ "$CODE" -eq 0 ] || fail "$OUT"
+assert_not_says 'would delete id=3' "$OUT" 'a nested live child'
+assert_not_says 'would delete id=4' "$OUT" 'a nested live index'
+mv "$FIX/latest.saved" "$FIX/manifests/$D_LATEST.json"
+mv "$FIX/orphan.saved" "$FIX/manifests/$D_ORPHAN.json"
+note 'nested indexes are traversed recursively'
+
+cp "$FIX/page-1.json" "$FIX/page.saved"
+jq '.[0] as $version | [range(100) | $version]' "$FIX/page.saved" >"$FIX/page-1.json"
+for error in 403 404 500; do
+    STUB_PAGE_ERROR="$error" assert_refusal
+done
+jq '.[0].metadata.container.tags = null' "$FIX/page.saved" >"$FIX/page-1.json"
+assert_refusal
+jq '.[0].metadata.container.tags = ["sha256-deadbeef.att"]' "$FIX/page.saved" >"$FIX/page-1.json"
+run --owner viktor45 --packages fumox --dry-run --prune-untagged
+[ "$CODE" -eq 0 ] || fail "$OUT"
+assert_not_says 'would delete id=1' "$OUT" 'OCI referrer fallback tag'
+mv "$FIX/page.saved" "$FIX/page-1.json"
+note 'pagination errors and malformed items abort; referrer tags survive'
+
+FUMOX_GHCR_MAX_INSPECTS=1 assert_refusal
+STUB_LOGIN_CODE=1 assert_refusal
+STUB_DELETE_ERROR=403 assert_refusal
+STUB_DELETE_ERROR=404 run --owner viktor45 --packages fumox --no-dry-run --prune-untagged
+[ "$CODE" -eq 0 ] || fail 'already-deleted versions should be harmless'
+FUMOX_GHCR_MAX_INSPECTS=1 run --owner viktor45 --packages fumox,fumox-meow --dry-run --prune-untagged
+[ "$CODE" -ne 0 ] || fail 'inspection cap must not silently disable protection'
+assert_says 'packages processed: 0, skipped: 2' "$OUT" 'independent package caps'
+note 'inspection limits, login and delete failures propagate'
 
 echo
 echo "cleanup-ghcr.sh: all checks passed"

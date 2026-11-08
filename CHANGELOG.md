@@ -209,6 +209,15 @@ are stamped when the batch is published.
 
 ### Changed
 
+- CI is reusable by both image publishers and checks the releasing commit
+  before building. Pull requests also build all three Docker images on
+  amd64 and arm64 without starting containers. The quality gate includes
+  the declared minimum Rust version, `cargo audit`, workflow validation,
+  and pinned Python tooling maintained by Dependabot.
+- Image publishers attest and verify a uniquely tagged candidate before
+  moving public tags. Publishing and retention share a concurrency group;
+  failed runs no longer delete potentially shared image digests.
+
 - A probe cycle is bounded now. It carries a wall-clock budget (three
   quarters of the period), and a lane that starts after the budget is
   spent issues no check: the row is deferred, not charged and not
@@ -858,6 +867,22 @@ are stamped when the batch is published.
   over the same column.
 
 ### Fixed
+
+- Release tags no longer implicitly publish `latest`: only stable tag
+  pushes on main may publish release tags, and moving aliases cannot roll
+  back to older versions. Non-main branch tags use a `branch-` prefix to
+  avoid colliding with release aliases. Index validation requires one amd64 and
+  one arm64 image rather than merely counting matching descriptors.
+- GHCR cleanup protects nested manifests and recent retained indexes,
+  preserves OCI referrer tags, and aborts before deletion if inventory or
+  manifest inspection is incomplete. Registry login and deletion failures
+  now fail the run instead of reporting success.
+- The meow pin updater retries PR creation when a verified update branch
+  exists without a PR, respects closed PRs, and refuses unexpected branch
+  contents. Manual runs update the default branch's pins.
+- The Dockerfile frontend directive is now the first line and pinned by
+  digest in all three images, so the selected frontend actually takes
+  effect.
 
 - The client states that it ignores the environment proxy configuration.
   The address that was vetted and the address that is connected to have

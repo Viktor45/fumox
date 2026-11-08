@@ -1,13 +1,5 @@
-# Frontend pinned by digest: an unpinned frontend is re-resolved on every
-# build (14 MB image, ~19 s on a cold cache here) and a future release
-# could change build semantics under us. The digest is what pins it.
-#
-# The tag is the rolling `1` channel rather than a fixed patch version
-# (`1.27` was): a fixed version never moves, so no updater could ever
-# propose a bump and the frontend would freeze until a human noticed.
-# With `1`, Dependabot sees the tag move and proposes the digest bump.
-# Bump the digest: `docker buildx imagetools inspect docker/dockerfile:1`.
 # syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# Dependabot does not track syntax directives; update this digest manually.
 #
 # Fumox container image.
 #

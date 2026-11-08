@@ -69,7 +69,17 @@
 # ship for both.
 
 # Global build args (usable in the FROM lines below).
-# RUST_VERSION is a full image reference: tag + digest.
+#
+# The rust base image is NOT an ARG: Dependabot's docker parser only reads
+# literal FROM lines and never substitutes ${...}, so an ARG-indirected
+# reference is invisible to it and the pin would freeze. The reference
+# lives in the FROM line of the chef stage below instead.
+ARG BUILD_CACHE=layers
+ARG CARGO_CHEF_VERSION=v0.1.78
+
+# ---- Stage 1: toolchain + cargo-chef ---------------------------------------
+# sqlx links the system SQLite (not bundled), so headers are needed at build;
+# curl + xz-utils fetch and unpack the cargo-chef tarball; mold is the linker.
 #
 # The DIGEST is what pins the bytes — the multi-arch INDEX digest, so both
 # CI architectures resolve to the same image and a rebuild cannot silently
@@ -88,14 +98,7 @@
 # permanent freeze.
 # `-slim-trixie` matches the runtime base below (Debian 13) explicitly
 # instead of relying on what the plain `-slim` tag happens to alias to.
-ARG RUST_VERSION=1.98-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7
-ARG BUILD_CACHE=layers
-ARG CARGO_CHEF_VERSION=v0.1.78
-
-# ---- Stage 1: toolchain + cargo-chef ---------------------------------------
-# sqlx links the system SQLite (not bundled), so headers are needed at build;
-# curl + xz-utils fetch and unpack the cargo-chef tarball; mold is the linker.
-FROM rust:${RUST_VERSION} AS chef
+FROM rust:1.98-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS chef
 # Validate BUILD_CACHE first, before the apt and cargo-chef work: without this
 # a typo in FUMOX_BUILD_CACHE (.env) surfaces much later as BuildKit's
 # "unknown stage build-foo" from `FROM build-${BUILD_CACHE}`.

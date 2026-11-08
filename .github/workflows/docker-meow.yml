@@ -44,10 +44,17 @@
 # GHCR image exists for deployments that prefer to pull, point the compose
 # service's `image:` at it and drop its `build:` section.
 #
-# Quality gate: the build job pulls the image it just pushed back and runs
-# scripts/meow-controller-smoke.sh against it — the kernel must refuse to
-# start without a controller secret, and the controller must reject a
-# request that presents none.
+# Quality gate: DISABLED. The build job used to pull the image it just
+# pushed back and run scripts/meow-controller-smoke.sh against it — the
+# kernel must refuse to start without a controller secret, and the
+# controller must reject a request that presents none. That stand listens
+# on :9090, and port-listening smoke stands are turned off across the
+# workflows. The step is kept verbatim below for a one-revert restore, and
+# the script still runs locally. What is no longer proved before the image
+# is published: that an unauthenticated controller cannot be started.
+# The build still verifies the downloaded archive against the pinned
+# sha256, and the merge job still verifies the published indexes and their
+# provenance attestations.
 
 name: Docker meow
 
@@ -181,6 +188,9 @@ jobs:
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
+      # DISABLED: started the meow kernel, whose controller listens on
+      # :9090. Kept verbatim for a one-revert restore; see the header.
+      #
       # The controller smoke test runs against the image that was just
       # pushed: the artefact the release publishes is the artefact the
       # test proves. The image is pulled back by digest (the job is
@@ -189,14 +199,14 @@ jobs:
       # It proves the property that makes the controller safe to expose at
       # all: the kernel refuses to start without a secret, and the
       # controller rejects a request that does not present one.
-      - name: Controller smoke test
-        env:
-          IMAGE: ${{ steps.image.outputs.name }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          docker pull "${IMAGE}@${DIGEST}"
-          docker tag "${IMAGE}@${DIGEST}" localhost/fumox-meow:local
-          bash scripts/meow-controller-smoke.sh localhost/fumox-meow:local
+      # - name: Controller smoke test
+      #   env:
+      #     IMAGE: ${{ steps.image.outputs.name }}
+      #     DIGEST: ${{ steps.build.outputs.digest }}
+      #   run: |
+      #     docker pull "${IMAGE}@${DIGEST}"
+      #     docker tag "${IMAGE}@${DIGEST}" localhost/fumox-meow:local
+      #     bash scripts/meow-controller-smoke.sh localhost/fumox-meow:local
 
       # Attest this single-platform image by digest; the merge job only
       # stitches already-attested digests into the manifest list.

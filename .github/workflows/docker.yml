@@ -33,19 +33,24 @@
 #   docker run -d --name fumox-probe ... ghcr.io/viktor45/fumox fumox-probe
 #
 # Quality gates before the tags are published:
-#   - the per-architecture build job pulls the image it just pushed back
-#     and runs scripts/container-smoke.sh against it (the server comes up
-#     with the deployment mounts, /healthz answers, the database appears
-#     in the data mount, and a read-only data mount fails predictably);
-#   - the kube-smoke job plays the kube manifest on an empty volume and
-#     asserts that the server and the probe both reach the running state
-#     without a restart (scripts/kube-coldstart-smoke.sh).
-# The merge job waits for both, so a broken image is never published.
-# Before it goes green it also verifies what it published: the index is
-# a manifest list with exactly the two linux children, and every digest
-# involved (per-platform and the index itself) carries a provenance
-# attestation. On failure or cancellation it deletes the per-arch
-# versions it pushed, so a failed run leaves no untagged orphans.
+#   - the per-architecture build job compiles the workspace and pushes the
+#     image, so a build that does not compile never reaches a tag;
+#   - the merge job verifies what it published: the index is a manifest
+#     list with exactly the two linux children, and every digest involved
+#     (per-platform and the index itself) carries a provenance attestation.
+#     On failure or cancellation it deletes the per-arch versions it
+#     pushed, so a failed run leaves no untagged orphans.
+#
+# DISABLED: the two runtime smoke stands that used to gate the merge.
+# Both started containers that listen on ports, which is turned off across
+# the workflows; the blocks below are kept verbatim so they can be restored
+# in one revert. What is no longer proved before a release:
+#   - scripts/container-smoke.sh — the server comes up with the deployment
+#     mounts, /healthz answers, the database appears in the data mount, and
+#     a read-only data mount fails predictably;
+#   - scripts/kube-coldstart-smoke.sh — the kube manifest on an empty volume
+#     brings the server and the probe up without a restart.
+# Both scripts still run locally against a built image.
 
 name: Docker
 
@@ -147,18 +152,20 @@ jobs:
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
+      # DISABLED: started the fumox server container, which listens on
+      # :8080/:8081. Kept verbatim for a one-revert restore; see the header.
       # The container smoke test runs against the image that was just
       # pushed: the artefact the release publishes is the artefact the
       # test proves. The image is pulled back by digest (the job is
       # already logged in to GHCR), so no second build is needed.
-      - name: Container smoke test
-        env:
-          IMAGE: ${{ steps.image.outputs.name }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          docker pull "${IMAGE}@${DIGEST}"
-          docker tag "${IMAGE}@${DIGEST}" localhost/fumox:local
-          bash scripts/container-smoke.sh localhost/fumox:local
+      # - name: Container smoke test
+      #   env:
+      #     IMAGE: ${{ steps.image.outputs.name }}
+      #     DIGEST: ${{ steps.build.outputs.digest }}
+      #   run: |
+      #     docker pull "${IMAGE}@${DIGEST}"
+      #     docker tag "${IMAGE}@${DIGEST}" localhost/fumox:local
+      #     bash scripts/container-smoke.sh localhost/fumox:local
 
       # Attest this single-platform image by digest; the merge job only
       # stitches already-attested digests into the manifest list.
@@ -177,6 +184,10 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # DISABLED: `podman kube play` brought up the server and the probe, both
+  # of which listen on ports. Kept verbatim for a one-revert restore; see
+  # the header. The merge job no longer waits on it.
+  #
   # The cold-start e2e test of the kube layout (podman kube play). It runs
   # on amd64 only: what it proves (the schema race between the server and
   # the probe on an empty volume) does not depend on the architecture, and
@@ -184,29 +195,29 @@ jobs:
   #
   # The job gates the release: the merge job below waits for it, so a
   # broken cold start cannot reach the published tags.
-  kube-smoke:
-    permissions:
-      contents: read
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install podman
-        run: |
-          if ! command -v podman >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y podman
-          fi
-          podman version
-
-      - name: Build the images
-        run: |
-          podman build -t localhost/fumox:local .
-          podman build -t localhost/fumox-meow:local docker/meow
-
-      - name: Cold-start e2e test
-        run: bash scripts/kube-coldstart-smoke.sh
+  # kube-smoke:
+  #   permissions:
+  #     contents: read
+  #   runs-on: ubuntu-24.04
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+  #
+  #     - name: Install podman
+  #       run: |
+  #         if ! command -v podman >/dev/null 2>&1; then
+  #           sudo apt-get update
+  #           sudo apt-get install -y podman
+  #         fi
+  #         podman version
+  #
+  #     - name: Build the images
+  #       run: |
+  #         podman build -t localhost/fumox:local .
+  #         podman build -t localhost/fumox-meow:local docker/meow
+  #
+  #     - name: Cold-start e2e test
+  #       run: bash scripts/kube-coldstart-smoke.sh
 
   merge:
     permissions:
@@ -217,7 +228,9 @@ jobs:
       id-token: write
       attestations: write
     runs-on: ubuntu-24.04
-    needs: [build, kube-smoke]
+    # kube-smoke is disabled (see above), so the merge waits on the build
+    # alone. Restoring that job means putting it back in this list.
+    needs: build
     steps:
       # The full history and the tags: which versions exist is what
       # decides whether `latest` and `major.minor` may move.

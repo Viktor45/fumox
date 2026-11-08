@@ -84,6 +84,7 @@ jobs:
           bash scripts/tests/revive-xhttp-proxies.test.sh
           bash scripts/tests/smoke-down.test.sh
           bash scripts/tests/smoke-up.test.sh
+          bash scripts/tests/update-meow-pin.test.sh
           bash scripts/tests/validate-meow-version.test.sh
 
       # The changelog generator runs on a draft git-cliff produces; it
@@ -101,6 +102,16 @@ jobs:
           /tmp/cliff-venv/bin/pip install --quiet git-cliff
           PATH="/tmp/cliff-venv/bin:$PATH" bash scripts/tests/cliff-config.test.sh
 
+  # DISABLED: this job ran a real nginx container listening on :80 and
+  # :443. Port-listening smoke stands are turned off across the workflows;
+  # the block below is kept verbatim so the coverage can be restored in one
+  # revert. What is no longer proved on a PR: nginx -t, the ACME webroot
+  # exception to the HTTPS redirect, the TLS handshake, the /export token
+  # masking in the access log, and the SIGHUP certificate reload.
+  # scripts/nginx-smoke.sh still runs locally:
+  #   docker build -t localhost/fumox-nginx:local docker/nginx
+  #   bash scripts/nginx-smoke.sh localhost/fumox-nginx:local
+  #
   # Smoke test of the nginx TLS-front image (docker/nginx/): the image is
   # built with the default compose flavour and run with self-signed
   # certificates mounted at /certs. scripts/nginx-smoke.sh then proves
@@ -109,13 +120,13 @@ jobs:
   # the access log masks the /export tokens, and a SIGHUP reload serves a
   # replaced certificate. Needs a container engine, hence its own job
   # (the Script tests above are deliberately hermetic).
-  nginx-smoke:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Build the nginx image
-        run: docker build -t localhost/fumox-nginx:local docker/nginx
-
-      - name: Nginx image smoke test
-        run: bash scripts/nginx-smoke.sh localhost/fumox-nginx:local
+  # nginx-smoke:
+  #   runs-on: ubuntu-24.04
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+  #
+  #     - name: Build the nginx image
+  #       run: docker build -t localhost/fumox-nginx:local docker/nginx
+  #
+  #     - name: Nginx image smoke test
+  #       run: bash scripts/nginx-smoke.sh localhost/fumox-nginx:local

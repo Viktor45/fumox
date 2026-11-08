@@ -1,33 +1,135 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
+# Dependabot version updates for Fumox.
+#
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Shape of the config: one grouped PR per ecosystem per run instead of one
+# PR per dependency, a raised PR limit so a group never blocks the next
+# batch, and a cooldown so a release that is retracted or superseded within
+# a few days never becomes a PR. Cooldown applies to version updates only —
+# security updates still arrive immediately.
+#
+# `prefix: build` + `include: scope` produces `build(deps): ...`, which is
+# what cliff.toml's commit_parsers drop from the changelog: a dependency
+# bump is not a change to the shipped image.
+#
+# What Dependabot CANNOT see, and why:
+#   - the meow-rs release pin (version + two archive sha256 sums). No
+#     ecosystem tracks a GitHub release tarball; .github/workflows/update-meow.yml
+#     proposes that bump instead.
+#   - the cargo-chef release pin and its two checksums in the Dockerfile.
+#     Same reason; bump CARGO_CHEF_VERSION and the sums by hand.
+#   - the `# syntax=docker/dockerfile:1@sha256:...` frontend directive. The
+#     docker parser only reads FROM lines. Bump it with
+#     `docker buildx imagetools inspect docker/dockerfile:1`.
+#   - dtolnay/rust-toolchain, ignored below: the pin tracks the `stable`
+#     BRANCH, not a release.
 
 version: 2
 updates:
+  # Every `uses:` in .github/workflows is pinned to a commit SHA with a
+  # version comment. Dependabot resolves the SHA to a tag itself and
+  # rewrites both the SHA and the comment, so the pins stay exact.
   - package-ecosystem: "github-actions"
-    directory: "/" # workflow files
+    directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - "dependencies"
+      - "github_actions"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    groups:
+      # One PR for the whole action set: the docker/* actions release
+      # together and bumping them apart only creates merge conflicts.
+      actions:
+        patterns:
+          - "*"
+    ignore:
+      # The pin is the head of the `stable` branch, which is AHEAD of the
+      # repository's only tag (v1). Dependabot resolves a SHA pin through
+      # tags, so a bump here would move the toolchain backwards. Bump it
+      # deliberately: gh api repos/dtolnay/rust-toolchain/branches/stable
+      #   --jq .commit.sha
+      - dependency-name: "dtolnay/rust-toolchain"
+
   # The workspace crates (fumox-core, fumox-server, fumox-probe) and
-  # Cargo.lock: one version-update PR per batch of related Rust
-  # dependencies.
+  # Cargo.lock. The manifests declare loose caret ranges ("1", "0.8"), so
+  # increase-if-necessary only touches Cargo.toml when a new version falls
+  # outside the declared range; everything else is a Cargo.lock refresh.
   - package-ecosystem: "cargo"
-    directory: "/" # the workspace root
+    directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 10
+    versioning-strategy: "increase-if-necessary"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    groups:
+      # One PR per batch of related Rust dependencies: a workspace-wide
+      # resolution is tested once by `cargo test --locked`, not once per
+      # crate.
+      rust:
+        patterns:
+          - "*"
+
   # The Dockerfiles pin their base images by digest; Dependabot tracks the
-  # tags those pins were taken from and proposes a digest bump when the tag
-  # moves. One entry per Dockerfile (the docker ecosystem does not recurse).
+  # tag the pin was taken from and proposes a digest bump when the tag
+  # moves. One entry per Dockerfile directory: the docker ecosystem does
+  # not recurse, and it only reads literal FROM lines (the rust base is
+  # inlined in the root Dockerfile for exactly this reason).
   - package-ecosystem: "docker"
-    directory: "/" # the root Dockerfile
+    directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    groups:
+      # The chef and runtime stages share bases; one PR keeps them in
+      # step instead of landing a debian bump twice.
+      root-images:
+        patterns:
+          - "*"
+
   - package-ecosystem: "docker"
     directory: "/docker/nginx"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+
   - package-ecosystem: "docker"
     directory: "/docker/meow"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "build"
+      include: "scope"

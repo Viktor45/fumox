@@ -3225,30 +3225,37 @@ async fn probe_screen_shows_heartbeat_meow_and_quarantine_queue() {
 
 /// The alive verdicts read the periods the daemon publishes in its own
 /// heartbeat, not this server's `[probe]` config copy. Seeded: beat
-/// interval 5 s, cycle 300 s. At the exact boundary
-/// `now - ts == 3 × interval` the daemon is still alive (`<=`), and a
-/// ~100 s old meow contact is alive against its 3 × cycle window — a
-/// threshold taken from the config copy could disagree with both.
+/// interval 60 s, cycle 300 s. The config copy would say 30 s and 60 s,
+/// so the two windows disagree on both cards: a beat 120 s old is alive
+/// against the reported 180 s window and dead against the config copy's
+/// 90 s one, a meow contact 300 s old is alive against the reported
+/// 900 s window and dead against the config copy's 180 s one.
+///
+/// The ages sit inside their windows rather than on their edges: the
+/// handler reads the wall clock when it renders, so a stamp seeded
+/// exactly at the edge reads dead as soon as the render crosses the
+/// next second.
 #[tokio::test]
 async fn probe_alive_verdicts_use_the_reported_periods() {
     let (_dir, state) = test_state(1000).await;
     let pool = state.pool.clone();
     let now = fumox_core::models::now_ts();
 
-    // Heartbeat age exactly 3 × the reported 5 s interval: the boundary
-    // itself counts as alive.
+    // Beat 120 s old against the reported 60 s period: alive inside the
+    // reported 3 × 60 s window.
     fumox_core::repo::meta_set(
         &pool,
         "probe_heartbeat",
         &format!(
-            r#"{{"ts":{ts},"pid":7,"version":"0.1.0","interval_secs":5,"cycle_interval_secs":300}}"#,
-            ts = now - 15
+            r#"{{"ts":{ts},"pid":7,"version":"0.1.0","interval_secs":60,"cycle_interval_secs":300}}"#,
+            ts = now - 120
         ),
     )
     .await
     .unwrap();
-    // Meow contact ~100 s old, well inside 3 × the reported 300 s cycle.
-    fumox_core::repo::meta_set(&pool, "meow_last_ok", &(now - 100).to_string())
+    // Meow contact 300 s old against the reported 300 s cycle: alive
+    // inside the reported 3 × 300 s window.
+    fumox_core::repo::meta_set(&pool, "meow_last_ok", &(now - 300).to_string())
         .await
         .unwrap();
 
@@ -3261,11 +3268,12 @@ async fn probe_alive_verdicts_use_the_reported_periods() {
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     // Exactly the two alive badges the page can carry: the daemon's and
-    // the meow contact's. The boundary age must not read as dead.
+    // the meow contact's. A threshold taken from the config copy would
+    // have called both of them dead.
     assert_eq!(
         html.matches(r#"<span class="badge alive">"#).count(),
         2,
-        "daemon and meow contact must both read alive at the boundary: {html}"
+        "daemon and meow contact must both read alive against the reported periods: {html}"
     );
     assert!(
         !html.contains(r#"<span class="badge error">"#),

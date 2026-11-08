@@ -192,6 +192,20 @@ are stamped when the batch is published.
   pipeline, the admin panel and the backfill instead of being read per
   request, and a database that arrives after the startup is picked up
   without a restart.
+- `[retention].removed_proxies_days` (default `0`): the server's
+  retention sweep now deletes the proxies that have sat in the `removed`
+  status for longer than the window, next to the journal purges it
+  already runs on the same cadence. The purge rides the same bounded
+  batches as the admin's *purge removed* button, so a large stale tier
+  cannot hold the WAL write lock the probe daemon needs.
+  The zero window is the opt-out, not a full wipe: unlike the two journal
+  windows, whose zero would empty the table and is clamped to one day
+  instead, `removed` stays reversible until the operator presses the
+  button — the behaviour every deployment had before this window existed.
+  The sweep stamps the deleted count into `ServerRetentionStamp.proxies`
+  (a serde default, so a stamp written before the field existed still
+  parses) and `/admin/probe` shows it in the server-sweep line and in a
+  keep-line once the window is on.
 
 ### Changed
 
@@ -830,6 +844,18 @@ are stamped when the batch is published.
   A restart does not end the admin sessions: the cookie carries its own
   expiry and the revocation epoch lives in the database. What ends them
   is a token rotation, or the logout button.
+
+- The journal and source screens page with a cursor instead of a page
+  number. The old walk counted rows and skipped that many, so a row that
+  arrived while the operator was reading moved under them, the same page
+  number showed a different set on every click, and the last page could
+  not be reached at all. The screens now seek to a position in the sort
+  key and take the rows after it: the next link carries the position as
+  one opaque token, the set under the reader does not move, and the cost
+  of a page does not grow with its number. The journal's index follows —
+  `idx_fetch_time_id` replaces `idx_fetch_time`, which was a strict
+  prefix of it, so the highest-write table does not carry two indexes
+  over the same column.
 
 ### Fixed
 
@@ -2674,6 +2700,30 @@ are stamped when the batch is published.
   script is a file now (`/admin/static/app.js`), every handler is
   delegated from there, and the policy allows scripts from the origin
   only: `script-src 'self'`. Inline styles stay for now.
+- The probe daemon could write the subscription. SQLite has no roles:
+  every process that opens the file may write every table, and the file
+  the daemon opens is the same one the ingest pipeline writes. A defect
+  in the daemon — or a daemon that was taken over — could rewrite the
+  hosts, the credentials and the sources. The daemon's connections now
+  run behind a SQLite authorizer whose rules are an allow-list: the
+  `proxies` table carries the subscription content, so only its health
+  columns are writable (`status`, `fail_count`, the check and ladder
+  timestamps, `latency_ms`), the daemon's own bookkeeping tables are
+  writable as before, and a table added later is denied by default
+  instead of silently becoming writable. The server keeps full write
+  access to the same file, and the schema is applied before the
+  restricted connections exist, so the guard never has to let a
+  migration through. A write the daemon must not perform belongs to the
+  server: the automatic purge of the `removed` proxies is the standing
+  example.
+- The template engine pulled in an unmaintained parser (RUSTSEC-2026-0374).
+  askama's `config` feature teaches the derive to read an `askama.toml`
+  — this project has none — and it brings the abandoned `basic-toml`
+  parser along, which was the only reason that crate sat in the tree.
+  The dependency is built with `default-features = false` and the
+  `derive`, `std` and `urlencode` features; `urlencode` stays, because
+  it is already in the default set and keeps the `|urlencode` filter
+  available to the templates.
 
 ### Docs
 

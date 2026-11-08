@@ -37,7 +37,13 @@
 # whatever the registry serves that day; bump the pin deliberately (it
 # prints the digest) together with security updates, e.g. via Dependabot's
 # docker ecosystem (.github/dependabot.yml).
-FROM nginx:stable-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
+#
+# The tag is the rolling `stable` channel, not a fixed nginx version, so
+# Dependabot sees it move and proposes the digest bump. `stable` is the
+# right channel for a TLS front: it is the series that gets the security
+# backports, and `mainline` would move the build semantics underneath the
+# image on every release.
+FROM nginx:stable-alpine@sha256:583b7f2fce1cdb8da5ad5c39ebd3c33b98b87d493190e548bdee1fa8c619c311
 
 ARG NGINX_FLAVOUR=compose
 

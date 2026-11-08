@@ -58,18 +58,22 @@ ARG MEOW_SHA256_ARM64=42f12dac9313a3c70bc4e8da7faca863a673d393d6e6f9274274a045d4
 # trixie-slim pinned by digest — the same multi-arch index the fumox image's
 # runtime stage pins, so the compose stack shares one distro snapshot. Bump
 # the pin deliberately, together with security updates.
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS fetch
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS fetch
 ARG MEOW_VERSION
 ARG MEOW_SHA256_AMD64
 ARG MEOW_SHA256_ARM64
 ARG TARGETARCH
-# apt pins, same discipline as the root Dockerfile: exact versions (identical
-# on linux/amd64 and linux/arm64), so a rebuild fetches the same helper
-# binaries; a superseded pin fails loudly instead of drifting.
+# The helper packages float with the mirror, same reasoning as the root
+# Dockerfile: the digest pins the base, the apt layer follows Debian, and
+# an exact-version pin would only turn every security update into a build
+# outage. The package SET is fixed, so both architectures fetch the same
+# helpers. What the fetch actually depends on is verified separately: the
+# release archive is checked against the pinned sha256 below, so the
+# version of curl cannot influence what lands in the image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates=20250419+deb13u1 \
-        curl=8.14.1-2+deb13u7 \
-        file=1:5.46-5 \
+        ca-certificates \
+        curl \
+        file \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
     # The target triple is part of the asset name: without it the download
@@ -111,10 +115,11 @@ RUN set -eux; \
 
 # ---- Stage 2: minimal runtime ------------------------------------------------
 # Same pinned digest as the fetch stage above.
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS runtime
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
+# The runtime packages float with the mirror, same reasoning as above.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates=20250419+deb13u1 \
-        tini=0.19.0-3+b8 \
+        ca-certificates \
+        tini \
     && rm -rf /var/lib/apt/lists/* \
     # The gid is shared with the fumox image (999), the uid is not: the
     # proxy kernel reads the generated config through the group and must

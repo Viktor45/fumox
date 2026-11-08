@@ -1,0 +1,127 @@
+# Proposes a bump of the pinned meow-rs release as a pull request.
+#
+# Dependabot cannot do this one: the pin is a version tag plus the two
+# sha256 sums of the release's musl archives, duplicated across
+# docker/meow/Dockerfile, docker-compose.build.yml and .env.example. No
+# Dependabot ecosystem tracks a GitHub release tarball, and a bump that
+# reaches only some of the copies leaves the local build and the published
+# image shipping different kernels. scripts/update-meow-pin.sh rewrites
+# all of them in one pass, and scripts/tests/update-meow-pin.test.sh pins
+# that behaviour (run by ci.yml).
+#
+# The script downloads both archives and proves they hash to the sums the
+# release publishes BEFORE anything is written. That verification is the
+# point of this workflow: docker-meow.yml is dispatch-only and docker.yml
+# runs on tags, so no workflow builds the meow image on a pull request and
+# a bad pin would otherwise merge unchallenged and break the next release.
+#
+# Nothing is published here. The PR is the deliverable; packaging the
+# wrapper image stays the deliberate, manual docker-meow.yml dispatch it
+# has always been, run after the bump is reviewed and merged.
+#
+# A branch that already exists is left alone: it means a PR for this
+# release is still open, or was closed on purpose. Neither is a reason to
+# push over it, so this workflow never force-pushes.
+
+name: Update meow-rs pin
+
+on:
+  schedule:
+    # Weekly, off the hour: GitHub delays scheduled workflows that land
+    # on a popular minute.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      meow_version:
+        description: "meow-rs tag to pin, e.g. v0.29.0 (default: the newest release)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# One run at a time: two runs racing would both try to create the same
+# bot/meow-<version> branch.
+concurrency:
+  group: update-meow-pin
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Update the pin
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Through the environment, not interpolated into the script:
+          # the value is operator input, and validate-meow-version.sh
+          # rejects anything outside the release-tag alphabet.
+          MEOW_INPUT: ${{ inputs.meow_version }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "$MEOW_INPUT" ]; then
+            args+=(--version "$MEOW_INPUT")
+          fi
+          scripts/update-meow-pin.sh "${args[@]}"
+
+      - name: Open the pull request
+        if: steps.pin.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.pin.outputs.version }}
+          PREVIOUS: ${{ steps.pin.outputs.previous_version }}
+          SHA256_AMD64: ${{ steps.pin.outputs.sha256_amd64 }}
+          SHA256_ARM64: ${{ steps.pin.outputs.sha256_arm64 }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          branch="bot/meow-${VERSION}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::notice::branch $branch already exists; leaving the existing pull request alone" >&2
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add docker/meow/Dockerfile docker-compose.build.yml .env.example USERGUIDE.md USERGUIDE.ru.md
+          # `build(deps):` is what cliff.toml drops from the changelog: a
+          # kernel bump is not a change to the shipped fumox image.
+          git commit -m "build(deps): bump meow-rs from ${PREVIOUS} to ${VERSION}"
+          git push -u origin "$branch"
+
+          release="https://github.com/meow-rs/meow-rs/releases/tag/${VERSION}"
+          # printf rather than a heredoc: the YAML block scalar indents
+          # every line, and a heredoc would carry that indentation into
+          # the PR body, where Markdown reads it as a code block.
+          body="$(printf '%s\n' \
+            "Bumps the pinned meow-rs kernel from \`${PREVIOUS}\` to \`${VERSION}\`." \
+            "" \
+            "Release: ${release}" \
+            "" \
+            "| archive | sha256 |" \
+            "| --- | --- |" \
+            "| \`meow-${VERSION}-x86_64-unknown-linux-musl.tar.gz\` | \`${SHA256_AMD64}\` |" \
+            "| \`meow-${VERSION}-aarch64-unknown-linux-musl.tar.gz\` | \`${SHA256_ARM64}\` |" \
+            "" \
+            "Both sums were read from the release's \`.sha256\` assets and checked against the downloaded archives before this branch was written, so the pin is the one upstream published and the archives are intact. The sum and the archive come from the same release: this review is still the trust boundary." \
+            "" \
+            "Updated in one pass: the \`ARG\` block and the header build example in \`docker/meow/Dockerfile\`, the compose build defaults, \`.env.example\`, and the documented default in both user guides." \
+            "" \
+            "Review notes:" \
+            "- Read the [release notes](${release}) for kernel behaviour changes." \
+            "- Nothing is published by this PR. After merging, dispatch \`docker-meow.yml\` with \`${VERSION}\` and the two sums above to package and attest the wrapper image." \
+          )"
+          gh pr create \
+            --base "$BASE" \
+            --head "$branch" \
+            --title "build(deps): bump meow-rs from ${PREVIOUS} to ${VERSION}" \
+            --body "$body"

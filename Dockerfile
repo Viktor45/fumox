@@ -1,8 +1,13 @@
-# Frontend pinned by digest, not by the floating `:1` tag: an unpinned
-# frontend is re-resolved on every build (14 MB image, ~19 s on a cold
-# cache here) and a future release could change build semantics under us.
-# Bump both parts together: `docker buildx imagetools inspect docker/dockerfile:<ver>`.
-# syntax=docker/dockerfile:1.27@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# Frontend pinned by digest: an unpinned frontend is re-resolved on every
+# build (14 MB image, ~19 s on a cold cache here) and a future release
+# could change build semantics under us. The digest is what pins it.
+#
+# The tag is the rolling `1` channel rather than a fixed patch version
+# (`1.27` was): a fixed version never moves, so no updater could ever
+# propose a bump and the frontend would freeze until a human noticed.
+# With `1`, Dependabot sees the tag move and proposes the digest bump.
+# Bump the digest: `docker buildx imagetools inspect docker/dockerfile:1`.
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 #
 # Fumox container image.
 #
@@ -64,17 +69,26 @@
 # ship for both.
 
 # Global build args (usable in the FROM lines below).
-# RUST_VERSION is a full image reference, pinned to the patch level on
-# purpose: a bare 1.98 tag floats, and any 1.98.x patch release rebuilds the
-# chef layer, which invalidates `cargo chef cook` and the whole type=gha
-# cache in CI (~7 min per architecture to recover). Bump it deliberately
-# when you want a toolchain update. `-slim-trixie` matches the runtime base
-# below (Debian 13) explicitly instead of relying on what the plain `-slim`
-# tag happens to alias to. The reference is additionally pinned by digest —
-# the multi-arch INDEX digest, so both CI architectures resolve to the same
-# bytes: a rebuild cannot silently pick up a rebuilt tag (bump the pin with
-# toolchain updates; Dependabot's docker ecosystem proposes the bump).
-ARG RUST_VERSION=1.98.1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7
+# RUST_VERSION is a full image reference: tag + digest.
+#
+# The DIGEST is what pins the bytes — the multi-arch INDEX digest, so both
+# CI architectures resolve to the same image and a rebuild cannot silently
+# pick up a rebuilt tag.
+#
+# The TAG is deliberately NOT pinned to the patch level (it was 1.98.1):
+# a fixed patch tag never moves, so Dependabot could never propose a bump
+# and the toolchain would stay frozen until a human noticed. `1.98` is the
+# floating minor channel of the MSRV declared in Cargo.toml
+# (rust-version = "1.98"), so a patch release moves the tag, Dependabot
+# proposes the digest bump, and the builder stays on the declared MSRV
+# series instead of drifting onto a newer toolchain. It does invalidate
+# the chef layer and the whole type=gha cache (~7 min per architecture to
+# recover) once per patch release — that is the price of the toolchain
+# actually getting its fixes, and it is a one-off per bump rather than a
+# permanent freeze.
+# `-slim-trixie` matches the runtime base below (Debian 13) explicitly
+# instead of relying on what the plain `-slim` tag happens to alias to.
+ARG RUST_VERSION=1.98-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7
 ARG BUILD_CACHE=layers
 ARG CARGO_CHEF_VERSION=v0.1.78
 
@@ -90,19 +104,26 @@ RUN case "${BUILD_CACHE}" in \
         layers|mounts) ;; \
         *) echo "invalid BUILD_CACHE='${BUILD_CACHE}': expected 'layers' or 'mounts'" >&2; exit 1 ;; \
     esac
-# The apt packages are pinned to exact versions (identical on linux/amd64
-# and linux/arm64, checked against this digest-pinned base), so a rebuild
-# compiles against the same system libraries the digest freezes. The mirror
-# is live: when Debian supersedes a pinned version with a security update,
-# the build fails loudly here — bump the pins deliberately, together with
-# the base digest above.
+# The apt packages are NOT pinned to exact versions. The base image is
+# pinned by digest, but `apt-get update` pulls the CURRENT Debian index on
+# top of it, so an exact-version pin was the only thing between the image
+# and the security updates Debian publishes for these packages — and it
+# bought nothing: the digest already freezes the base filesystem, while the
+# apt layer lands on whatever the mirror serves. Pinning the versions
+# turned every Debian security update into a build outage ("no such
+# version") that a human had to clear, and left the image on a known
+# vulnerable package until they did.
+# The package SET is still fixed (the same libraries on amd64 and arm64);
+# only the patch level floats with the mirror. The consequence is that the
+# image is not bit-for-bit reproducible across rebuilds: the base is frozen
+# by digest, the apt layer follows the mirror.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates=20250419+deb13u1 \
-        curl=8.14.1-2+deb13u7 \
-        libsqlite3-dev=3.46.1-7+deb13u2 \
-        pkg-config=1.8.1-4 \
-        xz-utils=5.8.1-1+deb13u2 \
-        mold=2.37.1+dfsg-1 \
+        ca-certificates \
+        curl \
+        libsqlite3-dev \
+        pkg-config \
+        xz-utils \
+        mold \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 ARG CARGO_CHEF_VERSION
@@ -184,13 +205,18 @@ FROM build-${BUILD_CACHE} AS builder
 # is pinned by digest like the chef stage above (the multi-arch index, so
 # both CI architectures resolve to the same bytes). Bump the pin together
 # with security updates; the meow image's stages pin the same digest.
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS runtime
-# apt pins, same discipline as the chef stage above: a rebuild installs
-# exactly these runtime libraries, and a superseded pin fails loudly.
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
+# The runtime libraries float with the mirror, same reasoning as the chef
+# stage above: the digest pins the base, the apt layer follows Debian.
+# libsqlite3-0 is the one library the build stage has to agree with: the
+# chef stage installs libsqlite3-dev, the runtime installs the shared
+# object. A patch-level drift between the two stages is harmless — the
+# SONAME (libsqlite3.so.0) is stable across the whole 3.x series, so the
+# runtime satisfies the link the build stage made.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates=20250419+deb13u1 \
-        libsqlite3-0=3.46.1-7+deb13u2 \
-        tini=0.19.0-3+b8 \
+        ca-certificates \
+        libsqlite3-0 \
+        tini \
     && rm -rf /var/lib/apt/lists/* \
     # The uid and the gid are pinned, not left to the allocator: the meow
     # image runs its user under the same gid (999) with another uid (998),

@@ -27,13 +27,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  quality:
-    uses: ./.github/workflows/ci.yml
-    with:
-      skip_image_builds: true
-
+  # No Rust quality gate: the wrapper packages a pinned, sha256-verified
+  # upstream binary, not Fumox source. Publishing stays gated by the build's
+  # hash check and the candidate/verify/promote attestation flow below.
   build:
-    needs: quality
     timeout-minutes: 30
     permissions:
       contents: read
@@ -127,7 +124,7 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: [quality, build]
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

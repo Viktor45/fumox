@@ -899,7 +899,7 @@ pub struct DatabaseConfig {
     /// comment edit and a DDL edit are indistinguishable from here, and a
     /// silent re-stamp hides a schema that fell behind the files. With
     /// the flag off the boot stops and names the version; the operator
-    /// then runs the `repair_migration_checksums` example, or turns the
+    /// then runs the `repair_migration_checksums` utility, or turns the
     /// flag on for that run.
     #[serde(default = "defaults::allow_checksum_repair")]
     pub allow_checksum_repair: bool,

@@ -326,7 +326,7 @@ async fn migrate_records_only_the_versions_it_repaired() {
 
 /// The repair is one-directional on purpose: a version the embedded set
 /// does not know about belongs to a newer Fumox, and its row is none of
-/// this build's business. The `repair_migration_checksums` example states
+/// this build's business. The `repair_migration_checksums` utility states
 /// that as a pre-flight check instead of re-stamping what it can and
 /// leaving `migrate()` to fail with `VersionMissing`.
 #[tokio::test]

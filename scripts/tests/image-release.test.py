@@ -109,9 +109,14 @@ class ImageReleaseTest(unittest.TestCase):
         for filename in ("docker.yml", "docker-meow.yml"):
             workflow = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
             jobs = workflow["jobs"]
-            self.assertEqual(jobs["quality"]["uses"], "./.github/workflows/ci.yml")
-            self.assertEqual(jobs["build"]["needs"], "quality")
-            self.assertIn("quality", jobs["merge"]["needs"])
+            if filename == "docker.yml":
+                self.assertEqual(jobs["quality"]["uses"], "./.github/workflows/ci.yml")
+                self.assertEqual(jobs["build"]["needs"], "quality")
+                self.assertIn("quality", jobs["merge"]["needs"])
+            else:
+                self.assertNotIn("quality", jobs)
+                self.assertNotIn("needs", jobs["build"])
+                self.assertEqual(jobs["merge"]["needs"], "build")
             steps = jobs["merge"]["steps"]
             runs = [step.get("run", "") for step in steps]
             candidate = runs.index("bash scripts/image-release.sh candidate")

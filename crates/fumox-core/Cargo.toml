@@ -5,9 +5,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# The repair utility lives in examples/ but is a bin, not an example.
+# Disable example auto-discovery so cargo does not also claim the file as
+# an example target, which warns about one source in two build targets.
+autoexamples = false
 
-# The migration-repair utility is a real binary target, not only an
-# example: integration tests run it through `CARGO_BIN_EXE_…`, and cargo
+# The migration-repair utility is a binary target whose source sits in
+# examples/: integration tests run it through `CARGO_BIN_EXE_…`, and cargo
 # builds bin targets before it compiles the tests that reference them, so
 # a targeted `cargo test --test migration_repair` needs no prior build.
 [[bin]]

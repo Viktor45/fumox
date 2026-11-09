@@ -127,7 +127,7 @@ max_connections = 8
 # файла, поэтому правку комментария и правку DDL он не различает, а тихая
 # пере-подпись скрывает схему, отставшую от файлов. С false сервер
 # останавливается и называет версию: запустите
-# `cargo run -p fumox-core --example repair_migration_checksums -- <путь к базе>`
+# `cargo run -p fumox-core --bin repair_migration_checksums -- <путь к базе>`
 # или включите флаг на один запуск.
 # Range: true | false, default false.
 # Re-stamp the checksum of an applied migration whose file changed after it
@@ -135,7 +135,7 @@ max_connections = 8
 # tell a comment edit from a DDL edit, and a silent re-stamp hides a schema
 # that fell behind the files. With false the server stops and names the
 # version: run
-# `cargo run -p fumox-core --example repair_migration_checksums -- <db path>`
+# `cargo run -p fumox-core --bin repair_migration_checksums -- <db path>`
 # or turn the flag on for that run.
 allow_checksum_repair = false
 

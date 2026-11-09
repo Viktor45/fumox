@@ -209,11 +209,15 @@ are stamped when the batch is published.
 
 ### Changed
 
-- CI is reusable by both image publishers and checks the releasing commit
+- CI is reusable by the Fumox image publisher and checks the releasing commit
   before building. Pull requests also build all three Docker images on
   amd64 and arm64 without starting containers. The quality gate includes
   the declared minimum Rust version, `cargo audit`, workflow validation,
   and pinned Python tooling maintained by Dependabot.
+- The meow wrapper workflow no longer runs that Rust gate: the image
+  packages a pinned, sha256-verified upstream binary rather than Fumox
+  source, so a dispatch builds straight away. Publishing is still gated by
+  the build's hash check and the candidate/verify/promote attestation flow.
 - Image publishers attest and verify a uniquely tagged candidate before
   moving public tags. Publishing and retention share a concurrency group;
   failed runs no longer delete potentially shared image digests.

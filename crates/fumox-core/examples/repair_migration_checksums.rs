@@ -28,7 +28,7 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run --example repair_migration_checksums -- /path/to/db.sqlite
+//! cargo run --bin repair_migration_checksums -- /path/to/db.sqlite
 //! ```
 //!
 //! The path defaults to the `DatabaseConfig::default()` location

@@ -524,7 +524,7 @@ fn checksum_mismatch_error(version: i64) -> crate::Error {
         "applied migration {version} differs from the file — a new migration file is needed. \
          sqlx: migration {version} was previously applied but has been modified. \
          If the edit was comment-only, re-stamp it with \
-         `cargo run -p fumox-core --example repair_migration_checksums -- <database path>`, \
+         `cargo run -p fumox-core --bin repair_migration_checksums -- <database path>`, \
          or start once with [database].allow_checksum_repair = true."
     ))
 }
@@ -708,7 +708,7 @@ async fn record_migration_repair(pool: &SqlitePool, versions: &[i64]) -> crate::
 /// embedded migrator ([`embedded_migrator`]) derives from the current file
 /// content. Used by [`migrate_with`] to recover from a checksum mismatch
 /// (comment-only edits to already-applied migration files), and exposed as
-/// a standalone helper so tests, the `repair_migration_checksums` example
+/// a standalone helper so tests, the `repair_migration_checksums` utility
 /// and ops scripts can trigger the same repair without booting the full
 /// server — one implementation, so the guards below cannot drift from the
 /// tool's copy. The migrator is always this build's embedded one: a caller

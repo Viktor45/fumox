@@ -14,6 +14,7 @@ struct ProfileRow {
     output_format: String,
     pipeline: Option<String>,
     countries: Option<String>,
+    include_unknown_country: i64,
     enabled: i64,
     created_at: i64,
     updated_at: i64,
@@ -48,10 +49,7 @@ impl TryFrom<ProfileRow> for Profile {
                 })
                 .transpose()?
                 .unwrap_or_default(),
-            // The geo-unknown flag lives in the model for now; the
-            // schema carries no column for it, so a row loads with the
-            // historical semantics.
-            include_unknown_country: false,
+            include_unknown_country: row.include_unknown_country != 0,
             enabled: row.enabled != 0,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -83,7 +81,7 @@ fn countries_to_text(list: &[String]) -> crate::Result<Option<String>> {
     Ok(Some(super::json_to_text(&value)?))
 }
 
-const COLUMNS: &str = "id, slug, access_token, name, output_format, pipeline, countries, enabled, created_at, updated_at";
+const COLUMNS: &str = "id, slug, access_token, name, output_format, pipeline, countries, include_unknown_country, enabled, created_at, updated_at";
 
 /// Insert a new profile. The caller assigns `id` (see [`crate::models::new_id`]).
 ///
@@ -100,7 +98,7 @@ where
     // sqlx 0.9 SqlSafeStr: {COLUMNS} is a compile-time constant; all data
     // flows through .bind().
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO profiles ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO profiles ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )))
     .bind(profile.id.clone())
     .bind(profile.slug.clone())
@@ -115,6 +113,7 @@ where
             .transpose()?,
     )
     .bind(countries_to_text(&profile.countries)?)
+    .bind(profile.include_unknown_country)
     .bind(profile.enabled)
     .bind(profile.created_at)
     .bind(profile.updated_at)
@@ -134,7 +133,7 @@ where
     let affected = sqlx::query(
         "UPDATE profiles SET
             slug = ?, access_token = ?, name = ?, output_format = ?, pipeline = ?,
-            countries = ?, enabled = ?, updated_at = ?
+            countries = ?, include_unknown_country = ?, enabled = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(&profile.slug)
@@ -149,6 +148,7 @@ where
             .transpose()?,
     )
     .bind(countries_to_text(&profile.countries)?)
+    .bind(profile.include_unknown_country)
     .bind(profile.enabled)
     .bind(profile.updated_at)
     .bind(&profile.id)
@@ -499,7 +499,7 @@ pub async fn dedup_stats(pool: &DbPool, profile_id: &str) -> crate::Result<Dedup
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Encoding, OutputFormat, Source};
+    use crate::models::{OutputFormat, Source};
     use crate::repo::sources as sources_repo;
     use crate::repo::tests::temp_pool;
 
@@ -521,28 +521,7 @@ mod tests {
     }
 
     fn sample_source(id: &str) -> Source {
-        let now = crate::models::now_ts();
-        Source {
-            id: id.to_string(),
-            slug: None,
-            access_token: None,
-            name: "s".into(),
-            url: "https://example.com".into(),
-            enabled: true,
-            encoding: Encoding::Auto,
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
-        }
+        Source::fixture(id, crate::models::now_ts())
     }
 
     #[tokio::test]
@@ -598,6 +577,74 @@ mod tests {
 
         assert!(delete(&pool, "prf1aaaaaaa").await.unwrap());
         assert!(get(&pool, "prf1aaaaaaa").await.unwrap().is_none());
+    }
+
+    /// A token that matches one profile's slug and another profile's id
+    /// must resolve to the slug owner, whatever the row order of the
+    /// table happens to be: `ORDER BY (slug = ?) DESC` in
+    /// [`resolve_token`] puts the slug match first. Both insertion orders
+    /// are exercised — with the id-owner inserted first, the id-owner
+    /// would win without that ORDER BY.
+    #[tokio::test]
+    async fn a_slug_matching_another_profiles_id_resolves_to_the_slug_owner() {
+        // prfAaaaaaaa owns the string "prfBaaaaaaa" as its slug,
+        // prfBaaaaaaa owns it as its id: the token hits both rows once,
+        // and the slug owner must win in either row order.
+        for insert_order in [
+            ["prfBaaaaaaa", "prfAaaaaaaa"], // id-owner first
+            ["prfAaaaaaaa", "prfBaaaaaaa"], // slug-owner first
+        ] {
+            let (_dir, pool) = temp_pool().await;
+            for id in insert_order {
+                let mut profile = sample_profile(id);
+                profile.slug = Some(if id == "prfAaaaaaaa" {
+                    "prfBaaaaaaa".into() // collides with the id-owner's id
+                } else {
+                    format!("slug-{id}")
+                });
+                create(&pool, &profile).await.unwrap();
+            }
+            assert_eq!(
+                resolve_token(&pool, "prfBaaaaaaa")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                "prfAaaaaaaa",
+                "the slug owner must win, whatever the row order ({insert_order:?})"
+            );
+        }
+    }
+
+    /// The geo-unknown flag survives the database round trip: a profile
+    /// written with it set reads it back, an update that does not touch
+    /// the flag keeps it, and an update that flips it writes through.
+    #[tokio::test]
+    async fn include_unknown_country_round_trips_through_the_database() {
+        let (_dir, pool) = temp_pool().await;
+        let mut profile = sample_profile("prf6fffffff");
+        profile.include_unknown_country = true;
+        create(&pool, &profile).await.unwrap();
+        let loaded = get(&pool, "prf6fffffff").await.unwrap().unwrap();
+        assert!(
+            loaded.include_unknown_country,
+            "the flag must survive create → get, not die at the row mapping"
+        );
+
+        // An update that does not touch the flag keeps it.
+        profile.name = "Renamed".into();
+        update(&pool, &profile).await.unwrap();
+        let loaded = get(&pool, "prf6fffffff").await.unwrap().unwrap();
+        assert!(
+            loaded.include_unknown_country,
+            "an update must not silently reset the stored flag"
+        );
+
+        // Flipping it off writes through as well.
+        profile.include_unknown_country = false;
+        update(&pool, &profile).await.unwrap();
+        let loaded = get(&pool, "prf6fffffff").await.unwrap().unwrap();
+        assert!(!loaded.include_unknown_country);
     }
 
     /// A row written by an older release holds the token in plain text.

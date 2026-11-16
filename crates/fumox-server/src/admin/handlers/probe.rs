@@ -24,6 +24,7 @@ use fumox_core::repo::proxies::QuarantineQueueRow;
 use fumox_core::repo::{meta_get_many, probe as probe_repo, proxies};
 use futures_util::Stream;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -423,6 +424,108 @@ impl ProbeTemplate {
 
 impl_i18n!(ProbeTemplate);
 
+/// The five `meta` stamps the overview renders, after parsing: the
+/// cards' view models plus the "exists but does not parse" flags the
+/// banner needs.
+struct ProbeMetaStamps {
+    heartbeat: Option<Heartbeat>,
+    heartbeat_unreadable: bool,
+    meow_last_ok: Option<MeowContact>,
+    meow_unreadable: bool,
+    meow_memory: Option<MeowMemory>,
+    last_rotation: Option<LastRotation>,
+    server_retention: Option<ServerRetentionStamp>,
+}
+
+/// Parse the meta stamps fetched by [`meta_get_many`] into their view
+/// models, with the staleness verdicts the cards render. The meow-contact
+/// verdict thresholds against the cycle period the daemon itself reported,
+/// so the heartbeat is parsed first and feeds that verdict.
+fn parse_probe_meta(
+    meta: &HashMap<String, String>,
+    now: i64,
+    probe: &ProbeConfig,
+) -> ProbeMetaStamps {
+    let heartbeat_record = meta_record::<HeartbeatRecord>(
+        probe_repo::meta::HEARTBEAT_KEY,
+        meta.get(probe_repo::meta::HEARTBEAT_KEY)
+            .map(String::as_str),
+    );
+    let heartbeat_unreadable = matches!(heartbeat_record, MetaRecord::Unreadable);
+    let heartbeat = match heartbeat_record {
+        MetaRecord::Value(hb) => Some(Heartbeat {
+            ts: hb.ts,
+            pid: hb.pid,
+            version: hb.version,
+            // Same threshold the banner applies, so the card and
+            // the banner can never call the same daemon alive in
+            // one place and dead in the other.
+            alive: now - hb.ts <= heartbeat_stale_after(probe, hb.interval_secs),
+            interval_secs: hb.interval_secs,
+            cycle_interval_secs: hb.cycle_interval_secs,
+        }),
+        MetaRecord::Missing | MetaRecord::Unreadable => None,
+    };
+
+    let meow_record = meta_ts_record(
+        probe_repo::meta::MEOW_LAST_OK_KEY,
+        meta.get(probe_repo::meta::MEOW_LAST_OK_KEY)
+            .map(String::as_str),
+    );
+    let meow_unreadable = matches!(meow_record, MetaRecord::Unreadable);
+    let meow_last_ok = match meow_record {
+        MetaRecord::Value(ts) => Some(MeowContact {
+            ts,
+            // Without this verdict a contact from last month rendered as
+            // a green "available". The cycle period the daemon reported in
+            // its own heartbeat outranks this server's config copy.
+            alive: now - ts
+                <= meow_stale_after(
+                    probe,
+                    heartbeat.as_ref().and_then(|hb| hb.cycle_interval_secs),
+                ),
+        }),
+        MetaRecord::Missing | MetaRecord::Unreadable => None,
+    };
+
+    let meow_memory = match meta_record::<MeowMemory>(
+        probe_repo::meta::MEOW_MEMORY_KEY,
+        meta.get(probe_repo::meta::MEOW_MEMORY_KEY)
+            .map(String::as_str),
+    ) {
+        MetaRecord::Value(mem) => Some(mem),
+        MetaRecord::Missing | MetaRecord::Unreadable => None,
+    };
+
+    let last_rotation = match meta_record::<LastRotation>(
+        probe_repo::meta::LAST_ROTATION_KEY,
+        meta.get(probe_repo::meta::LAST_ROTATION_KEY)
+            .map(String::as_str),
+    ) {
+        MetaRecord::Value(rot) => Some(rot),
+        MetaRecord::Missing | MetaRecord::Unreadable => None,
+    };
+
+    let server_retention = match meta_record::<ServerRetentionStamp>(
+        probe_repo::meta::SERVER_RETENTION_KEY,
+        meta.get(probe_repo::meta::SERVER_RETENTION_KEY)
+            .map(String::as_str),
+    ) {
+        MetaRecord::Value(stamp) => Some(stamp),
+        MetaRecord::Missing | MetaRecord::Unreadable => None,
+    };
+
+    ProbeMetaStamps {
+        heartbeat,
+        heartbeat_unreadable,
+        meow_last_ok,
+        meow_unreadable,
+        meow_memory,
+        last_rotation,
+        server_retention,
+    }
+}
+
 /// Probe overview: status aggregates, daemon heartbeat,
 /// meow-rs status and the quarantine queue. The read-only config tables
 /// live on the Settings page.
@@ -465,74 +568,16 @@ pub async fn probe_overview(State(state): State<AdminState>, headers: HeaderMap)
         Err(err) => return server_error(&state, &headers, "probe.journal_counts", &err),
     };
 
-    let heartbeat_record = meta_record::<HeartbeatRecord>(
-        probe_repo::meta::HEARTBEAT_KEY,
-        meta.get(probe_repo::meta::HEARTBEAT_KEY)
-            .map(String::as_str),
-    );
-    let heartbeat_unreadable = matches!(heartbeat_record, MetaRecord::Unreadable);
-    let heartbeat = match heartbeat_record {
-        MetaRecord::Value(hb) => Some(Heartbeat {
-            ts: hb.ts,
-            pid: hb.pid,
-            version: hb.version,
-            // Same threshold the banner applies, so the card and
-            // the banner can never call the same daemon alive in
-            // one place and dead in the other.
-            alive: now - hb.ts <= heartbeat_stale_after(&state.probe(), hb.interval_secs),
-            interval_secs: hb.interval_secs,
-            cycle_interval_secs: hb.cycle_interval_secs,
-        }),
-        MetaRecord::Missing | MetaRecord::Unreadable => None,
-    };
-
-    let meow_record = meta_ts_record(
-        probe_repo::meta::MEOW_LAST_OK_KEY,
-        meta.get(probe_repo::meta::MEOW_LAST_OK_KEY)
-            .map(String::as_str),
-    );
-    let meow_unreadable = matches!(meow_record, MetaRecord::Unreadable);
-    let meow_last_ok = match meow_record {
-        MetaRecord::Value(ts) => Some(MeowContact {
-            ts,
-            // Without this verdict a contact from last month rendered as
-            // a green "available". The cycle period the daemon reported in
-            // its own heartbeat outranks this server's config copy.
-            alive: now - ts
-                <= meow_stale_after(
-                    &state.probe(),
-                    heartbeat.as_ref().and_then(|hb| hb.cycle_interval_secs),
-                ),
-        }),
-        MetaRecord::Missing | MetaRecord::Unreadable => None,
-    };
-
-    let meow_memory = match meta_record::<MeowMemory>(
-        probe_repo::meta::MEOW_MEMORY_KEY,
-        meta.get(probe_repo::meta::MEOW_MEMORY_KEY)
-            .map(String::as_str),
-    ) {
-        MetaRecord::Value(mem) => Some(mem),
-        MetaRecord::Missing | MetaRecord::Unreadable => None,
-    };
-
-    let last_rotation = match meta_record::<LastRotation>(
-        probe_repo::meta::LAST_ROTATION_KEY,
-        meta.get(probe_repo::meta::LAST_ROTATION_KEY)
-            .map(String::as_str),
-    ) {
-        MetaRecord::Value(rot) => Some(rot),
-        MetaRecord::Missing | MetaRecord::Unreadable => None,
-    };
-
-    let server_retention = match meta_record::<ServerRetentionStamp>(
-        probe_repo::meta::SERVER_RETENTION_KEY,
-        meta.get(probe_repo::meta::SERVER_RETENTION_KEY)
-            .map(String::as_str),
-    ) {
-        MetaRecord::Value(stamp) => Some(stamp),
-        MetaRecord::Missing | MetaRecord::Unreadable => None,
-    };
+    let stamps = parse_probe_meta(&meta, now, &state.probe());
+    let ProbeMetaStamps {
+        heartbeat,
+        heartbeat_unreadable,
+        meow_last_ok,
+        meow_unreadable,
+        meow_memory,
+        last_rotation,
+        server_retention,
+    } = stamps;
 
     // True population count for the quarantine card. `proxy_counts` already
     // ran; pull the entry out instead of issuing another query. The status

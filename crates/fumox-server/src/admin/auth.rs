@@ -11,7 +11,7 @@
 use crate::admin::AdminState;
 use crate::admin::i18n::{self, Lang};
 use crate::admin::theme::{self, Theme};
-use crate::security::{ClientKeySource, client_key, ct_eq};
+use crate::security::{ClientKeySource, RateLimiter, client_key, ct_eq};
 use askama::Template;
 use axum::extract::{ConnectInfo, Form, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
@@ -31,19 +31,34 @@ pub const SESSION_COOKIE: &str = "fumox_session";
 /// the two limits cannot drift apart.
 pub(crate) const MAX_BODY_BYTES: usize = 1 << 20;
 
-/// Derive a 32-byte key from the admin token and a purpose tag.
-pub fn derive_key(purpose: &[u8], token: &str) -> Vec<u8> {
+/// Derive a 32-byte key from the admin token and a purpose tag. The fixed
+/// size is what lets [`mac_hex`] build its HMAC without a failure branch:
+/// a SHA-256 digest always fits the hash's block by zero-padding.
+pub fn derive_key(purpose: &[u8], token: &str) -> [u8; 32] {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(purpose);
     hasher.update(b"|");
     hasher.update(token.as_bytes());
-    hasher.finalize().to_vec()
+    hasher.finalize().into()
 }
 
-fn mac_hex(key: &[u8], message: &str) -> String {
+/// The HMAC block key. A key here is always a [`derive_key`] output — a
+/// SHA-256 digest, typed as `[u8; 32]` above — and RFC 2104 schedules a key
+/// shorter than the hash's block by zero-padding it, which is exactly what
+/// `new_from_slice` computes for keys of at most the block size. Building
+/// the block here constructs the MAC with the infallible [`KeyInit::new`]:
+/// HMAC is defined for any key length, so the `InvalidLength` error
+/// `new_from_slice` returns has no honest failure branch.
+fn block_key(key: &[u8; 32]) -> hmac::digest::Key<Hmac<Sha256>> {
+    let mut block = hmac::digest::Key::<Hmac<Sha256>>::default();
+    block[..key.len()].copy_from_slice(key);
+    block
+}
+
+fn mac_hex(key: &[u8; 32], message: &str) -> String {
     use std::fmt::Write as _;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac = Hmac::<Sha256>::new(&block_key(key));
     mac.update(message.as_bytes());
     let bytes = mac.finalize().into_bytes();
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -114,10 +129,10 @@ pub(crate) async fn revoke_all_sessions(pool: &fumox_core::db::DbPool) -> bool {
 /// `[admin].token`, and with it the stored session key, did not change.
 /// This also rejects pre-epoch cookies, which MACed the bare session key:
 /// they match no epoch, so upgrading costs one re-login.
-fn epoch_session_key(key: &[u8], epoch: u64) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+fn epoch_session_key(key: &[u8; 32], epoch: u64) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new(&block_key(key));
     mac.update(&epoch.to_be_bytes());
-    mac.finalize().into_bytes().to_vec()
+    mac.finalize().into_bytes().into()
 }
 
 /// Version tag of the current session-cookie format. The cookie value
@@ -129,7 +144,7 @@ const COOKIE_VERSION: &str = "v2";
 /// Mint a session cookie value: `{version}.{expires_unix}.{hmac}` over
 /// the epoch-mixed session key. `epoch` must be the value
 /// [`session_epoch`] returned for the request that issues the cookie.
-pub fn issue_session(key: &[u8], ttl: Duration, epoch: u64) -> String {
+pub fn issue_session(key: &[u8; 32], ttl: Duration, epoch: u64) -> String {
     let expires = fumox_core::models::now_ts() + ttl.as_secs() as i64;
     let epoch_key = epoch_session_key(key, epoch);
     format!(
@@ -155,7 +170,7 @@ pub fn issue_session(key: &[u8], ttl: Duration, epoch: u64) -> String {
 /// honoring it would hand a copied cookie back the lifetime the epoch
 /// exists to cut short. It never shipped in a published image, so no
 /// upgrade pays for that rejection.
-pub fn verify_session(key: &[u8], value: &str, epoch: u64) -> Option<i64> {
+pub fn verify_session(key: &[u8; 32], value: &str, epoch: u64) -> Option<i64> {
     let epoch_key = epoch_session_key(key, epoch);
     let (version, rest) = match value.strip_prefix(COOKIE_VERSION) {
         Some(rest) => (COOKIE_VERSION, rest.strip_prefix('.')?),
@@ -176,25 +191,15 @@ pub fn verify_session(key: &[u8], value: &str, epoch: u64) -> Option<i64> {
 
 /// CSRF token bound to the session cookie value; deterministic, so no
 /// server-side storage is needed.
-pub fn csrf_token(csrf_key: &[u8], session_value: &str) -> String {
+pub fn csrf_token(csrf_key: &[u8; 32], session_value: &str) -> String {
     mac_hex(csrf_key, session_value)
 }
 
-/// Extract the session cookie from `Cookie` headers.
+/// Extract the session cookie from `Cookie` headers: the one cookie
+/// scanner of the panel ([`super::cookie_value`]) read for the session
+/// name.
 pub fn session_cookie_value(headers: &axum::http::HeaderMap) -> Option<String> {
-    for cookie_header in headers.get_all(header::COOKIE).iter() {
-        let Ok(text) = cookie_header.to_str() else {
-            continue;
-        };
-        for pair in text.split(';') {
-            if let Some((name, value)) = pair.trim().split_once('=')
-                && name.trim() == SESSION_COOKIE
-            {
-                return Some(value.trim().to_string());
-            }
-        }
-    }
-    None
+    super::cookie_value(headers, SESSION_COOKIE).map(str::to_string)
 }
 
 /// `Set-Cookie` value of the session cookie: the attributes shared by the
@@ -321,8 +326,90 @@ fn cross_site_context(method: &Method, headers: &HeaderMap) -> bool {
     }
 }
 
-/// Outermost admin middleware: per-IP rate limiting. Login gets the hard
-/// limit, everything else the soft one.
+/// The per-IP key the request is attributed to, plus the warning of a key
+/// that degraded to the peer despite a declared header and a trusted proxy
+/// ([`ClientKeySource::PeerFallback`]): everything behind that peer lands
+/// in one bucket, so say so once per window — the condition holds for
+/// every request the window covers.
+fn client_ip(state: &AdminState, addr: SocketAddr, headers: &HeaderMap) -> String {
+    let (key, source) = client_key(addr, headers, &state.trusted_cidrs, state.trusted_header);
+    let ip = key.to_string();
+    if source == ClientKeySource::PeerFallback {
+        crate::security::warn_shared_peer_bucket(&ip, state.admin_limiter.window());
+    }
+    ip
+}
+
+/// Positive cross-site evidence is rejected *without counting* against any
+/// window (see [`rate_limit`] for why): the answer is the localized 403 and
+/// the warn is the audit line. `None` is "same-origin, or the signals
+/// cannot establish cross-site — process and count the request".
+fn cross_site_rejection(
+    state: &AdminState,
+    req: &Request,
+    ip: &str,
+    path: &str,
+) -> Option<Response> {
+    if !cross_site_context(req.method(), req.headers()) {
+        return None;
+    }
+    tracing::warn!(
+        ip = %ip,
+        path = %path,
+        "cross-site admin request rejected without counting"
+    );
+    let lang = state.locales.lang_from_headers(req.headers());
+    Some(plain(StatusCode::FORBIDDEN, lang.t("err.cross_site")))
+}
+
+/// The 429 of an exhausted window: the localized text plus the window's
+/// remaining seconds in `Retry-After`, so a well-behaved client waits
+/// instead of burning the quota again on the next attempt.
+fn rate_limited_response(lang: &Lang, retry_after: u64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!("{}\n", lang.t("err.rate_limited")),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, retry_after.into());
+    response
+}
+
+/// The login-window accounting of the response the handler produced. The
+/// window counts *failed* attempts: a successful login is not a guess, and
+/// it must not cost the operator a slot in the brute-force window — the
+/// slot is given back, the window is not reset, so the failures that filled
+/// it stay counted and a successful login between two wrong guesses does
+/// not hand the attacker a fresh window. A failed login is the panel's
+/// primary brute-force audit signal, attributed here, in the one layer that
+/// holds the per-IP key, so a grep over the event yields exactly one record
+/// per attempt (the success line is the handler's, with the same key; the
+/// 429 warn covers only the exhausted-window case).
+async fn attribute_login_attempt(
+    limiter: &RateLimiter,
+    ip: &str,
+    is_login: bool,
+    method: &Method,
+    path: &str,
+    status: StatusCode,
+) {
+    if !is_login {
+        return;
+    }
+    if status == StatusCode::UNPROCESSABLE_ENTITY {
+        tracing::warn!(ip = %ip, method = %method, path = %path, "failed admin login attempt");
+    } else {
+        limiter.refund(ip).await;
+    }
+}
+
+/// Per-IP rate limiting, layered under the host gate: the outermost admin
+/// middleware is `enforce_allowed_hosts` (`mod.rs`), which rejects a Host
+/// outside the allowlist before it can burn a rate-limit window. Login
+/// gets the hard limit, everything else the soft one.
 ///
 /// The login window counts failed attempts: a successful login returns
 /// the slot it took, so the operator's own sign-in never eats the
@@ -353,28 +440,9 @@ pub async fn rate_limit(
     if path.starts_with("/admin/static/") {
         return next.run(req).await;
     }
-    let (key, source) = client_key(
-        addr,
-        req.headers(),
-        &state.trusted_cidrs,
-        state.trusted_header,
-    );
-    let ip = key.to_string();
-    // A key that degraded to the peer despite a declared header and a
-    // trusted proxy ([`ClientKeySource::PeerFallback`]) puts everything
-    // behind that peer into one bucket: say so once per window, the
-    // condition holds for every request the window covers.
-    if source == ClientKeySource::PeerFallback {
-        crate::security::warn_shared_peer_bucket(&ip, state.admin_limiter.window());
-    }
-    if cross_site_context(req.method(), req.headers()) {
-        tracing::warn!(
-            ip = %ip,
-            path = %path,
-            "cross-site admin request rejected without counting"
-        );
-        let lang = state.locales.lang_from_headers(req.headers());
-        return plain(StatusCode::FORBIDDEN, lang.t("err.cross_site"));
+    let ip = client_ip(&state, addr, req.headers());
+    if let Some(rejection) = cross_site_rejection(&state, &req, &ip, path) {
+        return rejection;
     }
     let is_login = req.method() == Method::POST && path == "/admin/login";
     let limiter = if is_login {
@@ -384,43 +452,14 @@ pub async fn rate_limit(
     };
     if let Err(retry_after) = limiter.check(&ip).await {
         tracing::warn!(ip = %ip, path = %path, "admin rate limit exceeded");
-        let lang = state.locales.lang_from_headers(req.headers());
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            format!("{}\n", lang.t("err.rate_limited")),
-        )
-            .into_response();
-        // The window's remaining seconds, so a well-behaved client waits
-        // instead of burning the quota again on the next attempt.
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, retry_after.into());
-        return response;
+        return rate_limited_response(&state.locales.lang_from_headers(req.headers()), retry_after);
     }
-    // The failed-login attribution below runs after `req` is consumed;
-    // keep owned copies of the request identity for it.
+    // The failed-login attribution runs after `req` is consumed; keep
+    // owned copies of the request identity for it.
     let method = req.method().clone();
     let path = path.to_owned();
     let response = next.run(req).await;
-    // The login window counts *failed* attempts: a successful login is
-    // not a guess, and it must not cost the operator a slot in the
-    // brute-force window. The slot is given back, the window is not
-    // reset: the failures that filled it stay counted, so a successful
-    // login between two wrong guesses does not hand the attacker a fresh
-    // window.
-    if is_login && response.status() != StatusCode::UNPROCESSABLE_ENTITY {
-        limiter.refund(&ip).await;
-    }
-    // A failed login is the panel's primary brute-force audit signal, but
-    // the handler stays out of the failure log: the attempt is attributed
-    // here, in the one layer that holds the per-IP key, so a grep over the
-    // event yields exactly one record per attempt (the success line is the
-    // handler's, with the same key). The 429 warn above only covers the
-    // exhausted-window case.
-    if is_login && response.status() == StatusCode::UNPROCESSABLE_ENTITY {
-        tracing::warn!(ip = %ip, method = %method, path = %path, "failed admin login attempt");
-    }
+    attribute_login_attempt(&limiter, &ip, is_login, &method, &path, response.status()).await;
     response
 }
 
@@ -446,9 +485,12 @@ pub async fn require_auth(State(state): State<AdminState>, req: Request, next: N
                     error = %err,
                     "cannot read the session epoch; rejecting the request"
                 );
+                // A user-facing answer, so from the catalog like every
+                // other panel text.
+                let lang = state.locales.lang_from_headers(req.headers());
                 return plain(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "the session revocation state is unavailable, try again\n",
+                    lang.t("err.epoch_unavailable"),
                 );
             }
         },
@@ -698,7 +740,7 @@ pub async fn login_submit(
                 tracing::error!(error = %err, "cannot read the session epoch; refusing the login");
                 return plain(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "the session revocation state is unavailable, try again\n",
+                    lang.t("err.epoch_unavailable"),
                 );
             }
         };
@@ -807,6 +849,7 @@ fn plain(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::{cookie_from, request};
     use tower::ServiceExt;
 
     const TOKEN: &str = "test-admin-token";
@@ -866,52 +909,14 @@ mod tests {
         );
     }
 
-    /// f18 end to end: logout bumps the persisted epoch, so the cookie the
-    /// browser held (a stolen copy included) stops authenticating, and a
-    /// fresh login under the new epoch works again.
-    /// Build a request with the `ConnectInfo` extension the rate limiter
-    /// extracts; a real listener attaches it via
-    /// `into_make_service_with_connect_info`.
-    fn request(
-        method: &str,
-        uri: &str,
-        body: &str,
-        cookie: Option<&str>,
-    ) -> axum::extract::Request {
-        let mut builder = axum::http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .extension(ConnectInfo::<SocketAddr>(
-                "127.0.0.1:41000".parse().unwrap(),
-            ));
-        if let Some(cookie) = cookie {
-            builder = builder.header(header::COOKIE, cookie);
-        }
-        builder
-            .body(axum::body::Body::from(body.to_string()))
-            .unwrap()
-    }
-
-    /// The `name=value` pair of the session `Set-Cookie` header.
-    fn cookie_from(response: &axum::response::Response) -> String {
-        response
-            .headers()
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    }
-
     /// The bare value of a `name=value` cookie pair.
     fn cookie_value(pair: &str) -> &str {
         pair.split_once('=').unwrap().1
     }
 
+    /// f18 end to end: logout bumps the persisted epoch, so the cookie the
+    /// browser held (a stolen copy included) stops authenticating, and a
+    /// fresh login under the new epoch works again.
     #[tokio::test]
     async fn logout_bumps_the_epoch_and_revokes_the_session() {
         let (_dir, state) = crate::admin::test_admin_state(
@@ -1693,24 +1698,13 @@ mod tests {
         .await;
         let app = crate::admin::router(state);
 
-        // A writer funneling the subscriber's output into a shared buffer
-        // (same trick as `fumox_core::logging` and the scheduler tests).
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let make_writer = captured.clone();
+        // The shared test writer funneling the subscriber's output into a
+        // buffer the assertions read back (`fumox_core::logging::capture`).
+        let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
-            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .with_writer(make_writer)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
         crate::test_support::stabilize_callsite_interests();
@@ -1840,6 +1834,80 @@ mod tests {
         );
         assert_eq!(session_cookie_value(&headers).as_deref(), Some("abc.def"));
         assert_eq!(session_cookie_value(&axum::http::HeaderMap::new()), None);
+    }
+
+    /// The 503 an unreadable revocation epoch produces is a user-facing
+    /// answer, so it comes from the message catalog like every other panel
+    /// text: the body carries the localized sentence, not the bare key a
+    /// typo would render — on both paths that answer it, the session check
+    /// and the login mint.
+    #[tokio::test]
+    async fn an_unreadable_epoch_answers_the_localized_503() {
+        use http_body_util::BodyExt;
+
+        let (_dir, state) = crate::admin::test_admin_state(
+            fumox_core::config::AdminConfig {
+                enabled: true,
+                token: TOKEN.to_string(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+        let app = crate::admin::router(state.clone());
+
+        // Mint a session while the database is still alive.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = cookie_from(&response);
+
+        state.pool.close().await;
+
+        // The session check cannot read the epoch.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/admin",
+                "",
+                Some(&format!("{cookie}; fumox_lang=en")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("the session revocation state is unavailable"),
+            "the 503 body must come from the message catalog: {body:.400}"
+        );
+
+        // A correct token cannot read the epoch to mint a session under.
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/login",
+                &format!("token={TOKEN}"),
+                Some("fumox_lang=en"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("the session revocation state is unavailable"),
+            "the 503 body must come from the message catalog: {body:.400}"
+        );
     }
 
     #[test]

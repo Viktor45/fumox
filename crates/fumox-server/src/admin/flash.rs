@@ -26,6 +26,37 @@ pub(crate) const FLASH_HEADER: &str = "x-fumox-flash";
 /// `error`).
 pub(crate) const FLASH_LEVEL_HEADER: &str = "x-fumox-flash-level";
 
+/// The level of a pending toast. The client renders only two shapes
+/// (`error` gets the error style, everything else the default one), so
+/// the store keeps the level as this enum instead of a free-form string:
+/// a producer's typo cannot park a level the payload cannot name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlashLevel {
+    Ok,
+    Error,
+}
+
+impl FlashLevel {
+    /// The level a `FLASH_LEVEL_HEADER` value names. `error` is the only
+    /// word the client tells from the rest, so anything else — a missing
+    /// header included — is the default toast.
+    pub fn from_header(value: &str) -> Self {
+        if value == "error" {
+            Self::Error
+        } else {
+            Self::Ok
+        }
+    }
+
+    /// The wire word the `/admin/flash` payload carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// How many pending messages the store keeps. The panel has a handful of
 /// operators, one message each; the ceiling only bounds a leak.
 const CAPACITY: usize = 64;
@@ -47,7 +78,7 @@ pub struct FlashStore {
 #[derive(Default)]
 struct Inner {
     /// `(message, level, stored at)` per session.
-    entries: HashMap<String, (String, String, Instant)>,
+    entries: HashMap<String, (String, FlashLevel, Instant)>,
     /// The sessions in insertion order, oldest first.
     order: VecDeque<String>,
 }
@@ -63,7 +94,7 @@ impl FlashStore {
     /// The message is percent-encoded, the same shape the `HX-Trigger`
     /// header carries: a response header is Latin-1 on the wire, so raw
     /// UTF-8 would arrive as mojibake.
-    pub fn put(&self, session: &str, message: String, level: String) {
+    pub fn put(&self, session: &str, message: String, level: FlashLevel) {
         if session.is_empty() {
             return;
         }
@@ -85,7 +116,7 @@ impl FlashStore {
 
     /// Take the pending message of the session, if any. The message is
     /// handed out once: the second request finds nothing.
-    pub fn take(&self, session: &str) -> Option<(String, String)> {
+    pub fn take(&self, session: &str) -> Option<(String, FlashLevel)> {
         let mut inner = self.lock();
         inner.expire();
         let (message, level, _) = inner.entries.remove(session)?;
@@ -120,10 +151,10 @@ mod tests {
     #[test]
     fn a_message_is_handed_out_once() {
         let store = FlashStore::new();
-        store.put("s1", "hello".into(), "ok".into());
+        store.put("s1", "hello".into(), FlashLevel::Ok);
         assert_eq!(
             store.take("s1"),
-            Some(("hello".to_string(), "ok".to_string()))
+            Some(("hello".to_string(), FlashLevel::Ok))
         );
         assert_eq!(store.take("s1"), None, "the message was replayed");
     }
@@ -131,8 +162,8 @@ mod tests {
     #[test]
     fn the_messages_of_two_sessions_do_not_mix() {
         let store = FlashStore::new();
-        store.put("s1", "one".into(), "ok".into());
-        store.put("s2", "two".into(), "error".into());
+        store.put("s1", "one".into(), FlashLevel::Ok);
+        store.put("s2", "two".into(), FlashLevel::Error);
         assert_eq!(store.take("s2").map(|(m, _)| m), Some("two".to_string()));
         assert_eq!(store.take("s1").map(|(m, _)| m), Some("one".to_string()));
         assert_eq!(store.take("s1"), None);
@@ -141,7 +172,7 @@ mod tests {
     #[test]
     fn a_message_without_a_session_is_dropped() {
         let store = FlashStore::new();
-        store.put("", "hello".into(), "ok".into());
+        store.put("", "hello".into(), FlashLevel::Ok);
         assert_eq!(store.take(""), None);
     }
 
@@ -149,10 +180,20 @@ mod tests {
     fn the_store_stays_bounded() {
         let store = FlashStore::new();
         for idx in 0..(CAPACITY * 2) {
-            store.put(&format!("s{idx}"), "m".into(), "ok".into());
+            store.put(&format!("s{idx}"), "m".into(), FlashLevel::Ok);
         }
         // The oldest entries are gone, the newest are still there.
         assert_eq!(store.take("s0"), None);
         assert!(store.take(&format!("s{}", CAPACITY * 2 - 1)).is_some());
+    }
+
+    #[test]
+    fn an_unknown_level_header_is_the_default_toast() {
+        assert_eq!(FlashLevel::from_header("error"), FlashLevel::Error);
+        assert_eq!(FlashLevel::from_header("ok"), FlashLevel::Ok);
+        assert_eq!(FlashLevel::from_header(""), FlashLevel::Ok);
+        assert_eq!(FlashLevel::from_header("bogus"), FlashLevel::Ok);
+        assert_eq!(FlashLevel::Ok.as_str(), "ok");
+        assert_eq!(FlashLevel::Error.as_str(), "error");
     }
 }

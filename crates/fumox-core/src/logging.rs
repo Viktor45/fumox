@@ -45,39 +45,27 @@ fn build_filter(rust_log: Option<&str>, level: LogLevel) -> EnvFilter {
 }
 
 fn fallback_filter(level: LogLevel) -> EnvFilter {
-    EnvFilter::new(level.as_str())
-        .add_directive("sqlx::query=warn".parse().expect("valid directive"))
+    // The silencer is spelled straight into the directive list instead of
+    // `add_directive(..parse()..)`: both parts are known-valid constants
+    // (`LogLevel::as_str` is a closed set), so there is no parse `Result`
+    // left to panic on. `EnvFilter::new` parses comma-separated directives
+    // in order, and the config level (no target) never collides with the
+    // `sqlx::query` target, so the resulting directive set is identical.
+    EnvFilter::new(format!("{},sqlx::query=warn", level.as_str()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    /// A writer funneling the subscriber's output into a shared buffer,
-    /// so a test can tell whether an event made it through the filter.
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
 
     /// Reports whether `event` passes `filter`, checked through a real
     /// subscriber: `EnvFilter` has no public "would this event pass?" probe.
     fn event_passes(filter: EnvFilter, event: fn()) -> bool {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let make_writer = Arc::clone(&captured);
+        let (make_writer, captured) = capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_ansi(false)
-            .with_writer(move || Captured(Arc::clone(&make_writer)))
+            .with_writer(make_writer)
             .finish();
         tracing::subscriber::with_default(subscriber, event);
         !captured.lock().unwrap().is_empty()
@@ -147,5 +135,51 @@ mod tests {
             );
             assert!(!event_passes(filter(), event_sqlx_query_debug));
         }
+    }
+}
+
+/// Test-support helper for the log-capturing test modules of the workspace
+/// crates (this file's filter tests, `fumox-core::db`, `fumox-core::config_writer`,
+/// and the server's admin, scheduler, pipeline and export tests): a writer
+/// funneling a tracing subscriber's output into a shared
+/// `Arc<Mutex<Vec<u8>>>` buffer the test reads the captured lines back
+/// from. Deliberately compiled outside `cfg(test)`: the sibling crates'
+/// test builds link fumox-core as a plain dependency, where this crate's
+/// own `cfg(test)` never applies (the same reasoning as
+/// [`crate::db::tempdir_lite`]). No production call sites.
+pub mod capture {
+    use std::sync::{Arc, Mutex};
+
+    /// The writer half of [`captured_writer`]: appends everything the
+    /// subscriber emits into the shared buffer. Constructed only by
+    /// [`captured_writer`]; the field is private.
+    pub struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            // Poisoned only if a writer panicked mid-write; the captured
+            // bytes stay valid, so recover the lock (the workspace-wide
+            // discipline) rather than failing the write.
+            let mut captured = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            captured.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A fresh shared buffer plus the make-writer closure for
+    /// `tracing_subscriber::fmt().with_writer(..)`: the buffer is what the
+    /// test reads the captured lines back from, the closure hands the
+    /// subscriber a writer appending into it.
+    pub fn captured_writer() -> (impl Fn() -> CapturedWriter, Arc<Mutex<Vec<u8>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&captured);
+        (move || CapturedWriter(Arc::clone(&writer)), captured)
     }
 }

@@ -140,22 +140,21 @@ fn canonicalize_host_str(raw: &str) -> Result<String, MalformedHost> {
     if let Some(rest) = raw.strip_prefix('[') {
         return bracketed_ipv6(rest);
     }
-    // One count, three branches: no colon (a name or an IPv4 literal),
-    // exactly one colon (a `host:port` authority), more (a bare IPv6).
-    match raw.matches(':').count() {
+    // One `split_once`, three shapes: no colon (a name or an IPv4 literal),
+    // a remainder free of colons (the single-colon `host:port` authority),
+    // a remainder still carrying colons (a bare IPv6).
+    match raw.split_once(':') {
         // A FQDN may spell a trailing dot; stripping it gives the name one
         // canonical form, so the allowlist match does not depend on the
         // resolver style the client used.
-        0 => Ok(strip_trailing_dot(&raw.to_ascii_lowercase()).to_owned()),
-        // `rsplit_once` handles exactly this single-colon form (a bare
-        // IPv6 with its many colons never reaches this branch).
-        1 => {
-            let (host, _) = raw.rsplit_once(':').expect("one colon always splits");
+        None => Ok(strip_trailing_dot(&raw.to_ascii_lowercase()).to_owned()),
+        // Exactly one colon: a `host:port` authority.
+        Some((host, port)) if !port.contains(':') => {
             Ok(strip_trailing_dot(&host.to_ascii_lowercase()).to_owned())
         }
         // Bare IPv6, wrap in brackets so the canonical form matches
         // `[2001:db8::1]`.
-        _ => Ok(format!("[{}]", raw.to_ascii_lowercase())),
+        Some(_) => Ok(format!("[{}]", raw.to_ascii_lowercase())),
     }
 }
 
@@ -556,7 +555,8 @@ mod tests {
     /// canonical form matches the bracketed-input shape (`[x]`): a bare
     /// IPv6 address with a trailing port (`2001:db8::1:8080`) must stay
     /// whole inside brackets — it is not a `host:port` pair, only the
-    /// single-colon form is (`rsplit_once` handles exactly that one).
+    /// single-colon form is (the branch whose remainder after the first
+    /// colon carries no colon).
     #[test]
     fn canonicalize_host_str_handles_bare_ipv6() {
         assert_eq!(canon("2001:db8::1"), "[2001:db8::1]");

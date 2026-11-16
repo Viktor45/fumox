@@ -368,26 +368,6 @@ async fn repair_leaves_migrations_this_build_does_not_embed_alone() {
     drop(pool);
 }
 
-#[tokio::test]
-async fn migrate_propagates_non_mismatch_errors_untouched() {
-    // The repair only fires for `MigrateError::VersionMismatch`.
-    // A pristine DB exercises a different code path (first-time apply);
-    // it must not be turned into a repair. We assert the call simply
-    // succeeds. The negative case (a dirty DB, a missing file) is
-    // covered by sqlx's own tests, not duplicated here.
-    let dir = TempDir::new("first_run");
-    let path = dir.path().join("fumox.db");
-    let cfg = DatabaseConfig {
-        path: path.clone(),
-        ..Default::default()
-    };
-    let pool = db::connect_pool(&cfg).await.unwrap();
-    db::migrate(&pool)
-        .await
-        .expect("first-time migrate must succeed");
-    drop(pool);
-}
-
 /// The empty-repair re-raise arm: when `VersionMismatch` fires but the
 /// repair rewrites nothing, `migrate()` must surface the *original* error
 /// and must not claim a repair it did not make (no

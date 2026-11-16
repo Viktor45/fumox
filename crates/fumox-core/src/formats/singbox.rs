@@ -27,22 +27,7 @@ use serde_json::{Map, Value};
 /// apart. A caller that already holds an entry can simply ask the mapping
 /// itself — a `None` means "no sing-box counterpart".
 pub fn is_supported(scheme: Scheme) -> bool {
-    entry_to_outbound_named(&bare_entry(scheme), "").is_some()
-}
-
-/// An entry that carries nothing but a scheme, for the support question.
-fn bare_entry(scheme: Scheme) -> ProxyEntry {
-    ProxyEntry {
-        scheme,
-        name: String::new(),
-        host: String::new(),
-        port: 0,
-        credential: String::new(),
-        params: Vec::new(),
-        raw_path: String::new(),
-        raw_line: String::new(),
-        canonical: None,
-    }
+    entry_to_outbound_named(&ProxyEntry::scheme_only(scheme), "").is_some()
 }
 
 /// Map one entry onto a sing-box outbound using its own name as the tag.
@@ -62,149 +47,12 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
     let blocks = Blocks::of(entry);
 
     match entry.scheme {
-        Scheme::Vless => {
-            m.insert("type".into(), Value::String("vless".into()));
-            m.insert("server".into(), Value::String(entry.host.clone()));
-            m.insert("server_port".into(), num(entry.port));
-            m.insert("uuid".into(), Value::String(entry.credential.clone()));
-            if let Some(flow) = super::param_value(entry, "flow") {
-                m.insert("flow".into(), Value::String(flow.to_string()));
-            }
-            let reality = crate::params::is_reality(entry, &blocks);
-            let tls = crate::params::wants_tls(entry, &blocks);
-            if let Some(tls) = tls_object(entry, &blocks, tls, reality) {
-                m.insert("tls".into(), tls);
-            }
-            if let Some(transport) = transport_object(entry, "type", &blocks) {
-                m.insert("transport".into(), transport);
-            }
-        }
-        Scheme::Vmess => {
-            m.insert("type".into(), Value::String("vmess".into()));
-            m.insert("server".into(), Value::String(entry.host.clone()));
-            m.insert("server_port".into(), num(entry.port));
-            m.insert("uuid".into(), Value::String(entry.credential.clone()));
-            // vmess JSON spells the cipher `scy` and the alter id `aid`, Clash
-            // YAML `cipher`/`alterId`; read both or the proxy silently defaults.
-            let cipher = super::param_value(entry, "scy")
-                .or_else(|| super::param_value(entry, "cipher"))
-                .unwrap_or_else(|| "auto".into());
-            m.insert("security".into(), Value::String(cipher));
-            // One shared reader, one type (u64, a negative value is 0) for
-            // both encoders.
-            m.insert("alter_id".into(), unsigned(super::alter_id(entry)));
-            // vmess JSON spells TLS as `tls: "tls"`; Clash input uses the
-            // boolean `tls: true`; some feeds spell it `security=tls`.
-            if crate::params::wants_tls(entry, &blocks)
-                && let Some(tls) = tls_object(entry, &blocks, true, false)
-            {
-                m.insert("tls".into(), tls);
-            }
-            if let Some(transport) = transport_object(entry, "net", &blocks) {
-                m.insert("transport".into(), transport);
-            }
-        }
-        Scheme::Trojan => {
-            m.insert("type".into(), Value::String("trojan".into()));
-            m.insert("server".into(), Value::String(entry.host.clone()));
-            m.insert("server_port".into(), num(entry.port));
-            m.insert("password".into(), Value::String(entry.credential.clone()));
-            let reality = crate::params::is_reality(entry, &blocks);
-            // Trojan is TLS by definition: the shared decision says so, and
-            // the Clash writer leaves the key out for the same reason.
-            if crate::params::wants_tls(entry, &blocks)
-                && let Some(tls) = tls_object(entry, &blocks, true, reality)
-            {
-                m.insert("tls".into(), tls);
-            }
-            if let Some(transport) = transport_object(entry, "type", &blocks) {
-                m.insert("transport".into(), transport);
-            }
-        }
-        Scheme::Ss => {
-            m.insert("type".into(), Value::String("shadowsocks".into()));
-            m.insert("server".into(), Value::String(entry.host.clone()));
-            m.insert("server_port".into(), num(entry.port));
-            // Credential is stored as "method:password"; the shared splitter
-            // owns the missing/empty-method fallback (see `parsers::clash`
-            // `SS_SPEC` for the parse-time canonicalization).
-            let (method, password) = super::split_ss_credential(&entry.credential);
-            m.insert("method".into(), Value::String(method.to_string()));
-            m.insert("password".into(), Value::String(password.to_string()));
-            // SIP003 plugin: sing-box takes the raw plugin name and the
-            // option string after it, e.g. plugin "obfs-local" with
-            // plugin_opts "obfs=http;obfs-host=example.com".
-            if let Some(raw) = super::param_value(entry, "plugin") {
-                let mut parts = raw.splitn(2, ';');
-                let name = parts.next().unwrap_or_default().trim().to_string();
-                if !name.is_empty() {
-                    m.insert("plugin".into(), Value::String(name));
-                    if let Some(opts) = parts.next() {
-                        let opts = opts.trim().trim_end_matches(';').to_string();
-                        if !opts.is_empty() {
-                            m.insert("plugin_opts".into(), Value::String(opts));
-                        }
-                    }
-                }
-            }
-        }
-        Scheme::Hysteria2 => {
-            m.insert("type".into(), Value::String("hysteria2".into()));
-            m.insert("server".into(), Value::String(entry.host.clone()));
-            m.insert("server_port".into(), num(entry.port));
-            m.insert("password".into(), Value::String(entry.credential.clone()));
-            if let Some(tls) = tls_object(entry, &blocks, true, false) {
-                m.insert("tls".into(), tls);
-            }
-            if let Some(obfs) = super::param_value(entry, "obfs") {
-                let mut o = Map::new();
-                o.insert("type".into(), Value::String(obfs.to_string()));
-                if let Some(pass) = super::param_value(entry, "obfs-password") {
-                    o.insert("password".into(), Value::String(pass.to_string()));
-                }
-                m.insert("obfs".into(), Value::Object(o));
-            }
-            // sing-box wants integer rates: the non-digit tail of e.g.
-            // "50 Mbps" is trimmed off, and a value left unparseable is
-            // dropped entirely instead of shipping a config sing-box
-            // rejects. The Clash writer copies the same fields through
-            // verbatim (see the `Hysteria2` arm of `entry_to_clash_named`).
-            for (out_key, keys) in [
-                ("up_mbps", ["upMbps", "up"]),
-                ("down_mbps", ["downMbps", "down"]),
-            ] {
-                if let Some(rate) = keys
-                    .iter()
-                    .find_map(|k| super::param_value(entry, k))
-                    .and_then(|v| {
-                        v.trim()
-                            .trim_end_matches(|c: char| !c.is_ascii_digit())
-                            .parse::<u32>()
-                            .ok()
-                    })
-                {
-                    m.insert(out_key.into(), Value::Number(rate.into()));
-                }
-            }
-        }
-        Scheme::Socks5 => {
-            m.insert("type".into(), Value::String("socks".into()));
-            m.insert("server".into(), Value::String(entry.host.clone()));
-            m.insert("server_port".into(), num(entry.port));
-            // Credential is stored as "user:pass"; both parts are optional,
-            // and a colon-less credential is all username (the shared
-            // splitter owns the decision).
-            let (user, password) = super::split_user_password(&entry.credential);
-            if !user.is_empty() {
-                m.insert("username".into(), Value::String(user.to_string()));
-            }
-            if !password.is_empty() {
-                m.insert("password".into(), Value::String(password.to_string()));
-            }
-            if super::param_truthy(entry, "tls") {
-                m.insert("tls".into(), minimal_tls(entry));
-            }
-        }
+        Scheme::Vless => vless_fields(&mut m, entry, &blocks),
+        Scheme::Vmess => vmess_fields(&mut m, entry, &blocks),
+        Scheme::Trojan => trojan_fields(&mut m, entry, &blocks),
+        Scheme::Ss => ss_fields(&mut m, entry),
+        Scheme::Hysteria2 => hysteria2_fields(&mut m, entry, &blocks),
+        Scheme::Socks5 => socks5_fields(&mut m, entry),
         // sing-box has no outbound type for either, and guessing a field
         // layout would hand it a config it cannot start. `None` is
         // `filter_map`ped away, so they are left out of the export.
@@ -214,6 +62,160 @@ pub fn entry_to_outbound_named(entry: &ProxyEntry, tag: &str) -> Option<Value> {
     }
 
     Some(Value::Object(m))
+}
+
+/// The three fields every outbound starts with.
+fn base_fields(m: &mut Map<String, Value>, entry: &ProxyEntry, outbound_type: &str) {
+    m.insert("type".into(), Value::String(outbound_type.into()));
+    m.insert("server".into(), Value::String(entry.host.clone()));
+    m.insert("server_port".into(), num(entry.port));
+}
+
+/// Vless body: uuid, optional flow, TLS/REALITY and the transport read
+/// from the URI `type` key.
+fn vless_fields(m: &mut Map<String, Value>, entry: &ProxyEntry, blocks: &Blocks) {
+    base_fields(m, entry, "vless");
+    m.insert("uuid".into(), Value::String(entry.credential.clone()));
+    if let Some(flow) = super::param_value(entry, "flow") {
+        m.insert("flow".into(), Value::String(flow.to_string()));
+    }
+    let reality = crate::params::is_reality(entry, blocks);
+    let tls = crate::params::wants_tls(entry, blocks);
+    if let Some(tls) = tls_object(entry, blocks, tls, reality) {
+        m.insert("tls".into(), tls);
+    }
+    if let Some(transport) = transport_object(entry, "type", blocks) {
+        m.insert("transport".into(), transport);
+    }
+}
+
+/// Vmess body: uuid, the `scy`/`cipher` cipher and the `aid`/`alterId`
+/// alter id, TLS and the transport read from the `net` key.
+fn vmess_fields(m: &mut Map<String, Value>, entry: &ProxyEntry, blocks: &Blocks) {
+    base_fields(m, entry, "vmess");
+    m.insert("uuid".into(), Value::String(entry.credential.clone()));
+    // vmess JSON spells the cipher `scy` and the alter id `aid`, Clash
+    // YAML `cipher`/`alterId`; read both or the proxy silently defaults.
+    let cipher = super::param_value(entry, "scy")
+        .or_else(|| super::param_value(entry, "cipher"))
+        .unwrap_or_else(|| "auto".into());
+    m.insert("security".into(), Value::String(cipher));
+    // One shared reader, one type (u64, a negative value is 0) for
+    // both encoders.
+    m.insert("alter_id".into(), unsigned(super::alter_id(entry)));
+    // vmess JSON spells TLS as `tls: "tls"`; Clash input uses the
+    // boolean `tls: true`; some feeds spell it `security=tls`.
+    if crate::params::wants_tls(entry, blocks)
+        && let Some(tls) = tls_object(entry, blocks, true, false)
+    {
+        m.insert("tls".into(), tls);
+    }
+    if let Some(transport) = transport_object(entry, "net", blocks) {
+        m.insert("transport".into(), transport);
+    }
+}
+
+/// Trojan body: password, TLS (on by definition) and the transport read
+/// from the URI `type` key.
+fn trojan_fields(m: &mut Map<String, Value>, entry: &ProxyEntry, blocks: &Blocks) {
+    base_fields(m, entry, "trojan");
+    m.insert("password".into(), Value::String(entry.credential.clone()));
+    let reality = crate::params::is_reality(entry, blocks);
+    // Trojan is TLS by definition: the shared decision says so, and
+    // the Clash writer leaves the key out for the same reason.
+    if crate::params::wants_tls(entry, blocks)
+        && let Some(tls) = tls_object(entry, blocks, true, reality)
+    {
+        m.insert("tls".into(), tls);
+    }
+    if let Some(transport) = transport_object(entry, "type", blocks) {
+        m.insert("transport".into(), transport);
+    }
+}
+
+/// Shadowsocks body: the `method:password` credential split and the
+/// SIP003 plugin fields.
+fn ss_fields(m: &mut Map<String, Value>, entry: &ProxyEntry) {
+    base_fields(m, entry, "shadowsocks");
+    // Credential is stored as "method:password"; the shared splitter
+    // owns the missing/empty-method fallback (see `parsers::clash`
+    // `SS_SPEC` for the parse-time canonicalization).
+    let (method, password) = super::split_ss_credential(&entry.credential);
+    m.insert("method".into(), Value::String(method.to_string()));
+    m.insert("password".into(), Value::String(password.to_string()));
+    // SIP003 plugin: sing-box takes the raw plugin name and the
+    // option string after it, e.g. plugin "obfs-local" with
+    // plugin_opts "obfs=http;obfs-host=example.com".
+    if let Some(raw) = super::param_value(entry, "plugin") {
+        let mut parts = raw.splitn(2, ';');
+        let name = parts.next().unwrap_or_default().trim().to_string();
+        if !name.is_empty() {
+            m.insert("plugin".into(), Value::String(name));
+            if let Some(opts) = parts.next() {
+                let opts = opts.trim().trim_end_matches(';').to_string();
+                if !opts.is_empty() {
+                    m.insert("plugin_opts".into(), Value::String(opts));
+                }
+            }
+        }
+    }
+}
+
+/// Hysteria2 body: password, TLS, the obfs pair and the integer rates.
+fn hysteria2_fields(m: &mut Map<String, Value>, entry: &ProxyEntry, blocks: &Blocks) {
+    base_fields(m, entry, "hysteria2");
+    m.insert("password".into(), Value::String(entry.credential.clone()));
+    if let Some(tls) = tls_object(entry, blocks, true, false) {
+        m.insert("tls".into(), tls);
+    }
+    if let Some(obfs) = super::param_value(entry, "obfs") {
+        let mut o = Map::new();
+        o.insert("type".into(), Value::String(obfs.to_string()));
+        if let Some(pass) = super::param_value(entry, "obfs-password") {
+            o.insert("password".into(), Value::String(pass.to_string()));
+        }
+        m.insert("obfs".into(), Value::Object(o));
+    }
+    // sing-box wants integer rates: the non-digit tail of e.g.
+    // "50 Mbps" is trimmed off, and a value left unparseable is
+    // dropped entirely instead of shipping a config sing-box
+    // rejects. The Clash writer copies the same fields through
+    // verbatim (see the `Hysteria2` arm of `entry_to_clash_named`).
+    for (out_key, keys) in [
+        ("up_mbps", ["upMbps", "up"]),
+        ("down_mbps", ["downMbps", "down"]),
+    ] {
+        if let Some(rate) = keys
+            .iter()
+            .find_map(|k| super::param_value(entry, k))
+            .and_then(|v| {
+                v.trim()
+                    .trim_end_matches(|c: char| !c.is_ascii_digit())
+                    .parse::<u32>()
+                    .ok()
+            })
+        {
+            m.insert(out_key.into(), Value::Number(rate.into()));
+        }
+    }
+}
+
+/// Socks5 body: the optional `user:pass` credential and the TLS toggle.
+fn socks5_fields(m: &mut Map<String, Value>, entry: &ProxyEntry) {
+    base_fields(m, entry, "socks");
+    // Credential is stored as "user:pass"; both parts are optional,
+    // and a colon-less credential is all username (the shared
+    // splitter owns the decision).
+    let (user, password) = super::split_user_password(&entry.credential);
+    if !user.is_empty() {
+        m.insert("username".into(), Value::String(user.to_string()));
+    }
+    if !password.is_empty() {
+        m.insert("password".into(), Value::String(password.to_string()));
+    }
+    if super::param_truthy(entry, "tls") {
+        m.insert("tls".into(), minimal_tls(entry));
+    }
 }
 
 /// Encode the final candidate list as a sing-box config document (pretty

@@ -500,7 +500,7 @@ fn transport_key(scheme: Scheme) -> &'static str {
 /// node the way the emitted document is built: a `sni` beats a
 /// `servername`, a `pbk` beats the `public-key` of a `reality-opts`
 /// block.
-fn source_rank(scheme: Scheme, key: &str, source: &str) -> u32 {
+fn source_rank(key: &str, source: &str) -> u32 {
     let order: &[&str] = match key {
         "sni" => &["sni", "servername"],
         "fp" => &["fp", "client-fingerprint"],
@@ -524,7 +524,6 @@ fn source_rank(scheme: Scheme, key: &str, source: &str) -> u32 {
         "type" => &["type", "network"],
         _ => &[],
     };
-    let _ = scheme;
     match order.iter().position(|candidate| *candidate == source) {
         Some(index) => index as u32,
         // A key without a table of its own is spelled by itself.
@@ -588,7 +587,7 @@ pub fn canonical(entry: &ProxyEntry) -> Vec<(String, String)> {
     // occurrence, the way the stored parameters keep it.
     let mut chosen: BTreeMap<String, (u32, String, usize, String)> = BTreeMap::new();
     for (order, (key, source, value)) in candidates.iter().enumerate() {
-        let rank = source_rank(entry.scheme, key, source);
+        let rank = source_rank(key, source);
         let replace = match chosen.get(key) {
             Some((best_rank, best_source, best_order, _)) => {
                 (rank, source.as_str(), order) < (*best_rank, best_source.as_str(), *best_order)
@@ -772,28 +771,9 @@ fn scalar_text(value: &serde_norway::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Param;
 
     fn entry(scheme: Scheme, params: &[(&str, &str)]) -> ProxyEntry {
-        ProxyEntry {
-            scheme,
-            name: "proxy".into(),
-            host: "example.com".into(),
-            port: 443,
-            credential: "secret".into(),
-            params: params
-                .iter()
-                .map(|(k, v)| Param {
-                    key: (*k).into(),
-                    value: (*v).into(),
-                    known: true,
-                    bare: false,
-                })
-                .collect(),
-            raw_path: String::new(),
-            raw_line: String::new(),
-            canonical: None,
-        }
+        crate::formats::test_util::entry(scheme, "secret", params)
     }
 
     fn canonical_map(entry: &ProxyEntry) -> BTreeMap<String, String> {

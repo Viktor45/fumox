@@ -99,7 +99,9 @@ fn protocols_json(protocols: &Option<Vec<Scheme>>) -> crate::Result<Option<Strin
         return Ok(None);
     };
     let names: Vec<&str> = list.iter().map(|scheme| scheme.as_str()).collect();
-    super::json_to_text(&serde_json::to_value(names).expect("scheme list serializes")).map(Some)
+    let value = serde_json::to_value(names)
+        .map_err(|e| crate::Error::Parse(format!("cannot serialize sources.protocols: {e}")))?;
+    super::json_to_text(&value).map(Some)
 }
 
 fn headers_json(
@@ -107,13 +109,22 @@ fn headers_json(
 ) -> crate::Result<Option<String>> {
     headers
         .as_ref()
-        .map(|map| super::json_to_text(&serde_json::to_value(map).expect("header map serializes")))
+        .map(|map| {
+            let value = serde_json::to_value(map).map_err(|e| {
+                crate::Error::Parse(format!("cannot serialize sources.headers: {e}"))
+            })?;
+            super::json_to_text(&value)
+        })
         .transpose()
 }
 
 fn tags_json(tags: &Option<Vec<String>>) -> crate::Result<Option<String>> {
     tags.as_ref()
-        .map(|tags| super::json_to_text(&serde_json::to_value(tags).expect("tags serialize")))
+        .map(|tags| {
+            let value = serde_json::to_value(tags)
+                .map_err(|e| crate::Error::Parse(format!("cannot serialize sources.tags: {e}")))?;
+            super::json_to_text(&value)
+        })
         .transpose()
 }
 
@@ -1107,6 +1118,44 @@ mod tests {
         assert_eq!(loaded["src6ffffffff"], a);
 
         assert!(get_many(&pool, &[]).await.unwrap().is_empty());
+    }
+
+    /// The documented graceful skip: one row whose enum column does not
+    /// parse (`encoding`, `input_format`) is left out with a warning by
+    /// both the batched `/sub` member load and the ingest listing, while
+    /// every healthy row still comes back.
+    #[tokio::test]
+    async fn a_corrupt_row_is_skipped_by_get_many_and_list() {
+        let (_dir, pool) = temp_pool().await;
+        let healthy = sample_source("src1aaaaaaaa");
+        create(&pool, &healthy).await.unwrap();
+        create(&pool, &sample_source("src2bbbbbbbb")).await.unwrap();
+        create(&pool, &sample_source("src3cccccccc")).await.unwrap();
+        sqlx::query("UPDATE sources SET encoding = 'bogus' WHERE id = 'src2bbbbbbbb'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sources SET input_format = 'bogus' WHERE id = 'src3cccccccc'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The member load answers with the healthy rows only.
+        let loaded = get_many(&pool, &["src1aaaaaaaa", "src2bbbbbbbb", "src3cccccccc"])
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["src1aaaaaaaa"], healthy);
+
+        // The listing keeps the healthy source in the ingest rotation,
+        // enabled and disabled filters alike.
+        for enabled_only in [false, true] {
+            let listed = list(&pool, enabled_only).await.unwrap();
+            assert_eq!(
+                listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+                vec!["src1aaaaaaaa"]
+            );
+        }
     }
 
     /// The admin sources list: count/rows apply the same whitelist

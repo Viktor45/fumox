@@ -54,17 +54,27 @@ pub async fn backfill_missing_geo_within_budget(
 async fn backfill_pass<G: GeoLookup>(geo: &G, pool: &DbPool, mask: GeoFactMask, budget: Duration) {
     let started = std::time::Instant::now();
     let updated = run_backfill(geo, pool, budget, mask).await;
-    // Rows the resolver could not answer (or the budget did not reach) stay
-    // missing; the summary names how many, so a directory without a usable
-    // database is visible instead of only the rows that happened to
-    // resolve.
-    let remaining = match proxies::count_missing_geo(pool, mask).await {
+    let remaining = count_remaining(pool, mask).await;
+    log_pass_summary(started, updated, remaining);
+}
+
+/// How many rows still miss a fact this pass could fill, or `None` when
+/// even the count failed (already logged).
+async fn count_remaining(pool: &DbPool, mask: GeoFactMask) -> Option<i64> {
+    match proxies::count_missing_geo(pool, mask).await {
         Ok(count) => Some(count),
         Err(err) => {
             tracing::warn!(error = %err, "geo backfill: cannot count remaining rows");
             None
         }
-    };
+    }
+}
+
+/// The pass summary. Rows the resolver could not answer (or the budget did
+/// not reach) stay missing; the summary names how many, so a directory
+/// without a usable database is visible instead of only the rows that
+/// happened to resolve.
+fn log_pass_summary(started: std::time::Instant, updated: usize, remaining: Option<i64>) {
     if updated > 0 || remaining != Some(0) {
         tracing::info!(
             updated,
@@ -118,97 +128,170 @@ async fn run_backfill<G: GeoLookup>(
     let mut updated = 0usize;
     loop {
         if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                budget_secs = budget.as_secs(),
-                updated,
-                "geo backfill: budget elapsed before every row missing a fact was \
-                 examined; the rest stay missing and are retried by the next pass"
-            );
+            warn_budget_elapsed(budget, updated);
             break;
         }
-        // One row over the batch size: a short page no longer means "the
-        // table is exhausted", the retry window can leave holes in it.
-        let rows = match proxies::list_missing_geo(pool, cursor, BATCH + 1, mask, now()).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(error = %err, "geo backfill: cannot list rows");
-                return updated;
-            }
-        };
-        if rows.is_empty() {
+        // Both dead ends below are logged where they happen; the walk just
+        // ends, the next pass retries what is left.
+        let Some(page) = fetch_page(pool, cursor, mask).await else {
             break;
-        }
-        let has_more = rows.len() as i64 > BATCH;
-        let rows = &rows[..rows.len().min(BATCH as usize)];
-        use futures_util::StreamExt;
-        // `buffered` (not `buffer_unordered`) keeps the id order the
-        // cursor pagination walks, holding at most `GEO_LOOKUP_CONCURRENCY`
-        // lookups in flight; once the budget elapses the queued lookups
-        // short-circuit instead of piling onto the resolver.
-        let stamps = futures_util::stream::iter(
-            rows.iter()
-                .map(|(_, host)| async move {
-                    if std::time::Instant::now() >= deadline {
-                        return Lookup::Skipped;
-                    }
-                    match geo.resolve_host(host).await {
-                        None => Lookup::NoFacts,
-                        Some(info) => {
-                            let stamp = GeoStamp::from_info(&info);
-                            if stamp.is_empty() {
-                                Lookup::NoFacts
-                            } else {
-                                Lookup::Facts(stamp)
-                            }
-                        }
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
-        .buffered(GEO_LOOKUP_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-        // One batch commits as one transaction: the fact updates of a batch
-        // land together or not at all, so a concurrent reader never sees
-        // half of a batch's rows filled.
-        let mut tx = match pool.begin().await {
-            Ok(tx) => tx,
-            Err(err) => {
-                tracing::warn!(error = %err, "geo backfill: cannot open the batch transaction");
-                return updated;
-            }
         };
-        for ((id, _), stamp) in rows.iter().zip(stamps) {
-            cursor = (*id).max(cursor);
-            match stamp {
-                // Past the budget: the row was not looked up, so it is not
-                // marked; it stays missing and the next pass tries it.
-                Lookup::Skipped => continue,
-                // The resolver answered, but it knows nothing about this
-                // address: remember the attempt so the next pass leaves the
-                // row alone for a while.
-                Lookup::NoFacts => {
-                    if let Err(err) = proxies::mark_geo_attempt_tx(&mut tx, *id, now()).await {
-                        tracing::warn!(proxy = id, error = %err, "geo backfill: cannot record the attempt");
-                    }
-                }
-                Lookup::Facts(stamp) => {
-                    if let Err(err) = proxies::update_geo_tx(&mut tx, *id, &stamp).await {
-                        tracing::warn!(proxy = id, error = %err, "geo backfill: update failed");
-                    } else {
-                        updated += 1;
-                    }
-                }
-            }
-        }
-        if let Err(err) = tx.commit().await {
-            tracing::warn!(error = %err, "geo backfill: cannot commit the batch");
-        }
-        if !has_more {
+        let stamps = resolve_page(geo, &page.rows, deadline).await;
+        let Some(tx) = open_batch_tx(pool).await else {
+            break;
+        };
+        updated += commit_batch(tx, &page.rows, &stamps, &mut cursor).await;
+        if !page.has_more {
             break;
         }
     }
     updated
+}
+
+/// The budget ran out mid-walk: name it, so a backlog bigger than the
+/// budget is visible instead of a pass that silently ends early.
+fn warn_budget_elapsed(budget: Duration, updated: usize) {
+    tracing::warn!(
+        budget_secs = budget.as_secs(),
+        updated,
+        "geo backfill: budget elapsed before every row missing a fact was \
+         examined; the rest stay missing and are retried by the next pass"
+    );
+}
+
+/// One page of the walk: the rows to resolve and whether the table
+/// continues past them.
+struct Page {
+    /// `(id, host)` pairs, oldest id first, at most [`BATCH`] of them.
+    rows: Vec<(i64, String)>,
+    /// The listing returned a row beyond the page, so the walk continues
+    /// from the last id the page holds.
+    has_more: bool,
+}
+
+/// The next page of the walk, or `None` when it is over: the listing
+/// failed (already logged) or there is nothing more to fill.
+async fn fetch_page(pool: &DbPool, cursor: i64, mask: GeoFactMask) -> Option<Page> {
+    // One row over the batch size: a short page no longer means "the
+    // table is exhausted", the retry window can leave holes in it.
+    let mut rows = match proxies::list_missing_geo(pool, cursor, BATCH + 1, mask, now()).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, "geo backfill: cannot list rows");
+            return None;
+        }
+    };
+    if rows.is_empty() {
+        return None;
+    }
+    let has_more = rows.len() as i64 > BATCH;
+    rows.truncate(BATCH as usize);
+    Some(Page { rows, has_more })
+}
+
+/// Resolve every host of a page, oldest id first: at most
+/// [`GEO_LOOKUP_CONCURRENCY`] lookups in flight, and once `deadline` has
+/// elapsed the queued lookups short-circuit to [`Lookup::Skipped`] instead
+/// of piling onto the resolver.
+async fn resolve_page<G: GeoLookup>(
+    geo: &G,
+    rows: &[(i64, String)],
+    deadline: std::time::Instant,
+) -> Vec<Lookup> {
+    use futures_util::StreamExt;
+    // `buffered` (not `buffer_unordered`) keeps the id order the
+    // cursor pagination walks, holding at most `GEO_LOOKUP_CONCURRENCY`
+    // lookups in flight.
+    futures_util::stream::iter(
+        rows.iter()
+            .map(|(_, host)| async move {
+                if std::time::Instant::now() >= deadline {
+                    return Lookup::Skipped;
+                }
+                match geo.resolve_host(host).await {
+                    None => Lookup::NoFacts,
+                    Some(info) => {
+                        let stamp = GeoStamp::from_info(&info);
+                        if stamp.is_empty() {
+                            Lookup::NoFacts
+                        } else {
+                            Lookup::Facts(stamp)
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .buffered(GEO_LOOKUP_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await
+}
+
+/// Open the transaction a page commits through: the fact updates of a
+/// batch land together or not at all, so a concurrent reader never sees
+/// half of a batch's rows filled. `None` when it cannot be opened (already
+/// logged); the walk stops and the next pass retries what is left.
+async fn open_batch_tx(pool: &DbPool) -> Option<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    match pool.begin().await {
+        Ok(tx) => Some(tx),
+        Err(err) => {
+            tracing::warn!(error = %err, "geo backfill: cannot open the batch transaction");
+            None
+        }
+    }
+}
+
+/// Apply the resolved stamps of a page and commit the transaction.
+/// Returns how many rows it filled and advances `cursor` past the last id
+/// the page held.
+async fn commit_batch(
+    mut tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    rows: &[(i64, String)],
+    stamps: &[Lookup],
+    cursor: &mut i64,
+) -> usize {
+    let mut updated = 0usize;
+    for ((id, _), stamp) in rows.iter().zip(stamps) {
+        *cursor = (*id).max(*cursor);
+        if apply_lookup(&mut tx, *id, stamp).await {
+            updated += 1;
+        }
+    }
+    if let Err(err) = tx.commit().await {
+        tracing::warn!(error = %err, "geo backfill: cannot commit the batch");
+    }
+    updated
+}
+
+/// Write one row's outcome through the batch transaction: `true` when the
+/// row left the missing set.
+async fn apply_lookup(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    stamp: &Lookup,
+) -> bool {
+    match stamp {
+        // Past the budget: the row was not looked up, so it is not
+        // marked; it stays missing and the next pass tries it.
+        Lookup::Skipped => false,
+        // The resolver answered, but it knows nothing about this
+        // address: remember the attempt so the next pass leaves the
+        // row alone for a while.
+        Lookup::NoFacts => {
+            if let Err(err) = proxies::mark_geo_attempt_tx(tx, id, now()).await {
+                tracing::warn!(proxy = id, error = %err, "geo backfill: cannot record the attempt");
+            }
+            false
+        }
+        Lookup::Facts(stamp) => {
+            if let Err(err) = proxies::update_geo_tx(tx, id, stamp).await {
+                tracing::warn!(proxy = id, error = %err, "geo backfill: update failed");
+                false
+            } else {
+                true
+            }
+        }
+    }
 }
 
 /// What one lookup of a batch produced.
@@ -250,28 +333,7 @@ mod tests {
     }
 
     fn source(id: &str) -> Source {
-        let now = fumox_core::models::now_ts();
-        Source {
-            id: id.into(),
-            slug: None,
-            access_token: None,
-            name: "s".into(),
-            url: "https://example.com".into(),
-            enabled: true,
-            encoding: Default::default(),
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
-        }
+        Source::fixture(id, fumox_core::models::now_ts())
     }
 
     fn entry(host: &str) -> ProxyEntry {

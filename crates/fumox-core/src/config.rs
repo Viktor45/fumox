@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -297,6 +297,17 @@ impl AppConfig {
     /// the count under a `.limit` suffix, and the window is fixed to one
     /// of four units by the parser.
     fn numeric_settings(&self) -> Vec<(&'static str, u64)> {
+        let mut settings = Vec::new();
+        settings.extend(self.server_database_fetch_numeric_settings());
+        settings.extend(self.geo_network_admin_numeric_settings());
+        settings.extend(self.probe_numeric_settings());
+        settings.extend(self.meow_retention_numeric_settings());
+        settings
+    }
+
+    /// The numeric settings of the `server`, `database` and `fetch`
+    /// sections.
+    fn server_database_fetch_numeric_settings(&self) -> Vec<(&'static str, u64)> {
         vec![
             (
                 "server.export_max_rows",
@@ -330,6 +341,13 @@ impl AppConfig {
                 "fetch.retry_base_backoff_ms",
                 self.fetch.retry_base_backoff_ms,
             ),
+        ]
+    }
+
+    /// The numeric settings of the `ingest`, `geo`, `network` and
+    /// `admin` sections.
+    fn geo_network_admin_numeric_settings(&self) -> Vec<(&'static str, u64)> {
+        vec![
             (
                 "ingest.refresh_check_limit",
                 u64::from(self.ingest.refresh_check_limit),
@@ -354,6 +372,12 @@ impl AppConfig {
                 "admin.login_rate_limit.limit",
                 u64::from(self.admin.login_rate_limit.limit),
             ),
+        ]
+    }
+
+    /// The numeric settings of the `probe` section.
+    fn probe_numeric_settings(&self) -> Vec<(&'static str, u64)> {
+        vec![
             ("probe.cycle_interval_secs", self.probe.cycle_interval_secs),
             ("probe.sample_size", u64::from(self.probe.sample_size)),
             ("probe.fail_limit", u64::from(self.probe.fail_limit)),
@@ -384,6 +408,12 @@ impl AppConfig {
                 "probe.backlog_target_drain_minutes",
                 self.probe.backlog_target_drain_minutes,
             ),
+        ]
+    }
+
+    /// The numeric settings of the `meow` and `retention` sections.
+    fn meow_retention_numeric_settings(&self) -> Vec<(&'static str, u64)> {
+        vec![
             ("meow.timeout_secs", self.meow.timeout_secs),
             ("meow.backoff_initial_secs", self.meow.backoff_initial_secs),
             ("meow.backoff_max_secs", self.meow.backoff_max_secs),
@@ -436,9 +466,12 @@ impl AppConfig {
     /// at the back of it for ever.
     fn validate_probe_queue(&self) -> crate::Result<()> {
         // The divisor is at least 1: the range table bounds the cycle
-        // interval to a second or more, and `validate_bounds` ran.
+        // interval to a second or more, and `validate_bounds` ran. The
+        // multiplication comes first: a cycle longer than an hour drains
+        // a *fraction* of the sample per hour, and dividing `3600 / cycle`
+        // first would floor that fraction to zero and refuse every limit.
         let per_hour =
-            u64::from(self.probe.sample_size) * (3600 / self.probe.cycle_interval_secs.max(1));
+            u64::from(self.probe.sample_size) * 3600 / self.probe.cycle_interval_secs.max(1);
         if u64::from(self.ingest.refresh_check_limit) > per_hour {
             return Err(crate::Error::Config(format!(
                 "ingest.refresh_check_limit = {} is larger than what the probe drains in an \
@@ -509,7 +542,7 @@ pub fn load(path: Option<&Path>) -> crate::Result<LoadedConfig> {
     // configuration actually has, so a variable that names no key
     // cannot shadow something else; `check_env_vars` turns such a name
     // into an error instead of letting it pass unnoticed.
-    let mut paths = config_paths();
+    let mut paths = config_paths()?;
     paths.extend(DEPRECATED_PATHS.iter().map(|p| (*p).to_string()));
     let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
     figment = figment.merge(Env::prefixed(ENV_PREFIX).split("__").only(&path_refs));
@@ -536,12 +569,13 @@ const DEPRECATED_PATHS: &[&str] = &["probe.refresh_check_limit"];
 /// The env layer's whitelist: `FUMOX_SERVER__BIND` maps to
 /// `server.bind`, and a variable naming no path here names no
 /// configuration key.
-pub fn config_paths() -> Vec<String> {
-    let value = serde_json::to_value(AppConfig::default()).expect("the default config serializes");
+pub fn config_paths() -> crate::Result<Vec<String>> {
+    let value = serde_json::to_value(AppConfig::default())
+        .map_err(|e| crate::Error::Config(format!("cannot serialize the default config: {e}")))?;
     let mut paths = Vec::new();
     collect_paths("", &value, &mut paths);
     paths.sort();
-    paths
+    Ok(paths)
 }
 
 /// The configuration paths the environment currently overrides.
@@ -556,7 +590,22 @@ pub fn config_paths() -> Vec<String> {
 /// config key is not reported: [`check_env_vars`] refuses the start
 /// instead.
 pub fn env_overridden_paths() -> Vec<String> {
-    let known = config_paths();
+    // The whitelist comes from serializing the built-in default config,
+    // whose Serialize impl is derived over fixed types and carries no
+    // operator input. Should that ever fail, `load` reports the same
+    // error and no process reaches this render path; the fallback keeps
+    // the answer truthful ("nothing can be matched against the config's
+    // own keys") instead of panicking inside a request handler.
+    let known = match config_paths() {
+        Ok(paths) => paths,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "the built-in config paths cannot be computed"
+            );
+            Vec::new()
+        }
+    };
     let mut overridden: Vec<String> = Vec::new();
     for (name, _) in std::env::vars_os() {
         let Some(name) = name.to_str() else { continue };
@@ -676,21 +725,25 @@ pub fn load_config(path: Option<&Path>) -> crate::Result<AppConfig> {
     Ok(load(path)?.config)
 }
 
-/// What the config dump writes instead of the admin token.
+/// What the config dump writes instead of a credential: the admin token
+/// and the meow API token, the two secrets the config carries.
 pub const REDACTED_ADMIN_TOKEN: &str = "<redacted>";
 
-/// The resolved configuration as TOML, with the admin token redacted.
+/// The resolved configuration as TOML, with every credential redacted.
 ///
 /// This is what `--print-config` prints: the effective value of every
 /// key after the file and the environment were merged, so the operator
 /// can see which value is in force and which one the file would give
-/// without the environment. The admin token is a credential, and the
-/// dump lands in terminals, CI logs and bug reports, so it is replaced
-/// by a placeholder.
+/// without the environment. The admin token and the meow API token are
+/// credentials, and the dump lands in terminals, CI logs and bug
+/// reports, so they are replaced by a placeholder.
 pub fn dump(config: &AppConfig) -> crate::Result<String> {
     let mut redacted = config.clone();
     if !redacted.admin.token.is_empty() {
         redacted.admin.token = REDACTED_ADMIN_TOKEN.to_string();
+    }
+    if !redacted.meow.api_token.is_empty() {
+        redacted.meow.api_token = REDACTED_ADMIN_TOKEN.to_string();
     }
     toml::to_string(&redacted)
         .map_err(|err| crate::Error::Config(format!("cannot render the configuration: {err}")))
@@ -1392,7 +1445,7 @@ impl Default for ProbeConfig {
 
 /// meow-rs integration for T2 checks. meow-rs runs as a separate
 /// system service; Fumox only talks to its REST API and reloads its config.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeowConfig {
     /// meow-rs REST API address (`host:port`).
@@ -1452,6 +1505,26 @@ impl Default for MeowConfig {
             backoff_max_secs: defaults::meow_backoff_max_secs(),
             ipv6: defaults::meow_ipv6(),
         }
+    }
+}
+
+impl fmt::Debug for MeowConfig {
+    /// A hand-written `Debug` impl, because the token is a credential and
+    /// the derived one would print it: `{:?}` of the whole [`AppConfig`]
+    /// and of [`LoadedConfig`] delegate to the fields' `Debug`, so the
+    /// secret never reaches a debug log or a panic message any more than
+    /// it reaches `--print-config` (see [`dump`]).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeowConfig")
+            .field("api_addr", &self.api_addr)
+            .field("api_token", &REDACTED_ADMIN_TOKEN)
+            .field("config_path", &self.config_path)
+            .field("test_url", &self.test_url)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("backoff_initial_secs", &self.backoff_initial_secs)
+            .field("backoff_max_secs", &self.backoff_max_secs)
+            .field("ipv6", &self.ipv6)
+            .finish()
     }
 }
 
@@ -1929,7 +2002,7 @@ mod defaults {
     use super::*;
 
     pub fn server_bind() -> SocketAddr {
-        "0.0.0.0:8080".parse().expect("valid socket address")
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080)
     }
 
     /// The drop gate is on by default: a source that carries drop rules
@@ -2028,7 +2101,7 @@ mod defaults {
         String::new()
     }
     pub fn admin_bind() -> SocketAddr {
-        "127.0.0.1:8081".parse().expect("valid socket address")
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081)
     }
     pub const fn session_ttl_hours() -> u32 {
         168
@@ -2141,9 +2214,10 @@ mod defaults {
         PathBuf::from("config/meow.yaml")
     }
     pub fn meow_test_url() -> Vec<String> {
-        // One endpoint, not a list. The probe draws the URL once per cycle
-        // (see `fumox-probe`'s `cycle_test_url`), so a list only ever
-        // widened the ways a whole cycle could fail; seven addresses of one
+        // One endpoint, not a list. The probe draws the URL once per
+        // (sub-)batch (see `fumox-probe`'s `batch_test_url`), so a list
+        // only ever widened the ways a whole batch could fail; seven
+        // addresses of one
         // vendor made that worse, because a region where that vendor is
         // blocked failed every proxy at once. This endpoint answers 204
         // and is not tied to one account; operators whose egress cannot
@@ -2849,6 +2923,51 @@ probe_results_days = 7
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A cycle longer than an hour drains a *fraction* of the sample per
+    /// hour, not zero: 10000 every 7200 s is 5000 rows an hour, so a
+    /// limit of 100 fits. The check must rate the real drain rate, not
+    /// the zero an integer `3600 / cycle` division produces.
+    #[test]
+    fn a_refresh_limit_a_slow_cycle_can_drain_is_accepted() {
+        let dir = std::env::temp_dir().join(format!("fumox-cfg-queue-slow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.toml");
+
+        std::fs::write(
+            &file,
+            "[probe]\ncycle_interval_secs = 7200\nsample_size = 10000\n\
+             [ingest]\nrefresh_check_limit = 100\n",
+        )
+        .unwrap();
+        if let Err(err) = load_config_isolated(Some(&file)) {
+            panic!("a limit the slow cycle drains must load: {err}");
+        }
+
+        // The boundary holds for the slow cycle too: 5000 fits, 5001
+        // does not.
+        std::fs::write(
+            &file,
+            "[probe]\ncycle_interval_secs = 7200\nsample_size = 10000\n\
+             [ingest]\nrefresh_check_limit = 5000\n",
+        )
+        .unwrap();
+        assert!(load_config_isolated(Some(&file)).is_ok());
+
+        std::fs::write(
+            &file,
+            "[probe]\ncycle_interval_secs = 7200\nsample_size = 10000\n\
+             [ingest]\nrefresh_check_limit = 5001\n",
+        )
+        .unwrap();
+        let err = load_config_isolated(Some(&file)).unwrap_err();
+        assert!(
+            err.to_string().contains("ingest.refresh_check_limit"),
+            "the error must name the key: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The shipped `config/app.toml` is the full reference of every available
     /// key at its default value (owner request 2026-08-30). Guard it against
     /// rot: whenever a config struct gains a field, the file must gain the
@@ -2879,7 +2998,7 @@ probe_results_days = 7
             toml_leaf_paths(key, item, &mut file_keys);
         }
         let mut default_keys = std::collections::BTreeSet::new();
-        for path in config_paths() {
+        for path in config_paths().expect("the default config serializes") {
             default_keys.insert(path);
         }
         for omitted in REFERENCE_FILE_OMISSIONS {
@@ -3028,7 +3147,7 @@ probe_results_days = 7
     /// exists is applied and a key that does not is refused.
     #[test]
     fn the_env_whitelist_is_the_config_key_set() {
-        let paths = config_paths();
+        let paths = config_paths().expect("the default config serializes");
         assert!(paths.contains(&"server.bind".to_string()));
         assert!(paths.contains(&"admin.token".to_string()));
         assert!(paths.contains(&"meow.test_url".to_string()));
@@ -3562,6 +3681,54 @@ probe_results_days = 7
             !text.contains("a-real-secret") && text.contains(REDACTED_ADMIN_TOKEN),
             "the admin section debug redacts too: {text}"
         );
+    }
+
+    /// The meow API token is a credential like the admin token: it
+    /// unlocks the meow-rs external controller, and the dump and the
+    /// `Debug` output land in the same terminals, CI logs and bug
+    /// reports — so the placeholder takes its place there too.
+    #[test]
+    fn the_meow_api_token_is_redacted_like_the_admin_token() {
+        let config = AppConfig {
+            meow: MeowConfig {
+                api_token: "a-real-secret".to_string(),
+                ..MeowConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let text = dump(&config).expect("the config must render");
+        assert!(
+            !text.contains("a-real-secret"),
+            "the token must not appear in the dump: {text}"
+        );
+        assert!(
+            text.contains(REDACTED_ADMIN_TOKEN),
+            "the placeholder must be there instead: {text}"
+        );
+
+        // The whole-config `Debug` delegates to the section's `Debug`,
+        // so the placeholder shows up there instead of the token.
+        let text = format!("{config:?}");
+        assert!(
+            !text.contains("a-real-secret"),
+            "the token must not appear in AppConfig debug: {text}"
+        );
+        assert!(
+            text.contains(&format!("api_token: \"{REDACTED_ADMIN_TOKEN}\"")),
+            "the placeholder must be there instead: {text}"
+        );
+
+        let text = format!("{:?}", config.meow);
+        assert!(
+            !text.contains("a-real-secret") && text.contains(REDACTED_ADMIN_TOKEN),
+            "the meow section debug redacts too: {text}"
+        );
+
+        // An empty token stays empty: the placeholder would suggest a
+        // token is set when none is.
+        let config = AppConfig::default();
+        let text = dump(&config).expect("the config must render");
+        assert!(!text.contains(REDACTED_ADMIN_TOKEN), "{text}");
     }
 
     /// The cross-field check names both values: an operator who typed

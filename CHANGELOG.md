@@ -24,40 +24,25 @@ are stamped when the batch is published.
   lets the boot re-stamp an applied migration whose file changed since it
   was applied. Off by default, and the refusal is explicit: a mismatch
   stops the start and names the version, the reason and the two ways out
-  (ship a new migration file, or start once with the flag set). The
-  repair writes the versions it touched under `meta.migrations_repaired`
-  before it retries, so the fact survives the boot log, and a repair that
-  rewrote nothing re-raises the original mismatch instead of claiming a
-  repair that did not happen.
+  (ship a new migration file, or start once with the flag set). A repair
+  that rewrote nothing re-raises the original mismatch instead of
+  claiming a repair that did not happen.
 - The migrations run under an inter-process lock now (a `flock` sidecar
-  next to the database, mode 0600, symlink-proof). sqlx does not lock a
-  SQLite database while it migrates it, so two processes that started at
-  once read the same applied list and raced. The second one waits now,
-  re-reads the list and continues. A busy database is retried with a
-  backoff instead of failing the start.
+  next to the database, mode 0600, symlink-proof), so two processes that
+  started at once no longer race: the second one waits, re-reads the
+  applied list and continues. A busy database is retried with a backoff
+  instead of failing the start.
 - `FUMOX_REVIVE_CONFIRM_STOPPED=1`: the explicit confirmation for a
   restore over a database that still looks busy. The restore refuses by
   default; the variable says "the daemon really is stopped, go ahead".
 - An integration test for `scripts/repair-geo-stamps.sh`
-  (`scripts/tests/repair-geo-stamps.test.sh`): it drives the repair
-  against a scratch database and asserts on the refusals (a missing
-  database, a symlinked one, a directory others may write to, a running
-  server), on the backup it leaves behind and on the batched clearing.
-  Needs nothing but bash and the sqlite3 CLI.
+  (`scripts/tests/repair-geo-stamps.test.sh`).
 - The probe cycle summary reports the wall-clock cost of the cycle and
-  of every stage, the depth of the priority queue before and after the
-  cycle, how many checks each group of lanes may still run, and how
-  many rows the spent budget deferred. A cycle that overran its period
-  says so instead of ending quietly.
+  of every stage, and how many rows the spent budget deferred; a cycle
+  that overran its period says so.
 - An integration test for `scripts/smoke-down.sh`
-  (`scripts/tests/smoke-down.test.sh`): it drives the teardown through
-  a stubbed `docker` and asserts on the compose command the script
-  builds, under the oldest bash on the machine, so the bash 3.2
-  empty-array guard is exercised where it is load-bearing. Needs
-  nothing but bash. The revive-script suite grew the matching negative
-  coverage: the SQL injection payload, a pipe-bearing source name, a
-  census locked by another writer, and the undo advice on the
-  count-parse failure path.
+  (`scripts/tests/smoke-down.test.sh`), and matching negative coverage
+  in the revive-script suite.
 
 - `[geo].startup_download_budget_secs` (default 60, `0` = do not
   wait): the ceiling on how long startup blocks on the GeoLite2
@@ -69,110 +54,54 @@ are stamped when the batch is published.
 - Snell and AnyTLS proxy protocols: parsed from subscriptions (URI
   and Clash YAML), rendered into the Clash output and the URI list,
   and covered by T2 tunnel checks. sing-box exports leave them out:
-  the sing-box outbound set has no type for either, so emitting one
-  would hand the client a block it cannot start.
+  the sing-box outbound set has no type for either.
 - meow-rs 0.22.0 gains for T2, with no further Fumox change: the
-  `xhttp` transport is a real outbound (0.21.x had no XHTTP at all,
-  so such entries could not be checked), and SIP003 Shadowsocks
+  `xhttp` transport is a real outbound, and SIP003 Shadowsocks
   plugins (`shadow-tls`, `restls`, `jls`, `kcptun`, `gost-plugin`)
-  run in-process instead of spawning a helper binary the `fumox-meow`
-  image does not ship, so plugin-backed entries that used to fail T2
+  run in-process, so plugin-backed entries that used to fail T2
   now work. Fumox already rendered both correctly; only the engine
-  gained the ability to honour them.
-  **Which engine, and how to check it:** these two need meow-rs
-  0.22.0 or newer. The version is supplied by the `MEOW_VERSION`
-  build argument of `docker/meow/Dockerfile`, which pins one concrete
-  release together with the two sha256 sums the upstream release
-  publishes (the build verifies the download against them and fails on
-  a mismatch); the `fumox-meow` wrapper image
-  (`ghcr.io/viktor45/fumox-meow`, pinned by digest in the compose
-  stack) carries exactly that release and is never rebuilt with a
-  floating "latest". The release inside a running container is one
-  command away: `docker compose exec meow meow -v` prints
-  `Meow Meta 0.27.0` for the release the current build pins
-  (`meow --version` prints the same number). **Warning:** an engine
-  older than 0.22.0 cannot check the entries listed above — the
-  `xhttp` transport does not exist for it and the SIP003 plugins have
-  no in-process implementation — so those proxies fail T2 and never
-  reach the `ready` tier even though Fumox renders them correctly.
+  gained the ability to honour them. Check the pinned release with
+  `docker compose exec meow meow -v`: an engine older than 0.22.0
+  cannot check these entries — they fail T2 and never reach the
+  `ready` tier even though Fumox renders them correctly.
 - `[meow].ipv6` (default `false`, matching meow-rs): rendered into
-  the generated meow config. 0.22.0 made the key effective
-  end-to-end: under `false` AAAA lookups are skipped and the direct
-  outbound answers IPv4-only, where 0.21.x resolved both families
-  whatever the key said. Only the test-URL host goes through the
-  resolver (proxy servers are pinned to a vetted IP literal), so it
-  matters solely on IPv6-only egress or an AAAA-only test URL.
+  the generated meow config; 0.22.0 made the key effective end-to-end
+  (under `false` AAAA lookups are skipped). It matters solely on
+  IPv6-only egress or an AAAA-only test URL.
 - The probe screen shows the meow-rs kernel's live RSS (from
   `GET /memory`, refreshed whenever a T2 batch reloads the engine),
   with the OS memory limit and the share of it when one is set.
-- The probe screen grew a *History rotation* panel. The daemon's
-  retention loop deleted old `probe_results` and `fetch_log` rows
-  with nothing but a per-run info line to show for it, so a probe
-  whose retention loop had wedged looked identical to one on
-  schedule until the database grew. The loop now stamps a
-  `last_rotation` record on every run, including runs that deleted
-  nothing, so the age of the stamp itself is the "retention is
-  alive" signal. The panel renders it: when the last rotation
-  ran, how many rows each journal lost, and how many rows each
-  holds now. Before the first run it says the probe daemon owns the
-  loop instead of rendering a blank.
+- The probe screen grew a *History rotation* panel: when the last
+  retention run happened, how many rows each journal lost and holds
+  now; before the first run it names the owner of the loop instead of
+  rendering a blank.
 - The dashboard's *fetches in 24h* card shows how long ago the
   scheduler's last sweep started (`last sweep: N s ago`), or that
-  none has run yet. A scheduler that died or wedged mid-run left
-  the card reading `0 / 0` with nothing to separate it from an
-  idle deployment, exactly the state an operator cannot see from
-  outside. The sweep stamps `server_cycle` at its start, so a hung
-  sweep ages the line instead of looking healthy.
-- The geo backfill runs on a schedule, not only at startup. A row
-  whose host lookup failed once — DNS down at ingest time, a
-  partially filled stamp, geo disabled while the row was imported —
-  kept its NULL columns until the process restarted. The scheduler
-  now repeats the pass every six hours with a five-minute budget,
-  detached and never overlapping itself (a tick that fires while the
-  previous pass still runs is skipped, under the same panic-safe
-  overlap flag the sweep uses). The startup pass takes its budget
-  from `[geo].startup_download_budget_secs`, so one configured knob
-  governs both.
-- The backfill decides per fact, not per row. A row holding a country
-  but no ASN counted as "already filled", so an installation that
-  added `GeoLite2-ASN.mmdb` later never stamped the rows that were
-  waiting for it. The missing-row query now selects either missing
-  fact, and a mask derived from the loaded databases stops the pass
-  from chasing a value no database can answer; the closing log line
-  reports how many rows remain.
+  none has run yet; a hung sweep ages the line instead of looking
+  healthy.
+- The geo backfill runs on a schedule now (every six hours, five
+  minutes of budget, never overlapping itself), not only at startup:
+  a row whose host lookup failed once no longer keeps its NULL
+  columns until the process restarts. The startup pass shares the
+  `[geo].startup_download_budget_secs` budget.
+- The backfill decides per fact, not per row: a row holding a country
+  but no ASN is no longer counted as "already filled", so databases
+  added later get their missing values stamped.
 - The fetch journal records how long each attempt took
-  (`fetch_log.duration_ms`, migration 0009): from the start of the
-  fetch, retries and their backoff included, to the verdict. The
-  admin fetch log renders it beside the timestamp, so a slow
-  upstream or a long retry chain no longer looks identical to a
-  fast failure.
+  (`fetch_log.duration_ms`, migration 0009), retries included; the
+  admin fetch log renders it beside the timestamp.
 - Enabling or disabling a source or profile is an in-place HTMX
   swap: a small POST (`/admin/sources/{id}/toggle`,
   `/admin/profiles/{id}/toggle`) re-renders the badge and the
   button without reloading the page, with the same CSRF token and
   the no-JavaScript form fallback the rest of the panel uses.
 - A container smoke test for the runtime image
-  (`scripts/container-smoke.sh`): it starts the server with the bind
-  mounts a deployment uses (`/app/data` owned by the fumox uid 999,
-  `/app/config` read-only), waits for `/healthz` to answer 200, asserts
-  that the SQLite file was created inside the data mount, and then
-  starts the image once more with a read-only data mount and asserts
-  that the container exits with a non-zero code — a misconfigured mount
-  must surface as a failed start, not as a container that looks alive.
-  The CI runs it on both architectures against the image it just
-  published, so the artefact the release ships is the artefact the
-  test proves.
+  (`scripts/container-smoke.sh`), run in CI on both architectures
+  against the image the release just published.
 - A cold-start e2e test for the kube layout
-  (`scripts/kube-coldstart-smoke.sh`): `podman kube play` on an empty
-  volume, then wait for the server to answer `/healthz` and for the
-  probe to reach the running state, and assert that no container
-  restarted. It is what proves that the two pods can start at the same
-  time without the probe dying on the schema lock.
+  (`scripts/kube-coldstart-smoke.sh`).
 - A controller smoke test for the meow image
-  (`scripts/meow-controller-smoke.sh`): the kernel must refuse to start
-  without a controller secret, the controller must reject a request
-  that carries no `Authorization` header (or a wrong one), and it must
-  answer the request that presents the secret.
+  (`scripts/meow-controller-smoke.sh`).
 
 - The GeoLite2 channel is an operator decision now, not a baked-in URL:
   `[geo].auto_download` (default `true`), `[geo].download_urls` and
@@ -184,28 +113,16 @@ are stamped when the batch is published.
   checksum the download has to match. The toggle is in the admin panel
   and in `config/app.toml`.
 - `/healthz` names the geo state on a second line
-  (`geo: off | no databases | degraded | ready`). The first line says
-  that the process and the database answer; the second says whether
-  the country facts are there, which is the difference between a
-  deployment that enriches its names and one that does not.
+  (`geo: off | no databases | degraded | ready`).
 - The GeoLite2 databases are opened once per process and shared by the
-  pipeline, the admin panel and the backfill instead of being read per
-  request, and a database that arrives after the startup is picked up
-  without a restart.
+  pipeline, the admin panel and the backfill; a database that arrives
+  after the startup is picked up without a restart.
 - `[retention].removed_proxies_days` (default `0`): the server's
-  retention sweep now deletes the proxies that have sat in the `removed`
-  status for longer than the window, next to the journal purges it
-  already runs on the same cadence. The purge rides the same bounded
-  batches as the admin's *purge removed* button, so a large stale tier
-  cannot hold the WAL write lock the probe daemon needs.
-  The zero window is the opt-out, not a full wipe: unlike the two journal
-  windows, whose zero would empty the table and is clamped to one day
-  instead, `removed` stays reversible until the operator presses the
-  button — the behaviour every deployment had before this window existed.
-  The sweep stamps the deleted count into `ServerRetentionStamp.proxies`
-  (a serde default, so a stamp written before the field existed still
-  parses) and `/admin/probe` shows it in the server-sweep line and in a
-  keep-line once the window is on.
+  retention sweep now deletes proxies that have sat in the `removed`
+  status for longer than the window, in the same bounded batches as
+  the admin's *purge removed* button. The zero window is the opt-out:
+  `removed` stays reversible until the operator presses the button.
+  The deleted count shows on `/admin/probe`.
 
 ### Changed
 
@@ -222,157 +139,96 @@ are stamped when the batch is published.
   moving public tags. Publishing and retention share a concurrency group;
   failed runs no longer delete potentially shared image digests.
 
-- A probe cycle is bounded now. It carries a wall-clock budget (three
-  quarters of the period), and a lane that starts after the budget is
-  spent issues no check: the row is deferred, not charged and not
-  journaled, and the next cycle picks it up. A cycle that outlives the
-  whole period is aborted. The lanes also share one check quota per
-  group of work (the quarantine drain, the coverage lanes, the tunnel
-  lanes) instead of applying `probe.sample_size` each on its own, so a
-  cycle runs the number of checks the setting names instead of up to
-  five times as many. Guarded by
-  `a_spent_budget_defers_the_rows_of_the_lane`.
-- The hosts of a cycle are resolved once. The rows of a feed often
-  share their host, and every row spent a DNS lookup of its own; the
-  tunnel lanes then resolved the same hosts a second time. The tunnel
-  lanes reuse the addresses the coverage lanes of the same cycle
-  already vetted. Guarded by `the_hosts_of_a_cycle_are_resolved_once`.
+- A probe cycle is bounded now: a wall-clock budget (three quarters of
+  the period) defers the lanes that start too late, a cycle that
+  outlives the whole period is aborted, and the lanes share one check
+  quota per group of work, so a cycle runs the number of checks
+  `probe.sample_size` names instead of up to five times as many.
+  Guarded by `a_spent_budget_defers_the_rows_of_the_lane`.
+- The hosts of a cycle are resolved once: the tunnel lanes reuse the
+  addresses the coverage lanes of the same cycle already vetted. Guarded by
+  `the_hosts_of_a_cycle_are_resolved_once`.
 - The engine's backoff says how long it is and when the lanes run
-  again, and a recovery is logged as well: until now the refusal said
-  only that meow-rs was unavailable, and the return to service was
-  silent.
+  again, and a recovery is logged as well.
 - The controller of the proxy kernel is vetted before the first probe
-  cycle now. It carries a bearer token on every request and can rewrite
-  the kernel's configuration, so it has to stay where nobody else
-  reaches it: a public address (a literal, or a name that resolves into
-  one) aborts the start, and a controller that is not on loopback must
-  have a token. A redirect is not followed any more, so the token cannot
-  be carried to whoever the controller points at. The path the probe
-  writes the kernel's configuration to is checked too: it has to be
-  absolute (the kernel resolves it in its own filesystem, not in the
-  probe's) and its directory is created, so an unusable location is a
-  startup message instead of a write error on every cycle.
+  cycle: a public address aborts the start, a non-loopback controller
+  must have a token, redirects are not followed, and the kernel-config
+  write path must be absolute (its directory is created).
   **Migration:** a deployment that reaches the controller over a
   network (the compose stack does: `meow:9090`) has to set
   `FUMOX_MEOW__API_TOKEN`; a loopback controller keeps working without
-  one. Guarded by `a_public_controller_address_is_refused`,
-  `a_network_controller_without_a_token_is_refused`,
-  `a_loopback_controller_may_run_without_a_token`,
-  `a_malformed_controller_address_is_refused` and
-  `a_relative_meow_config_path_is_refused_at_startup`.
+  one. Guarded by `a_public_controller_address_is_refused`.
 - An attempt the engine never judged is journaled under a kind of its
-  own now (`t2_unverified`) instead of `t2`. A `t2` row is a verdict, a
-  `t2_unverified` row is the record of an attempt the engine could not
-  complete (an outage, a refused request, a run of blips), and the two
-  are told apart by the panel and by the log. Both count as an attempt
-  for the T2 recency queue, so a dead engine cannot pin the head of it
-  forever. Migration `0011` carries the matching index.
-- The list of the protocols meow-rs can tunnel lives in one place. The
-  probe carried its own copy of the list beside the mapping that
-  decides the same question, so the two could drift apart and a
-  protocol would be offered to the engine and dropped again. The
-  mapping is the authority now: a protocol it cannot express has no
-  Clash definition, and the probe reads that as "not tunnelable".
+  own now (`t2_unverified`) instead of `t2`: a `t2` row is a verdict,
+  a `t2_unverified` row the record of an attempt the engine could not
+  complete. Both count as an attempt for the T2 recency queue.
+  Migration `0011` carries the matching index.
+- The list of the protocols meow-rs can tunnel lives in one place:
+  a protocol it cannot express is treated as "not tunnelable" instead
+  of being offered to the engine and dropped again.
 - The dedup key now carries a version and is computed from one
   canonical form of a node instead of a fixed list of parameter names.
   Every parameter that changes how a client connects counts — including
-  the ones the list never named: the `h2-opts`, `http-opts`, `grpc-opts`
-  and `obfs-opts` blocks, xhttp's mode/path/extra, the snell protocol
-  revision, hysteria2's port hopping, tuic's relay mode — while the
-  cosmetic ones (the display name, the advertising tags, the bandwidth
-  caps) stay out. The structured blocks are expanded into the scalars
-  they carry, so a node published as a `reality-opts` block and the
-  same node published as the flat `pbk`/`sid` parameters hash alike,
-  and the spellings of one parameter (`servername`/`sni`,
-  `network`/`net`, `cipher`/`scy`) count once. The version is part of
-  the pre-image, so a change of the canonical form changes every key:
-  the stored rows are recomputed on the first start after the upgrade,
-  before the first ingest. **Upgrade:** the recompute rewrites the key
-  of every stored row and leaves the row itself alone, so a node keeps
-  its status, its latency, its geo facts and its probe history — the
-  new key is invisible to the panel and to the clients. A node the feed
-  advertised under two spellings lives in two rows before the upgrade;
-  the recompute merges them into one: the row the probe has judged
-  survives, the source links of both rows end up on it, the probe
-  history of both rows follows the node, and the state the surviving
-  row lacks is filled from the row that goes away. A node the probe had
-  retired keeps its verdict across a merge; it comes back through the
-  paths that exist for that (`[ingest].removed_as_unknown` revives a
-  retired node the feed still carries, the panel's *Revive* buttons
-  revive a retired population), not through the merge. After the
-  recompute no two rows describe the same node — the key is unique —
-  so the same node cannot be listed twice any more. What the operator
-  may still see is a node that *looks* twice because the feeds spell
-  it apart in a way that changes the connection (a different SNI, a
-  different transport); the canonical form counts those apart on
-  purpose. Such a row is removed like any other: mark it `removed` on
-  the *Proxies* screen and *Purge removed* deletes it from the
-  database. The server logs the version it stores
-  at startup, with the number of rows it rewrote and merged. A
-  downgrade to a build without the recompute leaves the rows under keys
-  that build no longer produces, and the nodes are re-identified on the
-  next ingest, so downgrading is not recommended. Guarded by
-  `two_rows_that_describe_the_same_node_are_merged`,
-  `a_merge_moves_the_state_and_the_history_of_the_node`,
-  `a_merge_fills_the_gaps_of_the_surviving_row`,
-  `the_recompute_is_idempotent` and
-  `the_version_marker_gates_the_recompute`.
-- `[probe].refresh_check_limit` moved to `[ingest].refresh_check_limit`:
-  the priority queue belongs to the scheduler, the probe only drains it.
-  The old key is still accepted for one release — its value is carried
-  over to the new key and a warning names the key to rename — so an
-  upgrade from a config that still carries the old spelling does not
-  turn into a refusal to start. `FUMOX_PROBE__REFRESH_CHECK_LIMIT` is
-  accepted the same way. The old key goes away in the next release.
+  the `h2-opts`/`http-opts`/`grpc-opts`/`obfs-opts` blocks, xhttp's
+  mode/path/extra, the snell protocol revision, hysteria2's port
+  hopping, tuic's relay mode — while the cosmetic ones (the display
+  name, the advertising tags, the bandwidth caps) stay out. Blocks and
+  their flat spellings hash alike, and alternative spellings of one
+  parameter (`servername`/`sni`, `network`/`net`, `cipher`/`scy`)
+  count once.
+  **Upgrade:** the stored keys are recomputed on the first start
+  after the upgrade; rows keep their status, latency, geo facts and
+  probe history. Duplicates the feeds spelled differently are merged
+  into one row (the probe-judged one survives, its state filled from
+  the row that goes away); a retired node keeps its verdict and comes
+  back only through the usual revive paths. A node that *looks* twice
+  because the connection genuinely differs (a different SNI, a
+  different transport) counts apart on purpose — remove it with
+  *Purge removed* if unwanted. A downgrade re-identifies the nodes on
+  the next ingest, so downgrading is not recommended. Guarded by
+  `two_rows_that_describe_the_same_node_are_merged`.
+- `[probe].refresh_check_limit` moved to `[ingest].refresh_check_limit`
+  (the priority queue belongs to the scheduler). The old key and the
+  `FUMOX_PROBE__REFRESH_CHECK_LIMIT` variable are still accepted for one
+  release: the value is carried over and a warning names the key to
+  rename.
 - The T2 test URL is drawn once per probe cycle instead of once per
-  check: every check of a cycle hits the same endpoint, so a proxy no
-  longer gets opposite verdicts in two consecutive cycles because the
-  draw landed on a different address. A batch in which every tunnel
-  failed (no success at all and more than one failure) is read as a
-  suspect endpoint rather than a dead fleet: the proxies are stamped
-  unverified and the fail ladder does not grow. The shipped default is
-  one neutral endpoint instead of seven addresses of one vendor, and
-  every `[meow].test_url` entry has to be an absolute `http(s)` URL: a
-  private address needs `[probe].allow_private_targets = true`.
-- The configuration is checked at startup instead of at first use. Every
-  numeric setting has an explicit range now, and a value outside it
-  aborts the boot with the key and the bound in the message; a
-  `trust_proxy_ips` entry that trusts every peer (`0.0.0.0/0`, `::/0`) is
-  a config error, and a panel on a public address that sends its
+  check, so a proxy no longer gets opposite verdicts in two consecutive
+  cycles. A batch in which every tunnel failed is read as a suspect
+  endpoint rather than a dead fleet: the proxies are stamped unverified
+  and the fail ladder does not grow. The shipped default is one neutral
+  endpoint, and every `[meow].test_url` entry has to be an absolute
+  `http(s)` URL: a private address needs
+  `[probe].allow_private_targets = true`.
+- The configuration is checked at startup instead of at first use.
+  Every numeric setting has an explicit range, a value outside it
+  aborts the boot with the key and the bound in the message, a
+  `trust_proxy_ips` entry that trusts every peer (`0.0.0.0/0`, `::/0`)
+  is a config error, and a panel on a public address that sends its
   session cookie without `Secure` warns at startup.
 - A `FUMOX_*` variable that names no configuration key is refused
-  instead of being ignored: the mistake was invisible, the setting kept
-  the value the file gave it, and the operator never learned why. The
-  message names the variable and the closest key.
+  instead of being ignored; the message names the variable and the
+  closest key.
 - The *Edit settings* page refuses a `[meow].test_url` the loader would
   reject (an empty list, a non-`http(s)` URL, a private address while
   the probe's guard is on) instead of writing a file that stops both
   binaries at the next start, and a save whose live reload failed tells
   the operator instead of only logging it.
-- The shared volume was split by purpose and owner. The one `meow-shared`
-  volume (which held the GeoLite2 databases *and* the kernel's
-  configuration exchange) became two: `fumox-geo` for the databases,
-  written by the server alone, and `fumox-meow` for the exchange
-  directory, written by the probe and read by the kernel. The compose
-  stack mounts them at `/shared/geo` and `/shared/meow`, and
-  `FUMOX_GEO__DB_DIR` follows the databases into their own volume
-  (`/shared/geo`, the quadlet units and the manifest declare the same).
-  A deployment that keeps its own `.mmdb` files has to move them to the
-  new volume; the guide and the compose header say where.
+- The shared volume was split by purpose and owner: `fumox-geo` for the
+  GeoLite2 databases (written by the server alone) and `fumox-meow` for
+  the kernel's configuration exchange (written by the probe, read by
+  the kernel), mounted at `/shared/geo` and `/shared/meow`.
+  `FUMOX_GEO__DB_DIR` follows the databases into their own volume.
+  **Migration:** a deployment that keeps its own `.mmdb` files has to
+  move them to the new volume.
 - The nginx example serves every layout now. The server blocks moved
   into a template that the image's entrypoint renders, so the upstream
   addresses are a runtime choice
-  (`FUMOX_UPSTREAM_PUBLIC`, `FUMOX_UPSTREAM_ADMIN`, `FUMOX_SERVER_NAME`),
-  and the resolver belongs to the flavour: the compose flavour resolves
-  the service names through Docker's embedded DNS (`127.0.0.11`), the
-  podman flavour needs none, because there the upstream is the pod
-  loopback (`127.0.0.1:8080` / `127.0.0.1:8081`). The `Host` header is
-  normalised before it is forwarded (the default ports are dropped, a
-  non-default port is kept, a Host that is not a plain hostname is
-  replaced by the canonical name), the SSE stream at `/admin/events` has
-  its own location with the buffering off and a long read timeout, and
-  the remaining `/admin` locations answer in seconds. The redirect from
-  `:80` goes to the normalised host, never to the raw client header.
+  (`FUMOX_UPSTREAM_PUBLIC`, `FUMOX_UPSTREAM_ADMIN`, `FUMOX_SERVER_NAME`);
+  the `Host` header is normalised before it is forwarded, the SSE stream
+  at `/admin/events` has its own location with the buffering off, and
+  the redirect from `:80` goes to the normalised host, never to the raw
+  client header.
 - The quadlet units and the kube manifest declare resource limits: the
   server gets `MemoryMax=512M`, `CPUQuota=100%`, `TasksMax=256`, the
   probe and the kernel smaller quotas (in the `[Service]` section of
@@ -393,72 +249,49 @@ are stamped when the batch is published.
   300 seconds (`[geo].startup_download_budget_secs`). A larger value
   in the file is clamped and named in a startup warning, so a
   hand-edited config cannot hold the boot hostage.
-- The GeoLite2 download does not block the listener bind any more: it
-  runs in its own task, the listeners bind as soon as the budget is
-  spent, and the file lands later by an atomic rename. A country
-  allowlist on a profile is the one hard dependency: with geo enabled,
-  such a profile and no City database aborts the start with a message
-  naming the state and the directory.
+- The GeoLite2 download does not block the listener bind any more: the
+  listeners bind as soon as the budget is spent, and the file lands
+  later by an atomic rename. A country allowlist on a profile is the
+  one hard dependency: with geo enabled, such a profile and no City
+  database aborts the start with a message naming the state and the
+  directory.
 - A payload that parsed but could not be stored is journaled under its
   own error class (`storage`) and keeps the real HTTP status of the
   response, instead of being reported as an upstream failure with a
   substituted 500.
-- The ingest report adds up. `proxies_found` is what was stored,
-  `dropped` is what the source's own filters discarded (the protocol
-  allowlist and the `drop` rules), and `found = dropped + kept` holds
-  in the real run as well as in the dry run.
-- The geo lookup tells the three outcomes apart: a name that did not
-  resolve (cached for ten minutes only), an address no database knows
-  (a fact about the host, cached like every other verdict) and a
-  database read that failed (a fault of this process). Each has its
-  own counter and its own rate-limited log line. The DNS step goes
-  through the shared resolver, so the geo lookup runs under the same
-  concurrency cap as the rest of the process and the address it looks
-  up is the one the dial path would pick.
-- The *Proxies* browser pages with a cursor instead of a page number. A
-  page number asks the database to skip every row of the pages before
-  it, so a deep page walked the whole table and a row written between
-  two requests shifted the rows under the reader. The page resumes from
-  the sort key of the last row it showed now, so the database seeks
-  straight to it, and the panel offers *First* / *Previous* / *Next*
-  instead of a strip of page numbers. The filters and the sort stay with
-  the link, the cursor travels as one opaque token (a display name may
-  hold any character), and each of the three sorts (by update, by
-  latency, by name) pages on its own key. **Migration:** the `page`
-  parameter of `/admin/proxies` is ignored now — a bookmark that
-  carries it shows the first page — while the *Fetch log* and the
-  *Sources* screen keep their page numbers.
-- A truncated export says so twice. `/export/alive/{token}`
-  and `/export/ready/{token}` ship at most
-  `[server].export_max_rows` rows (50 000 by default), and the body
-  carried the count of what it holds but not the size of the tier it
-  came from: a download that carried 50 000 rows looked exactly like a
-  download of a tier of 50 000. The body names both now —
-  `# truncated: showing 50000 of 81234 — raise [server].export_max_rows`
-  — so the file states what it left out, and the render warns once per
-  window that it was capped. The response carries the same two facts, so
-  a client that holds nothing but the headers (a download, a proxy in
-  between) still tells a full list from a truncated one:
-  `X-Fumox-Export-Total` is the size of the tier and
-  `X-Fumox-Export-Truncated: true` marks a body the cap cut. A body
-  that carries the whole tier says nothing about a truncation that did
-  not happen. Guarded by
+- The ingest report adds up: `proxies_found` is what was stored,
+  `dropped` is what the source's own filters discarded, and
+  `found = dropped + kept` holds in the real run as well as in the dry
+  run.
+- The geo lookup tells the three outcomes apart (a name that did not
+  resolve, an address no database knows, a database read that failed);
+  each has its own counter and its own rate-limited log line. The DNS
+  step goes through the shared resolver under the same concurrency cap
+  as the rest of the process.
+- The *Proxies* browser pages with a cursor instead of a page number:
+  the panel offers *First* / *Previous* / *Next*, the filters and the
+  sort stay with the link, and each of the three sorts pages on its own
+  key. **Migration:** the `page` parameter of `/admin/proxies` is
+  ignored now — a bookmark that carries it shows the first page — while
+  the *Fetch log* and the *Sources* screen keep their page numbers.
+- A truncated export says so twice. `/export/alive/{token}` and
+  `/export/ready/{token}` ship at most `[server].export_max_rows` rows
+  (50 000 by default); the body names both numbers now
+  (`# truncated: showing 50000 of 81234 — raise
+  [server].export_max_rows`), and the response carries
+  `X-Fumox-Export-Total` (the size of the tier) and
+  `X-Fumox-Export-Truncated: true`, so even a client that holds nothing
+  but the headers tells a full list from a truncated one. Guarded by
   `a_truncated_export_marks_itself_in_the_headers`.
-- The export capability token is kept in process memory. The public
-  export links read it from the `meta` table on every request, so a
-  download cost a database read before it cost anything else. The token
-  is read once at startup and kept in memory, and the admin panel and
-  the public listener share the copy, so a rotation from the panel
-  reaches both at once. `meta` stays the source of truth: the token
-  survives a restart and is what a restore brings back.
+- The export capability token is kept in process memory, read once at
+  startup and shared by the admin panel and the public listener, so a
+  rotation from the panel reaches both at once. `meta` stays the
+  source of truth: the token survives a restart and is what a restore
+  brings back.
 - A source fetch has a wall-clock budget now (three minutes). The first
   attempt, every retry and every backoff sleep share it, and a backoff
   that would run past the budget is not slept through: the fetch ends
-  with the cause of the failure and the note that the budget ran out.
-  Until now a source that kept answering `503` held a concurrency
-  permit and the source's in-flight mark for the sum of every backoff —
-  sixteen retries from the shipped 500 ms base are ~33 s of pure sleep,
-  and every attempt adds a connect and a read timeout on top. Guarded by
+  with the cause of the failure and the note that the budget ran out. Guarded by
   `a_fetch_is_bounded_by_its_wall_clock_budget`.
 - A refused request says why it was refused. A client error carries a
   reason beside the status code, and the text reaches `fetch_log.error`
@@ -466,331 +299,163 @@ are stamped when the batch is published.
   the way (a redirect left the configured origin) now reports
   `client error: HTTP 403: headers withheld: redirect left the
   configured origin` instead of a bare `403`, which was
-  indistinguishable from a refusal by the target itself. This is
-  deliberate: the reason is part of the stored error text. Guarded by
+  indistinguishable from a refusal by the target itself. The reason
+  is part of the stored error text. Guarded by
   `a_refused_redirect_states_that_the_headers_were_withheld`.
 - The forwarding headers are read only when the operator names the family
   the trusted proxy writes. `[server].trust_proxy_header` and
   `[admin].trust_proxy_header` (default `"none"`; the values `"none"`,
   `"xff"`, `"forwarded"` and `"both"`) declare it: `none` honors no
   header at all and the peer address is the client, `xff` reads
-  `X-Forwarded-For` (and the `X-Forwarded-Host` / `X-Forwarded-Proto`
+  `X-Forwarded-For` (and `X-Forwarded-Host` / `X-Forwarded-Proto`
   beside it), `forwarded` reads the RFC 7239 `Forwarded` header, `both`
-  reads the two and honors them only when they agree: the same address in
-  both, or one header that names nobody while the other names the client.
-  A trusted proxy's address used to be enough: the header was read
-  because the peer was on the trust list, so a client that reached the
-  panel through a pass-through proxy had its own text confirmed by the
-  proxy's copy of it.
+  reads the two and honors them only when they agree.
   **Migration:** a deployment behind a reverse proxy names the family the
   proxy writes (`trust_proxy_header = "xff"` for nginx's
   `$proxy_add_x_forwarded_for`) on every listener that sits behind it.
   Without the declaration the per-IP rate limit counts the proxy's own
   address (one budget for the whole fleet), the scheme hint is ignored
-  (the links stay on `http` behind a TLS front) and the forwarded host is
-  not believed. A `trust_proxy_ips` without a `trust_proxy_header` is
-  named in a startup warning. A chain of several proxies in front of the
-  server has the same effect once every hop of it is in the trust list:
-  the header walk skips the trusted hops, finds no untrusted address
-  left and falls back to the address next to the server, so one
-  rate-limit key serves the whole fleet. Name every hop in
+  and the forwarded host is not believed; a `trust_proxy_ips` without a
+  `trust_proxy_header` is named in a startup warning. A chain of several
+  trusted proxies has the same effect: name every hop in
   `trust_proxy_ips` and raise the limit that key shares.
 - The session cookie carries the version of its format now
-  (`v2.{expires}.{mac}`). The format of the previous build
-  (`{expires}.{mac}`, the MAC over the same epoch-mixed key) is still
-  accepted, so the upgrade costs no re-login, and the version tag is
-  covered by the MAC, so the two formats cannot be mistaken for each
-  other. A cookie minted before the revocation epoch existed (a MAC over
-  the bare session key) is refused on purpose: it matches no epoch, and
-  honoring it would hand a copied cookie back the lifetime the epoch
-  exists to cut short.
-- The session cookie is scoped to the panel. It is issued and cleared with
-  `Path=/admin` instead of `Path=/`, so the browser does not hand the
-  panel's session to the public listener and a public route never sees
-  it. `HttpOnly`, `SameSite=Lax` and the `Secure` flag
+  (`v2.{expires}.{mac}`); the previous build's format is still accepted,
+  so the upgrade costs no re-login, and a cookie minted before the
+  revocation epoch existed is refused on purpose.
+- The session cookie is scoped to the panel: it is issued and cleared
+  with `Path=/admin` instead of `Path=/`, so the public listener never
+  sees it. `HttpOnly`, `SameSite=Lax` and the `Secure` flag
   (`[admin].secure_cookies`) are unchanged.
 - The login window counts the failed attempts only. A successful login
-  gives its slot back, so the operator's own sign-in never eats the
-  brute-force budget of the address the panel is reached on, and it does
-  not reset the window either: the failures that filled it stay counted,
-  so a correct guess between two wrong ones does not hand an attacker a
-  fresh window.
+  gives its slot back and does not reset the window, so a correct guess
+  between two wrong ones does not hand an attacker a fresh window.
 - The dashboard's per-source table follows the status machine order:
-  unknown, alive, ready, quarantine, removed, so a fresh row starts
-  the table instead of sitting between the quarantine and removed
-  counts. "Oldest alive" became "Oldest ready" (the age of the oldest
-  tunnel-verified proxy of the source, measured from `created_at`
-  like the column it replaces), and the "Protocols" and "Countries"
-  columns are gone: a bare count of distinct values read poorly, and
-  the protocol and country split panels below already carry the
-  breakdown.
+  unknown, alive, ready, quarantine, removed. "Oldest alive" became
+  "Oldest ready" (the age of the oldest tunnel-verified proxy), and the
+  "Protocols" and "Countries" columns are gone (the split panels below
+  already carry the breakdown).
 - The pipeline builder is three tabs instead of one column of seven
-  sections. The sections are grouped in the order the pipeline runs:
-  *Input* (protocol filter), *Rules* (renaming and discarding, the lists
-  that grow) and *Output* (health, geo, sorting, limit). Each tab states
-  in one line what it is for, and *Output* lays its four sections out
-  two-up on a wide screen. The tabs are CSS-only like the settings
-  editor (hidden radios drive the panes, no JavaScript). One component
-  renders both the source and the profile form, so both get the layout,
-  and the profile keeps its tri-state controls on renaming and
-  discarding.
-- Rule lists are capped in height and carry a live count. Ten discard
-  rules used to push the add button, the second list and the preview a
-  screen down; the list now scrolls inside its pane and a counter beside
-  each heading shows how many rules it holds. The count is recomputed
-  after every HTMX settle, and blank lines do not count: the rename
-  editor deliberately keeps one empty line as a place to start typing,
-  and an empty line emits no rule.
-- The dashboard stat cards lost their per-metric colour stripe. It read
-  as a status signal and it lied: green under "checks in 24h" over a
-  0/12, amber under a healthy median latency. Status colour belongs to
-  the badges, which mark a real state, and the cards now match every
-  other panel.
-- `/export/alive/{token}` and `/export/ready/{token}` re-read and
-  re-serialized the whole tier on every download. Both now render at
-  most once per 30 s (`EXPORT_TTL_SECS`) and are served from the
-  shared processed cache in between, like `/sub` and `/src`; the
-  entries carry no source id, so per-source invalidation never
-  touches them. The exports have no source TTL to inherit and no
-  invalidation trigger (the probe owns the tiers), so the window is
-  fixed and short, and an expired entry is re-rendered inline rather
-  than served stale: a download is a snapshot by definition, and a
-  quietly outdated one is worse than a slow request. A tier can
-  therefore lag a status change by up to 30 s.
-- The two export links are now capped at 50 000 rows, and the cap is
-  a setting rather than a constant: `[server].export_max_rows`
-  (`FUMOX_SERVER__EXPORT_MAX_ROWS`), defaulting to the number the
-  hard-coded `EXPORT_MAX_ROWS` used, so a deployment that never sets
-  it changes nothing and a bigger tier can be shipped whole. The
-  window above bounds the *rate* of rendering; nothing bounded the
-  *size*. Unlike `/sub` and `/src`, which a profile's `limit.count` and
-  a source's pipeline cap already bound, these two have no upstream
-  cap, so one download on a public cacheable URL meant an unbounded
-  `fetch_all`, an unbounded serialization and an unbounded body. The
-  cap is a `LIMIT ?` in the backing query (`list_alive` /
-  `list_ready`), not a post-read truncate, and it truncates the stable
-  id order (lowest ids first), so two renders of the same tier agree.
-  The `nodes count` header reports the actual number of lines the body
-  carries; the cut itself is marked by `X-Fumox-Export-Truncated` (and
-  the size of the tier by `X-Fumox-Export-Total`), not by the count;
-  the admin badge (`count_alive` /
-  `count_ready`) stays uncapped on purpose, so the operator can still
-  see that the export is smaller than the tier. The cap is applied
-  after the host and token gates: a rejected request cannot tell a
-  capped render from a full one, and costs no query. Guarded by
-  `export_body_is_capped_in_sql`,
-  `cap_is_applied_after_the_host_and_token_gates`,
-  `export_cap_follows_the_configured_setting` and
-  `server_export_max_rows_is_configurable`.
+  sections, grouped in the order the pipeline runs: *Input* (protocol
+  filter), *Rules* (renaming and discarding) and *Output* (health, geo,
+  sorting, limit). CSS-only; both the source and the profile form get
+  the layout.
+- Rule lists are capped in height and carry a live count; the list
+  scrolls inside its pane instead of pushing the page down.
+- The dashboard stat cards lost their per-metric colour stripe (it read
+  as a status signal and it lied); status colour belongs to the badges.
+- `/export/alive/{token}` and `/export/ready/{token}` render at most
+  once per 30 s (`EXPORT_TTL_SECS`) and are served from the shared
+  processed cache in between, like `/sub` and `/src`; a tier can lag a
+  status change by up to 30 s.
+- The two export links are capped at 50 000 rows, and the cap is a
+  setting rather than a constant: `[server].export_max_rows`
+  (`FUMOX_SERVER__EXPORT_MAX_ROWS`). The cut is marked by
+  `X-Fumox-Export-Truncated` (and the size of the tier by
+  `X-Fumox-Export-Total`); the admin badge stays uncapped, so the
+  operator can see that the export is smaller than the tier. Guarded by
+  `export_body_is_capped_in_sql`.
 - Ingest resolves geo facts concurrently instead of one await per
-  entry. Every unseen host costs up to `[geo].dns_timeout` (5 s by
-  default) when DNS hangs, so a feed of dead hosts cost the sum of
-  them. Lookups now overlap under a cap of 32 in flight
-  (`GEO_LOOKUP_CONCURRENCY`), keeping the input order the drop rules
-  and the reconcile upsert rely on (`buffered`, not
-  `buffer_unordered`).
+  entry, under a cap of 32 in flight (`GEO_LOOKUP_CONCURRENCY`),
+  keeping the input order the drop rules and the reconcile upsert rely
+  on.
 - The shipped `config/app.toml` no longer enables
-  `[probe].allow_private_targets`. The probe dials targets carried
-  by *feeds*, untrusted input, so the example now ships the same
-  `false` the built-in default uses, with the comment rewritten to
-  say what the flag actually disables (loopback / RFC1918 /
-  link-local / CGNAT) and that `true` is an explicit opt-in for
-  isolated test infrastructure. The Compose probe service passes
-  the variable explicitly
-  (`FUMOX_PROBE__ALLOW_PRIVATE_TARGETS`, default `false`, so the
-  environment outranks a hand-edited file the way every other key
-  does) and `.env.example` documents it.
-- `migration 0008` adds `idx_proxies_updated_at`, covering the
-  admin proxies list's default `ORDER BY p.updated_at DESC, p.id
-  DESC` (the id tiebreaker is part of the index, it is part of the
-  order). Without it every page of the list, and the matching
-  `COUNT`, walked the whole table.
-- The minimum supported Rust toolchain is **1.98** (up from 1.94).
-  `Cargo.toml`'s `rust-version` stays a floor, not a lock: CI builds
-  on current stable, and 1.98 is the oldest toolchain the workspace
-  must keep building on.
+  `[probe].allow_private_targets`: the probe dials targets carried by
+  *feeds*, untrusted input. The Compose probe service passes the
+  variable explicitly (`FUMOX_PROBE__ALLOW_PRIVATE_TARGETS`, default
+  `false`) and `.env.example` documents it.
+- `migration 0008` adds `idx_proxies_updated_at`, covering the admin
+  proxies list's default sort; without it every page of the list and
+  the matching `COUNT` walked the whole table.
+- The minimum supported Rust toolchain is **1.98** (up from 1.94);
+  `Cargo.toml`'s `rust-version` stays a floor, not a lock.
 - The import answers with a redirect and a toast instead of a summary
-  page. A successful import ends on `/admin/import` with the totals in
-  the flash message (how many sources and profiles were created, and
-  how many warnings the file produced), the way the other admin
-  actions report themselves. Every warning is logged as it happens,
-  one line each, so a file with a dozen slug collisions does not turn
-  the screen into a wall of text.
-- The import page states the limits it enforces. At most 500 rows per
-  table and a document of at most 256 KiB are accepted, and both
-  numbers are shown next to the upload control and next to the export
-  button. The document cap is smaller than the transport limit on
-  purpose: the payload travels urlencoded, where every byte may cost
-  three, so 256 KiB of JSON still fits the 1 MiB the panel accepts.
-- The export says when its own file cannot be imported back. A
-  deployment with more than 500 sources or profiles, or with a
-  configuration that serializes past 256 KiB, produced a file the
-  import screen refused. The export names the limit it exceeds in the
-  file itself (an `import_limit` field), logs a warning about it and
-  shows the limits next to the export button, so the operator learns
-  it at the download and not at the upload.
+  page: the totals (sources and profiles created, warnings) land in the
+  flash message, every warning is logged as it happens.
+- The import page states the limits it enforces: at most 500 rows per
+  table and a document of at most 256 KiB, shown next to the upload
+  control and the export button.
+- The export says when its own file cannot be imported back: a file
+  past those limits names the limit it exceeds in the file itself (an
+  `import_limit` field) and warns in the log.
 - The alive/ready export links on the import screen degrade instead of
-  failing. A counter or a capability token that could not be read
-  replaced the whole page with an error page, losing the import form
-  itself. The block is hidden now and the reason goes to the log, so
-  the screen stays usable.
+  failing: the block is hidden and the reason goes to the log, so the
+  screen stays usable.
 - The import vets the URLs of the file with the policy of the
-  deployment. The private-address rule was hard-coded, so a deployment
-  that deliberately allows private URLs (isolated infrastructure) could
-  not import a source pointing at one, and one that does not allow
-  them got the check on a different code path than the source form.
-  The import follows `[admin].allow_private_urls` now, like the form
-  does.
+  deployment (`[admin].allow_private_urls`), like the source form does.
 - The public subscription says what it could not deliver. An output
-  format that cannot express an entry (a protocol with no counterpart
-  in the target format) is served with the warning
+  format that cannot express an entry is served with the warning
   `X-Fumox-Warning: incompatible-entries-skipped` and the number of
-  the skipped entries in `X-Fumox-Skipped`. A Clash document carries
-  the same count as a `# skipped: N (unsupported scheme)` comment, so a
-  file copied out of the browser still shows the loss. The warning
-  header may carry several values at once now, comma-separated
-  (`parse-error, incompatible-entries-skipped`).
+  the skipped entries in `X-Fumox-Skipped`; a Clash document carries
+  the same count as a `# skipped: N (unsupported scheme)` comment. The
+  warning header may carry several values, comma-separated.
 - The single-source endpoint reports the "everything is hidden" verdict
   too: a source whose proxies are all quarantined or removed is served
-  with `X-Fumox-Warning: all-proxies-quarantined`, instead of an empty
-  list that reads like an empty feed.
-- The graceful shutdown is bounded now. Both listeners stop accepting
-  on SIGTERM/SIGINT and drain what they have for at most 10 seconds; a
-  drain that runs over the deadline is abandoned with a warning and
-  the open connections are dropped. The admin panel's SSE stream and a
-  slow export download never end on their own, so the wait could hold
-  the process forever, and the supervisor's kill skipped the drain and
-  the shutdown log behind it.
-- The health probe follows the configured bind address. `--health-check`
-  probed `127.0.0.1` with the configured port, so an instance bound to
-  another address (or to the IPv6 wildcard) was probed on a socket it
-  does not listen on. The probe uses the bound address itself now, and
-  the loopback only for a wildcard: `127.0.0.1` for `0.0.0.0`, `::1`
-  for `::`.
-- A render that wedges no longer holds the cache claim forever. The
+  with `X-Fumox-Warning: all-proxies-quarantined`.
+- The graceful shutdown is bounded now: both listeners drain for at
+  most 10 seconds on SIGTERM/SIGINT; a drain that runs over the
+  deadline is abandoned with a warning.
+- The health probe follows the configured bind address (`127.0.0.1`
+  for `0.0.0.0`, `::1` for `::`, the bound address itself otherwise).
+- A render that wedges no longer holds the cache claim forever: the
   background re-render has the same 30-second deadline as the inline
-  one, and the verdict of a failed render is remembered for the waiters
-  behind it, so a burst of clients on a failing key costs one attempt
-  instead of one per client.
+  one, and a burst of clients on a failing key costs one attempt.
 - The export links in the admin panel state that both links carry the
   same token: one secret opens the alive and the ready tier, and a
-  rotation revokes both links at once. The panel's hint says it in both
-  languages.
-- The dashboard reads one snapshot. The per-status counters were one
-  query per status, and the screen mixed them with the lists, so a
-  proxy that changed status between two reads made the totals disagree
-  with the table below them. The counters are one grouped query now,
-  and the whole screen is read in a single transaction, so the numbers
-  and the lists describe the same moment. Guarded by
+  rotation revokes both links at once.
+- The dashboard reads one snapshot: the per-status counters and the
+  lists come from one grouped query in a single transaction, so the
+  numbers describe the same moment as the table. Guarded by
   `dashboard_aggregates_stats_and_leads_with_source_errors`.
-- The latency aggregates cover the live pool the panel shows. The
-  averages counted every proxy that had a latency, the quarantined and
-  the removed ones included, while the "top alive" list showed only the
-  `alive` and `ready` rows. Both read the same predicate now
-  (`status IN ('alive', 'ready') AND latency_ms IS NOT NULL`), so a
+- The latency aggregates cover the live pool the panel shows: both
+  read `status IN ('alive', 'ready') AND latency_ms IS NOT NULL`, so a
   slow dead node cannot drag the median of a healthy tier down.
-- A source URL with a password shows the password masked. The address
-  `https://user:pass@host/sub` was printed in full in the list, on the
-  card and in the edit form, and the mask that hid the same secret in
-  the headers was accepted back as a submitted value. The URL is masked
-  on every screen now, the stored address keeps the password (the
-  fetcher needs it), and a mask is only accepted back under the key it
-  was rendered for: under any other key, or when two keys share it,
-  the form asks for the value again. Guarded by
-  `the_url_password_is_masked`,
-  `the_stored_password_comes_back_under_the_mask` and
-  `a_shared_mask_under_a_new_key_is_reported`.
-- A profile's access token is a password field now. The token guards a
-  public endpoint, so the form renders it with `type="password"` and
-  `autocomplete="new-password"`: the secret is not in the DOM in clear
-  text, and the browser does not offer a stored password for it. The
-  field carries the placeholder and never the value, so an unchanged
-  placeholder keeps the stored token and a typed token replaces it. The
-  panel also refuses a token shorter than 16 characters now, the same
-  floor the import path applies, and the endpoint link got
-  `rel="noreferrer noopener"`.
-- The profile access token has a floor of 16 characters. The import
-  path already refused a shorter one and the form did not, so the two
-  paths disagreed about the same rule; a token guards a public endpoint
-  and must not be guessable. Guarded by
+- A source URL with a password shows the password masked on every
+  screen; the stored address keeps the password, and a mask is only
+  accepted back under the key it was rendered for. Guarded by
+  `the_url_password_is_masked`.
+- A profile's access token is a password field now
+  (`type="password"`, `autocomplete="new-password"`); the field
+  carries the placeholder and never the value, so an unchanged
+  placeholder keeps the stored token. The panel also refuses a token
+  shorter than 16 characters (the import floor) and the endpoint link
+  got `rel="noreferrer noopener"`. Guarded by
   `a_short_typed_token_is_refused_like_in_the_import_path`.
-- A profile and its composition are written in one transaction. The row
-  was written first and the links second, so a failure in between left
-  a profile that belonged to no source. Both are one write now
-  (`upsert_with_sources`), and the profile cache is invalidated right
-  after a successful update, before the response goes out: the public
-  output used to keep the old composition until the cached entry
-  expired. Guarded by `the_public_output_follows_the_profile_writes`.
-- The profile toggle is a targeted update. It rewrote the whole row
-  with the values the form happened to hold, so a change made
-  elsewhere in the meantime was silently reverted. It is now
-  `UPDATE ... SET enabled = NOT enabled` on the one column the action
-  owns.
-- Changing a profile's slug warns. The old `/sub/{slug}` stops working
-  the moment the slug changes, and the panel said nothing about it. The
-  change is reported in a toast that names the old and the new address.
-- The proxy card refreshes the geo facts in the background. Opening a
-  card for a host whose country was unknown paid a DNS timeout on the
-  response path, so a dead host made the panel wait. The stored values
-  are rendered right away and the refresh runs as a background task; the
-  new facts show up on the next open of the card.
-- The purge of the removed proxies runs in batches. It deleted every
-  row in one statement, holding the WAL write lock for the whole set
-  and blocking the writers for as long as it took. The rows are deleted
-  in batches now with the lock released in between, and the total is
-  accumulated into the counter the panel reports. The event also
-  carries the peer the purge came from, so an action that removed
-  thousands of rows leaves a trace of who asked.
+- A profile and its composition are written in one transaction, and
+  the profile cache is invalidated right after a successful update. Guarded by
+  `the_public_output_follows_the_profile_writes`.
+- The profile toggle is a targeted update (`UPDATE ... SET enabled =
+  NOT enabled`), so a change made elsewhere in the meantime is no
+  longer silently reverted.
+- Changing a profile's slug warns in a toast that names the old and
+  the new address.
+- The proxy card refreshes the geo facts in the background; a dead
+  host no longer makes the panel wait a DNS timeout.
+- The purge of the removed proxies runs in batches with the lock
+  released in between, and the event carries the peer the purge came
+  from.
 - Deleting a source retires only the proxies that source fed, and only
-  under the strict policy. The orphan sweep was global: deleting one
-  source marked the proxies of every other source as removed. The sweep
-  is scoped to the links of the deleted source now, and the conservative
-  policy (`[ingest].drop_gate = false`) leaves the detached proxies
-  alone: a `ready` proxy is tunnel-verified and an `unknown` one has
-  not had its first verdict yet, so the probe stays the only authority
-  over their lifecycle. Guarded by
+  under the strict policy: the orphan sweep is scoped to the links of
+  the deleted source, and `[ingest].drop_gate = false` leaves the
+  detached proxies alone. Guarded by
   `mark_source_orphans_removed_protects_listed_statuses`.
-- The log filters are encoded in the pagination links. The result and
-  the error class were interpolated into the query string raw, so a
-  value with an `&` or a `#` broke the link and could smuggle a
-  parameter into the next page. Every filter goes through one
-  percent-encoding helper now. Guarded by
+- The log filters are encoded in the pagination links (one
+  percent-encoding helper), so a value with an `&` or a `#` can no
+  longer break the link or smuggle a parameter. Guarded by
   `the_pagination_link_encodes_every_filter`.
-- A pipeline `remove` that does not parse changes nothing. An
-  unparsable index read as "no remove at all", so the row request
-  appended a fresh empty line instead of leaving the rules as they
-  were. A broken `remove` is a broken request now: the rows stay as
-  they are. Guarded by `a_broken_remove_changes_nothing` and
-  `a_broken_remove_in_the_drop_section_changes_nothing`.
-- The probe cycle model moved into `fumox-core`, next to the heartbeat
-  contract it is derived from. The dashboard estimated the drain time
-  from a formula that lived in the handler and could drift from the one
-  the daemon actually runs; the estimate and the cycle are computed by
-  the same code now.
-- The probe screen reads its metadata through one helper. Four
-  separate lookups with their own error handling meant a single
-  unreadable record turned the whole panel into an error page, and an
-  unreadable heartbeat was indistinguishable from a missing one. The
-  reads are collected into one pass now, and a record that cannot be
-  parsed is reported as such instead of being read as "no record".
-- The proxy status filter has one source of truth. The list of the
-  statuses the filter accepts, the list of all statuses and the badge
-  that names the status were three separate lists that could drift.
-  They are derived from one table now, and a rejected status value is
-  logged instead of silently dropped.
-- The scheduler takes its retention windows from the entry point. The
-  windows were derived from the command line inside the scheduler
-  itself, so a server started without the argument the probe daemon
-  expects swept the journals on a different cadence than the
-  configuration asked for. The parsed configuration is handed over
-  now, and the argument parsing lives at the entry point alone.
-- The journal retention sweep is one routine in `fumox-core`. The
-  server and the probe daemon each carried their own copy of the
-  cut-off arithmetic and the purge order, and they could drift: a
-  zero-day window is clamped to one day in both now, and the purge
-  order is asserted by one test instead of two. Both call
-  `repo::retention::sweep_shared_journals`, so the clamp and the
-  order live in one place.
+- A pipeline `remove` that does not parse is a broken request now: the
+  rows stay as they are. Guarded by `a_broken_remove_changes_nothing`.
+- The probe cycle model moved into `fumox-core`: the dashboard's drain
+  estimate and the daemon's cycle are computed by the same code.
+- The probe screen reads its metadata through one helper, and a record
+  that cannot be parsed is reported as such instead of being read as
+  "no record".
+- The proxy status filter has one source of truth, and a rejected
+  status value is logged instead of silently dropped.
+- The scheduler takes its retention windows from the parsed
+  configuration handed over at the entry point.
+- The journal retention sweep is one routine shared by the server and
+  the probe daemon; a zero-day window is clamped to one day in both.
 - The pipeline editor and the pipeline engine describe the same
   contract. The editor accepted a form the engine read differently —
   a trimmed rule text, a mistyped sort key, an unchecked checkbox read
@@ -826,49 +491,27 @@ are stamped when the batch is published.
   (the wall-clock budget and the number of attempts), so a stalled
   refresh reads as stalled instead of as a spinner that never ends.
 - The settings screen says what a save actually puts in force. The file
-  is written and the in-memory view is refreshed, so the panel shows the
-  values that were just saved, but only some of them are in force for
-  the running processes:
+  is written and the panel shows the saved values, but only some of
+  them are in force for the running processes:
 
-  - **on the next request**: `[admin].token` (the session and the CSRF
-    key are derived from it per request, so a rotation is enforced at
-    once and ends every session minted under the old token),
-    `[admin].session_ttl_hours` (the lifetime of a newly minted session)
-    and `[admin].secure_cookies` (the attribute of a newly minted
-    cookie; a cookie already in the browser keeps the attributes it was
-    given);
-  - **after a server restart**: `[server].bind`,
-    `[server].allowed_hosts`, `[server].trust_proxy_ips`,
-    `[server].trust_proxy_header`, `[server].export_max_rows`, the two
-    `[server]` rate limits, `[admin].bind`, `[admin].enabled`,
-    `[admin].rate_limit`, `[admin].login_rate_limit`,
-    `[admin].locales_dir`, `[admin].allowed_hosts`,
-    `[admin].trust_proxy_ips`, `[admin].trust_proxy_header`,
-    `[admin].allow_private_urls`, `[database].path`, `[log].server` and
-    every key of `[geo]`, `[fetch]`, `[ingest]` and `[retention]` — the
-    listeners, the connection pool, the tracing subscriber, the fetcher,
-    the scheduler and the retention windows are all built at startup and
-    keep the values they booted with;
-  - **after a probe restart**: every key of `[probe]` (the daemon reads
-    its own configuration), plus `[geo].startup_download_budget_secs`
-    (a startup budget) and `[meow].ipv6` (the generated meow-rs
-    configuration).
+  - **on the next request**: `[admin].token`, `[admin].session_ttl_hours`,
+    `[admin].secure_cookies`;
+  - **after a server restart**: the `[server]` keys (bind, allowed_hosts,
+    trust_proxy_ips/header, export_max_rows, the two rate limits),
+    the `[admin]` keys (bind, enabled, both rate limits, locales_dir,
+    allowed_hosts, trust_proxy_ips/header, allow_private_urls),
+    `[database].path`, `[log].server` and every key of `[geo]`, `[fetch]`,
+    `[ingest]` and `[retention]`;
+  - **after a probe restart**: every key of `[probe]`, plus
+    `[geo].startup_download_budget_secs` and `[meow].ipv6`.
 
-  A restart does not end the admin sessions: the cookie carries its own
-  expiry and the revocation epoch lives in the database. What ends them
-  is a token rotation, or the logout button.
+  A restart does not end the admin sessions; what ends them is a token
+  rotation, or the logout button.
 
 - The journal and source screens page with a cursor instead of a page
-  number. The old walk counted rows and skipped that many, so a row that
-  arrived while the operator was reading moved under them, the same page
-  number showed a different set on every click, and the last page could
-  not be reached at all. The screens now seek to a position in the sort
-  key and take the rows after it: the next link carries the position as
-  one opaque token, the set under the reader does not move, and the cost
-  of a page does not grow with its number. The journal's index follows —
-  `idx_fetch_time_id` replaces `idx_fetch_time`, which was a strict
-  prefix of it, so the highest-write table does not carry two indexes
-  over the same column.
+  number: the set under the reader does not move and the cost of a page
+  does not grow with its number. `idx_fetch_time_id` replaces
+  `idx_fetch_time`, which was a strict prefix of it.
 
 ### Fixed
 
@@ -892,290 +535,182 @@ are stamped when the batch is published.
   digest in all three images, so the selected frontend actually takes
   effect.
 
-- The client states that it ignores the environment proxy configuration.
-  The address that was vetted and the address that is connected to have
-  to be the same one: a proxy in between would make the SSRF check
-  describe a path the request does not take, and the pinned address
-  would describe only the hop *to* the proxy. The client is built with
-  `no_proxy()` now, so the guarantee does not rest on which reqwest
-  features the build happens to enable. Guarded by
-  `the_client_ignores_the_environment_proxy_configuration`.
 - The redaction of a source URL missed the credential-bearing query
-  names the feeds use in the wild. `sig` (a signature, `X-Amz-Signature`),
-  `session` (`jsessionid`) and `credential` are masked now, beside the
-  stems that were already there (`token`, `key`, `auth`, `secret`,
-  `pass`). A masked harmless value costs a diagnostic; an unmasked
-  credential costs a secret in the journal and in every log shipper
-  downstream of it. Guarded by
-  `credential_bearing_query_names_are_masked`.
+  names the feeds use in the wild: `sig`, `session` and `credential`
+  are masked now, beside the stems that were already there (`token`,
+  `key`, `auth`, `secret`, `pass`).
+  Guarded by `credential_bearing_query_names_are_masked`.
 - The error text of a failed fetch could carry the credentials of the
-  source URL. The redaction replaced the URL inside the message, but
-  reqwest does not always print the URL exactly as the process built it,
-  and a substitution that missed left the raw userinfo in the text. The
-  tail of the message is replaced now, so the credentials cannot survive
-  a spelling difference. Guarded by
+  source URL: the tail of the message is replaced now, so the
+  credentials cannot survive a spelling difference of the URL. Guarded by
   `a_failing_fetch_does_not_leak_the_source_credentials`.
-- The size cap counts the bytes *after* decompression, and that is now
-  proven: a 161-byte gzip body that expands to 128 KiB is refused under a
-  64 KiB cap. Guarded by `a_gzip_body_is_capped_after_decompression`.
-- The retry ceiling is applied, not only documented: a configuration that
-  asks for more retries than the process supports (the admin form bounds
-  the field, the config file and the `FUMOX_*` env layer do not) is
-  capped at sixteen, and the wire sees seventeen attempts at most.
-  Guarded by `the_retry_count_is_capped_at_the_supported_ceiling` and
-  `an_oversized_retry_count_stops_at_the_ceiling`.
-- Every redirect hop is vetted again, and that is now proven: the
-  resolution and vetting layer is a seam now, so a test can hand it a
-  public first host and a private target and watch the second hop be
-  refused there. Guarded by `every_redirect_hop_is_vetted_again`.
+- The size cap counts the bytes *after* decompression: a gzip body
+  that expands past the cap is refused. Guarded by
+  `a_gzip_body_is_capped_after_decompression`.
+- The retry ceiling is applied, not only documented: a configuration
+  that asks for more retries than the process supports is capped at
+  sixteen, and the wire sees seventeen attempts at most. Guarded by
+  `the_retry_count_is_capped_at_the_supported_ceiling`.
+- Every redirect hop is vetted again: a public first host with a
+  private target is refused at the second hop. Guarded by
+  `every_redirect_hop_is_vetted_again`.
+- The client states that it ignores the environment proxy
+  configuration (`no_proxy()`), so the SSRF check describes the path
+  the request actually takes. Guarded by
+  `the_client_ignores_the_environment_proxy_configuration`.
 
-- The rendered-subscription cache was bounded by entry count, not by
-  memory. One rendered body is megabytes, so a ceiling of ten thousand
-  entries was a multi-gigabyte ceiling in practice. The limit is a byte
-  budget now (64 MiB) and every entry is charged its body plus a fixed
-  overhead, so the entry count is bounded too. Guarded by
-  `the_cache_is_bounded_by_bytes` and
-  `an_entry_costs_its_body_plus_an_overhead`.
-- The invalidation counter of a cache key could be evicted together with
-  the entry it guards. The counter said which renderings were
-  superseded by an invalidation; a counter the cache had dropped said
-  "never invalidated", and a render that had started before the change
-  could store its pre-change rows as fresh for a whole TTL. The
-  counters live outside the evictable cache now, in a map bounded by
-  the number of keys the process ever used. Guarded by
+- The rendered-subscription cache is bounded by a byte budget now
+  (64 MiB), not by entry count. Guarded by `the_cache_is_bounded_by_bytes`.
+- The invalidation counter of a cache key can no longer be evicted
+  together with the entry it guards (a render that started before a
+  change could store its pre-change rows as fresh for a whole TTL). Guarded by
   `a_generation_outlives_the_entry_it_guards`.
-- An invalidation of one source scanned the whole cache for the
-  renderings that carried it. The renderings now record the sources
-  they were built from, and the invalidation goes straight to them.
-  Guarded by `the_reverse_index_names_the_keys_of_a_source` and
-  `an_invalidation_reaches_the_keys_the_index_names`.
-- A host that came back after its own quiet window could warn past the
-  budget of the log window. The budget stopped a flood of *new* hosts
-  from mirroring itself into the log, but a host that returned after an
-  hour warned again whatever the budget said, so a scan that kept its
-  hosts could fill the window with warnings. A returning host spends
-  the budget like any other now, and a host the window could not warn
-  about is named in the rollover summary. Guarded by
-  `a_returning_host_does_not_bypass_the_window_budget`.
-- A download that waited behind the leader of an export render and gave
-  up after the deadline said nothing. The leader was stuck, the waiter
-  rendered the body on its own, and the log showed neither. The timeout
-  is now a warning naming the tier.
-- Rows that could not be turned into an entry were skipped one warning
-  at a time. A tier of thousands of corrupt rows wrote thousands of
-  warnings into the log, and the warnings drowned the render that
-  reported them. The render now skips them and says so in one line,
-  with the count and the first few row ids.
+- An invalidation of one source goes straight to the renderings that
+  record it instead of scanning the whole cache. Guarded by
+  `the_reverse_index_names_the_keys_of_a_source`.
+- A returning host spends the log-window budget like any other, and a
+  host the window could not warn about is named in the rollover
+  summary. Guarded by `a_returning_host_does_not_bypass_the_window_budget`.
+- A download that waited behind a stuck export render and gave up
+  after the deadline now logs a warning naming the tier.
+- Rows that could not be turned into an entry are skipped and reported
+  in one line, with the count, instead of one warning per row.
 
-- The restore of `scripts/revive-xhttp-proxies.sh` replaced the database
-  while the daemon could still be writing to it, and the copy was a plain
-  `cp` over the live file. The restore now checks the backup before it
-  touches anything (an empty file, one that fails `integrity_check`, one
-  that does not carry the Fumox schema and one behind a symlink are all
-  refused), takes the exclusive lock and holds it for the whole copy,
-  stages the copy in the database's own directory, verifies it and renames
-  it into place, compares the size of the file that took the name against
-  the backup and rolls back to the snapshot when the copy came out short.
-  The write-ahead log of the replaced file is removed only after the copy
-  is confirmed. Any abort prints the snapshot's path and a ready-made
-  rollback command.
+- The restore of `scripts/revive-xhttp-proxies.sh` is safe now: the
+  backup is validated before it touches anything (empty, failed
+  `integrity_check`, wrong schema, behind a symlink — all refused), the
+  exclusive lock is held for the whole copy, the copy is staged,
+  verified and renamed into place with a rollback on a short copy, and
+  any abort prints the snapshot's path and a rollback command.
 - The restore could not tell that something still had the database open.
-  The old probe asked for the exclusive lock, which a reader in WAL mode
-  does not block, so a live daemon went unnoticed. The probe now checks
-  the journal mode and treats a write-ahead log that survives the probe as
-  a connection that is still there, and the refusal names the way to say
-  "the daemon really is stopped" (`FUMOX_REVIVE_CONFIRM_STOPPED=1`).
-- The census of the same script read a locked database as an empty one
-  and answered "Nothing to revive." with exit 0. A locked database is now
-  reported as the lock it is (exit 75), and any other read failure is
-  reported as such instead of being read as an empty database.
+  The probe now checks the journal mode and treats a write-ahead log
+  that survives the probe as a live connection; the refusal names the
+  way to say "the daemon really is stopped"
+  (`FUMOX_REVIVE_CONFIRM_STOPPED=1`).
 - The selection of the same script matched rows whose `params` is not
-  JSON, and `json_extract` raises on malformed JSON. The selection is
-  restricted to valid JSON now, and the malformed rows cannot reach the
-  extraction.
-- The adoption target was picked by row order, so a source whose id
-  matched the argument by slug could win over the one that matched by id.
-  The order is explicit now (id, then slug, then name), and the id of
-  the *ranked* path is checked against the plain-nanoid shape before it
-  reaches a SQL literal, like the explicit path already did. A source
-  whose id is not a plain nanoid is skipped rather than adopted.
-- The backup of the same script was written through the `.backup` dot
-  command with the path interpolated into it, so a quote in the path
-  changed the command. The backup is written by `VACUUM INTO` with the
-  path as a quoted literal now, and an existing file at the path stops
-  the run instead of being written through.
-- The flags `--adopt-source` and `--no-adopt` were silently ignored
-  without `--include-unlinked`, so an operator could believe a target had
-  been chosen when none had. They are refused now (exit 64), and the
-  usage block says so.
-- `scripts/repair-geo-stamps.sh` wrote its backup through a dot command
-  with the path interpolated into it, kept the whole table under the write
-  lock, ran against a live server, and told the operator to start the
-  server afterwards when it needed a restart. The backup is written by
-  `VACUUM INTO` (which refuses to overwrite), the columns are cleared in
-  batches, a running server is refused (exit 75, `FUMOX_ALLOW_RUNNING_SERVER=1`
-  overrides it), and the header says STOP before and RESTART after.
-- The migration-repair tool re-stamped rows of a migration that never
-  ran, and of a migration that failed halfway: both leave the schema
-  behind the files while the bookkeeping says the opposite. It refuses a
-  dirty migration ("migration N is in a failed/dirty state") and a
-  migration that was never applied ("not applied successfully"), and it
-  reports a write-ahead log it could not checkpoint instead of leaving
-  the copy in pieces.
+  valid JSON (where `json_extract` raises); the selection is restricted
+  to valid JSON now.
+- The adoption target was picked by row order; the order is explicit
+  now (id, then slug, then name), and a source whose id is not a plain
+  nanoid is skipped rather than adopted.
+- The backup of the same script is written by `VACUUM INTO` with the
+  path as a quoted literal (a quote in the path can no longer change
+  the command), and an existing file at the path stops the run.
+- The flags `--adopt-source` and `--no-adopt` are refused (exit 64)
+  without `--include-unlinked` instead of being silently ignored.
+- `scripts/repair-geo-stamps.sh`: the backup is written by `VACUUM
+  INTO`, the columns are cleared in batches, a running server is
+  refused (exit 75, `FUMOX_ALLOW_RUNNING_SERVER=1` overrides it), and
+  the header says STOP before and RESTART after.
+- The migration-repair tool refuses a dirty migration and a migration
+  that was never applied, and reports a write-ahead log it could not
+  checkpoint.
 - The T2 block flag of a proxy that had been failing before the flag
-  existed stayed NULL, which reads as "no recent T2 failure" and lets the
-  T1 lane check a proxy the tunnel lane had already condemned. Migration
-  `0013` backfills it from the probe history. A NULL flag now means "no
-  T2 attempt yet", "the last attempt succeeded" or "no check since the
-  migration", and the comment in the migration says so.
-- One failing lane cancelled the whole cycle. A lane that raised an
-  error ended the cycle, so a single failing write left the fleet
-  unprobed until the next cycle. The lanes are isolated now: the
-  failing lane is logged with its whole error chain and the name of
-  the lane, and the other lanes of the cycle still run. A T2 config
-  that cannot be written is handled like a rejected reload now: the
-  rows are journaled unverified, the engine is put into backoff, and
-  the lane returns cleanly instead of failing the cycle. Guarded by
+  existed stayed NULL and let the T1 lane check a proxy the tunnel lane
+  had already condemned; migration `0013` backfills it from the probe
+  history.
+- One failing lane no longer cancels the whole probe cycle: the failing
+  lane is logged with its error chain, the other lanes still run, and a
+  T2 config that cannot be written is handled like a rejected reload. Guarded by
   `a_failing_lane_does_not_cancel_the_cycle`.
-- The config the probe hands to the engine was written in place: a
-  crash or a full disk left a half-written config in front of the
-  engine, and a name planted in the directory could be written through.
-  The config is written into a temporary file in the target directory
-  now (created exclusively, without following a symlink, mode 0640 so
-  the kernel's shared group can read it and nobody else can), flushed
-  to disk and renamed onto the target: the engine reads either the old
-  or the new file and never a half-written one. A directory every local
-  user may write to is refused. The file itself stays where it is (the
-  kernel resolves it by path, and the exchange volume is shared with
-  the kernel's container, so it cannot be a tmpfs), but the temporary
-  file of the write never stays behind. Guarded by
-  `the_meow_config_is_renamed_into_place_inside_its_directory` and
-  `the_meow_config_write_does_not_follow_a_planted_symlink`.
-- The fail ladder of a batch was applied one row at a time, two awaits
-  per row: an outage that touched a hundred rows cost two hundred
-  round trips and held the write lock for all of them. The ladder of a
-  batch now moves in one transaction, and the journal rows of the
-  batch are inserted in one statement.
-- An outage of the proxy kernel was charged to the proxies under test.
-  Every answer meow-rs gave was read as a verdict about the proxy: a
-  tunnel that failed, a request it refused, a transport error, a
-  configuration reload it rejected. A dead kernel therefore walked a
-  healthy pool down the fail ladder and into quarantine, and the pool
-  was retired by an infrastructure failure. The engine's answers are
-  split now: a *tunnel verdict* (503, 504, and a 400 whose message
+- The config the probe hands to the engine is written atomically now
+  (temporary file, flush, rename; mode 0640, symlinks not followed), so
+  the engine reads either the old or the new file and never a
+  half-written one; a world-writable directory is refused. Guarded by
+  `the_meow_config_is_renamed_into_place_inside_its_directory`.
+- The fail ladder of a batch moves in one transaction, and the journal
+  rows of the batch are inserted in one statement.
+- An outage of the proxy kernel is no longer charged to the proxies
+  under test: a *tunnel verdict* (503, 504, and a 400 whose message
   names a fault of the proxy) is the only outcome that spends a
   proxy's fail budget; everything else — a 404, a 405, a 401, a 429, an
   unreadable body, a refused request — is an engine fault, journaled
-  unverified and never charged. The status code is kept in the journal
-  and in the log, so a 503/504 stays distinguishable from a 400.
-  Guarded by `only_a_tunnel_verdict_is_charged_to_the_proxy` and
-  `a_delay_response_without_a_numeric_delay_is_not_a_pass`.
-- A run of transient engine errors was charged to the proxies as well. A
-  single failed delay check with a live engine was logged and forgotten,
-  but three of them in a row are no longer a per-request hiccup: the
-  run is escalated to an engine fault now — the row is journaled
-  unverified, no proxy is charged, and the engine is put into backoff.
-  Guarded by `a_run_of_blips_escalates_to_an_engine_fault` and
-  `t2_per_request_blip_with_alive_engine_does_not_abort`.
-- The probe cycle summary could not tell a refused target from a failed
-  one, and an engine fault from either. The private-address refusals
-  are counted apart from the verdicts, and the engine faults apart from
-  both: the summary reports `blocked` and `engine_faults` per lane, and
-  a batch whose targets were refused logs one aggregated warning with
-  the count and the reasons instead of one warning per row. Guarded by
+  unverified and never charged. The status code is kept in the journal. Guarded by
+  `only_a_tunnel_verdict_is_charged_to_the_proxy`.
+- A run of three transient engine errors in a row is escalated to an
+  engine fault: journaled unverified, no proxy charged, engine into
+  backoff. Guarded by `a_run_of_blips_escalates_to_an_engine_fault`.
+- The probe cycle summary reports `blocked` and `engine_faults` per
+  lane apart from the verdicts, and a batch of refused targets logs one
+  aggregated warning. Guarded by
   `a_refused_target_is_counted_as_a_refusal_not_an_engine_fault`.
-- The T1 connectivity check presented the wrong name to the server. The
-  handshake used the stored host as the TLS server name and ignored the
-  name the node itself carries, so a node reached through a CDN (which
-  publishes its own name in `sni`/`servername`) and a node whose host is
-  an IP literal (whose certificate was issued for a name the row also
-  carries) failed the handshake against a server that only accepts its
-  own name, and were quarantined as dead. The node's own name is
-  presented now, and an IP-literal host without a name of its own
-  presents none instead of failing because of it. Guarded by
-  `tls_check_presents_the_nodes_own_sni`,
-  `tls_check_accepts_an_ip_literal_host` and
-  `tls_check_keeps_the_sni_of_an_ip_literal_host`.
-- The check and the writers disagreed about whether a node speaks TLS.
-  The probe answered the question from its own table of parameter
-  spellings, and the writers answered it from another one: a node
-  carrying an SNI was written as a TLS node and probed as plaintext, so
-  a broken TLS node passed the pre-check and was served; `security=xtls`
-  and any other unknown, non-empty `security` value were read as
-  plaintext for the same reason. One shared decision now answers the
-  question for the check and for both writers, and a `security` value
-  this build does not know is treated as TLS: a node whose transport
-  cannot be identified is not probed as plaintext. Guarded by
-  `kind_decision_table` and `clash_and_uri_spellings_agree_on_tls`.
-- A T1 check gave up on a node after its first address. Only the first
-  vetted address was dialed, and a TLS failure on it ended the check
-  even when the other addresses of the same node were reachable — a
-  node whose first address is broken was quarantined although it works.
-  Every vetted address is dialed at once now, the first one that
-  completes the check wins, and a failure on one of them no longer
-  stops the others; the check fails only when the whole list has, and
-  the error it reports is the one of the last attempt. Guarded by
-  `every_vetted_address_is_tried`.
-- A TLS check against a server that does not speak TLS reported the
-  failure as a generic connect error, so the journal could not tell a
-  broken handshake from an unreachable host. The handshake failure is
-  now named as such. Guarded by
-  `tls_check_against_a_plain_listener_fails_with_a_tls_error` and
-  `tls_check_completes_the_handshake`.
+- The T1 connectivity check presents the node's own name as the TLS
+  server name (a CDN node's `sni`/`servername`, an IP-literal host with
+  a certificate name) instead of the stored host; an IP-literal host
+  without a name of its own presents none. Guarded by
+  `tls_check_presents_the_nodes_own_sni`.
+- The check and the writers agree on whether a node speaks TLS (one
+  shared decision instead of two vocabularies); an unknown non-empty
+  `security` value is treated as TLS, never as plaintext.
+  Guarded by `kind_decision_table`.
+- A T1 check dials every vetted address of a node, the first one that
+  completes wins; a failure on the first address no longer quarantines
+  a working node. Guarded by `every_vetted_address_is_tried`.
+- A TLS check against a server that does not speak TLS is named as a
+  handshake failure in the journal, not as a generic connect error. Guarded by
+  `tls_check_against_a_plain_listener_fails_with_a_tls_error`.
 - The Clash and the sing-box writer could disagree about the same node:
-  both questions — does the node need TLS, and which transport does it
-  speak — were answered twice, from two vocabularies. A `tls: true` in
-  a Clash YAML source reached the Clash writer and not the sing-box
-  one; a `security: none` node carrying an SNI was written as TLS in
-  one format and as plaintext in the other; a REALITY node without a
-  `security` parameter was written as plaintext; and a node whose
-  transport only the Clash spelling named (`ws-opts`, `ws-headers`,
-  `grpc-opts`, `h2-opts`) lost its path and its host in the sing-box
-  output, because that writer read the flat parameters only. One
-  shared decision now answers both questions — an explicit toggle
-  first, then `security`, then the REALITY keys, then the SNI — and
-  each writer only projects the result onto its own format. The
-  transport is normalised to one spelling before it is written, so
-  `type=http` over TCP, Xray's `httpupgrade` and the Clash `network`
-  name the same transport in both outputs. Guarded by
-  `both_encoders_agree_on_tls`, `both_encoders_agree_on_the_transport`
-  and `both_encoders_agree_on_the_transport_settings`.
-- The admin panel answered `403 err.cross_site` ("межсайтовый запрос
-  отклонён") to the login form's own submit, in every browser, so the
-  panel could not be logged into at all. The panel sets
-  `Referrer-Policy: no-referrer` on every response, and per Fetch a
-  request whose referrer policy resolves to `no-referrer` is stamped
-  with `Origin: null`, which the panel's own cross-site gate
-  (`admin::auth::cross_site_context`) rejects before authentication.
-  The token was never at fault, and neither was a proxy: the request
-  that came back was the browser's own navigation POST carrying a
-  null origin. The policy is now `same-origin`, which still keeps the
-  panel URL away from third-party origins (the leak the header exists
-  to prevent) while letting the browser send its real origin.
+  whether it needs TLS and which transport it speaks were answered
+  twice, from two vocabularies (a `tls: true` reached one writer and
+  not the other; a REALITY node without `security` was written as
+  plaintext; a Clash-only transport spelling lost its path and host in
+  the sing-box output). One shared decision answers both questions, and
+  the transport is normalised to one spelling, so both outputs name the
+  same transport. Guarded by `both_encoders_agree_on_tls`.
+- The admin panel answered `403 err.cross_site` to the login form's own
+  submit and could not be logged into at all: the `Referrer-Policy` is
+  `same-origin` now, which still keeps the panel URL away from
+  third-party origins.
 - The *Edit settings* page carried a hardcoded English hint under the
-  admin token field ("Leave empty to keep the current token.") while
-  every other string on the panel comes from the catalog: a Russian
-  operator saw one English sentence on the most sensitive form. The
-  hint is the `set.token_keep_hint` catalog key now.
-- A quarantined hysteria2 could never come back. Its second chance and
-  ladder steps were plain TCP connects, and a TCP connect to a QUIC
-  port fails unconditionally, so a single T2-blip quarantine walked
-  the row to `removed` on verdicts no check it was given could actually
-  judge. Quarantined rows of the `T2_REVIVAL_SCHEMES` schemes (the
-  intersection of the T1-excluded and T2-supported sets: exactly
-  hysteria2) are now re-checked through a real meow-rs tunnel:
-  success revives the row into the `ready` tier with a clean slate, an
-  authoritative tunnel failure advances the same configured ladder,
-  and a meow-rs outage is journaled unverified and leaves the row due
-  for the next cycle. The two lanes are disjoint by construction, so a
-  due row is never charged twice in one cycle. Guarded by
-  `quarantined_hysteria2_is_revived_by_a_tunnel_check`,
-  `quarantined_hysteria2_tunnel_failure_walks_the_ladder_to_removal`
-  and `quarantined_hysteria2_is_not_charged_for_a_meow_outage`.
-- A bare integer `rate_limit = 300` in `config/app.toml` aborted boot:
-  figment's TOML pipeline delivers integers as `i64`, and the
-  `RateLimit` visitor only implemented `visit_u64`. Guarded by
+  admin token field; the hint is the `set.token_keep_hint` catalog key
+  now.
+- A quarantined hysteria2 could never come back: its second-chance
+  checks were plain TCP connects, which fail unconditionally on a QUIC
+  port. Quarantined rows of the T2-revival schemes are re-checked
+  through a real meow-rs tunnel now; success revives the row into the
+  `ready` tier, an authoritative failure advances the same configured
+  ladder, and a meow-rs outage is journaled unverified. Guarded by
+  `quarantined_hysteria2_is_revived_by_a_tunnel_check`.
+- A bare integer `rate_limit = 300` in `config/app.toml` aborted boot
+  (the `RateLimit` visitor only implemented `visit_u64`). Guarded by
   `rate_limit_deserializes_from_bare_toml_integer`.
+- An operator's `RUST_LOG` was silently overridden for sqlx; the
+  silencer now lives in the fallback only, and an unparsable `RUST_LOG`
+  falls back to the config level.
+- A failed config-editor save could leak the tmp file (a full copy of
+  the config carrying `[admin].token`), and a committed save was not
+  durable across a crash; the tmp is removed on failure, fsynced
+  before the rename, and the parent directory is synced after it.
+- The settings editor accepted values that fail the next boot (a
+  `[log]` level outside the canonical set, a `u64` above `i64::MAX`
+  wrapped negative inside the `toml_edit` document).
+- A database the revive script cannot read looked like an empty one
+  ("Nothing to revive.", exit 0); the census is validated now — a
+  sqlite3 failure exits 75, a census that is not four counts exits 70,
+  and the abort advice comes from one `undo_hint`.
+- A pipe in a source name shifted the revive script's adoption
+  classification; the name is selected last now.
+- The sing-box vmess output dropped a Clash-sourced cipher and alter
+  id (`security: auto`, `alter_id: 0`); both spellings are read now.
+- A Shadowsocks entry parsed from a Clash item without `cipher`
+  serialized to an unparsable SIP002 userinfo; the export defaults
+  `chacha20-ietf-poly1305` now, the same default the Clash writer
+  applies.
+- A raw `=` in a URI parameter key forged a parameter on round-trip;
+  keys escape `=` now, values keep theirs byte-for-byte.
+- `scripts/smoke-down.sh --keep-data` aborted on the stock macOS bash
+  3.2 (unquoted empty-array expansion under `set -u`); both arrays
+  carry the `${arr[@]+"${arr[@]}"}` guard now.
+- A failed database lookup during a *Refresh now* click was folded into
+  the "unknown source" warning; it is logged as an error naming the
+  source now.
+- The rate limiter's `refund` used the deprecated
+  `AtomicU64::fetch_update`, which broke the CI clippy gate; replaced
+  with a compare-and-swap loop.
+- The probe heartbeat test asserts a range (600..=660 s) instead of an
+  exact count recomputed from the wall clock.
+- A bare integer `rate_limit = 300` in `config/app.toml` aborted boot
+  (the `RateLimit` visitor only implemented `visit_u64`).
 - An operator's `RUST_LOG` was silently overridden for sqlx. The
   `sqlx::query=warn` silencer was chained onto *every* filter, and
   `EnvFilter::add_directive` replaces a same-target directive, so
@@ -1194,22 +729,20 @@ are stamped when the batch is published.
   next start (the dropdowns now accept exactly what `LogLevel`
   deserializes), and a `u64` field above `i64::MAX` wrapped negative
   inside the `toml_edit` document, so the saved config failed
-  `config::load` at the next start. Guarded by
-  `apply_all_rejects_an_unknown_log_level` and
-  `u64_field_refuses_a_value_that_does_not_fit_the_document_i64`.
+  `config::load` at the next start.
+  Guarded by `apply_all_rejects_an_unknown_log_level`.
 - A database the revive script cannot read looked like an empty one:
   an exclusive lock left the census empty and the run saying
   "Nothing to revive." with exit 0. The census is validated now: a
   sqlite3 failure exits 75 with instructions, a census that is not
-  four counts exits 70, and the post-backup abort advice comes from
-  one `undo_hint`, never a bare `cp`, which the script's own header
-  forbids.
+  four counts exits 70, and any other read failure is reported as
+  such; the post-backup abort advice comes from one `undo_hint`,
+  never a bare `cp`, which the script's own header forbids.
 - A pipe in a source name shifted the revive script's adoption
   classification: the name rode mid-row in the sqlite3 output, so a
   `foo|bar` name pushed the `enabled`/`drops` fields out of place and
   could route the adoption into the wrong safety branch. The name is
-  selected last now. Guarded by the pipe-name scenarios in
-  `scripts/tests/revive-xhttp-proxies.test.sh`.
+  selected last now.
 - The sing-box vmess output dropped a Clash-sourced cipher and alter
   id: the writer read only the JSON spellings (`scy`/`aid`), so an
   entry parsed from Clash YAML (`cipher`/`alterId`) silently exported
@@ -1223,8 +756,8 @@ are stamped when the batch is published.
 - A raw `=` in a URI parameter key forged a parameter on round-trip:
   `parse_query` splits on the *first* `=`, so a key like
   `allowInsecure=x` re-parsed as a *present* `allowInsecure`
-  parameter. Keys escape `=` now; values keep theirs byte-for-byte.
-  Guarded by `equals_sign_in_a_param_key_is_escaped`.
+  parameter. Keys escape `=` now; values keep theirs byte-for-byte. Guarded by
+  `equals_sign_in_a_param_key_is_escaped`.
 - `scripts/smoke-down.sh --keep-data` aborted on the stock macOS bash
   3.2: an unquoted empty-array expansion is fatal under `set -u`,
   exactly the state `--keep-data` puts `VOLUME_FLAGS` in. Both arrays
@@ -1236,183 +769,84 @@ are stamped when the batch is published.
 - The rate limiter's `refund` used the deprecated
   `AtomicU64::fetch_update`, which failed `cargo clippy -D warnings`
   and broke the CI gate; replaced with a compare-and-swap loop.
-- The probe heartbeat test asserted an exact seconds count that is
-  recomputed from the wall clock at render time; it asserts a
-  600..=660 range now.
+- The probe heartbeat test asserts a range (600..=660 s) instead of an
+  exact count recomputed from the wall clock.
 
-- Every page heading collapsed to a character-wide column on a phone.
-  `.page-head h1` carried `flex: 1`, which is `flex: 1 1 0%`: a zero
-  flex-basis tells the browser the heading occupies no space, so the row
-  never wraps, the action buttons take the whole width and the heading is
-  left with the few leftover pixels. With the body-level
-  `overflow-wrap: anywhere` that rendered "Proxies total: 4638" as
-  `Pr / ox / ie / s / to / tal: / 46 / 38`. The basis is `auto` now, so
-  the heading claims its text width and the actions wrap below it, while
-  `flex-grow` still keeps them right-aligned on a wide screen. All 13
-  templates that use `.page-head` were affected, not just the proxies
-  list.
-- Ordinary words broke mid-word in table columns at phone width. The body
-  sets `overflow-wrap: anywhere` so that unbreakable tokens (URLs, SHA
-  fingerprints, raw proxy lines) cannot blow a column out, but it also
-  split names once a column got tight: "FlareFeed" as "FlareFe / ed" in
-  the source and profile name columns, "Endpoint" as "Endpo / int" in
-  the key-value tables, and `false` as `fal / se` in a value column
-  squeezed to 49px by a sentence-long label beside it. Name links and
-  key-value labels now opt out with `overflow-wrap: normal`, and the
-  starved value columns carry min-width floors so a long label can no
-  longer take the row. URLs, addresses and hashes still break anywhere,
-  which is what the global rule is for.
-- The key-value tables could not keep a two-column shape below 420px: a
-  sentence-long label plus a `nowrap` timestamp need more than the
-  ~255px a panel has, and squeezing them both split words and pushed the
-  table past the panel edge. Each row now stacks below that width, label
-  above value.
+- Every page heading collapsed to a character-wide column on a phone:
+  `.page-head h1` carried `flex: 1`, whose zero flex-basis told the
+  browser the heading occupies no space. The basis is `auto` now, so
+  the heading claims its text width and the actions wrap below it.
+- Ordinary words broke mid-word in table columns at phone width; name
+  links and key-value labels opt out with `overflow-wrap: normal`, and
+  the starved value columns carry min-width floors. URLs, addresses and
+  hashes still break anywhere.
+- The key-value tables stack label above value below 420px.
 - Every `<select>` on the source and profile forms was 39px tall on a
-  phone. The 16px font rule (there so iOS does not zoom the page on
-  focus) only lifts a select to 39px, under the 44px target. Selects now
-  carry `min-height: 44px` at that breakpoint, including the dashboard
-  Top-N picker and the pipeline rule-row target selects.
-- The settings tabs named the wrong tab to assistive tech. The panes swap
-  on the hidden radio's `:checked`, but `aria-selected` was rendered
-  server-side and never updated, so after switching to *Probe* the DOM
-  still announced *Server* as selected. A small listener now mirrors the
-  radio state onto the labels.
-- `[hidden]` silently stopped working anywhere it met an author `display`.
-  `.badge { display: inline-block }` outranks the user-agent stylesheet,
-  so the pipeline rule counters rendered "0" instead of disappearing.
-  The attribute is restated once, globally.
-- A pipeline rule row wrapped over three ragged lines. The rows sit
-  inside a `.field`, so `.field select { width: 100% }` handed the
-  target select the full panel width. `.ped-row select` is `width: auto`
-  now, and on a phone the remove button keeps its own size instead of
-  becoming a full-width row of its own, which was an easy mis-tap on a
-  destructive action.
+  phone; selects now carry `min-height: 44px` at that breakpoint.
+- The settings tabs named the wrong tab to assistive tech; a small
+  listener mirrors the radio state onto the labels now.
+- `[hidden]` stopped working wherever it met an author `display` (the
+  pipeline rule counters rendered "0" instead of disappearing); the
+  attribute is restated once, globally.
+- A pipeline rule row wrapped over three ragged lines; `.ped-row
+  select` is `width: auto` now, and the remove button keeps its own
+  size on a phone instead of becoming an easy mis-tap.
 - The dashboard's "new proxies over the last 7 days" chart labelled its
-  columns with clipped timestamps. Each bar is a midnight-UTC day bucket,
-  but it was rendered through the shared `<time class="ts">` helper, which
-  base.html's `localize()` rewrites into a full local timestamp, so every
-  label spent its 64 px on `00:00:00` and the browser cut the date down to
-  `09/23/202…`. The columns now carry a `day`-classed `<time>` that
-  `localize()` formats date-only, and the tooltip still carries the full
-  instant and zone. The same column's `aria-label` had the `<time>`
-  element interpolated into the attribute, so screen readers were handed
-  the raw markup; it is plain text now. Covered by
-  `day_element_omits_the_time_part`.
-- Source reconcile retired proxies that belonged to someone else. The
-  end-of-pass sweep asked a global question ("is this row link-less?")
-  and therefore swept up the deliberate residue the admin *Delete
-  source* click leaves behind under `drop_gate = false`, where
-  `mark_orphans_removed` protects `ready` and `unknown` rows and
-  leaves them link-less on purpose. Reconciling an unrelated source
-  one tick later retired them, undoing the operator's choice. The
+  columns with clipped timestamps: the columns carry a `day`-classed
+  `<time>` that `localize()` formats date-only now, and the
+  `aria-label` is plain text instead of interpolated markup.
+- Source reconcile retired proxies that belonged to someone else: the
   sweep now runs before the `DELETE` and asks only about the links
-  *this* pass removes: a stale link of this source and no link that
-  survives it. Guarded by
+  *this* pass removes. Guarded by
   `reconcile_of_another_source_leaves_protected_orphans_alone`.
 - `check_failed` lost fail-count increments and could resurrect a
-  retired row. The `fail_count` read and the write that acts on it
-  were two pool-level statements: overlapping checks of the same row
-  lost an increment, and the write carried no status guard, so a row
-  that had meanwhile been driven to `removed` with a second chance
-  scheduled was pulled back into `quarantine`. Both statements now
-  run in one `BEGIN IMMEDIATE` transaction (`SQLITE_BUSY_SNAPSHOT` is
-  outside `busy_timeout`) and repeat the `status IN ('unknown',
-  'alive', 'ready')` guard; a refused write reports
-  `Transition::Unchanged` instead of the attempted transition.
-- A T1 success lifted the T2 suppression flag. `check_succeeded`
-  cleared `last_t2_failed_at` on any success, so a proxy that had just
-  failed its tunnel check re-entered the T1 rotation on a plain
-  TCP/TLS verdict, the exact case the flag (migration 0007) exists
-  to suppress. Only a T2 success does now, and `ready` is the T2
-  success tier: after a failed T2 the proxy's T1 checks are skipped
-  until the next successful T2. The releases between the change that
-  introduced the flag and this fix did not hold that rule — see the
-  correction in the *2026-09-22* and *2026-09-21* entries.
-- A meow-rs outage was charged to the proxies it skipped. The
-  journal-and-fail path ran the whole fail ladder for every due proxy
-  when the engine was down at `ping`/`reload_config` or died
-  mid-batch, and with the shipped `fail_limit = 2` two outage cycles
-  quarantined a proxy that had failed no check at all, dropping a
-  healthy row out of both T2 selectors and out of `/export/alive` for
-  the sidecar's fault. An outage is now a distinct outcome:
-  `journal_engine_fault` still writes the `probe_kind='t2'` record
-  (the entry that un-sticks the head of the recency queue) and stamps
-  `last_t2_failed_at` with a `ready` → `alive` demote, so the
-  tunnel-verified tier still does not outlive an outage, but
-  `fail_count` and the quarantine ladder stay untouched. The outage
-  is charged to the engine instead: `BatchGuard` strikes, the
-  exponential backoff, the log line. The boundary is the
-  post-failure `/version` ping: a `ServiceUnavailable` the engine
-  *answers* is a per-request blip and remains an ordinary charged
-  verdict. Guarded by
+  retired row: the read and the write now run in one `BEGIN IMMEDIATE`
+  transaction and repeat the `status IN ('unknown', 'alive', 'ready')`
+  guard; a refused write reports `Transition::Unchanged`.
+- A T1 success lifted the T2 suppression flag: only a T2 success clears
+  `last_t2_failed_at` now, so after a failed T2 the proxy's T1 checks
+  are skipped until the next successful T2. The releases between the
+  change that introduced the flag (migration 0007) and this fix did not
+  hold that rule — see the correction in the *2026-09-22* and *2026-09-21*
+  entries.
+- A meow-rs outage is no longer charged to the proxies it skipped: it
+  is a distinct outcome that journals the attempt and demotes `ready`
+  to `alive`, but leaves `fail_count` and the quarantine ladder
+  untouched. The outage is charged to the engine instead (`BatchGuard`
+  strikes, the exponential backoff, the log line). A
+  `ServiceUnavailable` the engine *answers* is a per-request blip and
+  remains an ordinary charged verdict. Guarded by
   `meow_outage_never_quarantines_a_healthy_proxy`.
-- Every revival path left the row in no probe lane. `reset_status`,
-  `revive_removed` and its country / ASN / no-probe-history variants
-  and `revive_quarantine` put the row back to `unknown` but kept
-  `last_t2_failed_at` set, and the revival predicates did not require
-  a `proxy_source_links` row, so a revived proxy no T1 lane selects
-  (`last_t2_failed_at IS NULL`) and no T2 sample offers (`alive` /
-  `ready`) would ever look at again. The flag is now cleared with the
-  rest of the lifecycle and the link predicate is applied. *Reset
-  status* additionally enqueues the row for priority checking, the
-  handoff the bulk paths hand their callers.
-- *Reset status* reported a proxy that still exists as nonexistent.
-  `reset_status` returns one boolean for two different outcomes: a row
-  that is gone, and a row that exists but belongs to no probe lane (no
-  `proxy_source_links` row left after reconciliation retired it, or a
-  scheme no lane checks (`tuic`, `mieru`)). Both came back as `false`
-  and both were answered with `err.proxy_not_found`, so an operator
-  pressing the button on a proxy sitting right there on the screen was
-  told it did not exist. The second case is now a rejected action
-  rather than a 404: the panel answers with the unchanged
-  `#status-badge` fragment (which is what the form's `hx-target`
-  expects) and a message saying the status was left as it is because no
-  probe can reach the row (`px.reset_unreachable`, both catalogs). A
-  genuinely missing row still 404s, and a database error still 500s.
-- The probe priority queue accepted rows no lane would ever drain: an
-  id with no `proxy_source_links` row and an id under a T2 block.
-  `enqueue_checks` now applies the drain's own predicates, so the
-  revival paths cannot leave dead weight in the table. Guarded by
+- Every revival path left the row in no probe lane: the flag is now
+  cleared with the rest of the lifecycle and the link predicate is
+  applied, so a revived proxy is picked up again. *Reset status*
+  additionally enqueues the row for priority checking.
+- *Reset status* reported a proxy that still exists as nonexistent
+  (a row that exists but belongs to no probe lane came back as
+  `false`). That case is a rejected action now, with a message saying
+  the status was left as it is because no probe can reach the row
+  (`px.reset_unreachable`); a genuinely missing row still 404s.
+- The probe priority queue no longer accepts rows no lane would ever
+  drain: `enqueue_checks` applies the drain's own predicates. Guarded by
   `queue_drain_skips_rows_under_a_t2_block`.
-- The admin *Logout* button was a CSRF-able POST. `/admin/logout`
-  sat outside the protected nest, so an attacker page that could
-  auto-submit a cross-site form signed the operator out at will. The
-  route moved inside, where `require_auth` and `csrf_protect` both
-  run; the form in `base.html` already ships the `_csrf` field. Guarded
-  by `logout_requires_session_and_csrf`.
+- The admin *Logout* button was a CSRF-able POST; `/admin/logout` sat
+  outside the protected nest, so an attacker page could sign the
+  operator out at will. The route moved inside, where `require_auth`
+  and `csrf_protect` both run.
 - A `Host` header holding userinfo leaked the export token into a
-  link. The link-builder stripped the port with its own parser and
-  never canonicalized, so `name@evil.com` was emitted verbatim into
-  `http://name@evil.com/export/alive/{token}`: the link sends the
-  operator, and anyone who clicks it, to an attacker-controlled host
-  with the token as the query. It runs the same canonicalizer as the
-  gate, even with the empty allowlist the gate itself skips. Guarded
-  by `build_serve_link_host_never_emits_userinfo`.
+  link (`name@evil.com` was emitted verbatim into the export URL).
+  The link runs the same canonicalizer as the gate now.
 - Config import accepted a pipeline 16× larger than the edit form
-  allows. The `PIPELINE_BYTES` cap (65536) was applied by the source
-  and profile forms but not by the import validator, so a file could
-  plant a pipeline up to the 1 MiB body limit; the stored JSON is
-  re-rendered into every edit form and recompiled by the preview.
+  allows; the `PIPELINE_BYTES` cap (65536) applies to the import
+  validator now.
 - A repeated source reference in one profile aborted the import
-  halfway. `profile_sources` is keyed by `(profile_id, source_id)`,
-  so a hand-edited file naming the same reference twice failed the
-  whole composition insert *after* the profile row was committed,
-  leaving an empty profile behind a 500. A repeat now collapses to
-  its first position. Two *source rows* sharing one reference are a
-  new hard error instead: the reference is the join key that binds
-  the rows together and the write phase keys new ids by it, so the
-  file does not say which row a profile composition means
-  (`val.dup_ref` in both catalogs). `/admin/export` never emits
-  either shape, so this only ever sees a hand-edited file. Guarded
-  by `repeated_source_reference_stores_the_source_once`.
-- The *Edit source* form mangled header values containing a bullet.
-  The mask restore matched on `value.contains('•')` and looked the
-  original up by header name, so a real value the operator typed with
-  a bullet in it (`tok•en`) was silently replaced by the stored
-  secret, and a secret whose key the operator renamed was dropped and
-  the literal mask `abc…••••` was sent upstream. The restore now
-  matches on the mask itself, so a renamed key keeps its secret and a
-  typed value is a value.
+  halfway, leaving an empty profile behind a 500. A repeat now
+  collapses to its first position; two *source rows* sharing one
+  reference are a hard error instead (`val.dup_ref`).
+- The *Edit source* form mangled header values containing a bullet: a
+  typed value was silently replaced by the stored secret, and a renamed
+  key had its secret dropped. The restore matches on the mask itself
+  now, so a renamed key keeps its secret and a typed value is a value.
 - The sing-box / Xray parser dropped every credential of a
   multi-user endpoint. The builders took `users.first()` and emitted
   one entry, silently and with no invalid counter to show for it, so a
@@ -1423,107 +857,52 @@ are stamped when the batch is published.
   invalid instead of vanishing. Guarded by
   `every_user_of_an_xray_endpoint_becomes_an_entry`.
 - Two Clash-advertised nodes differing only in a connection-defining
-  field deduplicated into one row. The dedup key counted the URI
-  spellings of a parameter only, so the Clash ones (`servername`,
-  `network`, `ws-path`, `client-fingerprint`, `grpc-service-name`,
-  plus the URI-less `ws-headers`, `ws-opts` and `reality-opts`
-  blocks, stored verbatim) were invisible to the dedup key and the
-  upsert overwrote one node with the other. The spellings that do
-  have a URI form are now canonicalized onto it, so the same node
-  advertised as Clash YAML and as a URI still deduplicates together.
-  Guarded by `clash_spellings_are_security_relevant`,
-  `clash_structured_fields_are_security_relevant` and
-  `clash_and_uri_spellings_agree`.
-- Fingerprint pre-images could be forged from inside a value. The
-  pairs were joined with `&` and `k=v` unescaped, so
-  `path=/search` + `host=evil` and the single parameter
-  `host=evil&path=/search` hashed identically, so attacker-controlled
-  feed text choosing which of two nodes a dedup keeps. Keys and
-  values are now escaped, `%` included, so escaping is reversible.
-  Guarded by `separator_bytes_in_values_cannot_forge_a_pair`.
-- URI serialization emitted parameter values verbatim. The Clash and
-  sing-box parsers feed the same `Param` list with *decoded* text
-  from YAML / JSON scalars, so a value can carry a raw `&` or `#`:
-  `&` spawned a bogus extra parameter and `#` swallowed the proxy
-  name (everything after the first `#` is the fragment). Only the
-  query delimiters, space and the C0 controls are escaped now; `%`
-  is deliberately left alone, which is what keeps a value the URI
-  parsers stored still percent-encoded byte-exact. Guarded by
-  `query_delimiters_in_values_do_not_corrupt_the_line` and
-  `already_encoded_values_are_not_double_encoded`.
-- SSRF policy missed two IPv6 spellings of a blocked address. Only
-  the mapped form (`::ffff:0:0/96`) was vetted, so `[::a9fe:a9fe]`,
-  the metadata endpoint in the deprecated IPv4-compatible `::/96` form,
-  walked past the policy; the deprecated site-local block
-  `fec0::/10` was not blocked at all, despite being routable unicast
-  space an internal service can be addressed on. `::/96` is now vetted
-  as the embedded IPv4 (`::8.8.8.8` stays public, it is not a blanket
-  prefix ban). Guarded by
-  `ipv4_compatible_and_site_local_v6_are_blocked`.
-- A database path with a percent escape opened the wrong file. The
-  path was interpolated into a `sqlite:` URL string and sqlx
-  URI-parsed it, so a database file named `pl%2Fain.db` was opened as
-  `pl/ain.db`, a file that does not exist, or worse one that does
-  and was never chmod'ed to 0600, while the file
-  `pre_create_db_file` had just created with mode 0600 sat unused.
-  The path now reaches SQLite as a `PathBuf`. Guarded by
+  field deduplicated into one row: the dedup key counted the URI
+  spellings of a parameter only, so the Clash ones were invisible to it.
+  The spellings that do have a URI form are canonicalized onto it now.
+- Fingerprint pre-images could be forged from inside a value (the
+  pairs were joined unescaped, so two different parameter sets hashed
+  identically); keys and values are escaped now, `%` included. Guarded by
+  `separator_bytes_in_values_cannot_forge_a_pair`.
+- URI serialization emitted parameter values verbatim: a raw `&`
+  spawned a bogus extra parameter and `#` swallowed the proxy name.
+  Only the query delimiters, space and the C0 controls are escaped now. Guarded by
+  `query_delimiters_in_values_do_not_corrupt_the_line`.
+- SSRF policy missed two IPv6 spellings of a blocked address (the
+  deprecated IPv4-compatible `::/96` form and the site-local block
+  `fec0::/10`); both are vetted now.
+  Guarded by `ipv4_compatible_and_site_local_v6_are_blocked`.
+- A database path with a percent escape opened the wrong file (the
+  path was interpolated into a `sqlite:` URL string and URI-parsed);
+  the path now reaches SQLite as a `PathBuf`. Guarded by
   `connect_pool_opens_the_literal_path_without_uri_decoding`.
 - `database.max_connections = 0` surfaced as a 30-second startup
-  stall. sqlx accepts a zero-sized pool and then fails every
-  acquisition with `PoolTimedOut` after its acquire timeout, so a
-  typo in `[database]` cost the operator a stall and an error that
-  never named the offending key. It is rejected before the pool or
-  the file exists. Guarded by `connect_pool_rejects_zero_max_connections`.
-- The migration-checksum self-heal hid a possible DDL gap. sqlx
-  hashes the whole file and never re-runs an applied migration, so a
-  re-stamp cannot tell a comment edit from a DDL edit: the boot
-  recovered with a single `warn` and the schema stayed behind the
-  files, discoverable only by noticing a missing column much later.
-  The affected versions are now logged at `error` level with the
-  instruction to ship a new migration file, and recorded under
-  `meta.migrations_repaired` so the fact survives the boot log. A
-  repair that rewrote nothing re-raises the original mismatch instead
-  of claiming a repair that did not happen. The gap itself is *not*
-  closed and is not meant to be: the re-stamp is bookkeeping only, so
-  an edited already-applied migration is still never applied; only a
-  new migration file can bring the schema up to date, which is why
-  the repair now shouts instead of helping. Guarded by
+  stall; it is rejected before the pool or the file exists. Guarded by
+  `connect_pool_rejects_zero_max_connections`.
+- The migration-checksum self-heal hid a possible DDL gap: the
+  affected versions are now logged at `error` level with the
+  instruction to ship a new migration file, and a repair that rewrote
+  nothing re-raises the original mismatch. Guarded by
   `migrate_records_the_repaired_versions_in_meta`.
 - The `repair_migration_checksums` example re-stamped rows that were
-  already current, reported them as repairs, and had its own copy of
-  the UPDATE, and the `success = 1 AND checksum != ?2` guards could
-  drift from the copy `migrate()` uses. It now calls
-  `db::repair_migration_checksums`, says "already current" for the
-  rest, and refuses a database carrying a migration this build does
-  not embed (a newer Fumox) instead of leaving `migrate()` to fail
-  with `VersionMissing`. Guarded by
+  already current and had its own copy of the UPDATE; it now calls
+  `db::repair_migration_checksums` and refuses a database carrying a
+  migration this build does not embed. Guarded by
   `repair_leaves_migrations_this_build_does_not_embed_alone`.
-- With the geo resolver inactive (geo disabled, or the `.mmdb` files
-  absent, the default configuration), `drop_entries` zipped the
-  entries against an *empty* stamp slice and returned nothing, so a
-  source with any `drop` rule was reconciled empty and retired
-  wholesale. The lookup is indexed with `geo.get(idx)`: entries past
-  the end of the slice count as unstamped and survive, and regex
-  rules (which need no stamp) still fire. Guarded by
+- With the geo resolver inactive, `drop_entries` zipped the entries
+  against an *empty* stamp slice and returned nothing, so a source with
+  any `drop` rule was reconciled empty and retired wholesale. The
+  lookup is indexed with `geo.get(idx)` now: entries past the end of
+  the slice count as unstamped and survive, and regex rules still fire. Guarded by
   `drop_entries_keeps_the_batch_when_the_geo_slice_is_short`.
 - A parse or DB failure suppressed re-fetching a source for a whole
-  TTL. The raw snapshot was written right after the fetch, before
-  anything was parsed or reconciled, but it *is* the freshness marker
-  (`Caches::raw_is_fresh`), so one bad payload stopped every
-  non-forced fetch until the TTL elapsed while the scheduler kept
-  reporting successful ingests. It is now written only once the
-  payload has parsed and reconciled. Guarded by
+  TTL (the raw snapshot *is* the freshness marker); it is written only
+  once the payload has parsed and reconciled. Guarded by
   `a_parse_failure_leaves_no_fresh_raw_snapshot`.
 - A background re-render that started before an ingest committed
-  stored its pre-commit rows with a full fresh TTL. The put landed
-  after `invalidate_processed_for_source` and the invalidated key
-  served the old rows as fresh until the TTL expired, the very
-  staleness the invalidation had just ended. Every invalidation now
-  bumps a per-key generation, the re-render claims the generation
-  before it starts, and `processed_put_revalidated` drops a rendering
-  whose generation moved (including one that moved between the check
-  and the insert). Guarded by
-  `revalidation_started_before_an_ingest_does_not_store_its_rendering`.
+  stored its pre-commit rows with a full fresh TTL: every invalidation
+  now bumps a per-key generation, and a rendering whose generation
+  moved is dropped.
 - A cached `/sub` and `/src` snapshot outlived an unrecoverable
   upstream error. Stale-while-revalidate spawned the re-render, the
   render returned the documented `http_client` verdict, and the stale
@@ -1563,17 +942,14 @@ are stamped when the batch is published.
   wrong-but-plausible file was kept for another month. The
   `database_type` the metadata block declares must now match the
   slot, and the type only counts *after* the marker (a city name in
-  the data section is not a declaration). This is a format and
-  identity check, not provenance: the mirrors publish no checksum to
-  pin here. Guarded by
+  the data section is not a declaration). Guarded by
   `a_well_formed_file_of_the_wrong_kind_is_refreshed`.
 - The unattended GeoLite2 download followed any redirect. The client
   used `Policy::limited(MAX_REDIRECTS)`, which follows off https and
   to any host, so a hijacked release or a mis-typed URL could deliver
   a foreign file into `db_dir`. Redirects are now https-only, capped,
   and restricted to `github.com` and the `*.githubusercontent.com`
-  release-asset CDN. Guarded by
-  `a_redirect_off_the_mirror_hosts_is_refused`.
+  release-asset CDN. Guarded by `a_redirect_off_the_mirror_hosts_is_refused`.
 - The smoke stand could overwrite the main stack's config. Named
   volumes are project-scoped but the `./config` bind mount is the
   same host directory for every compose project, so the smoke
@@ -1590,28 +966,20 @@ are stamped when the batch is published.
   release keeps the previous behaviour.
 - A `ready` proxy rendered the `unknown` badge on the proxy detail
   card. The template's badge chain had no `ready` arm, so a
-  tunnel-verified proxy fell through to the `else`. Guarded by the
-  admin-side assertion added next to the existing `/export/ready/`
-  card check.
+  tunnel-verified proxy fell through to the `else`.
 - The admin panel's *Create from defaults* button could never work.
-  `is_writable` tested writability by opening the path for write,
-  which fails with `EISDIR` on a directory, and the handler hands it
-  `config/`, the directory, while the same call on the *file* path in
-  `admin/mod.rs` takes the missing-file branch and answers true. The
-  button's state and its handler disagreed about one question, so an
-  operator with no `config/app.toml` got a "not writable" error about
-  a directory the process could plainly write to. A directory is now
-  answered with the `create_new` probe the missing-file branch
-  already used. Guarded by
-  `is_writable_returns_true_for_writable_directory`.
+  Writability was tested by opening the path for write, which fails
+  with `EISDIR` on a directory, and the handler hands it `config/` —
+  so an operator with no `config/app.toml` got a "not writable" error
+  about a directory the process could plainly write to. A directory is
+  now answered with the `create_new` probe the missing-file branch
+  already used. Guarded by `is_writable_returns_true_for_writable_directory`.
 - The dedup key ignored TLS certificate pinning, so two nodes
   differing only in the certificate they pin shared one key and the
   second was overwritten by reconcile's `ON CONFLICT`, vanishing
-  from the database and from every subscription. The pin counts in the
-  dedup key in either spelling now (`pinSHA256`, with Clash's
-  `fingerprint` folded onto it); listing both keys instead would
-  have split a node published as Clash YAML from the same node
-  published as a URI. Guarded by `cert_pin_is_security_relevant`.
+  from the database and from every subscription. The pin now counts in
+  either spelling (`pinSHA256`, with Clash's `fingerprint` folded onto
+  it). Guarded by `cert_pin_is_security_relevant`.
 - The dedup key ignored several more connection-defining parameters,
   so two nodes differing only in one of them collapsed onto one row
   and the upsert silently overwrote the first with the second. The
@@ -1619,191 +987,143 @@ are stamped when the batch is published.
   `:authority` override, the snell `version` protocol revision,
   `obfs-host`, hysteria2's `ports` port-hopping range, tuic's
   `udp_relay_mode` and `disable_sni`; and for vmess the cipher and
-  the alter id as Clash spells them (`cipher`/`alterId` are folded
-  onto the URI spellings `scy`/`aid`, the same per-scheme aliasing
-  `network`→`net` already had). The one toggle vocabulary shared by
-  the dedup key, the output writers and the forbid-insecure filter
-  also learned the `yes`/`on` spellings: a Clash `allowInsecure: yes`
+  the alter id as Clash spells them (`cipher`/`alterId` folded onto
+  the URI spellings `scy`/`aid`). The shared toggle vocabulary also
+  learned the `yes`/`on` spellings: a Clash `allowInsecure: yes`
   used to contribute nothing to the pre-image and merged with the
-  verification-on variant of the same node. Guarded by
-  `newly_covered_security_params_split_nodes`,
-  `two_vmess_nodes_differing_only_in_cipher_do_not_collapse`,
-  `clash_and_uri_spellings_agree_for_vmess` and the `yes`/`on` cases
-  in `insecure_aliases_collapse` / `falsy_insecure_equals_absent`.
+  verification-on variant of the same node.
   Upgrade note: every node carrying one of these parameters or
   spellings hashes differently now. The stored rows are recomputed on
   the first start after the upgrade (see the *dedup key version* entry
   below), so the node keeps its row, its status and its probe history
-  under the new key.
+  under the new key. Guarded by `newly_covered_security_params_split_nodes`.
 - A vless proxy that arrived from a Clash YAML source was served to
   sing-box clients as plaintext. mihomo spells the toggle `tls: true`
   and the SNI `servername`; the sing-box writer's TLS decision read
-  only `security`/`sni`, matched neither, and emitted no `tls` object
-  at all, while the same proxy as a `vless://` URI encoded
-  correctly and the Clash writer kept both spellings. The decision now
-  reads an explicit `tls` toggle first and returns from it, so a
-  `tls: false` carrying a stray `servername` stays plaintext too.
-  Guarded by `vless_from_clash_input_keeps_tls_and_servername` and
-  `clash_tls_false_outranks_a_stray_servername`.
+  only `security`/`sni`, matched neither and emitted no `tls` object
+  at all, while the same proxy as a `vless://` URI encoded correctly.
+  The decision now reads an explicit `tls` toggle first and returns
+  from it, so a `tls: false` carrying a stray `servername` stays
+  plaintext too. Guarded by `vless_from_clash_input_keeps_tls_and_servername`.
 - One malformed endpoint discarded every good one in an Xray
-  outbound. The `vnext` and `servers` builders returned `Err` from
-  inside their per-element loop, and the caller turned that into a
-  single `invalid` count without keeping the entries already built,
-  so a two-endpoint vless whose first user was valid and second was
-  not, yielded zero entries. A bad element now costs only itself, and
-  `Err` is raised once after the loop, only when nothing at all was
-  built, so a fully malformed outbound is still counted `invalid`.
-  Guarded by `an_unusable_vnext_element_keeps_the_earlier_endpoints`
-  and `a_malformed_xray_server_element_keeps_the_earlier_endpoints`.
+  outbound. The `vnext` and `servers` builders failed inside their
+  per-element loop, so a two-endpoint vless whose first user was
+  valid and second was not yielded zero entries. A bad element now
+  costs only itself, and the failure is raised only when nothing at
+  all was built, so a fully malformed outbound is still counted
+  `invalid`.
+  Guarded by `an_unusable_vnext_element_keeps_the_earlier_endpoints`.
 - A Clash-sourced vless/vmess node was health-checked as plain TCP.
-  `t1::check_kind` decided TCP-vs-TLS from `security` alone, but the
-  Clash parser never emits that key (it stores `tls`/`servername`),
-  so a node with broken TLS was marked `alive` and served, while the
-  same node from a URI spelling was correctly walked to quarantine.
-  The verdict depended on which feed the node arrived in. The
-  decision now accepts both producer vocabularies, case-insensitively,
-  mirroring the Clash writer that already understood both. Guarded by
+  The Clash parser stores `tls`/`servername` and never emits
+  `security`, so the verdict read plain TCP: a node with broken TLS
+  was marked `alive` and served, while the same node from a URI
+  spelling was correctly walked to quarantine. The decision now
+  accepts both producer vocabularies, case-insensitively. Guarded by
   `clash_and_uri_spellings_agree_on_tls`.
 - An export→import round trip could silently strip a profile's slug.
-  `apply_import` seeded one `taken_slugs` set from both the sources
-  and the profiles tables and handed it to every object, but the two
-  slugs live in separate namespaces (independent `UNIQUE` columns on
-  two different tables, resolved per table). A source always claimed a
-  shared slug first, so the profile was written without one and its
-  `/sub/{slug}` URL became `/sub/{id}`, breaking every client already
-  pointed at it, with only a warning in the import summary. The claim
-  set is now per table. A comment in the same function naming
-  `/sub/{slug}` for both sides was wrong about the routes too, and is
-  corrected. Guarded by `a_source_and_a_profile_may_hold_the_same_slug`.
+  The two slugs live in separate namespaces (independent `UNIQUE`
+  columns on two different tables), but one claim set was seeded from
+  both tables, so a source always claimed a shared slug first: the
+  profile was written without one and its `/sub/{slug}` URL became
+  `/sub/{id}`, breaking every client already pointed at it, with only
+  a warning in the import summary. The claim set is now per table. Guarded by
+  `a_source_and_a_profile_may_hold_the_same_slug`.
 - Opening a proxy card could wipe the country ingest had resolved.
-  The geo resolver needs only one backend to hit, so a host in the
-  Cloudflare block returned an ASN with no country, and both
-  `update_geo_full`, which bound all three columns unconditionally,
-  unlike every other writer in the tree, and the `ProxyRow` handed
-  to the template, overwrote the stored facts with NULL. The card
-  showed `-` for a row the database still knew. The columns are now
-  `COALESCE`d like the reconcile upsert, and the call site merges the
-  stamp instead of replacing the row's fields with it. Guarded by
-  `update_geo_full_keeps_stored_facts_a_partial_stamp_cannot_replace`
-  and `a_partial_stamp_does_not_clear_the_rendered_geo_fields`.
+  A host in the Cloudflare block resolves to an ASN with no country,
+  and both the writer that bound all three columns unconditionally and
+  the row handed to the template overwrote the stored facts with NULL,
+  so the card showed `-` for a row the database still knew. The
+  columns are now `COALESCE`d like the reconcile upsert, and the call
+  site merges the stamp instead of replacing the row's fields with it. Guarded by
+  `update_geo_full_keeps_stored_facts_a_partial_stamp_cannot_replace`.
 - The probe ladder editor accepted values the server refuses to boot
-  from. `i64_list_field` checked only that each line parsed as an
-  integer and that the list was non-empty, with no step cap and no
-  range check, while the canonical loader enforces at most 16 steps
-  each within a month and both binaries abort on a bad file. The
-  panel reported success and the next restart of `fumox-server` and
+  from. The editor checked only that each line parsed as an integer
+  and that the list was non-empty, with no step cap and no range
+  check, while the canonical loader enforces at most 16 steps each
+  within a month and both binaries abort on a bad file. The panel
+  reported success and the next restart of `fumox-server` and
   `fumox-probe` died on the file it had just written. The bounds are
-  now the loader's, and the test beside it pins that an accepted
-  ladder round trips through `config::load_config` while a rejected
-  one never reaches the file. Guarded by
+  now the loader's. Guarded by
   `recheck_ladder_bounds_match_the_canonical_loader`.
-- A source's own `limit.count` capped the entire merged profile. When
-  a profile declared no explicit sort, the sort winner was a
-  *source's* compiled pipeline, and its `finalize` truncated the
-  merged cross-source vector, so a two-source profile whose first
-  source set `limit: {count: 2}` served 2 nodes instead of 5,
-  contradicting the comment above the code. Only a profile-level cap
-  now truncates the merged list. Behaviour change for operators: a
-  multi-source profile whose source set `limit.count` will now serve
-  more proxies than before, because each source's top is served up to
-  that count. Both guides' `limit` row now says so. Guarded by
+- A source's own `limit.count` capped the entire merged profile. A
+  two-source profile whose first source set `limit: {count: 2}` served
+  2 nodes instead of 5. Only a profile-level cap now truncates the
+  merged list. Behaviour change for operators: a multi-source profile
+  whose source set `limit.count` will now serve more proxies than
+  before, because each source's top is served up to that count. Both
+  guides' `limit` row now says so. Guarded by
   `source_limit_does_not_truncate_the_other_sources`.
 - Two overlapping settings submissions silently lost one change while
   both reported success. The editor's load → mutate → save ran
-  unsynchronised (the temp-file counter in `save` covered only the
-  rename half of the race), and the write button carries no
-  double-submit guard, so a double-click issued two POSTs and the
-  second rename published a document snapshotted before the first
-  landed. `EditableConfig` now holds a lock across the whole cycle,
-  released on drop. That lock is not reentrant, and the plain loader
-  must never take it: the admin handler re-reads through
-  `config::load_config` while the editor handle is alive, so a loader
-  that took it would hang the request and the panel would stop saving.
-  Both rules are pinned by a test. Guarded by
+  unsynchronised, and the write button carries no double-submit guard,
+  so a double-click issued two POSTs and the second rename published a
+  document snapshotted before the first landed. The editor now holds a
+  lock across the whole cycle, released on drop. That lock is not
+  reentrant and the plain loader must never take it: the admin handler
+  re-reads through `config::load_config` while the editor handle is
+  alive, so a loader that took it would hang the request and the panel
+  would stop saving. Guarded by
   `overlapping_edits_do_not_lose_the_first_change`.
 - The same vmess node advertised as Clash YAML and as a `vmess://`
   link got two fingerprints, two rows and two entries in every
-  subscription. Clash's `network` is folded onto the URI spelling of
-  the same field to stop exactly that, but vmess's other spellings call
-  the same field `net`; the fold is per-scheme now, onto `net` for
-  vmess and `type` for the rest. The alias test beside it only ever
-  covered vless, whose URI spelling really is `type`. Guarded by
+  subscription. The fold of Clash's `network` onto the URI spelling is
+  per-scheme now, onto `net` for vmess and `type` for the rest. Guarded by
   `clash_and_uri_spellings_agree_for_vmess`.
 - A Clash socks5 entry carrying only `username` was stored as
-  `onlyuser` rather than `onlyuser:`, and both output writers guard
-  on `split_once(':')`, so the outbound carried no username and no
-  password and the authentication was lost silently. Credentials are
-  now joined positionally, with an absent field keeping its slot. The
-  leading slot is per-spec: socks5 keeps it, because both writers
-  treat an empty first part as absent, while shadowsocks does not,
-  because its writers default the method only on a colon-less
-  credential. Guarded by
+  `onlyuser` rather than `onlyuser:`, and both output writers split
+  on the colon, so the outbound carried no username and no password
+  and the authentication was lost silently. Credentials are now joined
+  positionally, with an absent field keeping its slot. The leading slot
+  is per-spec: socks5 keeps it, while shadowsocks does not, because its
+  writers default the method only on a colon-less credential. Guarded
+  by `a_password_only_socks5_keeps_its_credential`. Guarded by
   `a_password_only_socks5_keeps_its_credential`.
 - Bulk revival enqueued the oldest proxies rather than the newest.
-  `enqueue_checks` claims in its comment that the newest ids win the
-  limit, but it walked the caller's id list in chunks oldest-first, so
-  the per-chunk `ORDER BY p.id DESC LIMIT ?` spent the whole limit on
-  the first 500 ids and everything above that was never considered. It
-  now chunks a descending-sorted, deduped copy, so chunking and
-  newest-wins can agree at all. Guarded by
+  It walked the caller's id list in chunks oldest-first, so the
+  per-chunk `ORDER BY p.id DESC LIMIT ?` spent the whole limit on the
+  first 500 ids and everything above that was never considered. It now
+  chunks a descending-sorted, deduped copy. Guarded by
   `enqueue_prefers_the_newest_ids_across_chunk_boundaries`.
 - A permanently dead source was re-fetched every 30 seconds for the
-  life of the deployment. A failed fetch writes no timestamp (the
-  column is documented as *last successful fetch* and a test pins
-  that), and the scheduler read a NULL as due-now, with no failure
-  backoff anywhere, so a 401, a dead DNS name or a body that no longer
-  parses got the same cadence as a healthy source. The sweep now
-  applies an exponential backoff read from the fetch journal,
-  doubling from 60 s to a 3600 s cap, and consults the journal only
-  for sources whose recorded error class says the last attempt
-  failed, so a healthy source pays no extra query. Guarded by
-  `a_dead_source_is_not_refetched_on_every_sweep`.
+  life of the deployment. A failed fetch writes no timestamp and the
+  scheduler read a NULL as due-now, with no failure backoff anywhere,
+  so a 401, a dead DNS name or a body that no longer parses got the
+  same cadence as a healthy source. The sweep now applies an
+  exponential backoff read from the fetch journal, doubling from 60 s
+  to a 3600 s cap. Guarded by `a_dead_source_is_not_refetched_on_every_sweep`.
 - The probe could lose the only address family a proxy was reachable
-  on. `vet_probe_host_addrs` truncated the vetted list to four before
-  the caller picked a family, and `pick_vetted` falls back to the
-  first address, so a CDN hostname publishing four or more AAAA
-  records had every working A record truncated away, and the probe
-  dialled, or pinned meow-rs to, an address it could not use. The cap
-  now reserves a slot for the first address of each family present.
-  The list is still at most four long, so the dial budget the cap
-  exists to bound is unchanged, and the fetcher path, which filters
-  by family before vetting, was never affected. Guarded by
-  `vetted_address_cap_keeps_both_families`.
+  on. The vetted list was truncated to four before the caller picked a
+  family, so a CDN hostname publishing four or more AAAA records had
+  every working A record truncated away, and the probe dialled, or
+  pinned meow-rs to, an address it could not use. The cap now reserves
+  a slot for the first address of each family present; the list is
+  still at most four long. Guarded by `vetted_address_cap_keeps_both_families`.
 - Every T2 batch charged healthy TLS proxies a tunnel failure. The
   pin substitutes the vetted IP into `server`, and `sni`/`servername`
-  is emitted only when the entry already carries it (the normal
-  shape of a `trojan://pass@example.com:443#n` line), so mihomo had
-  no name to verify the certificate against and fell back to the IP
+  is emitted only when the entry already carries it, so mihomo had no
+  name to verify the certificate against and fell back to the IP
   literal, while the mapping deliberately does not force
   `skip-cert-verify`. Pinning now carries the entry's own server
   name, or failing that the pre-pin hostname, under the key the writer
   reads for that scheme; an entry already hosted on an IP literal is
-  left alone. Guarded by
-  `pinning_keeps_a_tls_server_name_for_a_bare_entry`.
+  left alone. Guarded by `pinning_keeps_a_tls_server_name_for_a_bare_entry`.
 - One probe cycle could charge a single dead proxy two failures. The
-  queued lane and the random lane run back to back and their
-  selectors overlapped completely (claiming a row only deletes the
-  queue row, it does not change the proxy's status), so the same proxy
-  could reach the ladder's limit in one cycle instead of across
-  three, and one that failed the queue lane and then passed the
-  random lane had its counter reset in the same breath. The queue lane
-  now hands its claimed ids to the random lane, which filters them
-  out of the draw; the overlap is closed in the probe rather than in
-  the core selectors it reads through. Guarded by
+  queued lane and the random lane run back to back and their selectors
+  overlapped completely, so the same proxy could reach the ladder's
+  limit in one cycle instead of across three, and one that failed the
+  queue lane and then passed the random lane had its counter reset in
+  the same breath. The queue lane now hands its claimed ids to the
+  random lane, which filters them out of the draw. Guarded by
   `queued_and_random_t1_lanes_do_not_double_charge_a_cycle`.
 - A client could pick its own rate-limit key, including on the admin
   login brute-force cap, behind a `Forwarded`-emitting reverse proxy
-  that leaves `X-Forwarded-For` alone. `client_key` tried XFF first
-  and only fell through to `Forwarded` when XFF yielded nothing, and
-  `walk_xff` cannot tell a client-authored entry from a
-  proxy-appended one, so a forged header short-circuited the one the
-  proxy actually signed. An exhausted all-trusted chain in one header
-  is now evidence that the peer wrote that header, and the client
-  named by the other wins. The trade-off is documented rather than
-  hidden: when two proxies each write one header and they disagree,
-  requests share the per-deployment bucket (5 requests per 60 s by
-  default), the cost of not being able to tell which header the
-  deployment's proxy writes. Guarded by
+  that leaves `X-Forwarded-For` alone. A forged header short-circuited
+  the one the proxy actually signed. An exhausted all-trusted chain in
+  one header is now evidence that the peer wrote that header, and the
+  client named by the other wins. The trade-off is documented rather
+  than hidden: when two proxies each write one header and they
+  disagree, requests share the per-deployment bucket (5 requests per
+  60 s by default). Guarded by
   `a_two_proxy_chain_writing_one_header_each_keeps_the_client_key`.
 - A profile with an access token could never be saved again. The
   edit form re-renders the masked placeholder `abc…••••`, which the
@@ -1811,420 +1131,345 @@ are stamped when the batch is published.
   "unchanged mask keeps the stored secret" fixup, so the whole save
   aborted with 422 and the profile's name, slug, output format,
   country allowlist and source composition were all frozen. The mask
-  is now matched exactly, the rule the sources page already used for
-  header secrets, so a token the operator actually typed is validated
+  is now matched exactly, so a token the operator typed is validated
   like any other value. Guarded by
   `a_typed_bullet_is_not_mistaken_for_the_mask`.
 - Three admin screens answered `500` for a host the panel had
   already admitted. The router gates on `[admin].allowed_hosts` but
-  builds the serve links against the separate `[server].allowed_hosts`,
-  and all three callers turned that rejection into an internal error,
-  so on a deployment that pins both lists, which is the reason both
-  exist, *Import / Export*, *Sources* and *Profiles* were
-  unreachable. The links are now built against the host that reached
-  the panel. Note that the link then carries the panel's own host, so
-  on a split allowlist it still 404s when the public listener is
-  clicked; that trade-off is documented in place of the 500.
-  Guarded by `serve_link_pages_render_for_an_admin_allowlisted_host`.
+  built the serve links against the separate `[server].allowed_hosts`,
+  so on a deployment that pins both lists *Import / Export*, *Sources*
+  and *Profiles* were unreachable. The links are now built against the
+  host that reached the panel. The link then carries the panel's own
+  host, so on a split allowlist it still 404s when the public listener
+  is clicked; that trade-off is documented in place of the 500. Guarded
+  by `serve_link_pages_render_for_an_admin_allowlisted_host`. Guarded by
+  `serve_link_pages_render_for_an_admin_allowlisted_host`.
 - The copyable endpoint link on a token-protected profile's page
   answered 403 when clicked: the serve endpoint's token gate rejects
   a URL without `?token=`, and the link was built without one. The
-  link now carries the token in its query string. Deliberate despite
-  the masked token row beside it: the mask keeps the stored secret
-  from casual display, while the link is the artifact the operator
-  hands to clients and cannot work without the secret. The token
-  charset cap (alphanumeric plus `-_.~`) keeps it URL-safe without
-  escaping.
+  link now carries the token in its query string. The mask keeps the
+  stored secret from casual display, while the link is the artifact the
+  operator hands to clients and cannot work without the secret. The
+  token charset cap (alphanumeric plus `-_.~`) keeps it URL-safe
+  without escaping.
 - A cold render could be cached as fresh for a full source TTL after
-  an ingest. The generation counter exists so an invalidation drops a
-  rendering computed from pre-ingest rows, but the cold path stored
-  unconditionally and `invalidate_processed_for_source` could only
-  bump keys it found by iterating existing entries, so a key with no
-  entry yet, which is exactly an in-flight cold render, was invisible
-  to it. The cold path now claims the key before rendering and stores
-  through the same guarded put the stale path already used. The bump
-  itself was a read-modify-write: two invalidations of the same key
-  (two sources feeding one profile, ingesting at once) could both
-  read G and write G+1, losing a bump and letting a render claimed
-  in between store behind the second one; bumps are serialized now.
-  Guarded by
+  an ingest. The cold path stored unconditionally, so a key with no
+  entry yet — exactly an in-flight cold render — was invisible to the
+  invalidation. The cold path now claims the key before rendering and
+  stores through the same guarded put the stale path already used. The
+  bump itself was a read-modify-write: two invalidations of the same
+  key could both read G and write G+1, losing a bump; bumps are
+  serialized now. Guarded by
   `inline_render_started_before_an_ingest_does_not_store_its_rendering`
-  and `concurrent_invalidations_do_not_lose_a_generation`.
+  and `concurrent_invalidations_do_not_lose_a_generation`. Guarded by
+  `revalidation_started_before_an_ingest_does_not_store_its_rendering`.
 - `X-Fumox-Warning: all-proxies-quarantined` was sent for profiles
   where nothing was quarantined. The predicate counted `ready` as a
-  hidden tier, contradicting the comment three lines above it, and
-  read the pre-filter population, so a `filter.protocols` (or ASN,
-  or drop-rule) filter that removed every ready proxy produced a
-  health warning. Only `quarantine` and `removed` count now: a
-  filter is a configuration fact, not a health one. Guarded by
+  hidden tier and read the pre-filter population, so a
+  `filter.protocols` (or ASN, or drop-rule) filter that removed every
+  ready proxy produced a health warning. Only `quarantine` and
+  `removed` count now: a filter is a configuration fact, not a health
+  one. Guarded by
   `a_filter_that_hides_every_ready_proxy_is_not_a_quarantine_warning`.
 - A proxy the probe had already quarantined or removed kept being
   served. `/sub` and `/src` stamp their cache entry with the source
   fetch TTL, but the probe is a separate process that moves rows
-  between tiers and nothing in the server reacts to it, so the only
-  ingest-time drop is gated on a fetch having changed something. The
-  window was therefore the feed-download interval: an hour by
-  default, up to 24 at the admin form's maximum. Rendered output is
-  now capped at 30 s of freshness, the same bound `alive_export`
-  already used for exactly this reason, and stale entries are still
-  served immediately while being re-rendered in the background.
-  Guarded by `rendered_output_is_not_fresh_for_a_whole_source_ttl`.
+  between tiers and nothing in the server reacts to it, so the window
+  was the feed-download interval: an hour by default, up to 24 at the
+  admin form's maximum. Rendered output is now capped at 30 s of
+  freshness, and stale entries are still served immediately while
+  being re-rendered in the background. Guarded by
+  `rendered_output_is_not_fresh_for_a_whole_source_ttl`.
 - A pipe in a host or credential could move a fingerprint field
   boundary. The pre-image joins its fields with a literal `|` and the
   escaping rewrote only `%`, `&` and `=`, so two malformed feed lines
   that both contained one collapsed into a single row and a node
-  vanished from the subscription, while the comment beside it
-  claimed the escaping made separators unforgeable. The separator is
-  escaped now, so the pre-image is injective in it, and the over-claim
-  is narrowed to what the code does: the scheme and the port are
-  written unescaped, one being a fixed enum literal and the other a
-  number by type. Guarded by
+  vanished from the subscription. The separator is escaped now, so the
+  pre-image is injective in it. Guarded by
   `pipe_in_a_field_cannot_shift_the_pre_image_boundary`.
 - The dashboard's "unprobeable (tuic/mieru)" sub-line could exceed
   the "Never checked yet" headline it sits under. The sub-line
   counted removed rows and the headline excluded them, so after
   *Remove unprobeable unknown* the panel read 0 with 300 beneath it.
-  The sub-line now carries the headline's own population filter.
-  Guarded by
+  The sub-line now carries the headline's own population filter. Guarded
+  by `unprobeable_count_excludes_rows_the_cleanup_button_retired`. Guarded by
   `unprobeable_count_excludes_rows_the_cleanup_button_retired`.
 - At `[probe].sample_size = 0` the probe page's backlog banner
-  reported the queue as a multiple of a sample that does not exist:
-  the two sample-proportional triggers divided the quarantine depth
-  by a `.max(1)` stand-in while the snapshot underneath printed the
-  real `0`, so a 25-row queue read "25× the per-cycle sample" above a
-  "sample 0/cycle". Both triggers now stay off at zero: there is no
-  sample to measure against, and the `all_idle` line already reports
-  the state with the numbers an operator can act on. The config bounds
-  table starts the sample at 1 and refuses the file at startup
-  otherwise, so the zero branch is now a guard rather than a state an
-  operator can reach. Guarded by
+  reported the queue as a multiple of a sample that does not exist, so
+  a 25-row queue read "25× the per-cycle sample" above a "sample
+  0/cycle". Both triggers now stay off at zero: there is no sample to
+  measure against, and the `all_idle` line already reports the state
+  with the numbers an operator can act on. The config bounds table
+  starts the sample at 1 and refuses the file at startup otherwise. Guarded by
   `sample_size_zero_reports_idleness_not_a_ratio_over_zero`.
 - The banner's `cycle_interval_secs` recommendation could ask for a
   cycle faster than the daemon's own heartbeat floor. The period is
-  `ceil(target / cycles)`, so a queue long enough to need many cycles
-  and a tight `connect_timeout_secs + tls_timeout_secs` land on
-  single-digit seconds: with `sample_size = 100`, `concurrency = 64`,
-  1 s timeouts and a 60 s cycle, a 10 000-row queue produced
-  `cycle_interval_secs = 2`. A cycle is several `SELECT`s across the
-  pool plus its writes, and the daemon already puts a `.max(5)` floor
-  on its beat period, so the recommendation now stays silent below
-  that instead of printing a value an operator should not set. The
-  knob itself is unaffected: a period the model can certify at or
-  above the floor still prints. Both guides' recommendation list
-  says so. Guarded by
-  `period_rec_never_lands_below_the_beating_floor`, and the whole
-  value space is swept by `recs_stay_inside_the_range_the_form_accepts`
-  so no knob can print a value outside the settings form's own range.
+  `ceil(target / cycles)`, so a long queue and a tight
+  `connect_timeout_secs + tls_timeout_secs` land on single-digit
+  seconds. The daemon puts a `.max(5)` floor on its beat period, so
+  the recommendation now stays silent below that instead of printing a
+  value an operator should not set. The knob itself is unaffected: a
+  period the model can certify at or above the floor still prints. Both
+  guides' recommendation list says so. Guarded by
+  `period_rec_never_lands_below_the_beating_floor` and
+  `recs_stay_inside_the_range_the_form_accepts`, so no knob can print
+  a value outside the settings form's own range.
 - Drop rules corrupted the geo pairing of everything after the
-  first dropped entry. The ingest path handed `reconcile_source` the
-  entry list after a source's pipeline drop rules had shortened it,
-  together with the geo stamps resolved for the list *before* the
-  drop. The two are paired by index, so every proxy past the first
-  dropped entry was stored carrying a neighbouring host's country
-  and ASN, so one IP could end up stamped with several autonomous
-  systems, and the admin ASN cleanup buttons then acted on that
-  noise. The drop pass now returns the stamps that belong to exactly
-  the surviving entries.
-  `scripts/repair-geo-stamps.sh` rewrites the already-corrupted
-  rows: it clears the three `geo_*` columns (after a backup) and
-  lets the startup backfill re-resolve every row from its own host,
-  verified on a copy of a production database, 23249 rows
-  re-stamped, 1162784 stamped rows re-checked against the resolver,
-  0 wrong, and the number of hosts carrying more than one ASN went
-  2510 → 0.
+  first dropped entry: the geo stamps were resolved for the list
+  *before* the drop and paired by index with the shortened list, so
+  every proxy past the first dropped entry was stored carrying a
+  neighbouring host's country and ASN, one IP could end up stamped
+  with several autonomous systems, and the admin ASN cleanup buttons
+  then acted on that noise. The drop pass now returns the stamps that
+  belong to exactly the surviving entries.
+  `scripts/repair-geo-stamps.sh` rewrites the already-corrupted rows:
+  it clears the three `geo_*` columns (after a backup) and lets the
+  startup backfill re-resolve every row from its own host, verified
+  on a copy of a production database: 0 wrong re-stamped rows and 0
+  hosts carrying more than one ASN.
 - The probe card's kernel RSS line reached the reader as literal
   HTML source: it was assembled with a `<time>` element inside and
-  rendered through an escaping handle, so the card showed
-  `<time class="ts" …>` text wrapped over four lines. The line is
-  plain text now (`RSS 24.5 MiB · 1.2% / 2.0 GiB`) and the timestamp
-  is rendered by the template as a proper `time` element beside it.
+  rendered through an escaping handle. The line is plain text now and
+  the timestamp is rendered by the template as a proper `time` element
+  beside it.
 - `scripts/revive-xhttp-proxies.sh`: a one-shot repair for the
-  vless+xhttp rows the pre-0.22 engine stranded in `removed`: the
-  transport did not exist there, every T2 check failed, the fail
-  ladder ran its course, and only the terminal status is wrong
-  (Fumox rendered the transport correctly all along). Linked rows
-  are revived and enqueued for priority checking;
-  `--include-unlinked` also adopts link-less rows into a source,
-  because every probe lane selects on the `proxy_source_links` row,
-  a revived row without a link sits in no lane at all and stays dead
-  whatever its feed does later. `--adopt-source` names the adoptive
+  vless+xhttp rows the pre-0.22 engine stranded in `removed` — the
+  transport did not exist there and every T2 check failed, while
+  Fumox rendered the transport correctly all along. Linked rows are
+  revived and enqueued for priority checking; `--include-unlinked`
+  also adopts link-less rows into a source, because every probe lane
+  selects on the `proxy_source_links` row and a revived row without a
+  link sits in no lane at all. `--adopt-source` names the adoptive
   source explicitly, `--no-adopt` revives without linking.
   `--restore` undoes a run safely: it verifies the backup before
   touching anything, refuses while anything has the database open,
-  snapshots what it is about to overwrite, deletes the write-ahead
-  log that would otherwise be replayed on top of the restored file,
-  and integrity-checks the result. The bare `cp` the script used to
+  snapshots what it is about to overwrite, deletes the write-ahead log
+  that would otherwise be replayed on top of the restored file, and
+  integrity-checks the result. The bare `cp` the script used to
   suggest fails either loudly (`database disk image is malformed`) or,
   worse, quietly: the log fits, the copy "succeeds",
   `PRAGMA integrity_check` prints `ok`, and the database holds the
   pre-restore data after all.
 - The admin event stream paid for events nobody consumed. It ran
   `count_by_status` when a connection opened and, every 30 s
-  thereafter, the counts plus two `meta` reads, emitting
-  `probe.stats` and `heartbeat` events; no
-  template ever listened to either (the panel reacts to `fetch.*`
-  only, re-broadcast as `fumox:refresh`), so every admin tab held a
-  query loop whose output was dropped on arrival. The tick is gone:
-  the stream forwards bus events, keeps its keep-alive and idle
-  hard cap, a lagged consumer logs what it lost instead of assuming
-  a periodic tick repairs state (nothing did), and the layout shows
-  a connection chip instead: hidden until the `EventSource` opens,
-  flipping to a *stale* state while the browser reconnects,
-  announced via `role=status`. Guarded by
-  `sse_stream_forwards_bus_events`.
+  thereafter, the counts plus two `meta` reads, emitting `probe.stats`
+  and `heartbeat` events; the panel reacts to `fetch.*` only,
+  re-broadcast as `fumox:refresh`, so every admin tab held a query
+  loop whose output was dropped on arrival. The tick is gone: the
+  stream forwards bus events, keeps its keep-alive and idle hard cap,
+  a lagged consumer logs what it lost, and the layout shows a
+  connection chip instead: hidden until the `EventSource` opens,
+  flipping to a *stale* state while the browser reconnects, announced
+  via `role=status`. Guarded by `sse_stream_forwards_bus_events`.
 - The probe screen judged the daemon against the *server's* config.
   `probe_heartbeat` carried only `{ts, pid, version}`, so the panel
-  thresholded staleness with its own `[probe].heartbeat_interval_secs`,
-  and the meow card rendered green for a `meow_last_ok` contact from
-  any point in the past. Server and probe may read different config
-  files (or env overlays), and a probe on a slower schedule than the
-  server's copy turned its still-alive badge stale. The heartbeat now
-  reports the daemon's effective beat and cycle periods, the panel
-  prefers the reported values (falling back to its own config, floor
-  5 s), the heartbeat verdict keeps its 3× rule, and the meow contact
-  goes stale after three daemon cycles. Guarded by
-  `heartbeat_threshold_mirrors_the_daemon_beat_period`,
+  thresholded staleness with its own
+  `[probe].heartbeat_interval_secs`, and the meow card rendered green
+  for a `meow_last_ok` contact from any point in the past. Server and
+  probe may read different config files (or env overlays), so a probe
+  on a slower schedule than the server's copy turned its still-alive
+  badge stale. The heartbeat now reports the daemon's effective beat
+  and cycle periods; the panel prefers the reported values (falling
+  back to its own config, floor 5 s), the heartbeat verdict keeps its
+  3× rule, and the meow contact goes stale after three daemon cycles.
+  Guarded by `heartbeat_threshold_mirrors_the_daemon_beat_period`,
   `meow_stale_threshold_is_three_cycles` and
   `heartbeat_payload_reports_the_effective_beat_and_cycle_periods`.
 - Neither daemon said which database it opened. The resolved
   `[database].path` is otherwise visible only on *Settings*, so a
   stream of scratch instances, containers and volume mounts made
-  "which file am I on" a guess, and pointing the probe at a
-  different file than the server surfaced only when the journals
-  diverged. Both processes now log `database configured` at startup
-  with the resolved path and the count of `FUMOX_*` overrides; the
-  count, not the names or values, so a surprise override is
-  attributable without logging secrets.
+  "which file am I on" a guess. Both processes now log
+  `database configured` at startup with the resolved path and the count
+  of `FUMOX_*` overrides; the count, not the names or values, so a
+  surprise override is attributable without logging secrets.
 - A panic inside one scheduler sweep silently stopped every later
-  one. The detached sweep task reset the overlap flag after the
-  `await`, so an unwind left `sweeping` stuck at `true` and the loop
-  skipped every future tick: no fetches, no error, only a dashboard
-  staying quiet. The flag now travels in a drop guard that resets it
-  on the normal path and on unwind alike. A panicked ingest task
-  names its source instead of vanishing into `is_some()`, and
-  shutdown got its missing half: `main` drops the refresh channel
-  (closing it is the scheduler's shutdown signal), awaits the loop
-  for at most 5 s so a wedged sweep cannot hold the process past its
-  budget, and names the sources still in flight as abandoned
-  mid-request, so a gap in `fetch_log` or an upstream's request log
-  has an explanation in ours. Guarded by
-  `sweep_guard_resets_the_flag_on_unwind`.
-- `/healthz` answered `ok` with a dead database. The route returned
-  a static string, so an instance whose only shared dependency was
-  gone kept telling the orchestrator it was fine while every
-  subscription 500'd. It now runs `SELECT 1` and answers
-  `503 database unavailable` when the pool stops answering, and it
-  *stays* after the public rate-limit layer on purpose: an exhausted
-  window must not make the liveness probe answer 429 and restart a
-  healthy instance. Both properties are pinned by tests that
-  exercise the layering without binding listeners:
-  `healthz_stays_outside_the_public_rate_limit`,
+  one: an unwind left the overlap flag stuck and the loop skipped every
+  future tick — no fetches, no error, only a dashboard staying quiet.
+  The flag now travels in a drop guard that resets it on the normal
+  path and on unwind alike. A panicked ingest task names its source
+  instead of vanishing, and shutdown got its missing half: the refresh
+  channel is dropped (closing it is the scheduler's shutdown signal),
+  the loop is awaited for at most 5 s so a wedged sweep cannot hold the
+  process past its budget, and the sources still in flight are named as
+  abandoned mid-request, so a gap in `fetch_log` has an explanation in
+  ours. Guarded by `sweep_guard_resets_the_flag_on_unwind`.
+- `/healthz` answered `ok` with a dead database, so an instance whose
+  only shared dependency was gone kept telling the orchestrator it was
+  fine while every subscription 500'd. It now runs `SELECT 1` and
+  answers `503 database unavailable` when the pool stops answering,
+  and it *stays* after the public rate-limit layer on purpose: an
+  exhausted window must not make the liveness probe answer 429 and
+  restart a healthy instance. Guarded by
+  `healthz_stays_outside_the_public_rate_limit` and
   `healthz_goes_red_when_the_database_is_closed`.
 - A scanner sending random `Host` headers to the export links
   logged one warning per request. The gate runs before the token
   check, so the warn is the only signal a misconfigured allowlist
-  leaves, but it was also a line a sweep of random hosts could
-  amplify indefinitely. Rejections now warn once per host per hour
-  (repeats drop to debug) and the registry is capped at 1024
-  distinct hosts, aged out by the same window, so an
-  unauthenticated flood can neither mirror itself into the log nor
-  pin memory. Guarded by
-  `host_reject_warns_once_per_host_per_window`,
+  leaves. Rejections now warn once per host per hour (repeats drop to
+  debug) and the registry is capped at 1024 distinct hosts, aged out
+  by the same window, so an unauthenticated flood can neither mirror
+  itself into the log nor pin memory. Guarded by
+  `host_reject_warns_once_per_host_per_window` and
   `host_reject_log_is_bounded_under_a_flood`.
 - A burst of requests on a cold subscription key rendered it once
-  per request. Each caller ran the full render (database reads plus
-  serialization) and all but one dropped the result, and the export
-  links' 30 s window had the same hole: every request landing on an
-  expired entry re-rendered the tier. Both paths now go through the
-  cache's inline-render claim: the first request renders, the rest
-  wake when its claim ends and serve the stored entry, claiming a
-  render only when the leader stored none (it failed, or an
-  invalidation superseded its put). The exports still never serve a
-  stale body, not even to a waiter. Guarded by
+  per request, and the export links' 30 s window had the same hole:
+  every request landing on an expired entry re-rendered the tier. Both
+  paths now go through the cache's inline-render claim: the first
+  request renders, the rest wake when its claim ends and serve the
+  stored entry, claiming a render only when the leader stored none.
+  The exports still never serve a stale body, not even to a waiter. Guarded by
   `concurrent_cold_requests_share_one_render`.
-- The raw source cache stored whole fetched payloads nothing read.
-  Only `fetched_at` was ever consulted (`raw_is_fresh` checked the
-  age and nothing wanted the snapshot back), so the last payload of
-  every source sat in memory as dead weight; the layer now stores
-  the freshness marker alone. Rendered bodies are `Bytes` instead
-  of `Vec<u8>`, so concurrent responses of one cached rendering
-  share an allocation instead of copying the whole body per
-  request.
+- The raw source cache stored whole fetched payloads nothing read:
+  only `fetched_at` was ever consulted, so the last payload of every
+  source sat in memory as dead weight; the layer now stores the
+  freshness marker alone. Rendered bodies are shared instead of copied
+  whole per request.
 - A settings save could report success for a setting that was never
-  written. `EditableConfig::set` fails when the slot on disk holds a
-  non-table value (say `server = 42` where the editor needs
-  `[server]` to dive into), and every call site discarded the
-  result: the save wrote the untouched document back and the
-  operator got a green toast. The failure now surfaces as a
-  per-field error, and unrelated edits of the same save still
-  apply. Guarded by
+  written. A slot on disk holding a non-table value (say `server = 42`
+  where the editor needs `[server]` to dive into) failed the write, and
+  every call site discarded the result: the save wrote the untouched
+  document back and the operator got a green toast. The failure now
+  surfaces as a per-field error, and unrelated edits of the same save
+  still apply. Guarded by
   `apply_all_surfaces_unsettable_slot_instead_of_swallowing_it`.
 - A base64 subscription wrapped at 76 columns parsed as zero
-  entries. Interior whitespace is not base64, broke the
-  length-modulo check and made the payload fall back to being read
-  as plain text, silently yielding nothing, while real producers
-  do wrap (email-style line breaks, stray blank lines), so a whole
+  entries. Interior whitespace is not base64, broke the length-modulo
+  check and made the payload fall back to being read as plain text,
+  silently yielding nothing, while real producers do wrap, so a whole
   feed could count as empty. The decoder strips whitespace before
-  decoding, under auto-detection and a pinned `base64` encoding
-  alike. Guarded by `line_wrapped_base64_payload_decodes`.
+  decoding, under auto-detection and a pinned `base64` encoding alike. Guarded by
+  `line_wrapped_base64_payload_decodes`.
 - A vmess line could serialize with a host, port, name or
-  credential different from the stored entry. The JSON writer lays
-  the structured fields down first and then inserted every
-  pass-through parameter verbatim, so a stray `add` / `port` /
-  `ps` / `id` parameter (Clash passes unknown fields through; a
-  vmess JSON can carry `PS` next to `ps`) overwrote them in the
-  emitted object. The reserved field names are skipped like `v`
-  already was, case-insensitively. Guarded by
+  credential different from the stored entry. The JSON writer inserted
+  every pass-through parameter verbatim, so a stray `add` / `port` /
+  `ps` / `id` parameter (a vmess JSON can carry `PS` next to `ps`)
+  overwrote the structured fields in the emitted object. The reserved
+  field names are skipped like `v` already was, case-insensitively. Guarded by
   `consumed_fields_win_over_colliding_params`.
 - Clash-sourced entries serialized onto the URI list with mihomo
-  field names. An entry that never had a source line (Clash YAML,
-  sing-box JSON) carries mihomo spellings (`network`, `servername`,
-  `client-fingerprint`, multi-line `ws-opts` YAML blocks) that a
-  URI client either ignores (`network` selects no transport,
-  `tls=true` enables no TLS) or cannot parse at all, so exporting a
-  Clash-fed source through the URI serializer produced lines that
-  did not mean what the entry said. Entries without a source line
-  now pass through a translation onto the canonical URI vocabulary
-  first: `servername`→`sni`, `network`→`net` (vmess) / `type`,
-  `ws-path`→`path`, `client-fingerprint`→`fp`, the structured
-  blocks (`ws-opts`, `reality-opts`, `grpc-opts`, `h2-opts`,
-  `http-opts`, `obfs-opts`) flattened onto their URI parameters,
-  `tls` / `skip-cert-verify` booleans mapped onto the spellings each
-  scheme's clients read, and the first occurrence winning a
-  collision. REALITY initially escaped that treatment: mihomo writes
-  it as `tls: true` + `reality-opts`, so the flattened `pbk`/`sid`
-  sat next to `security=tls` (or no `security` at all) and the
-  client dropped the REALITY keys. For vless and trojan the
+  field names, so exporting a Clash-fed source through the URI
+  serializer produced lines that did not mean what the entry said.
+  Entries without a source line now pass through a translation onto
+  the canonical URI vocabulary first: `servername`→`sni`,
+  `network`→`net` (vmess) / `type`, `ws-path`→`path`,
+  `client-fingerprint`→`fp`, the structured blocks (`ws-opts`,
+  `reality-opts`, `grpc-opts`, `h2-opts`, `http-opts`, `obfs-opts`)
+  flattened onto their URI parameters, `tls` / `skip-cert-verify`
+  booleans mapped onto the spellings each scheme's clients read, and
+  the first occurrence winning a collision. For vless and trojan the
   `security` key is forced to `reality` whenever a public key is
-  present, however `tls` was spelled.
-  URI-sourced entries keep their stored bytes untouched;
-  the translation is output-only. Guarded by
+  present, however `tls` was spelled: mihomo writes REALITY as
+  `tls: true` plus `reality-opts`, which a client drops unless
+  `security` says `reality`. URI-sourced entries keep their stored
+  bytes untouched; the translation is output-only. Guarded by
   `clash_vless_item_serializes_onto_the_uri_vocabulary`,
   `clash_vless_reality_item_serializes_with_security_reality` and the
-  sibling `clash_*` serialization tests.
+  sibling `clash_*` serialization tests. Guarded by
+  `clash_spellings_are_security_relevant`.
 - The certificate-verification toggles had a different spelling list
-  per consumer. `formats::is_insecure` (behind the sing-box and
-  Clash writers) recognized three aliases, and its comment claimed
-  the underscore `allow_insecure`, the spelling sing-box and tuic
-  links actually use, as "never arrives from parsed feeds", so those
-  writers emitted no `insecure` flag for a node that requested one
-  and the client then verified certificates the server never
-  presented; the fingerprint normalization recognized the same
-  three, so the same server advertised once with `allow_insecure`
-  and once with `skip-cert-verify` deduplicated as two rows; and
-  the pipeline's forbid-insecure filter carried its own fourth copy
-  of the list. One list (`models::INSECURE_ALIASES`) and one
-  truthiness rule now back all three. One-time churn to expect:
-  `allow_insecure`-spelled nodes fingerprint differently than
-  before, so the first ingest after upgrading re-inserts them as
-  new rows and the old rows retire through the ordinary reconcile
-  pass.
+  per consumer. The sing-box and Clash writers did not recognize the
+  underscore `allow_insecure`, the spelling sing-box and tuic links
+  actually use, so those writers emitted no `insecure` flag for a node
+  that requested one and the client then verified certificates the
+  server never presented; the fingerprint normalization recognized the
+  same three aliases, so the same server advertised once with
+  `allow_insecure` and once with `skip-cert-verify` deduplicated as
+  two rows; and the pipeline's forbid-insecure filter carried its own
+  fourth copy of the list. One list and one truthiness rule now back
+  all three. One-time churn to expect: `allow_insecure`-spelled nodes
+  fingerprint differently than before, so the first ingest after
+  upgrading re-inserts them as new rows and the old rows retire
+  through the ordinary reconcile pass.
 - Geo problems were invisible exactly where they mattered. A geo
   directory with no usable database, or one missing a single kind,
   produced one vague warn at best while rows silently stayed
-  unenriched, and the startup backfill summary reported only the
-  rows that happened to resolve, so "0 updated" read the same
-  whether the pool was fully stamped or the resolver could answer
-  nothing. Startup now names the files that opened (one info line),
-  each missing kind gets its own warn naming the file and the
-  directory, and the backfill summary carries the `remaining` count
-  of rows with every geo column NULL, retried on the next start,
-  so a broken directory is visible instead of indistinguishable
-  from a healthy run.
+  unenriched, and the startup backfill summary reported only the rows
+  that happened to resolve, so "0 updated" read the same whether the
+  pool was fully stamped or the resolver could answer nothing.
+  Startup now names the files that opened, each missing kind gets its
+  own warn naming the file and the directory, and the backfill summary
+  carries the `remaining` count of rows with every geo column NULL,
+  retried on the next start.
 - Probe lanes vetted candidate hosts one DNS lookup at a time,
   ahead of every real verdict. Each lookup is bounded by
-  `[geo].dns_timeout` (5 s by default) and the lanes ran them
-  serially in their select loops before spawning any check, so a
-  batch full of dead names queued one timeout per candidate while
-  the check semaphore sat idle. Vetting is now concurrent under the
-  same `probe.concurrency` budget and order-preserving, in the T1
-  sample, the quarantine recheck and the T2 lanes alike; a closed
-  lane or a panicked vetting task refuses that target so the row
-  stays on the ordinary fail ladder. Guarded by
+  `[geo].dns_timeout` (5 s by default) and the lanes ran them serially
+  before spawning any check, so a batch full of dead names queued one
+  timeout per candidate while the check semaphore sat idle. Vetting is
+  now concurrent under the same `probe.concurrency` budget and
+  order-preserving, in the T1 sample, the quarantine recheck and the
+  T2 lanes alike; a closed lane or a panicked vetting task refuses
+  that target so the row stays on the ordinary fail ladder. Guarded by
   `vet_hosts_preserves_order_and_policy`.
-- The meow config file's 0600 mode was only applied at creation.
-  `create(true).mode(0o600)` leaves a pre-existing file's mode
-  alone, so a `meow.yaml` from an older binary, a hand-copied
-  sample or a restored backup kept whatever permissions it had
-  while the daemon rewrote it in place with every proxy credential
-  in plain text. The mode is re-asserted with an `fchmod` on the
-  open file descriptor, after the open has resolved the path, so
-  no second path resolution can be swapped in between. Guarded by
+- The meow config file's 0600 mode was only applied at creation, so a
+  `meow.yaml` from an older binary, a hand-copied sample or a restored
+  backup kept whatever permissions it had while the daemon rewrote it
+  in place with every proxy credential in plain text. The mode is
+  re-asserted with an `fchmod` on the open file descriptor, so no
+  second path resolution can be swapped in between. Guarded by
   `meow_config_permissions_are_reasserted_on_an_existing_file`.
-- T2 outage cycles read as healthy batches. The batch folded
-  every row into one `t2_checked` counter, including rows an
-  engine-wide outage kept away from meow-rs (ping/reload failure,
-  the mid-batch abort guard) and rows `clash::generate` could not
-  serialize, exactly the situation the counter is watched for. The
+- T2 outage cycles read as healthy batches. The batch folded every
+  row into one `t2_checked` counter, including rows an engine-wide
+  outage kept away from meow-rs and rows `clash::generate` could not
+  serialize — exactly the situation the counter is watched for. The
   cycle log now separates them: `t2_checked` counts only rows that
   got a real verdict, `t2_aborted` the outage casualties and
   `t2_skipped` the unserializable ones. Guarded by
-  `t2_outage_counters_report_aborted_not_checked`,
+  `t2_outage_counters_report_aborted_not_checked` and
   `t2_live_engine_counters_count_real_checks`.
-- A failed probe journal write logged at warn and vanished into
-  the noise. The write failure means the history row for a verdict
-  that *did* land is gone for good (the lifecycle transition
-  succeeds regardless), and a burst of them is the only symptom
-  when the database is locked or unwritable. The level is error
-  now.
+- A failed probe journal write logged at warn and vanished into the
+  noise. The write failure means the history row for a verdict that
+  *did* land is gone for good, and a burst of them is the only symptom
+  when the database is locked or unwritable. The level is error now.
 - Ingesting a large feed held the WAL write lock past the probe's
-  patience. The reconcile transaction ran two statements per entry
-  (upsert, then link stamp), so a refresh of tens of thousands of
-  entries outlived the probe daemon's `busy_timeout` and its
-  journals were dropped. The upsert is one multi-row
-  `INSERT .. ON CONFLICT .. RETURNING` per 250 entries and the
-  link sweep one per 500 (3 binds a row), keeping the lock span
-  short while the transaction still makes the link sweep sound;
-  duplicate fingerprints inside a batch collapse onto one id as
-  the per-row upserts did.
-- Toasts for the plain-browser path did not exist. HTMX callers
-  got `HX-Trigger` toasts, but a browser that posted a form without
-  HTMX got a bare redirect with the message dropped, so on the
-  shared pages (rotate the export token, purge removed) the action
-  left no visible confirmation. Redirects now carry `flash` /
-  `flash_level` query parameters that the layout turns into a toast
-  and strips from the URL immediately, so a refresh or a copied URL
-  does not replay it. Appended with `&` when the target already
-  carries a query. The import form echoes the submitted payload
-  back on a 422 so a fix-and-retry does not start from an empty
-  textarea, token rotation confirms through the same toast
-  mechanism, the purge dialog shows how many `removed` rows it is
-  about to delete (unfiltered, the count it acts on), and the empty
+  patience. The reconcile transaction ran two statements per entry,
+  so a refresh of tens of thousands of entries outlived the probe
+  daemon's `busy_timeout` and its journals were dropped. The upsert is
+  one multi-row `INSERT .. ON CONFLICT .. RETURNING` per 250 entries
+  and the link sweep one per 500 (3 binds a row), keeping the lock
+  span short; duplicate fingerprints inside a batch collapse onto one
+  id as the per-row upserts did.
+- Toasts for the plain-browser path did not exist. HTMX callers got
+  `HX-Trigger` toasts, but a browser that posted a form without HTMX
+  got a bare redirect with the message dropped, so on the shared pages
+  (rotate the export token, purge removed) the action left no visible
+  confirmation. Redirects now carry `flash` / `flash_level` query
+  parameters that the layout turns into a toast and strips from the
+  URL immediately, appended with `&` when the target already carries
+  a query. The import form echoes the submitted payload back on a 422
+  so a fix-and-retry does not start from an empty textarea, token
+  rotation confirms through the same toast mechanism, the purge dialog
+  shows how many `removed` rows it is about to delete, and the empty
   proxies list offers a *clear filters* link when a filter is what
   hid the rows. Guarded by `flash_redirect_merges_into_an_existing_query`.
 - Accessibility of the admin's live pieces. The toggle swaps on
   sources and profiles replaced the badge and button without the
-  `aria-live` / `aria-atomic` attributes and `aria-pressed` state
-  the initial render carries, silently ending the announcements a
-  screen reader had; keyboard focus fell to `<body>` after every
-  toggle because the button that was activated is re-created, so
-  focus is now restored onto the fresh button, only when it was
-  not moved elsewhere in the meantime. The schema and country stat
-  tables' colour-coded badges had `title` but no accessible name
-  and their dot colours were unexplained: a legend and per-badge
-  `aria-label`s ("alive: 12") now name both. The dialogs on
+  `aria-live` / `aria-atomic` attributes and `aria-pressed` state the
+  initial render carries, silently ending the announcements a screen
+  reader had; keyboard focus fell to `<body>` after every toggle
+  because the button that was activated is re-created, so focus is now
+  restored onto the fresh button, only when it was not moved
+  elsewhere in the meantime. The schema and country stat tables'
+  colour-coded badges had `title` but no accessible name: a legend and
+  per-badge `aria-label`s ("alive: 12") now name both. The dialogs on
   *Proxies*, *Sources* and *Profiles* gained `aria-labelledby`
   pointing at their headings.
-- Placeholder cells rendered a bare comma. `fmt_opt_ts_element(None)`
-  and the proxies list's T1/T2 coverage column both returned `,`
-  where they meant "no value", so the timestamp tables showed an
-  orphan comma under "last seen" and a row with neither check got a
-  `,` in the coverage cell. Both use the en dash the rest of the
-  tables use.
+- Placeholder cells rendered a bare comma. The timestamp tables and
+  the proxies list's T1/T2 coverage column both returned `,` where
+  they meant "no value", so the tables showed an orphan comma under
+  "last seen" and a row with neither check got a `,` in the coverage
+  cell. Both use the en dash the rest of the tables use.
 - A proxy ingested while geo was unavailable bypassed the ASN
-  filters. `exclude_asns` and the allowlist read the stored
-  `geo_asn`, and a row that never got one matched neither, so the
-  exclude list kept a proxy whose geo-enriched name printed the
-  very AS it was supposed to be dropped for. Serving now resolves
-  the missing ASN once per candidate before the filters run
-  (`fill_missing_asns`; the same host is a cache hit by the time
-  geo-enrich asks), and a stored ASN is never overwritten. Only a
-  host that genuinely cannot be resolved stays unknown: the
-  allowlist drops it, an exclude list keeps it, as documented.
-- A host whose DNS failed once was cached as "unknown" forever. The
-  resolver cached negative verdicts with no lifetime, so a transient
-  resolver outage kept the host out of every ASN filter and every
-  `{asn}`-bearing name until the process restarted. Positive and
+  filters. `exclude_asns` and the allowlist read the stored `geo_asn`,
+  and a row that never got one matched neither, so the exclude list
+  kept a proxy whose geo-enriched name printed the very AS it was
+  supposed to be dropped for. Serving now resolves the missing ASN
+  once per candidate before the filters run, and a stored ASN is never
+  overwritten. Only a host that genuinely cannot be resolved stays
+  unknown: the allowlist drops it, an exclude list keeps it, as
+  documented.
+- A host whose DNS failed once was cached as "unknown" forever, so a
+  transient resolver outage kept the host out of every ASN filter and
+  every `{asn}`-bearing name until the process restarted. Positive and
   negative entries now expire after six hours — the same cadence as
   the periodic backfill — so a recovered host is picked up without a
   restart.
@@ -2258,40 +1503,35 @@ are stamped when the batch is published.
   candidate, so the batch that picks the least recently checked rows
   seeked into the largest table once per candidate. The stamp is
   denormalised onto the proxy row now (`last_t2_checked_at`, migration
-  `0014`) and refreshed whenever a T2 attempt is journaled, so the
-  queue is an index scan over the proxy table. The stamp is permanent:
-  a rotated journal cannot push a proxy back into the "never checked"
-  tier, which the lookup over the journal could do. Guarded by
-  `the_t2_recency_stamp_follows_the_journal` and
+  `0014`) and refreshed whenever a T2 attempt is journaled. The stamp
+  is permanent: a rotated journal cannot push a proxy back into the
+  "never checked" tier, which the lookup over the journal could do.
+  Guarded by `the_t2_recency_stamp_follows_the_journal` and
   `the_t2_recency_stamp_survives_the_history_sweep`.
 - The settings form shows the file, not the environment. The panel
   writes the file, so the values on the page are the file's own now
   (the file is parsed over the defaults, without the `FUMOX_*` layer
   that shadows it). A setting the environment overrides renders
   read-only and is left out of the write: the env layer wins over the
-  file, so a value written there would never take effect and the
-  operator would be shown a change that does not happen. The page says
-  which settings are locked and why. Guarded by
+  file, so a value written there would never take effect. The page
+  says which settings are locked and why. Guarded by
   `the_form_shows_the_file_and_not_the_environment`,
   `an_env_locked_field_is_not_written_back`,
   `an_env_lock_covers_the_halves_of_a_rate_limit_pair` and
   `an_env_locked_field_renders_read_only_with_a_reason`.
 - A checkbox the browser did not post no longer resets its setting.
   Every boolean on the edit form is a checkbox plus a hidden
-  `value="off"` input, so a field that did not arrive (a disabled
-  control, a pane the operator never reached) was written as `false`
-  — a value nobody chose, applied to a setting nobody touched. The
-  key is handled only when the form carried it. Guarded by
+  `value="off"` input, so a field that did not arrive was written as
+  `false` — a value nobody chose, applied to a setting nobody touched.
+  The key is handled only when the form carried it. Guarded by
   `a_bool_the_form_did_not_carry_is_not_reset`.
 - A rate limit whose pair reached the panel half-filled is refused
-  instead of guessed. A form that lost one half of the pair (a
-  browser that dropped the field, a hand-written request) is not a
+  instead of guessed. A form that lost one half of the pair is not a
   form the operator meant to send: the missing half is taken from the
   file for the check, the submit is refused with a field error, and
   the file is left byte-identical. Guarded by
   `a_partial_rate_limit_pair_is_refused_and_the_file_stays_untouched`
-  and
-  `a_partial_rate_limit_pair_without_the_limit_is_refused`.
+  and `a_partial_rate_limit_pair_without_the_limit_is_refused`.
 - The admin token rotation is decided by the document, not by the
   submitted field. The panel compared the token of the running
   configuration with the one the form carried, so every save that
@@ -2317,8 +1557,7 @@ are stamped when the batch is published.
   aborts both of them; the save is refused now, with the reason on the
   page, and the file stays byte-identical. The edit page also explains
   a config it could not read: the values below it are the running
-  ones, not the file's, and an operator who does not know that would
-  believe they edited the file. Guarded by
+  ones, not the file's. Guarded by
   `a_config_the_loader_refuses_is_not_written` and
   `the_edit_page_explains_a_config_it_could_not_read`.
 - A logout that could not revoke the sessions says so. The epoch bump can
@@ -2329,19 +1568,16 @@ are stamped when the batch is published.
   and the login screen carries a banner that names the failure, so the
   revocation can be repeated or the token changed.
 - A database error while reading the session epoch is refused, not
-  treated as an epoch of zero. Zero is the epoch of a world before the
-  first bump: a cookie minted back then would verify again, which is
-  exactly what the epoch exists to prevent, and a value that is not a
-  number is the same case (the row was written by something else and its
-  meaning is unknown). Both answer `503` now instead of letting the
-  session through.
+  treated as an epoch of zero: a cookie minted before the first bump
+  would verify again, which is exactly what the epoch exists to
+  prevent, and a value that is not a number is the same case. Both
+  answer `503` now instead of letting the session through.
 - A malformed `Host` never reaches the serve link. The link builder
-  canonicalised the header and then checked nothing else, so a host like
-  `evil.com/`, `evil.com?x=1`, `evil.com#fragment`, `evil.com%2f`,
-  `evil.com name`, `evil\com` or `evil.com:@x` ended up as the authority
-  of a URL that carries the export token. The canonical form is checked
-  against the host grammar now (a DNS name, an IPv4 literal, a bracketed
-  IPv6 literal), and anything else falls back to the bound address.
+  canonicalised the header and then checked nothing else, so a
+  malformed host ended up as the authority of a URL that carries the
+  export token. The canonical form is checked against the host grammar
+  now (a DNS name, an IPv4 literal, a bracketed IPv6 literal), and
+  anything else falls back to the bound address.
 - The serve link keeps the port the request came in on. The port of the
   `Host` header was dropped and the port of `[server].bind` was used
   instead, so a panel reached on a published port (a NAT mapping, a
@@ -2354,17 +1590,15 @@ are stamped when the batch is published.
   a proxy appended after it were dropped without a word.
 - The per-IP window exempts the static path only. Every `HEAD` request
   was exempt from the window, so the paths that matter (the login, the
-  panel actions) had a free window on a method an attacker picks at will.
-  A `HEAD` on `/admin/static/*` stays exempt (it is the same path check
-  the CSS fetch was), every other `HEAD` counts like the `GET` it stands
-  for.
+  panel actions) had a free window on a method an attacker picks at
+  will. A `HEAD` on `/admin/static/*` stays exempt, every other `HEAD`
+  counts like the `GET` it stands for.
 - The import writes in one transaction. The sources were written one by
   one and the profiles after them, each on its own, so a failure
-  half-way through (a write error, a constraint the file slipped past)
-  left the sources already in the database and no profiles: a
-  configuration that was half imported and looked whole. The whole
-  write phase runs in a single transaction now, so a failure leaves the
-  database exactly as it was.
+  half-way through left the sources already in the database and no
+  profiles: a configuration that was half imported and looked whole.
+  The whole write phase runs in a single transaction now, so a failure
+  leaves the database exactly as it was.
 - The import no longer refuses a file because a name did not resolve.
   Every imported URL was resolved inside the request, and a timeout or
   a SERVFAIL counted as a hard error, so a source whose host was
@@ -2372,9 +1606,8 @@ are stamped when the batch is published.
   failure that says nothing about the target is a warning now (the URL
   is vetted again at fetch time, on every request); only a policy
   violation (a private address) stays fatal. The name-resolution
-  window is bounded as a whole now, not only per URL: at most 25 URLs
-  are resolved per import and the window has a deadline of its own, so
-  a file full of dead hosts cannot hold the request open.
+  window is bounded as a whole now: at most 25 URLs are resolved per
+  import and the window has a deadline of its own.
 - The import rejects a document that is not a document. A body that is
   not JSON, or JSON without the `version` field, ended in an error page
   carrying the raw parser message. Both are refused with `422` and a
@@ -2382,11 +1615,9 @@ are stamped when the batch is published.
   256 KiB cap is refused the same way, before it is parsed at all.
 - The `Authorization` header of a protected profile accepted only the
   exact spelling `Bearer`. The scheme is compared case-insensitively
-  now (RFC 7235 makes the scheme case-insensitive, and clients spell it
-  `bearer` as often as `Bearer`), so `bearer <token>` opens the profile.
-  Another scheme is not a bearer token at all: `Basic <token>` is
-  refused like a missing token. The token itself is still compared
-  verbatim against the stored hash.
+  now, so `bearer <token>` opens the profile. Another scheme is not a
+  bearer token at all: `Basic <token>` is refused like a missing token.
+  The token itself is still compared verbatim against the stored hash.
 - The failed-access-token log could be out-warned. A client that came
   back after its own window elapsed was warned again without spending
   the per-window budget, so a small set of rotating clients could flood
@@ -2423,12 +1654,11 @@ are stamped when the batch is published.
   names it now.
 - The "refresh now" action answers with the real status fragment and
   `202 Accepted`. The state was rendered from a formatted string
-  instead of the fragment the other actions use, so the busy state and
-  the final verdict were assembled in two different places.
+  instead of the fragment the other actions use.
 - A source lookup tells "not found" from "the database said no". Both
   answered with the same empty page, so a failing database looked like
   a deleted source.
-- The probe backlog estimate cannot overflow. The retirement rate was
+- The probe backlog estimate cannot overflow: the retirement rate was
   multiplied by the check period without a saturating multiply, so a
   large rate and a large period wrapped around and reported a drain
   time of seconds.
@@ -2440,24 +1670,23 @@ are stamped when the batch is published.
   form. A submission carrying thousands of `ped_rename_<i>_` fields
   was parsed row by row, so a programmatic client could make the panel
   spend its memory on the rows it was going to drop anyway. The cap is
-  256 rows per section now; the limit is unreachable from the UI.
-  Guarded by `from_form_caps_the_number_of_rows_per_section`.
+  256 rows per section now; the limit is unreachable from the UI. Guarded by
+  `from_form_caps_the_number_of_rows_per_section`.
 - The pipeline editor trimmed the rule text it read. A regular
   expression or a replacement string that starts or ends with a space
   lost it, so the rule the operator typed was not the rule the
   pipeline ran. The rule fields (match, replace, flags, key, ASNs) and
   the geo template are read verbatim now; only the scalar fields (the
   target, the cap) are trimmed. A whitespace-only pattern survives in
-  raw mode as well, where it is a legitimate pattern.
-  Guarded by `from_form_keeps_the_rule_text_verbatim` and
+  raw mode as well. Guarded by
+  `from_form_keeps_the_rule_text_verbatim` and
   `ingest_keeps_a_whitespace_only_pattern_in_raw_mode`.
 - The ASN fields of the pipeline editor accepted a list of separators
   as if it were an allowlist. A field holding only commas and spaces
   parsed into an empty list, and an empty list dropped every proxy
   that carries an ASN. The field means "no ASN list" when nothing
-  survives the split now, and the drop branch goes through the same
-  helper the other branches use.
-  Guarded by `an_asn_field_of_separators_is_not_an_allowlist`.
+  survives the split now. Guarded by
+  `an_asn_field_of_separators_is_not_an_allowlist`.
 - A mistyped sort key or cap was dropped instead of reported. The
   editor fell back to the default, so the operator saw a working
   pipeline that ignored the key they had chosen. The raw value is kept
@@ -2465,36 +1694,32 @@ are stamped when the batch is published.
   Guarded by `an_unknown_sort_key_is_reported_and_kept` and
   `a_mistyped_cap_is_reported_from_the_field`.
 - The checkboxes of the pipeline editor read an absent field as "on".
-  A form that does not send the field at all — a programmatic client,
-  a browser that skipped it — turned the built-in default off. The
-  switches are tri-state now: absent means "keep the default", and an
-  unchecked box submits its own "off". Guarded by
+  A form that does not send the field at all turned the built-in
+  default off. The switches are tri-state now: absent means "keep the
+  default", and an unchecked box submits its own "off". Guarded by
   `the_built_in_default_switches_are_tri_state`.
 - A profile pipeline of `null` overrode the pipeline it was supposed
   to extend. The null was read as "no pipeline", so the profile
   replaced the source pipeline with nothing. A null profile pipeline
-  overrides nothing now. Guarded by
-  `a_null_profile_pipeline_overrides_nothing`.
+  overrides nothing now. Guarded by `a_null_profile_pipeline_overrides_nothing`.
 - The pipeline resolved the ASN of a proxy on every request, even when
-  no ASN rule was in play. The resolver was called for a pipeline that
-  never looks at an ASN, so a request spent a database lookup it did
+  no ASN rule was in play, so a request spent a database lookup it did
   not need. The lookup happens only when a rule filters on an ASN; the
   missing ASNs are filled on the ingest side and by the backfill.
   Guarded by `a_pipeline_without_an_asn_rule_resolves_no_asn` and
   `a_proxy_without_a_stored_asn_still_honours_the_exclude_list`.
-- The insecure-parameter filter ran before the rename rules. A proxy
-  whose insecure parameter was rewritten by a rename rule was dropped
-  anyway, so the filter judged the parameters before the pipeline had
-  finished with them. The filter runs after the renames now and sees
-  the final parameters. Guarded by
+- The insecure-parameter filter ran before the rename rules, so a
+  proxy whose insecure parameter was rewritten by a rename rule was
+  dropped anyway. The filter runs after the renames now and sees the
+  final parameters. Guarded by
   `the_insecure_filter_sees_the_renamed_parameters` and
   `a_stored_insecure_proxy_is_dropped_even_when_a_rename_rewrites_it`.
-- A broken rename rule logged one line per proxy it skipped. A feed of
-  a thousand proxies with an unparsable pattern filled the log with a
-  thousand lines. The skips are counted per rule and reported in one
-  WARN line per rule now (the rule index, the target, the count and a
-  truncated sample of the value); the per-entry event stays at TRACE.
-  Guarded by `a_broken_rename_rule_warns_once_per_rule`.
+- A broken rename rule logged one line per proxy it skipped, so a
+  broken pattern filled the log with one line per entry. The skips are
+  counted per rule and reported in one WARN line per rule now (the
+  rule index, the target, the count and a truncated sample of the
+  value); the per-entry event stays at TRACE. Guarded by
+  `a_broken_rename_rule_warns_once_per_rule`.
 - The scheduler could not tell "no history" from "the history could
   not be read". A read error fell back to the TTL cadence, so a source
   whose journal was unreadable was fetched on every sweep. The source
@@ -2522,11 +1747,11 @@ are stamped when the batch is published.
   leaving the panel waiting for an answer that never comes.
 - The proxy card showed the secret parts in full. The credential, the
   password in the proxy line and the values of the credential-bearing
-  parameters were rendered as stored, so a screen (a shared screen, a
-  screenshot in a ticket, a shoulder surfer) carried the working
-  secret. They are masked now — `user:sec…••••` for a credential,
-  `[redacted]` for a secret parameter value — and the card says that
-  the value is a secret and never reaches the log.
+  parameters were rendered as stored, so a shared screen or a
+  screenshot in a ticket carried the working secret. They are masked
+  now — `user:sec…••••` for a credential, `[redacted]` for a secret
+  parameter value — and the card says that the value is a secret and
+  never reaches the log.
 - The sources screens showed the secret parts of a URL. A source whose
   address carries a password (`https://user:pass@host/sub`) or a
   secret query value (`?token=…`) showed it on the list, on the card
@@ -2578,386 +1803,241 @@ are stamped when the batch is published.
 - The repair scripts follow a symlink at the database or the backup path.
   A symlink is refused now: the operator asked for a database, not for
   whatever the link points at.
-- The settings editor re-enabled toggles on a failed save. Every
-  boolean on the edit form is a checkbox plus a hidden `value="off"`
-  input, and the failed-save replay rendered those hidden inputs
-  through `bool_value`, which read *presence* as truth, so the
-  replayed form came back with every `off` input ticked, and
-  resubmitting it silently turned the settings back on, the
-  security-relevant toggles included. Save and replay now share one
-  `parse_bool_literal` (`on`/`true`/`1` against `off`/`false`/`0`/
-  empty, anything else refused), and a template audit test pins every
-  hidden-off input to a `bool_value` checkbox. Guarded by
-  `checkbox_replay_reads_the_literals_the_save_parser_accepts` and
-  `every_hidden_off_pair_renders_through_bool_value`.
+- The settings editor re-enabled toggles on a failed save: the
+  failed-save replay read the hidden `value="off"` inputs as *present*,
+  so the replayed form came back with every toggle ticked.
+  Save and replay now share one `parse_bool_literal` (`on`/`true`/`1`
+  against `off`/`false`/`0`/empty, anything else refused). Guarded by
+  `checkbox_replay_reads_the_literals_the_save_parser_accepts`.
 - `scripts/revive-xhttp-proxies.sh` interpolated `--adopt-source` raw
-  into its sqlite SQL, so
-  `--adopt-source "x'; DROP TABLE proxies;--"` dropped the `proxies`
-  table even under `--dry-run`, before any backup existed. The value's
-  single quotes are doubled through a variable now (bash 3.2 keeps the
-  backslashes of an escaped replacement in `${var//pat/repl}`), the
-  resolved source id is shape-checked against a plain nanoid before
-  its first literal, and `FUMOX_REFRESH_CHECK_LIMIT` must be a plain
-  number before it reaches the `LIMIT` clause. A legitimate name
-  carrying an apostrophe still matches. Guarded by the injection and
-  quoted-name scenarios in `scripts/tests/revive-xhttp-proxies.test.sh`.
+  into its sqlite SQL, so a quote in the name dropped the `proxies`
+  table even under `--dry-run`. The value's single quotes are doubled
+  now, the resolved source id is shape-checked against a plain nanoid
+  before its first literal, and `FUMOX_REFRESH_CHECK_LIMIT` must be a
+  plain number before it reaches the `LIMIT` clause. A legitimate name
+  carrying an apostrophe still matches.
 - The YAML alias guard's boundary set missed `?`: in flow context
   libyaml scans `?*a` as an alias even without a space, so an
-  alias-bomb payload hid behind a `?` from the whitespace-only
-  boundary check. `?` joined the boundary set and the bomb-payload
-  regression list. Guarded by the `a: [?*a, ?*b]` case in the
-  `reject_yaml_aliases` tests.
-- Config import accepted access tokens outside the URL charset. The
-  `/sub/{id}?token=…` serve link embeds the token unescaped, so a
-  token with a space or a non-ASCII character round-trips broken;
-  import now enforces the profile form's unreserved-ASCII rule
-  (`A-Za-z0-9-_.~`). Guarded by
-  `import_rejects_tokens_outside_the_url_charset`.
-- Admin sessions are revocable now. Logging out (or rotating
-  `[admin].token` from the settings screen) cleared the browser cookie,
-  but nothing server-side could reject a copy of it: the MAC covered
-  only the expiry timestamp and the session key is frozen at startup,
-  so a stolen or copied cookie stayed valid until its TTL. A
-  revocation epoch is persisted in the `meta` table and mixed into the
-  session key (`HMAC(session_key, epoch_be)`); a bump (on logout and
-  on token rotation) invalidates every cookie minted before it at
-  once, and it survives a restart because it lives in the database.
-  This deliberately rejects pre-epoch cookies too: they MACed the bare
-  session key and match no epoch, so the first login after upgrading
-  to this build fails and costs one re-login (rolling back to the
-  previous build costs the same, symmetrically: the old binary
-  rejects the new cookie format as well).
+  alias-bomb payload hid behind a `?`. `?` joined the boundary set and
+  the bomb-payload regression list.
+- Config import accepted access tokens outside the URL charset; import
+  now enforces the profile form's unreserved-ASCII rule
+  (`A-Za-z0-9-_.~`). Guarded by `import_rejects_tokens_outside_the_url_charset`.
+- Admin sessions are revocable now: a revocation epoch persisted in the
+  `meta` table is mixed into the session key, so a bump (on logout and
+  on token rotation) invalidates every cookie minted before it at once,
+  and it survives a restart. Pre-epoch cookies are rejected on purpose,
+  so the first login after the upgrade costs one re-login.
 - The admin middleware rejects cross-site requests before auth, CSRF
   and rate limiting, answering `403` (`err.cross_site`) without
   charging the rate-limit window. A request is cross-site when
-  `Sec-Fetch-Site: cross-site` says so (top-level `navigate`
-  document GETs are exempt, so opening `/admin` from a link or
-  bookmark still works), or, for clients without Fetch Metadata,
-  when it carries an `Origin` that does not belong to the panel:
-  `Origin: null`, an unparsable origin, or an origin whose host:port
-  differs from the `Host` header. Requests with none of these headers
-  (curl, monitoring, health checks) are unaffected. The gate closes
-  the hole where any web page the operator visited could pin their IP
-  at the 429 ceiling with auto-issued cross-site panel requests, and
-  it inherits the panel's existing assumption that a reverse proxy
-  forwards `Host` unchanged: a proxy that rewrites `Host` away from
-  the origin the browser sees makes non-browser integrations that
-  send an `Origin` header answer `403` (they must drop the header,
-  or the proxy must pass the original `Host` through: the same
-  requirement `host_gate` already imposed).
-- The container stack runs with the least privilege it can run with.
-  Every service declares `user: "999:999"` (the kernel: `998:999`),
+  `Sec-Fetch-Site: cross-site` says so (top-level `navigate` document
+  GETs are exempt, so opening `/admin` from a link still works), or,
+  for clients without Fetch Metadata, when it carries an `Origin` that
+  does not belong to the panel (`Origin: null`, an unparsable origin,
+  or a host:port that differs from `Host`). Requests with none of these
+  headers (curl, monitoring, health checks) are unaffected. A proxy
+  that rewrites `Host` away from the origin the browser sees makes
+  non-browser integrations that send an `Origin` header answer `403`
+  (they must drop the header, or the proxy must pass the original
+  `Host` through: the same requirement `host_gate` already imposed).
+- The container stack runs with the least privilege it can run with:
+  every service declares `user: "999:999"` (the kernel: `998:999`),
   `cap_drop: ["ALL"]`, `security_opt: ["no-new-privileges:true"]` and
-  `read_only: true`, and the paths that must be writable are tmpfs
-  mounts (`/tmp` for the SQLite scratch files, `/run/meow` for the
-  rendered kernel config) or volumes. The quadlet units say the same
-  in their own dialect (`User=`, `Group=`, `NoNewPrivileges=true`,
-  `ReadOnly=true`, explicit `Tmpfs=`), and the kube manifest carries a
-  `securityContext` with `runAsNonRoot`, `allowPrivilegeEscalation:
-  false`, `readOnlyRootFilesystem: true` and `capabilities: drop:
-  ["ALL"]`.
-- The admin token no longer reaches the probe. The quadlet stack splits
-  the environment in two: `fumox.env` holds the shared runtime
-  variables, `fumox-admin.env` holds the panel's login token and is
-  read by the server alone; the kube manifest does the same with the
-  `fumox-env` and `fumox-admin` secrets. The probe and the kernel
-  therefore cannot reach the admin panel even if one of them is
-  compromised.
-- The admin panel moved into its own network namespace. The compose
-  stack kept one stack with two networks; the quadlet and kube layouts
-  became two pods — `fumox` (the server alone) and `fumox-worker` (the
-  probe and the proxy kernel). The kernel handles untrusted proxy
-  traffic and its configuration is writable by the probe, so it must not
-  be able to reach the panel; the two pods need no network path to each
-  other, the server and the probe exchange everything through the shared
-  SQLite volume. The port publishing changed with it: the public
-  listener stays on 8080 and the admin panel stays on 127.0.0.1:8081.
+  `read_only: true`, and the writable paths are tmpfs mounts (`/tmp`,
+  `/run/meow`) or volumes. The quadlet units say the same in their own
+  dialect (`User=`, `Group=`, `NoNewPrivileges=true`, `ReadOnly=true`,
+  explicit `Tmpfs=`), and the kube manifest carries a `securityContext`
+  with `runAsNonRoot`, `allowPrivilegeEscalation: false`,
+  `readOnlyRootFilesystem: true` and `capabilities: drop: ["ALL"]`.
+- The admin token no longer reaches the probe: the quadlet stack
+  splits the environment in two (`fumox.env` for the shared runtime
+  variables, `fumox-admin.env` for the panel's login token, read by
+  the server alone), and the kube manifest does the same with the
+  `fumox-env` and `fumox-admin` secrets.
+- The admin panel moved into its own network namespace: the quadlet and
+  kube layouts became two pods — `fumox` (the server alone) and
+  `fumox-worker` (the probe and the proxy kernel). The kernel handles
+  untrusted proxy traffic and its configuration is writable by the
+  probe, so it must not be able to reach the panel; the two pods need
+  no network path to each other and exchange everything through the
+  shared SQLite volume. The public listener stays on 8080 and the
+  admin panel on 127.0.0.1:8081.
 - The meow-rs external-controller is authenticated and unreachable from
-  outside its pod. The kernel refuses to start without a controller
-  secret (`FUMOX_MEOW__API_TOKEN`, generated at random and checked
-  against `[A-Za-z0-9._-]`), the probe presents it as
-  `Authorization: Bearer <token>`, and the controller is bound to the
-  pod loopback (`127.0.0.1:9090`) in the pod layouts. The port is
-  published nowhere: it is not in the compose file, not in the pod
-  units and not in the manifest. The bootstrap config lost its
-  `mixed-port: 7890` — the delay checks go through the controller and
-  need no inbound listener.
-- The exchange directory is not world-writable any more. The old
-  layout gave `/shared` mode 1777, so every user on the host could
-  write into the kernel's configuration. The directories are split by
-  purpose and owner now (`/shared/geo` for the GeoLite2 databases, the
-  server's; `/shared/meow` for the config exchange, the probe's), the
-  exchange directory is group-writable for the shared gid (0770) and
-  the files inside it are 0640.
+  outside its pod: the kernel refuses to start without a controller
+  secret (`FUMOX_MEOW__API_TOKEN`, random, checked against
+  `[A-Za-z0-9._-]`), the probe presents it as `Authorization: Bearer
+  <token>`, and the controller is bound to the pod loopback
+  (`127.0.0.1:9090`). The port is published nowhere, and the bootstrap
+  config lost its `mixed-port: 7890`.
+- The exchange directory is not world-writable any more (the old
+  layout gave `/shared` mode 1777): the directories are split by
+  purpose and owner (`/shared/geo`, the server's; `/shared/meow`, the
+  probe's), the exchange directory is group-writable for the shared
+  gid (0770) and the files inside it are 0640.
 - The images are pinned to immutable identifiers: the compose file
-  names them by digest (`image: …@sha256:…`), so a deployment cannot
-  change under a running stack, and the meow wrapper pins its upstream
-  release to a concrete version whose SHA256 sums the build verifies
-  against a file in this repository — a tampered asset or a tampered
-  checksum file cannot pass. The release workflow takes the version and
-  the sums as inputs, so a new upstream release is picked up through
-  review and not by resolving "latest" at build time.
-- The example secrets in the documentation are generated, not literal.
-  The quadlet examples ship an empty `FUMOX_ADMIN__TOKEN=` (an empty
-  token disables the panel) next to the `openssl rand -hex 32` step
-  that fills it, the kube instructions create the secrets from a random
-  value instead of the `change-me` placeholder, and the env files are
-  installed with mode 600 so the secret is never briefly readable by
-  another user.
-- The session and CSRF keys follow the token as it stands. Both were
-  derived from `[admin].token` once at startup, so a token rotated
-  through the settings screen did not change the effective key: the
-  cookie of the old token kept verifying until the next restart. The keys
-  are derived per request from the live token now (one SHA-256, next to
-  the indexed read of the revocation epoch every authenticated request
-  does), so a rotation ends the sessions of every browser at once.
-- The admin host allowlist is one rule for the whole panel. A request
+  names them by digest (`image: …@sha256:…`), and the meow wrapper
+  pins its upstream release to a concrete version whose SHA256 sums
+  the build verifies against a file in this repository.
+- The example secrets in the documentation are generated, not literal:
+  the quadlet examples ship an empty `FUMOX_ADMIN__TOKEN=` next to
+  the `openssl rand -hex 32` step that fills it, the kube instructions
+  create the secrets from a random value instead of the `change-me`
+  placeholder, and the env files are installed with mode 600.
+- The session and CSRF keys follow the token as it stands: they are
+  derived per request from the live token now, so a rotation ends the
+  sessions of every browser at once.
+- The admin host allowlist is one rule for the whole panel: a request
   whose `Host` is not on `[admin].allowed_hosts` is refused with `400`
   before it reaches the rate limiter, the authentication gate or any
-  handler, on every route (`/admin`, `/admin/sources`, `/admin/import`,
-  `/admin/settings`, …), and the same host is what the serve links are
-  built from. A request that arrived through a proxy in the operator's
-  trust list is also judged by the host that proxy forwarded
-  (`X-Forwarded-Host`, or the `Forwarded: host=` element), so a front
-  that rewrites `Host` to its own upstream name does not lock the
-  operator out of the panel they allowlisted. The forwarded host is read
-  only from a trusted peer and only from the header family the operator
-  declared. The startup log names the accepted hosts, and a non-empty
-  allowlist is a breaking change for a deployment that relied on every
-  host being served.
-- The content-security policy of the admin panel allowed inline script.
-  `script-src` carried `'unsafe-inline'` for the bootstrap of
-  `base.html` and for the event handlers the templates put on their
-  elements, so an injected markup ran in the panel's own origin — with
-  the session cookie and the CSRF token of the operator. The panel's
-  script is a file now (`/admin/static/app.js`), every handler is
-  delegated from there, and the policy allows scripts from the origin
-  only: `script-src 'self'`. Inline styles stay for now.
-- The probe daemon could write the subscription. SQLite has no roles:
-  every process that opens the file may write every table, and the file
-  the daemon opens is the same one the ingest pipeline writes. A defect
-  in the daemon — or a daemon that was taken over — could rewrite the
-  hosts, the credentials and the sources. The daemon's connections now
-  run behind a SQLite authorizer whose rules are an allow-list: the
-  `proxies` table carries the subscription content, so only its health
-  columns are writable (`status`, `fail_count`, the check and ladder
-  timestamps, `latency_ms`), the daemon's own bookkeeping tables are
-  writable as before, and a table added later is denied by default
-  instead of silently becoming writable. The server keeps full write
-  access to the same file, and the schema is applied before the
-  restricted connections exist, so the guard never has to let a
-  migration through. A write the daemon must not perform belongs to the
-  server: the automatic purge of the `removed` proxies is the standing
-  example.
-- The template engine pulled in an unmaintained parser (RUSTSEC-2026-0374).
-  askama's `config` feature teaches the derive to read an `askama.toml`
-  — this project has none — and it brings the abandoned `basic-toml`
-  parser along, which was the only reason that crate sat in the tree.
-  The dependency is built with `default-features = false` and the
-  `derive`, `std` and `urlencode` features; `urlencode` stays, because
-  it is already in the default set and keeps the `|urlencode` filter
-  available to the templates.
+  handler, on every route, and the same host is what the serve links
+  are built from. A request through a trusted proxy is judged by the
+  host that proxy forwarded (`X-Forwarded-Host`, or `Forwarded:
+  host=`), read only from a trusted peer and only from the header
+  family the operator declared. The startup log names the accepted
+  hosts, and a non-empty allowlist is a breaking change for a
+  deployment that relied on every host being served.
+- The content-security policy of the admin panel allowed inline script
+  (`'unsafe-inline'`), so an injected markup ran in the panel's own
+  origin — with the session cookie and the CSRF token of the operator.
+  The panel's script is a file now (`/admin/static/app.js`), every
+  handler is delegated from there, and the policy is `script-src
+  'self'`. Inline styles stay for now.
+- The probe daemon could write the subscription (SQLite has no roles:
+  every process that opens the file may write every table). The
+  daemon's connections now run behind a SQLite authorizer whose rules
+  are an allow-list: the `proxies` table carries the subscription
+  content, so only its health columns are writable (`status`,
+  `fail_count`, the check and ladder timestamps, `latency_ms`), the
+  daemon's own bookkeeping tables stay writable, and a table added
+  later is denied by default. The server keeps full write access to the
+  same file.
+- The template engine pulled in an unmaintained parser
+  (RUSTSEC-2026-0374): askama's `config` feature brings the abandoned
+  `basic-toml` parser along, and this project has no `askama.toml`. The
+  dependency is built with `default-features = false` and the
+  `derive`, `std` and `urlencode` features.
 
 ### Docs
 
-- The podman guide describes the deployment as it is now. The quadlet
-  variant installs two environment files (the shared one and the
-  admin-only one) instead of one, the kube variant creates two
-  `podman secret`s from random values instead of a literal `change-me`,
-  the cookie note moved out of the variant-A subsection into the shared
-  preparation part (both variants publish the panel over plain HTTP and
-  both need the same answer), and the upgrade section grew the case of
+- The podman guide describes the deployment as it is now: the quadlet
+  variant installs two environment files, the kube variant creates two
+  `podman secret`s from random values, the cookie note moved into the
+  shared preparation part, and the upgrade section grew the case of
   units that name the GHCR image directly (`podman pull … && systemctl
-  --user restart …`, without the `podman tag` step) together with the
-  warning to back up the database first: the server migrates the schema
-  at startup. A new section explains how to put the nginx TLS front in
-  front of the pod layouts, with the upstream names each variant needs
+  --user restart …`) together with the warning to back up the database
+  first. A new section explains how to put the nginx TLS front in front
+  of the pod layouts, with the upstream names each variant needs
   (`127.0.0.1:8080` / `127.0.0.1:8081` inside the server pod, `server:
-  8080` / `server:8081` for compose) and the ready-made start command.
-  The guide also spells out what the two pods do at start: they come up
-  at the same time, the server applies the schema and the probe waits
-  for the database with its own backoff, so a `database is locked` error
-  never takes the probe down.
-- The guides' alive-linger rule contradicted the reconciler: they had a
-  source refresh unlink everything but `alive` rows, with `unknown`
-  said never to linger. The link actually survives for `alive`,
-  `ready`, `unknown` and `quarantine` rows, and only a source carrying
-  `drop` rules under `[ingest].drop_gate = true` retires its links on
-  the next refresh regardless of status. Both language versions state
+  8080` / `server:8081` for compose). The guide also spells out what
+  the two pods do at start: the server applies the schema and the probe
+  waits for the database with its own backoff, so a `database is locked`
+  error never takes the probe down.
+- The guides' alive-linger rule contradicted the reconciler: the link
+  survives for `alive`, `ready`, `unknown` and `quarantine` rows, and
+  only a source carrying `drop` rules under `[ingest].drop_gate = true`
+  retires its links on the next refresh. Both language versions state
   the real set now.
 - `config/app.toml` described the shipped recheck ladder as
-  "10m → 15m" while shipping `recheck_delays_secs = [900]`, a single
-  15-minute step; the comment matches the list again.
-- The settings form advertised a range it never enforced. The four
-  rate-limit inputs carried `min="1" max="1000000"`, but the only thing
-  that ever checked them was the browser's own number validation, so a
-  POST that skipped the browser wrote `0/min` and left every public
-  route behind a zero budget. The bounds are enforced server-side now,
-  and three of the four fields (`admin.rate_limit`,
-  `admin.login_rate_limit`, `server.auth_fail_rate_limit`) additionally
-  rendered no error line at all, so the message had nowhere to appear;
-  they have one, for the number and the unit.
+  "10m → 15m" while shipping `recheck_delays_secs = [900]`; the
+  comment matches the list again.
+- The settings form advertised a range it never enforced: only the
+  browser's own number validation checked the four rate-limit inputs,
+  so a POST that skipped the browser wrote `0/min`. The bounds are
+  enforced server-side now, and the three fields that rendered no error
+  line have one.
 - Every bounded setting now shows its range under the input, taken
   from the same table the save handler enforces, so the number an
   operator reads before typing and the number in the rejection after
-  saving cannot be different values. The recheck ladder, which is a
-  list rather than a number, states its own bound (up to 16 steps,
-  each 1..=30 days) next to its existing hint.
+  saving cannot differ. The recheck ladder states its own bound (up to
+  16 steps, each 1..=30 days).
 - The accepted range of a setting now lives in one place,
-  `config::bounds`, instead of three: literal arguments at the save
-  site, literal `min`/`max` attributes in the template, and prose in
-  `config/app.toml`. The form and the validator read the same rows, the
-  quarantine ladder's 16-step and 30-day limits are now shared with the
-  config deserializer that enforces them at load, and a test fails if a
-  number input appears with no row, if a row stops being rendered, or
-  if the template grows a literal bound again.
-- The number and unit halves of a rate limit sat on two lines with the
-  unit select spanning the whole panel: the `.field` rule gives every
-  input `width: 100%`, and two of those inside a wrapping flex row each
-  claim a line. They are one control and now sit on one line, going back
-  to a full-width stack on phones where a 120px number would leave the
-  unit too narrow to read.
+  `config::bounds`, instead of three (save handler, template
+  attributes, `config/app.toml` prose); a test fails if a number input
+  appears with no row, if a row stops being rendered, or if the
+  template grows a literal bound again.
+- The number and unit halves of a rate limit sit on one line now, going
+  back to a full-width stack on phones.
 - The i18n key scanner matched `t("…")` anywhere in a template,
-  including the tail of a helper whose name ended in `t`, so
-  `self.range_text("probe.sample_size")` was read as a catalog lookup
-  for the key `probe.sample_size`. The pattern is word-bounded now;
-  it was a false positive waiting for any helper to grow a `t`.
+  including the tail of a helper whose name ended in `t`; the pattern
+  is word-bounded now.
 
 - `config/app.toml` documented what each key *does* but never what
-  values it accepts, and the accepted range is not discoverable from
-  the file: the bounds live in the admin form's `min`/`max`
-  attributes, so a hand-edited config had no way to learn that
-  `probe.recheck_delays_secs` fails to load past 16 steps or 30 days
-  per step, that `[server].export_max_rows = 0` serves one row rather
-  than everything, or that the daemon raises a sub-second heartbeat
-  period to 5 s. Every key now opens its comment block with the range
-  it is actually held to, and the keys the form does not edit say so
-  instead of implying a bound they do not have. The two keys whose
-  prose admitted no range (the `host:port` sockets, the paths, the
-  token) say that plainly in words instead.
-  The `[probe]` block also carried the `allow_private_targets` SSRF
-  explanation above `connect_timeout_secs`, next to a commented-out
-  duplicate of a key that lives 50 lines further down; it now sits
-  with the key it describes, and the stray commented-out copy is gone.
+  values it accepts. Every key now opens its comment block with the
+  range it is actually held to, and the keys the form does not edit say
+  so instead of implying a bound they do not have.
 - The guide told operators to drop GeoLite2 `.mmdb` files into
-  `./config`; the shipped Compose stack has set
-  `FUMOX_GEO__DB_DIR=/shared` since 338929e, and the environment
-  outranks the file, so that directory was never scanned. The compose
-  header, `config/app.toml` and both guides now point at the
-  `meow-shared` volume and say plainly that the manual step is
-  optional on a stock stack (the server downloads the databases into
-  `/shared` at startup anyway).
-- Both guides described `./config` as mounted read-only. The server
-  container mounts it read-write precisely so the admin *Edit
-  settings* page can save, which is the change this batch
-  introduced; the probe is the `:ro` one. `FUMOX_CONFIG_ACCESS`,
-  the knob that this change added, was documented in the compose
-  file, the changelog and `scripts/smoke-up.sh` but in neither
-  guide, so it is now in the `.env` table too.
-- The reverse-proxy note told operators to set both
-  `[server].allowed_hosts` and `[admin].allowed_hosts` "to the
-  hostname the proxy serves", and the note behind *Import / Export*,
-  *Sources* and *Profiles* still described the serve links as being
-  built against the **public** list — which was true then, and made
-  exactly those three screens answer `500` on the shipped loopback
-  quickstart (`http://127.0.0.1:8081/admin`) plus a pinned public
-  domain. The links are built from the **panel's own host** now — the
-  `Host` the request that reached the panel carried — with the public
-  port from `[server].bind`, and that host is validated against
-  `[admin].allowed_hosts`, the list the panel gate uses, so the
-  screens render. The two lists stay separate, and a split list has a
-  visible price: the link carries the admin host, so clicking it
-  lands on the public listener, which gates on
-  `[server].allowed_hosts` and answers `404` for a host that is not
-  on that list. The trade-off is deliberate — a panel host the public
-  list rejects would otherwise break the whole page instead of one
-  link. What an operator has to add is therefore: every host that
-  should reach the **public** endpoints (`/sub`, `/src`, `/export/*`)
-  in `[server].allowed_hosts`, every host that should reach the
-  **panel** in `[admin].allowed_hosts`, and — if the serve links are
-  to work when clicked — the panel host in both. The shipped
-  configuration leaves both lists empty, which admits every host. The
-  note, both guides' configuration tables and both troubleshooting
-  sections now spell this out.
-- The *Settings* page was described as rendering "every
-  `config/app.toml` knob except the admin token" and "the complete
+  `./config`; the shipped Compose stack sets
+  `FUMOX_GEO__DB_DIR=/shared` and the environment outranks the file, so
+  that directory was never scanned. The compose header,
+  `config/app.toml` and both guides now point at the geo volume
+  (`fumox-geo`) and say that the manual step is optional on a stock
+  stack; the alternative (drop the override and set `[geo].db_dir`) is
+  named there too.
+- Both guides described `./config` as mounted read-only; the server
+  container mounts it read-write so the admin *Edit settings* page can
+  save, and `FUMOX_CONFIG_ACCESS` is in the `.env` table now.
+- The reverse-proxy note still described the serve links as being built
+  against the **public** host list, which made the *Import / Export*,
+  *Sources* and *Profiles* screens answer `500` on the shipped loopback
+  quickstart. The links are built from the **panel's own host** now,
+  validated against `[admin].allowed_hosts`. The two lists stay
+  separate: every host that should reach the public endpoints
+  (`/sub`, `/src`, `/export/*`) goes into `[server].allowed_hosts`,
+  every host that should reach the panel into
+  `[admin].allowed_hosts`, and the panel host in both if the serve
+  links must work when clicked. The shipped configuration leaves both
+  lists empty, which admits every host.
+- The *Settings* page was described as rendering "the complete
   effective config". Two keys have no rendered field:
   `[server].export_max_rows` and
-  `[geo].startup_download_budget_secs`. Both apply from the file as
-  documented; the guides now name them as the exception instead of
-  claiming completeness.
+  `[geo].startup_download_budget_secs`; the guides now name them as the
+  exception.
 - `[server].export_max_rows = 0` was undocumented. It does not mean
   unlimited: the value clamps up to 1 row, so the body serves a
   single node. The config reference (both languages) now says so,
   next to the sibling keys that do give `0` a meaning.
 - The export links were first documented as "rendered at most once
   every 30 s", then corrected to "that holds per request, not per
-  window" (the cache had no single-flight claim). That correction is
-  itself superseded now: the render behind a cold or expired export
-  entry *is* single-flighted, so a burst landing exactly on the
-  boundary runs one render and the rest wait for its fresh entry.
-  Both guides state the current behaviour.
-- Corrected code comments that asserted more than the code
-  delivers: the `check_ip` policy no longer claims to cover "every
-  IPv6 form that carries an IPv4 address" (the IPv4-translated
-  `::ffff:0:0:0/96` and Teredo `2001:0000::/32` are not matched, and
-  were not before either); `render_tier` no longer claims a
-  truncated download "documents itself" (the body carries no
-  truncation marker, only the `nodes count` header does);
-  `pipeline_size` no longer claims to match *both* form modes (the
-  raw form measures pretty-printed JSON, so a document in the window
-  between the two sizes imports and then fails to save); and the
-  real-`.mmdb` test asserts content only: its old age assertion
-  read the developer's own file mtimes and went red with "looks
-  stale" on untouched machines after a month, so freshness is
-  covered deterministically (via `set_modified`) by the fresh/stale
-  test above instead.
+  window". That correction is itself superseded now: the render behind
+  a cold or expired export entry *is* single-flighted, so a burst
+  landing exactly on the boundary runs one render and the rest wait for
+  its fresh entry.
+- Corrected code comments that asserted more than the code delivers:
+  the `check_ip` policy, `render_tier`, `pipeline_size` and the
+  real-`.mmdb` age assertion (which read the developer's own file
+  mtimes and went red on untouched machines after a month).
 - The pipeline tables in both guides described `limit.count` as
   capping "the final, deduplicated and sorted list" on a source as well
   as on a profile. A source-level cap applies to that source's own
-  proxies, before the merge, the behaviour the serving code's own
-  comment described, and the one this batch's `limit` fix made true,
-  so a multi-source profile serves each source's top up to that count,
-  i.e. more than `count` in total. Both tables now say which is which.
-- The root READMEs (English and Russian) missed the geo rework entirely:
-  they still told operators to download the GeoLite2 `.mmdb` files into
-  `config/` as a required three-step ritual, the state before the
-  automatic download and the Compose `/shared` override existed: on a
-  stock `docker compose up` the manual step was not only unnecessary but
-  a no-op, because the stack pins `FUMOX_GEO__DB_DIR=/shared` and the
-  environment outranks the file. The READMEs now lead with the automatic
-  download (the `[geo].startup_download_budget_secs` wait included), keep
-  the MaxMind signup steps as the optional "ship your own files" path,
-  and say where those files have to go under Compose: into the
-  `meow-shared` volume
-  (`docker compose cp GeoLite2-City.mmdb server:/shared/`), or drop the
-  override and set `[geo].db_dir` instead. The production checklist item
-  in both guides no longer phrases the download as an operator step: the
-  check is that geo enrichment works, not that someone downloaded a file.
-- `docker/README.ru.md` was missed when the English deployment guide grew
-  the same geo correction in this batch: it still headed its preparation
-  section with "app.toml + optional GeoLite2-*.mmdb" and carried a
-  `cp config/GeoLite2-*.mmdb` line that silently did nothing on both
-  variants (both set `FUMOX_GEO__DB_DIR=/shared`). The Russian text
-  mirrors the English one now: the config directory is app.toml only,
-  geo points at the `meow-shared` volume, and the manual step is
-  optional because the server downloads the databases itself.
+  proxies, before the merge, so a multi-source profile serves each
+  source's top up to that count, i.e. more than `count` in total. Both
+  tables now say which is which.
+- The root READMEs (English and Russian) missed the geo rework: they
+  still told operators to download the GeoLite2 `.mmdb` files into
+  `config/` as a required ritual, which on a stock `docker compose up`
+  was a no-op (the stack pins `FUMOX_GEO__DB_DIR=/shared` and the
+  environment outranks the file). The READMEs now lead with the
+  automatic download, keep the MaxMind signup steps as the optional
+  "ship your own files" path, and say where those files have to go
+  under Compose (`docker compose cp GeoLite2-City.mmdb server:/shared/`).
+  The production checklist item no longer phrases the download as an
+  operator step.
+- `docker/README.ru.md` missed the same geo correction; the Russian text
+  mirrors the English one now (the config directory is app.toml only,
+  geo points at the geo volume (`fumox-geo`), the manual step is
+  optional).
 - The documentation batch that landed after the last antislop audit
-  (`anti-slop/audit-005-2026-10-11.md`) carried eighteen English em
-  dashes across `CHANGELOG.md`, `USERGUIDE.md`, `README.md`,
-  `.env.example` and `docker/README.md`. All are rewritten to colons,
-  commas or parentheses; facts and anchors unchanged. Russian dash
-  usage follows the standing owner decision and was not touched.
+  carried eighteen English em dashes across `CHANGELOG.md`,
+  `USERGUIDE.md`, `README.md`, `.env.example` and `docker/README.md`.
+  All are rewritten to colons, commas or parentheses; facts and anchors
+  unchanged.
 - The guides and the container examples describe what a reverse proxy in
   front of the server needs. Three keys per listener decide it:
   `trust_proxy_ips` (the addresses that may speak for a client),
   `trust_proxy_header` (the header family that proxy writes) and
-  `allowed_hosts` (the names the deployment serves). The user guide
-  (both languages), the compose file, the nginx template and the podman
-  guide spell out each of them and what breaks without it: the per-IP
-  limit counting the front's own address (one budget for the whole
-  fleet), the links staying on `http` behind a TLS front, and the `Host`
-  header being taken as it comes.
+  `allowed_hosts` (the names the deployment serves), and what breaks
+  without each of them.
 - The user guide (both languages) documents what the public endpoints
   answer now: the `X-Fumox-Skipped` header and the
   `incompatible-entries-skipped` warning, that the warning header may
@@ -2965,70 +2045,42 @@ are stamped when the batch is published.
   bound on the shutdown drain and the address the `--health-check`
   probe uses.
 - The user guide (both languages) documents what the admin panel does
-  with a secret and what it does with a deleted source. A password
+  with a secret and what it does with a deleted source: a password
   inside a source URL is masked on every screen while the stored address
   keeps it, a profile's access token is a password field with a floor of
-  16 characters and the panel shows a placeholder instead of the value,
-  the dashboard shows the top failure reasons of the last 24 hours, and
-  a new *Deleting a source* section explains the two orphan policies
-  (`[ingest].drop_gate`) and the warning toast a failed sweep produces.
+  16 characters, and a new *Deleting a source* section explains the two
+  orphan policies (`[ingest].drop_gate`).
 - The changelog had two `### Changed` sections inside one release
-  block, so the second one rendered as a stray heading and its
-  entries sat apart from the rest of the category. The two are merged
-  into one section, and the entries are in the order the changes
-  landed.
+  block, so the second one rendered as a stray heading; the two are
+  merged into one section.
 - The user guide (both languages) documents what the admin panel does
-  with a secret, with a refused form and with a keyboard. The signing-in
-  section now names the content-security policy (`script-src 'self'`, the
-  script shipped as a file) and the mask formats the panel uses
-  (`user:sec…••••` for a proxy credential, `[redacted]` for a
-  credential-bearing parameter, the same for a URL password and a secret
-  query value); the source and proxy rows of the screen table name the
-  masks and the refresh cost the panel now shows; and a new *Keyboard and
-  screen reader* section lists what a refused form does (the message sits
-  on its field, the control points at it, the settings editor opens the
-  pane with the first error and marks every broken pane), what a
-  confirmation dialog focuses, and what the toggles announce. The export
-  screen notes that rotating the token asks for confirmation on a page of
-  its own.
+  with a secret, with a refused form and with a keyboard: the
+  content-security policy (`script-src 'self'`), the mask formats the
+  panel uses, and a new *Keyboard and screen reader* section (the
+  message sits on its field, the settings editor opens the pane with
+  the first error, what a confirmation dialog focuses).
 - Both user guides now describe the status tiers the way the code
-  computes them. `unknown`, `alive` and `ready` are the three live
-  verdicts, and the last two are tiers rather than fields: a proxy sits
-  in exactly one of them, a `ready` proxy was `alive` before its tunnel
-  check succeeded, and a failed tunnel check sends it back to `alive`.
-  `quarantine` and `removed` are the two states that keep a proxy out of
-  the output. The two export links follow the tiers exactly, so a
-  `ready` proxy appears in `/export/ready/{token}` and never in
-  `/export/alive/{token}`; `health.exclude_statuses` accepts all five
-  statuses, and the default still drops only the two retired ones, so
-  `/sub` can hand out a proxy nobody has checked yet. The Russian guide
-  carried the tier text only in English; both now carry the same
-  paragraph, and the misspelled "tier"/"тиер" wording is gone from
-  both.
+  computes them: `unknown`, `alive` and `ready` are the three live
+  verdicts, `quarantine` and `removed` the two states that keep a
+  proxy out of the output. The two export links follow the tiers
+  exactly, so a `ready` proxy appears in `/export/ready/{token}` and
+  never in `/export/alive/{token}`; `health.exclude_statuses` accepts
+  all five statuses, and the default still drops only the two retired
+  ones.
 - The guides grew a *Source settings* subsection that tables the fields
-  of the source form (name, slug, URL, encoding, input format, IP
-  family, protocols, cache TTL, tags, headers) with the value format of
-  each, and states what the TTL really is: the source's scheduler
-  refresh period, not only a cache lifetime. The `[probe]` table grew
-  the two keys that section 10 used to describe on its own:
-  `allow_private_targets` (the SSRF guard the probe applies to
-  feed-supplied dial targets, default `false`) and
-  `backlog_target_drain_minutes` (the drain target the backlog banner
-  compares against, default `60`). Section 10 is now a pointer to the
-  configuration reference.
+  of the source form and states what the TTL really is (the source's
+  scheduler refresh period, not only a cache lifetime). The `[probe]`
+  table grew `allow_private_targets` and
+  `backlog_target_drain_minutes`.
 - The `.env` table states what the admin token really does:
   `docker-compose.yml` refuses to start without `FUMOX_ADMIN__TOKEN`,
   while the binary's own default is `change-me`, which is not a
-  credential: the panel stays off until a real token is set, the admin
-  listener is then not started at all and `/admin` answers 404. An empty
-  token and `[admin].enabled = false` do the same. The quickstart's
-  command list names the variable as mandatory. Both guides also warn
-  that the plain-HTTP quickstart needs
-  `FUMOX_ADMIN__SECURE_COOKIES=false`, because Compose sets it to
-  `true` and the browser then drops the session cookie, and the
-  troubleshooting table names the two symptoms that produces: the
-  redirect loop after a successful login and the panel's `403`
-  (`err.cross_site`).
+  credential: the panel stays off until a real token is set and
+  `/admin` answers 404. Both guides also warn that the plain-HTTP
+  quickstart needs `FUMOX_ADMIN__SECURE_COOKIES=false`, because Compose
+  sets it to `true` and the browser then drops the session cookie (the
+  symptoms: the redirect loop after a successful login and the panel's
+  `403`).
 - Both guides say plainly that meow-rs is not part of the image and has
   to be started separately for the T2 checks: without it only the T1
   checks run, and the `ready` tier and the T2 confirmation are absent.
@@ -3039,41 +2091,29 @@ are stamped when the batch is published.
   reference states the accepted value formats (one URL, a TOML array or
   a comma-separated list) and the fact that the probe draws one URL per
   cycle.
-- The config-write guarantee is stated precisely now. The atomic
-  replacement holds on the successful `rename` path only; the fallback
-  that writes through the original inode is not atomic and can leave a
-  truncated file, so that path is called unsafe. The backlog worked
-  example is recomputed with the formula of section 10: a lane of 389
-  rows is `ceil(389/64) × 20 = 140 s` at `concurrency = 64` (980 s at
-  the current 8), which is still above the 60-second period.
+- The config-write guarantee is stated precisely now: the atomic
+  replacement holds on the successful `rename` path only, and the
+  fallback that writes through the original inode is called unsafe. The
+  backlog worked example is recomputed with the formula of section 10.
 - Section 11 names where the GeoLite2 databases come from: the public
   P3TERX release assets, which is why no MaxMind key is needed by
   default. A MaxMind key is only required when the operator points
-  `[geo].download_urls` at MaxMind's own authenticated URLs. The
-  troubleshooting table grew a row for a failing download that names
-  the directory where a hand-placed `.mmdb` belongs.
+  `[geo].download_urls` at MaxMind's own authenticated URLs.
 - The guides still described the meow-rs release as a floating `latest`
   that the build resolved through the GitHub API. The build resolves
-  nothing: `docker/meow/Dockerfile` pins `MEOW_VERSION` (currently
-  `v0.27.0`) together with the two sha256 sums of the release archives,
-  the build refuses a download whose hash differs, and `latest` is
-  refused outright, by the wrapper image and by the `docker-meow.yml`
-  workflow alike, which takes the tag and the two sums as its inputs.
-  Both guides say so now, and name the command that shows the running
-  engine's version (`docker compose exec meow meow -v`).
+  nothing: `docker/meow/Dockerfile` pins `MEOW_VERSION` together with
+  the two sha256 sums of the release archives, the build refuses a
+  download whose hash differs, and `latest` is refused outright. Both
+  guides name the command that shows the running engine's version
+  (`docker compose exec meow meow -v`).
 - The guides state the relative-path rule of the configuration file (a
-  relative path resolves against the working directory, so the systemd
-  unit pins `WorkingDirectory=/opt/fumox` and the guide recommends
-  absolute values), and section 12 grew a Compose subsection for the
-  database: the path inside the container (`/app/data/fumox.db` on the
-  `fumox-data` volume) and the WAL-safe backup from a one-shot container
-  that carries the `sqlite3` CLI, together with the warning that a copy
-  of the `.db` file taken while the WAL is active is not a backup. The
-  endpoint table also names, per endpoint, which source error class
-  speaks for the answer: on the aggregated `/sub` the class of **any**
-  member source speaks for the whole profile, while `/src` judges only
-  the class of its own source, and a `http_client` failure is answered
-  with the upstream status of the last fetch on both.
+  relative path resolves against the working directory), and section 12
+  grew a Compose subsection for the database: the path inside the
+  container (`/app/data/fumox.db` on the `fumox-data` volume) and the
+  WAL-safe backup from a one-shot container that carries the `sqlite3`
+  CLI, together with the warning that a copy of the `.db` file taken
+  while the WAL is active is not a backup. The endpoint table also
+  names, per endpoint, which source error class speaks for the answer.
 
 ## 2026-09-23 · sha-b72b03f
 

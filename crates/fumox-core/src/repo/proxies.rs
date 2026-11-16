@@ -227,6 +227,23 @@ const FOREIGN_SOURCE_LINK: &str = "EXISTS (SELECT 1 FROM proxy_source_links l
 /// others). The link stamp below uses 500, which is at that ceiling.
 const UPSERT_CHUNK: usize = 250;
 
+/// The SET fragment of every "move to removed" transition, shared
+/// verbatim (the guarantee [`RESET_SET`] gives the reset/revive family):
+/// the ladder bookkeeping goes with the retirement, a stale
+/// `quarantined_at`/`ladder_at` on a `removed` row describes a recheck
+/// schedule nobody walks any more. Each statement adds only the WHERE it
+/// retires under; the bind order is `removed_at`, `updated_at`, then the
+/// statement's own predicates. Whitespace is cosmetic; SQLite does not
+/// care. The statements interpolate this fragment with `format!` and
+/// pass `AssertSqlSafe`: the fragment is a compile-time constant of this
+/// module, every value flows through `.bind()`.
+const RETIRE_SET: &str = "status = 'removed',
+             quarantined_at = NULL,
+             ladder_at = NULL,
+             ladder_step = 0,
+             removed_at = ?,
+             updated_at = ?";
+
 /// Upsert all entries of one fetch and reconcile links for the source.
 /// Runs in a single transaction, and inside it the per-row work is
 /// batched into multi-row statements (see the upsert loop): the
@@ -296,7 +313,13 @@ pub async fn reconcile_source(
 }
 
 /// The timed body of [`reconcile_source`]: one `BEGIN IMMEDIATE` ..
-/// `commit` transaction over the whole pass.
+/// `commit` transaction over the whole pass. The steps of the pass are
+/// the private helpers below ([`ensure_geo_alignment`],
+/// [`lookup_existing_fingerprints`], [`upsert_entries`],
+/// [`account_upserted`], [`next_link_stamp`], [`stamp_source_links`],
+/// [`retire_unlinked_proxies`], [`delete_stale_links`]); they all run on
+/// the one transaction, in this order, and nothing commits before the
+/// sweep is done.
 async fn reconcile_source_pass(
     pool: &DbPool,
     source_id: &str,
@@ -315,11 +338,45 @@ async fn reconcile_source_pass(
     // whole critical section waits inside busy_timeout instead.
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
-    // `entries` and `geo` are paired by index below. A longer stamp slice
-    // than there are entries means the caller filtered one side of the pair
-    // and not the other: every stamp from the first extra position on would
-    // land on a host that never resolved to it. Refuse rather than persist
-    // proxies stamped with another host's country and ASN.
+    ensure_geo_alignment(entries, geo)?;
+
+    // Pre-existing fingerprints, for insert/update accounting.
+    let fingerprints: Vec<String> = entries.iter().map(ProxyEntry::fingerprint).collect();
+    let existing = lookup_existing_fingerprints(&mut tx, &fingerprints).await?;
+
+    let ids_by_fingerprint =
+        upsert_entries(&mut tx, source_id, entries, geo, &fingerprints, now).await?;
+    let proxy_ids = account_upserted(&mut stats, &fingerprints, &ids_by_fingerprint, &existing)?;
+
+    let stamp = next_link_stamp(&mut tx, source_id, now).await?;
+    stamp_source_links(&mut tx, source_id, &proxy_ids, stamp).await?;
+
+    // The retire sweep runs *before* the links go away (see
+    // [`retire_unlinked_proxies`]); under `drop_gate = false`
+    // (`keep_alive_linger`) the sweep is skipped outright: that option
+    // means the probe alone retires a proxy, and a proxy that dropped out
+    // of the feed has not failed anything. Retiring it here judged it
+    // without a verdict. `quarantine` lingers along with the live tiers
+    // for the same reason: unlinking it would strand a row in no probe
+    // lane, which kills it just as surely as the sweep did, only without
+    // the record.
+    let keep_alive_linger = policy.keep_alive_linger();
+    if !keep_alive_linger {
+        stats.removed = retire_unlinked_proxies(&mut tx, source_id, now).await?;
+    }
+    stats.unlinked = delete_stale_links(&mut tx, source_id, now, policy).await?;
+
+    tx.commit().await?;
+    Ok(stats)
+}
+
+/// Refuse a stamp slice longer than the entry slice. `entries` and `geo`
+/// are paired by index in the upsert ([`upsert_entry_chunk`]): a caller
+/// that filtered the entries but passed the unfiltered stamps back would
+/// otherwise store every proxy past the first drop with another host's
+/// country and ASN. Refuse rather than persist proxies stamped with
+/// another host's facts.
+fn ensure_geo_alignment(entries: &[ProxyEntry], geo: &[Option<GeoStamp>]) -> crate::Result<()> {
     if geo.len() > entries.len() {
         tracing::error!(
             entries = entries.len(),
@@ -330,9 +387,16 @@ async fn reconcile_source_pass(
             "reconcile_source: geo stamp count does not match entry count".to_string(),
         ));
     }
+    Ok(())
+}
 
-    // Pre-existing fingerprints, for insert/update accounting.
-    let fingerprints: Vec<String> = entries.iter().map(ProxyEntry::fingerprint).collect();
+/// The fingerprints already present in `proxies`, for the insert/update
+/// accounting ([`account_upserted`]), looked up in placeholder-sized
+/// chunks.
+async fn lookup_existing_fingerprints(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    fingerprints: &[String],
+) -> crate::Result<std::collections::HashSet<String>> {
     let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
     for chunk in fingerprints.chunks(500) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
@@ -342,107 +406,159 @@ async fn reconcile_source_pass(
         for fp in chunk {
             query = query.bind(fp);
         }
-        let rows: Vec<(String,)> = query.fetch_all(&mut *tx).await?;
+        let rows: Vec<(String,)> = query.fetch_all(&mut **tx).await?;
         existing.extend(rows.into_iter().map(|(fp,)| fp));
     }
+    Ok(existing)
+}
 
-    // Upsert each entry; the ON CONFLICT branch refreshes the mutable
-    // identity fields only. Lifecycle fields (status, fail_count, quarantine
-    // schedules, removed_at) are deliberately absent: the probe state
-    // machine is their sole owner, and a reappearing proxy keeps its state.
-    //
-    // One multi-row statement per chunk, `UPSERT_CHUNK` entries each
-    // (the ceilings that bound the constant live with it).
-    //
-    // Keyed by fingerprint because RETURNING emits rows in unspecified
-    // order, and duplicate fingerprints in one batch must collapse onto
-    // the one id.
+/// Upsert each entry; the ON CONFLICT branch refreshes the mutable
+/// identity fields only. Lifecycle fields (status, fail_count, quarantine
+/// schedules, removed_at) are deliberately absent: the probe state
+/// machine is their sole owner, and a reappearing proxy keeps its state.
+///
+/// One multi-row statement per chunk ([`upsert_entry_chunk`]),
+/// `UPSERT_CHUNK` entries each (the ceilings that bound the constant
+/// live with it).
+///
+/// Keyed by fingerprint because RETURNING emits rows in unspecified
+/// order, and duplicate fingerprints in one batch must collapse onto
+/// the one id.
+///
+/// `entries`, `fingerprints` and `geo` are paired by index; a shorter
+/// `geo` slice or a `None` element means "no fresh geo facts" (see
+/// [`reconcile_source_pass`]).
+async fn upsert_entries(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    entries: &[ProxyEntry],
+    geo: &[Option<GeoStamp>],
+    fingerprints: &[String],
+    now: i64,
+) -> crate::Result<std::collections::HashMap<String, i64>> {
     let mut ids_by_fingerprint: std::collections::HashMap<String, i64> =
         std::collections::HashMap::with_capacity(entries.len());
-    let mut proxy_ids: Vec<i64> = Vec::with_capacity(entries.len());
-    let mut seen_in_batch: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (chunk_idx, chunk) in entries.chunks(UPSERT_CHUNK).enumerate() {
-        let base = chunk_idx * UPSERT_CHUNK;
-        let placeholders =
-            vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
-        let sql = format!(
-            "INSERT INTO proxies
-                (fingerprint, scheme, name, host, port, credential,
-                 params, unknown_params, raw_line, raw_path,
-                 geo_country, geo_city, geo_asn, created_at, updated_at)
-             VALUES {placeholders}
-             ON CONFLICT(fingerprint) DO UPDATE SET
-                name = CASE WHEN {FOREIGN_SOURCE_LINK}
-                            THEN proxies.name ELSE excluded.name END,
-                params = CASE WHEN {FOREIGN_SOURCE_LINK}
-                              THEN proxies.params ELSE excluded.params END,
-                unknown_params = CASE WHEN {FOREIGN_SOURCE_LINK}
-                                      THEN proxies.unknown_params
-                                      ELSE excluded.unknown_params END,
-                raw_line = CASE WHEN {FOREIGN_SOURCE_LINK}
-                                THEN proxies.raw_line ELSE excluded.raw_line END,
-                raw_path = CASE WHEN {FOREIGN_SOURCE_LINK}
-                                THEN proxies.raw_path ELSE excluded.raw_path END,
-                geo_country = COALESCE(excluded.geo_country, proxies.geo_country),
-                geo_city = COALESCE(excluded.geo_city, proxies.geo_city),
-                geo_asn = COALESCE(excluded.geo_asn, proxies.geo_asn),
-                geo_attempts = CASE WHEN excluded.geo_country IS NOT NULL
-                                       OR excluded.geo_city IS NOT NULL
-                                       OR excluded.geo_asn IS NOT NULL
-                                     THEN 0 ELSE proxies.geo_attempts END,
-                last_geo_attempt_at = CASE WHEN excluded.geo_country IS NOT NULL
-                                              OR excluded.geo_city IS NOT NULL
-                                              OR excluded.geo_asn IS NOT NULL
-                                            THEN NULL ELSE proxies.last_geo_attempt_at END,
-                updated_at = excluded.updated_at
-             RETURNING id, fingerprint"
-        );
-        // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
-        let mut query = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql.as_str()));
-        for (idx, entry) in chunk.iter().enumerate() {
-            let fingerprint = fingerprints[base + idx].as_str();
-            let params_json =
-                super::json_to_text(&serde_json::Value::Object(entry.known_params_json()))?;
-            let unknown_json =
-                super::json_to_text(&serde_json::Value::Object(entry.unknown_params_json()))?;
-            let geostamp = geo
-                .get(base + idx)
-                .and_then(|stamp| stamp.as_ref())
-                .cloned()
-                .unwrap_or_default();
-            query = query
-                .bind(fingerprint)
-                .bind(entry.scheme.as_str())
-                .bind(&entry.name)
-                .bind(&entry.host)
-                .bind(entry.port)
-                .bind(&entry.credential)
-                .bind(params_json)
-                .bind(unknown_json)
-                .bind(&entry.raw_line)
-                .bind(&entry.raw_path)
-                .bind(geostamp.country)
-                .bind(geostamp.city)
-                .bind(geostamp.asn)
-                .bind(now)
-                .bind(now);
-        }
-        // The guard placeholders sit behind the VALUES list in the
-        // statement, so their binds follow the row binds.
-        let guard_binds = sql.matches(FOREIGN_SOURCE_LINK).count();
-        for _ in 0..guard_binds {
-            query = query.bind(source_id);
-        }
-        let rows: Vec<(i64, String)> = query.fetch_all(&mut *tx).await?;
+    for (chunk_idx, (chunk, chunk_fingerprints)) in entries
+        .chunks(UPSERT_CHUNK)
+        .zip(fingerprints.chunks(UPSERT_CHUNK))
+        .enumerate()
+    {
+        let rows = upsert_entry_chunk(
+            &mut *tx,
+            source_id,
+            chunk,
+            chunk_fingerprints,
+            geo,
+            chunk_idx * UPSERT_CHUNK,
+            now,
+        )
+        .await?;
         for (id, fingerprint) in rows {
             ids_by_fingerprint.insert(fingerprint, id);
         }
     }
+    Ok(ids_by_fingerprint)
+}
 
-    // Rebuild the per-entry id list in entry order and do the
-    // insert/update accounting. A fingerprint already in the DB, or
-    // already seen earlier in this same batch, counts as an update.
-    for fingerprint in &fingerprints {
+/// One multi-row upsert statement for one chunk: builds the statement,
+/// binds the chunk's rows, then the [`FOREIGN_SOURCE_LINK`] guard binds
+/// (they sit behind the VALUES list in the statement, so their binds
+/// follow the row binds), and returns the `RETURNING id, fingerprint`
+/// rows. `base` is the chunk's offset in the full entry list, the index
+/// the `geo` stamps pair at.
+async fn upsert_entry_chunk(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    chunk: &[ProxyEntry],
+    fingerprints: &[String],
+    geo: &[Option<GeoStamp>],
+    base: usize,
+    now: i64,
+) -> crate::Result<Vec<(i64, String)>> {
+    let placeholders =
+        vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+    let sql = format!(
+        "INSERT INTO proxies
+            (fingerprint, scheme, name, host, port, credential,
+             params, unknown_params, raw_line, raw_path,
+             geo_country, geo_city, geo_asn, created_at, updated_at)
+         VALUES {placeholders}
+         ON CONFLICT(fingerprint) DO UPDATE SET
+            name = CASE WHEN {FOREIGN_SOURCE_LINK}
+                        THEN proxies.name ELSE excluded.name END,
+            params = CASE WHEN {FOREIGN_SOURCE_LINK}
+                          THEN proxies.params ELSE excluded.params END,
+            unknown_params = CASE WHEN {FOREIGN_SOURCE_LINK}
+                                  THEN proxies.unknown_params
+                                  ELSE excluded.unknown_params END,
+            raw_line = CASE WHEN {FOREIGN_SOURCE_LINK}
+                            THEN proxies.raw_line ELSE excluded.raw_line END,
+            raw_path = CASE WHEN {FOREIGN_SOURCE_LINK}
+                            THEN proxies.raw_path ELSE excluded.raw_path END,
+            geo_country = COALESCE(excluded.geo_country, proxies.geo_country),
+            geo_city = COALESCE(excluded.geo_city, proxies.geo_city),
+            geo_asn = COALESCE(excluded.geo_asn, proxies.geo_asn),
+            geo_attempts = CASE WHEN excluded.geo_country IS NOT NULL
+                                   OR excluded.geo_city IS NOT NULL
+                                   OR excluded.geo_asn IS NOT NULL
+                                 THEN 0 ELSE proxies.geo_attempts END,
+            last_geo_attempt_at = CASE WHEN excluded.geo_country IS NOT NULL
+                                          OR excluded.geo_city IS NOT NULL
+                                          OR excluded.geo_asn IS NOT NULL
+                                        THEN NULL ELSE proxies.last_geo_attempt_at END,
+            updated_at = excluded.updated_at
+         RETURNING id, fingerprint"
+    );
+    // sqlx 0.9 SqlSafeStr: placeholder-list format! only; data is bound.
+    let mut query = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql.as_str()));
+    for (idx, entry) in chunk.iter().enumerate() {
+        let fingerprint = fingerprints[idx].as_str();
+        let params_json =
+            super::json_to_text(&serde_json::Value::Object(entry.known_params_json()))?;
+        let unknown_json =
+            super::json_to_text(&serde_json::Value::Object(entry.unknown_params_json()))?;
+        let geostamp = geo
+            .get(base + idx)
+            .and_then(|stamp| stamp.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        query = query
+            .bind(fingerprint)
+            .bind(entry.scheme.as_str())
+            .bind(&entry.name)
+            .bind(&entry.host)
+            .bind(entry.port)
+            .bind(&entry.credential)
+            .bind(params_json)
+            .bind(unknown_json)
+            .bind(&entry.raw_line)
+            .bind(&entry.raw_path)
+            .bind(geostamp.country)
+            .bind(geostamp.city)
+            .bind(geostamp.asn)
+            .bind(now)
+            .bind(now);
+    }
+    let guard_binds = sql.matches(FOREIGN_SOURCE_LINK).count();
+    for _ in 0..guard_binds {
+        query = query.bind(source_id);
+    }
+    Ok(query.fetch_all(&mut **tx).await?)
+}
+
+/// Rebuild the per-entry id list in entry order and do the insert/update
+/// accounting. A fingerprint already in the DB, or already seen earlier
+/// in this same batch, counts as an update. Returns the proxy ids in
+/// entry order.
+fn account_upserted(
+    stats: &mut ReconciliationStats,
+    fingerprints: &[String],
+    ids_by_fingerprint: &std::collections::HashMap<String, i64>,
+    existing: &std::collections::HashSet<String>,
+) -> crate::Result<Vec<i64>> {
+    let mut proxy_ids: Vec<i64> = Vec::with_capacity(fingerprints.len());
+    let mut seen_in_batch: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for fingerprint in fingerprints {
         let id = ids_by_fingerprint
             .get(fingerprint.as_str())
             .copied()
@@ -459,25 +575,39 @@ async fn reconcile_source_pass(
             stats.inserted_ids.push(id);
         }
     }
+    Ok(proxy_ids)
+}
 
-    // The stamp of this pass: `now`, but strictly greater than any
-    // `seen_at` this source's links already carry. Two passes of one
-    // source inside the same wall-clock second would otherwise stamp the
-    // same value, and the sweeps below could not tell the links of the
-    // previous pass from the links of this one (they compare
-    // `seen_at <> stamp`, not `<`). The read sits inside the
-    // `BEGIN IMMEDIATE` transaction, so no concurrent writer can slip a
-    // fresher stamp in between.
+/// The stamp of this pass: `now`, but strictly greater than any
+/// `seen_at` this source's links already carry. Two passes of one
+/// source inside the same wall-clock second would otherwise stamp the
+/// same value, and the sweeps below could not tell the links of the
+/// previous pass from the links of this one (they compare
+/// `seen_at <> stamp`, not `<`). The read sits inside the
+/// `BEGIN IMMEDIATE` transaction, so no concurrent writer can slip a
+/// fresher stamp in between.
+async fn next_link_stamp(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    now: i64,
+) -> crate::Result<i64> {
     let max_seen: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(seen_at), 0) FROM proxy_source_links WHERE source_id = ?",
     )
     .bind(source_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
-    let stamp = now.max(max_seen + 1);
+    Ok(now.max(max_seen + 1))
+}
 
-    // Stamp the links of everything still present in this source,
-    // batched like the upserts (3 binds per row).
+/// Stamp the links of everything still present in this source,
+/// batched like the upserts (3 binds per row).
+async fn stamp_source_links(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    proxy_ids: &[i64],
+    stamp: i64,
+) -> crate::Result<()> {
     for chunk in proxy_ids.chunks(500) {
         let placeholders = vec!["(?, ?, ?)"; chunk.len()].join(", ");
         let sql = format!(
@@ -489,21 +619,75 @@ async fn reconcile_source_pass(
         for id in chunk {
             query = query.bind(id).bind(source_id).bind(stamp);
         }
-        query.execute(&mut *tx).await?;
+        query.execute(&mut **tx).await?;
     }
+    Ok(())
+}
 
-    // Drop links this fetch no longer saw, then mark orphaned proxies
-    // removed (idempotent: proxies already removed keep their removed_at).
-    // With the alive-linger policy an alive *or ready* proxy keeps a
-    // link the fetch did not re-stamp, it stays linked to the source and
-    // keeps running the probe cycle; only the probe's own verdict can end
-    // it (`ready` is a live tier too).
-    let keep_alive_linger = policy.keep_alive_linger();
-    // Stale means "not stamped by this pass": the comparison is against
-    // this pass's own strictly-increasing stamp (see the link stamping
-    // above), so two passes inside one second still part last pass's
-    // links from this pass's.
-    let unlinked_sql = if keep_alive_linger {
+/// The retire sweep of the pass: it runs *before* the links go away and
+/// asks the question this pass is actually responsible for: "which
+/// proxies does the link DELETE ([`delete_stale_links`]) leave with no
+/// link at all?" That is a per-proxy answer about this source, not a
+/// global one. The unscoped `NOT EXISTS (link)` version swept up every
+/// link-less row in the table, including the deliberate residue of the
+/// admin source-delete path: `mark_source_orphans_removed` protects
+/// `ready` and `unknown` rows under `drop_gate = false` and leaves them
+/// link-less on purpose, and the very next reconcile of any *other*
+/// source retired them, undoing the operator's choice. The protected
+/// rows have no link to this source, so they are not in the candidate
+/// set. Both EXISTS share the same arguments: a stale link of this
+/// source (about to be deleted) and no link that survives it.
+///
+/// Idempotent: proxies already removed keep their removed_at (the
+/// `status != 'removed'` guard). Returns the number of rows retired.
+async fn retire_unlinked_proxies(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    now: i64,
+) -> crate::Result<usize> {
+    let retire_sql = format!(
+        "UPDATE proxies
+         SET {RETIRE_SET}
+         WHERE status != 'removed'
+           AND EXISTS (SELECT 1 FROM proxy_source_links l
+                       WHERE l.proxy_id = proxies.id AND l.source_id = ? AND l.seen_at <> ?)
+           AND NOT EXISTS (SELECT 1 FROM proxy_source_links l
+                           WHERE l.proxy_id = proxies.id
+                             AND NOT (l.source_id = ? AND l.seen_at <> ?))"
+    );
+    Ok(sqlx::query(sqlx::AssertSqlSafe(retire_sql.as_str()))
+        .bind(now)
+        .bind(now)
+        .bind(source_id)
+        .bind(now)
+        .bind(source_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected() as usize)
+}
+
+/// Drop the links of this source this fetch no longer saw; the proxies
+/// the DELETE leaves with no link at all are retired by
+/// [`retire_unlinked_proxies`], which runs before this DELETE inside the
+/// same transaction.
+///
+/// With the alive-linger policy an alive *or ready* proxy keeps a
+/// link the fetch did not re-stamp, it stays linked to the source and
+/// keeps running the probe cycle; only the probe's own verdict can end
+/// it (`ready` is a live tier too).
+///
+/// Stale means "not stamped by this pass": the comparison is against
+/// this pass's own strictly-increasing stamp ([`next_link_stamp`]), so
+/// two passes inside one second still part last pass's links from this
+/// pass's.
+async fn delete_stale_links(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source_id: &str,
+    now: i64,
+    policy: crate::ingest::IngestPolicy,
+) -> crate::Result<usize> {
+    let unlinked_sql = if policy.keep_alive_linger() {
         format!(
             "DELETE FROM proxy_source_links
              WHERE source_id = ?
@@ -514,57 +698,12 @@ async fn reconcile_source_pass(
     } else {
         "DELETE FROM proxy_source_links WHERE source_id = ? AND seen_at <> ?".to_string()
     };
-    // The retire sweep runs *before* the links go away and asks the
-    // question this pass is actually responsible for: "which proxies
-    // does the DELETE below leave with no link at all?" That is a
-    // per-proxy answer about this source, not a global one. The
-    // unscoped `NOT EXISTS (link)` version swept up every link-less row
-    // in the table, including the deliberate residue of the admin
-    // source-delete path: `mark_source_orphans_removed` protects `ready` and
-    // `unknown` rows under `drop_gate = false` and leaves them link-less
-    // on purpose, and the very next reconcile of any *other* source
-    // retired them, undoing the operator's choice. The protected rows
-    // have no link to this source, so they are not in the candidate set.
-    // Both EXISTS share the same arguments: a stale link of this source
-    // (about to be deleted) and no link that survives it.
-    //
-    // Under `drop_gate = false` the sweep is skipped outright: that option
-    // means the probe alone retires a proxy, and a proxy that dropped out
-    // of the feed has not failed anything. Retiring it here judged it
-    // without a verdict. `quarantine` lingers along with the live tiers
-    // for the same reason: unlinking it would strand a row in no probe
-    // lane, which kills it just as surely as the sweep did, only without
-    // the record.
-    if !keep_alive_linger {
-        const RETIRE_SQL: &str = "UPDATE proxies
-             SET status = 'removed', removed_at = ?, updated_at = ?
-             WHERE status != 'removed'
-               AND EXISTS (SELECT 1 FROM proxy_source_links l
-                           WHERE l.proxy_id = proxies.id AND l.source_id = ? AND l.seen_at <> ?)
-               AND NOT EXISTS (SELECT 1 FROM proxy_source_links l
-                               WHERE l.proxy_id = proxies.id
-                                 AND NOT (l.source_id = ? AND l.seen_at <> ?))";
-        stats.removed = sqlx::query(RETIRE_SQL)
-            .bind(now)
-            .bind(now)
-            .bind(source_id)
-            .bind(now)
-            .bind(source_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected() as usize;
-    }
-
-    stats.unlinked = sqlx::query(sqlx::AssertSqlSafe(unlinked_sql))
+    Ok(sqlx::query(sqlx::AssertSqlSafe(unlinked_sql))
         .bind(source_id)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
-        .rows_affected() as usize;
-
-    tx.commit().await?;
-    Ok(stats)
+        .rows_affected() as usize)
 }
 
 /// Batch of `(id, host)` rows still missing a fact the loaded databases
@@ -2171,13 +2310,12 @@ pub async fn mark_source_orphans_removed(
     // The link subquery names the source's own proxies and the NOT EXISTS
     // excludes the source's own link, so a proxy that another source
     // still feeds is not an orphan.
-    let mut sql = String::from(
-        "UPDATE proxies SET status = 'removed', quarantined_at = NULL, ladder_at = NULL,
-                ladder_step = 0, removed_at = ?, updated_at = ?
+    let mut sql = format!(
+        "UPDATE proxies SET {RETIRE_SET}
          WHERE status != 'removed'
            AND id IN (SELECT proxy_id FROM proxy_source_links WHERE source_id = ?)
            AND NOT EXISTS (SELECT 1 FROM proxy_source_links l
-                           WHERE l.proxy_id = proxies.id AND l.source_id != ?)",
+                           WHERE l.proxy_id = proxies.id AND l.source_id != ?)"
     );
     if !protected_statuses.is_empty() {
         let placeholders = vec!["?"; protected_statuses.len()].join(", ");
@@ -2245,17 +2383,11 @@ pub async fn count_detached(pool: &DbPool) -> crate::Result<i64> {
 /// how many rows were affected.
 pub async fn remove_detached(pool: &DbPool) -> crate::Result<u64> {
     let now = crate::models::now_ts();
-    let result = sqlx::query(
-        "UPDATE proxies SET
-             status = 'removed',
-             quarantined_at = NULL,
-             ladder_at = NULL,
-             ladder_step = 0,
-             removed_at = ?,
-             updated_at = ?
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE proxies SET {RETIRE_SET}
          WHERE status != 'removed'
-           AND id NOT IN (SELECT proxy_id FROM proxy_source_links)",
-    )
+           AND id NOT IN (SELECT proxy_id FROM proxy_source_links)"
+    )))
     .bind(now)
     .bind(now)
     .execute(pool)
@@ -2265,14 +2397,6 @@ pub async fn remove_detached(pool: &DbPool) -> crate::Result<u64> {
 
 /// How many rows one purge batch deletes.
 const PURGE_BATCH_SIZE: i64 = 1000;
-
-/// The pause between two purge batches.
-///
-/// The purge holds the WAL write lock for the duration of a batch, and
-/// the probe daemon wants that lock for its own state machine. The pause
-/// gives it a window between two batches instead of making it wait for
-/// the whole sweep.
-const PURGE_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Physically delete every `removed` proxy and, via `ON DELETE CASCADE`,
 /// its source links and probe/speed history («purge
@@ -2317,29 +2441,16 @@ const PURGE_STALE_SQL: &str = "DELETE FROM proxies WHERE id IN (
 /// and the pause between them lets the other writer in before the next
 /// batch starts.
 pub async fn purge_removed_before(pool: &DbPool, before: Option<i64>) -> crate::Result<u64> {
-    let mut total = 0u64;
-    loop {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let mut delete = sqlx::query(match before {
+    super::purge_batched(
+        pool,
+        match before {
             Some(_) => PURGE_STALE_SQL,
             None => PURGE_ALL_SQL,
-        });
-        if let Some(cutoff) = before {
-            delete = delete.bind(cutoff);
-        }
-        let affected = delete
-            .bind(PURGE_BATCH_SIZE)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        tx.commit().await?;
-        total += affected;
-        if affected < PURGE_BATCH_SIZE as u64 {
-            break;
-        }
-        tokio::time::sleep(PURGE_BATCH_PAUSE).await;
-    }
-    Ok(total)
+        },
+        before,
+        PURGE_BATCH_SIZE,
+    )
+    .await
 }
 
 // Bulk cleanup actions: one-click ways to
@@ -2355,16 +2466,10 @@ pub async fn purge_removed_before(pool: &DbPool, before: Option<i64>) -> crate::
 /// already given up on. Returns how many rows were affected.
 pub async fn quarantine_to_removed(pool: &DbPool) -> crate::Result<u64> {
     let now = crate::models::now_ts();
-    let result = sqlx::query(
-        "UPDATE proxies SET
-             status = 'removed',
-             quarantined_at = NULL,
-             ladder_at = NULL,
-             ladder_step = 0,
-             removed_at = ?,
-             updated_at = ?
-         WHERE status = 'quarantine'",
-    )
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE proxies SET {RETIRE_SET}
+         WHERE status = 'quarantine'"
+    )))
     .bind(now)
     .bind(now)
     .execute(pool)
@@ -2380,16 +2485,10 @@ pub async fn quarantine_to_removed(pool: &DbPool) -> crate::Result<u64> {
 /// never-resolved rows. Returns how many rows were affected.
 pub async fn remove_alive_without_country(pool: &DbPool) -> crate::Result<u64> {
     let now = crate::models::now_ts();
-    let result = sqlx::query(
-        "UPDATE proxies SET
-             status = 'removed',
-             quarantined_at = NULL,
-             ladder_at = NULL,
-             ladder_step = 0,
-             removed_at = ?,
-             updated_at = ?
-         WHERE status IN ('alive', 'ready') AND geo_country IS NULL",
-    )
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE proxies SET {RETIRE_SET}
+         WHERE status IN ('alive', 'ready') AND geo_country IS NULL"
+    )))
     .bind(now)
     .bind(now)
     .execute(pool)
@@ -2409,16 +2508,10 @@ pub async fn remove_alive_by_asn(pool: &DbPool, asn: &str) -> crate::Result<u64>
         return Ok(0);
     };
     let now = crate::models::now_ts();
-    let result = sqlx::query(
-        "UPDATE proxies SET
-             status = 'removed',
-             quarantined_at = NULL,
-             ladder_at = NULL,
-             ladder_step = 0,
-             removed_at = ?,
-             updated_at = ?
-         WHERE status IN ('alive', 'ready') AND geo_asn = ?",
-    )
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE proxies SET {RETIRE_SET}
+         WHERE status IN ('alive', 'ready') AND geo_asn = ?"
+    )))
     .bind(now)
     .bind(now)
     .bind(canonical)
@@ -2433,16 +2526,10 @@ pub async fn remove_alive_by_asn(pool: &DbPool, asn: &str) -> crate::Result<u64>
 /// rows were affected.
 pub async fn remove_alive_by_country(pool: &DbPool, code: &str) -> crate::Result<u64> {
     let now = crate::models::now_ts();
-    let result = sqlx::query(
-        "UPDATE proxies SET
-             status = 'removed',
-             quarantined_at = NULL,
-             ladder_at = NULL,
-             ladder_step = 0,
-             removed_at = ?,
-             updated_at = ?
-         WHERE status IN ('alive', 'ready') AND geo_country = ?",
-    )
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE proxies SET {RETIRE_SET}
+         WHERE status IN ('alive', 'ready') AND geo_country = ?"
+    )))
     .bind(now)
     .bind(now)
     .bind(code)
@@ -2458,16 +2545,10 @@ pub async fn remove_alive_by_country(pool: &DbPool, code: &str) -> crate::Result
 /// simply not yet checked. Returns how many rows were affected.
 pub async fn remove_unprobeable_unknown(pool: &DbPool) -> crate::Result<u64> {
     let now = crate::models::now_ts();
-    let result = sqlx::query(
-        "UPDATE proxies SET
-             status = 'removed',
-             quarantined_at = NULL,
-             ladder_at = NULL,
-             ladder_step = 0,
-             removed_at = ?,
-             updated_at = ?
-         WHERE status = 'unknown' AND scheme IN ('tuic', 'mieru')",
-    )
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE proxies SET {RETIRE_SET}
+         WHERE status = 'unknown' AND scheme IN ('tuic', 'mieru')"
+    )))
     .bind(now)
     .bind(now)
     .execute(pool)

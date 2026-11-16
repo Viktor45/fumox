@@ -28,22 +28,7 @@ use serde_norway::{Mapping, Value};
 /// apart. A caller that already holds an entry can simply ask the mapping
 /// itself — a `None` means "no mihomo counterpart".
 pub fn is_supported(scheme: Scheme) -> bool {
-    entry_to_clash_named(&bare_entry(scheme), "").is_some()
-}
-
-/// An entry that carries nothing but a scheme, for the support question.
-fn bare_entry(scheme: Scheme) -> ProxyEntry {
-    ProxyEntry {
-        scheme,
-        name: String::new(),
-        host: String::new(),
-        port: 0,
-        credential: String::new(),
-        params: Vec::new(),
-        raw_path: String::new(),
-        raw_line: String::new(),
-        canonical: None,
-    }
+    entry_to_clash_named(&ProxyEntry::scheme_only(scheme), "").is_some()
 }
 
 /// Map one entry onto a Clash proxy definition using its own name.
@@ -68,150 +53,17 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
     put("server", Value::String(entry.host.clone()));
     put("port", num(i64::from(entry.port)));
 
+    // One writer per scheme arm keeps the dispatcher readable; the arm
+    // bodies are unchanged.
     match entry.scheme {
-        Scheme::Vless => {
-            put("type", Value::String("vless".into()));
-            put("uuid", Value::String(entry.credential.clone()));
-            copy_param(entry, "flow", "flow", &mut put);
-            // One shared decision on whether the proxy is wrapped; the
-            // sing-box writer asks the same question.
-            if crate::params::wants_tls(entry, &blocks) {
-                put("tls", Value::Bool(true));
-                copy_param(entry, "sni", "servername", &mut put);
-                copy_param(entry, "servername", "servername", &mut put);
-            }
-            copy_param(entry, "fp", "client-fingerprint", &mut put);
-            copy_param(entry, "client-fingerprint", "client-fingerprint", &mut put);
-            put_reality_opts(entry, &blocks, &mut put);
-            put_alpn(entry, &mut put);
-            put_transport(entry, "type", &blocks, &mut put);
-        }
-        Scheme::Vmess => {
-            put("type", Value::String("vmess".into()));
-            put("uuid", Value::String(entry.credential.clone()));
-            // One shared reader, one type (u64, a negative value is 0) for
-            // both encoders.
-            put("alterId", Value::Number(super::alter_id(entry).into()));
-            let cipher = super::param_value(entry, "scy")
-                .or_else(|| super::param_value(entry, "cipher"))
-                .unwrap_or_else(|| "auto".into());
-            put("cipher", Value::String(cipher));
-            // vmess JSON carries TLS in `tls: "tls"`; Clash input uses the
-            // boolean `tls: true`; some feeds spell it `security=tls`.
-            if crate::params::wants_tls(entry, &blocks) {
-                put("tls", Value::Bool(true));
-                copy_param(entry, "sni", "servername", &mut put);
-                copy_param(entry, "servername", "servername", &mut put);
-            }
-            copy_param(entry, "fp", "client-fingerprint", &mut put);
-            copy_param(entry, "client-fingerprint", "client-fingerprint", &mut put);
-            put_alpn(entry, &mut put);
-            put_transport(entry, "net", &blocks, &mut put);
-        }
-        Scheme::Trojan => {
-            put("type", Value::String("trojan".into()));
-            put("password", Value::String(entry.credential.clone()));
-            copy_param(entry, "sni", "sni", &mut put);
-            copy_param(entry, "flow", "flow", &mut put);
-            copy_param(entry, "fp", "client-fingerprint", &mut put);
-            copy_param(entry, "client-fingerprint", "client-fingerprint", &mut put);
-            put_reality_opts(entry, &blocks, &mut put);
-            put_alpn(entry, &mut put);
-            put_transport(entry, "type", &blocks, &mut put);
-        }
-        Scheme::Ss => {
-            put("type", Value::String("ss".into()));
-            // The shared splitter owns the missing/empty-method fallback
-            // (see `parsers::clash` `SS_SPEC` for the parse-time
-            // canonicalization).
-            let (cipher, password) = super::split_ss_credential(&entry.credential);
-            put("cipher", Value::String(cipher.to_string()));
-            put("password", Value::String(password.to_string()));
-            put_ss_plugin(entry, &mut put);
-        }
-        Scheme::Hysteria2 => {
-            put("type", Value::String("hysteria2".into()));
-            put("password", Value::String(entry.credential.clone()));
-            copy_param(entry, "sni", "sni", &mut put);
-            copy_param(entry, "obfs", "obfs", &mut put);
-            copy_param(entry, "obfs-password", "obfs-password", &mut put);
-            copy_param(entry, "upMbps", "up", &mut put);
-            copy_param(entry, "up", "up", &mut put);
-            copy_param(entry, "downMbps", "down", &mut put);
-            copy_param(entry, "down", "down", &mut put);
-            copy_param(entry, "pinSHA256", "fingerprint", &mut put);
-            copy_param(entry, "fingerprint", "fingerprint", &mut put);
-            copy_param(entry, "ports", "ports", &mut put);
-            put_alpn(entry, &mut put);
-        }
-        Scheme::Socks5 => {
-            put("type", Value::String("socks5".into()));
-            // Credential is stored as "user:pass"; both parts are optional,
-            // and a colon-less credential is all username (the shared
-            // splitter owns the decision).
-            let (user, password) = super::split_user_password(&entry.credential);
-            if !user.is_empty() {
-                put("username", Value::String(user.to_string()));
-            }
-            if !password.is_empty() {
-                put("password", Value::String(password.to_string()));
-            }
-            if super::param_truthy(entry, "tls") {
-                put("tls", Value::Bool(true));
-            }
-        }
-        Scheme::Snell => {
-            put("type", Value::String("snell".into()));
-            // meow-rs names the secret `psk`; the URI keeps it as the
-            // userinfo, so the credential maps straight across.
-            put("psk", Value::String(entry.credential.clone()));
-            // Omitted entirely when the feed does not say: meow's own
-            // default is v4, and writing an explicit default here would
-            // pin every entry to a value the operator never chose.
-            if let Some(version) = super::param_value(entry, "version") {
-                put("version", Value::String(version.to_string()));
-            }
-            // Only emitted when asked, so a false cannot become "true"
-            // through a string round-trip. `udp` comes from the shared
-            // tail below, which also covers the Clash-input case.
-            if super::param_truthy(entry, "reuse") {
-                put("reuse", Value::Bool(true));
-            }
-            // Both keys pass through verbatim, including the combinations
-            // meow rejects (obfs-opts on v6, mode on older). It drops those
-            // items rather than failing the config, so the T2 check 404s and
-            // charges the proxy, which is the honest verdict.
-            if let Some(mode) = super::param_value(entry, "mode") {
-                put("mode", Value::String(mode.to_string()));
-            }
-            // A Clash feed keeps the nested `obfs-opts` block, a URI feed the
-            // flat `obfs` / `obfs-host` pair. The flat form wins, as in put_ws_opts.
-            let obfs =
-                super::param_value(entry, "obfs").or_else(|| super::map_str(&blocks.obfs, "mode"));
-            let obfs_host = super::param_value(entry, "obfs-host")
-                .or_else(|| super::map_str(&blocks.obfs, "host"));
-            if obfs.is_some() || obfs_host.is_some() {
-                let mut opts = Mapping::new();
-                // meow treats an absent obfs as off, and so do we: only a
-                // host without a mode would be ambiguous.
-                opts.insert(
-                    Value::String("mode".into()),
-                    Value::String(obfs.clone().unwrap_or_else(|| "off".to_string())),
-                );
-                if let Some(host) = obfs_host {
-                    opts.insert(Value::String("host".into()), Value::String(host));
-                }
-                put("obfs-opts", Value::Mapping(opts));
-            }
-        }
-        Scheme::AnyTls => {
-            put("type", Value::String("anytls".into()));
-            put("password", Value::String(entry.credential.clone()));
-            // meow's anytls parser reads `sni` only; it has no
-            // client-fingerprint knob, so `fp` is deliberately not mapped.
-            copy_param(entry, "sni", "sni", &mut put);
-            // skip-cert-verify and udp come from the shared tail below.
-        }
+        Scheme::Vless => put_vless(entry, &blocks, &mut put),
+        Scheme::Vmess => put_vmess(entry, &blocks, &mut put),
+        Scheme::Trojan => put_trojan(entry, &blocks, &mut put),
+        Scheme::Ss => put_ss(entry, &mut put),
+        Scheme::Hysteria2 => put_hysteria2(entry, &mut put),
+        Scheme::Socks5 => put_socks5(entry, &mut put),
+        Scheme::Snell => put_snell(entry, &blocks, &mut put),
+        Scheme::AnyTls => put_anytls(entry, &mut put),
         Scheme::Naive | Scheme::Tuic | Scheme::Mieru => return None,
     }
 
@@ -224,6 +76,171 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
     }
 
     Some(Value::Mapping(m))
+}
+
+/// `vless` arm of [`entry_to_clash_named`]: the scheme keys plus the
+/// TLS/REALITY knobs and the transport block.
+fn put_vless(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Value)) {
+    put("type", Value::String("vless".into()));
+    put("uuid", Value::String(entry.credential.clone()));
+    copy_param(entry, "flow", "flow", put);
+    // One shared decision on whether the proxy is wrapped; the
+    // sing-box writer asks the same question.
+    if crate::params::wants_tls(entry, blocks) {
+        put("tls", Value::Bool(true));
+        copy_param(entry, "sni", "servername", put);
+        copy_param(entry, "servername", "servername", put);
+    }
+    copy_param(entry, "fp", "client-fingerprint", put);
+    copy_param(entry, "client-fingerprint", "client-fingerprint", put);
+    put_reality_opts(entry, blocks, put);
+    put_alpn(entry, put);
+    put_transport(entry, "type", blocks, put);
+}
+
+/// `vmess` arm of [`entry_to_clash_named`]: the scheme keys plus the
+/// TLS knobs and the transport block.
+fn put_vmess(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Value)) {
+    put("type", Value::String("vmess".into()));
+    put("uuid", Value::String(entry.credential.clone()));
+    // One shared reader, one type (u64, a negative value is 0) for
+    // both encoders.
+    put("alterId", Value::Number(super::alter_id(entry).into()));
+    let cipher = super::param_value(entry, "scy")
+        .or_else(|| super::param_value(entry, "cipher"))
+        .unwrap_or_else(|| "auto".into());
+    put("cipher", Value::String(cipher));
+    // vmess JSON carries TLS in `tls: "tls"`; Clash input uses the
+    // boolean `tls: true`; some feeds spell it `security=tls`.
+    if crate::params::wants_tls(entry, blocks) {
+        put("tls", Value::Bool(true));
+        copy_param(entry, "sni", "servername", put);
+        copy_param(entry, "servername", "servername", put);
+    }
+    copy_param(entry, "fp", "client-fingerprint", put);
+    copy_param(entry, "client-fingerprint", "client-fingerprint", put);
+    put_alpn(entry, put);
+    put_transport(entry, "net", blocks, put);
+}
+
+/// `trojan` arm of [`entry_to_clash_named`]: the scheme keys plus the
+/// TLS/REALITY knobs and the transport block.
+fn put_trojan(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Value)) {
+    put("type", Value::String("trojan".into()));
+    put("password", Value::String(entry.credential.clone()));
+    copy_param(entry, "sni", "sni", put);
+    copy_param(entry, "flow", "flow", put);
+    copy_param(entry, "fp", "client-fingerprint", put);
+    copy_param(entry, "client-fingerprint", "client-fingerprint", put);
+    put_reality_opts(entry, blocks, put);
+    put_alpn(entry, put);
+    put_transport(entry, "type", blocks, put);
+}
+
+/// `ss` arm of [`entry_to_clash_named`]: the split credential and the
+/// SIP003 plugin.
+fn put_ss(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
+    put("type", Value::String("ss".into()));
+    // The shared splitter owns the missing/empty-method fallback
+    // (see `parsers::clash` `SS_SPEC` for the parse-time
+    // canonicalization).
+    let (cipher, password) = super::split_ss_credential(&entry.credential);
+    put("cipher", Value::String(cipher.to_string()));
+    put("password", Value::String(password.to_string()));
+    put_ss_plugin(entry, put);
+}
+
+/// `hysteria2` arm of [`entry_to_clash_named`]: the credential plus the
+/// obfs/rate/fingerprint parameters.
+fn put_hysteria2(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
+    put("type", Value::String("hysteria2".into()));
+    put("password", Value::String(entry.credential.clone()));
+    copy_param(entry, "sni", "sni", put);
+    copy_param(entry, "obfs", "obfs", put);
+    copy_param(entry, "obfs-password", "obfs-password", put);
+    copy_param(entry, "upMbps", "up", put);
+    copy_param(entry, "up", "up", put);
+    copy_param(entry, "downMbps", "down", put);
+    copy_param(entry, "down", "down", put);
+    copy_param(entry, "pinSHA256", "fingerprint", put);
+    copy_param(entry, "fingerprint", "fingerprint", put);
+    copy_param(entry, "ports", "ports", put);
+    put_alpn(entry, put);
+}
+
+/// `socks5` arm of [`entry_to_clash_named`]: the optional per-part
+/// credential and the TLS toggle.
+fn put_socks5(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
+    put("type", Value::String("socks5".into()));
+    // Credential is stored as "user:pass"; both parts are optional,
+    // and a colon-less credential is all username (the shared
+    // splitter owns the decision).
+    let (user, password) = super::split_user_password(&entry.credential);
+    if !user.is_empty() {
+        put("username", Value::String(user.to_string()));
+    }
+    if !password.is_empty() {
+        put("password", Value::String(password.to_string()));
+    }
+    if super::param_truthy(entry, "tls") {
+        put("tls", Value::Bool(true));
+    }
+}
+
+/// `snell` arm of [`entry_to_clash_named`]: the psk, the optional
+/// version/reuse/mode knobs and the obfs block.
+fn put_snell(entry: &ProxyEntry, blocks: &Blocks, put: &mut impl FnMut(&str, Value)) {
+    put("type", Value::String("snell".into()));
+    // meow-rs names the secret `psk`; the URI keeps it as the
+    // userinfo, so the credential maps straight across.
+    put("psk", Value::String(entry.credential.clone()));
+    // Omitted entirely when the feed does not say: meow's own
+    // default is v4, and writing an explicit default here would
+    // pin every entry to a value the operator never chose.
+    if let Some(version) = super::param_value(entry, "version") {
+        put("version", Value::String(version.to_string()));
+    }
+    // Only emitted when asked, so a false cannot become "true"
+    // through a string round-trip. `udp` comes from the shared
+    // tail below, which also covers the Clash-input case.
+    if super::param_truthy(entry, "reuse") {
+        put("reuse", Value::Bool(true));
+    }
+    // Both keys pass through verbatim, including the combinations
+    // meow rejects (obfs-opts on v6, mode on older). It drops those
+    // items rather than failing the config, so the T2 check 404s and
+    // charges the proxy, which is the honest verdict.
+    if let Some(mode) = super::param_value(entry, "mode") {
+        put("mode", Value::String(mode.to_string()));
+    }
+    // A Clash feed keeps the nested `obfs-opts` block, a URI feed the
+    // flat `obfs` / `obfs-host` pair. The flat form wins, as in put_ws_opts.
+    let obfs = super::param_value(entry, "obfs").or_else(|| super::map_str(&blocks.obfs, "mode"));
+    let obfs_host =
+        super::param_value(entry, "obfs-host").or_else(|| super::map_str(&blocks.obfs, "host"));
+    if obfs.is_some() || obfs_host.is_some() {
+        let mut opts = Mapping::new();
+        // meow treats an absent obfs as off, and so do we: only a
+        // host without a mode would be ambiguous.
+        opts.insert(
+            Value::String("mode".into()),
+            Value::String(obfs.clone().unwrap_or_else(|| "off".to_string())),
+        );
+        if let Some(host) = obfs_host {
+            opts.insert(Value::String("host".into()), Value::String(host));
+        }
+        put("obfs-opts", Value::Mapping(opts));
+    }
+}
+
+/// `anytls` arm of [`entry_to_clash_named`]: the credential and `sni`.
+fn put_anytls(entry: &ProxyEntry, put: &mut impl FnMut(&str, Value)) {
+    put("type", Value::String("anytls".into()));
+    put("password", Value::String(entry.credential.clone()));
+    // meow's anytls parser reads `sni` only; it has no
+    // client-fingerprint knob, so `fp` is deliberately not mapped.
+    copy_param(entry, "sni", "sni", put);
+    // skip-cert-verify and udp come from the shared tail below.
 }
 
 /// `reality-opts: {public-key, short-id}` from URI `pbk`/`sid` params or a

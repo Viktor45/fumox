@@ -185,8 +185,13 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         }
         object.insert(p.key.clone(), Value::String(p.value.clone()));
     }
-    let json = serde_json::to_string(&Value::Object(object))
-        .expect("vmess JSON object serialization cannot fail");
+    let json = match serde_json::to_string(&Value::Object(object)) {
+        Ok(text) => text,
+        Err(err) => {
+            tracing::error!(error = %err, "vmess JSON serialization failed");
+            String::new()
+        }
+    };
     let b64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD_NO_PAD,
         json.as_bytes(),
@@ -208,27 +213,8 @@ fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Result<St
 
 fn numeric_field(object: &serde_json::Map<String, Value>, key: &str) -> Result<u16, ParseError> {
     match object.get(key) {
-        Some(Value::Number(n)) => {
-            let port = match n.as_u64() {
-                Some(v) => u16::try_from(v).ok(),
-                // A producer may spell the port as a float (`443.0`): it is
-                // accepted when the fraction is zero and it fits u16.
-                None => n
-                    .as_f64()
-                    .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= f64::from(u16::MAX))
-                    .map(|v| v as u16),
-            };
-            // Port 0 is not a dialable endpoint (the schema CHECK, migration
-            // 0018, refuses it too), so the line is as invalid as an
-            // out-of-range one.
-            port.filter(|&p| p != 0)
-                .ok_or_else(|| invalid(format!("vmess: port out of range: {n}")))
-        }
-        Some(Value::String(s)) => match s.trim().parse::<u16>() {
-            // The same zero rejection on the string spelling.
-            Ok(0) | Err(_) => Err(invalid(format!("vmess: invalid port string: {s:?}"))),
-            Ok(port) => Ok(port),
-        },
+        Some(Value::Number(n)) => super::port_from_number(n, "vmess").map_err(invalid),
+        Some(Value::String(s)) => super::port_from_string(s, "vmess").map_err(invalid),
         Some(_) => Err(invalid(format!("vmess: field {key} is not numeric"))),
         None => Err(ParseError::new(
             ParseErrorKind::MissingField,

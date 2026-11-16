@@ -170,6 +170,71 @@ fn mode_flags(value: &str) -> (bool, bool) {
     (value == "set", value == "defaults")
 }
 
+/// The rename and drop rule rows carried by the form. Rows are collected
+/// through an index map, so gaps (a dropped row) and out-of-order fields
+/// parse identically. The cap ([`MAX_RULE_ROWS`]) only bounds a
+/// programmatic submission: the widget never renders more than a handful
+/// of rows, a form with thousands must not make the server build
+/// thousands of rules (and thousands of regexes).
+fn parse_rule_rows(form: &[(String, String)]) -> (Vec<RenameRow>, Vec<DropRow>) {
+    let mut rename_rows: std::collections::BTreeMap<usize, RenameRow> =
+        std::collections::BTreeMap::new();
+    let mut drop_rows: std::collections::BTreeMap<usize, DropRow> =
+        std::collections::BTreeMap::new();
+    for (key, value) in form {
+        let (prefix, rows): (&str, bool) = if key.starts_with("ped_rename_") {
+            ("ped_rename_", true)
+        } else if key.starts_with("ped_drop_") {
+            ("ped_drop_", false)
+        } else {
+            continue;
+        };
+        let Some((index, field)) = key[prefix.len()..].rsplit_once('_') else {
+            continue;
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        let (known, held) = if rows {
+            (rename_rows.contains_key(&index), rename_rows.len())
+        } else {
+            (drop_rows.contains_key(&index), drop_rows.len())
+        };
+        if !known && held >= MAX_RULE_ROWS {
+            continue;
+        }
+        // The rule's own text is taken verbatim, the selector value
+        // is trimmed (it comes from a fixed list).
+        let raw = value.to_string();
+        let target = value.trim().to_string();
+        if rows {
+            let row = rename_rows.entry(index).or_default();
+            match field {
+                "match" => row.match_pattern = raw,
+                "replace" => row.replace = raw,
+                "flags" => row.flags = raw,
+                "target" => row.target = target,
+                "key" => row.param_key = raw,
+                _ => {}
+            }
+        } else {
+            let row = drop_rows.entry(index).or_default();
+            match field {
+                "match" => row.match_pattern = raw,
+                "flags" => row.flags = raw,
+                "target" => row.target = target,
+                "key" => row.param_key = raw,
+                "asns" => row.asns = raw,
+                _ => {}
+            }
+        }
+    }
+    (
+        rename_rows.into_values().collect(),
+        drop_rows.into_values().collect(),
+    )
+}
+
 /// Ready-made builder states; `blank` is the empty state. `None` for a
 /// name no preset carries: the caller answers with an explicit error
 /// instead of silently rendering an empty widget.
@@ -251,62 +316,7 @@ impl BuilderState {
 
         // Rows are collected through an index map, so gaps (a dropped row)
         // and out-of-order fields parse identically.
-        let mut rename_rows: std::collections::BTreeMap<usize, RenameRow> =
-            std::collections::BTreeMap::new();
-        let mut drop_rows: std::collections::BTreeMap<usize, DropRow> =
-            std::collections::BTreeMap::new();
-        for (key, value) in form {
-            let (prefix, rows): (&str, bool) = if key.starts_with("ped_rename_") {
-                ("ped_rename_", true)
-            } else if key.starts_with("ped_drop_") {
-                ("ped_drop_", false)
-            } else {
-                continue;
-            };
-            let Some((index, field)) = key[prefix.len()..].rsplit_once('_') else {
-                continue;
-            };
-            let Ok(index) = index.parse::<usize>() else {
-                continue;
-            };
-            // The cap on the number of rows a section may hold. The
-            // widget never renders more than a handful, so the limit only
-            // bounds a programmatic submission: a form with a thousand
-            // rows must not make the server build a thousand rules.
-            let (known, held) = if rows {
-                (rename_rows.contains_key(&index), rename_rows.len())
-            } else {
-                (drop_rows.contains_key(&index), drop_rows.len())
-            };
-            if !known && held >= MAX_RULE_ROWS {
-                continue;
-            }
-            // The rule's own text is taken verbatim, the selector value
-            // is trimmed (it comes from a fixed list).
-            let raw = value.to_string();
-            let target = value.trim().to_string();
-            if rows {
-                let row = rename_rows.entry(index).or_default();
-                match field {
-                    "match" => row.match_pattern = raw,
-                    "replace" => row.replace = raw,
-                    "flags" => row.flags = raw,
-                    "target" => row.target = target,
-                    "key" => row.param_key = raw,
-                    _ => {}
-                }
-            } else {
-                let row = drop_rows.entry(index).or_default();
-                match field {
-                    "match" => row.match_pattern = raw,
-                    "flags" => row.flags = raw,
-                    "target" => row.target = target,
-                    "key" => row.param_key = raw,
-                    "asns" => row.asns = raw,
-                    _ => {}
-                }
-            }
-        }
+        let (rename, drop) = parse_rule_rows(form);
 
         let (filter_set, filter_defaults) = mode_flags(&get("ped_filter"));
         let (geo_set, geo_defaults) = mode_flags(&get("ped_geo"));
@@ -324,10 +334,10 @@ impl BuilderState {
             asns: get("ped_filter_asns"),
             exclude_asns: get("ped_filter_exclude_asns"),
             forbid_insecure: flag("ped_forbid_insecure", true),
-            rename: rename_rows.into_values().collect(),
+            rename,
             rename_skip: rename_mode == "skip",
             rename_defaults: rename_mode == "defaults",
-            drop: drop_rows.into_values().collect(),
+            drop,
             drop_skip: drop_mode == "skip",
             drop_defaults: drop_mode == "defaults",
             geo_set,
@@ -358,7 +368,8 @@ impl BuilderState {
     /// through its `Serialize` side, which carries the omit-defaults
     /// policy (`skip_serializing_if` per field), so the emitted keys are
     /// the schema's own and a new schema field cannot be missed here
-    /// without a compile error at the struct literals below.
+    /// without a compile error at the struct literals in the per-section
+    /// `emit_*` helpers.
     ///
     /// Two values the typed schema cannot hold — a mistyped cap and an
     /// unknown sort key — ride along in the emitted document, so the
@@ -379,9 +390,51 @@ impl BuilderState {
             limit: None,
         };
         let mut issues: Vec<PipelineIssue> = Vec::new();
-        let mut mistyped_limit: Option<String> = None;
-        let mut mistyped_sort: Option<String> = None;
+        self.emit_filter(&mut config);
+        self.emit_rename(&mut config);
+        self.emit_drop(&mut config);
+        self.emit_geo(&mut config);
+        self.emit_health(&mut config);
+        let mistyped_sort = self.emit_sort(&mut config, &mut issues);
+        let mistyped_limit = self.emit_limit(&mut config, &mut issues);
 
+        // The typed config is plain data (strings, numbers, arrays of
+        // them), serde_json cannot fail serializing it: a failure would
+        // mean a broken serializer, not a broken config. The emit
+        // degrades to "nothing configured" with the failure logged,
+        // instead of panicking the request thread.
+        let readable = match serde_json::to_value(&config) {
+            Ok(readable) => readable,
+            Err(err) => {
+                tracing::error!(error = %err, "pipeline v1 config failed to serialize");
+                return None;
+            }
+        };
+        if issues.is_empty() && readable.as_object().is_some_and(|map| map.len() == 1) {
+            return None; // only "version", nothing configured
+        }
+        let mut document = readable.clone();
+        if let Some(raw) = &mistyped_limit {
+            document["limit"] = serde_json::json!({ "count": raw });
+        }
+        if let Some(raw) = &mistyped_sort {
+            document["sort"]["by"] = serde_json::json!(raw);
+        }
+        if issues.is_empty() {
+            Some(Emitted::Config(document))
+        } else {
+            Some(Emitted::NeedsValidation {
+                document,
+                readable,
+                issues,
+            })
+        }
+    }
+
+    /// The filter section of the emitted document: an explicit `{}` in the
+    /// defaults mode, the non-default values in the set mode, nothing
+    /// otherwise.
+    fn emit_filter(&self, config: &mut PipelineConfig) {
         if self.filter_defaults {
             // An explicit `{}`: a profile resets the source's filter.
             config.filter = Some(FilterConfig {
@@ -412,7 +465,11 @@ impl BuilderState {
                 });
             }
         }
+    }
 
+    /// The rename section: an explicit `[]` in the defaults mode, the
+    /// typed rules in the set mode, nothing otherwise.
+    fn emit_rename(&self, config: &mut PipelineConfig) {
         if self.rename_defaults {
             // An explicit `[]`: a profile resets the source's rename rules.
             config.rename = Some(Vec::new());
@@ -437,7 +494,11 @@ impl BuilderState {
                 config.rename = Some(rules);
             }
         }
+    }
 
+    /// The drop section: an explicit `[]` in the defaults mode, the typed
+    /// rules in the set mode, nothing otherwise.
+    fn emit_drop(&self, config: &mut PipelineConfig) {
         if self.drop_defaults {
             // An explicit `[]`: a profile resets the source's drop rules.
             config.drop = Some(Vec::new());
@@ -479,7 +540,12 @@ impl BuilderState {
                 config.drop = Some(rules);
             }
         }
+    }
 
+    /// The geo section: an explicit `{}` in the defaults mode, the enabled
+    /// flag and the template when they differ from the defaults, nothing
+    /// otherwise.
+    fn emit_geo(&self, config: &mut PipelineConfig) {
         if self.geo_defaults {
             // An explicit `{}`: a profile resets the source's geo step.
             config.geo = Some(GeoStepConfig {
@@ -507,7 +573,12 @@ impl BuilderState {
                 });
             }
         }
+    }
 
+    /// The health section: an explicit `{}` in the defaults mode, the
+    /// exclusion list when it differs from the built-in defaults, nothing
+    /// otherwise.
+    fn emit_health(&self, config: &mut PipelineConfig) {
         if self.health_defaults {
             // An explicit `{}`: a profile resets the source's health
             // filter, so the section is built with the default exclusion
@@ -522,105 +593,110 @@ impl BuilderState {
                 exclude_statuses: self.exclude_statuses.clone(),
             });
         }
+    }
 
+    /// The sort section: an explicit `{}` in the defaults mode, the
+    /// selected key in the set mode. An unknown key is reported through
+    /// `issues` and returned as the raw value that rides along in the
+    /// emitted document (the typed schema cannot hold it).
+    fn emit_sort(
+        &self,
+        config: &mut PipelineConfig,
+        issues: &mut Vec<PipelineIssue>,
+    ) -> Option<String> {
         if self.sort_defaults {
             // An explicit `{}`: a profile resets the source's sort.
             config.sort = Some(SortConfig {
                 by: SortBy::Source,
                 desc: false,
             });
-        } else if self.sort_set {
-            let by = SortBy::ALL
-                .iter()
-                .find(|sort| sort.as_str() == self.sort_by.trim())
-                .copied();
-            match by {
-                Some(by) => {
-                    if by != SortBy::Source || self.sort_desc {
-                        config.sort = Some(SortConfig {
-                            by,
-                            desc: self.sort_desc,
-                        });
-                    }
-                }
-                None if !self.sort_by.trim().is_empty() => {
-                    // An unknown key: the raw value rides along in the
-                    // document, the typed one keeps the rest of the
-                    // section.
-                    mistyped_sort = Some(self.sort_by.clone());
-                    issues.push(PipelineIssue {
-                        key: "pipeline.unknown_sort",
-                        args: vec![self.sort_by.clone()],
+            return None;
+        }
+        if !self.sort_set {
+            return None;
+        }
+        let by = SortBy::ALL
+            .iter()
+            .find(|sort| sort.as_str() == self.sort_by.trim())
+            .copied();
+        match by {
+            Some(by) => {
+                if by != SortBy::Source || self.sort_desc {
+                    config.sort = Some(SortConfig {
+                        by,
+                        desc: self.sort_desc,
                     });
-                    if self.sort_desc {
-                        config.sort = Some(SortConfig {
-                            by: SortBy::Source,
-                            desc: true,
-                        });
-                    }
                 }
-                None => {
-                    if self.sort_desc {
-                        config.sort = Some(SortConfig {
-                            by: SortBy::Source,
-                            desc: true,
-                        });
-                    }
+            }
+            None if !self.sort_by.trim().is_empty() => {
+                // An unknown key: the raw value rides along in the
+                // document, the typed one keeps the rest of the
+                // section.
+                issues.push(PipelineIssue {
+                    key: "pipeline.unknown_sort",
+                    args: vec![self.sort_by.clone()],
+                });
+                if self.sort_desc {
+                    config.sort = Some(SortConfig {
+                        by: SortBy::Source,
+                        desc: true,
+                    });
+                }
+                return Some(self.sort_by.clone());
+            }
+            None => {
+                if self.sort_desc {
+                    config.sort = Some(SortConfig {
+                        by: SortBy::Source,
+                        desc: true,
+                    });
                 }
             }
         }
+        None
+    }
 
-        // The one value the typed schema cannot hold: a mistyped cap
-        // rides along as a JSON string so the validator reports it on the
-        // panel language instead of the field silently disappearing. That
-        // output is deliberately not a valid v1 config, so it cannot
-        // travel inside `LimitConfig` (whose `count` is
-        // `Option<serde_json::Number>`) and is patched into the serialized
-        // document below.
+    /// The limit section: an explicit `null` cap in the defaults mode, the
+    /// parsed number in the set mode. A mistyped cap is reported through
+    /// `issues` and returned as the raw value that rides along in the
+    /// emitted document: the validator reports it on the panel language
+    /// instead of the field silently disappearing. That output is
+    /// deliberately not a valid v1 config, so it cannot travel inside
+    /// `LimitConfig` (whose `count` is `Option<serde_json::Number>`) and
+    /// is patched into the serialized document by the caller.
+    fn emit_limit(
+        &self,
+        config: &mut PipelineConfig,
+        issues: &mut Vec<PipelineIssue>,
+    ) -> Option<String> {
         if self.limit_defaults {
             // An explicit `null` cap: a profile resets the source's limit
             // back to "no cap" (the same reset semantics as an empty
             // rename/drop array).
             config.limit = Some(LimitConfig { count: None });
-        } else if self.limit_set {
-            let raw = self.limit_count.trim();
-            if !raw.is_empty() {
-                match raw.parse::<i64>() {
-                    Ok(count) => {
-                        config.limit = Some(LimitConfig {
-                            count: Some(serde_json::Number::from(count)),
-                        })
-                    }
-                    Err(_) => {
-                        mistyped_limit = Some(raw.to_string());
-                        issues.push(PipelineIssue {
-                            key: "pipeline.invalid_limit",
-                            args: vec![raw.to_string()],
-                        });
-                    }
-                }
+            return None;
+        }
+        if !self.limit_set {
+            return None;
+        }
+        let raw = self.limit_count.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        match raw.parse::<i64>() {
+            Ok(count) => {
+                config.limit = Some(LimitConfig {
+                    count: Some(serde_json::Number::from(count)),
+                });
+                None
             }
-        }
-
-        let readable = serde_json::to_value(&config).expect("pipeline v1 config always serializes");
-        if issues.is_empty() && readable.as_object().is_some_and(|map| map.len() == 1) {
-            return None; // only "version", nothing configured
-        }
-        let mut document = readable.clone();
-        if let Some(raw) = &mistyped_limit {
-            document["limit"] = serde_json::json!({ "count": raw });
-        }
-        if let Some(raw) = &mistyped_sort {
-            document["sort"]["by"] = serde_json::json!(raw);
-        }
-        if issues.is_empty() {
-            Some(Emitted::Config(document))
-        } else {
-            Some(Emitted::NeedsValidation {
-                document,
-                readable,
-                issues,
-            })
+            Err(_) => {
+                issues.push(PipelineIssue {
+                    key: "pipeline.invalid_limit",
+                    args: vec![raw.to_string()],
+                });
+                Some(raw.to_string())
+            }
         }
     }
 
@@ -667,6 +743,52 @@ pub(crate) enum Ingest {
 fn raw(reason: &'static str) -> Ingest {
     tracing::debug!(reason, "stored pipeline fell back to raw mode");
     Ingest::Raw
+}
+
+/// Whether the stored config means something the widget cannot express,
+/// so ingest falls back to raw mode instead of flipping its meaning.
+fn unrepresentable(config: &PipelineConfig) -> bool {
+    // An empty allowlist means "output nothing" and an empty `match`
+    // pattern matches everywhere, real configs the widget cannot
+    // express, so they stay in raw mode instead of flipping meaning.
+    // A pattern of whitespace only is the same thing: the widget
+    // cannot type it (an empty row means "not typed yet").
+    if config
+        .filter
+        .as_ref()
+        .is_some_and(|f| f.protocols.as_ref().is_some_and(|p| p.is_empty()))
+    {
+        return true;
+    }
+    // Same raw-guard for the ASN allowlist: an empty `asns` array is
+    // "keep nothing", which the text field cannot distinguish from
+    // "not set".
+    if config
+        .filter
+        .as_ref()
+        .is_some_and(|f| f.asns.as_ref().is_some_and(|a| a.is_empty()))
+    {
+        return true;
+    }
+    if config
+        .rename
+        .as_ref()
+        .is_some_and(|rules| rules.iter().any(|r| r.match_pattern.trim().is_empty()))
+    {
+        return true;
+    }
+    // Same raw-guard for drop: an empty `match` discards everything ,
+    // a real rule the widget cannot express (its empty line means
+    // "not typed yet"). ASN-targeted rules carry no pattern by
+    // design; the `asns` field is the source of truth.
+    if config.drop.as_ref().is_some_and(|rules| {
+        rules
+            .iter()
+            .any(|r| r.target.as_deref() != Some("asn") && r.match_pattern.trim().is_empty())
+    }) {
+        return true;
+    }
+    false
 }
 
 /// Result of [`BuilderState::emit`].
@@ -745,182 +867,194 @@ impl BuilderState {
         if config.version != 1 {
             return raw("version");
         }
-        // An empty allowlist means "output nothing" and an empty `match`
-        // pattern matches everywhere, real configs the widget cannot
-        // express, so they stay in raw mode instead of flipping meaning.
-        // A pattern of whitespace only is the same thing: the widget
-        // cannot type it (an empty row means "not typed yet").
-        if config
-            .filter
-            .as_ref()
-            .is_some_and(|f| f.protocols.as_ref().is_some_and(|p| p.is_empty()))
-        {
-            return raw("unrepresentable");
-        }
-        // Same raw-guard for the ASN allowlist: an empty `asns` array is
-        // "keep nothing", which the text field cannot distinguish from
-        // "not set".
-        if config
-            .filter
-            .as_ref()
-            .is_some_and(|f| f.asns.as_ref().is_some_and(|a| a.is_empty()))
-        {
-            return raw("unrepresentable");
-        }
-        if config
-            .rename
-            .as_ref()
-            .is_some_and(|rules| rules.iter().any(|r| r.match_pattern.trim().is_empty()))
-        {
-            return raw("unrepresentable");
-        }
-        // Same raw-guard for drop: an empty `match` discards everything ,
-        // a real rule the widget cannot express (its empty line means
-        // "not typed yet"). ASN-targeted rules carry no pattern by
-        // design; the `asns` field is the source of truth.
-        if config.drop.as_ref().is_some_and(|rules| {
-            rules
-                .iter()
-                .any(|r| r.target.as_deref() != Some("asn") && r.match_pattern.trim().is_empty())
-        }) {
+        if unrepresentable(&config) {
             return raw("unrepresentable");
         }
         let mut state = Self::new();
-
-        if let Some(filter) = config.filter {
-            let has_values = filter.protocols.as_ref().is_some_and(|p| !p.is_empty())
-                || filter
-                    .exclude_protocols
-                    .as_ref()
-                    .is_some_and(|p| !p.is_empty())
-                || filter.asns.as_ref().is_some_and(|a| !a.is_empty())
-                || filter.exclude_asns.as_ref().is_some_and(|a| !a.is_empty())
-                || !filter.forbid_insecure;
-            if has_values {
-                state.filter_set = true;
-                state.protocols = filter.protocols.unwrap_or_default();
-                state.exclude_protocols = filter.exclude_protocols.unwrap_or_default();
-                // The stored spellings (bare or `AS`-prefixed) are kept
-                // verbatim: the validator accepts both, so the round trip
-                // does not rewrite what was configured.
-                state.asns = filter.asns.unwrap_or_default().join(", ");
-                state.exclude_asns = filter.exclude_asns.unwrap_or_default().join(", ");
-                state.forbid_insecure = filter.forbid_insecure;
-            } else {
-                state.filter_defaults = true;
-            }
-        }
-        if let Some(rules) = config.rename {
-            if rules.is_empty() {
-                state.rename_defaults = true;
-            } else {
-                state.rename = rules
-                    .into_iter()
-                    .map(|rule: RenameRule| {
-                        // Split the `param:KEY` form back into the select
-                        // value and the key field; `name` (or the absent
-                        // target) is the select's default.
-                        let (target, param_key) = match rule.target.as_deref() {
-                            None | Some("name") => (String::new(), String::new()),
-                            Some(raw) => match raw.strip_prefix("param:") {
-                                Some(key) => ("param".to_string(), key.to_string()),
-                                None => (raw.to_string(), String::new()),
-                            },
-                        };
-                        RenameRow {
-                            match_pattern: rule.match_pattern,
-                            replace: rule.replace,
-                            flags: rule.flags,
-                            target,
-                            param_key,
-                        }
-                    })
-                    .collect();
-            }
-        }
-        if let Some(rules) = config.drop {
-            if rules.is_empty() {
-                state.drop_defaults = true;
-            } else {
-                state.drop = rules
-                    .into_iter()
-                    .map(|rule: DropRule| {
-                        // ASN rules: round-trip the JSON array back into a
-                        // comma-separated free-text field. Other targets
-                        // follow the existing rename split.
-                        let asns = rule
-                            .asns
-                            .as_ref()
-                            .map(|list| list.join(", "))
-                            .unwrap_or_default();
-                        let (target, param_key) = match rule.target.as_deref() {
-                            None | Some("name") => (String::new(), String::new()),
-                            Some("asn") => ("asn".to_string(), String::new()),
-                            Some(raw) => match raw.strip_prefix("param:") {
-                                Some(key) => ("param".to_string(), key.to_string()),
-                                None => (raw.to_string(), String::new()),
-                            },
-                        };
-                        DropRow {
-                            match_pattern: rule.match_pattern,
-                            flags: rule.flags,
-                            target,
-                            param_key,
-                            asns,
-                        }
-                    })
-                    .collect();
-            }
-        }
-        if let Some(geo) = config.geo {
-            let template = geo.template.trim();
-            let has_values =
-                !geo.enabled || (!template.is_empty() && template != DEFAULT_GEO_TEMPLATE);
-            if has_values {
-                state.geo_set = true;
-                state.geo_enabled = geo.enabled;
-                // The built-in default template is shown as the empty value: the
-                // field's placeholder carries it and emit never writes it out.
-                if template != DEFAULT_GEO_TEMPLATE {
-                    state.geo_template = geo.template;
-                }
-            } else {
-                state.geo_defaults = true;
-            }
-        }
-        if let Some(health) = config.health {
-            if health.exclude_statuses != crate::pipeline::default_exclude_statuses() {
-                state.health_set = true;
-                state.exclude_statuses = health.exclude_statuses;
-            } else {
-                state.health_defaults = true;
-            }
-        }
-        if let Some(sort) = config.sort {
-            if sort.by != SortBy::Source || sort.desc {
-                state.sort_set = true;
-                state.sort_by = sort.by.as_str().to_string();
-                state.sort_desc = sort.desc;
-            } else {
-                state.sort_defaults = true;
-            }
-        }
-        if let Some(limit) = config.limit {
-            match limit.count {
-                // `null` is the explicit "no cap" reset of the profile
-                // tri-state; a set cap is 1 or more (0/negative already
-                // failed validation before ingest sees it).
-                None => state.limit_defaults = true,
-                Some(count) => {
-                    state.limit_set = true;
-                    state.limit_count = count.to_string();
-                }
-            }
-        }
+        state.ingest_filter(config.filter);
+        state.ingest_rename(config.rename);
+        state.ingest_drop(config.drop);
+        state.ingest_geo(config.geo);
+        state.ingest_health(config.health);
+        state.ingest_sort(config.sort);
+        state.ingest_limit(config.limit);
         // `dedup` has no builder field: the section is accepted and
         // ignored in v1 (deduplication is unconditional, any `by`
         // compiles), so emit canonicalizes it away.
         Ingest::Builder(Box::new(state))
+    }
+
+    /// The filter section of a stored config: the values that differ from
+    /// the defaults set the section, default-only content maps to the
+    /// explicit-defaults mode.
+    fn ingest_filter(&mut self, filter: Option<FilterConfig>) {
+        let Some(filter) = filter else {
+            return;
+        };
+        let has_values = filter.protocols.as_ref().is_some_and(|p| !p.is_empty())
+            || filter
+                .exclude_protocols
+                .as_ref()
+                .is_some_and(|p| !p.is_empty())
+            || filter.asns.as_ref().is_some_and(|a| !a.is_empty())
+            || filter.exclude_asns.as_ref().is_some_and(|a| !a.is_empty())
+            || !filter.forbid_insecure;
+        if has_values {
+            self.filter_set = true;
+            self.protocols = filter.protocols.unwrap_or_default();
+            self.exclude_protocols = filter.exclude_protocols.unwrap_or_default();
+            // The stored spellings (bare or `AS`-prefixed) are kept
+            // verbatim: the validator accepts both, so the round trip
+            // does not rewrite what was configured.
+            self.asns = filter.asns.unwrap_or_default().join(", ");
+            self.exclude_asns = filter.exclude_asns.unwrap_or_default().join(", ");
+            self.forbid_insecure = filter.forbid_insecure;
+        } else {
+            self.filter_defaults = true;
+        }
+    }
+
+    /// The rename section: an explicit `[]` maps to the defaults mode, the
+    /// rules rebuild the typed rows with the target split back.
+    fn ingest_rename(&mut self, rules: Option<Vec<RenameRule>>) {
+        let Some(rules) = rules else {
+            return;
+        };
+        if rules.is_empty() {
+            self.rename_defaults = true;
+            return;
+        }
+        self.rename = rules
+            .into_iter()
+            .map(|rule: RenameRule| {
+                // Split the `param:KEY` form back into the select
+                // value and the key field; `name` (or the absent
+                // target) is the select's default.
+                let (target, param_key) = match rule.target.as_deref() {
+                    None | Some("name") => (String::new(), String::new()),
+                    Some(raw) => match raw.strip_prefix("param:") {
+                        Some(key) => ("param".to_string(), key.to_string()),
+                        None => (raw.to_string(), String::new()),
+                    },
+                };
+                RenameRow {
+                    match_pattern: rule.match_pattern,
+                    replace: rule.replace,
+                    flags: rule.flags,
+                    target,
+                    param_key,
+                }
+            })
+            .collect();
+    }
+
+    /// The drop section: an explicit `[]` maps to the defaults mode, the
+    /// rules rebuild the typed rows (ASN rules round-trip the JSON array
+    /// back into the comma-separated free-text field).
+    fn ingest_drop(&mut self, rules: Option<Vec<DropRule>>) {
+        let Some(rules) = rules else {
+            return;
+        };
+        if rules.is_empty() {
+            self.drop_defaults = true;
+            return;
+        }
+        self.drop = rules
+            .into_iter()
+            .map(|rule: DropRule| {
+                // ASN rules: round-trip the JSON array back into a
+                // comma-separated free-text field. Other targets
+                // follow the existing rename split.
+                let asns = rule
+                    .asns
+                    .as_ref()
+                    .map(|list| list.join(", "))
+                    .unwrap_or_default();
+                let (target, param_key) = match rule.target.as_deref() {
+                    None | Some("name") => (String::new(), String::new()),
+                    Some("asn") => ("asn".to_string(), String::new()),
+                    Some(raw) => match raw.strip_prefix("param:") {
+                        Some(key) => ("param".to_string(), key.to_string()),
+                        None => (raw.to_string(), String::new()),
+                    },
+                };
+                DropRow {
+                    match_pattern: rule.match_pattern,
+                    flags: rule.flags,
+                    target,
+                    param_key,
+                    asns,
+                }
+            })
+            .collect();
+    }
+
+    /// The geo section: values that differ from the defaults set it,
+    /// default-only content maps to the explicit-defaults mode.
+    fn ingest_geo(&mut self, geo: Option<GeoStepConfig>) {
+        let Some(geo) = geo else {
+            return;
+        };
+        let template = geo.template.trim();
+        let has_values = !geo.enabled || (!template.is_empty() && template != DEFAULT_GEO_TEMPLATE);
+        if has_values {
+            self.geo_set = true;
+            self.geo_enabled = geo.enabled;
+            // The built-in default template is shown as the empty value: the
+            // field's placeholder carries it and emit never writes it out.
+            if template != DEFAULT_GEO_TEMPLATE {
+                self.geo_template = geo.template;
+            }
+        } else {
+            self.geo_defaults = true;
+        }
+    }
+
+    /// The health section: a non-default exclusion list sets it, the
+    /// default list maps to the explicit-defaults mode.
+    fn ingest_health(&mut self, health: Option<HealthConfig>) {
+        let Some(health) = health else {
+            return;
+        };
+        if health.exclude_statuses != crate::pipeline::default_exclude_statuses() {
+            self.health_set = true;
+            self.exclude_statuses = health.exclude_statuses;
+        } else {
+            self.health_defaults = true;
+        }
+    }
+
+    /// The sort section: a non-default key or direction sets it, the
+    /// default maps to the explicit-defaults mode.
+    fn ingest_sort(&mut self, sort: Option<SortConfig>) {
+        let Some(sort) = sort else {
+            return;
+        };
+        if sort.by != SortBy::Source || sort.desc {
+            self.sort_set = true;
+            self.sort_by = sort.by.as_str().to_string();
+            self.sort_desc = sort.desc;
+        } else {
+            self.sort_defaults = true;
+        }
+    }
+
+    /// The limit section: an explicit `null` cap maps to the defaults
+    /// mode, a set cap rebuilds the number field.
+    fn ingest_limit(&mut self, limit: Option<LimitConfig>) {
+        let Some(limit) = limit else {
+            return;
+        };
+        match limit.count {
+            // `null` is the explicit "no cap" reset of the profile
+            // tri-state; a set cap is 1 or more (0/negative already
+            // failed validation before ingest sees it).
+            None => self.limit_defaults = true,
+            Some(count) => {
+                self.limit_set = true;
+                self.limit_count = count.to_string();
+            }
+        }
     }
 }
 
@@ -1297,7 +1431,12 @@ impl WidgetFragment {
     /// Rendered widget HTML (embedded into the form via `| safe`; everything
     /// inside is server-generated and escaped by askama).
     pub(crate) fn html(self) -> String {
-        self.render().unwrap_or_default()
+        self.render().unwrap_or_else(|err| {
+            // A broken widget must not pass silently: the log names the
+            // failure, the form ships an empty `#ped-widget`.
+            tracing::error!(error = %err, "pipeline widget rendering failed");
+            String::new()
+        })
     }
 }
 

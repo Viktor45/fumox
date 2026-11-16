@@ -16,6 +16,7 @@ After=fumox-server.service
 
 [Container]
 Image=localhost/fumox:local
+#Image=ghcr.io/viktor45/fumox:latest
 ContainerName=fumox-probe
 Pod=fumox-worker.pod
 Exec=fumox-probe

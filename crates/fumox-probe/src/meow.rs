@@ -18,18 +18,23 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use fumox_core::config::MeowConfig;
-use rand::seq::IndexedRandom;
+use rand::RngExt;
 
 pub struct MeowClient {
     http: reqwest::Client,
     base_url: String,
-    test_urls: Vec<String>,
+    /// The configured test URLs. `new` refuses an empty `meow.test_url`,
+    /// and the first URL is kept apart from the rest so that "at least
+    /// one" is a structural fact [`Self::pick_test_url`] can rely on.
+    test_url_first: String,
+    test_url_rest: Vec<String>,
     timeout: Duration,
     /// Bearer token for the external-controller, empty when the
     /// controller is unauthenticated.
     api_token: String,
     /// The controller host as configured. A name is resolved (and vetted)
-    /// at startup, see [`MeowClient::verify_address`].
+    /// at startup and again before every tunnel batch, see
+    /// [`MeowClient::verify_address`].
     host: String,
     /// Whether the host is a name rather than an IP literal.
     host_is_name: bool,
@@ -138,6 +143,23 @@ fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// The verdict about a controller name's resolution: none of the
+/// addresses may be public, the bearer token would be reachable there.
+/// Private and loopback resolutions are allowed — the token rule of
+/// [`MeowClient::new`] covers a controller somebody else reaches.
+fn vet_controller_resolution(host: &str, addrs: &[IpAddr]) -> Result<(), String> {
+    for ip in addrs {
+        if fumox_core::ssrf::is_public(*ip) {
+            return Err(format!(
+                "meow.api_addr host {host} resolves to the public address {ip}: the \
+                 controller carries the bearer token, so it must stay on loopback or a \
+                 private network"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a delay-endpoint status is a verdict about the proxy.
 ///
 /// meow-rs answers a failed tunnel with 503 (transport failure) or 504
@@ -230,6 +252,19 @@ impl MeowClient {
                 config.api_addr
             ));
         }
+        // The config deserializer already refuses an empty `meow.test_url`,
+        // but the struct can also be built by hand; the split into first and
+        // rest below is what makes a non-empty list visible to the types.
+        let (test_url_first, test_url_rest) = match config.test_url.as_slice() {
+            [first, rest @ ..] => (first.clone(), rest.to_vec()),
+            [] => {
+                return Err(
+                    "meow.test_url must contain at least one URL: every tunnel batch \
+                     draws its endpoint from the list"
+                        .into(),
+                );
+            }
+        };
         let timeout = Duration::from_secs(config.timeout_secs.max(1));
         // One client, built exactly once: a builder failure is a startup
         // error to report, not something to paper over with a silently
@@ -254,7 +289,8 @@ impl MeowClient {
             // that forgets to would otherwise hang forever.
             http,
             base_url: format!("http://{}", format_host_port(&host, port)),
-            test_urls: config.test_url.clone(),
+            test_url_first,
+            test_url_rest,
             timeout,
             api_token,
             host_is_name: fumox_core::ssrf::parse_ip_literal(&host).is_none(),
@@ -262,11 +298,14 @@ impl MeowClient {
         })
     }
 
-    /// Vet a controller *name* at startup: it must not resolve into public
-    /// address space, where the bearer token would leak.
+    /// Vet a controller *name*: it must not resolve into public address
+    /// space, where the bearer token would leak. The vet runs at startup
+    /// and again before every tunnel batch: DNS changes while the daemon
+    /// runs, and the name that was private at startup is not private
+    /// forever.
     ///
-    /// A name that does not resolve is not a startup failure: the engine
-    /// may simply not be up yet, and the probe is built to run without it
+    /// A name that does not resolve is not a failure: the engine may
+    /// simply not be up yet, and the probe is built to run without it
     /// (T2 is skipped with a backoff, T1 keeps going). The name is then
     /// treated as network-reachable, so the token rule of
     /// [`MeowClient::new`] applies to it.
@@ -286,17 +325,7 @@ impl MeowClient {
                 return Ok(());
             }
         };
-        for ip in &addrs {
-            if fumox_core::ssrf::is_public(*ip) {
-                return Err(format!(
-                    "meow.api_addr host {} resolves to the public address {ip}: the \
-                     controller carries the bearer token, so it must stay on loopback or a \
-                     private network",
-                    self.host
-                ));
-            }
-        }
-        Ok(())
+        vet_controller_resolution(&self.host, &addrs)
     }
 
     /// The `Authorization` header of every controller request.
@@ -317,21 +346,27 @@ impl MeowClient {
     /// checks rotate across the list instead of hammering one endpoint
     /// (one URL may be blocked or degraded in a given region).
     fn pick_test_url<'a>(&'a self, rng: &mut impl rand::Rng) -> &'a str {
-        self.test_urls
-            .choose(rng)
-            .expect("meow.test_url is never empty (guaranteed by the config deserializer)")
+        // A uniform index over `first + rest`: the first URL is always
+        // there (see the field docs), so the draw never comes up empty.
+        let idx = rng.random_range(..=self.test_url_rest.len());
+        match self.test_url_rest.get(idx) {
+            Some(url) => url,
+            None => &self.test_url_first,
+        }
     }
 
-    /// The test URL of one cycle: one draw from the configured list,
-    /// shared by every check of the cycle.
+    /// The test URL of one (sub-)batch: one draw from the configured
+    /// list, shared by every check of the batch.
     ///
     /// A per-check draw gives the same proxy opposite verdicts in
     /// consecutive cycles, which reads as "the proxy dies on its own", and
-    /// a cycle whose draws all land on an unreachable endpoint fails every
-    /// proxy at once. One draw per cycle keeps a cycle internally
-    /// consistent and makes the endpoint a property of the cycle, visible
-    /// in its log line.
-    pub fn cycle_test_url(&self) -> &str {
+    /// a batch whose draws all land on an unreachable endpoint fails every
+    /// proxy at once. One draw per batch keeps a batch internally
+    /// consistent and makes the endpoint a property of the batch, visible
+    /// in its log line. The batch, not the cycle, is the unit that shares
+    /// one endpoint: a reload refusal splits the batch in half, and each
+    /// half draws its own URL.
+    pub fn batch_test_url(&self) -> &str {
         self.pick_test_url(&mut rand::rng())
     }
 
@@ -475,8 +510,8 @@ impl MeowClient {
 
     /// `GET /proxies/{name}/delay`, run one real tunnel check.
     ///
-    /// `test_url` is the endpoint of the current cycle (see
-    /// [`cycle_test_url`]): the same one for every check of the cycle.
+    /// `test_url` is the endpoint of the current batch (see
+    /// [`batch_test_url`]): the same one for every check of the batch.
     ///
     /// The outcome says who the failure belongs to. `ProxyFailed` is a
     /// verdict about the proxy (meow ran the tunnel test and it died) and
@@ -850,26 +885,27 @@ mod tests {
         ));
     }
 
-    /// The URL of the cycle is the URL every check of the cycle uses: the
-    /// probe draws it once, the checks do not pick their own.
+    /// The URL of the batch is the URL every check of the batch uses: the
+    /// probe draws it once per (sub-)batch, the checks do not pick their
+    /// own.
     #[tokio::test]
-    async fn delay_requests_use_the_url_of_the_cycle() {
+    async fn delay_requests_use_the_url_of_the_batch() {
         let reloads = Arc::new(AtomicUsize::new(0));
         let (_addr, mut config, seen) = mock_api(reloads.clone()).await;
         config.test_url = vec!["http://a.example/204".into(), "http://b.example/204".into()];
         let client = MeowClient::new(&config).unwrap();
 
-        let cycle_url = client.cycle_test_url().to_string();
+        let batch_url = client.batch_test_url().to_string();
         assert!(
-            cycle_url == "http://a.example/204" || cycle_url == "http://b.example/204",
-            "{cycle_url}"
+            batch_url == "http://a.example/204" || batch_url == "http://b.example/204",
+            "{batch_url}"
         );
         assert!(matches!(
-            client.check_delay("fumox-1", &cycle_url).await,
+            client.check_delay("fumox-1", &batch_url).await,
             DelayOutcome::Ok(_)
         ));
         let params = seen.lock().unwrap().clone();
-        assert_eq!(params.get("url"), Some(&cycle_url));
+        assert_eq!(params.get("url"), Some(&batch_url));
     }
 
     #[test]
@@ -1192,6 +1228,43 @@ mod tests {
                 "{addr} must be accepted"
             );
         }
+    }
+
+    /// The verdict about a controller name's resolution: a public address
+    /// is refused with the host and the address named (the vet runs again
+    /// before every tunnel batch, so a name that drifts into public space
+    /// mid-run stops the batches instead of leaking the token), while
+    /// loopback and private resolutions stay allowed.
+    #[test]
+    fn a_public_resolution_of_the_controller_name_is_refused() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let error = vet_controller_resolution("ctrl.internal", &[ip("8.8.8.8")])
+            .expect_err("a public resolution must be refused");
+        assert!(error.contains("ctrl.internal"), "{error}");
+        assert!(error.contains("8.8.8.8"), "{error}");
+        assert!(error.contains("public address"), "{error}");
+
+        assert!(
+            vet_controller_resolution("ctrl.internal", &[ip("127.0.0.1"), ip("10.0.0.5")]).is_ok(),
+            "loopback and private resolutions are allowed"
+        );
+        assert!(
+            vet_controller_resolution("ctrl.internal", &[]).is_ok(),
+            "an empty answer has nothing to refuse"
+        );
+    }
+
+    /// The vet itself walks both paths: an IP literal is vetted at
+    /// construction and never re-resolved, a name is resolved here —
+    /// "localhost" resolves on every host, so the name path runs end to
+    /// end without a network.
+    #[tokio::test]
+    async fn verify_address_walks_the_name_path() {
+        let client = MeowClient::new(&meow_config("127.0.0.1:9090", "")).unwrap();
+        assert!(client.verify_address(Duration::from_secs(1)).await.is_ok());
+
+        let client = MeowClient::new(&meow_config("localhost:9090", "")).unwrap();
+        assert!(client.verify_address(Duration::from_secs(1)).await.is_ok());
     }
 
     /// An address that is not a `host:port` pair cannot be dialled at

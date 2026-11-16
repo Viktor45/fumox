@@ -504,8 +504,24 @@ async fn retention_sweep(pool: &DbPool, retention: &ServerRetention) {
     // `retention::purge_stale_removed_proxies`): the delete is content
     // deletion the daemon's authorizer denies. A zero window leaves the
     // tier untouched.
-    let mut error = outcome.error;
-    let mut proxies_deleted = 0u64;
+    let (proxies_deleted, purge_error) = rotate_removed_proxies(pool, retention, now).await;
+
+    // Stamp the run under the server's own key, so /admin/probe surfaces
+    // it even without the daemon. `last_rotation` stays the daemon's: the
+    // server never touches `probe_results`, and overwriting the daemon's
+    // stamp with a zeroed `probe_results` counter read as "the daemon
+    // rotated" in a deployment that has none.
+    stamp_server_retention(pool, now, outcome, proxies_deleted, purge_error).await;
+}
+
+/// The TTL purge of the `removed` proxies: how many rows went, and the
+/// error text when the purge failed (the caller stamps it into the
+/// retention stamp, so a failed rotation is visible on /admin/probe).
+async fn rotate_removed_proxies(
+    pool: &DbPool,
+    retention: &ServerRetention,
+    now: i64,
+) -> (u64, Option<String>) {
     match fumox_core::repo::retention::purge_stale_removed_proxies(
         pool,
         u64::from(retention.removed_proxies_days),
@@ -513,26 +529,31 @@ async fn retention_sweep(pool: &DbPool, retention: &ServerRetention) {
     )
     .await
     {
-        Ok(0) => {}
+        Ok(0) => (0, None),
         Ok(deleted) => {
-            proxies_deleted = deleted;
             tracing::info!(deleted, "rotated removed proxies");
+            (deleted, None)
         }
         Err(err) => {
             tracing::warn!(error = %err, "removed-proxies rotation failed");
-            error.get_or_insert(format!("proxies: {err}"));
+            (0, Some(format!("proxies: {err}")))
         }
     }
+}
 
-    // Stamp the run under the server's own key, so /admin/probe surfaces
-    // it even without the daemon. `last_rotation` stays the daemon's: the
-    // server never touches `probe_results`, and overwriting the daemon's
-    // stamp with a zeroed `probe_results` counter read as "the daemon
-    // rotated" in a deployment that has none. A failed pass keeps the
-    // stamp of the last successful one (`ok: false` with the error text,
-    // see `ServerRetentionStamp`); the purge failures are collected
-    // across both passes, so a full wipe-out cannot advance the "last
-    // good" ts.
+/// Stamp the retention pass under the server's own key. A failed pass
+/// keeps the stamp of the last successful one (`ok: false` with the
+/// error text, see `ServerRetentionStamp`); the purge failures are
+/// collected across both passes (the journals' error first), so a full
+/// wipe-out cannot advance the "last good" ts.
+async fn stamp_server_retention(
+    pool: &DbPool,
+    now: i64,
+    outcome: fumox_core::repo::retention::RetentionOutcome,
+    proxies_deleted: u64,
+    purge_error: Option<String>,
+) {
+    let error = outcome.error.or(purge_error);
     let stamp = probe::meta::ServerRetentionStamp {
         ts: if error.is_none() {
             now
@@ -545,12 +566,22 @@ async fn retention_sweep(pool: &DbPool, retention: &ServerRetention) {
         ok: error.is_none(),
         error,
     };
-    if let Err(error) = fumox_core::repo::meta_set(
-        pool,
-        probe::meta::SERVER_RETENTION_KEY,
-        &serde_json::to_string(&stamp).expect("meta payload holds only JSON-native fields"),
-    )
-    .await
+    // The stamp holds only JSON-native fields, so serialization cannot
+    // fail; if it ever does, the pass stays unstamped and the note gets
+    // the same debug level as a failed write: a reporting miss in a
+    // detached background task is not a reason to panic the task.
+    let payload = match serde_json::to_string(&stamp) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "server retention: cannot serialize the retention stamp"
+            );
+            return;
+        }
+    };
+    if let Err(error) =
+        fumox_core::repo::meta_set(pool, probe::meta::SERVER_RETENTION_KEY, &payload).await
     {
         tracing::debug!(error = %error, "server retention: cannot stamp server_retention");
     }
@@ -617,60 +648,13 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                if !sweeping.take() {
-                    tracing::warn!(
-                        skipped_ticks = sweeping.skipped(),
-                        "scheduler sweep still running; the tick is skipped"
-                    );
-                    continue;
-                }
-                let env = env.clone();
-                let state = state.clone();
-                let events = events.clone();
-                let sweeping_done = SweepGuard(sweeping.flag());
-                let handle = tokio::spawn(async move {
-                    let _guard = sweeping_done;
-                    sweep(&env, &state, &events).await;
-                });
-                watch_task(handle, "scheduler sweep");
+                spawn_sweep_tick(&mut sweeping, &env, &state, &events);
             }
             _ = retention_tick.tick() => {
-                if !retention_sweeping.take() {
-                    tracing::debug!(
-                        skipped_ticks = retention_sweeping.skipped(),
-                        "scheduler retention sweep still running; skipping this tick"
-                    );
-                    continue;
-                }
-                let pool = env.pool.clone();
-                let guard = SweepGuard(retention_sweeping.flag());
-                let handle = tokio::spawn(async move {
-                    let _guard = guard;
-                    retention_sweep(&pool, &retention).await;
-                });
-                watch_task(handle, "scheduler retention sweep");
+                spawn_retention_tick(&mut retention_sweeping, &env, retention);
             }
             _ = geo_backfill_tick.tick() => {
-                if !geo_backfilling.take() {
-                    tracing::debug!(
-                        skipped_ticks = geo_backfilling.skipped(),
-                        "geo backfill: previous pass still running, skipping this tick"
-                    );
-                    continue;
-                }
-                let pool = env.pool.clone();
-                let geo = Arc::clone(&env.geo);
-                let guard = SweepGuard(geo_backfilling.flag());
-                let handle = tokio::spawn(async move {
-                    let _guard = guard;
-                    crate::geo_backfill::backfill_missing_geo_within_budget(
-                        pool,
-                        geo,
-                        GEO_BACKFILL_BUDGET,
-                    )
-                    .await;
-                });
-                watch_task(handle, "geo backfill");
+                spawn_geo_backfill_tick(&mut geo_backfilling, &env);
             }
             maybe_id = refresh_rx.recv() => {
                 let Some(source_id) = maybe_id else {
@@ -680,6 +664,74 @@ pub async fn run(
             }
         }
     }
+}
+
+/// One sweep pass on its slot: when the previous pass still holds the
+/// slot, the skipped tick is logged and nothing runs; otherwise the
+/// sweep is spawned detached, guarded by the slot's flag.
+fn spawn_sweep_tick(
+    slot: &mut SweepSlot,
+    env: &IngestEnv,
+    state: &SchedulerState,
+    events: &EventBus,
+) {
+    if !slot.take() {
+        tracing::warn!(
+            skipped_ticks = slot.skipped(),
+            "scheduler sweep still running; the tick is skipped"
+        );
+        return;
+    }
+    let env = env.clone();
+    let state = state.clone();
+    let events = events.clone();
+    let guard = SweepGuard(slot.flag());
+    let handle = tokio::spawn(async move {
+        let _guard = guard;
+        sweep(&env, &state, &events).await;
+    });
+    watch_task(handle, "scheduler sweep");
+}
+
+/// One retention pass on its slot, spawned detached like the fetch sweep
+/// so its bounded deletes do not hold the refresh channel (see
+/// [`retention_sweep`]).
+fn spawn_retention_tick(slot: &mut SweepSlot, env: &IngestEnv, retention: ServerRetention) {
+    if !slot.take() {
+        tracing::debug!(
+            skipped_ticks = slot.skipped(),
+            "scheduler retention sweep still running; skipping this tick"
+        );
+        return;
+    }
+    let pool = env.pool.clone();
+    let guard = SweepGuard(slot.flag());
+    let handle = tokio::spawn(async move {
+        let _guard = guard;
+        retention_sweep(&pool, &retention).await;
+    });
+    watch_task(handle, "scheduler retention sweep");
+}
+
+/// One geo backfill pass on its slot: the walk runs detached and never
+/// overlaps itself (see [`GEO_BACKFILL_INTERVAL`]).
+fn spawn_geo_backfill_tick(slot: &mut SweepSlot, env: &IngestEnv) {
+    if !slot.take() {
+        tracing::debug!(
+            skipped_ticks = slot.skipped(),
+            "geo backfill: previous pass still running, skipping this tick"
+        );
+        return;
+    }
+    let pool = env.pool.clone();
+    let geo = Arc::clone(&env.geo);
+    let guard = SweepGuard(slot.flag());
+    let handle = tokio::spawn(async move {
+        let _guard = guard;
+        crate::geo_backfill::backfill_missing_geo_within_budget(pool, geo, GEO_BACKFILL_BUDGET)
+            .await;
+    });
+    watch_task(handle, "geo backfill");
 }
 
 /// Watch a detached task and report its panic. The handle is awaited by a
@@ -706,22 +758,7 @@ async fn dispatch_refresh(
     match sources::get(&env.pool, source_id).await {
         // Explicit "refresh now": always hit the network — unless a
         // forced refresh of the same source was accepted moments ago.
-        // The in-flight guard only deduplicates concurrent fetches, so
-        // the spacing here is what keeps back-to-back requests from
-        // fetching the same URL twice in a row.
-        Ok(Some(source)) => {
-            if !state
-                .allow_forced_refresh(&source.id, fumox_core::models::now_ts())
-                .await
-            {
-                tracing::debug!(
-                    source = %source.id,
-                    "forced refresh throttled: the previous one is too recent"
-                );
-                return;
-            }
-            spawn_refresh(env, state, events, source);
-        }
+        Ok(Some(source)) => accept_forced_refresh(env, state, events, source).await,
         Ok(None) => {
             tracing::warn!(source = %source_id, "refresh requested for unknown source");
         }
@@ -733,6 +770,29 @@ async fn dispatch_refresh(
             );
         }
     }
+}
+
+/// The *Refresh now* target exists: honor the forced-refresh spacing —
+/// the in-flight guard only deduplicates concurrent fetches, so the
+/// spacing here is what keeps back-to-back requests from fetching the
+/// same URL twice in a row — and spawn the ingest.
+async fn accept_forced_refresh(
+    env: &IngestEnv,
+    state: &SchedulerState,
+    events: &EventBus,
+    source: Source,
+) {
+    if !state
+        .allow_forced_refresh(&source.id, fumox_core::models::now_ts())
+        .await
+    {
+        tracing::debug!(
+            source = %source.id,
+            "forced refresh throttled: the previous one is too recent"
+        );
+        return;
+    }
+    spawn_refresh(env, state, events, source);
 }
 
 /// Run one *Refresh now* ingest in the background and report a panic.
@@ -765,35 +825,9 @@ fn spawn_refresh(env: &IngestEnv, state: &SchedulerState, events: &EventBus, sou
 
 /// One scheduler sweep: ingest every enabled source that is due.
 async fn sweep(env: &IngestEnv, state: &SchedulerState, events: &EventBus) {
-    // Stamped at the start, not the end: the age of this stamp is "time
-    // since the loop last got a sweep underway", so a sweep hung inside
-    // its own body ages the stamp instead of looking healthy.
-    let started_at = fumox_core::models::now_ts();
-    if let Err(err) = fumox_core::repo::meta_set(
-        &env.pool,
-        fumox_core::repo::probe::meta::SERVER_CYCLE_KEY,
-        &started_at.to_string(),
-    )
-    .await
-    {
-        tracing::warn!(error = %err, "scheduler sweep: cannot stamp server_cycle");
-    }
+    stamp_server_cycle(&env.pool).await;
 
-    let due = match sources::list(&env.pool, true).await {
-        Ok(all) => {
-            let now = fumox_core::models::now_ts();
-            let pool = env.pool.clone();
-            due_sources(all, now, move |id| {
-                let pool = pool.clone();
-                async move { failure_history(&pool, &id).await }
-            })
-            .await
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "scheduler sweep: cannot list sources");
-            return;
-        }
-    };
+    let due = collect_due_sources(&env.pool).await;
     if due.is_empty() {
         return;
     }
@@ -808,6 +842,51 @@ async fn sweep(env: &IngestEnv, state: &SchedulerState, events: &EventBus) {
         // vanishing into `is_some()`.
         tasks.spawn(async move { (source_id, handle.await) });
     }
+    drain_ingest_tasks(tasks).await;
+}
+
+/// Stamp the sweep's cycle under the server's own key, so the panel can
+/// tell a live loop from a wedged one. Stamped at the start, not the
+/// end: the age of this stamp is "time since the loop last got a sweep
+/// underway", so a sweep hung inside its own body ages the stamp
+/// instead of looking healthy.
+async fn stamp_server_cycle(pool: &DbPool) {
+    let started_at = fumox_core::models::now_ts();
+    if let Err(err) = fumox_core::repo::meta_set(
+        pool,
+        fumox_core::repo::probe::meta::SERVER_CYCLE_KEY,
+        &started_at.to_string(),
+    )
+    .await
+    {
+        tracing::warn!(error = %err, "scheduler sweep: cannot stamp server_cycle");
+    }
+}
+
+/// The sources due for a fetch this sweep, in the order the sweep found
+/// them. A listing that fails is logged as an error and reads as
+/// "nothing due": a sweep over a broken database must not turn into a
+/// storm of upstream requests.
+async fn collect_due_sources(pool: &DbPool) -> Vec<Source> {
+    let all = match sources::list(pool, true).await {
+        Ok(all) => all,
+        Err(err) => {
+            tracing::error!(error = %err, "scheduler sweep: cannot list sources");
+            return Vec::new();
+        }
+    };
+    let now = fumox_core::models::now_ts();
+    due_sources(all, now, move |id| {
+        let pool = pool.clone();
+        async move { failure_history(&pool, &id).await }
+    })
+    .await
+}
+
+/// Drain a sweep's ingest tasks: a panic inside one ingest task (a
+/// `JoinError`) is logged with the source that died, a failure of the
+/// sweep task itself is logged on its own.
+async fn drain_ingest_tasks(mut tasks: JoinSet<(String, Result<(), tokio::task::JoinError>)>) {
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((_source_id, Ok(()))) => {}
@@ -851,14 +930,6 @@ fn spawn_ingest(
     // The in-flight guard is acquired atomically (mutex + set insert) inside
     // the spawned task; a duplicate spawn for the same source returns early.
     let fut = async move {
-        let IngestEnv {
-            pool,
-            fetcher,
-            caches,
-            geo,
-            settings,
-            budget,
-        } = env;
         let Some(in_flight) = state.acquire_source(&source_id).await else {
             tracing::debug!(source = %source_id, "source already fetching; skipping");
             return;
@@ -867,151 +938,15 @@ fn spawn_ingest(
         // The permit wait and the fetch share one ceiling: a source that
         // hangs, or a permit that never comes, must not pin the mark and
         // the slot for the life of the process.
-        let attempt = tokio::time::timeout(budget, async {
-            // A free permit means the fetch is not queued at all: it starts
-            // right away and only `fetch.started` is published. Only a task
-            // that really has to wait announces itself as `fetch.queued`,
-            // so a sweep that starts a batch of sources at once cannot
-            // flood the event stream with queue announcements nothing
-            // waits on. Under `[fetch].max_concurrency` saturation the
-            // queued window can span many sweeps, and the panel's notion
-            // of "fetching" must not include that wait: `fetch.started`
-            // fires only once a permit is in hand.
-            let permit = match state.semaphore.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    events.publish(FETCH_QUEUED, serde_json::json!({ "source_id": source_id }));
-                    match state.semaphore.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return None, // semaphore closed during shutdown
-                    }
-                }
-            };
-            // The row may have changed while this task waited for the
-            // permit: an admin edit (a new URL, new headers) must be
-            // honored, not fetched from the snapshot the sweep captured. A
-            // source deleted in the meantime is not fetched at all — the
-            // fetch would only write rows for a source that no longer
-            // exists.
-            let source = match sources::get(&pool, &source_id).await {
-                Ok(Some(fresh)) => {
-                    if fresh.updated_at != source.updated_at {
-                        tracing::debug!(
-                            source = %source_id,
-                            "refresh: the source row changed while queued; fetching the fresh one"
-                        );
-                    }
-                    fresh
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        source = %source_id,
-                        "refresh: the source row is gone; skipping the fetch"
-                    );
-                    return None;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        source = %source_id,
-                        error = %err,
-                        "refresh: cannot re-read the source row; fetching the snapshot"
-                    );
-                    source
-                }
-            };
-            events.publish(FETCH_STARTED, serde_json::json!({ "source_id": source_id }));
-            let outcome =
-                ingest::ingest_source(&pool, &fetcher, &geo, settings, &source, force).await;
-            drop(permit);
-            Some(outcome)
-        })
+        let attempt = tokio::time::timeout(
+            env.budget,
+            ingest_attempt(&env, &state, &events, source, force),
+        )
         .await;
         match attempt {
             Ok(Some(outcome)) => {
                 drop(in_flight);
-                match outcome {
-                    ingest::IngestOutcome::Ok {
-                        proxies_found,
-                        dropped,
-                        stats,
-                        duration_ms,
-                    } => {
-                        // New/changed/removed rows → every rendered output containing
-                        // this source is stale. Drop them now so clients see the fresh
-                        // data immediately instead of waiting out the processed TTL.
-                        // When nothing changed the renderings stay valid.
-                        if stats.inserted + stats.updated + stats.removed > 0 {
-                            caches.invalidate_processed_for_source(&source_id).await;
-                        }
-                        events.publish(
-                            FETCH_DONE,
-                            serde_json::json!({
-                                "source_id": source_id,
-                                "ok": true,
-                                "proxies_found": proxies_found,
-                                "dropped": dropped,
-                                "duration_ms": duration_ms,
-                            }),
-                        );
-                        tracing::info!(
-                            source = %source_id,
-                            proxies_found,
-                            dropped,
-                            inserted = stats.inserted,
-                            updated = stats.updated,
-                            removed = stats.removed,
-                            duration_ms,
-                            "source ingested"
-                        );
-                    }
-                    failed @ (ingest::IngestOutcome::FetchFailed { .. }
-                    | ingest::IngestOutcome::ParseFailed { .. }
-                    | ingest::IngestOutcome::StorageFailed { .. }) => {
-                        // Every failure branch funnels into one publication:
-                        // the `fetch.failed` payload holds the same field
-                        // set whichever branch produced it, the branches
-                        // differ only in the values.
-                        let FailureReport {
-                            error_class,
-                            message,
-                            http_status,
-                            level,
-                            duration_ms,
-                        } = failure_report(&failed)
-                            .expect("a failed outcome always carries its report");
-                        // One log site for every failure branch: a storage
-                        // fault is this process's own (an error), the
-                        // upstream faults are warnings.
-                        if level == tracing::Level::ERROR {
-                            tracing::error!(
-                                source = %source_id,
-                                error_class = %error_class,
-                                error = %message,
-                                duration_ms,
-                                "source ingest failed"
-                            );
-                        } else {
-                            tracing::warn!(
-                                source = %source_id,
-                                error_class = %error_class,
-                                error = %message,
-                                duration_ms,
-                                "source ingest failed"
-                            );
-                        }
-                        events.publish(
-                            FETCH_FAILED,
-                            serde_json::json!({
-                                "source_id": source_id,
-                                "ok": false,
-                                "error_class": error_class,
-                                "message": message,
-                                "http_status": http_status,
-                                "duration_ms": duration_ms,
-                            }),
-                        );
-                    }
-                }
+                report_outcome(&env.caches, &events, &source_id, outcome).await;
             }
             Ok(None) => {
                 // The semaphore is closed (the process is shutting down), or
@@ -1027,7 +962,7 @@ fn spawn_ingest(
                 let duration_ms = started.elapsed().as_millis() as i64;
                 tracing::warn!(
                     source = %source_id,
-                    budget_secs = budget.as_secs(),
+                    budget_secs = env.budget.as_secs(),
                     duration_ms,
                     "source ingest exceeded its budget; the attempt was abandoned"
                 );
@@ -1046,11 +981,100 @@ fn spawn_ingest(
     tokio::spawn(fut)
 }
 
+/// One bounded ingest attempt: wait for a concurrency permit, re-read the
+/// source row, run the ingest. `None` when nothing was attempted at all —
+/// the semaphore closed during shutdown, or the source row vanished while
+/// the task waited for its permit.
+///
+/// Event order: `fetch.queued` only when the task actually has to wait
+/// for a concurrency permit, `fetch.started` once a permit is in hand and
+/// the fetch can actually go out, then the outcome event. Under
+/// `[fetch].max_concurrency` saturation the queued window can span many
+/// sweeps, and the panel's "fetching" notion must not start before any
+/// request is made.
+async fn ingest_attempt(
+    env: &IngestEnv,
+    state: &SchedulerState,
+    events: &EventBus,
+    source: Source,
+    force: bool,
+) -> Option<ingest::IngestOutcome> {
+    // A free permit means the fetch is not queued at all: it starts
+    // right away and only `fetch.started` is published. Only a task
+    // that really has to wait announces itself as `fetch.queued`,
+    // so a sweep that starts a batch of sources at once cannot
+    // flood the event stream with queue announcements nothing
+    // waits on.
+    let permit = match state.semaphore.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            events.publish(FETCH_QUEUED, serde_json::json!({ "source_id": source.id }));
+            match state.semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return None, // semaphore closed during shutdown
+            }
+        }
+    };
+    // The row may have changed while this task waited for the
+    // permit: an admin edit (a new URL, new headers) must be
+    // honored, not fetched from the snapshot the sweep captured. A
+    // source deleted in the meantime is not fetched at all — the
+    // fetch would only write rows for a source that no longer
+    // exists.
+    let source = reread_source(&env.pool, source).await?;
+    events.publish(FETCH_STARTED, serde_json::json!({ "source_id": source.id }));
+    let outcome = ingest::ingest_source(
+        &env.pool,
+        &env.fetcher,
+        &env.geo,
+        env.settings,
+        &source,
+        force,
+    )
+    .await;
+    drop(permit);
+    Some(outcome)
+}
+
+/// Re-read the source row after the permit wait: an admin edit (a new
+/// URL, new headers) must be honored, not fetched from the snapshot the
+/// sweep captured. A source deleted in the meantime is not fetched at
+/// all — the fetch would only write rows for a source that no longer
+/// exists — and a read that fails falls back to the snapshot.
+async fn reread_source(pool: &DbPool, source: Source) -> Option<Source> {
+    match sources::get(pool, &source.id).await {
+        Ok(Some(fresh)) => {
+            if fresh.updated_at != source.updated_at {
+                tracing::debug!(
+                    source = %source.id,
+                    "refresh: the source row changed while queued; fetching the fresh one"
+                );
+            }
+            Some(fresh)
+        }
+        Ok(None) => {
+            tracing::debug!(
+                source = %source.id,
+                "refresh: the source row is gone; skipping the fetch"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                source = %source.id,
+                error = %err,
+                "refresh: cannot re-read the source row; fetching the snapshot"
+            );
+            Some(source)
+        }
+    }
+}
+
 /// The report of a failed outcome: the `error_class` the event carries,
 /// the human-readable message, the HTTP status when the server answered
 /// one, the log level and the measured duration. Every failure branch
 /// (`FetchFailed`, `ParseFailed`, `StorageFailed`) funnels into one
-/// `fetch.failed` publication through [`failure_report`]: the payload
+/// `fetch.failed` publication through [`report_failure`]: the payload
 /// holds the same field set whichever branch produced it, the branches
 /// differ only in these values.
 struct FailureReport {
@@ -1061,48 +1085,157 @@ struct FailureReport {
     duration_ms: i64,
 }
 
-/// The [`FailureReport`] of a failed outcome; `None` when it succeeded.
-fn failure_report(outcome: &ingest::IngestOutcome) -> Option<FailureReport> {
-    let (error_class, message, http_status, level, duration_ms) = match outcome {
-        ingest::IngestOutcome::FetchFailed {
-            failure,
+/// Publish and log the outcome of one ingest attempt: on a success,
+/// drop the stale rendered outputs and announce the fresh data; on a
+/// failure, funnel every failed branch into one `fetch.failed`
+/// publication (see [`FailureReport`]).
+async fn report_outcome(
+    caches: &Caches,
+    events: &EventBus,
+    source_id: &str,
+    outcome: ingest::IngestOutcome,
+) {
+    match outcome {
+        ingest::IngestOutcome::Ok {
+            proxies_found,
+            dropped,
+            stats,
             duration_ms,
-        } => (
-            failure.error_class().as_str(),
-            failure.to_string(),
-            failure.http_status(),
-            tracing::Level::WARN,
-            *duration_ms,
-        ),
-        ingest::IngestOutcome::ParseFailed {
-            message,
-            duration_ms,
-        } => (
-            "parse_error",
-            message.clone(),
-            None,
-            tracing::Level::WARN,
-            *duration_ms,
-        ),
-        ingest::IngestOutcome::StorageFailed {
-            message,
-            duration_ms,
-        } => (
-            "storage",
-            message.clone(),
-            None,
-            tracing::Level::ERROR,
-            *duration_ms,
-        ),
-        ingest::IngestOutcome::Ok { .. } => return None,
-    };
-    Some(FailureReport {
+        } => {
+            report_ingested(
+                caches,
+                events,
+                source_id,
+                proxies_found,
+                dropped,
+                &stats,
+                duration_ms,
+            )
+            .await;
+        }
+        failed @ (ingest::IngestOutcome::FetchFailed { .. }
+        | ingest::IngestOutcome::ParseFailed { .. }
+        | ingest::IngestOutcome::StorageFailed { .. }) => {
+            report_failure(events, source_id, &failed);
+        }
+    }
+}
+
+/// The success path: when the reconcile changed rows, every rendered
+/// output containing this source is stale — drop them now so clients
+/// see the fresh data immediately instead of waiting out the processed
+/// TTL (when nothing changed the renderings stay valid) — then publish
+/// `fetch.done` and log the verdict.
+async fn report_ingested(
+    caches: &Caches,
+    events: &EventBus,
+    source_id: &str,
+    proxies_found: usize,
+    dropped: usize,
+    stats: &fumox_core::repo::proxies::ReconciliationStats,
+    duration_ms: Option<i64>,
+) {
+    if stats.inserted + stats.updated + stats.removed > 0 {
+        caches.invalidate_processed_for_source(source_id).await;
+    }
+    events.publish(
+        FETCH_DONE,
+        serde_json::json!({
+            "source_id": source_id,
+            "ok": true,
+            "proxies_found": proxies_found,
+            "dropped": dropped,
+            "duration_ms": duration_ms,
+        }),
+    );
+    tracing::info!(
+        source = %source_id,
+        proxies_found,
+        dropped,
+        inserted = stats.inserted,
+        updated = stats.updated,
+        removed = stats.removed,
+        duration_ms,
+        "source ingested"
+    );
+}
+
+/// The failure path: one log site for every failure branch — a storage
+/// fault is this process's own (an error), the upstream faults are
+/// warnings — and one `fetch.failed` publication.
+///
+/// The caller ([`report_outcome`]) has already narrowed the outcome to
+/// the three failed variants, so a success — the only case without a
+/// report — cannot reach here; the `Ok` arm reports nothing instead of
+/// panicking on an invariant the types cannot quite carry.
+fn report_failure(events: &EventBus, source_id: &str, failed: &ingest::IngestOutcome) {
+    let FailureReport {
         error_class,
         message,
         http_status,
         level,
         duration_ms,
-    })
+    } = match failed {
+        ingest::IngestOutcome::FetchFailed {
+            failure,
+            duration_ms,
+        } => FailureReport {
+            error_class: failure.error_class().as_str(),
+            message: failure.to_string(),
+            http_status: failure.http_status(),
+            level: tracing::Level::WARN,
+            duration_ms: *duration_ms,
+        },
+        ingest::IngestOutcome::ParseFailed {
+            message,
+            duration_ms,
+        } => FailureReport {
+            error_class: "parse_error",
+            message: message.clone(),
+            http_status: None,
+            level: tracing::Level::WARN,
+            duration_ms: *duration_ms,
+        },
+        ingest::IngestOutcome::StorageFailed {
+            message,
+            duration_ms,
+        } => FailureReport {
+            error_class: "storage",
+            message: message.clone(),
+            http_status: None,
+            level: tracing::Level::ERROR,
+            duration_ms: *duration_ms,
+        },
+        ingest::IngestOutcome::Ok { .. } => return,
+    };
+    if level == tracing::Level::ERROR {
+        tracing::error!(
+            source = %source_id,
+            error_class = %error_class,
+            error = %message,
+            duration_ms,
+            "source ingest failed"
+        );
+    } else {
+        tracing::warn!(
+            source = %source_id,
+            error_class = %error_class,
+            error = %message,
+            duration_ms,
+            "source ingest failed"
+        );
+    }
+    events.publish(
+        FETCH_FAILED,
+        serde_json::json!({
+            "source_id": source_id,
+            "ok": false,
+            "error_class": error_class,
+            "message": message,
+            "http_status": http_status,
+            "duration_ms": duration_ms,
+        }),
+    );
 }
 
 #[cfg(test)]
@@ -1138,25 +1271,11 @@ mod tests {
 
     fn test_source(id: &str, url: String, ttl: i64, last_fetched_at: Option<i64>) -> Source {
         Source {
-            id: id.to_string(),
-            slug: None,
-            access_token: None,
             name: id.to_string(),
             url,
-            enabled: true,
-            encoding: Default::default(),
-            input_format: None,
-            protocols: None,
             cache_ttl_seconds: ttl,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: fumox_core::models::now_ts(),
-            updated_at: fumox_core::models::now_ts(),
             last_fetched_at,
-            last_error: None,
-            error_class: None,
+            ..Source::fixture(id, now_ts())
         }
     }
 
@@ -1252,22 +1371,11 @@ mod tests {
         tracing::subscriber::DefaultGuard,
         Arc<std::sync::Mutex<Vec<u8>>>,
     ) {
-        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let make_writer = captured.clone();
+        let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(level)
-            .with_writer(move || Captured(Arc::clone(&make_writer)))
+            .with_writer(make_writer)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
         crate::test_support::stabilize_callsite_interests();
@@ -2292,45 +2400,11 @@ mod tests {
     }
 
     /// A local upstream that answers every request with the same 200 body
-    /// and counts the requests it received. Reads the request out before
-    /// answering, like a real HTTP server (see `ingest::ingest_env` for
-    /// why the extra care keeps fetch counts stable).
+    /// and counts the requests it received: the shared
+    /// `test_support::one_shot_upstream`, whose read-before-answering care
+    /// is what keeps the fetch counts stable.
     async fn ok_upstream(body: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let counter = hits.clone();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let counter = counter.clone();
-                tokio::spawn(async move {
-                    let mut received = Vec::with_capacity(1024);
-                    loop {
-                        let mut scratch = [0u8; 1024];
-                        match sock.read(&mut scratch).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                received.extend_from_slice(&scratch[..n]);
-                                if received.windows(4).any(|w| w == b"\r\n\r\n")
-                                    || received.len() >= 16 * 1024
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = sock.write_all(head.as_bytes()).await;
-                    let _ = sock.write_all(body.as_bytes()).await;
-                });
-            }
-        });
-        (addr, hits)
+        crate::test_support::one_shot_upstream(vec![body]).await
     }
 
     /// Seed a rendered output that names the source, the way a served

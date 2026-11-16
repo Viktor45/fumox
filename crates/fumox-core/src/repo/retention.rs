@@ -52,20 +52,12 @@ pub fn cutoff(now: i64, days: u64) -> i64 {
     now.saturating_sub(span)
 }
 
-/// Purge the journal rows both binaries write and report what went.
-///
-/// The order is the one the daemon's retention loop has always used: the
-/// journal first, then the queue rows whose proxy already left the
-/// `unknown` state, then the queue rows that are simply too old. A row
-/// that is both settled and old is counted once, in the settled pass.
-pub async fn sweep_shared_journals(
-    pool: &DbPool,
-    windows: &RetentionWindows,
-    now: i64,
-) -> RetentionOutcome {
-    let mut outcome = RetentionOutcome::default();
-
-    match fetch_log::purge_before(pool, cutoff(now, u64::from(windows.fetch_log_days))).await {
+/// The `fetch_log` pass of the sweep: the journal rows older than
+/// `before` go, the count lands in `outcome.fetch_log`, and the first
+/// failure is stamped into `outcome.error` — the callers read it as a
+/// failed rotation, not a quiet one.
+async fn rotate_fetch_log(pool: &DbPool, outcome: &mut RetentionOutcome, before: i64) {
+    match fetch_log::purge_before(pool, before).await {
         Ok(0) => {}
         Ok(deleted) => {
             outcome.fetch_log = deleted;
@@ -76,8 +68,12 @@ pub async fn sweep_shared_journals(
             outcome.error.get_or_insert(format!("fetch_log: {error}"));
         }
     }
-    // Priority-queue housekeeping: requests whose proxy already left
-    // `unknown`, and stale leftovers from an offline probe.
+}
+
+/// The settled pass of the sweep: the queue rows whose proxy already
+/// left `unknown` go, and the count accumulates into
+/// `outcome.probe_requests`.
+async fn drop_settled_probe_requests(pool: &DbPool, outcome: &mut RetentionOutcome) {
     match probe::purge_settled_checks(pool).await {
         Ok(0) => {}
         Ok(deleted) => {
@@ -91,7 +87,13 @@ pub async fn sweep_shared_journals(
                 .get_or_insert(format!("probe_requests settled: {error}"));
         }
     }
-    match probe::purge_requests_before(pool, cutoff(now, windows.queue_stale_days)).await {
+}
+
+/// The stale pass of the sweep: the queue rows that are simply too old
+/// — the leftovers from an offline probe — go, and the count
+/// accumulates into `outcome.probe_requests`.
+async fn rotate_stale_probe_requests(pool: &DbPool, outcome: &mut RetentionOutcome, before: i64) {
+    match probe::purge_requests_before(pool, before).await {
         Ok(0) => {}
         Ok(deleted) => {
             outcome.probe_requests += deleted;
@@ -104,6 +106,28 @@ pub async fn sweep_shared_journals(
                 .get_or_insert(format!("probe_requests stale: {error}"));
         }
     }
+}
+
+/// Purge the journal rows both binaries write and report what went.
+///
+/// The order is the one the daemon's retention loop has always used: the
+/// journal first, then the queue rows whose proxy already left the
+/// `unknown` state, then the queue rows that are simply too old. A row
+/// that is both settled and old is counted once, in the settled pass.
+pub async fn sweep_shared_journals(
+    pool: &DbPool,
+    windows: &RetentionWindows,
+    now: i64,
+) -> RetentionOutcome {
+    let mut outcome = RetentionOutcome::default();
+    rotate_fetch_log(
+        pool,
+        &mut outcome,
+        cutoff(now, u64::from(windows.fetch_log_days)),
+    )
+    .await;
+    drop_settled_probe_requests(pool, &mut outcome).await;
+    rotate_stale_probe_requests(pool, &mut outcome, cutoff(now, windows.queue_stale_days)).await;
     outcome
 }
 

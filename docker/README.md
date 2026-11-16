@@ -20,9 +20,8 @@ the podman flavour).
 
 ## Preparation (both variants)
 
-Quadlet does not build images: the server unit references the local name
-`localhost/fumox:local`, and the meow unit pins the published GHCR image by
-digest (see its `Image=` line). Prepare them either way:
+Quadlet does not build images: the units reference the images named on
+their `Image=` lines. Prepare them either way:
 
 **Option 1: pull the published GHCR images (fastest):**
 
@@ -38,15 +37,14 @@ podman tag ghcr.io/viktor45/fumox-meow:latest localhost/fumox-meow:local
 current tag rules, so there is no automatic rebuild on push to `main`).
 `ghcr.io/viktor45/fumox-meow` is packaged manually by `docker-meow.yml`.
 
-A tag — `latest`, `0.2.0`, `local` — is a mutable pointer: it guarantees
-nothing about which bytes a start actually runs, so it does not ensure
-integrity. That is why a unit that names GHCR directly pins the image by
-digest instead of by tag (`fumox-meow.container` carries
-`ghcr.io/viktor45/fumox-meow@sha256:…`, the same manifest
-docker-compose.yml pins), and why the `localhost/*:local` names above are
-for building and development only: before a real start, replace the tag
-with a digest — `podman pull ghcr.io/viktor45/fumox@sha256:<digest>`, with
-the digest taken from the release page or printed by
+A tag is a mutable pointer: it guarantees nothing about which bytes a
+start runs, so a unit that names GHCR directly pins the image by digest
+(`fumox-meow.container` carries `ghcr.io/viktor45/fumox-meow@sha256:…`,
+the same manifest docker-compose.yml pins), and the `localhost/*:local`
+names above are for building and development only: before a real start,
+replace the tag with a digest — `podman pull
+ghcr.io/viktor45/fumox@sha256:<digest>`, with the digest taken from the
+release page or printed by
 `podman inspect --format '{{.Digest}}' ghcr.io/viktor45/fumox-meow:latest`
 after the pull.
 
@@ -75,10 +73,8 @@ Two independent secrets are needed, and they are never stored together:
 | `FUMOX_ADMIN__TOKEN` | the server only            | the admin panel's login token                        |
 | `FUMOX_MEOW__API_TOKEN` | the probe and the kernel | the meow-rs external-controller secret                |
 
-In the pod layouts the server reads the shared env file as well, so it
-sees the controller secret too — it needs no access to it, but that file
-is the one the three containers have in common. The admin token is never
-in it.
+The server also reads the shared env file, so it sees the controller
+secret too; the admin token is never in it.
 
 Generate both at random — the literal placeholder `change-me` is **not** a
 token: the server refuses to start with it on a non-loopback bind, and an
@@ -93,8 +89,7 @@ The controller secret may only contain `[A-Za-z0-9._-]`; the kernel's
 entrypoint refuses anything else.
 
 Variant A (quadlet) keeps them in two environment files, variant B (kube) in
-two `podman secret`s — the split is what keeps the admin token away from the
-probe and the kernel. Both files are created with mode 600: they hold a
+two `podman secret`s. Both files are created with mode 600: they hold a
 secret and must not be readable by other users.
 
 ### Geo enrichment and the shared volumes
@@ -102,20 +97,17 @@ secret and must not be readable by other users.
 Geo enrichment points at its own volume, not the config directory: both
 variants (and the kube manifest) set `FUMOX_GEO__DB_DIR=/shared/geo`, the
 volume that belongs to the server alone (quadlet: `fumox-geo.volume`,
-`VolumeName=fumox-geo`; kube: the `fumox-geo` PVC). The environment
-outranks `[geo].db_dir`, so `.mmdb` files dropped into the config
-directory are silently never scanned. The server downloads the
-GeoLite2 databases into `/shared/geo` at startup, so the manual step is
-optional; to ship your own files instead, copy them into that volume
+`VolumeName=fumox-geo`; kube: the `fumox-geo` PVC), so `.mmdb` files
+dropped into the config directory are never scanned. The server downloads
+the GeoLite2 databases into `/shared/geo` at startup, so the manual step
+is optional; to ship your own files instead, copy them into that volume
 (`podman volume mount fumox-geo` prints the host path, the same
 pattern the DB migration below uses).
 
 The kernel's configuration exchange is a second, separate volume
 (`fumox-meow.volume`, `VolumeName=fumox-meow`; kube: the `fumox-meow` PVC):
 the probe renders the T2 batch to `/shared/meow/meow.yaml` and hot-reloads
-the kernel through its REST API. The kernel does not need the GeoLite2
-databases and the server does not need the kernel's configuration, so the
-two are not mixed.
+the kernel through its REST API.
 
 ### Cookie security on plain HTTP
 
@@ -128,8 +120,7 @@ to `/admin/login`. Override only when TLS is terminated at a reverse proxy:
 - variant A: `FUMOX_ADMIN__SECURE_COOKIES=true` in `fumox-admin.env`
 - variant B: `FUMOX_ADMIN__SECURE_COOKIES=true` in the `fumox-admin` secret
 
-The env layer outranks the file (the same figment merge that powers the rest
-of the override hierarchy). Rotating `[admin].token` or flipping
+The env layer outranks the file. Rotating `[admin].token` or flipping
 `secure_cookies` invalidates every active session on the next request, so
 plan token rotations for a quiet window.
 
@@ -152,8 +143,7 @@ plan token rotations for a quiet window.
    URLs) and is read by the server only. `FUMOX_CONFIG` is the path to the
    TOML config file inside the container (default: `/app/config/app.toml`
    from the mounted config directory). Unit-level `Environment=` values
-   outrank these files, which is exactly why the path is not fixed in the
-   units, configure it here.
+   outrank these files.
 
 2. Install the units (every file from the folder, into one unit directory):
 
@@ -174,14 +164,10 @@ Check: `curl -s http://127.0.0.1:8080/healthz` → `ok`; admin panel at
 as compose). Logs: `journalctl --user -u fumox-server -u fumox-probe -u fumox-meow -f`.
 
 A note on `network-online.target` (the pod units order themselves after
-it): in a user session that target usually has nothing behind it — the
-wait-online service of the network manager lives in the system manager,
-and user units are not ordered against system services. A pod can
-therefore start before the network is really up, and neither variant wires
-an explicit readiness gate for a first cycle. The daemons tolerate that
-window: binding the listeners needs no DNS, the probe retries the database
-and the kernel with its own backoff, and the kernel dials the proxies at
-runtime. If your host brings the network up late and the start must wait
+it): in a user session that target usually has nothing behind it, so a pod
+can start before the network is really up. The daemons tolerate that
+window — the probe retries the database and the kernel with its own
+backoff. If your host brings the network up late and the start must wait
 for it, order the units against the specific user-level network service
 your setup provides (there is none by default).
 
@@ -190,10 +176,7 @@ your setup provides (there is none by default).
 `fumox.pod` holds the server alone; `fumox-worker.pod` holds the probe and
 the kernel. They exchange nothing over the network: the server and the
 probe talk through the shared SQLite volume, the probe and the kernel
-through the shared config volume. The split is deliberate — the kernel
-handles untrusted proxy traffic and its configuration is writable by the
-probe, so it must not be able to reach the admin panel even inside a
-shared network namespace.
+through the shared config volume.
 
 The two pods start at the same time and neither waits for the other. The
 server creates and migrates the schema before it binds its listeners; the
@@ -210,9 +193,8 @@ unit stays up.
 `fumox-server.container` mounts the config directory as `:rw,z`, so the
 admin *Edit settings* page (`/admin/settings/edit`) writes
 `/app/config/app.toml` in place through the `toml_edit`-backed editor.
-Comments survive every save; ENV overrides (`FUMOX_SECTION__KEY`) keep
-winning per the figment merge; both server and probe must be restarted
-after a save. `fumox-probe.container` stays read-only: the probe only
+Both server and probe must be restarted after a save.
+`fumox-probe.container` stays read-only: the probe only
 reads the file at startup and never writes it. If you prefer the editor
 off entirely, change the server mount to `:ro,z`; the page will render
 disabled with a red `set.edit_unwritable` banner explaining why.
@@ -232,11 +214,7 @@ disabled with a red `set.edit_unwritable` banner explaining why.
    The `fumox-env` secret carries what the probe and the kernel share (the
    controller secret, and optionally `FUMOX_MEOW__TEST_URL` /
    `FUMOX_PROBE__ALLOW_PRIVATE_TARGETS`). The `fumox-admin` secret carries
-   the panel's login token and is attached to the server container only, so
-   neither the probe nor the kernel can reach the panel. Add
-   `FUMOX_ADMIN__SECURE_COOKIES=false` to `fumox-admin` when the panel is
-   opened over plain HTTP (the default posture of this variant), or `true`
-   when TLS is terminated in front of it.
+   the panel's login token and is attached to the server container only.
 
 3. In `fumox-pod.yaml` adjust the `config` directory `hostPath` (currently
    `/opt/fumox/config`).
@@ -279,13 +257,9 @@ yours).
 `podman kube play` starts the containers of both pods at once. An init
 container cannot wait for the server here: init containers run *before* the
 app containers, so a "wait for /healthz" init container would deadlock the
-pod. It is not needed either — the probe does not depend on the server: it
-reads the proxy list from the database and writes the health verdicts back.
-The one shared resource is the schema, and both sides apply it on startup:
-SQLite serializes the two writers and the loser retries until the lock is
-free (`connect_probe_pool` in `crates/fumox-core/src/db.rs`). The compose
-layout gates the probe on the server's health check instead; the pod layout
-does not need it.
+pod, and the probe does not depend on the server (see "The two pods, and
+what runs when" above). The compose layout gates the probe on the server's
+health check instead; the pod layout does not need it.
 
 The cold start therefore looks like this: the server migrates the schema and
 binds, the probe waits for the database to be readable (retrying with its own
@@ -328,9 +302,9 @@ count on the Fumox side.
 
 Running it inside the server pod (quadlet) means the nginx container shares
 the pod's network namespace with the server, so the upstreams are the
-loopback addresses and nothing else has to be reachable. A container that
-joins a pod's namespace cannot publish ports itself, so the pod publishes
-the TLS port: add these lines to `fumox.pod` and reload it
+loopback addresses. A container that joins a pod's namespace cannot publish
+ports itself, so the pod publishes the TLS port: add these lines to
+`fumox.pod` and reload it
 
 ```ini
 PublishPort=80:80
@@ -384,15 +358,10 @@ definition, so the loopback upstreams hold and the pod publishes the port:
 (The `certs` volume is a `hostPath` pointing at the directory with
 `fullchain.pem` and `privkey.pem`.)
 
-With TLS in front of the panel, set `FUMOX_ADMIN__SECURE_COOKIES=true`
-(variant A: `fumox-admin.env`; variant B: the `fumox-admin` secret), or
-browsers will drop the session cookie.
-
 Which host names the front accepts is decided by Fumox itself:
 `[server].allowed_hosts` (`FUMOX_SERVER__ALLOWED_HOSTS`). The nginx front
-normalises the `Host` header (the default ports are dropped, a non-default
-port is kept, and a Host that is not a plain hostname is replaced by the
-canonical name), so a crafted Host cannot end up in a generated link.
+normalises the `Host` header, so a crafted Host cannot end up in a
+generated link.
 
 The front writes the `X-Forwarded-*` family, so the server side has to be
 told which header family to believe and which addresses may write it.
@@ -412,19 +381,16 @@ trust_proxy_header = "xff"
 allowed_hosts     = ["fumox.example.com"]
 ```
 
-The canonical name has to be on both lists: the panel gates the request
-on `[admin].allowed_hosts` and builds the export link from the host the
-panel was opened on, while the public listener gates the link on
-`[server].allowed_hosts`. The startup log names a `trust_proxy_ips`
-without a `trust_proxy_header`.
+The canonical name has to be on both lists. The startup log names a
+`trust_proxy_ips` without a `trust_proxy_header`.
 
 ## Differences from docker compose
 
 - `FUMOX_MEOW__API_ADDR: meow:9090` → `127.0.0.1:9090`: a pod shares one
   network namespace, there are no per-service DNS names. 9090 is not
   published to the host, same as compose.
-- The compose stack is one network with two networks (`default` + `meow`);
-  the pod layout achieves the same separation by splitting the pods.
+- The compose stack has two networks (`default` + `meow`); the pod layout
+  achieves the same separation by splitting the pods.
 - Images are either pulled from GHCR or built manually (`podman build`);
   compose does both for you (`up -d` pulls, `up --build` builds).
 - Podman named volumes (`fumox-data`, `fumox-geo`, `fumox-meow`) are not
@@ -441,13 +407,10 @@ without a `trust_proxy_header`.
   (the docker volume mountpoint may require root; on macOS/OrbStack the
   data lives inside the docker VM.)
 - `restart: unless-stopped` → `Restart=always` with `RestartSec=5` in the
-  `[Service]` sections. The two agree where it matters: both restart the
-  container whenever it is not the operator who stopped it, and neither
-  restarts a deliberate stop. The delay is the one addition: systemd
-  restarts a unit that dies in a loop at a steady pace, the fixed 5 s
-  throttle keeps a crash loop from spinning. (`Restart=on-failure` would
-  NOT be equivalent: systemd would then leave a unit that exited cleanly
-  — exit code 0 — down, while compose restarts it.)
+  `[Service]` sections (the fixed delay keeps a crash loop from spinning).
+  (`Restart=on-failure` would NOT be equivalent: systemd would then leave
+  a unit that exited cleanly — exit code 0 — down, while compose restarts
+  it.)
 - The `FUMOX_ADMIN__TOKEN` secret is kept not in a `.env` next to the
   compose file but in `~/.config/fumox/fumox-admin.env` (variant A) or a
   `podman secret` (variant B).

@@ -18,6 +18,12 @@ autoexamples = false
 name = "repair_migration_checksums"
 path = "examples/repair_migration_checksums.rs"
 
+[features]
+# Compiles the `Source::fixture` test constructor so the sibling crates'
+# tests seed the same source-row shape; enabled in dev-dependencies only,
+# never in a release build.
+test-util = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

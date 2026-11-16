@@ -87,6 +87,7 @@
 "err.cross_site" = "cross-site request rejected"
 "err.csrf_failed" = "CSRF check failed"
 "err.csrf_stale" = "your session has been refreshed or has ended (for example after a logout); reload the page and try again"
+"err.epoch_unavailable" = "the session revocation state is unavailable, try again"
 "err.error_id" = "error id: {}"
 "err.host_not_allowed" = "request host '{host}' is not allowed for the admin panel; add it to {setting}"
 "err.internal" = "internal error"

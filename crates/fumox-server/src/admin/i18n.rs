@@ -76,83 +76,8 @@ impl Locales {
     /// translated phrase) emptied every other key of that language and
     /// the panel fell back to echoing the raw keys.
     pub fn load(dir: &Path) -> Self {
-        let mut catalogs: BTreeMap<String, Arc<HashMap<String, String>>> = BTreeMap::new();
-        for (code, text) in EMBEDDED_LOCALES {
-            match parse_catalog(text) {
-                Ok(messages) => {
-                    catalogs.insert((*code).to_string(), Arc::new(messages));
-                }
-                Err(err) => {
-                    tracing::error!(code, error = %err, "embedded locale failed to parse");
-                }
-            }
-        }
-
-        match std::fs::read_dir(dir) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-                        continue;
-                    }
-                    let Some(code) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                        continue;
-                    };
-                    let code = code.trim().to_ascii_lowercase();
-                    if code.is_empty() {
-                        continue;
-                    }
-                    // The code travels into the switcher's request
-                    // (`?lang=` on the login form, the setter's form
-                    // field) and into the cookie value, so only the
-                    // characters a language code can hold are accepted: a
-                    // file named `..toml` or `w%20w.toml` must not smuggle
-                    // anything into either.
-                    if !code
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                    {
-                        tracing::warn!(
-                            code = %code,
-                            path = %path.display(),
-                            "locale file skipped: invalid language code"
-                        );
-                        continue;
-                    }
-                    match std::fs::read_to_string(&path)
-                        .map_err(|err| err.to_string())
-                        .and_then(|text| parse_catalog(&text))
-                    {
-                        Ok(messages) => {
-                            tracing::info!(code = %code, path = %path.display(), "locale loaded");
-                            let merged = merge_into_base(catalogs.get(&code), messages);
-                            catalogs.insert(code, Arc::new(merged));
-                        }
-                        Err(err) => {
-                            tracing::error!(path = %path.display(), error = %err, "locale file skipped");
-                        }
-                    }
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!(
-                    dir = %dir.display(),
-                    "locales directory not found, using embedded catalogs"
-                );
-            }
-            Err(err) => {
-                // The directory exists but cannot be read (permissions, a
-                // file standing in its place): every extra language the
-                // operator dropped there is silently unavailable, so this
-                // is a warning, not the expected no-directory case.
-                tracing::warn!(
-                    dir = %dir.display(),
-                    error = %err,
-                    "locales directory unreadable, using embedded catalogs"
-                );
-            }
-        }
-
+        let mut catalogs = embedded_catalogs_map();
+        merge_disk_catalogs(&mut catalogs, dir);
         Self::from_catalogs(catalogs)
     }
 
@@ -234,6 +159,108 @@ impl Locales {
         self.catalogs
             .contains_key(&code.trim().to_ascii_lowercase())
     }
+}
+
+/// Parse the catalogs compiled into the binary.
+fn embedded_catalogs_map() -> BTreeMap<String, Arc<HashMap<String, String>>> {
+    let mut catalogs = BTreeMap::new();
+    for (code, text) in EMBEDDED_LOCALES {
+        match parse_catalog(text) {
+            Ok(messages) => {
+                catalogs.insert((*code).to_string(), Arc::new(messages));
+            }
+            Err(err) => {
+                tracing::error!(code, error = %err, "embedded locale failed to parse");
+            }
+        }
+    }
+    catalogs
+}
+
+/// Merge the `*.toml` files of `dir` onto the built-in catalogs. A `dir`
+/// that cannot be read at all (missing, or present but inaccessible)
+/// leaves the embedded catalogs as they are: a missing directory is the
+/// normal no-extra-languages case (info), any other read error is warned
+/// about, the operator's files are then silently unused.
+fn merge_disk_catalogs(catalogs: &mut BTreeMap<String, Arc<HashMap<String, String>>>, dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                dir = %dir.display(),
+                "locales directory not found, using embedded catalogs"
+            );
+            return;
+        }
+        Err(err) => {
+            // The directory exists but cannot be read (permissions, a
+            // file standing in its place): every extra language the
+            // operator dropped there is silently unavailable, so this
+            // is a warning, not the expected no-directory case.
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %err,
+                "locales directory unreadable, using embedded catalogs"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        load_disk_file(catalogs, &entry.path());
+    }
+}
+
+/// Load one disk catalog onto the built-in ones: vet the language code in
+/// the file name, read and parse the file, overlay it per key. A file
+/// that cannot be read or parsed is logged and skipped.
+fn load_disk_file(catalogs: &mut BTreeMap<String, Arc<HashMap<String, String>>>, path: &Path) {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+        return;
+    }
+    let Some(code) = disk_language_code(path) else {
+        return;
+    };
+    match std::fs::read_to_string(path)
+        .map_err(|err| err.to_string())
+        .and_then(|text| parse_catalog(&text))
+    {
+        Ok(messages) => {
+            tracing::info!(code = %code, path = %path.display(), "locale loaded");
+            let merged = merge_into_base(catalogs.get(&code), messages);
+            catalogs.insert(code, Arc::new(merged));
+        }
+        Err(err) => {
+            tracing::error!(path = %path.display(), error = %err, "locale file skipped");
+        }
+    }
+}
+
+/// The vetted language code of a locale file name: the trimmed,
+/// lower-cased file stem. `None` when the stem is empty (skipped
+/// silently) or holds characters a language code cannot (logged as
+/// skipped).
+///
+/// The code travels into the switcher's request (`?lang=` on the login
+/// form, the setter's form field) and into the cookie value, so only the
+/// characters a language code can hold are accepted: a file named
+/// `..toml` or `w%20w.toml` must not smuggle anything into either.
+fn disk_language_code(path: &Path) -> Option<String> {
+    let code = path.file_stem()?.to_str()?.trim().to_ascii_lowercase();
+    if code.is_empty() {
+        return None;
+    }
+    if !code
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        tracing::warn!(
+            code = %code,
+            path = %path.display(),
+            "locale file skipped: invalid language code"
+        );
+        return None;
+    }
+    Some(code)
 }
 
 /// Overlay a disk catalog onto the built-in one of the same language.

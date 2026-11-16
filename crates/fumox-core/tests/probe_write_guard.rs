@@ -3,22 +3,7 @@
 
 use fumox_core::config::DatabaseConfig;
 use fumox_core::db;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-fn temp_db_path(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("fumox-probe-guard-{label}-{nanos}.db"))
-}
-
-fn cleanup_files(path: &PathBuf) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(path.with_extension("db-wal"));
-    let _ = std::fs::remove_file(path.with_extension("db-shm"));
-}
+use fumox_core::tempdir_lite::TempDir;
 
 /// Asserts that the statement is refused by the authorizer.
 ///
@@ -38,9 +23,9 @@ async fn assert_denied(pool: &db::DbPool, sql: &'static str, label: &str) {
 
 #[tokio::test]
 async fn the_probe_may_change_the_health_status_but_not_the_content() {
-    let path = temp_db_path("content");
+    let dir = TempDir::new("content");
     let cfg = DatabaseConfig {
-        path: path.clone(),
+        path: dir.path().join("fumox.db"),
         ..Default::default()
     };
 
@@ -144,14 +129,13 @@ async fn the_probe_may_change_the_health_status_but_not_the_content() {
 
     drop(probe);
     drop(server);
-    cleanup_files(&path);
 }
 
 #[tokio::test]
 async fn the_probe_may_write_its_own_bookkeeping() {
-    let path = temp_db_path("bookkeeping");
+    let dir = TempDir::new("bookkeeping");
     let cfg = DatabaseConfig {
-        path: path.clone(),
+        path: dir.path().join("fumox.db"),
         ..Default::default()
     };
 
@@ -232,14 +216,13 @@ async fn the_probe_may_write_its_own_bookkeeping() {
 
     drop(probe);
     drop(server);
-    cleanup_files(&path);
 }
 
 #[tokio::test]
 async fn the_probe_applies_the_schema_before_its_connections_are_restricted() {
-    let path = temp_db_path("migrate");
+    let dir = TempDir::new("migrate");
     let cfg = DatabaseConfig {
-        path: path.clone(),
+        path: dir.path().join("fumox.db"),
         ..Default::default()
     };
 
@@ -263,14 +246,73 @@ async fn the_probe_applies_the_schema_before_its_connections_are_restricted() {
     .await;
 
     drop(probe);
-    cleanup_files(&path);
+}
+
+#[tokio::test]
+async fn the_probe_cannot_reconfigure_the_shared_file_with_a_pragma() {
+    let dir = TempDir::new("pragma");
+    let cfg = DatabaseConfig {
+        path: dir.path().join("fumox.db"),
+        ..Default::default()
+    };
+    let server = db::connect_pool(&cfg).await.unwrap();
+    db::migrate(&server).await.unwrap();
+    let probe = db::connect_probe_pool(&cfg).await.unwrap();
+
+    // A pragma read is a read, like any other read.
+    let (foreign_keys,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&probe)
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign_keys, 1,
+        "the connection's own configuration must be untouched"
+    );
+    // The introspection pragmas take an argument too, but theirs is the
+    // subject of the question, not a value to set.
+    let indexes = sqlx::query("PRAGMA index_list(proxies)")
+        .fetch_all(&probe)
+        .await
+        .unwrap();
+    assert!(
+        !indexes.is_empty(),
+        "the introspection pragmas must keep working"
+    );
+
+    // A pragma with a value reconfigures what it names, and the ones
+    // that name a file property write the shared file's header itself —
+    // outside every table the rules govern.
+    assert_denied(&probe, "PRAGMA user_version = 7", "stamping user_version").await;
+    assert_denied(
+        &probe,
+        "PRAGMA main.user_version = 7",
+        "stamping user_version of the main database",
+    )
+    .await;
+    let (version,): (i64,) = sqlx::query_as("PRAGMA user_version")
+        .fetch_one(&probe)
+        .await
+        .unwrap();
+    assert_eq!(version, 0, "the pragma write must not have landed");
+
+    // The schema is not the probe's to reshape either: the rename is
+    // refused before its `sqlite_master` writes are even compiled.
+    assert_denied(
+        &probe,
+        "ALTER TABLE proxies RENAME TO proxies_renamed",
+        "renaming a table",
+    )
+    .await;
+
+    drop(probe);
+    drop(server);
 }
 
 #[tokio::test]
 async fn the_probe_cannot_attach_another_database() {
-    let path = temp_db_path("attach");
+    let dir = TempDir::new("attach");
     let cfg = DatabaseConfig {
-        path: path.clone(),
+        path: dir.path().join("fumox.db"),
         ..Default::default()
     };
     let server = db::connect_pool(&cfg).await.unwrap();
@@ -288,5 +330,4 @@ async fn the_probe_cannot_attach_another_database() {
 
     drop(probe);
     drop(server);
-    cleanup_files(&path);
 }

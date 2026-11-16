@@ -19,8 +19,8 @@ use crate::models::{ProxyEntry, Scheme};
 use base64::Engine;
 
 use super::uri::{
-    decode_b64_lenient, encode_fragment, host_for_output, parse_hostport, parse_query,
-    percent_decode, serialize_query, split_fragment, split_path, split_query,
+    decode_b64_lenient, emit_tail, parse_hostport, parse_query, percent_decode, split_fragment,
+    split_path, split_query,
 };
 
 /// Parse the part of an ss line that follows `ss://`.
@@ -126,18 +126,9 @@ pub fn serialize(entry: &ProxyEntry) -> String {
     out.push_str("ss://");
     out.push_str(&blob);
     out.push('@');
-    out.push_str(&host_for_output(entry));
-    out.push(':');
-    out.push_str(&entry.port.to_string());
-    out.push_str(&entry.raw_path);
-    if !entry.params.is_empty() {
-        out.push('?');
-        out.push_str(&serialize_query(&entry.params));
-    }
-    if !entry.name.is_empty() {
-        out.push('#');
-        out.push_str(&encode_fragment(&entry.name));
-    }
+    // The tail is the generic one: the ss-specific part of the line is
+    // only the base64 credential in the head.
+    emit_tail(entry, &mut out);
     out
 }
 

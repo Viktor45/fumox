@@ -67,59 +67,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     })
     .await?;
 
-    // Pre-flight: every embedded migration must already be applied (we are
-    // re-stamping checksums, not applying anything new). A version mismatch
-    // means the user's setup is in a state this utility cannot fix.
-    //
-    // The whole table is read, not only the successful rows: a failed
-    // migration (sqlx's `success = 0`) is a database that stopped halfway
-    // through a migration, and re-stamping checksums over it would paper
-    // over the half-applied DDL.
-    let rows: Vec<(i64, bool)> =
-        sqlx::query_as("SELECT version, success FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(&pool)
-            .await?;
-    for (version, success) in &rows {
-        if !*success {
-            return Err(format!(
-                "migration {version} is in a failed/dirty state — fix it before running the utility"
-            )
-            .into());
-        }
-    }
-    let applied_versions: Vec<i64> = rows.iter().map(|(version, _)| *version).collect();
-    let applied: std::collections::HashSet<i64> = applied_versions.iter().copied().collect();
-    let embedded_versions: Vec<i64> = migrator.iter().map(|m| m.version).collect();
-    let only_in_embedded: Vec<i64> = embedded_versions
-        .iter()
-        .copied()
-        .filter(|v| !applied.contains(v))
-        .collect();
-    if !only_in_embedded.is_empty() {
-        return Err(format!(
-            "migration(s) {only_in_embedded:?} were not applied successfully — they have \
-             never been applied; run the server once to apply them, then re-run this utility"
-        )
-        .into());
-    }
-    // The mirror check. A database carrying a version this build does not
-    // embed was migrated by a newer Fumox; re-stamping the versions we do
-    // know about would leave sqlx refusing to start with
-    // `VersionMissing(<that version>)` anyway, so the tool must say so up
-    // front instead of promising a `migrate()` that cannot succeed.
-    let only_in_applied: Vec<i64> = applied_versions
-        .iter()
-        .copied()
-        .filter(|v| !embedded_versions.contains(v))
-        .collect();
-    if !only_in_applied.is_empty() {
-        return Err(format!(
-            "the database has applied migrations this build does not embed: \
-             {only_in_applied:?}; it was migrated by a newer Fumox, downgrade \
-             to that build instead of re-stamping checksums"
-        )
-        .into());
-    }
+    // Pre-flight: the database must already mirror this build's embedded
+    // migration set — see `verify_repairable_state` for what is checked
+    // and why each mismatch is a state this utility cannot fix.
+    verify_repairable_state(&pool, &migrator).await?;
 
     // The UPDATE itself lives in `db::repair_migration_checksums` so the
     // guards (applied and successful rows only, checksums compared against
@@ -183,6 +134,67 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
              applied migration, so if the edit was not comment-only the schema \
              on disk is behind the files, ship a new migration file for the DDL."
         );
+    }
+    Ok(())
+}
+
+/// Pre-flight for the re-stamp: every embedded migration must already be
+/// applied (we are re-stamping checksums, not applying anything new), and
+/// nothing may be applied that this build does not embed. A version
+/// mismatch means the user's setup is in a state this utility cannot fix.
+///
+/// The whole table is read, not only the successful rows: a failed
+/// migration (sqlx's `success = 0`) is a database that stopped halfway
+/// through a migration, and re-stamping checksums over it would paper
+/// over the half-applied DDL.
+async fn verify_repairable_state(
+    pool: &sqlx::SqlitePool,
+    migrator: &Migrator,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let rows: Vec<(i64, bool)> =
+        sqlx::query_as("SELECT version, success FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await?;
+    for (version, success) in &rows {
+        if !*success {
+            return Err(format!(
+                "migration {version} is in a failed/dirty state — fix it before running the utility"
+            )
+            .into());
+        }
+    }
+    let applied_versions: Vec<i64> = rows.iter().map(|(version, _)| *version).collect();
+    let applied: std::collections::HashSet<i64> = applied_versions.iter().copied().collect();
+    let embedded_versions: Vec<i64> = migrator.iter().map(|m| m.version).collect();
+    let only_in_embedded: Vec<i64> = embedded_versions
+        .iter()
+        .copied()
+        .filter(|v| !applied.contains(v))
+        .collect();
+    if !only_in_embedded.is_empty() {
+        return Err(format!(
+            "migration(s) {only_in_embedded:?} were not applied successfully — they have \
+             never been applied; run the server once to apply them, then re-run this utility"
+        )
+        .into());
+    }
+    // The mirror check. A database carrying a version this build does not
+    // embed was migrated by a newer Fumox; re-stamping the versions we do
+    // know about would leave sqlx refusing to start with
+    // `VersionMissing(<that version>)` anyway, so the tool must say so up
+    // front instead of promising a `migrate()` that cannot succeed.
+    let only_in_applied: Vec<i64> = applied_versions
+        .iter()
+        .copied()
+        .filter(|v| !embedded_versions.contains(v))
+        .collect();
+    if !only_in_applied.is_empty() {
+        return Err(format!(
+            "the database has applied migrations this build does not embed: \
+             {only_in_applied:?}; it was migrated by a newer Fumox, downgrade \
+             to that build instead of re-stamping checksums"
+        )
+        .into());
     }
     Ok(())
 }

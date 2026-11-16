@@ -4,6 +4,7 @@
 //! fingerprinting, protocol parsers, geo enrichment and output-format
 //! encoders used by both `fumox-server` and `fumox-probe`.
 
+pub mod bootstrap;
 pub mod config;
 pub mod config_writer;
 pub mod db;

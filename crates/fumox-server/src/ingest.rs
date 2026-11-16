@@ -129,42 +129,81 @@ pub async fn ingest_source(
         };
     }
 
-    // The fetch clock starts here and stops at the verdict, retries and
-    // their backoff included: one `fetch` call can legitimately stretch far
-    // past a minute ([fetch].max_retries × capped backoff), holds a
-    // concurrency permit the whole time, and without a measurement a slow
-    // upstream is indistinguishable from a fast one. Journaled into
-    // `fetch_log.duration_ms` and carried on the outcome for the caller's
-    // logs and events.
+    // The two halves of the pass journal their own verdicts where they
+    // happen: a failed fetch (the `Err` below) is already the final
+    // outcome, the stored payload is reconciled and journaled in the
+    // second half.
+    let (fetched, duration_ms) = match fetch_and_journal(pool, fetcher, geo, source, now).await {
+        Ok(fetched) => fetched,
+        Err(outcome) => return outcome,
+    };
+    reconcile_and_journal(pool, fetched, settings, source, now, duration_ms).await
+}
+
+/// The fetch half of [`ingest_source`]: the measured fetch → decode →
+/// parse pass ([`fetch_and_filter`]) with its failure verdicts already
+/// journaled to `fetch_log` and the source row. `Ok` carries the payload
+/// and its measured duration to the reconcile half; `Err` is the final
+/// [`IngestOutcome`], there is nothing left to do.
+///
+/// The fetch clock starts at the request and stops at the verdict,
+/// retries and their backoff included: one `fetch` call can legitimately
+/// stretch far past a minute ([fetch].max_retries × capped backoff),
+/// holds a concurrency permit the whole time, and without a measurement a
+/// slow upstream is indistinguishable from a fast one. Journaled into
+/// `fetch_log.duration_ms` and carried on the outcome for the caller's
+/// logs and events.
+async fn fetch_and_journal(
+    pool: &DbPool,
+    fetcher: &Fetcher,
+    geo: &GeoResolver,
+    source: &Source,
+    now: i64,
+) -> Result<(FetchedAndFiltered, i64), IngestOutcome> {
     let fetch_started = std::time::Instant::now();
     let fetched = match fetch_and_filter(fetcher, geo, source).await {
         Ok(fetched) => fetched,
         Err(FetchAndFilterError::Fetch(failure)) => {
             let duration_ms = elapsed_ms(fetch_started);
             journal_failure(pool, source, &failure, now, duration_ms).await;
-            return IngestOutcome::FetchFailed {
+            return Err(IngestOutcome::FetchFailed {
                 failure,
                 duration_ms,
-            };
+            });
         }
         Err(FetchAndFilterError::Parse { payload, message }) => {
             let duration_ms = elapsed_ms(fetch_started);
             journal_parse_failure(pool, source, &payload, &message, now, duration_ms).await;
-            return IngestOutcome::ParseFailed {
+            return Err(IngestOutcome::ParseFailed {
                 message,
                 duration_ms,
-            };
+            });
         }
     };
-    let duration_ms = elapsed_ms(fetch_started);
+    Ok((fetched, elapsed_ms(fetch_started)))
+}
+
+/// The reconcile half of [`ingest_source`]: store the payload's proxies,
+/// journal the verdict and hand the pass's inserts (and, with
+/// `[ingest].removed_as_unknown`, the revived rows) to the priority probe
+/// queue.
+async fn reconcile_and_journal(
+    pool: &DbPool,
+    fetched: FetchedAndFiltered,
+    settings: IngestSettings,
+    source: &Source,
+    now: i64,
+    duration_ms: i64,
+) -> IngestOutcome {
     // `last_fetched_at` is a *freshness* stamp, not a download log: it
     // stands for "the database is already reconciled from this payload"
-    // (the TTL short-circuit above reads it). It is therefore written only
-    // once the payload has parsed and reconciled (`journal_success` runs
-    // after the reconcile): stamping it before that made a single parse or
-    // DB failure suppress every non-forced re-fetch for a whole TTL while
-    // the scheduler kept reporting successful ingests.
-    let payload = fetched.payload;
+    // (the TTL short-circuit in [`ingest_source`] reads it). It is
+    // therefore written only once the payload has parsed and reconciled
+    // (`journal_success` runs after the reconcile): stamping it before
+    // that made a single parse or DB failure suppress every non-forced
+    // re-fetch for a whole TTL while the scheduler kept reporting
+    // successful ingests.
+    let payload = &fetched.payload;
     let found = fetched.kept.len();
     // Alive-linger. `[ingest].drop_gate` decides whether a source's drop
     // rules disable it, see [`fumox_core::ingest::IngestPolicy`].
@@ -185,7 +224,7 @@ pub async fn ingest_source(
             // `journal_success` stamps `last_fetched_at`, the freshness
             // marker the TTL short-circuit checks before the next
             // re-fetch.
-            journal_success(pool, source, &payload, found, now, duration_ms).await;
+            journal_success(pool, source, payload, found, now, duration_ms).await;
             if fetched.dropped > 0 {
                 tracing::info!(
                     source = %source.id,
@@ -195,26 +234,8 @@ pub async fn ingest_source(
                     "the source's own filters discarded entries before reconcile"
                 );
             }
-            // `[ingest].removed_as_unknown`: a removed proxy the feed
-            // still carries resets to the pristine `unknown` state and
-            // gets the same priority-queue handoff as a fresh insert.
-            // A failure is logged and never fails the ingest, the
-            // next refresh simply retries.
-            let mut queue_ids = stats.inserted_ids.clone();
-            if settings.removed_as_unknown {
-                let fps: Vec<String> = fetched.kept.iter().map(ProxyEntry::fingerprint).collect();
-                match proxies::revive_removed(pool, &fps, now).await {
-                    Ok(ids) => queue_ids.extend(ids),
-                    Err(err) => {
-                        tracing::warn!(
-                            source = %source.id,
-                            fingerprints = fps.len(),
-                            error = %err,
-                            "removed-as-unknown revival failed"
-                        )
-                    }
-                }
-            }
+            let queue_ids =
+                collect_queue_ids(pool, &fetched, settings, source, now, &stats.inserted_ids).await;
             enqueue_probe_requests(
                 pool,
                 &source.id,
@@ -239,13 +260,44 @@ pub async fn ingest_source(
             // error class and the real status of the response.
             let message = err.to_string();
             tracing::error!(error = %err, source = %source.id, "reconciliation failed");
-            journal_storage_failure(pool, source, &payload, &message, now, duration_ms).await;
+            journal_storage_failure(pool, source, payload, &message, now, duration_ms).await;
             IngestOutcome::StorageFailed {
                 message,
                 duration_ms,
             }
         }
     }
+}
+
+/// The ids one reconciled pass hands to the priority probe queue: the
+/// fresh inserts plus — with `[ingest].removed_as_unknown` on — the
+/// `removed` rows the feed carries again, revived first so they re-enter
+/// the probe cycle like a fresh insert. A revival failure is logged and
+/// never fails the ingest, the next refresh simply retries.
+async fn collect_queue_ids(
+    pool: &DbPool,
+    fetched: &FetchedAndFiltered,
+    settings: IngestSettings,
+    source: &Source,
+    now: i64,
+    inserted_ids: &[i64],
+) -> Vec<i64> {
+    let mut queue_ids = inserted_ids.to_vec();
+    if settings.removed_as_unknown {
+        let fps: Vec<String> = fetched.kept.iter().map(ProxyEntry::fingerprint).collect();
+        match proxies::revive_removed(pool, &fps, now).await {
+            Ok(ids) => queue_ids.extend(ids),
+            Err(err) => {
+                tracing::warn!(
+                    source = %source.id,
+                    fingerprints = fps.len(),
+                    error = %err,
+                    "removed-as-unknown revival failed"
+                )
+            }
+        }
+    }
+    queue_ids
 }
 
 /// Milliseconds since `started`. The u128 elapsed only overflows i64 after
@@ -855,27 +907,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn source_with(encoding: Encoding, input_format: Option<InputFormat>) -> Source {
-        let now = fumox_core::models::now_ts();
         Source {
-            id: "srcA0000000".into(),
-            slug: None,
-            access_token: None,
-            name: "s".into(),
-            url: "https://example.com".into(),
-            enabled: true,
             encoding,
             input_format,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
+            ..Source::fixture("srcA0000000", fumox_core::models::now_ts())
         }
     }
 
@@ -909,7 +944,8 @@ mod tests {
     /// The same, but the upstream answers with a different body per
     /// request: the first request gets `bodies[0]`, the second `bodies[1]`,
     /// and a request beyond the list gets the last body again. A second
-    /// ingest of the same source needs a second, different feed.
+    /// ingest of the same source needs a second, different feed. The
+    /// upstream itself is the shared `test_support::one_shot_upstream`.
     async fn ingest_env_with_bodies(
         bodies: Vec<&'static str>,
     ) -> (
@@ -919,47 +955,7 @@ mod tests {
         Source,
         Arc<AtomicUsize>,
     ) {
-        assert!(!bodies.is_empty(), "the upstream needs at least one body");
-        let requests = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&requests);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            while let Ok((mut sock, _)) = listener.accept().await {
-                // The counter doubles as the index of the body this
-                // request is answered with: the requests are sequential.
-                let index = counted.fetch_add(1, Ordering::SeqCst);
-                let body = bodies[index.min(bodies.len() - 1)];
-                // Read the request out before answering, like a real HTTP
-                // server. Closing a socket that still holds unread client
-                // bytes makes the kernel send RST, which can clobber the
-                // client's buffered read of the response; the fetcher then
-                // retries, opening a second connection the counter sees,
-                // and the exact-fetch-count assertions below would flake.
-                let mut received = Vec::with_capacity(1024);
-                loop {
-                    let mut scratch = [0u8; 1024];
-                    match sock.read(&mut scratch).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            received.extend_from_slice(&scratch[..n]);
-                            if received.windows(4).any(|w| w == b"\r\n\r\n")
-                                || received.len() >= 16 * 1024
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body.as_bytes()).await;
-            }
-        });
+        let (addr, requests) = crate::test_support::one_shot_upstream(bodies).await;
 
         let dir = fumox_core::tempdir_lite::TempDir::new("ingest-test");
         let cfg = fumox_core::config::DatabaseConfig {

@@ -128,10 +128,7 @@ macro_rules! impl_presentation {
             /// through to *unknown*, mirroring the template chains.
             #[allow(dead_code)]
             fn status_label(&self, status: &str) -> String {
-                let key = crate::admin::presentation::STATUS_KEYS
-                    .iter()
-                    .find(|(value, _)| *value == status)
-                    .map(|(_, key)| *key)
+                let key = crate::admin::presentation::known_status_key(status)
                     .unwrap_or(crate::admin::presentation::UNKNOWN_STATUS_KEY);
                 self.lang.t(key).to_string()
             }
@@ -243,6 +240,38 @@ mod tests {
         assert_eq!(
             fmt_ts_element(i64::MAX),
             format!("<time class=\"ts\" datetime=\"{0}\">{0}</time>", i64::MAX)
+        );
+    }
+
+    /// `status_label` resolves every schema value to its own key and
+    /// falls back to *unknown* for both the literal `unknown` value and
+    /// a wire token from outside the schema (a newer build's data): the
+    /// badge helpers (dashboard.html, probe.html, sources/detail.html)
+    /// never echo a raw token.
+    #[test]
+    fn status_label_maps_schema_values_and_falls_back_to_unknown() {
+        struct Sample {
+            lang: crate::admin::i18n::Lang,
+        }
+        impl_presentation!(Sample);
+        let lang =
+            crate::admin::i18n::Locales::load(std::path::Path::new("/nonexistent")).default_lang();
+        let sample = Sample { lang: lang.clone() };
+
+        for (value, key) in STATUS_KEYS {
+            assert_eq!(
+                sample.status_label(value),
+                lang.t(key),
+                "{value}: the badge must render its own key"
+            );
+        }
+
+        let unknown = lang.t(UNKNOWN_STATUS_KEY);
+        assert_eq!(sample.status_label("unknown"), unknown);
+        assert_eq!(
+            sample.status_label("wire-token-from-a-newer-schema"),
+            unknown,
+            "an outsider value falls back to unknown, never echoes the token"
         );
     }
 }

@@ -482,71 +482,17 @@ impl Fetcher {
                     )),
                 ));
             }
-            let parsed = Url::parse(&current).map_err(|e| FetchFailure::Network {
-                message: format!("invalid URL: {e}"),
-                permanent: true,
-                attempts: 1,
-            })?;
-            match parsed.scheme() {
-                "http" | "https" => {}
-                other => {
-                    return Err(FetchFailure::Network {
-                        message: format!("unsupported scheme: {other}"),
-                        permanent: true,
-                        attempts: 1,
-                    });
-                }
-            }
-
-            // SSRF: resolve the host ourselves, vet every address, then pin
-            // the chosen one so reqwest cannot be re-resolved (DNS
-            // rebinding) to a different address between check and connect.
-            let host = parsed.host_str().ok_or_else(|| FetchFailure::Network {
-                message: "URL has no host".to_string(),
-                permanent: true,
-                attempts: 1,
-            })?;
-            let pinned = self
-                .resolver
-                .resolve_and_vet(host, family)
-                .await
-                .map_err(|e| {
-                    // The URL may carry userinfo credentials, never log it raw.
-                    tracing::warn!(url = %redact_url(&current), reason = %e, "SSRF protection blocked the fetch");
-                    FetchFailure::http_client_why(403, Some("SSRF policy blocked the resolved address"))
-                })?;
-            let port = parsed
-                .port_or_known_default()
-                .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
-
-            let client = self
-                .build_client(host, SocketAddr::new(pinned, port), deadline)
-                .map_err(|e| FetchFailure::Network {
-                    message: redacted_request_error(&e),
-                    permanent: false,
-                    attempts: 1,
-                })?;
-            let mut request = client.get(parsed.clone());
-            let same_origin = configured_origin
-                .as_ref()
-                .is_some_and(|origin| *origin == origin_of(&parsed));
-            if same_origin {
-                for (name, value) in headers {
-                    request = request.header(name.as_str(), value.as_str());
-                }
-            } else if !headers.is_empty() {
-                withheld = Some("headers withheld: redirect left the configured origin");
-                tracing::warn!(
-                    url = %redact_url(&current),
-                    "redirect left the configured origin, source headers withheld"
-                );
-            }
-
-            let response = request.send().await.map_err(|e| FetchFailure::Network {
-                message: redacted_request_error(&e),
-                permanent: false,
-                attempts: 1,
-            })?;
+            let hop = self.vet_hop(&current, family).await?;
+            let response = self
+                .send_hop(
+                    &current,
+                    &hop,
+                    headers,
+                    configured_origin.as_ref(),
+                    &mut withheld,
+                    deadline,
+                )
+                .await?;
             let status = response.status().as_u16();
 
             if (300..400).contains(&status) {
@@ -555,7 +501,8 @@ impl Fetcher {
                     .get(reqwest::header::LOCATION)
                     .and_then(|v| v.to_str().ok())
                     .ok_or_else(|| FetchFailure::http_client_why(status, withheld))?;
-                current = parsed
+                current = hop
+                    .parsed
                     .join(location)
                     .map_err(|_| FetchFailure::http_client_why(status, withheld))?
                     .to_string();
@@ -579,18 +526,7 @@ impl Fetcher {
 
             // Stream the body with a hard cap (decompression-bomb guard).
             let limit = self.config.max_response_bytes;
-            let mut body: Vec<u8> = Vec::new();
-            let mut stream = response;
-            while let Some(chunk) = stream.chunk().await.map_err(|e| FetchFailure::Network {
-                message: redacted_request_error(&e),
-                permanent: false,
-                attempts: 1,
-            })? {
-                if body.len() as u64 + chunk.len() as u64 > limit {
-                    return Err(FetchFailure::ResponseTooLarge { limit, attempts: 1 });
-                }
-                body.extend_from_slice(&chunk);
-            }
+            let body = stream_body(response, limit).await?;
             let bytes = body.len() as u64;
             return Ok(FetchedPayload {
                 http_status: status,
@@ -606,6 +542,127 @@ impl Fetcher {
             Some(&format!("redirect chain longer than {MAX_REDIRECTS} hops")),
         ))
     }
+
+    /// Parse and vet one hop of the redirect chain: the URL is parsed, the
+    /// scheme is checked, and the host is resolved with every resolved
+    /// address vetted against the SSRF policy. Returns the hop ready to
+    /// dial: the parsed URL plus the connect address the vetting picked.
+    ///
+    /// That address is what [`Self::send_hop`] pins into the request
+    /// client, so nothing between this check and the connect can move the
+    /// connection elsewhere (DNS rebinding).
+    async fn vet_hop(&self, current: &str, family: IpFamily) -> Result<VettedHop, FetchFailure> {
+        let parsed = Url::parse(current).map_err(|e| FetchFailure::Network {
+            message: format!("invalid URL: {e}"),
+            permanent: true,
+            attempts: 1,
+        })?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Err(FetchFailure::Network {
+                    message: format!("unsupported scheme: {other}"),
+                    permanent: true,
+                    attempts: 1,
+                });
+            }
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| FetchFailure::Network {
+                message: "URL has no host".to_string(),
+                permanent: true,
+                attempts: 1,
+            })?
+            .to_string();
+        let pinned = self
+            .resolver
+            .resolve_and_vet(&host, family)
+            .await
+            .map_err(|e| {
+                // The URL may carry userinfo credentials, never log it raw.
+                tracing::warn!(url = %redact_url(current), reason = %e, "SSRF protection blocked the fetch");
+                FetchFailure::http_client_why(403, Some("SSRF policy blocked the resolved address"))
+            })?;
+        let port = parsed
+            .port_or_known_default()
+            .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+        Ok(VettedHop {
+            parsed,
+            host,
+            addr: SocketAddr::new(pinned, port),
+        })
+    }
+
+    /// Build the pinned client for a vetted hop and send the request.
+    ///
+    /// The source-configured headers are applied only while the hop is on
+    /// the origin the admin configured; a redirect that left it marks
+    /// `withheld`, so the failures of this chain carry the reason the
+    /// request looked anonymous to the target.
+    async fn send_hop(
+        &self,
+        current: &str,
+        hop: &VettedHop,
+        headers: &std::collections::BTreeMap<String, String>,
+        configured_origin: Option<&(String, String, u16)>,
+        withheld: &mut Option<&'static str>,
+        deadline: tokio::time::Instant,
+    ) -> Result<reqwest::Response, FetchFailure> {
+        let client = self
+            .build_client(&hop.host, hop.addr, deadline)
+            .map_err(|e| FetchFailure::Network {
+                message: redacted_request_error(&e),
+                permanent: false,
+                attempts: 1,
+            })?;
+        let mut request = client.get(hop.parsed.clone());
+        let same_origin = configured_origin.is_some_and(|origin| *origin == origin_of(&hop.parsed));
+        if same_origin {
+            for (name, value) in headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+        } else if !headers.is_empty() {
+            *withheld = Some("headers withheld: redirect left the configured origin");
+            tracing::warn!(
+                url = %redact_url(current),
+                "redirect left the configured origin, source headers withheld"
+            );
+        }
+        request.send().await.map_err(|e| FetchFailure::Network {
+            message: redacted_request_error(&e),
+            permanent: false,
+            attempts: 1,
+        })
+    }
+}
+
+/// One hop of the redirect chain, vetted and ready to dial: the parsed
+/// URL, the host it carries and the connect address the SSRF vetting
+/// picked for that host.
+struct VettedHop {
+    parsed: Url,
+    host: String,
+    addr: SocketAddr,
+}
+
+/// Stream the response body with a hard cap (decompression-bomb guard):
+/// the cap counts the bytes the decompressed stream hands over, so a body
+/// that is tiny on the wire and huge after decompression is refused
+/// instead of buffered to completion.
+async fn stream_body(mut response: reqwest::Response, limit: u64) -> Result<Vec<u8>, FetchFailure> {
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| FetchFailure::Network {
+        message: redacted_request_error(&e),
+        permanent: false,
+        attempts: 1,
+    })? {
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            return Err(FetchFailure::ResponseTooLarge { limit, attempts: 1 });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// The failure reported when a fetch ran out of its wall-clock budget. The
@@ -653,7 +710,7 @@ fn origin_of(url: &Url) -> (String, String, u16) {
 /// not always print the URL exactly as this process built it (it may drop
 /// the userinfo or the default port), and a substitution that misses
 /// leaves the raw credentials in the message.
-fn redacted_request_error(error: &reqwest::Error) -> String {
+pub(crate) fn redacted_request_error(error: &reqwest::Error) -> String {
     let text = error.to_string();
     let Some(url) = error.url() else {
         return text;

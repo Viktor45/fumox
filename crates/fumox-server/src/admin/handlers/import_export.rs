@@ -586,6 +586,81 @@ pub async fn import_form(
     .await
 }
 
+/// The 422 screen of a refused import: the error list and the payload
+/// echoed back so a fix-and-retry does not start from an empty textarea.
+async fn render_rejected(
+    state: &AdminState,
+    lang: &Lang,
+    theme: Theme,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    errors: Vec<String>,
+    payload: String,
+) -> Response {
+    render_page(
+        state,
+        RenderArgs {
+            lang: lang.clone(),
+            theme,
+            peer,
+            headers,
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            errors,
+            payload: Some(payload),
+        },
+    )
+    .await
+}
+
+/// Parse the payload, check the schema version and run the shared
+/// validation pass. Every refusal is an `Err` and the file only an `Ok`:
+/// no branch can drift away from the screen, the echoed payload or the
+/// error list.
+async fn stage_import(
+    state: &AdminState,
+    lang: &Lang,
+    payload: &str,
+) -> Result<(ConfigExport, Vec<String>), Vec<String>> {
+    match serde_json::from_str::<ConfigExport>(payload) {
+        Err(err) => Err(vec![lang.t("io.err_parse").replace("{}", &err.to_string())]),
+        Ok(parsed) if parsed.version != SUPPORTED_VERSION => Err(vec![
+            lang.t("io.err_version")
+                .replace("{}", &parsed.version.to_string()),
+        ]),
+        Ok(parsed) => {
+            // All-or-nothing validation pass.
+            let validation = validate_import(state, lang, &parsed).await;
+            if validation.errors.is_empty() {
+                Ok((parsed, validation.warnings))
+            } else {
+                Err(validation.errors)
+            }
+        }
+    }
+}
+
+/// The toast of a successful import: the totals, plus the warning count
+/// when the file carried any. The details stay in the log.
+fn import_done_message(lang: &Lang, summary: &ImportSummary) -> String {
+    let sources = summary.sources_created.to_string();
+    let profiles = summary.profiles_created.to_string();
+    if summary.warnings.is_empty() {
+        lang.t_named(
+            "io.import_done",
+            &[("sources", sources), ("profiles", profiles)],
+        )
+    } else {
+        lang.t_named(
+            "io.import_done_warnings",
+            &[
+                ("sources", sources),
+                ("profiles", profiles),
+                ("warnings", summary.warnings.len().to_string()),
+            ],
+        )
+    }
+}
+
 /// `POST /admin/import`, validate then create-new.
 pub async fn import_submit(
     State(state): State<AdminState>,
@@ -608,58 +683,17 @@ pub async fn import_submit(
                 caps::IMPORT_BODY_BYTES.to_string(),
             ],
         )];
-        return render_page(
-            &state,
-            RenderArgs {
-                lang,
-                theme,
-                peer,
-                headers: &headers,
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                errors,
-                payload: Some(payload),
-            },
-        )
-        .await;
+        return render_rejected(&state, &lang, theme, peer, &headers, errors, payload).await;
     }
 
-    // Parse, then the version, then the shared validation: every refusal
-    // funnels into the one 422 return below, so the screen, the echoed
-    // payload and the error list cannot drift between the branches.
-    let mut validation = ImportValidation::default();
-    let mut file = None;
-    match serde_json::from_str::<ConfigExport>(&payload) {
-        Err(err) => validation
-            .errors
-            .push(lang.t("io.err_parse").replace("{}", &err.to_string())),
-        Ok(parsed) if parsed.version != SUPPORTED_VERSION => validation.errors.push(
-            lang.t("io.err_version")
-                .replace("{}", &parsed.version.to_string()),
-        ),
-        Ok(parsed) => {
-            // All-or-nothing validation pass.
-            validation = validate_import(&state, &lang, &parsed).await;
-            file = Some(parsed);
+    let (file, warnings) = match stage_import(&state, &lang, &payload).await {
+        Ok(staged) => staged,
+        Err(errors) => {
+            return render_rejected(&state, &lang, theme, peer, &headers, errors, payload).await;
         }
-    }
-    if !validation.errors.is_empty() {
-        return render_page(
-            &state,
-            RenderArgs {
-                lang,
-                theme,
-                peer,
-                headers: &headers,
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                errors: validation.errors,
-                payload: Some(payload),
-            },
-        )
-        .await;
-    }
-    let file = file.expect("a file without validation errors has been parsed");
+    };
 
-    match apply_import(&state, &lang, file, validation.warnings).await {
+    match apply_import(&state, &lang, file, warnings).await {
         Ok(summary) => {
             tracing::info!(
                 sources = summary.sources_created,
@@ -672,25 +706,7 @@ pub async fn import_submit(
             for warning in &summary.warnings {
                 tracing::info!(warning = %warning, "import warning");
             }
-            let message = if summary.warnings.is_empty() {
-                lang.t_named(
-                    "io.import_done",
-                    &[
-                        ("sources", summary.sources_created.to_string()),
-                        ("profiles", summary.profiles_created.to_string()),
-                    ],
-                )
-            } else {
-                lang.t_named(
-                    "io.import_done_warnings",
-                    &[
-                        ("sources", summary.sources_created.to_string()),
-                        ("profiles", summary.profiles_created.to_string()),
-                        ("warnings", summary.warnings.len().to_string()),
-                    ],
-                )
-            };
-            super::flash_redirect("/admin/import", &message, "ok")
+            super::flash_redirect("/admin/import", &import_done_message(&lang, &summary), "ok")
         }
         Err(err) => super::server_error(&state, &headers, "import.apply", &err),
     }
@@ -818,31 +834,15 @@ fn push_pipeline_errors(
 /// re-vets every request anyway, so the row is imported and checked
 /// again later. Only a policy violation (a private address) is fatal.
 async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -> ImportValidation {
-    let mut validation = ImportValidation::default();
-
-    // Row-count caps: one 1 MiB body could carry
-    // thousands of rows, each triggering cache invalidation and (before the
-    // window below) a DNS lookup.
-    if file.sources.len() > caps::IMPORT_ROWS {
-        validation.errors.push(
-            lang.t("val.import_too_many_rows")
-                .replace("{}", &caps::IMPORT_ROWS.to_string())
-                + " ("
-                + lang.t("io.source_word")
-                + ")",
-        );
-    }
-    if file.profiles.len() > caps::IMPORT_ROWS {
-        validation.errors.push(
-            lang.t("val.import_too_many_rows")
-                .replace("{}", &caps::IMPORT_ROWS.to_string())
-                + " ("
-                + lang.t("io.profile_word")
-                + ")",
-        );
-    }
+    // Row-count caps: one 1 MiB body could carry thousands of rows, each
+    // triggering cache invalidation and (before the window below) a DNS
+    // lookup. Nothing else is worth checking past the caps.
+    let mut validation = ImportValidation {
+        errors: row_cap_errors(file, lang),
+        ..Default::default()
+    };
     if !validation.errors.is_empty() {
-        return validation; // nothing else is worth checking past the row caps
+        return validation;
     }
 
     // A reference is the join key between a source row and the profile
@@ -856,123 +856,187 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
     // worth a name lookup.
     let mut url_is_valid: Vec<bool> = Vec::with_capacity(file.sources.len());
 
+    // The static pass: every row, no name resolution, no I/O.
     for (index, s) in file.sources.iter().enumerate() {
-        let ctx = row_ctx(lang.t("io.source_word"), index, &s.name, Some(&s.reference));
-        if !seen_refs.insert(s.reference.as_str()) {
-            validation.errors.push(format!(
-                "{ctx}: {}",
-                lang.t("val.dup_ref").replace("{ref}", &s.reference)
-            ));
-        }
-        if let Err(message) = validate_name(&s.name, lang) {
-            validation.errors.push(format!("{ctx}: {message}"));
-        }
-        // The same floor the profile token has: a third-party file must
-        // not plant a guessable secret on a public endpoint (`/src`), and
-        // an already-hashed value is what a deployment stored, not what
-        // the file chooses.
-        if let Some(token) = s.access_token.as_deref()
-            && !token.is_empty()
-            && !fumox_core::token::is_hashed(token)
-        {
-            if token.chars().count() < caps::TOKEN_MIN {
-                validation
-                    .errors
-                    .push(format!("{ctx}: {}", lang.t("val.token_too_short_import")));
-            }
-            if let Err(message) = validate_token(token, lang) {
-                validation.errors.push(format!("{ctx}: {message}"));
-            }
-        }
-        let mut url_ok = true;
-        if s.url.trim().is_empty() {
-            validation
-                .errors
-                .push(format!("{ctx}: {}", lang.t("val.required")));
-            url_ok = false;
-        } else if s.url.len() > caps::URL {
-            validation.errors.push(format!(
-                "{ctx}: {}",
-                lang.t("val.field_too_long")
-                    .replace("{}", &caps::URL.to_string())
-            ));
-            url_ok = false;
-        } else if let Err(issue) = fetcher::validate_url(&s.url) {
-            validation
-                .errors
-                .push(format!("{ctx}: {}", url_problem_message(lang, &issue)));
-            url_ok = false;
-        }
+        let url_ok = validate_source_row(s, index, &mut seen_refs, lang, &mut validation.errors);
         url_is_valid.push(url_ok);
-        if let Some(slug) = s.slug.as_deref()
-            && !slug.is_empty()
-            && let Err(message) = validate_slug_format(slug, lang)
-        {
-            validation.errors.push(format!("{ctx}: {message}"));
-        }
-        if let Err(message) = validate_ttl(s.cache_ttl_seconds, lang) {
-            validation.errors.push(format!("{ctx}: {message}"));
-        }
-        if let Some(tags) = s.tags.as_ref()
-            && let Err(message) = validate_tags(tags, lang)
-        {
-            validation.errors.push(format!("{ctx}: {message}"));
-        }
-        if let Some(map) = s.headers.as_ref()
-            && let Err(message) = validate_header_map(map, lang)
-        {
-            validation.errors.push(format!("{ctx}: {message}"));
-        }
-        if let Some(pipeline) = s.pipeline.as_ref() {
-            push_pipeline_errors(pipeline, &ctx, lang, &mut validation.errors);
-        }
     }
-
     for (index, p) in file.profiles.iter().enumerate() {
-        let ctx = row_ctx(lang.t("io.profile_word"), index, &p.name, None);
-        if let Err(message) = validate_name(&p.name, lang) {
-            validation.errors.push(format!("{ctx}: {message}"));
-        }
-        if let Some(slug) = p.slug.as_deref()
-            && !slug.is_empty()
-            && let Err(message) = validate_slug_format(slug, lang)
-        {
-            validation.errors.push(format!("{ctx}: {message}"));
-        }
-        // Imported access tokens: a third-party file
-        // must not plant a guessable secret on a public endpoint. Tokens
-        // shorter than the floor are hard errors, silently regenerating
-        // them would change what the operator expects the file to contain.
-        //
-        // A token that is already a hash is not a secret the file chooses:
-        // it is what this deployment stored (the export of a hashed row),
-        // and the plaintext rules below do not apply to it.
-        if let Some(token) = p.access_token.as_deref()
-            && !token.is_empty()
-            && !fumox_core::token::is_hashed(token)
-        {
-            if token.chars().count() < caps::TOKEN_MIN {
-                validation
-                    .errors
-                    .push(format!("{ctx}: {}", lang.t("val.token_too_short_import")));
-            }
-            if let Err(message) = validate_token(token, lang) {
-                validation.errors.push(format!("{ctx}: {message}"));
-            }
-        }
-        if let Some(pipeline) = p.pipeline.as_ref() {
-            push_pipeline_errors(pipeline, &ctx, lang, &mut validation.errors);
-        }
-        if let Err(message) = validate_countries(&p.countries, lang) {
-            validation.errors.push(format!("{ctx}: {message}"));
-        }
+        validate_profile_row(p, index, lang, &mut validation.errors);
     }
 
-    // The DNS window: the first `IMPORT_DNS_VET` URLs are resolved inside
-    // the request, the rest are only statically validated (the fetch path
-    // re-vets every request anyway, so this is latency/DNS-traffic
-    // hygiene, not a security hole). The whole window is bounded by
-    // `IMPORT_DNS_WINDOW`: the per-URL timeout alone would add up.
+    // The DNS pass over the statically-valid URLs, bounded by its own
+    // window: see `vet_dns_window`.
+    vet_dns_window(state, lang, file, &url_is_valid, &mut validation).await;
+
+    validation
+}
+
+/// The row-count caps of the import: one 1 MiB body could carry thousands
+/// of rows, each triggering cache invalidation and (before the DNS window)
+/// a name lookup. A non-empty list stops the whole validation pass.
+fn row_cap_errors(file: &ConfigExport, lang: &Lang) -> Vec<String> {
+    let mut errors = Vec::new();
+    if file.sources.len() > caps::IMPORT_ROWS {
+        errors.push(
+            lang.t("val.import_too_many_rows")
+                .replace("{}", &caps::IMPORT_ROWS.to_string())
+                + " ("
+                + lang.t("io.source_word")
+                + ")",
+        );
+    }
+    if file.profiles.len() > caps::IMPORT_ROWS {
+        errors.push(
+            lang.t("val.import_too_many_rows")
+                .replace("{}", &caps::IMPORT_ROWS.to_string())
+                + " ("
+                + lang.t("io.profile_word")
+                + ")",
+        );
+    }
+    errors
+}
+
+/// The static pass over one imported source row: the shared validators of
+/// the forms plus the source-only rules. Pushes the row's errors and
+/// reports whether its URL passed the static check — only those rows are
+/// worth a name lookup in the DNS window below.
+fn validate_source_row<'a>(
+    s: &'a ExportSource,
+    index: usize,
+    seen_refs: &mut HashSet<&'a str>,
+    lang: &Lang,
+    errors: &mut Vec<String>,
+) -> bool {
+    let ctx = row_ctx(lang.t("io.source_word"), index, &s.name, Some(&s.reference));
+    if !seen_refs.insert(s.reference.as_str()) {
+        errors.push(format!(
+            "{ctx}: {}",
+            lang.t("val.dup_ref").replace("{ref}", &s.reference)
+        ));
+    }
+    if let Err(message) = validate_name(&s.name, lang) {
+        errors.push(format!("{ctx}: {message}"));
+    }
+    // The same floor the profile token has: a third-party file must
+    // not plant a guessable secret on a public endpoint (`/src`), and
+    // an already-hashed value is what a deployment stored, not what
+    // the file chooses.
+    if let Some(token) = s.access_token.as_deref()
+        && !token.is_empty()
+        && !fumox_core::token::is_hashed(token)
+    {
+        push_token_errors(token, &ctx, lang, errors);
+    }
+    let url_ok = validate_url_row(&s.url, &ctx, lang, errors);
+    if let Some(slug) = s.slug.as_deref()
+        && !slug.is_empty()
+        && let Err(message) = validate_slug_format(slug, lang)
+    {
+        errors.push(format!("{ctx}: {message}"));
+    }
+    if let Err(message) = validate_ttl(s.cache_ttl_seconds, lang) {
+        errors.push(format!("{ctx}: {message}"));
+    }
+    if let Some(tags) = s.tags.as_ref()
+        && let Err(message) = validate_tags(tags, lang)
+    {
+        errors.push(format!("{ctx}: {message}"));
+    }
+    if let Some(map) = s.headers.as_ref()
+        && let Err(message) = validate_header_map(map, lang)
+    {
+        errors.push(format!("{ctx}: {message}"));
+    }
+    if let Some(pipeline) = s.pipeline.as_ref() {
+        push_pipeline_errors(pipeline, &ctx, lang, errors);
+    }
+    url_ok
+}
+
+/// The static pass over one imported profile row: the same validators as
+/// the profile form.
+fn validate_profile_row(p: &ExportProfile, index: usize, lang: &Lang, errors: &mut Vec<String>) {
+    let ctx = row_ctx(lang.t("io.profile_word"), index, &p.name, None);
+    if let Err(message) = validate_name(&p.name, lang) {
+        errors.push(format!("{ctx}: {message}"));
+    }
+    if let Some(slug) = p.slug.as_deref()
+        && !slug.is_empty()
+        && let Err(message) = validate_slug_format(slug, lang)
+    {
+        errors.push(format!("{ctx}: {message}"));
+    }
+    // Imported access tokens: a third-party file
+    // must not plant a guessable secret on a public endpoint. Tokens
+    // shorter than the floor are hard errors, silently regenerating
+    // them would change what the operator expects the file to contain.
+    //
+    // A token that is already a hash is not a secret the file chooses:
+    // it is what this deployment stored (the export of a hashed row),
+    // and the plaintext rules below do not apply to it.
+    if let Some(token) = p.access_token.as_deref()
+        && !token.is_empty()
+        && !fumox_core::token::is_hashed(token)
+    {
+        push_token_errors(token, &ctx, lang, errors);
+    }
+    if let Some(pipeline) = p.pipeline.as_ref() {
+        push_pipeline_errors(pipeline, &ctx, lang, errors);
+    }
+    if let Err(message) = validate_countries(&p.countries, lang) {
+        errors.push(format!("{ctx}: {message}"));
+    }
+}
+
+/// The floor and the charset rule of an imported plaintext token, shared
+/// by the source and the profile rows: tokens shorter than the floor are
+/// hard errors, silently regenerating them would change what the operator
+/// expects the file to contain.
+fn push_token_errors(token: &str, ctx: &str, lang: &Lang, errors: &mut Vec<String>) {
+    if token.chars().count() < caps::TOKEN_MIN {
+        errors.push(format!("{ctx}: {}", lang.t("val.token_too_short_import")));
+    }
+    if let Err(message) = validate_token(token, lang) {
+        errors.push(format!("{ctx}: {message}"));
+    }
+}
+
+/// The static URL checks of one imported source row — empty, too long,
+/// structurally invalid — as hard errors. Returns whether the URL is
+/// worth a name lookup in the DNS window below.
+fn validate_url_row(url: &str, ctx: &str, lang: &Lang, errors: &mut Vec<String>) -> bool {
+    if url.trim().is_empty() {
+        errors.push(format!("{ctx}: {}", lang.t("val.required")));
+        false
+    } else if url.len() > caps::URL {
+        errors.push(format!(
+            "{ctx}: {}",
+            lang.t("val.field_too_long")
+                .replace("{}", &caps::URL.to_string())
+        ));
+        false
+    } else if let Err(issue) = fetcher::validate_url(url) {
+        errors.push(format!("{ctx}: {}", url_problem_message(lang, &issue)));
+        false
+    } else {
+        true
+    }
+}
+
+/// The DNS window: the first [`caps::IMPORT_DNS_VET`] URLs are resolved
+/// inside the request, the rest are only statically validated (the fetch
+/// path re-vets every request anyway, so this is latency/DNS-traffic
+/// hygiene, not a security hole). The whole window is bounded by
+/// [`caps::IMPORT_DNS_WINDOW`]: the per-URL timeout alone would add up.
+async fn vet_dns_window(
+    state: &AdminState,
+    lang: &Lang,
+    file: &ConfigExport,
+    url_is_valid: &[bool],
+    validation: &mut ImportValidation,
+) {
     let mut vetted = 0usize;
     let mut expired = false;
     let deadline = tokio::time::Instant::now() + caps::IMPORT_DNS_WINDOW;
@@ -1047,8 +1111,6 @@ async fn validate_import(state: &AdminState, lang: &Lang, file: &ConfigExport) -
             &[vetted.to_string(), total_valid.to_string()],
         ));
     }
-
-    validation
 }
 
 /// Write phase: create sources (fresh ids), then profiles with composition
@@ -1160,8 +1222,14 @@ async fn apply_import(
             &mut summary,
         );
         // The same normalization the profile form applies: the allowlist is
-        // compared against the uppercase country codes of the proxies.
-        profile.countries = validate_countries(&profile.countries, lang).unwrap_or_default();
+        // compared against the uppercase country codes of the proxies. A
+        // list this call refuses cannot come through `validate_import`, so
+        // an error means the gate was bypassed — and an empty list means
+        // "no filtering" (`ExportProfile`), so defaulting to one would
+        // widen access instead of failing the import.
+        profile.countries = validate_countries(&profile.countries, lang).map_err(|message| {
+            fumox_core::Error::Config(format!("imported profile «{}»: {message}", profile.name))
+        })?;
         profile.id = id.clone();
         profile.created_at = now;
         profile.updated_at = now;
@@ -1427,25 +1495,10 @@ mod tests {
         // The DB itself allows one slug on both tables.
         let now = models::now_ts();
         let existing_source = models::Source {
-            id: models::new_id(),
             slug: Some("main".into()),
-            access_token: None,
             name: "s0".into(),
             url: "https://example.com/sub".into(),
-            enabled: true,
-            encoding: Encoding::Auto,
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
+            ..models::Source::fixture(&models::new_id(), now)
         };
         sources::create(&pool, &existing_source).await.unwrap();
         let existing_profile = models::Profile {
@@ -1698,23 +1751,12 @@ mod tests {
         let (_dir, state) = test_state().await;
         let old = state.export_token.current(&state.pool).await.unwrap();
 
-        // The same writer trick the scheduler tests use.
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let make_writer = captured.clone();
+        // The shared test writer of `fumox_core::logging::capture`.
+        let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
-            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .with_writer(make_writer)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -1754,45 +1796,19 @@ mod tests {
         let pool = state.pool.clone();
         let now = models::now_ts();
         let source = models::Source {
-            id: models::new_id(),
             slug: Some("s0".into()),
-            access_token: None,
             name: "s0".into(),
             url: "https://secret-host.example/sub".into(),
-            enabled: true,
-            encoding: Encoding::Auto,
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
+            ..models::Source::fixture(&models::new_id(), now)
         };
         sources::create(&pool, &source).await.unwrap();
 
-        // The same writer trick the scheduler tests use.
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let make_writer = captured.clone();
+        // The shared test writer of `fumox_core::logging::capture`.
+        let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
-            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .with_writer(make_writer)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -1862,6 +1878,67 @@ mod tests {
             rows.is_empty(),
             "the profiles must be rolled back: {rows:?}"
         );
+    }
+
+    /// An allowlist the write phase cannot normalize must abort the import,
+    /// not become an empty list: an empty `countries` means "no filtering"
+    /// (`ExportProfile`), so defaulting to it would silently widen access
+    /// for every client of the profile. `validate_import` refuses such a
+    /// file before any write — but the invariant must not live in the call
+    /// order of another function, so the write phase refuses on its own.
+    #[tokio::test]
+    async fn an_unnormalizable_allowlist_aborts_the_import() {
+        let (_dir, state) = test_state().await;
+        let pool = state.pool.clone();
+        let lang = state.locales.default_lang();
+
+        let mut p1 = profile("p1", None, &[]);
+        // Three letters: no entry of the list parses, and `validate_import`
+        // refuses the file with the same message.
+        p1.countries = vec!["DEU".into()];
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: Vec::new(),
+            profiles: vec![p1],
+        };
+        let err = apply_import(&state, &lang, file, Vec::new())
+            .await
+            .expect_err("an allowlist validate_import refuses must abort the write phase");
+        assert!(
+            err.to_string().contains("DEU"),
+            "the error must name the offending code: {err}"
+        );
+
+        // The refusal is a transaction abort, not a widened import: the
+        // profile must not be stored without its filter.
+        let rows = profiles::list(&pool, false).await.unwrap();
+        assert!(rows.is_empty(), "nothing must be written: {rows:?}");
+    }
+
+    /// The Ok path of the write-phase normalization: lowercase and repeated
+    /// codes are stored uppercase and deduplicated, the way the profile
+    /// form stores them — the allowlist is compared against the uppercase
+    /// codes of the proxies.
+    #[tokio::test]
+    async fn the_write_phase_normalizes_the_allowlist() {
+        let (_dir, state) = test_state().await;
+        let pool = state.pool.clone();
+        let lang = state.locales.default_lang();
+
+        let mut p1 = profile("p1", None, &[]);
+        p1.countries = vec!["de".into(), "US".into(), "de".into()];
+        let file = ConfigExport {
+            version: SUPPORTED_VERSION,
+            exported_at: 1,
+            sources: Vec::new(),
+            profiles: vec![p1],
+        };
+        apply_import(&state, &lang, file, Vec::new()).await.unwrap();
+
+        let rows = profiles::list(&pool, false).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].countries, vec!["DE".to_string(), "US".to_string()]);
     }
 
     /// An export bigger than the import accepts says so in the file

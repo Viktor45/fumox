@@ -73,7 +73,8 @@ pub struct SingBoxParseResult {
     pub unsupported: usize,
     /// Outbound objects missing required fields or over the parameter cap.
     pub invalid: usize,
-    /// Outbounds left out because the payload reached the entry cap.
+    /// Outbounds left out because the payload reached the entry cap, plus
+    /// the entries of the one outbound that crossed it.
     pub skipped: usize,
 }
 
@@ -120,6 +121,12 @@ fn harvest(config: &Map<String, Value>, result: &mut SingBoxParseResult) -> bool
         return false;
     };
     for outbound in outbounds {
+        if result.entries.len() >= super::MAX_ENTRIES {
+            // The cap is reached: the rest of the payload is counted instead
+            // of parsed, so the load stays bounded and the truncation shows.
+            result.skipped += 1;
+            continue;
+        }
         parse_outbound(outbound, result);
     }
     true
@@ -129,20 +136,12 @@ fn parse_outbound(outbound: &Value, result: &mut SingBoxParseResult) {
     let Some(map) = outbound.as_object() else {
         // Nothing is known about this outbound, so the event carries only
         // `error` (see the logging contract in the module docs).
-        let message = "outbound is not a JSON object";
-        tracing::debug!(error = message, "skipping malformed sing-box outbound");
-        result.invalid += 1;
+        reject_invalid("outbound is not a JSON object", result);
         return;
     };
     // Dialect: sing-box spells the kind `type`, Xray spells it `protocol`.
-    let (kind_key, kind) = if let Some(kind) = map.get("type").and_then(Value::as_str) {
-        ("type", kind)
-    } else if let Some(kind) = map.get("protocol").and_then(Value::as_str) {
-        ("protocol", kind)
-    } else {
-        let message = "outbound without a `type`/`protocol`";
-        tracing::debug!(error = message, "skipping malformed sing-box outbound");
-        result.invalid += 1;
+    let Some((kind_key, kind)) = outbound_kind(map) else {
+        reject_invalid("outbound without a `type`/`protocol`", result);
         return;
     };
     if NON_PROXY_TYPES.contains(&kind) {
@@ -153,6 +152,66 @@ fn parse_outbound(outbound: &Value, result: &mut SingBoxParseResult) {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let Some(built) = build_outbound(map, kind_key, kind, &name) else {
+        skip_unsupported(kind, &name, result);
+        return;
+    };
+    match built {
+        Ok(built) => accept_outbound(built, kind, &name, result),
+        Err(message) => reject_outbound(kind, &name, &message, result),
+    }
+}
+
+/// Reject a malformed outbound: one debug event naming the concrete reason
+/// and one invalid count. A bad outbound never fails the payload (the
+/// log-and-skip principle is in the module docs).
+fn reject_invalid(message: &str, result: &mut SingBoxParseResult) {
+    tracing::debug!(error = message, "skipping malformed sing-box outbound");
+    result.invalid += 1;
+}
+
+/// Count one recognized proxy protocol without a [`ProxyEntry`]
+/// representation, named by what it declared (`kind` and `tag`).
+fn skip_unsupported(kind: &str, name: &str, result: &mut SingBoxParseResult) {
+    tracing::debug!(
+        kind,
+        tag = skip_tag(name),
+        "sing-box: proxy protocol without a representation"
+    );
+    result.unsupported += 1;
+}
+
+/// Reject one outbound whose dialect builder failed, named by what it
+/// declared plus the concrete reason.
+fn reject_outbound(kind: &str, name: &str, message: &str, result: &mut SingBoxParseResult) {
+    tracing::debug!(
+        kind,
+        tag = skip_tag(name),
+        error = %message,
+        "skipping malformed sing-box outbound"
+    );
+    result.invalid += 1;
+}
+
+/// The dialect-spelled kind of an outbound: sing-box spells it `type`, Xray
+/// spells it `protocol`; `None` when the outbound declares neither.
+fn outbound_kind(map: &Map<String, Value>) -> Option<(&str, &str)> {
+    if let Some(kind) = map.get("type").and_then(Value::as_str) {
+        return Some(("type", kind));
+    }
+    map.get("protocol")
+        .and_then(Value::as_str)
+        .map(|kind| ("protocol", kind))
+}
+
+/// Dispatch one proxy outbound to its dialect builder; `None` for a
+/// protocol without a [`ProxyEntry`] representation.
+fn build_outbound(
+    map: &Map<String, Value>,
+    kind_key: &str,
+    kind: &str,
+    name: &str,
+) -> Option<Result<XrayOutbound, String>> {
     // sing-box spells the SOCKS protocol version explicitly; only 5 has a
     // URI representation, so an explicit other version is counted as
     // unsupported like the protocols without a representation at all
@@ -161,74 +220,56 @@ fn parse_outbound(outbound: &Value, result: &mut SingBoxParseResult) {
         && matches!(kind, "socks" | "socks5")
         && str_field(map, "version").is_some_and(|version| version != "5")
     {
+        return None;
+    }
+    match (kind_key, kind) {
+        ("type", "vless") => Some(native_vless(map, name).map(vec1)),
+        ("type", "vmess") => Some(native_vmess(map, name).map(vec1)),
+        ("type", "trojan") => Some(native_trojan(map, name).map(vec1)),
+        ("type", "shadowsocks") => Some(native_ss(map, name).map(vec1)),
+        ("type", "hysteria2") => Some(native_hysteria2(map, name).map(vec1)),
+        ("type", "socks" | "socks5") => Some(native_socks(map, name).map(vec1)),
+        ("protocol", "vless") => Some(xray_vless(map, name)),
+        ("protocol", "vmess") => Some(xray_vmess(map, name)),
+        ("protocol", "trojan") => Some(xray_trojan(map, name)),
+        ("protocol", "shadowsocks") => Some(xray_ss(map, name)),
+        ("protocol", "socks") => Some(xray_socks(map, name)),
+        _ => None,
+    }
+}
+
+/// Store one successfully built outbound: summarize its skips in one event
+/// and append its entries under the entry cap.
+fn accept_outbound(built: XrayOutbound, kind: &str, name: &str, result: &mut SingBoxParseResult) {
+    // One summary event per outbound: the element loops count their
+    // skips instead of logging per element (the logging contract is
+    // in the module docs).
+    if built.skips.any() {
         tracing::debug!(
             kind,
-            tag = skip_tag(&name),
-            "sing-box: proxy protocol without a representation"
+            tag = skip_tag(name),
+            no_endpoint = built.skips.no_endpoint,
+            no_credential = built.skips.no_credential,
+            rejected = built.skips.rejected,
+            dropped = built.skips.dropped,
+            "sing-box: outbound skipped elements"
         );
-        result.unsupported += 1;
-        return;
     }
-    let built = match (kind_key, kind) {
-        ("type", "vless") => native_vless(map, &name).map(vec1),
-        ("type", "vmess") => native_vmess(map, &name).map(vec1),
-        ("type", "trojan") => native_trojan(map, &name).map(vec1),
-        ("type", "shadowsocks") => native_ss(map, &name).map(vec1),
-        ("type", "hysteria2") => native_hysteria2(map, &name).map(vec1),
-        ("type", "socks" | "socks5") => native_socks(map, &name).map(vec1),
-        ("protocol", "vless") => xray_vless(map, &name),
-        ("protocol", "vmess") => xray_vmess(map, &name),
-        ("protocol", "trojan") => xray_trojan(map, &name),
-        ("protocol", "shadowsocks") => xray_ss(map, &name),
-        ("protocol", "socks") => xray_socks(map, &name),
-        _ => {
-            tracing::debug!(
-                kind,
-                tag = skip_tag(&name),
-                "sing-box: proxy protocol without a representation"
-            );
-            result.unsupported += 1;
-            return;
+    // The outbound itself passed the cap check in `harvest`, but one
+    // outbound can carry more entries than the cap has slots left
+    // (an Xray endpoint list), so the per-entry bound is enforced
+    // here.
+    for entry in built.entries {
+        if result.entries.len() >= super::MAX_ENTRIES {
+            result.skipped += 1;
+            continue;
         }
-    };
-    match built {
-        Ok(built) => {
-            // One summary event per outbound: the element loops count their
-            // skips instead of logging per element (the logging contract is
-            // in the module docs).
-            if built.skips.any() {
-                tracing::debug!(
-                    kind,
-                    tag = skip_tag(&name),
-                    no_endpoint = built.skips.no_endpoint,
-                    no_credential = built.skips.no_credential,
-                    rejected = built.skips.rejected,
-                    dropped = built.skips.dropped,
-                    "sing-box: outbound skipped elements"
-                );
-            }
-            for entry in built.entries {
-                if result.entries.len() >= super::MAX_ENTRIES {
-                    result.skipped += 1;
-                    continue;
-                }
-                result.entries.push(entry);
-            }
-            // The users dropped by the per-endpoint cap, and the non-object
-            // junk elements, are counted as invalid: they were recognized
-            // but not stored.
-            result.invalid += built.skips.dropped;
-        }
-        Err(message) => {
-            tracing::debug!(
-                kind,
-                tag = skip_tag(&name),
-                error = %message,
-                "skipping malformed sing-box outbound"
-            );
-            result.invalid += 1;
-        }
+        result.entries.push(entry);
     }
+    // The users dropped by the per-endpoint cap, and the non-object
+    // junk elements, are counted as invalid: they were recognized
+    // but not stored.
+    result.invalid += built.skips.dropped;
 }
 
 /// The `tag` field of a skip event: `None` when the outbound carries no
@@ -986,16 +1027,28 @@ fn xray_stream_params(
     security: Option<&str>,
     params: &mut Vec<Param>,
 ) {
-    // The value the security key carries when TLS is on (`security=tls`,
-    // `tls=tls`).
-    const TLS_ON: &str = "tls";
     let network = str_field(stream, "network").unwrap_or("tcp");
     // TCP is the implicit transport in every dialect; `type=tcp` is stored
-    // only when it carries HTTP obfuscation (see the `tcp` arm below).
+    // only when it carries HTTP obfuscation (see `xray_tcp_params`).
     // Xray renamed `tcp` to `raw` in 1.8.24; it is the same transport.
     if network != "tcp" && network != "raw" {
         push_param(params, true, network_key, network);
     }
+    xray_security_params(stream, security, params);
+    xray_transport_params(stream, network, network_key, params);
+}
+
+/// Map the TLS half of `streamSettings`: the `security` spelling picks the
+/// `tlsSettings` or `realitySettings` block. `security` is the NAME of the
+/// key spelling TLS-on for the scheme.
+fn xray_security_params(
+    stream: &Map<String, Value>,
+    security: Option<&str>,
+    params: &mut Vec<Param>,
+) {
+    // The value the security key carries when TLS is on (`security=tls`,
+    // `tls=tls`).
+    const TLS_ON: &str = "tls";
     match str_field(stream, "security") {
         Some("tls") => {
             if let Some(key) = security {
@@ -1047,88 +1100,22 @@ fn xray_stream_params(
         }
         _ => {}
     }
+}
+
+/// Map the transport half of `streamSettings` onto parameters: the settings
+/// block matching `network` (`wsSettings`, `grpcSettings`, …).
+fn xray_transport_params(
+    stream: &Map<String, Value>,
+    network: &str,
+    network_key: &str,
+    params: &mut Vec<Param>,
+) {
     match network {
-        "ws" => {
-            if let Some(ws) = stream.get("wsSettings").and_then(Value::as_object) {
-                if let Some(path) = str_field(ws, "path") {
-                    push_param(params, true, "path", path);
-                }
-                if let Some(headers) = ws.get("headers").and_then(Value::as_object) {
-                    if let Some(host) = string_or_joined_array(headers.get("Host")) {
-                        push_param(params, true, "host", host);
-                    }
-                    // Headers other than `Host` are part of the handshake
-                    // identity a client has to replay; they pass through as
-                    // `headers.<name>` parameters, like the other unmapped
-                    // fields.
-                    for (key, value) in headers {
-                        if key.eq_ignore_ascii_case("host") || value.is_null() {
-                            continue;
-                        }
-                        push_param(
-                            params,
-                            false,
-                            &format!("headers.{key}"),
-                            json_to_param_value(value),
-                        );
-                    }
-                }
-                passthrough_settings(params, ws, &["path", "headers"]);
-            }
-        }
-        "grpc" => {
-            if let Some(grpc) = stream.get("grpcSettings").and_then(Value::as_object) {
-                if let Some(service) = str_field(grpc, "serviceName") {
-                    push_param(params, true, "serviceName", service);
-                }
-                passthrough_settings(params, grpc, &["serviceName"]);
-            }
-        }
-        "http" | "h2" => {
-            if let Some(http) = stream.get("httpSettings").and_then(Value::as_object) {
-                if let Some(host) = string_or_joined_array(http.get("host")) {
-                    push_param(params, true, "host", host);
-                }
-                if let Some(path) = str_field(http, "path") {
-                    push_param(params, true, "path", path);
-                }
-                passthrough_settings(params, http, &["host", "path"]);
-            }
-        }
-        "httpupgrade" => {
-            if let Some(upgrade) = stream.get("httpupgradeSettings").and_then(Value::as_object) {
-                if let Some(path) = str_field(upgrade, "path") {
-                    push_param(params, true, "path", path);
-                }
-                if let Some(host) = str_field(upgrade, "host") {
-                    push_param(params, true, "host", host);
-                }
-                passthrough_settings(params, upgrade, &["path", "host"]);
-            }
-        }
-        "xhttp" | "splithttp" => {
-            // Xray renamed the transport `splithttp` to `xhttp`; either
-            // settings key may spell the block.
-            if let Some(xhttp) = stream
-                .get("xhttpSettings")
-                .or_else(|| stream.get("splithttpSettings"))
-                .and_then(Value::as_object)
-            {
-                if let Some(host) = str_field(xhttp, "host") {
-                    push_param(params, true, "host", host);
-                }
-                if let Some(path) = str_field(xhttp, "path") {
-                    push_param(params, true, "path", path);
-                }
-                if let Some(mode) = str_field(xhttp, "mode") {
-                    push_param(params, true, "mode", mode);
-                }
-                if let Some(extra) = xhttp.get("extra") {
-                    push_param(params, false, "extra", json_to_param_value(extra));
-                }
-                passthrough_settings(params, xhttp, &["host", "path", "mode", "extra"]);
-            }
-        }
+        "ws" => xray_ws_params(stream, params),
+        "grpc" => xray_grpc_params(stream, params),
+        "http" | "h2" => xray_http_params(stream, params),
+        "httpupgrade" => xray_httpupgrade_params(stream, params),
+        "xhttp" | "splithttp" => xray_xhttp_params(stream, params),
         // The mKCP and QUIC transports have no URI spelling the clients
         // understand, so their whole settings block passes through as one
         // unknown parameter: nothing is lost, and a client that knows the
@@ -1139,38 +1126,132 @@ fn xray_stream_params(
                 push_param(params, false, &key, json_to_param_value(settings));
             }
         }
-        // TCP with HTTP obfuscation (`header.type: "http"`); plain TCP
-        // (`type: "none"` or absent) maps to no parameters at all. Xray's
-        // `raw` is the renamed TCP transport and carries the same block.
-        "tcp" | "raw" => {
-            let key = if network == "raw" {
-                "rawSettings"
-            } else {
-                "tcpSettings"
-            };
-            if let Some(settings) = stream.get(key).and_then(Value::as_object) {
-                if let Some(header) = settings.get("header").and_then(Value::as_object)
-                    && str_field(header, "type") == Some("http")
-                {
-                    push_param(params, true, network_key, "tcp");
-                    push_param(params, true, "headertype", "http");
-                    if let Some(request) = header.get("request").and_then(Value::as_object) {
-                        if let Some(path) = string_or_joined_array(request.get("path")) {
-                            push_param(params, true, "path", path);
-                        }
-                        if let Some(host) = request
-                            .get("headers")
-                            .and_then(Value::as_object)
-                            .and_then(|headers| string_or_joined_array(headers.get("Host")))
-                        {
-                            push_param(params, true, "host", host);
-                        }
-                    }
+        "tcp" | "raw" => xray_tcp_params(stream, network, network_key, params),
+        _ => {}
+    }
+}
+
+fn xray_ws_params(stream: &Map<String, Value>, params: &mut Vec<Param>) {
+    if let Some(ws) = stream.get("wsSettings").and_then(Value::as_object) {
+        if let Some(path) = str_field(ws, "path") {
+            push_param(params, true, "path", path);
+        }
+        if let Some(headers) = ws.get("headers").and_then(Value::as_object) {
+            if let Some(host) = string_or_joined_array(headers.get("Host")) {
+                push_param(params, true, "host", host);
+            }
+            // Headers other than `Host` are part of the handshake
+            // identity a client has to replay; they pass through as
+            // `headers.<name>` parameters, like the other unmapped
+            // fields.
+            for (key, value) in headers {
+                if key.eq_ignore_ascii_case("host") || value.is_null() {
+                    continue;
                 }
-                passthrough_settings(params, settings, &["header"]);
+                push_param(
+                    params,
+                    false,
+                    &format!("headers.{key}"),
+                    json_to_param_value(value),
+                );
             }
         }
-        _ => {}
+        passthrough_settings(params, ws, &["path", "headers"]);
+    }
+}
+
+fn xray_grpc_params(stream: &Map<String, Value>, params: &mut Vec<Param>) {
+    if let Some(grpc) = stream.get("grpcSettings").and_then(Value::as_object) {
+        if let Some(service) = str_field(grpc, "serviceName") {
+            push_param(params, true, "serviceName", service);
+        }
+        passthrough_settings(params, grpc, &["serviceName"]);
+    }
+}
+
+fn xray_http_params(stream: &Map<String, Value>, params: &mut Vec<Param>) {
+    if let Some(http) = stream.get("httpSettings").and_then(Value::as_object) {
+        if let Some(host) = string_or_joined_array(http.get("host")) {
+            push_param(params, true, "host", host);
+        }
+        if let Some(path) = str_field(http, "path") {
+            push_param(params, true, "path", path);
+        }
+        passthrough_settings(params, http, &["host", "path"]);
+    }
+}
+
+fn xray_httpupgrade_params(stream: &Map<String, Value>, params: &mut Vec<Param>) {
+    if let Some(upgrade) = stream.get("httpupgradeSettings").and_then(Value::as_object) {
+        if let Some(path) = str_field(upgrade, "path") {
+            push_param(params, true, "path", path);
+        }
+        if let Some(host) = str_field(upgrade, "host") {
+            push_param(params, true, "host", host);
+        }
+        passthrough_settings(params, upgrade, &["path", "host"]);
+    }
+}
+
+fn xray_xhttp_params(stream: &Map<String, Value>, params: &mut Vec<Param>) {
+    // Xray renamed the transport `splithttp` to `xhttp`; either
+    // settings key may spell the block.
+    if let Some(xhttp) = stream
+        .get("xhttpSettings")
+        .or_else(|| stream.get("splithttpSettings"))
+        .and_then(Value::as_object)
+    {
+        if let Some(host) = str_field(xhttp, "host") {
+            push_param(params, true, "host", host);
+        }
+        if let Some(path) = str_field(xhttp, "path") {
+            push_param(params, true, "path", path);
+        }
+        if let Some(mode) = str_field(xhttp, "mode") {
+            push_param(params, true, "mode", mode);
+        }
+        if let Some(extra) = xhttp.get("extra") {
+            push_param(params, false, "extra", json_to_param_value(extra));
+        }
+        passthrough_settings(params, xhttp, &["host", "path", "mode", "extra"]);
+    }
+}
+
+/// The TCP transport: `type=tcp` is stored only when it carries HTTP
+/// obfuscation (`header.type: "http"`); plain TCP (`type: "none"` or
+/// absent) maps to no parameters at all. Xray's `raw` is the renamed TCP
+/// transport and carries the same block.
+fn xray_tcp_params(
+    stream: &Map<String, Value>,
+    network: &str,
+    network_key: &str,
+    params: &mut Vec<Param>,
+) {
+    let key = if network == "raw" {
+        "rawSettings"
+    } else {
+        "tcpSettings"
+    };
+    if let Some(settings) = stream.get(key).and_then(Value::as_object) {
+        if let Some(header) = settings.get("header").and_then(Value::as_object)
+            && str_field(header, "type") == Some("http")
+        {
+            push_param(params, true, network_key, "tcp");
+            push_param(params, true, "headertype", "http");
+            if let Some(request) = header.get("request").and_then(Value::as_object) {
+                if let Some(path) = string_or_joined_array(request.get("path")) {
+                    push_param(params, true, "path", path);
+                }
+                if let Some(host) = request
+                    .get("headers")
+                    .and_then(Value::as_object)
+                    .and_then(|headers| string_or_joined_array(headers.get("Host")))
+                {
+                    push_param(params, true, "host", host);
+                }
+            }
+        }
+        passthrough_settings(params, settings, &["header"]);
     }
 }
 
@@ -1230,8 +1311,9 @@ fn finish(
     super::check_field_size("sing-box: credential", &credential)?;
     // A missing or non-string `tag` falls back to a `host:port` name (an
     // IPv6 host bracketed, the shape a URI authority spells). The
-    // placeholder derives from the already-capped host, so it cannot exceed
-    // the caps itself.
+    // placeholder derives from the already-capped host, and
+    // `host_port_name` reserves headroom for the suffix it adds, so it
+    // cannot exceed the caps itself.
     let name = if name.is_empty() {
         host_port_name(&host, port)
     } else {
@@ -1263,8 +1345,14 @@ fn finish(
 }
 
 /// `host:port` with an IPv6 host bracketed: the name an outbound without a
-/// usable `tag` falls back to (see `finish`).
+/// usable `tag` falls back to (see `finish`). The host comes in at up to the
+/// field-size cap, and the suffix this adds is at most 8 bytes (two brackets,
+/// a colon, five digits), so the host is cut with that headroom to keep the
+/// placeholder within the cap too — a tagless outbound must parse whenever
+/// the same outbound with a tag would.
 fn host_port_name(host: &str, port: u16) -> String {
+    const SUFFIX_HEADROOM: usize = 8;
+    let host = super::truncate_utf8(host, super::uri::MAX_PARAM_BYTES - SUFFIX_HEADROOM);
     if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
@@ -1320,19 +1408,8 @@ fn required_str(map: &Map<String, Value>, key: &str) -> Result<String, String> {
 /// A JSON number or decimal-string port; `dialect` prefixes the message.
 fn numeric_field(map: &Map<String, Value>, key: &str, dialect: &str) -> Result<u16, String> {
     match map.get(key) {
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .and_then(|v| u16::try_from(v).ok())
-            // Port 0 is not a dialable endpoint (the schema CHECK, migration
-            // 0018, refuses it too), so the outbound is as invalid as an
-            // out-of-range one.
-            .filter(|&p| p != 0)
-            .ok_or_else(|| format!("{dialect}: port out of range: {n}")),
-        Some(Value::String(s)) => match s.trim().parse::<u16>() {
-            // The same zero rejection on the string spelling.
-            Ok(0) | Err(_) => Err(format!("{dialect}: invalid port string: {s:?}")),
-            Ok(port) => Ok(port),
-        },
+        Some(Value::Number(n)) => super::port_from_number(n, dialect),
+        Some(Value::String(s)) => super::port_from_string(s, dialect),
         _ => Err(format!("{dialect}: missing field {key:?}")),
     }
 }
@@ -1441,6 +1518,74 @@ mod tests {
             assert_eq!(result.entries.len(), 0, "{payload}");
             assert_eq!(result.invalid, 1, "{payload}");
         }
+    }
+
+    /// The float spelling a producer may emit (`443.0`) parses like the
+    /// integer one: the same rule vmess and Clash apply, so the same port
+    /// is accepted by every vector parser instead of only two of them.
+    #[test]
+    fn a_float_singbox_port_parses_like_the_integer_one() {
+        for port in [r#""server_port":443"#, r#""server_port":443.0"#] {
+            let payload = format!(
+                r#"{{"outbounds":[{{"type":"trojan","tag":"t","server":"h",{port},"password":"p"}}]}}"#
+            );
+            let result = parse_payload(&payload).unwrap();
+            assert_eq!(result.entries.len(), 1, "{payload}");
+            assert_eq!(result.entries[0].port, 443, "{payload}");
+        }
+    }
+
+    /// A payload with a pathological number of outbounds stops at the cap,
+    /// and the remainder is counted instead of parsed (the cap discipline
+    /// lives in the outbound loop, like in the Clash parser): a malformed
+    /// outbound past the cap reports `skipped`, not `invalid`, and a
+    /// multi-entry outbound past the cap counts once, not per entry.
+    #[test]
+    fn a_payload_with_too_many_outbounds_is_capped() {
+        let mut outbounds: Vec<String> = (0..crate::parsers::MAX_ENTRIES)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"vless","tag":"n{i}","server":"h{i}.example.com","server_port":443,"uuid":"u{i}"}}"#
+                )
+            })
+            .collect();
+        outbounds.push(r#"{"type":"trojan"}"#.to_string());
+        outbounds.push(
+            r#"{"protocol":"vless","tag":"x","settings":{"vnext":[
+                {"address":"a.example.com","port":443,"users":[{"id":"u1"}]},
+                {"address":"b.example.com","port":443,"users":[{"id":"u2"}]}]}}"#
+                .to_string(),
+        );
+        let payload = format!(r#"{{"outbounds":[{}]}}"#, outbounds.join(","));
+        let result = parse_payload(&payload).unwrap();
+        assert_eq!(result.entries.len(), crate::parsers::MAX_ENTRIES);
+        assert_eq!(result.skipped, 2, "one per outbound past the cap");
+        assert_eq!(result.invalid, 0, "outbounds past the cap are not parsed");
+    }
+
+    /// The cap also holds within the one outbound that crosses it: it
+    /// carries more entries than the cap has slots left, so its over-cap
+    /// entries are dropped per entry and `entries` never exceeds the cap.
+    #[test]
+    fn an_outbound_crossing_the_cap_keeps_entries_within_it() {
+        let mut outbounds: Vec<String> = (0..crate::parsers::MAX_ENTRIES - 1)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"vless","tag":"n{i}","server":"h{i}.example.com","server_port":443,"uuid":"u{i}"}}"#
+                )
+            })
+            .collect();
+        outbounds.push(
+            r#"{"protocol":"vless","tag":"x","settings":{"vnext":[
+                {"address":"a.example.com","port":443,"users":[{"id":"u1"}]},
+                {"address":"b.example.com","port":443,"users":[{"id":"u2"}]}]}}"#
+                .to_string(),
+        );
+        let payload = format!(r#"{{"outbounds":[{}]}}"#, outbounds.join(","));
+        let result = parse_payload(&payload).unwrap();
+        assert_eq!(result.entries.len(), crate::parsers::MAX_ENTRIES);
+        assert_eq!(result.skipped, 1, "the entry over the cap");
+        assert_eq!(result.invalid, 0);
     }
 
     #[test]
@@ -1878,6 +2023,25 @@ mod tests {
         let result = parse_payload(&payload).unwrap();
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.invalid, 2);
+    }
+
+    /// The fallback `host:port` name of a tagless outbound is built from the
+    /// already-capped host, and the `[]:`/port suffix adds up to 8 bytes on
+    /// top of it. A host at the very edge of the server cap must still parse
+    /// without a `tag`: the placeholder is cut with that headroom so it cannot
+    /// slip over the name cap (the same outbound with a tag would pass).
+    #[test]
+    fn a_boundary_host_without_a_tag_stays_within_the_name_cap() {
+        let host = "h".repeat(crate::parsers::uri::MAX_PARAM_BYTES);
+        let payload = format!(
+            r#"{{"outbounds":[{{"type":"trojan","server":"{host}","server_port":443,
+             "password":"p"}}]}}"#
+        );
+        let result = parse_payload(&payload).unwrap();
+        assert_eq!(result.entries.len(), 1, "invalid: {}", result.invalid);
+        let name = &result.entries[0].name;
+        assert!(name.ends_with(":443"));
+        assert!(name.len() <= crate::parsers::uri::MAX_PARAM_BYTES);
     }
 
     /// The stored host must have one shape whatever the source spelled it:

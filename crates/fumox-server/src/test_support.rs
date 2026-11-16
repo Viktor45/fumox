@@ -1,6 +1,11 @@
 //! Test-only support shared by the log-capturing test modules (`admin`,
-//! `scheduler`): the tracing-dispatcher groundwork their `capture_logs`
-//! helpers all need.
+//! `scheduler`) and the fetch tests (`ingest`): the tracing-dispatcher
+//! groundwork their `capture_logs` helpers all need, and the local HTTP
+//! upstream the fetch-count assertions count against.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Keep ≥2 dispatchers permanently alive in tracing's global dispatcher
 /// registry, for the log-capturing test modules (auth, scheduler): a call
@@ -30,4 +35,54 @@ pub(crate) fn stabilize_callsite_interests() {
             std::mem::forget(tracing::Dispatch::new(subscriber));
         }
     });
+}
+
+/// A local HTTP upstream for the fetch tests (ingest, scheduler): answers
+/// every request with `HTTP/1.1 200 OK` carrying the next body from
+/// `bodies` — a request beyond the list gets the last body again — and
+/// counts the requests it received. Requests are answered sequentially,
+/// and the counter increments on accept, doubling as the index of the body
+/// the current request is answered with: the tests drive one fetch at a
+/// time and read a count only after the fetch it belongs to has completed.
+pub(crate) async fn one_shot_upstream(bodies: Vec<&'static str>) -> (SocketAddr, Arc<AtomicUsize>) {
+    assert!(!bodies.is_empty(), "the upstream needs at least one body");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&requests);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let index = counted.fetch_add(1, Ordering::SeqCst);
+            let body = bodies[index.min(bodies.len() - 1)];
+            // Read the request out before answering, like a real HTTP
+            // server. Closing a socket that still holds unread client
+            // bytes makes the kernel send RST, which can clobber the
+            // client's buffered read of the response; the fetcher then
+            // retries, opening a second connection the counter sees, and
+            // the exact-fetch-count assertions would flake.
+            let mut received = Vec::with_capacity(1024);
+            loop {
+                let mut scratch = [0u8; 1024];
+                match sock.read(&mut scratch).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        received.extend_from_slice(&scratch[..n]);
+                        if received.windows(4).any(|w| w == b"\r\n\r\n")
+                            || received.len() >= 16 * 1024
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+        }
+    });
+    (addr, requests)
 }

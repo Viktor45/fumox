@@ -4,8 +4,8 @@
 
 use super::{
     FormError, action_response, caps, flash_redirect, is_htmx, mask_secret, not_found,
-    pipeline_from_form, row_error_response, server_error, validate_countries, validate_name,
-    validate_slug, validate_token,
+    pipeline_from_form, row_error_response, server_error, sources::is_checkbox_on,
+    validate_countries, validate_name, validate_slug, validate_token,
 };
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
@@ -420,6 +420,116 @@ fn slug_changed(saved: Option<&str>, submitted: Option<&str>) -> bool {
     }
 }
 
+/// The stored row behind an edit: read once for the token mask, the
+/// preserved flags and the saved slug. A missing row or a failed read is
+/// a server-side failure, not a form error.
+async fn stored_profile_row(
+    state: &AdminState,
+    existing_id: Option<&str>,
+) -> Result<Option<Profile>, FormError> {
+    match existing_id {
+        Some(id) => match profiles::get(&state.pool, id).await {
+            Ok(Some(profile)) => Ok(Some(profile)),
+            Ok(None) => Err(FormError::Server(fumox_core::Error::NotFound(format!(
+                "profile {id}"
+            )))),
+            Err(err) => Err(FormError::Server(err)),
+        },
+        None => Ok(None),
+    }
+}
+
+/// The token the save keeps: an unchanged placeholder keeps the stored
+/// token, an empty field clears it, anything else is a token the operator
+/// typed. A typed token is held to the format and the cap; the failures
+/// land on the `access_token` field.
+fn resolve_access_token(
+    stored_token: Option<&str>,
+    token_raw: &str,
+    lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+) -> Option<String> {
+    let unchanged = stored_token.is_some() && token_raw == token_placeholder(stored_token);
+    let access_token = if unchanged {
+        stored_token.map(str::to_string)
+    } else if token_raw.is_empty() {
+        None
+    } else {
+        Some(token_raw.to_string())
+    };
+    // Token format cap: the token guards a public
+    // endpoint, so it is URL-safe and bounded like every other field.
+    if !unchanged && let Some(token) = access_token.as_ref() {
+        // The same floor the import path applies (L-194): a token that
+        // guards a public endpoint must not be guessable, so the form
+        // does not accept a shorter one either.
+        if token.chars().count() < caps::TOKEN_MIN {
+            errors.push((
+                "access_token".into(),
+                lang.t("val.token_too_short")
+                    .replace("{}", &caps::TOKEN_MIN.to_string()),
+            ));
+        }
+        if let Err(message) = validate_token(token, lang) {
+            errors.push(("access_token".into(), message));
+        }
+    }
+    access_token
+}
+
+/// The country allowlist of the form: comma-separated ISO 3166-1 alpha-2
+/// codes; empty means no filtering. Validated per code, normalized to
+/// uppercase; a refusal lands on the field as an error.
+fn countries_from_form(
+    form: &[(String, String)],
+    lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+) -> Vec<String> {
+    let codes: Vec<String> = form_get(form, "countries")
+        .split(',')
+        .map(|code| code.trim().to_string())
+        .filter(|code| !code.is_empty())
+        .collect();
+    match validate_countries(&codes, lang) {
+        Ok(list) => list,
+        Err(message) => {
+            errors.push(("countries".into(), message));
+            Vec::new()
+        }
+    }
+}
+
+/// Every selected source must exist (guards against stale form posts).
+/// One batched read covers the whole composition; duplicate picks are
+/// collapsed so a doubled row is not reported twice. A failed read is a
+/// server-side failure, not a form error.
+async fn validate_composition(
+    state: &AdminState,
+    composition: &[(String, i64)],
+    lang: &Lang,
+    errors: &mut Vec<(String, String)>,
+) -> Result<(), FormError> {
+    let mut unique_ids: Vec<&str> = composition.iter().map(|(id, _)| id.as_str()).collect();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    let found = match sources::get_many(&state.pool, &unique_ids).await {
+        Ok(by_id) => by_id,
+        // A failed query is not a bad choice of sources: it is a
+        // broken database, and it must not be rendered as a field
+        // error the operator can "fix".
+        Err(err) => return Err(FormError::Server(err)),
+    };
+    for (source_id, _) in composition {
+        if !found.contains_key(source_id) {
+            errors.push((
+                "sources".into(),
+                lang.t("val.source_missing").replace("{}", source_id),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate + assemble a `Profile` from form fields. Returns the model or
 /// the reason it could not be built: per-field errors (localized, shown
 /// next to fields) or a row that could not be read.
@@ -450,47 +560,14 @@ async fn build_profile_from_form(
     // The placeholder is resolved before validation: `…`/`•` are outside
     // the token charset, so an unchanged placeholder must never be
     // checked as typed.
-    let token_raw = form_get(form, "access_token");
-    let stored = match existing_id {
-        Some(id) => match profiles::get(&state.pool, id).await {
-            Ok(Some(profile)) => Some(profile),
-            Ok(None) => {
-                return Err(FormError::Server(fumox_core::Error::NotFound(format!(
-                    "profile {id}"
-                ))));
-            }
-            Err(err) => return Err(FormError::Server(err)),
-        },
-        None => None,
-    };
+    let stored = stored_profile_row(state, existing_id).await?;
     let stored_token = stored.as_ref().and_then(|p| p.access_token.as_deref());
-    // An unchanged placeholder keeps the stored token; anything else is a
-    // token the operator typed.
-    let unchanged = stored_token.is_some() && token_raw == token_placeholder(stored_token);
-    let access_token = if unchanged {
-        stored_token.map(str::to_string)
-    } else if token_raw.is_empty() {
-        None
-    } else {
-        Some(token_raw.clone())
-    };
-    // Token format cap: the token guards a public
-    // endpoint, so it is URL-safe and bounded like every other field.
-    if !unchanged && let Some(token) = access_token.as_ref() {
-        // The same floor the import path applies (L-194): a token that
-        // guards a public endpoint must not be guessable, so the form
-        // does not accept a shorter one either.
-        if token.chars().count() < caps::TOKEN_MIN {
-            errors.push((
-                "access_token".into(),
-                lang.t("val.token_too_short")
-                    .replace("{}", &caps::TOKEN_MIN.to_string()),
-            ));
-        }
-        if let Err(message) = validate_token(token, lang) {
-            errors.push(("access_token".into(), message));
-        }
-    }
+    let access_token = resolve_access_token(
+        stored_token,
+        &form_get(form, "access_token"),
+        lang,
+        &mut errors,
+    );
 
     let format_raw = form_get(form, "output_format");
     let output_format = match OutputFormat::from_str(&format_raw) {
@@ -506,45 +583,8 @@ async fn build_profile_from_form(
     // by emitting an empty section.
     let pipeline = pipeline_from_form(form, lang, &mut errors);
 
-    // Country allowlist: comma-separated ISO 3166-1 alpha-2 codes; empty
-    // means no filtering. Validated per code, normalized to uppercase.
-    let countries_raw = form_get(form, "countries");
-    let countries: Vec<String> = match validate_countries(
-        &countries_raw
-            .split(',')
-            .map(|code| code.trim().to_string())
-            .filter(|code| !code.is_empty())
-            .collect::<Vec<_>>(),
-        lang,
-    ) {
-        Ok(list) => list,
-        Err(message) => {
-            errors.push(("countries".into(), message));
-            Vec::new()
-        }
-    };
-
-    // Every selected source must exist (guards against stale form posts).
-    // One batched read covers the whole composition; duplicate picks are
-    // collapsed so a doubled row is not reported twice.
-    let mut unique_ids: Vec<&str> = composition.iter().map(|(id, _)| id.as_str()).collect();
-    unique_ids.sort_unstable();
-    unique_ids.dedup();
-    let found = match sources::get_many(&state.pool, &unique_ids).await {
-        Ok(by_id) => by_id,
-        // A failed query is not a bad choice of sources: it is a
-        // broken database, and it must not be rendered as a field
-        // error the operator can "fix".
-        Err(err) => return Err(FormError::Server(err)),
-    };
-    for (source_id, _) in composition {
-        if !found.contains_key(source_id) {
-            errors.push((
-                "sources".into(),
-                lang.t("val.source_missing").replace("{}", source_id),
-            ));
-        }
-    }
+    let countries = countries_from_form(form, lang, &mut errors);
+    validate_composition(state, composition, lang, &mut errors).await?;
 
     if !errors.is_empty() {
         return Err(FormError::Validation(errors));
@@ -569,7 +609,10 @@ async fn build_profile_from_form(
                 .as_ref()
                 .map(|p| p.include_unknown_country)
                 .unwrap_or(false),
-            enabled: form.iter().any(|(k, _)| k == "enabled"),
+            // Same checkbox read as the source form's save
+            // (`is_checkbox_on`): the flag follows the value, not the
+            // field's presence.
+            enabled: is_checkbox_on(form, "enabled"),
             // `stored` is the row read above for the mask, so `created_at`
             // carries over without a second query.
             created_at: stored.as_ref().map(|p| p.created_at).unwrap_or(now),
@@ -585,7 +628,9 @@ fn form_values_from(form: &[(String, String)]) -> ProfileFormValues {
         access_token: form_get(form, "access_token"),
         output_format: form_get(form, "output_format"),
         countries: form_get(form, "countries"),
-        enabled: form.iter().any(|(k, _)| k == "enabled"),
+        // Same read as the save: the replayed form shows the checkbox
+        // exactly the way the row would be saved.
+        enabled: is_checkbox_on(form, "enabled"),
     }
 }
 
@@ -949,13 +994,17 @@ impl_i18n!(ToggleFormFragment);
 /// The fragments read the id and the new state only, so the response is
 /// rendered from the row the targeted UPDATE returned — the toggle never
 /// rewrites the fields it did not look at.
+///
+/// A rendering failure is a server bug: it is logged (like
+/// `render_html`'s 500 path) and the swap degrades to an empty body —
+/// the halves are all-or-nothing, a half-rendered swap would replace the
+/// page markup with a dangling fragment.
 fn toggle_swap_fragment(lang: &Lang, profile_id: &str, enabled: bool, csrf: &str) -> String {
     let badge = EnabledBadgeFragment {
         lang: lang.clone(),
         enabled,
     }
-    .render()
-    .expect("badge fragment renders");
+    .render();
     let form = ToggleFormFragment {
         lang: lang.clone(),
         toggle_url: format!("/admin/profiles/{profile_id}/toggle"),
@@ -963,9 +1012,14 @@ fn toggle_swap_fragment(lang: &Lang, profile_id: &str, enabled: bool, csrf: &str
         csrf: csrf.to_string(),
         swap_oob: true,
     }
-    .render()
-    .expect("toggle form fragment renders");
-    format!("{badge}\n{form}")
+    .render();
+    match (badge, form) {
+        (Ok(badge), Ok(form)) => format!("{badge}\n{form}"),
+        (Err(err), _) | (_, Err(err)) => {
+            tracing::error!(error = %err, "toggle swap fragment rendering failed");
+            String::new()
+        }
+    }
 }
 
 pub async fn profile_toggle(
@@ -1060,6 +1114,33 @@ mod tests {
             FormError::Validation(errors) => errors,
             FormError::Server(err) => panic!("the form failed on the server: {err}"),
         }
+    }
+
+    /// The enabled checkbox is read from its value, not from its presence:
+    /// an unchecked checkbox submits nothing at all, a checked one submits
+    /// `1`, and any other value — an `enabled=false` included — counts as
+    /// unchecked. The same reading the source form's save documents and its
+    /// own test pins, so a hand-built post means the same thing in both
+    /// forms.
+    #[test]
+    fn the_enabled_checkbox_is_read_from_its_value() {
+        let case = |pairs: &[(&str, &str)]| {
+            form_values_from(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .enabled
+        };
+        for on in ["1", "on", "true"] {
+            assert!(case(&[("enabled", on)]), "{on} must read as checked");
+        }
+        for off in ["false", "0", "off", ""] {
+            assert!(!case(&[("enabled", off)]), "{off:?} must read as unchecked");
+        }
+        // The unchecked spelling: the field is absent entirely.
+        assert!(!case(&[]));
     }
 
     /// The composition parser, case by case: the `pos_{id}` numbers order
@@ -1563,27 +1644,10 @@ mod tests {
 
     /// A member source of the profile under test.
     async fn seed_member_source(pool: &fumox_core::db::DbPool, id: &str, name: &str) {
-        let now = now_ts();
         let source = fumox_core::models::Source {
-            id: id.into(),
-            slug: None,
-            access_token: None,
             name: name.into(),
             url: "https://example.com/sub".into(),
-            enabled: true,
-            encoding: Default::default(),
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
+            ..fumox_core::models::Source::fixture(id, now_ts())
         };
         sources::create(pool, &source).await.unwrap();
     }

@@ -296,6 +296,170 @@ fn list_page_link(
     link
 }
 
+/// The parsed query parameters of the list view: the filter fields, the
+/// sort key, the coverage bucket and the page size. The whitelists, the
+/// defaults and the logging of rejected values live here, so the handler
+/// itself reads as fetch-and-render.
+struct ListViewQuery {
+    statuses: Vec<String>,
+    scheme: String,
+    country: String,
+    source: String,
+    q: String,
+    sort: String,
+    /// The coverage bucket in its canonical spelling (`""` = no filter),
+    /// what the filter dropdown shows as active.
+    coverage_label: String,
+    /// The parsed bucket for the repo filter (`None` = no filter).
+    coverage: Option<CheckCoverage>,
+    per_page: i64,
+}
+
+impl ListViewQuery {
+    fn from_params(params: &QueryPairs) -> Self {
+        // `status` may repeat (multi-select); the rest are single-valued. This
+        // needs QueryPairs, a HashMap would keep only the last value.
+        //
+        // The whitelist is the status vocabulary of the core model: a value
+        // outside it is not a filter, it is a typo or a probe at the URL, and
+        // it is logged instead of being silently dropped.
+        let requested_statuses = params.all("status").cloned().collect::<Vec<String>>();
+        let mut rejected: Vec<&str> = Vec::new();
+        let statuses: Vec<String> = requested_statuses
+            .iter()
+            .filter(|value| {
+                if value.parse::<ProxyStatus>().is_ok() {
+                    true
+                } else {
+                    rejected.push(value.as_str());
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+        if !rejected.is_empty() {
+            tracing::warn!(
+                rejected = ?rejected,
+                "proxy list filter carries unknown status values"
+            );
+        }
+        // Sort key: the valid values and the default are decided by
+        // `repo::proxies::ProxyListOrder::from_param` — any string it
+        // does not map to falls back to `ProxyListOrder::Updated`, whose
+        // parameter is exactly "updated"; the fallback here only seeds the
+        // same default.
+        let sort = params
+            .get("sort")
+            .cloned()
+            .unwrap_or_else(|| "updated".into());
+        // Coverage bucket: a garbage value means "no filter", the same
+        // tolerance the scheme/country selects show; the bucket whitelist and
+        // its SQL fragments live in the repo's `CheckCoverage`.
+        let coverage = CheckCoverage::from_bucket(
+            &params
+                .get("coverage")
+                .cloned()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        );
+        let coverage_label = coverage
+            .map(|bucket| bucket.as_str().to_string())
+            .unwrap_or_default();
+        Self {
+            statuses,
+            scheme: params.get("scheme").cloned().unwrap_or_default(),
+            country: params.get("country").cloned().unwrap_or_default(),
+            source: params.get("source").cloned().unwrap_or_default(),
+            q: params.get("q").cloned().unwrap_or_default(),
+            sort,
+            coverage_label,
+            coverage,
+            per_page: clamp_limit(params.get("per_page").and_then(|v| v.parse().ok())),
+        }
+    }
+
+    /// The repo filter for this view. The filter clause set lives once in
+    /// the repo (`ProxyListFilter`): the count and the row reads apply
+    /// exactly the same clauses, and every value flows through a bind.
+    fn filter(&self) -> ProxyListFilter {
+        ProxyListFilter {
+            statuses: self.statuses.clone(),
+            scheme: self.scheme.clone(),
+            country: self.country.clone(),
+            source_id: self.source.clone(),
+            query: self.q.clone(),
+            coverage: self.coverage,
+        }
+    }
+}
+
+/// The four independent reads of the list screen — the filtered total
+/// for the pagination line, the unfiltered `removed` and detached
+/// counters, and the page rows — run concurrently in one `try_join!`
+/// (SQLite reads run concurrently in WAL mode) with one error site for
+/// their identical handlers.
+///
+/// The counters do not derive from the page rows. The purge dialog acts
+/// on every `removed` row regardless of the active filters, so the count
+/// it shows is unfiltered too. Detached rows: no feed reaches them and
+/// no probe lane can pick them up; the panel names them, so the operator
+/// can see how much of the table is detached.
+async fn list_reads(
+    state: &AdminState,
+    filter: &ProxyListFilter,
+    order: ProxyListOrder,
+    per_page: i64,
+    page: Option<&ProxyListPage>,
+) -> fumox_core::Result<(i64, i64, i64, Vec<ProxyListRow>)> {
+    tokio::try_join!(
+        proxies::count_filtered(&state.pool, filter),
+        proxies::count_removed(&state.pool),
+        proxies::count_detached(&state.pool),
+        proxies::list_filtered(&state.pool, filter, order, per_page + 1, page),
+    )
+}
+
+/// The three navigation links of the pager: the first page (only while a
+/// later page is shown), the page before and the page after.
+fn nav_links(
+    suffix: &str,
+    per_page: i64,
+    paged: bool,
+    prev: Option<&(ProxyListCursor, ProxyListDirection)>,
+    next: Option<&(ProxyListCursor, ProxyListDirection)>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let nav_first =
+        paged.then(|| list_page_link(suffix, per_page, None, ProxyListDirection::Forward));
+    let nav_prev =
+        prev.map(|(cursor, direction)| list_page_link(suffix, per_page, Some(cursor), *direction));
+    let nav_next =
+        next.map(|(cursor, direction)| list_page_link(suffix, per_page, Some(cursor), *direction));
+    (nav_first, nav_prev, nav_next)
+}
+
+/// The options of the status multi-select: every status of the core
+/// vocabulary with its checked flag.
+fn status_options(selected: &[String]) -> Vec<(String, bool)> {
+    ProxyStatus::all()
+        .iter()
+        .map(|status| {
+            (
+                status.as_str().to_string(),
+                selected.iter().any(|s| s == status.as_str()),
+            )
+        })
+        .collect()
+}
+
+/// The options of the scheme dropdown: every scheme of the core model
+/// with its checked flag.
+fn scheme_options(selected: &str) -> Vec<(String, bool)> {
+    Scheme::all()
+        .iter()
+        .map(|scheme| (scheme.as_str().to_string(), scheme.as_str() == selected))
+        .collect()
+}
+
 pub async fn proxies_list(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -303,71 +467,9 @@ pub async fn proxies_list(
 ) -> Response {
     let lang = state.locales.lang_from_headers(&headers);
     let theme = theme::from_headers(&headers);
-    // `status` may repeat (multi-select); the rest are single-valued. This
-    // needs QueryPairs, a HashMap would keep only the last value.
-    //
-    // The whitelist is the status vocabulary of the core model: a value
-    // outside it is not a filter, it is a typo or a probe at the URL, and
-    // it is logged instead of being silently dropped.
-    let requested_statuses = params.all("status").cloned().collect::<Vec<String>>();
-    let mut rejected: Vec<&str> = Vec::new();
-    let f_statuses: Vec<String> = requested_statuses
-        .iter()
-        .filter(|value| {
-            if value.parse::<ProxyStatus>().is_ok() {
-                true
-            } else {
-                rejected.push(value.as_str());
-                false
-            }
-        })
-        .cloned()
-        .collect();
-    if !rejected.is_empty() {
-        tracing::warn!(
-            rejected = ?rejected,
-            "proxy list filter carries unknown status values"
-        );
-    }
-    let f_scheme = params.get("scheme").cloned().unwrap_or_default();
-    let f_country = params.get("country").cloned().unwrap_or_default();
-    let f_source = params.get("source").cloned().unwrap_or_default();
-    let f_q = params.get("q").cloned().unwrap_or_default();
-    // Sort key: the valid values and the default are decided by
-    // `repo::proxies::ProxyListOrder::from_param` below — any string it
-    // does not map to falls back to `ProxyListOrder::Updated`, whose
-    // parameter is exactly "updated"; the fallback here only seeds the
-    // same default.
-    let f_sort = params
-        .get("sort")
-        .cloned()
-        .unwrap_or_else(|| "updated".into());
-    // Coverage bucket: a garbage value means "no filter", the same
-    // tolerance the scheme/country selects show; the bucket whitelist and
-    // its SQL fragments live in the repo's `CheckCoverage`.
-    let f_coverage = params
-        .get("coverage")
-        .cloned()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let coverage = CheckCoverage::from_bucket(&f_coverage);
-    let f_coverage = coverage
-        .map(|bucket| bucket.as_str().to_string())
-        .unwrap_or_default();
-    let per_page = clamp_limit(params.get("per_page").and_then(|v| v.parse().ok()));
-
-    // The filter clause set lives once in the repo (`ProxyListFilter`):
-    // count and rows below apply exactly the same clauses, and every
-    // value flows through a bind.
-    let filter = ProxyListFilter {
-        statuses: f_statuses.clone(),
-        scheme: f_scheme.clone(),
-        country: f_country.clone(),
-        source_id: f_source.clone(),
-        query: f_q.clone(),
-        coverage,
-    };
-    let order = ProxyListOrder::from_param(&f_sort);
+    let query = ListViewQuery::from_params(&params);
+    let filter = query.filter();
+    let order = ProxyListOrder::from_param(&query.sort);
 
     // The cursor of the requested page. A token of another sort is not a
     // position in this one, so the list falls back to its first page
@@ -381,28 +483,11 @@ pub async fn proxies_list(
         direction: *direction,
     });
 
-    // The four reads below are independent of one another — the counters
-    // do not derive from the page rows — so one `try_join!` runs them
-    // concurrently (SQLite reads run concurrently in WAL mode) and keeps
-    // one error site for their identical handlers.
-    //
-    // `total` counts the filtered set for the pagination line.
-    //
-    // The purge dialog acts on every `removed` row regardless of the
-    // active filters, so the count it shows is unfiltered too.
-    //
-    // Detached rows: no feed reaches them and no probe lane can pick
-    // them up. The panel names them, so the operator can see how much
-    // of the table is detached.
-    let (total, removed_count, detached_count, mut rows) = match tokio::try_join!(
-        proxies::count_filtered(&state.pool, &filter),
-        proxies::count_removed(&state.pool),
-        proxies::count_detached(&state.pool),
-        proxies::list_filtered(&state.pool, &filter, order, per_page + 1, page.as_ref()),
-    ) {
-        Ok(reads) => reads,
-        Err(err) => return server_error(&state, &headers, "proxies.list", &err),
-    };
+    let (total, removed_count, detached_count, mut rows) =
+        match list_reads(&state, &filter, order, query.per_page, page.as_ref()).await {
+            Ok(reads) => reads,
+            Err(err) => return server_error(&state, &headers, "proxies.list", &err),
+        };
 
     // The side of the cursor the page takes: a page reached backwards
     // holds the rows right before the cursor, a page reached forwards
@@ -411,69 +496,24 @@ pub async fn proxies_list(
         .as_ref()
         .is_some_and(|page| page.direction == ProxyListDirection::Backward);
 
-    // One row more than the page holds: the extra row says whether a
-    // further page exists without a second count.
-    let has_more = rows.len() as i64 > per_page;
-    if backward && has_more {
-        // The rows closest to the cursor come last, so the over-fetched
-        // row is the farthest one: the page keeps the rows right before
-        // the cursor, and the extra row stays the proof that the table
-        // holds more of them.
-        rows.remove(0);
-    }
-    rows.truncate(per_page as usize);
-
-    // The neighbours of the page: a page reached forwards has a
-    // predecessor as soon as it is not the first one, a page reached
-    // backwards has a successor even when the table ends there.
-    let first_cursor = rows.first().map(|row| row.cursor(order));
-    let last_cursor = rows.last().map(|row| row.cursor(order));
-    let (prev, next) = if backward {
-        (
-            // Further back only when the table holds rows before this
-            // page.
-            if has_more {
-                first_cursor
-                    .as_ref()
-                    .map(|cursor| (cursor.clone(), ProxyListDirection::Backward))
-            } else {
-                None
-            },
-            // Forwards again: the rows after this page.
-            last_cursor
-                .as_ref()
-                .map(|cursor| (cursor.clone(), ProxyListDirection::Forward)),
-        )
-    } else {
-        (
-            if page.is_some() {
-                first_cursor
-                    .as_ref()
-                    .map(|cursor| (cursor.clone(), ProxyListDirection::Backward))
-            } else {
-                None
-            },
-            if has_more {
-                last_cursor
-                    .as_ref()
-                    .map(|cursor| (cursor.clone(), ProxyListDirection::Forward))
-            } else {
-                None
-            },
-        )
-    };
+    // The page body and its neighbours, the shape shared with the fetch
+    // journal (`keyset_page`).
+    let (prev_cursor, next_cursor) =
+        super::logs::keyset_page(&mut rows, page.is_some(), backward, query.per_page, |row| {
+            row.cursor(order)
+        });
+    let prev = prev_cursor.map(|cursor| (cursor, ProxyListDirection::Backward));
+    let next = next_cursor.map(|cursor| (cursor, ProxyListDirection::Forward));
 
     let suffix = list_query_suffix(&filter, order);
     let view_query = suffix.strip_prefix('&').unwrap_or_default().to_string();
-    let nav_first = page
-        .is_some()
-        .then(|| list_page_link(&suffix, per_page, None, ProxyListDirection::Forward));
-    let nav_prev = prev
-        .as_ref()
-        .map(|(cursor, direction)| list_page_link(&suffix, per_page, Some(cursor), *direction));
-    let nav_next = next
-        .as_ref()
-        .map(|(cursor, direction)| list_page_link(&suffix, per_page, Some(cursor), *direction));
+    let (nav_first, nav_prev, nav_next) = nav_links(
+        &suffix,
+        query.per_page,
+        page.is_some(),
+        prev.as_ref(),
+        next.as_ref(),
+    );
 
     // The country dropdown of the filter panel: a failed read answers
     // like every other query of this screen — the page says so instead of
@@ -498,19 +538,8 @@ pub async fn proxies_list(
             theme,
             active: "proxies",
             csrf: state.csrf_for(&headers),
-            all_statuses: ProxyStatus::all()
-                .iter()
-                .map(|status| {
-                    (
-                        status.as_str().to_string(),
-                        f_statuses.iter().any(|s| s == status.as_str()),
-                    )
-                })
-                .collect(),
-            all_schemes: Scheme::all()
-                .iter()
-                .map(|scheme| (scheme.as_str().to_string(), scheme.as_str() == f_scheme))
-                .collect(),
+            all_statuses: status_options(&query.statuses),
+            all_schemes: scheme_options(&query.scheme),
             rows,
             total,
             removed_count,
@@ -518,13 +547,13 @@ pub async fn proxies_list(
             nav_first,
             nav_prev,
             nav_next,
-            f_statuses,
-            f_scheme,
-            f_country,
-            f_source,
-            f_q,
-            f_sort,
-            f_coverage,
+            f_statuses: query.statuses,
+            f_scheme: query.scheme,
+            f_country: query.country,
+            f_source: query.source,
+            f_q: query.q,
+            f_sort: query.sort,
+            f_coverage: query.coverage_label,
             view_query,
             countries,
             sources,

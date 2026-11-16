@@ -489,39 +489,6 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Window in which at most one line per outcome is logged.
 const LOG_WINDOW_SECS: u64 = 60;
 
-/// Names that did not resolve.
-static DNS_FAILED: AtomicU64 = AtomicU64::new(0);
-/// Database reads that failed.
-static LOOKUP_ERRORS: AtomicU64 = AtomicU64::new(0);
-/// Addresses no loaded database knows.
-static NO_DATA: AtomicU64 = AtomicU64::new(0);
-
-/// The geo resolution counters of this process.
-///
-/// The three outcomes are distinct on purpose: a name that does not
-/// resolve says nothing about the host, an address without a record is a
-/// fact about it, and a database read that failed is a fault of this
-/// process. Merging them into one "unresolved" number hides which of the
-/// three an operator has to fix.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GeoStats {
-    /// Host names that did not resolve.
-    pub dns_failed: u64,
-    /// Database lookups that failed.
-    pub lookup_errors: u64,
-    /// Addresses no loaded database has a record for.
-    pub no_data: u64,
-}
-
-/// The geo counters of this process.
-pub fn geo_stats() -> GeoStats {
-    GeoStats {
-        dns_failed: DNS_FAILED.load(Ordering::Relaxed),
-        lookup_errors: LOOKUP_ERRORS.load(Ordering::Relaxed),
-        no_data: NO_DATA.load(Ordering::Relaxed),
-    }
-}
-
 /// Logs at most one line per window, so a feed full of dead names does
 /// not drown the log.
 struct Throttle {
@@ -659,36 +626,44 @@ impl GeoResolver {
             return resolver;
         };
         if log_startup {
-            let kinds = [
-                (GeoDbKind::City, backends.city.is_some()),
-                (GeoDbKind::Asn, backends.asn.is_some()),
-            ];
-            let opened: Vec<&str> = kinds
-                .iter()
-                .filter(|(_, loaded)| *loaded)
-                .map(|(kind, _)| kind.file_name())
-                .collect();
-            for (kind, loaded) in kinds {
-                if !loaded {
-                    // Debug while another backend is open: a deliberate
-                    // ASN-only or City-only setup is a supported
-                    // configuration, and warning about it on every
-                    // start would drown the warn above, which is
-                    // the one that means geo is off.
-                    tracing::debug!(
-                        file = kind.file_name(),
-                        dir = %cfg.db_dir.display(),
-                        "GeoLite2 database missing; its facts are skipped"
-                    );
-                }
-            }
-            tracing::info!(
-                dir = %cfg.db_dir.display(),
-                files = opened.join(", "),
-                "geo enrichment enabled"
-            );
+            Self::log_opened_databases(cfg, &backends);
         }
         resolver
+    }
+
+    /// The startup lines of a logging constructor: which database files
+    /// opened (one info line) and which did not (debug while another is
+    /// open, a deliberate ASN-only or City-only setup is supported).
+    fn log_opened_databases(cfg: &GeoConfig, backends: &Backends) {
+        let kinds = [
+            (GeoDbKind::City, backends.city.is_some()),
+            (GeoDbKind::Asn, backends.asn.is_some()),
+        ];
+        let opened: Vec<&str> = kinds
+            .iter()
+            .filter(|(_, loaded)| *loaded)
+            .map(|(kind, _)| kind.file_name())
+            .collect();
+        for (kind, loaded) in kinds {
+            if !loaded {
+                // Debug while another backend is open: a deliberate
+                // ASN-only or City-only setup is a supported
+                // configuration, and warning about it on every
+                // start would drown the no-databases warn of
+                // [`Self::construct`], which is the one that means
+                // geo is off.
+                tracing::debug!(
+                    file = kind.file_name(),
+                    dir = %cfg.db_dir.display(),
+                    "GeoLite2 database missing; its facts are skipped"
+                );
+            }
+        }
+        tracing::info!(
+            dir = %cfg.db_dir.display(),
+            files = opened.join(", "),
+            "geo enrichment enabled"
+        );
     }
 
     /// The databases this installation can read, opened once per directory
@@ -862,54 +837,96 @@ enum Resolved {
     DnsFailed(String),
 }
 
-/// Merge the facts of every loaded database for one IP: City
-/// contributes country + city, ASN the autonomous system on top.
+/// One uncached resolution: find the address the host stands for, then
+/// merge the facts of every loaded database for it.
 async fn resolve_uncached(backends: &Backends, host: &str, dns_timeout: Duration) -> Resolved {
-    let ip = match ssrf::parse_ip_literal(host) {
+    let ip = match lookup_ip(host, dns_timeout).await {
+        Ok(ip) => ip,
+        // The host never reached a database lookup: the outcome was
+        // decided, and logged, at the failure site.
+        Err(LookupRefusal::Dns(reason)) => return Resolved::DnsFailed(reason),
+        Err(LookupRefusal::NoAddress) => return Resolved::NoRecord { ip: None },
+    };
+    match merge_facts(backends, ip) {
+        Some(info) => Resolved::Facts(info),
+        None => {
+            if NO_DATA_LOG.allow() {
+                tracing::debug!(host = %host, ip = %ip, "geo: no database knows this address");
+            }
+            Resolved::NoRecord {
+                ip: Some(ip.to_string()),
+            }
+        }
+    }
+}
+
+/// Why a host never reached a database lookup. Small on purpose: it is
+/// the `Err` half of [`lookup_ip`], and the full `Resolved` it maps back
+/// to carries a whole `GeoInfo`.
+enum LookupRefusal {
+    /// The name did not resolve; the `String` is the resolver's reason.
+    Dns(String),
+    /// A non-global literal, or a name that resolved to no address the
+    /// dial path could use. No address is recorded.
+    NoAddress,
+}
+
+/// The address the geo lookup describes: a literal IP vetted by the SSRF
+/// policy, or for a name the address DNS resolution and the same policy
+/// pick. `Err` is a [`LookupRefusal`] — the host never gets that far.
+async fn lookup_ip(host: &str, dns_timeout: Duration) -> Result<IpAddr, LookupRefusal> {
+    match ssrf::parse_ip_literal(host) {
         Some(ip) => match ssrf::vet_addr(ip, false) {
-            Ok(vetted) => vetted.ip(),
+            Ok(vetted) => Ok(vetted.ip()),
             Err(reason) => {
-                NO_DATA.fetch_add(1, Ordering::Relaxed);
                 if NO_DATA_LOG.allow() {
                     tracing::debug!(host, %reason, "geo: the literal address is not a global one");
                 }
-                return Resolved::NoRecord { ip: None };
+                Err(LookupRefusal::NoAddress)
             }
         },
-        None => {
-            let addrs = match ssrf::lookup_with_timeout(host, dns_timeout).await {
-                Ok(addrs) => addrs,
-                Err(reason) => {
-                    DNS_FAILED.fetch_add(1, Ordering::Relaxed);
-                    if DNS_LOG.allow() {
-                        tracing::warn!(host, reason, "geo: the host name did not resolve");
-                    }
-                    return Resolved::DnsFailed(reason);
-                }
-            };
-            // `pick_vetted` picks from an already-vetted list: every
-            // resolved address goes through the shared policy first, a
-            // non-global answer must not become the lookup address.
-            let vetted: Vec<IpAddr> = addrs
-                .into_iter()
-                .filter_map(|addr| ssrf::vet_addr(addr, false).ok())
-                .map(|vetted| vetted.ip())
-                .collect();
-            match ssrf::pick_vetted(&vetted, IpFamily::Any) {
-                Some(ip) => ip,
-                None => {
-                    NO_DATA.fetch_add(1, Ordering::Relaxed);
-                    if NO_DATA_LOG.allow() {
-                        tracing::debug!(
-                            host,
-                            "geo: the host name resolved to no address the dial path could use"
-                        );
-                    }
-                    return Resolved::NoRecord { ip: None };
-                }
+        None => lookup_domain(host, dns_timeout).await,
+    }
+}
+
+/// The DNS half of [`lookup_ip`]: resolve the name and pick the address
+/// the dial path would use.
+async fn lookup_domain(host: &str, dns_timeout: Duration) -> Result<IpAddr, LookupRefusal> {
+    let addrs = match ssrf::lookup_with_timeout(host, dns_timeout).await {
+        Ok(addrs) => addrs,
+        Err(reason) => {
+            if DNS_LOG.allow() {
+                tracing::warn!(host, reason, "geo: the host name did not resolve");
             }
+            return Err(LookupRefusal::Dns(reason));
         }
     };
+    // `pick_vetted` picks from an already-vetted list: every
+    // resolved address goes through the shared policy first, a
+    // non-global answer must not become the lookup address.
+    let vetted: Vec<IpAddr> = addrs
+        .into_iter()
+        .filter_map(|addr| ssrf::vet_addr(addr, false).ok())
+        .map(|vetted| vetted.ip())
+        .collect();
+    match ssrf::pick_vetted(&vetted, IpFamily::Any) {
+        Some(ip) => Ok(ip),
+        None => {
+            if NO_DATA_LOG.allow() {
+                tracing::debug!(
+                    host,
+                    "geo: the host name resolved to no address the dial path could use"
+                );
+            }
+            Err(LookupRefusal::NoAddress)
+        }
+    }
+}
+
+/// Merge the facts of every loaded database for one IP: City
+/// contributes country + city, ASN the autonomous system on top.
+/// `None` when no loaded database knows the address.
+fn merge_facts(backends: &Backends, ip: IpAddr) -> Option<GeoInfo> {
     let mut info = GeoInfo {
         ip: ip.to_string(),
         ..Default::default()
@@ -930,16 +947,7 @@ async fn resolve_uncached(backends: &Backends, host: &str, dns_timeout: Duration
         info.asn_org = asn.asn_org;
         any = true;
     }
-    if !any {
-        NO_DATA.fetch_add(1, Ordering::Relaxed);
-        if NO_DATA_LOG.allow() {
-            tracing::debug!(host = %host, ip = %ip, "geo: no database knows this address");
-        }
-        return Resolved::NoRecord {
-            ip: Some(ip.to_string()),
-        };
-    }
-    Resolved::Facts(info)
+    any.then_some(info)
 }
 
 /// On-demand enrichment over **every** GeoLite2 database found in
@@ -1009,12 +1017,12 @@ fn lookup_city(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<GeoInfo> {
             Ok(Some(record)) => record,
             Ok(None) => return None,
             Err(err) => {
-                count_lookup_error(&err);
+                log_lookup_error(&err);
                 return None;
             }
         },
         Err(err) => {
-            count_lookup_error(&err);
+            log_lookup_error(&err);
             return None;
         }
     };
@@ -1044,12 +1052,12 @@ fn lookup_asn(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<GeoInfo> {
             Ok(Some(record)) => record,
             Ok(None) => return None,
             Err(err) => {
-                count_lookup_error(&err);
+                log_lookup_error(&err);
                 return None;
             }
         },
         Err(err) => {
-            count_lookup_error(&err);
+            log_lookup_error(&err);
             return None;
         }
     };
@@ -1060,11 +1068,10 @@ fn lookup_asn(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<GeoInfo> {
     })
 }
 
-/// Count a failed database read. A read that fails is a fault of this
+/// Log a failed database read. A read that fails is a fault of this
 /// process (a truncated or unreadable file), not a fact about the
-/// address, so it is counted apart from the "no record" case.
-fn count_lookup_error(error: &maxminddb::MaxMindDbError) {
-    LOOKUP_ERRORS.fetch_add(1, Ordering::Relaxed);
+/// address, so it is logged apart from the "no record" case.
+fn log_lookup_error(error: &maxminddb::MaxMindDbError) {
     if LOOKUP_ERROR_LOG.allow() {
         tracing::warn!(error = %error, "geo: the database lookup failed");
     }

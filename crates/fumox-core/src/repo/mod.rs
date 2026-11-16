@@ -234,6 +234,52 @@ pub(crate) fn text_to_json(
     })
 }
 
+/// The pause between two batches of a batched purge ([`purge_batched`]).
+///
+/// A purge batch holds the WAL write lock for the duration of its
+/// statement, and the probe daemon and the ingest want that lock for
+/// their own writes. The pause gives them a window between two batches
+/// instead of making them wait for the whole sweep.
+pub(crate) const PURGE_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Run a bounded-batch retention `DELETE` on the pool, one statement per
+/// batch with a pause between the batches (see [`PURGE_BATCH_PAUSE`]),
+/// until a batch deletes fewer than `batch_size` rows.
+///
+/// `sql` must have the shape
+/// `DELETE FROM t WHERE id IN (SELECT id FROM t WHERE … ORDER BY id
+/// LIMIT ?)`: the optional `cutoff` is bound first (`None` for a
+/// statement without a cutoff placeholder), the batch limit last. A
+/// single `DELETE` over the whole expired population would hold the
+/// write lock until the last row is gone and grow the WAL with one giant
+/// commit — on a long-lived database exactly the case the retention
+/// exists for. Each statement here is its own transaction, so the lock
+/// is released between the batches.
+///
+/// sqlx 0.9 SqlSafeStr: `sql` is a compile-time constant of the calling
+/// module; every value flows through `.bind()`.
+pub(crate) async fn purge_batched(
+    pool: &DbPool,
+    sql: &str,
+    cutoff: Option<i64>,
+    batch_size: i64,
+) -> crate::Result<u64> {
+    let mut total = 0u64;
+    loop {
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        if let Some(cutoff) = cutoff {
+            query = query.bind(cutoff);
+        }
+        let affected = query.bind(batch_size).execute(pool).await?.rows_affected();
+        total += affected;
+        if affected < batch_size as u64 {
+            break;
+        }
+        tokio::time::sleep(PURGE_BATCH_PAUSE).await;
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,12 +458,28 @@ mod tests {
             "the proxy row must carry the T2 recency stamp"
         );
 
-        // Schema version is stamped into meta by db::migrate. Bumped to 20
-        // by migration 0020 (the fetch journal keyset index, which replaces
-        // idx_fetch_time — a strict prefix of the new composite; 0019 was
-        // the sources access token).
+        // The geo-unknown flag of migration 0021 is on the profile row.
+        let profile_columns: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('profiles')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let profile_columns: Vec<&str> = profile_columns
+            .iter()
+            .map(|(name,)| name.as_str())
+            .collect();
+        assert!(
+            profile_columns.contains(&"include_unknown_country"),
+            "the profile row must carry the geo-unknown flag"
+        );
+
+        // Schema version is stamped into meta by db::migrate. Bumped to 21
+        // by migration 0021 (the profile geo-unknown flag,
+        // profiles.include_unknown_country); 0020 was the fetch journal
+        // keyset index, which replaces idx_fetch_time — a strict prefix of
+        // the new composite.
         let version = meta_get(&pool, "schema_version").await.unwrap();
-        assert_eq!(version.as_deref(), Some("20"));
+        assert_eq!(version.as_deref(), Some("21"));
 
         // The fetch-attempt stamp of migration 0015 is on the source row.
         let source_columns: Vec<(String,)> =

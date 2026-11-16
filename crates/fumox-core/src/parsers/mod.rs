@@ -282,6 +282,83 @@ pub(crate) fn validate_params(prefix: &str, params: &[Param]) -> Result<(), Stri
     Ok(())
 }
 
+/// The number types of the two serde backends the vector parsers read
+/// (`serde_json` for vmess/sing-box, `serde_norway` for Clash YAML), behind
+/// one port-reading face so the port rule lives in [`port_from_number`].
+pub(crate) trait PortNumber {
+    /// The integer value, when the number carries one.
+    fn port_u64(&self) -> Option<u64>;
+
+    /// The float value, when the number carries one.
+    fn port_f64(&self) -> Option<f64>;
+
+    /// The literal as it came in, for the error message.
+    fn port_text(&self) -> String;
+}
+
+impl PortNumber for serde_json::Number {
+    fn port_u64(&self) -> Option<u64> {
+        self.as_u64()
+    }
+
+    fn port_f64(&self) -> Option<f64> {
+        self.as_f64()
+    }
+
+    fn port_text(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl PortNumber for serde_norway::Number {
+    fn port_u64(&self) -> Option<u64> {
+        self.as_u64()
+    }
+
+    fn port_f64(&self) -> Option<f64> {
+        self.as_f64()
+    }
+
+    fn port_text(&self) -> String {
+        self.to_string()
+    }
+}
+
+/// The port a vector-format record carries as a JSON/YAML number: the
+/// integer spelling (`443`) or the float one a producer may emit (`443.0`,
+/// accepted when the fraction is zero and it fits u16).
+///
+/// Port 0 is not a dialable endpoint (the schema CHECK, migration 0018,
+/// refuses it too), so the record is as invalid as an out-of-range one.
+/// `dialect` prefixes the message, the way each vector parser names
+/// itself.
+pub(crate) fn port_from_number(n: &impl PortNumber, dialect: &str) -> Result<u16, String> {
+    let port = match n.port_u64() {
+        Some(v) => u16::try_from(v).ok(),
+        None => n
+            .port_f64()
+            .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= f64::from(u16::MAX))
+            .map(|v| v as u16),
+    };
+    port.filter(|&p| p != 0)
+        .ok_or_else(|| format!("{dialect}: port out of range: {}", n.port_text()))
+}
+
+/// The port a vector-format record carries as a decimal string.
+///
+/// The same zero rejection as [`port_from_number`]; the echoed value is
+/// bounded, a junk "port" can be arbitrarily long and the diagnostic
+/// travels into the logs.
+pub(crate) fn port_from_string(s: &str, dialect: &str) -> Result<u16, String> {
+    match s.trim().parse::<u16>() {
+        Ok(0) | Err(_) => Err(format!(
+            "{dialect}: invalid port string: {:?}",
+            truncate_utf8(s, 16)
+        )),
+        Ok(port) => Ok(port),
+    }
+}
+
 /// Reject a YAML document that contains an alias reference (`*anchor`).
 ///
 /// `serde_norway` resolves every alias by jumping to the anchor's event span
@@ -535,12 +612,18 @@ pub fn serialize(entry: &ProxyEntry) -> String {
         Scheme::Naive => serialize_naive(entry),
         Scheme::Ss => ss::serialize(entry),
         Scheme::Vmess => vmess::serialize(entry),
-        // The URI family shares one serializer; the spec comes from the
-        // registry, the same table `parse_line` reads.
-        other => uri::serialize_with_spec(
-            uri::spec_for(other.as_str()).expect("the registry covers every URI-family scheme"),
-            entry,
-        ),
+        // The URI family shares one serializer; each arm names its registry
+        // spec — the same table `parse_line` reaches through `spec_for`.
+        // The match is exhaustive over `Scheme`, so a new variant without an
+        // arm fails to compile instead of missing its spec at runtime.
+        Scheme::Vless => uri::serialize_with_spec(&uri::VLESS_SPEC, entry),
+        Scheme::Trojan => uri::serialize_with_spec(&uri::TROJAN_SPEC, entry),
+        Scheme::Hysteria2 => uri::serialize_with_spec(&uri::HYSTERIA2_SPEC, entry),
+        Scheme::Tuic => uri::serialize_with_spec(&uri::TUIC_SPEC, entry),
+        Scheme::Mieru => uri::serialize_with_spec(&uri::MIERU_SPEC, entry),
+        Scheme::Socks5 => uri::serialize_with_spec(&uri::SOCKS5_SPEC, entry),
+        Scheme::Snell => uri::serialize_with_spec(&uri::SNELL_SPEC, entry),
+        Scheme::AnyTls => uri::serialize_with_spec(&uri::ANYTLS_SPEC, entry),
     }
 }
 
@@ -1387,6 +1470,30 @@ mod tests {
         let line = "vless://u@h.example.com:443?network=ws&servername=x.example.com&tls=true#n";
         let entry = entry_for(line);
         assert_eq!(serialize(&entry), line);
+    }
+
+    /// The runtime half of the registry invariant behind `serialize`'s
+    /// lookup: every scheme the parsers can produce renders a line. The
+    /// compile-time half lives in `uri::spec_of_scheme`, whose match over
+    /// `Scheme` is exhaustive — a new variant without a registry entry is a
+    /// compile error, not a panic on this path.
+    #[test]
+    fn every_scheme_serializes_through_its_own_serializer() {
+        for scheme in Scheme::all() {
+            let entry = ProxyEntry {
+                scheme: *scheme,
+                name: "n".into(),
+                host: "h.example.com".into(),
+                port: 443,
+                credential: "pw".into(),
+                params: vec![],
+                raw_path: String::new(),
+                raw_line: String::new(),
+                canonical: None,
+            };
+            let line = serialize(&entry);
+            assert!(line.starts_with(scheme.as_str()), "{scheme}: {line}");
+        }
     }
 
     #[test]

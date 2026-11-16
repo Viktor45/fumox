@@ -277,25 +277,61 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     let host = super::normalize_host(&host);
     let port = numeric_field(map, "port").map_err(named)?;
 
-    // The credential fields are joined in their declared order, which is
-    // the only contract the output writers have: they split on `:` and
-    // read a colon-less credential as "no credential at all".
-    //   - an absent field *after* the first present one always keeps its
-    //     empty slot, or the fields in front of it shift left and are
-    //     lost: a socks5 item with only `username` must store
-    //     `onlyuser:`, not `onlyuser`;
-    //   - an absent *leading* field keeps its slot only when every part
-    //     is optional (`optional_credential_fields`), because the writers
-    //     then skip the empty part. Shadowsocks reads the first part as
-    //     the cipher, so there an absent leading field is dropped and an
-    //     ss item with only `password` stores the canonicalized
-    //     `chacha20-ietf-poly1305:pw` (see `SS_SPEC`);
-    //   - with nothing present the credential stays empty, so a
-    //     single-field scheme without its secret emits no userinfo.
-    //
-    // A field that is present but empty (`null` or an empty scalar) counts as
-    // absent: it says nothing about the secret, and treating it as present
-    // would keep an empty leading slot (`":pw"`, an empty cipher).
+    // The `:`-joined credential, the contract the output writers read.
+    let credential = credential_value(spec, map).map_err(named)?;
+
+    // A YAML scalar may legally contain a line break, but the URI
+    // serializers emit these two fields verbatim, one would split this proxy
+    // into several output lines and smuggle a foreign scheme past the
+    // source's protocol allowlist. Reject the item; the caller counts it.
+    // Parameter values are exempt: Clash keeps structured blocks (`ws-opts`,
+    // `reality-opts`, …) as multi-line YAML text, so they are sanitized at
+    // serialization time instead.
+    super::reject_line_breaks("clash: server", &host).map_err(named)?;
+    super::reject_line_breaks("clash: credential", &credential).map_err(named)?;
+
+    let params = collect_params(spec, map);
+    // Field-size cap: Clash
+    // params bypass `parse_query`, so the caps are enforced here.
+    super::validate_params("clash", &params).map_err(named)?;
+    // The host, the credential and the name are persisted verbatim, so they
+    // are capped like the parameters.
+    super::check_field_size("clash: server", &host).map_err(named)?;
+    super::check_field_size("clash: credential", &credential).map_err(named)?;
+    super::check_field_size("clash: name", &name).map_err(named)?;
+
+    Ok(Some(super::with_canonical_cache(ProxyEntry {
+        scheme: spec.scheme,
+        name,
+        host,
+        port,
+        credential,
+        params,
+        raw_path: String::new(),
+        raw_line: String::new(),
+        canonical: None,
+    })))
+}
+
+/// Join the credential fields of one item in their declared order, which is
+/// the only contract the output writers have: they split on `:` and read a
+/// colon-less credential as "no credential at all".
+///   - an absent field *after* the first present one always keeps its empty
+///     slot, or the fields in front of it shift left and are lost: a socks5
+///     item with only `username` must store `onlyuser:`, not `onlyuser`;
+///   - an absent *leading* field keeps its slot only when every part is
+///     optional (`optional_credential_fields`), because the writers then
+///     skip the empty part. Shadowsocks reads the first part as the cipher,
+///     so there an absent leading field is dropped and an ss item with only
+///     `password` stores the canonicalized `chacha20-ietf-poly1305:pw` (see
+///     `SS_SPEC`);
+///   - with nothing present the credential stays empty, so a single-field
+///     scheme without its secret emits no userinfo.
+///
+/// A field that is present but empty (`null` or an empty scalar) counts as
+/// absent: it says nothing about the secret, and treating it as present
+/// would keep an empty leading slot (`":pw"`, an empty cipher).
+fn credential_value(spec: &ClashTypeSpec, map: &serde_norway::Mapping) -> Result<String, String> {
     let fields: Vec<Option<String>> = spec
         .credential_fields
         .iter()
@@ -325,34 +361,20 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
     // complete `method:password` shape and the row merges with its
     // explicit-cipher twin; an item with no credential at all is unusable,
     // not a no-auth proxy, and is counted as invalid.
-    let credential = if spec.scheme == Scheme::Ss {
-        match fields.as_slice() {
-            [None, Some(password)] => {
-                format!("{}:{password}", crate::models::DEFAULT_SS_CIPHER)
-            }
-            [None, None] => {
-                return Err(named("clash: ss item has no cipher and no password".into()));
-            }
-            _ => credential,
-        }
-    } else {
-        credential
-    };
+    if spec.scheme != Scheme::Ss {
+        return Ok(credential);
+    }
+    match fields.as_slice() {
+        [None, Some(password)] => Ok(format!("{}:{password}", crate::models::DEFAULT_SS_CIPHER)),
+        [None, None] => Err("clash: ss item has no cipher and no password".into()),
+        _ => Ok(credential),
+    }
+}
 
-    // A YAML scalar may legally contain a line break, but the URI
-    // serializers emit these two fields verbatim, one would split this proxy
-    // into several output lines and smuggle a foreign scheme past the
-    // source's protocol allowlist. Reject the item; the caller counts it.
-    // Parameter values are exempt: Clash keeps structured blocks (`ws-opts`,
-    // `reality-opts`, …) as multi-line YAML text, so they are sanitized at
-    // serialization time instead.
-    super::reject_line_breaks("clash: server", &host).map_err(named)?;
-    super::reject_line_breaks("clash: credential", &credential).map_err(named)?;
-
-    // Everything not consumed structurally or as the credential is kept as
-    // a pass-through parameter, so no Clash option is ever lost.
-    let params: Vec<Param> = map
-        .iter()
+/// Everything not consumed structurally or as the credential is kept as a
+/// pass-through parameter, so no Clash option is ever lost.
+fn collect_params(spec: &ClashTypeSpec, map: &serde_norway::Mapping) -> Vec<Param> {
+    map.iter()
         .filter(|(key, _)| {
             let key = key.as_str().unwrap_or_default();
             !STRUCTURAL_FIELDS.contains(&key) && !spec.credential_fields.contains(&key)
@@ -367,27 +389,7 @@ fn parse_item(item: &Value) -> Result<Option<ProxyEntry>, String> {
                 bare: false,
             }
         })
-        .collect();
-    // Field-size cap: Clash
-    // params bypass `parse_query`, so the caps are enforced here.
-    super::validate_params("clash", &params).map_err(named)?;
-    // The host, the credential and the name are persisted verbatim, so they
-    // are capped like the parameters.
-    super::check_field_size("clash: server", &host).map_err(named)?;
-    super::check_field_size("clash: credential", &credential).map_err(named)?;
-    super::check_field_size("clash: name", &name).map_err(named)?;
-
-    Ok(Some(super::with_canonical_cache(ProxyEntry {
-        scheme: spec.scheme,
-        name,
-        host,
-        port,
-        credential,
-        params,
-        raw_path: String::new(),
-        raw_line: String::new(),
-        canonical: None,
-    })))
+        .collect()
 }
 
 fn string_field(map: &serde_norway::Mapping, key: &str) -> Result<String, String> {
@@ -400,27 +402,8 @@ fn string_field(map: &serde_norway::Mapping, key: &str) -> Result<String, String
 
 fn numeric_field(map: &serde_norway::Mapping, key: &str) -> Result<u16, String> {
     match map.get(key) {
-        Some(Value::Number(n)) => {
-            let port = match n.as_u64() {
-                Some(v) => u16::try_from(v).ok(),
-                // A feed may spell the port as a float (`443.0`): it is
-                // accepted when the fraction is zero and it fits u16.
-                None => n
-                    .as_f64()
-                    .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= f64::from(u16::MAX))
-                    .map(|v| v as u16),
-            };
-            // Port 0 is not a dialable endpoint (the schema CHECK, migration
-            // 0018, refuses it too), so the item is as invalid as an
-            // out-of-range one.
-            port.filter(|&p| p != 0)
-                .ok_or_else(|| format!("clash: port out of range: {n}"))
-        }
-        Some(Value::String(s)) => match s.trim().parse::<u16>() {
-            // The same zero rejection on the string spelling.
-            Ok(0) | Err(_) => Err(format!("clash: invalid port string: {s:?}")),
-            Ok(port) => Ok(port),
-        },
+        Some(Value::Number(n)) => super::port_from_number(n, "clash"),
+        Some(Value::String(s)) => super::port_from_string(s, "clash"),
         Some(_) => Err(format!("clash: field {key} is not numeric")),
         None => Err(format!("clash: missing field {key:?}")),
     }

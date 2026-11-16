@@ -552,31 +552,39 @@ fn url_and_family_unchanged(
     }
 }
 
+/// The last value of a form field, trimmed; an absent field is empty.
+fn form_field(form: &[(String, String)], key: &str) -> String {
+    form.iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Every non-empty trimmed value of a repeating form field, in order.
+fn form_field_all(form: &[(String, String)], key: &str) -> Vec<String> {
+    form.iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
 /// Validate + assemble a `Source` from form fields. Returns the model
 /// with the stored row it was built over (`None` for a create), or the
 /// reason it could not be built: per-field errors (translated, shown
 /// next to fields) or a row that could not be read.
+///
+/// Every field is parsed by its own helper below: the helper pushes its
+/// translated problems onto `errors` in field order and answers with the
+/// value the save should carry, so the form reports every bad field at
+/// once and the save happens only when `errors` came out empty.
 async fn build_source_from_form(
     state: &AdminState,
     lang: &Lang,
     form: &[(String, String)],
     existing_id: Option<&str>,
 ) -> Result<(Source, Option<Source>), FormError> {
-    let get = |key: &str| -> String {
-        form.iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.trim().to_string())
-            .unwrap_or_default()
-    };
-    let get_all = |key: &str| -> Vec<String> {
-        form.iter()
-            .filter(|(k, _)| k == key)
-            .map(|(_, v)| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .collect()
-    };
-
     let mut errors: Vec<(String, String)> = Vec::new();
 
     // The stored row is read once, up front: the form hands back the
@@ -584,29 +592,14 @@ async fn build_source_from_form(
     // and the updated row carries the creation stamp of the row it
     // replaces. A row that cannot be read is a broken database or a
     // vanished source, never a form error.
-    let existing = match existing_id {
-        Some(id) => match sources::get(&state.pool, id).await {
-            Ok(Some(stored)) => Some(stored),
-            // The row is gone: the save has nothing to update.
-            Ok(None) => {
-                return Err(FormError::Server(fumox_core::Error::NotFound(format!(
-                    "source {id}"
-                ))));
-            }
-            Err(err) => {
-                tracing::error!(error = %err, source = %id, "failed to read the source row");
-                return Err(FormError::Server(err));
-            }
-        },
-        None => None,
-    };
+    let existing = read_stored_source(state, existing_id).await?;
 
-    let name = get("name");
+    let name = form_field(form, "name");
     if let Err(message) = validate_name(&name, lang) {
         errors.push(("name".into(), message));
     }
 
-    let slug_raw = get("slug");
+    let slug_raw = form_field(form, "slug");
     let slug = validate_slug(
         &slug_raw,
         existing_id,
@@ -620,18 +613,129 @@ async fn build_source_from_form(
     // not extend there). Same contract as the profile form: the stored
     // token is a hash, so the field shows a placeholder, an unchanged
     // placeholder keeps the stored token, and an empty field clears it.
-    let token_raw = get("access_token");
-    let stored_token = existing.as_ref().and_then(|s| s.access_token.as_deref());
+    let access_token = parse_access_token(
+        lang,
+        &form_field(form, "access_token"),
+        existing.as_ref(),
+        &mut errors,
+    );
+    // The preferred family is parsed before the URL so the save-time SSRF
+    // check can vet the host under the source's own constraint.
+    let ip_family = parse_ip_family(lang, &form_field(form, "ip_family"), &mut errors);
+    // The URL: the edit form shows the secrets of the URL masked, so the
+    // stored values go back where the form still carries those masks.
+    // The restored URL is the one that is vetted and stored.
+    let url = validate_source_url(
+        state,
+        lang,
+        existing.as_ref(),
+        &form_field(form, "url"),
+        ip_family,
+        &mut errors,
+    )
+    .await;
+    let encoding = parse_encoding(lang, &form_field(form, "encoding"), &mut errors);
+    let input_format = parse_input_format(lang, &form_field(form, "input_format"), &mut errors);
+    let protocols = parse_protocols(lang, &form_field_all(form, "protocols"), &mut errors);
+    let cache_ttl_seconds =
+        parse_cache_ttl(lang, &form_field(form, "cache_ttl_seconds"), &mut errors);
+    let tags = parse_tags(lang, &form_field(form, "tags"), &mut errors);
+    let headers = parse_headers(
+        lang,
+        existing.as_ref(),
+        &form_field(form, "headers"),
+        &mut errors,
+    );
+    // Pipeline: in builder mode the JSON is generated from the widget
+    // fields server-side (a stale `pipeline` textarea, if any, is ignored);
+    // in raw mode the textarea is the input, as before.
+    let pipeline = pipeline_from_form(form, lang, &mut errors);
+
+    if !errors.is_empty() {
+        return Err(FormError::Validation(errors));
+    }
+
+    let now = now_ts();
+
+    Ok((
+        Source {
+            id: existing_id.map(str::to_string).unwrap_or_else(new_id),
+            slug,
+            access_token,
+            name,
+            url,
+            // HTML checkbox semantics: an unchecked checkbox submits nothing,
+            // a checked one submits its value (`1` in the source form), so
+            // the flag is read from the value, not from the field's presence.
+            enabled: is_checkbox_on(form, "enabled"),
+            encoding,
+            input_format,
+            protocols,
+            cache_ttl_seconds,
+            tags,
+            pipeline,
+            headers,
+            ip_family,
+            created_at: existing.as_ref().map(|s| s.created_at).unwrap_or(now),
+            updated_at: now,
+            // The fetcher owns these three columns: the admin write path
+            // does not carry them (`sources::update_settings` leaves the
+            // stored values alone), so the assembled row leaves them empty.
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        },
+        existing,
+    ))
+}
+
+/// The stored row is read once, up front: the form hands back the secrets
+/// it masked (the password of the URL, the header values), and the updated
+/// row carries the creation stamp of the row it replaces. A row that
+/// cannot be read is a broken database or a vanished source, never a form
+/// error.
+async fn read_stored_source(
+    state: &AdminState,
+    existing_id: Option<&str>,
+) -> Result<Option<Source>, FormError> {
+    match existing_id {
+        Some(id) => match sources::get(&state.pool, id).await {
+            Ok(Some(stored)) => Ok(Some(stored)),
+            // The row is gone: the save has nothing to update.
+            Ok(None) => Err(FormError::Server(fumox_core::Error::NotFound(format!(
+                "source {id}"
+            )))),
+            Err(err) => {
+                tracing::error!(error = %err, source = %id, "failed to read the source row");
+                Err(FormError::Server(err))
+            }
+        },
+        None => Ok(None),
+    }
+}
+
+/// The source's own access token guards `/src` (the profile token does not
+/// extend there). Same contract as the profile form: the stored token is a
+/// hash, so the field shows a placeholder, an unchanged placeholder keeps
+/// the stored token, and an empty field clears it.
+///
+/// Token format cap: the token guards a public endpoint, so it is URL-safe
+/// and bounded like the profile one.
+fn parse_access_token(
+    lang: &Lang,
+    token_raw: &str,
+    existing: Option<&Source>,
+    errors: &mut Vec<(String, String)>,
+) -> Option<String> {
+    let stored_token = existing.and_then(|s| s.access_token.as_deref());
     let unchanged = stored_token.is_some() && token_raw == token_placeholder(stored_token);
     let access_token = if unchanged {
         stored_token.map(str::to_string)
     } else if token_raw.is_empty() {
         None
     } else {
-        Some(token_raw.clone())
+        Some(token_raw.to_string())
     };
-    // Token format cap: the token guards a public endpoint, so it is
-    // URL-safe and bounded like the profile one.
     if !unchanged && let Some(token) = access_token.as_ref() {
         if token.chars().count() < caps::TOKEN_MIN {
             errors.push((
@@ -644,29 +748,43 @@ async fn build_source_from_form(
             errors.push(("access_token".into(), message));
         }
     }
+    access_token
+}
 
-    // The preferred family is parsed before the URL so the save-time SSRF
-    // check can vet the host under the source's own constraint.
-    let ip_family_raw = get("ip_family");
-    let ip_family = if ip_family_raw.is_empty() {
-        None
-    } else {
-        match IpFamily::from_str(&ip_family_raw) {
-            Ok(family) => Some(family),
-            Err(_) => {
-                errors.push(("ip_family".into(), lang.t("val.unknown_value").into()));
-                None
-            }
+/// The preferred IP family: empty means "no preference", an unknown value
+/// is a field error.
+fn parse_ip_family(
+    lang: &Lang,
+    ip_family_raw: &str,
+    errors: &mut Vec<(String, String)>,
+) -> Option<IpFamily> {
+    if ip_family_raw.is_empty() {
+        return None;
+    }
+    match IpFamily::from_str(ip_family_raw) {
+        Ok(family) => Some(family),
+        Err(_) => {
+            errors.push(("ip_family".into(), lang.t("val.unknown_value").into()));
+            None
         }
-    };
+    }
+}
 
-    // The URL: the edit form shows the secrets of the URL masked, so the
-    // stored values go back where the form still carries those masks.
-    // The restored URL is the one that is vetted and stored.
-    let url_raw = get("url");
-    let url = match existing.as_ref() {
-        Some(stored) => restore_url_secrets(&url_raw, &stored.url),
-        None => url_raw.clone(),
+/// The URL with the stored secrets put back under the masks, validated:
+/// empty and oversize are field errors, and a URL the edit changed (or a
+/// create) is vetted against the SSRF policy under the source's own
+/// family constraint.
+async fn validate_source_url(
+    state: &AdminState,
+    lang: &Lang,
+    existing: Option<&Source>,
+    url_raw: &str,
+    ip_family: Option<IpFamily>,
+    errors: &mut Vec<(String, String)>,
+) -> String {
+    let url = match existing {
+        Some(stored) => restore_url_secrets(url_raw, &stored.url),
+        None => url_raw.to_string(),
     };
     if url.is_empty() {
         errors.push(("url".into(), lang.t("val.required").into()));
@@ -680,7 +798,7 @@ async fn build_source_from_form(
     // the URL and its preferred family alone skips the vet, so saving a
     // renamed source does not depend on the feed host's DNS answering
     // this time too.
-    } else if !url_and_family_unchanged(existing.as_ref(), &url, ip_family)
+    } else if !url_and_family_unchanged(existing, &url, ip_family)
         && let Err(issue) = fetcher::vet_url_with_policy(
             &url,
             state.admin().allow_private_urls,
@@ -691,52 +809,72 @@ async fn build_source_from_form(
     {
         errors.push(("url".into(), url_problem_message(lang, &issue)));
     }
+    url
+}
 
-    let encoding_raw = get("encoding");
-    let encoding = if encoding_raw.is_empty() {
-        Encoding::Auto
-    } else {
-        match Encoding::from_str(&encoding_raw) {
-            Ok(encoding) => encoding,
-            Err(_) => {
-                errors.push(("encoding".into(), lang.t("val.unknown_value").into()));
-                Encoding::Auto
-            }
+/// The payload encoding; empty means `auto`. An unknown value is a field
+/// error and the save falls back to `auto`.
+fn parse_encoding(lang: &Lang, encoding_raw: &str, errors: &mut Vec<(String, String)>) -> Encoding {
+    if encoding_raw.is_empty() {
+        return Encoding::Auto;
+    }
+    match Encoding::from_str(encoding_raw) {
+        Ok(encoding) => encoding,
+        Err(_) => {
+            errors.push(("encoding".into(), lang.t("val.unknown_value").into()));
+            Encoding::Auto
         }
-    };
+    }
+}
 
-    let input_format_raw = get("input_format");
-    let input_format = if input_format_raw.is_empty() {
-        None
-    } else {
-        match InputFormat::from_str(&input_format_raw) {
-            Ok(format) => Some(format),
-            Err(_) => {
-                errors.push(("input_format".into(), lang.t("val.unknown_value").into()));
-                None
-            }
+/// The preferred parser; empty means "detect from the content". An
+/// unknown value is a field error.
+fn parse_input_format(
+    lang: &Lang,
+    input_format_raw: &str,
+    errors: &mut Vec<(String, String)>,
+) -> Option<InputFormat> {
+    if input_format_raw.is_empty() {
+        return None;
+    }
+    match InputFormat::from_str(input_format_raw) {
+        Ok(format) => Some(format),
+        Err(_) => {
+            errors.push(("input_format".into(), lang.t("val.unknown_value").into()));
+            None
         }
-    };
+    }
+}
 
-    let protocol_names = get_all("protocols");
-    let protocols = if protocol_names.is_empty() {
-        None
-    } else {
-        let mut schemes = Vec::new();
-        for raw in &protocol_names {
-            match Scheme::from_str(raw) {
-                Ok(scheme) => schemes.push(scheme),
-                Err(_) => errors.push((
-                    "protocols".into(),
-                    lang.t("val.unknown_protocol").replace("{}", raw),
-                )),
-            }
+/// The protocol allowlist; nothing selected means "every scheme the
+/// parser recognizes". An unknown name is a field error, the known ones
+/// are kept.
+fn parse_protocols(
+    lang: &Lang,
+    protocol_names: &[String],
+    errors: &mut Vec<(String, String)>,
+) -> Option<Vec<Scheme>> {
+    if protocol_names.is_empty() {
+        return None;
+    }
+    let mut schemes = Vec::new();
+    for raw in protocol_names {
+        match Scheme::from_str(raw) {
+            Ok(scheme) => schemes.push(scheme),
+            Err(_) => errors.push((
+                "protocols".into(),
+                lang.t("val.unknown_protocol").replace("{}", raw),
+            )),
         }
-        Some(schemes)
-    };
+    }
+    Some(schemes)
+}
 
-    let ttl_raw = get("cache_ttl_seconds");
-    let cache_ttl_seconds: i64 = match ttl_raw.parse::<i64>() {
+/// The cache TTL in seconds; an unparsable or out-of-range value is a
+/// field error and the save falls back to the same default the form
+/// ships with.
+fn parse_cache_ttl(lang: &Lang, ttl_raw: &str, errors: &mut Vec<(String, String)>) -> i64 {
+    match ttl_raw.parse::<i64>() {
         Ok(ttl) => match validate_ttl(ttl, lang) {
             Ok(()) => ttl,
             Err(message) => {
@@ -748,27 +886,44 @@ async fn build_source_from_form(
             errors.push(("cache_ttl_seconds".into(), ttl_range_message(lang)));
             3600
         }
-    };
+    }
+}
 
-    let tags_raw = get("tags");
-    let tags: Option<Vec<String>> = if tags_raw.is_empty() {
-        None
-    } else {
-        let list: Vec<String> = tags_raw
-            .split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect();
-        if let Err(message) = validate_tags(&list, lang) {
-            errors.push(("tags".into(), message));
-        }
-        Some(list)
-    };
+/// The comma-separated tag list; empty means "no tags". Format problems
+/// are a field error, the list is kept trimmed and non-empty.
+fn parse_tags(
+    lang: &Lang,
+    tags_raw: &str,
+    errors: &mut Vec<(String, String)>,
+) -> Option<Vec<String>> {
+    if tags_raw.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = tags_raw
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if let Err(message) = validate_tags(&list, lang) {
+        errors.push(("tags".into(), message));
+    }
+    Some(list)
+}
 
-    // Headers: "Key: value" lines. Masked values from the edit form are
-    // kept as-is only when unchanged, a masked placeholder means "keep the
-    // stored secret"; we re-read it from the DB below.
-    let headers_raw = get("headers");
+/// Headers: "Key: value" lines parsed into a map, empty lines skipped.
+/// Masked values from the edit form are kept as-is only when unchanged,
+/// a masked placeholder means "keep the stored secret"; we re-read it
+/// from the DB below. The caps and the header syntax are the shared
+/// rules: the whole map is replayed on every fetch of the source, so it
+/// is bounded like every other field, and a name/value the HTTP layer
+/// would refuse fails the form now instead of every future fetch. An
+/// empty map means "no headers".
+fn parse_headers(
+    lang: &Lang,
+    existing: Option<&Source>,
+    headers_raw: &str,
+    errors: &mut Vec<(String, String)>,
+) -> Option<std::collections::BTreeMap<String, String>> {
     let mut headers_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for line in headers_raw.lines() {
@@ -803,7 +958,7 @@ async fn build_source_from_form(
     // rendered for: under any other key it is reported, so the operator
     // enters the value again instead of a mask reaching the upstream
     // fetch as a credential.
-    if let Some(stored_headers) = existing.as_ref().and_then(|s| s.headers.as_ref())
+    if let Some(stored_headers) = existing.and_then(|s| s.headers.as_ref())
         && let Some(key) = restore_masked_headers(&mut headers_map, stored_headers)
     {
         errors.push((
@@ -811,59 +966,14 @@ async fn build_source_from_form(
             lang.t("val.header_mask").replace("{}", &key),
         ));
     }
-    // The caps and the header syntax are the shared rules: the whole map
-    // is replayed on every fetch of the source, so it is bounded like
-    // every other field, and a name/value the HTTP layer would refuse
-    // fails the form now instead of every future fetch.
     if let Err(message) = validate_header_map(&headers_map, lang) {
         errors.push(("headers".into(), message));
     }
-
-    // Pipeline: in builder mode the JSON is generated from the widget
-    // fields server-side (a stale `pipeline` textarea, if any, is ignored);
-    // in raw mode the textarea is the input, as before.
-    let pipeline = pipeline_from_form(form, lang, &mut errors);
-
-    if !errors.is_empty() {
-        return Err(FormError::Validation(errors));
+    if headers_map.is_empty() {
+        None
+    } else {
+        Some(headers_map)
     }
-
-    let now = now_ts();
-
-    Ok((
-        Source {
-            id: existing_id.map(str::to_string).unwrap_or_else(new_id),
-            slug,
-            access_token,
-            name,
-            url,
-            // HTML checkbox semantics: an unchecked checkbox submits nothing,
-            // a checked one submits its value (`1` in the source form), so
-            // the flag is read from the value, not from the field's presence.
-            enabled: is_checkbox_on(form, "enabled"),
-            encoding,
-            input_format,
-            protocols,
-            cache_ttl_seconds,
-            tags,
-            pipeline,
-            headers: if headers_map.is_empty() {
-                None
-            } else {
-                Some(headers_map)
-            },
-            ip_family,
-            created_at: existing.as_ref().map(|s| s.created_at).unwrap_or(now),
-            updated_at: now,
-            // The fetcher owns these three columns: the admin write path
-            // does not carry them (`sources::update_settings` leaves the
-            // stored values alone), so the assembled row leaves them empty.
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
-        },
-        existing,
-    ))
 }
 
 /// Names of the settings fields the assembled row changes relative to
@@ -967,7 +1077,10 @@ fn url_carries_mask(url: &str) -> bool {
 /// so a hand-built post means what it says, and any other value — an
 /// `enabled=false` included — counts as unchecked instead of flipping
 /// the flag on by mere presence.
-fn is_checkbox_on(form: &[(String, String)], key: &str) -> bool {
+///
+/// Shared with the profile form, which carries the same checkbox: one
+/// reading, so the two forms cannot drift apart on a hand-built post.
+pub(super) fn is_checkbox_on(form: &[(String, String)], key: &str) -> bool {
     form.iter()
         .rev()
         .find(|(k, _)| k == key)
@@ -975,34 +1088,29 @@ fn is_checkbox_on(form: &[(String, String)], key: &str) -> bool {
 }
 
 fn form_values_from(form: &[(String, String)]) -> SourceFormValues {
-    let get = |key: &str| -> String {
-        form.iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.trim().to_string())
-            .unwrap_or_default()
-    };
-    let url = get("url");
+    let url = form_field(form, "url");
     SourceFormValues {
-        name: get("name"),
-        slug: get("slug"),
-        access_token: get("access_token"),
+        name: form_field(form, "name"),
+        slug: form_field(form, "slug"),
+        access_token: form_field(form, "access_token"),
         url_masked: url_carries_mask(&url),
         url,
         // Same read as the save (`is_checkbox_on`): the replayed form
         // shows the checkbox exactly the way the row would be saved.
         enabled: is_checkbox_on(form, "enabled"),
-        encoding: get("encoding"),
-        input_format: get("input_format"),
-        ip_family: get("ip_family"),
+        encoding: form_field(form, "encoding"),
+        input_format: form_field(form, "input_format"),
+        ip_family: form_field(form, "ip_family"),
+        // Every value in order, an empty one included: the multi-select
+        // replays exactly what was posted.
         protocols: form
             .iter()
             .filter(|(k, _)| k == "protocols")
             .map(|(_, v)| v.trim().to_string())
             .collect(),
-        cache_ttl_seconds: get("cache_ttl_seconds"),
-        tags: get("tags"),
-        headers: get("headers"),
+        cache_ttl_seconds: form_field(form, "cache_ttl_seconds"),
+        tags: form_field(form, "tags"),
+        headers: form_field(form, "headers"),
     }
 }
 
@@ -1083,23 +1191,20 @@ pub async fn source_update(
             // The posted form is parsed once; the values and the protocol
             // selection come from the same parse.
             let values = form_values_from(&form);
-            // The header note follows the stored row, computed the same
-            // way as the GET render: it is about the values the form
-            // shows masked, not about what was posted. The assembled row
-            // does not exist here (validation failed), so the row is
-            // read again; a row that cannot be read keeps the note on,
-            // the previous render's assumption.
-            let headers_masked_note = match sources::get(&state.pool, &id).await {
-                Ok(Some(stored)) => stored.headers.as_ref().is_some_and(|m| !m.is_empty()),
-                Ok(None) | Err(_) => true,
-            };
-            // The token note follows the stored row the same way: the
-            // placeholder note is about the value the form shows, which is
-            // the stored token's stand-in, not what was posted.
-            let token_masked_note = match sources::get(&state.pool, &id).await {
-                Ok(Some(stored)) => stored.access_token.is_some(),
-                Ok(None) | Err(_) => true,
-            };
+            // Both notes follow the stored row, computed the same way as
+            // the GET render: they are about the values the form shows
+            // masked, not about what was posted. The assembled row does
+            // not exist here (validation failed), so the row is read
+            // once for both; a row that cannot be read keeps the notes
+            // on, the previous render's assumption.
+            let (headers_masked_note, token_masked_note) =
+                match sources::get(&state.pool, &id).await {
+                    Ok(Some(stored)) => (
+                        stored.headers.as_ref().is_some_and(|m| !m.is_empty()),
+                        stored.access_token.is_some(),
+                    ),
+                    Ok(None) | Err(_) => (true, true),
+                };
             return render_source_form(
                 &state,
                 &headers,
@@ -1254,43 +1359,15 @@ pub async fn source_detail(
     let backward = page
         .as_ref()
         .is_some_and(|page| page.direction == fetch_log::FetchLogDirection::Backward);
-    let has_more = log.len() as i64 > LOG_PAGE_SIZE;
-    if backward && has_more {
-        // The rows closest to the cursor come last: the over-fetched row
-        // is the farthest one, the page keeps the rows right before the
-        // cursor.
-        log.remove(0);
-    }
-    log.truncate(LOG_PAGE_SIZE as usize);
-    let cursor_of = |row: &fetch_log::FetchLogRow| fetch_log::FetchLogCursor {
-        fetched_at: row.fetched_at,
-        id: row.id,
-    };
-    let first_cursor = log.first().map(cursor_of);
-    let last_cursor = log.last().map(cursor_of);
-    let (prev, next) = if backward {
-        (
-            if has_more {
-                first_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Backward))
-            } else {
-                None
-            },
-            last_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Forward)),
-        )
-    } else {
-        (
-            if page.is_some() {
-                first_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Backward))
-            } else {
-                None
-            },
-            if has_more {
-                last_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Forward))
-            } else {
-                None
-            },
-        )
-    };
+    let (prev_cursor, next_cursor) =
+        super::logs::keyset_page(&mut log, page.is_some(), backward, LOG_PAGE_SIZE, |row| {
+            fetch_log::FetchLogCursor {
+                fetched_at: row.fetched_at,
+                id: row.id,
+            }
+        });
+    let prev = prev_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Backward));
+    let next = next_cursor.map(|cursor| (cursor, fetch_log::FetchLogDirection::Forward));
     let base = format!("/admin/sources/{id}");
     let nav_first = page
         .is_some()
@@ -1485,14 +1562,18 @@ impl_i18n!(ToggleFormFragment);
 /// normally plus the form marked out-of-band. Both halves come from the
 /// fragment templates the detail page includes, so the ids, aria
 /// attributes and the hx-* contract cannot drift from the initial render.
+///
+/// A rendering failure is a server bug: it is logged (like
+/// `render_html`'s 500 path) and the swap degrades to an empty body —
+/// the halves are all-or-nothing, a half-rendered swap would replace the
+/// page markup with a dangling fragment.
 fn toggle_swap_fragment(lang: &Lang, source: &Source, csrf: &str) -> String {
     let card = SourceCard::from_source(source);
     let badge = EnabledBadgeFragment {
         lang: lang.clone(),
         source: card.clone(),
     }
-    .render()
-    .expect("badge fragment renders");
+    .render();
     let form = ToggleFormFragment {
         lang: lang.clone(),
         toggle_url: format!("/admin/sources/{}/toggle", card.id),
@@ -1500,9 +1581,14 @@ fn toggle_swap_fragment(lang: &Lang, source: &Source, csrf: &str) -> String {
         csrf: csrf.to_string(),
         swap_oob: true,
     }
-    .render()
-    .expect("toggle form fragment renders");
-    format!("{badge}\n{form}")
+    .render();
+    match (badge, form) {
+        (Ok(badge), Ok(form)) => format!("{badge}\n{form}"),
+        (Err(err), _) | (_, Err(err)) => {
+            tracing::error!(error = %err, "toggle swap fragment rendering failed");
+            String::new()
+        }
+    }
 }
 
 pub async fn source_toggle(
@@ -1779,11 +1865,24 @@ pub async fn source_delete(
     // The row is gone; the rendered outputs that still name it go here.
     state.caches.invalidate_processed_for_source(&id).await;
     tracing::info!(source = %id, "source deleted");
+    deleted_source_response(lang, is_htmx(&headers), &id, sweep)
+}
+
+/// The delete response: the toast says the source is gone and names the
+/// outcome of the orphan sweep its deletion triggered — the rows the
+/// source fed lose their last link and drop out of every probe lane, so
+/// the operator has to hear what became of them.
+fn deleted_source_response(
+    lang: Lang,
+    is_htmx: bool,
+    source_id: &str,
+    sweep: Result<proxies::OrphanSweep, fumox_core::Error>,
+) -> Response {
     match sweep {
         Ok(sweep) => {
             if sweep.retired > 0 {
                 tracing::info!(
-                    source = %id,
+                    source = %source_id,
                     retired = sweep.retired,
                     "orphaned proxies marked removed"
                 );
@@ -1792,13 +1891,13 @@ pub async fn source_delete(
                 // The rows the sweep left alone on purpose: they have no
                 // source link any more, so no probe lane can reach them.
                 tracing::info!(
-                    source = %id,
+                    source = %source_id,
                     protected = sweep.protected,
                     "orphaned proxies left detached by the protected statuses"
                 );
             }
             action_response(
-                is_htmx(&headers),
+                is_htmx,
                 "/admin/sources",
                 String::new(),
                 lang.t("src.deleted_toast"),
@@ -1809,12 +1908,12 @@ pub async fn source_delete(
             // flagged: the operator has to hear it, the toast is the
             // only place they will see it.
             tracing::error!(
-                source = %id,
+                source = %source_id,
                 error = %err,
                 "failed to mark orphans removed"
             );
             action_response_err(
-                is_htmx(&headers),
+                is_htmx,
                 "/admin/sources",
                 String::new(),
                 lang.t("src.deleted_orphans_failed"),
@@ -1872,27 +1971,58 @@ pub async fn source_dry_run(
     // One event per outcome, without the URL or the headers: the log
     // tail names the source and the verdict, the secrets stay in the
     // database.
-    match &outcome {
+    log_dry_run_outcome(&id, &outcome);
+    let fragment = dry_run_fragment(lang, outcome);
+    if is_htmx(&headers) {
+        render_html(
+            fragment.lang.clone(),
+            "sources/_dryrun.html",
+            &fragment,
+            StatusCode::OK,
+        )
+    } else {
+        // Plain-browser path: this fragment is the HTMX swap target inside
+        // the source card, so a plain POST would land on a chrome-less
+        // page. Redirect back to the card with the outcome as a flash
+        // message instead, the same plain-browser fallback as
+        // `source_refresh`.
+        flash_redirect(
+            &format!("/admin/sources/{id}"),
+            &fragment.message,
+            if fragment.ok { "ok" } else { "error" },
+        )
+    }
+}
+
+/// One journal event per dry-run outcome, without the URL or the headers:
+/// the log tail names the source and the verdict, the secrets stay in the
+/// database.
+fn log_dry_run_outcome(source_id: &str, outcome: &crate::ingest::DryRunOutcome) {
+    match outcome {
         crate::ingest::DryRunOutcome::Ok {
             http_status,
             bytes,
             proxies_found,
             ..
         } => {
-            tracing::info!(source = %id, http_status, bytes, proxies_found, "dry run ok");
+            tracing::info!(source = %source_id, http_status, bytes, proxies_found, "dry run ok");
         }
         crate::ingest::DryRunOutcome::FetchFailed { failure } => {
             tracing::warn!(
-                source = %id,
+                source = %source_id,
                 error_class = %failure.error_class().as_str(),
                 "dry run failed"
             );
         }
         crate::ingest::DryRunOutcome::ParseFailed { .. } => {
-            tracing::warn!(source = %id, error_class = "parse", "dry run failed");
+            tracing::warn!(source = %source_id, error_class = "parse", "dry run failed");
         }
     }
-    let fragment = match outcome {
+}
+
+/// The dry-run fragment the card swaps in: one arm per outcome.
+fn dry_run_fragment(lang: Lang, outcome: crate::ingest::DryRunOutcome) -> DryRunFragment {
+    match outcome {
         crate::ingest::DryRunOutcome::Ok {
             http_status,
             bytes,
@@ -1935,25 +2065,6 @@ pub async fn source_dry_run(
             sample: Vec::new(),
             lang,
         },
-    };
-    if is_htmx(&headers) {
-        render_html(
-            fragment.lang.clone(),
-            "sources/_dryrun.html",
-            &fragment,
-            StatusCode::OK,
-        )
-    } else {
-        // Plain-browser path: this fragment is the HTMX swap target inside
-        // the source card, so a plain POST would land on a chrome-less
-        // page. Redirect back to the card with the outcome as a flash
-        // message instead, the same plain-browser fallback as
-        // `source_refresh`.
-        flash_redirect(
-            &format!("/admin/sources/{id}"),
-            &fragment.message,
-            if fragment.ok { "ok" } else { "error" },
-        )
     }
 }
 
@@ -2357,27 +2468,12 @@ mod tests {
 
     /// A source row as the toggle action holds it after the flip.
     fn sample_source(enabled: bool) -> Source {
-        let now = now_ts();
         Source {
-            id: new_id(),
             slug: Some("s1".into()),
-            access_token: None,
             name: "s1".into(),
             url: "https://example.com/sub".into(),
             enabled,
-            encoding: Encoding::Auto,
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
+            ..Source::fixture(&new_id(), now_ts())
         }
     }
 

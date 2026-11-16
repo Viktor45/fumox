@@ -27,7 +27,7 @@ use crate::admin::render_html;
 use crate::admin::theme::{self, Theme};
 use askama::Template;
 use axum::extract::{Form, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use fumox_core::config::{
     AdminConfig, AppConfig, DatabaseConfig, FetchConfig, GeoConfig, IngestConfig, LogConfig,
@@ -1153,7 +1153,15 @@ pub async fn settings_edit(State(state): State<AdminState>, headers: HeaderMap) 
     // (and wins), and the fields it overrides are rendered read-only
     // and left out of the write.
     let target = state.config_path.path_or_default();
-    let (raw, load_error) = match raw_from_file(&target) {
+    // The read and the TOML parse are synchronous file work: on the
+    // blocking pool, so a slow disk cannot stall the async runtime.
+    let (raw, load_error) = match tokio::task::spawn_blocking({
+        let target = target.clone();
+        move || raw_from_file(&target)
+    })
+    .await
+    .unwrap_or_else(|err| Err(err.to_string()))
+    {
         Ok(Some(raw)) => (raw, None),
         // No file yet: the operator creates it from the defaults.
         Ok(None) => (raw_from_config(&state.live()), None),
@@ -1206,15 +1214,12 @@ pub async fn settings_update(
     // it) is refused instead of being overwritten by a form that never
     // saw the newer content. The operator reloads and re-applies.
     let target = state.config_path.path_or_default();
-    if let Some(submitted) = raw.get("cfg_fingerprint").map(String::as_str)
-        && !submitted.is_empty()
-        && submitted != fingerprint(&target)
-    {
+    if form_is_stale(&target, &raw) {
         tracing::warn!(
             path = %target.display(),
             "settings save refused: the config file changed since the form was rendered"
         );
-        return settings_edit_conflict(&state, &headers);
+        return settings_edit_conflict(&state, &headers).await;
     }
 
     // Build a fresh `EditableConfig` so we can fail-and-replay the form
@@ -1241,99 +1246,170 @@ pub async fn settings_update(
         }
     };
 
-    let (path, previous_token, new_token, written_keys) = match outcome {
+    finish_save(&state, &headers, raw, &lang, &env_locked, &target, outcome).await
+}
+
+/// Whether the fingerprint the form carried no longer matches the file
+/// on disk: the document changed since the form was rendered. A form
+/// without a fingerprint (or with an empty one) is not stale — there is
+/// nothing to compare it against.
+fn form_is_stale(target: &Path, raw: &HashMap<String, String>) -> bool {
+    match raw.get("cfg_fingerprint").map(String::as_str) {
+        Some(submitted) if !submitted.is_empty() => submitted != fingerprint(target),
+        _ => false,
+    }
+}
+
+/// What a written save hands to the post-write steps: the file it
+/// wrote, the admin token the document carried before and after the
+/// write, and the key names for the audit line.
+struct SavedSave {
+    path: String,
+    previous_token: String,
+    new_token: String,
+    written_keys: Vec<String>,
+}
+
+/// Answer a finished save cycle. Every outcome that did not write the
+/// file gets the refusal page that explains why; a written save runs
+/// the post-write steps (audit line, session revocation on a token
+/// rotation, live-view refresh) and redirects with the toast.
+async fn finish_save(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw: HashMap<String, String>,
+    lang: &Lang,
+    env_locked: &[String],
+    target: &Path,
+    outcome: SaveOutcome,
+) -> Response {
+    match outcome {
         SaveOutcome::Saved {
             path,
             previous_token,
             new_token,
             written_keys,
-        } => (path, previous_token, new_token, written_keys),
-        SaveOutcome::Invalid(errors) => {
-            // Field names only, never the submitted values: the log must
-            // explain the refusal without carrying what the operator typed.
-            tracing::warn!(
-                fields = ?errors.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
-                "settings update rejected"
-            );
-            // The replayed form never echoes the submitted token back:
-            // the refusal would otherwise pin the typed secret into the
-            // 422 page. The field comes back empty and the message under
-            // it says the token was not applied, so the operator knows
-            // it has to be typed again.
-            let mut raw = raw;
-            raw.insert(KEY_ADMIN_TOKEN.to_string(), String::new());
-            let mut errors = errors;
-            if !errors.iter().any(|(field, _)| field == KEY_ADMIN_TOKEN) {
-                errors.push((
-                    KEY_ADMIN_TOKEN.to_string(),
-                    lang.t("set.edit_token_not_saved").to_string(),
-                ));
-            }
-            let template = edit_template(&state, &headers, raw, errors, None);
-            return render_html(
-                template.lang.clone(),
-                "settings_edit.html",
-                &template,
-                StatusCode::UNPROCESSABLE_ENTITY,
-            );
+        } => {
+            saved_response(
+                state,
+                headers,
+                lang,
+                env_locked,
+                SavedSave {
+                    path,
+                    previous_token,
+                    new_token,
+                    written_keys,
+                },
+            )
+            .await
         }
+        SaveOutcome::Invalid(errors) => invalid_form_response(state, headers, raw, lang, errors),
         SaveOutcome::InvalidDocument(message) => {
-            // The file on disk is one the binaries would refuse, so the
-            // panel did not write over it. The operator has to see the
-            // reason, otherwise the refusal is a mystery.
-            tracing::warn!(
-                error = %message,
-                path = %target.display(),
-                "settings save refused: the resulting config would not load"
-            );
-            let template =
-                edit_template(&state, &headers, raw, vec![(String::new(), message)], None);
-            return render_html(
-                template.lang.clone(),
-                "settings_edit.html",
-                &template,
-                StatusCode::UNPROCESSABLE_ENTITY,
-            );
+            invalid_document_response(state, headers, raw, target, message)
         }
         SaveOutcome::LoadError(message) => {
-            tracing::error!(
-                error = %message,
-                path = %target.display(),
-                "settings update: config load failed"
-            );
-            return settings_edit_load_error(&state, &headers, raw, message);
+            load_error_response(state, headers, raw, target, message)
         }
         SaveOutcome::WriteError(message) => {
-            tracing::error!(error = %message, path = %target.display(), "failed to save settings");
-            let template = edit_template(
-                &state,
-                &headers,
-                raw,
-                vec![(
-                    "".into(),
-                    lang.t_args("err.internal", &[format!("save: {message}")]),
-                )],
-                None,
-            );
-            return render_html(
-                template.lang.clone(),
-                "settings_edit.html",
-                &template,
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            write_error_response(state, headers, raw, lang, target, message)
         }
-        SaveOutcome::Conflict => {
-            // The file changed between the load and the write: the
-            // document in hand is a snapshot of a file that no longer
-            // exists. Refuse it like the stale-form case, so the other
-            // change survives.
-            tracing::warn!(
-                path = %target.display(),
-                "settings save refused: the config file changed during the save"
-            );
-            return settings_edit_conflict(&state, &headers);
-        }
-    };
+        SaveOutcome::Conflict => conflict_response(state, headers, target).await,
+    }
+}
+
+/// The page for a submit whose resulting document the binaries would
+/// refuse to load: the panel did not write over the operator's file,
+/// and the reason has to be visible, otherwise the refusal is a
+/// mystery.
+fn invalid_document_response(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw: HashMap<String, String>,
+    target: &Path,
+    message: String,
+) -> Response {
+    tracing::warn!(
+        error = %message,
+        path = %target.display(),
+        "settings save refused: the resulting config would not load"
+    );
+    refused_with_error(
+        state,
+        headers,
+        raw,
+        message,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+}
+
+/// The page for a submit the panel could not even read the target file
+/// for: the operator's own values come back under the load-failure
+/// banner that names the file and the reason it is unreadable.
+fn load_error_response(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw: HashMap<String, String>,
+    target: &Path,
+    message: String,
+) -> Response {
+    tracing::error!(
+        error = %message,
+        path = %target.display(),
+        "settings update: config load failed"
+    );
+    settings_edit_load_error(state, headers, raw, message)
+}
+
+/// The page for a submit the config writer could not write: the reason
+/// is a server fault, not a user error, so it rides under
+/// `err.internal`.
+fn write_error_response(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw: HashMap<String, String>,
+    lang: &Lang,
+    target: &Path,
+    message: String,
+) -> Response {
+    tracing::error!(error = %message, path = %target.display(), "failed to save settings");
+    refused_with_error(
+        state,
+        headers,
+        raw,
+        lang.t_args("err.internal", &[format!("save: {message}")]),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+/// The page for a submit the file moved on between the load and the
+/// write: the document in hand is a snapshot of a file that no longer
+/// exists. Refuse it like the stale-form case, so the other change
+/// survives.
+async fn conflict_response(state: &AdminState, headers: &HeaderMap, target: &Path) -> Response {
+    tracing::warn!(
+        path = %target.display(),
+        "settings save refused: the config file changed during the save"
+    );
+    settings_edit_conflict(state, headers).await
+}
+
+/// The post-write steps of a saved submit: the audit line, the session
+/// revocation on a token rotation, the live-view refresh and the
+/// redirect with the toast that says what actually happened.
+async fn saved_response(
+    state: &AdminState,
+    headers: &HeaderMap,
+    lang: &Lang,
+    env_locked: &[String],
+    saved: SavedSave,
+) -> Response {
+    let SavedSave {
+        path,
+        previous_token,
+        new_token,
+        written_keys,
+    } = saved;
 
     // The audit line names the file, the keys the submit wrote (names
     // only, never values) and a non-reversible tag of the session that
@@ -1341,46 +1417,73 @@ pub async fn settings_update(
     tracing::info!(
         path = %path,
         keys = written_keys.join(","),
-        session = %session_tag(&headers),
+        session = %session_tag(headers),
         "settings saved"
     );
 
-    // A token rotation through this form must also revoke the sessions
-    // minted under the old token: the session key is derived from the
-    // token at startup and stays frozen (`AdminState::session_key`), so
-    // without an epoch bump a stolen cookie keeps authenticating until
-    // the next restart.
-    //
-    // The comparison is between the token of the document before the
-    // write and the one after it, so only an actual change counts: an
-    // unconditional bump would log out the very session performing an
-    // unrelated save. An empty submit is NOT a change: `token_field`
-    // reads it as "keep the current token", so treating it as a
-    // rotation would log the operator out of every unrelated save (the
-    // field renders empty and untouched fields submit empty).
-    //
-    // A token the environment overrides is not a rotation at all: the
-    // file's value is inert, the running server keeps the environment's
-    // token, and the sessions that token minted stay valid.
-    let token_locked = env_locked.iter().any(|path| path == KEY_ADMIN_TOKEN);
-    let token_rotated = !token_locked && !new_token.is_empty() && new_token != previous_token;
-    if token_rotated {
-        tracing::info!("admin token rotated; all admin sessions revoked");
-        if !crate::admin::auth::revoke_all_sessions(&state.pool).await {
-            tracing::warn!(
-                "the session revocation did not persist; cookies minted under the old token stay valid"
-            );
-        }
-    }
+    let token_rotated =
+        revoke_rotated_token_sessions(state, env_locked, &previous_token, &new_token).await;
+    saved_redirect(state, headers, lang, env_locked, &path, token_rotated)
+}
 
+/// Revoke every admin session when this submit rotated the admin token,
+/// answering whether it did.
+///
+/// A token rotation through this form must also revoke the sessions
+/// minted under the old token: the session key is derived from the
+/// token at startup and stays frozen (`AdminState::session_key`), so
+/// without an epoch bump a stolen cookie keeps authenticating until
+/// the next restart.
+///
+/// The comparison is between the token of the document before the
+/// write and the one after it, so only an actual change counts: an
+/// unconditional bump would log out the very session performing an
+/// unrelated save. An empty submit is NOT a change: `token_field`
+/// reads it as "keep the current token", so treating it as a
+/// rotation would log the operator out of every unrelated save (the
+/// field renders empty and untouched fields submit empty).
+///
+/// A token the environment overrides is not a rotation at all: the
+/// file's value is inert, the running server keeps the environment's
+/// token, and the sessions that token minted stay valid.
+async fn revoke_rotated_token_sessions(
+    state: &AdminState,
+    env_locked: &[String],
+    previous_token: &str,
+    new_token: &str,
+) -> bool {
+    let token_locked = env_locked.iter().any(|locked| locked == KEY_ADMIN_TOKEN);
+    let token_rotated = !token_locked && !new_token.is_empty() && new_token != previous_token;
+    if !token_rotated {
+        return false;
+    }
+    tracing::info!("admin token rotated; all admin sessions revoked");
+    if !crate::admin::auth::revoke_all_sessions(&state.pool).await {
+        tracing::warn!(
+            "the session revocation did not persist; cookies minted under the old token stay valid"
+        );
+    }
+    true
+}
+
+/// The redirect a written save answers with: the live view is refreshed
+/// first, then the toast is attached.
+fn saved_redirect(
+    state: &AdminState,
+    headers: &HeaderMap,
+    lang: &Lang,
+    env_locked: &[String],
+    path: &str,
+    token_rotated: bool,
+) -> Response {
     // Refresh the figment-merged in-memory view so the next request to
     // /admin/settings, and every handler reading the live config,
     // renders the values the operator just wrote, instead of the startup
     // snapshot. ENV overrides are re-applied by `config::load` itself, so
     // `FUMOX_*` env vars keep winning on top of the file.
-    if let Err(err) = state.refresh_live_config(Path::new(&path)) {
+    if let Err(err) = state.refresh_live_config(Path::new(path)) {
         tracing::warn!(error = %err, path = %path, "live config refresh skipped");
-        return settings_refresh_failed(&lang, &headers, &path, &err);
+        return settings_refresh_failed(lang, headers, path, &err);
     }
 
     // The toast says what actually happened. A save that the
@@ -1388,11 +1491,69 @@ pub async fn settings_update(
     // learn that the value they changed is not the one in force. A
     // token rotation ends every session, the operator's own included,
     // so its toast says so instead of a plain "saved".
-    let (toast, level) = save_toast(&lang, &path, &env_locked, token_rotated);
+    let (toast, level) = save_toast(lang, path, env_locked, token_rotated);
     if headers.get("HX-Request").is_some() {
         return htmx_redirect_with_toast("/admin/settings", &toast, level);
     }
     super::flash_redirect("/admin/settings", &toast, level)
+}
+
+/// The edit page re-rendered with one form-level error and the status a
+/// refused write answers with: the operator's own values come back, the
+/// reason rides as the form-level error above them.
+fn refused_with_error(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw: HashMap<String, String>,
+    message: String,
+    status: StatusCode,
+) -> Response {
+    let template = edit_template(state, headers, raw, vec![(String::new(), message)], None);
+    render_html(
+        template.lang.clone(),
+        "settings_edit.html",
+        &template,
+        status,
+    )
+}
+
+/// The 422 page for a submit that did not validate: the operator's own
+/// values replayed with the per-field errors, so nothing they typed is
+/// lost to a re-render.
+fn invalid_form_response(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw: HashMap<String, String>,
+    lang: &Lang,
+    errors: Vec<(String, String)>,
+) -> Response {
+    // Field names only, never the submitted values: the log must
+    // explain the refusal without carrying what the operator typed.
+    tracing::warn!(
+        fields = ?errors.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
+        "settings update rejected"
+    );
+    // The replayed form never echoes the submitted token back:
+    // the refusal would otherwise pin the typed secret into the
+    // 422 page. The field comes back empty and the message under
+    // it says the token was not applied, so the operator knows
+    // it has to be typed again.
+    let mut raw = raw;
+    raw.insert(KEY_ADMIN_TOKEN.to_string(), String::new());
+    let mut errors = errors;
+    if !errors.iter().any(|(field, _)| field == KEY_ADMIN_TOKEN) {
+        errors.push((
+            KEY_ADMIN_TOKEN.to_string(),
+            lang.t("set.edit_token_not_saved").to_string(),
+        ));
+    }
+    let template = edit_template(state, headers, raw, errors, None);
+    render_html(
+        template.lang.clone(),
+        "settings_edit.html",
+        &template,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
 }
 
 /// Assemble the edit template: the fields every render shares (langs,
@@ -1400,6 +1561,11 @@ pub async fn settings_update(
 /// per-render `raw`/`errors`/`banner` passed in. One constructor for the
 /// render sites, so a new shared field cannot be added to the struct and
 /// forgotten at one of them.
+///
+/// The fingerprint is read synchronously on purpose: a single
+/// small-file read per render is not the load/validate/save cycle the
+/// blocking pool exists for (the pre-save check in `settings_update`
+/// reads it the same way).
 fn edit_template(
     state: &AdminState,
     headers: &HeaderMap,
@@ -1508,21 +1674,28 @@ fn settings_refresh_failed(
     super::flash_redirect("/admin/settings", &message, "error")
 }
 
+/// The HTMX answer of a finished save: the redirect the client follows
+/// and the toast event it renders. The redirect target is one of the
+/// static settings paths this module passes, so it is always visible
+/// ASCII and `HeaderValue::from_str` cannot refuse it — the refusal arm
+/// exists only because the type system cannot see that, and it degrades
+/// by dropping the header (with a log line, `wire_safe_header_value`)
+/// instead of panicking a live request handler.
 fn htmx_redirect_with_toast(redirect_to: &str, toast: &str, level: &str) -> Response {
-    (
+    let mut response = (
         StatusCode::SEE_OTHER,
-        [
-            (
-                HeaderName::from_static("hx-redirect"),
-                HeaderValue::from_str(redirect_to).expect("static settings path"),
-            ),
-            (
-                HeaderName::from_static("hx-trigger"),
-                super::toast_trigger(level, toast),
-            ),
-        ],
+        [(
+            HeaderName::from_static("hx-trigger"),
+            super::toast_trigger(level, toast),
+        )],
     )
-        .into_response()
+        .into_response();
+    if let Some(target) = super::wire_safe_header_value(redirect_to) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("hx-redirect"), target);
+    }
+    response
 }
 
 /// The config file changed under the open form, so the submit is
@@ -1530,10 +1703,17 @@ fn htmx_redirect_with_toast(redirect_to: &str, toast: &str, level: &str) -> Resp
 /// and the current fingerprint, so the operator reviews them and
 /// re-applies their change; a stale form carrying the old values would
 /// overwrite the change that beat it.
-fn settings_edit_conflict(state: &AdminState, headers: &HeaderMap) -> Response {
+async fn settings_edit_conflict(state: &AdminState, headers: &HeaderMap) -> Response {
     let lang = state.locales.lang_from_headers(headers);
-    let target = state.config_path.path_or_default();
-    let raw = match raw_from_file(&target) {
+    // The re-read is synchronous file work: on the blocking pool, so a
+    // slow disk cannot stall the async runtime.
+    let raw = match tokio::task::spawn_blocking({
+        let target = state.config_path.path_or_default();
+        move || raw_from_file(&target)
+    })
+    .await
+    .unwrap_or_else(|err| Err(err.to_string()))
+    {
         Ok(Some(raw)) => raw,
         Ok(None) | Err(_) => raw_from_config(&state.live()),
     };
@@ -1610,18 +1790,11 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
         return redirect_after_create(lang.t("set.file_created_noop").to_string());
     }
 
-    if !matches!(
-        fumox_core::config_writer::is_writable(target.parent().unwrap_or(Path::new("."))),
-        Ok(fumox_core::config_writer::Writability::Writable)
-    ) {
-        // Back to the overview with the reason as an error toast, like
-        // every other answer of this button: the operator clicked on the
-        // overview, the answer lands where they are instead of a 422 page
-        // that looks like the editor broke.
-        let message = lang.t_named(
-            "set.edit_unwritable",
-            &[("path", target.display().to_string())],
-        );
+    // Back to the overview with the reason as an error toast, like
+    // every other answer of this button: the operator clicked on the
+    // overview, the answer lands where they are instead of a 422 page
+    // that looks like the editor broke.
+    if let Some(message) = create_blocked_message(&lang, &target) {
         return super::flash_redirect("/admin/settings", &message, "error");
     }
 
@@ -1629,52 +1802,82 @@ pub async fn settings_create(State(state): State<AdminState>, headers: HeaderMap
     // temporary file in the same directory, fsynced, then moved into
     // place. A create that dies half-way leaves no half-written config
     // behind for the next start to refuse.
-    let created = tokio::task::spawn_blocking({
-        let target = target.clone();
-        move || {
-            fumox_core::config_writer::create_private_file_atomic(
-                &target,
-                fumox_core::config_writer::REFERENCE_CONFIG,
-            )
-        }
-    })
-    .await;
-
-    match created {
-        Ok(Ok(())) => {
-            tracing::info!(
-                path = %target.display(),
-                "config file created from reference defaults"
-            );
-        }
-        Ok(Err(err)) => {
-            tracing::error!(error = %err, path = %target.display(), "failed to write reference config");
-            return settings_create_failed(&state, &headers, err.to_string());
-        }
-        Err(err) => {
-            tracing::error!(error = %err, path = %target.display(), "failed to write reference config");
-            return settings_create_failed(&state, &headers, err.to_string());
-        }
+    if let Err(err) = write_reference_config(target.clone()).await {
+        tracing::error!(error = %err, path = %target.display(), "failed to write reference config");
+        return settings_create_failed(&state, &headers, err);
     }
+    tracing::info!(
+        path = %target.display(),
+        "config file created from reference defaults"
+    );
 
     // The file was just materialised from the embedded reference copy;
     // pull the freshly-merged view into the in-memory cache so the next
     // GET to /admin/settings/edit (and the *Settings* overview) renders
     // every default rather than the empty startup snapshot.
     if let Err(err) = state.refresh_live_config(&target) {
-        tracing::warn!(error = %err, path = %target.display(), "live config refresh after create skipped");
-        let message = lang.t_named(
-            "err.config_not_reloaded",
-            &[
-                ("path", target.display().to_string()),
-                ("error", err.to_string()),
-            ],
-        );
-        return super::flash_redirect("/admin/settings/edit", &message, "error");
+        return create_refresh_failed(&lang, &target, &err);
     }
     let path = target.display().to_string();
     let msg = lang.t_named("set.file_created_toast", &[("path", path)]);
     redirect_after_create(msg)
+}
+
+/// The error toast for a create the target directory cannot take, `None`
+/// when it can go ahead.
+fn create_blocked_message(lang: &Lang, target: &Path) -> Option<String> {
+    let writable = matches!(
+        fumox_core::config_writer::is_writable(target.parent().unwrap_or(Path::new("."))),
+        Ok(fumox_core::config_writer::Writability::Writable)
+    );
+    if writable {
+        return None;
+    }
+    Some(lang.t_named(
+        "set.edit_unwritable",
+        &[("path", target.display().to_string())],
+    ))
+}
+
+/// Write the embedded reference copy to `target` on the blocking pool.
+/// The writer's own error and the death of the blocking task degrade to
+/// the same refusal text: the caller answers both with the same page
+/// and log line.
+async fn write_reference_config(target: PathBuf) -> Result<(), String> {
+    match tokio::task::spawn_blocking(move || {
+        fumox_core::config_writer::create_private_file_atomic(
+            &target,
+            fumox_core::config_writer::REFERENCE_CONFIG,
+        )
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// The create reached the disk, but the running view could not be
+/// refreshed: the file on disk carries the reference configuration, the
+/// process keeps the old one until the next restart. The operator is
+/// told with an error-level toast, because a green "created" toast
+/// would claim the defaults are live while the server runs without
+/// them.
+fn create_refresh_failed(lang: &Lang, target: &Path, err: &fumox_core::Error) -> Response {
+    tracing::warn!(
+        error = %err,
+        path = %target.display(),
+        "live config refresh after create skipped"
+    );
+    let message = lang.t_named(
+        "err.config_not_reloaded",
+        &[
+            ("path", target.display().to_string()),
+            ("error", err.to_string()),
+        ],
+    );
+    super::flash_redirect("/admin/settings/edit", &message, "error")
 }
 
 fn redirect_after_create(toast: String) -> Response {
@@ -1754,13 +1957,7 @@ fn apply_all(
 }
 
 // Field helpers.
-// Field helpers.
 
-/// Bounds of the quarantine recheck ladder, copied from
-/// `fumox_core::config::de_recheck_delays` (the deserializer both
-/// binaries load the file with). The panel writes the file verbatim, so
-/// it must refuse exactly what that parser refuses: a value the loader
-/// rejects aborts the next start of fumox-server and fumox-probe.
 /// Return the value at `field` only when the form actually carried it.
 /// Missing fields are skipped silently, the editor only writes the
 /// sections the operator touched, preserving every other setting as it
@@ -2149,6 +2346,12 @@ fn cidr_list(
 /// The admin panel writes the file verbatim and the next start of both
 /// binaries aborts on anything `fumox_core::config` refuses, so a bound
 /// the loader does not share would turn a green toast into a dead server.
+///
+/// Bounds of the quarantine recheck ladder, copied from
+/// `fumox_core::config::de_recheck_delays` (the deserializer both
+/// binaries load the file with). The panel writes the file verbatim, so
+/// it must refuse exactly what that parser refuses: a value the loader
+/// rejects aborts the next start of fumox-server and fumox-probe.
 ///
 /// An empty list is refused even though the loader accepts one: for the
 /// only field using this helper today, the recheck ladder, `[]` means

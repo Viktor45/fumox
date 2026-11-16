@@ -640,7 +640,10 @@ impl JournalCounts {
     /// The current counts, counted only when the cached ones expired.
     /// The two counts are independent scans, so they run in parallel.
     pub async fn get(&self, pool: &DbPool) -> anyhow::Result<(i64, i64)> {
-        if let Some((at, counts)) = *self.inner.lock().expect("journal counts cache")
+        if let Some((at, counts)) = *self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             && at.elapsed() < self.ttl
         {
             return Ok(counts);
@@ -649,7 +652,10 @@ impl JournalCounts {
             fumox_core::repo::probe::count_all(pool),
             fumox_core::repo::fetch_log::count_all(pool),
         )?;
-        *self.inner.lock().expect("journal counts cache") = Some((Instant::now(), counts));
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), counts));
         Ok(counts)
     }
 }
@@ -1053,6 +1059,38 @@ mod tests {
         // After the TTL the counts are read again.
         let fresh = JournalCounts::new(Duration::ZERO);
         assert_eq!(fresh.get(&pool).await.unwrap(), (0, 1));
+    }
+
+    /// A panic in another request while the counts lock is held poisons
+    /// the std mutex; the panel must keep rendering: the cache holds no
+    /// invariant a poison would break, so the lock recovers through
+    /// `into_inner` (the module-wide discipline) instead of turning every
+    /// later render into a panic.
+    #[tokio::test]
+    async fn a_poisoned_journal_counts_mutex_keeps_serving() {
+        let dir = fumox_core::tempdir_lite::TempDir::new("journal-counts-poison");
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: dir.path().join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+
+        let cache = JournalCounts::new(Duration::from_secs(60));
+        assert_eq!(cache.get(&pool).await.unwrap(), (0, 0));
+
+        // A panic in another request while the lock is held poisons it.
+        let inner = Arc::clone(&cache.inner);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = inner.lock().unwrap();
+            panic!("the counting scan blew up while holding the lock");
+        }))
+        .is_err();
+        assert!(poisoned, "the panic must poison the mutex for this test");
+
+        // The next render still gets its counts.
+        assert_eq!(cache.get(&pool).await.unwrap(), (0, 0));
     }
 
     /// An invalidation reaches the keys the index names, and only those:

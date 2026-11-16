@@ -30,9 +30,12 @@
 //! download must match it (a mismatch leaves the previous database in
 //! place).
 
-use fumox_core::config::{AppConfig, GeoDbKind};
+use fumox_core::config::{AppConfig, GeoConfig, GeoDbKind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use crate::fetcher::redacted_request_error;
+use crate::redact::redact_url;
 
 /// Databases older than this are refreshed at the next start.
 const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -106,17 +109,39 @@ fn all_files() -> [GeoFile; 2] {
 /// `[geo].db_dir`. Called once from `main` before the geo resolver is built.
 pub async fn ensure_geo_databases(config: &AppConfig) {
     let geo = &config.geo;
+    if skip_by_config(geo) || skip_bad_dir(geo) {
+        return;
+    }
+    cleanup_orphan_tmp_files(&geo.db_dir);
+    for file in all_files() {
+        ensure_one_file(geo, &file, &config.fetch.user_agent).await;
+    }
+}
+
+/// The early exits that do not depend on the directory: geo enrichment
+/// switched off, or `[geo].auto_download` off (the files are then the
+/// operator's to provide). Each reason is logged where it is found, and
+/// `true` means the round is skipped.
+fn skip_by_config(geo: &GeoConfig) -> bool {
     if !geo.enabled {
         tracing::debug!("geo enrichment disabled, skipping GeoLite2 database download");
-        return;
+        return true;
     }
     if !geo.auto_download {
         tracing::info!("[geo].auto_download is off; the .mmdb files are provided by hand");
-        return;
+        return true;
     }
+    false
+}
+
+/// The `[geo].db_dir` checks: an empty directory has nowhere to install
+/// the files, and one that cannot be written to would fail at the rename
+/// anyway. Each reason is logged where it is found, and `true` means the
+/// round is skipped.
+fn skip_bad_dir(geo: &GeoConfig) -> bool {
     if geo.db_dir.as_os_str().is_empty() {
         tracing::debug!("[geo].db_dir is empty, skipping GeoLite2 database download");
-        return;
+        return true;
     }
     if let Err(reason) = ensure_writable_dir(&geo.db_dir) {
         tracing::warn!(
@@ -125,33 +150,43 @@ pub async fn ensure_geo_databases(config: &AppConfig) {
             "db_dir is not writable, skipping GeoLite2 database download; \
              provide the .mmdb files manually"
         );
-        return;
+        return true;
     }
-    cleanup_orphan_tmp_files(&geo.db_dir);
+    false
+}
 
-    for file in all_files() {
-        let name = file.kind.file_name();
-        let Some(url) = geo.download_urls.get(name) else {
+/// One slot of the round: resolve the configured URL and pinned checksum
+/// for `file`, run the download, and log the slot's outcome line.
+async fn ensure_one_file(geo: &GeoConfig, file: &GeoFile, user_agent: &str) {
+    let name = file.kind.file_name();
+    let Some(url) = geo.download_urls.get(name) else {
+        tracing::warn!(
+            file = name,
+            "no download URL configured for this database; provide the file by hand"
+        );
+        return;
+    };
+    let checksum = geo.sha256.get(name).map(String::as_str);
+    let outcome = ensure_one(&geo.db_dir, file, url, checksum, user_agent).await;
+    log_outcome(name, outcome);
+}
+
+/// The per-slot log line an [`Outcome`] becomes: up to date, downloaded
+/// (with the byte count), or failed (with the reason and the manual
+/// fallback for the operator).
+fn log_outcome(name: &'static str, outcome: Outcome) {
+    match outcome {
+        Outcome::Fresh => tracing::debug!(file = name, "GeoLite2 database is up to date"),
+        Outcome::Downloaded { bytes } => {
+            tracing::info!(file = name, bytes, "GeoLite2 database downloaded");
+        }
+        Outcome::Failed { reason } => {
             tracing::warn!(
                 file = name,
-                "no download URL configured for this database; provide the file by hand"
+                reason,
+                "GeoLite2 database download failed; will retry on next start; \
+                 provide the .mmdb file in [geo].db_dir manually or change [geo].download_urls"
             );
-            continue;
-        };
-        let checksum = geo.sha256.get(name).map(String::as_str);
-        match ensure_one(&geo.db_dir, &file, url, checksum, &config.fetch.user_agent).await {
-            Outcome::Fresh => tracing::debug!(file = name, "GeoLite2 database is up to date"),
-            Outcome::Downloaded { bytes } => {
-                tracing::info!(file = name, bytes, "GeoLite2 database downloaded");
-            }
-            Outcome::Failed { reason } => {
-                tracing::warn!(
-                    file = name,
-                    reason,
-                    "GeoLite2 database download failed; will retry on next start; \
-                     provide the .mmdb file in [geo].db_dir manually or change [geo].download_urls"
-                );
-            }
         }
     }
 }
@@ -426,7 +461,9 @@ async fn download_and_install(
     // should expect to move, not the exact file size.
     tracing::info!(
         file = %dest.display(),
-        url,
+        // The mirror URL may carry a credential in its query (`?key=`,
+        // `?token=`); redact.rs owns every URL that reaches the log.
+        url = %redact_url(url),
         bytes_hint = MAX_MMDB_BYTES,
         "downloading GeoLite2 database, this may take a few minutes"
     );
@@ -527,7 +564,7 @@ async fn download_body_capped(
             .get(url)
             .send()
             .await
-            .map_err(|err| format!("request failed: {err}"))?;
+            .map_err(|err| format!("request failed: {}", redacted_request_error(&err)))?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("HTTP {status}"));
@@ -551,7 +588,7 @@ async fn download_body_capped(
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|err| format!("download interrupted: {err}"))?
+            .map_err(|err| format!("download interrupted: {}", redacted_request_error(&err)))?
         {
             total += chunk.len() as u64;
             if total > max_bytes {
@@ -637,6 +674,30 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Capture log lines at `max` level and above: the redaction
+    /// assertions read them back instead of matching on internals. Same
+    /// pattern as in the pipeline tests, and the same call-site-interest
+    /// caveat: the registry is pinned to multi-dispatcher and the interests
+    /// rebuilt, so a call site first executed under another test's empty
+    /// dispatcher still logs here.
+    fn capture_logs(
+        max: tracing::Level,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(max)
+            .with_writer(make_writer)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        crate::test_support::stabilize_callsite_interests();
+        tracing::callsite::rebuild_interest_cache();
+        (captured, guard)
     }
 
     #[test]
@@ -1077,6 +1138,74 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("redirect"), "{err}");
         assert!(!dest.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The start-of-download log line names the mirror URL, and the URL the
+    /// operator configured may carry a credential in its query (`?key=`,
+    /// `?token=`): the line must name the redacted URL, like the fetcher's
+    /// log lines do — [`crate::redact`] mandates the redaction on every
+    /// path where a URL reaches the tracing log.
+    #[tokio::test]
+    async fn the_download_log_line_redacts_the_mirror_url() {
+        let (captured, _guard) = capture_logs(tracing::Level::INFO);
+
+        let body = fake_mmdb(b"fresh", CITY);
+        let base = serve_body(body).await;
+        let url = format!("{base}?key=SECRET-VALUE");
+        let dir = scratch_dir();
+        let dest = dir.join("GeoLite2-City.mmdb");
+
+        download_and_install(&dest, &url, CITY, None, "fumox-test")
+            .await
+            .unwrap();
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("SECRET-VALUE"),
+            "the mirror URL is logged raw: {logs}"
+        );
+        assert!(
+            logs.contains("key=[redacted]"),
+            "the log is expected to carry the redacted URL: {logs}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failed download travels into the warn log line as a reason, and a
+    /// reqwest error embeds the requested URL (` for url (...)`): the
+    /// credential in the mirror URL's query must not survive into that
+    /// text either.
+    #[tokio::test]
+    async fn a_failed_download_redacts_the_url_in_the_reason() {
+        // A closed local port: the connect fails fast and deterministically,
+        // and the reqwest error carries the requested URL.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let dir = scratch_dir();
+        let dest = dir.join("GeoLite2-City.mmdb");
+        let reason = download_and_install(
+            &dest,
+            &format!("http://{addr}/GeoLite2-City.mmdb?key=SECRET-VALUE"),
+            CITY,
+            None,
+            "fumox-test",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            !reason.contains("SECRET-VALUE"),
+            "the failure reason embeds the raw URL: {reason}"
+        );
+        assert!(
+            reason.contains("key=[redacted]"),
+            "the reason is expected to carry the redacted URL: {reason}"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

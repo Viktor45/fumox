@@ -852,23 +852,6 @@ async fn the_export_link_points_at_a_host_the_public_listener_accepts() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-/// Build a request with the ConnectInfo extension the rate limiter
-/// needs; a real listener attaches it via
-/// `into_make_service_with_connect_info`.
-fn request(method: &str, uri: &str, body: &str, cookie: Option<&str>) -> Request<Body> {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .extension(ConnectInfo::<SocketAddr>(
-            "127.0.0.1:41000".parse().unwrap(),
-        ));
-    if let Some(cookie) = cookie {
-        builder = builder.header(header::COOKIE, cookie);
-    }
-    builder.body(Body::from(body.to_string())).unwrap()
-}
-
 /// The `HX-Trigger` payload carries its message percent-encoded
 /// (the browser header is decoded as Latin-1), so a test that wants
 /// to read the toast text decodes it first.
@@ -896,21 +879,6 @@ async fn body_text(response: axum::response::Response) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// The `name=value` pair of a `Set-Cookie` header: everything up to the
-/// first attribute separator.
-fn cookie_from_set_cookie(response: &axum::response::Response) -> String {
-    response
-        .headers()
-        .get(header::SET_COOKIE)
-        .expect("the response must set a cookie")
-        .to_str()
-        .expect("the cookie is header-safe")
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string()
-}
-
 async fn login(app: &axum::Router) -> String {
     let response = app
         .clone()
@@ -932,7 +900,7 @@ async fn login(app: &axum::Router) -> String {
         .to_string();
     assert!(set_cookie.starts_with(&format!("{}=", auth::SESSION_COOKIE)));
     assert!(set_cookie.contains("HttpOnly"));
-    cookie_from_set_cookie(&response)
+    cookie_from(&response)
 }
 
 /// [`login`] on a request that names a specific `Host`: the allowlist
@@ -953,7 +921,7 @@ async fn login_with_host(app: &axum::Router, host: &str) -> String {
         .to_string();
     assert!(set_cookie.starts_with(&format!("{}=", auth::SESSION_COOKIE)));
     assert!(set_cookie.contains("HttpOnly"));
-    cookie_from_set_cookie(&response)
+    cookie_from(&response)
 }
 
 fn csrf_for(state: &AdminState, cookie: &str) -> String {
@@ -1406,27 +1374,7 @@ async fn post_without_csrf_is_rejected() {
     let app = router(state.clone());
     let cookie = login(&app).await;
 
-    let source = fumox_core::models::Source {
-        id: "srcA0000000".into(),
-        slug: None,
-        access_token: None,
-        name: "s".into(),
-        url: "https://example.com".into(),
-        enabled: true,
-        encoding: Default::default(),
-        input_format: None,
-        protocols: None,
-        cache_ttl_seconds: 3600,
-        tags: None,
-        pipeline: None,
-        headers: None,
-        ip_family: None,
-        created_at: 1,
-        updated_at: 1,
-        last_fetched_at: None,
-        last_error: None,
-        error_class: None,
-    };
+    let source = fumox_core::models::Source::fixture("srcA0000000", 1);
     fumox_core::repo::sources::create(&pool, &source)
         .await
         .unwrap();
@@ -3998,25 +3946,9 @@ async fn dashboard_aggregates_stats_and_leads_with_source_errors() {
     let now = fumox_core::models::now_ts();
     for id in ["srcS0000001", "srcS0000002"] {
         let source = fumox_core::models::Source {
-            id: id.into(),
-            slug: None,
-            access_token: None,
             name: format!("source {id}"),
             url: "https://example.com/sub".into(),
-            enabled: true,
-            encoding: Default::default(),
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
+            ..fumox_core::models::Source::fixture(id, now)
         };
         fumox_core::repo::sources::create(&pool, &source)
             .await
@@ -4831,6 +4763,41 @@ async fn dry_run_parses_source_without_writing_anything() {
         .await
         .unwrap();
     assert_eq!(log_count, 0);
+}
+
+/// The `/admin/flash` payload must stay valid JSON whatever a producer
+/// parked in the store. Today's only producer percent-encodes the message
+/// (`header_safe`), so the quote-free guarantee lives in that discipline
+/// alone; the store itself accepts anything, and a message that bypassed
+/// the encoding (parked here directly) must not hand the client a body
+/// its `response.json()` cannot read.
+#[tokio::test]
+async fn a_flash_message_with_quotes_still_answers_valid_json() {
+    let (_dir, state) = test_state(1000).await;
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let session = cookie
+        .split_once('=')
+        .map(|(_, value)| value.to_string())
+        .unwrap_or_default();
+
+    // A producer that skipped `header_safe`: the message carries the very
+    // characters a hand-built JSON envelope cannot survive.
+    let message = r#"He said "hi" \ done"#.to_string();
+    state
+        .flashes
+        .put(&session, message.clone(), flash::FlashLevel::Ok);
+
+    let response = app
+        .oneshot(request("GET", "/admin/flash", "", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).expect("the flash payload must be valid JSON");
+    assert_eq!(json["message"].as_str().expect("a message"), message);
+    assert_eq!(json["level"].as_str().expect("a level"), "ok");
 }
 
 /// The stream forwards bus events verbatim: publishing a fetch event
@@ -5852,27 +5819,11 @@ async fn dashboard_top_failures_panel_aggregates_the_fresh_failures_only() {
 
 /// A minimal enabled source fixture for repo writes.
 fn test_source(id: &str, slug: &str) -> fumox_core::models::Source {
-    let now = fumox_core::models::now_ts();
     fumox_core::models::Source {
-        id: id.into(),
         slug: Some(slug.into()),
-        access_token: None,
         name: format!("source {slug}"),
         url: "https://example.com/sub".into(),
-        enabled: true,
-        encoding: Default::default(),
-        input_format: None,
-        protocols: None,
-        cache_ttl_seconds: 3600,
-        tags: None,
-        pipeline: None,
-        headers: None,
-        ip_family: None,
-        created_at: now,
-        updated_at: now,
-        last_fetched_at: None,
-        last_error: None,
-        error_class: None,
+        ..fumox_core::models::Source::fixture(id, fumox_core::models::now_ts())
     }
 }
 
@@ -7934,25 +7885,9 @@ async fn saving_a_profile_in_the_panel_refreshes_the_public_subscription() {
     let (_dir, state) = test_state(1000).await;
     let now = fumox_core::models::now_ts();
     let source = fumox_core::models::Source {
-        id: "srcS0000000".into(),
-        slug: None,
-        access_token: None,
         name: "source".into(),
         url: "https://example.com/sub".into(),
-        enabled: true,
-        encoding: Default::default(),
-        input_format: None,
-        protocols: None,
-        cache_ttl_seconds: 3600,
-        tags: None,
-        pipeline: None,
-        headers: None,
-        ip_family: None,
-        created_at: now,
-        updated_at: now,
-        last_fetched_at: None,
-        last_error: None,
-        error_class: None,
+        ..fumox_core::models::Source::fixture("srcS0000000", now)
     };
     fumox_core::repo::sources::create(&state.pool, &source)
         .await
@@ -8263,6 +8198,83 @@ async fn source_update_redirects_an_htmx_call_and_a_browser_differently() {
         response.headers().get("HX-Redirect").is_none(),
         "a plain browser must not be handed an HX-Redirect header"
     );
+}
+
+/// The 422 re-render of a failed edit keeps both mask notes on the
+/// stored row, not on the posted form: a source with stored headers and
+/// a token re-renders with both hints, a source without them with
+/// neither, and a rejected form writes nothing.
+#[tokio::test]
+async fn a_failed_source_update_renders_the_mask_notes_from_the_stored_row() {
+    let (_dir, state) = test_state(1000).await;
+    let mut masked = test_source("srcNote0001", "note-masked");
+    masked.headers = Some(
+        [("X-Token", "hush")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    );
+    masked.access_token = Some("tok".into());
+    fumox_core::repo::sources::create(&state.pool, &masked)
+        .await
+        .unwrap();
+    // The stored token is the hashed form the repo keeps on write.
+    let stored_token = fumox_core::repo::sources::get(&state.pool, "srcNote0001")
+        .await
+        .unwrap()
+        .unwrap()
+        .access_token
+        .unwrap();
+    assert!(stored_token.starts_with("sha256$"), "{stored_token}");
+    let plain = seed_source(&state, "srcNote0002", "note-plain").await;
+
+    let app = router(state.clone());
+    let cookie = login(&app).await;
+    let csrf = csrf_for(&state, &cookie);
+
+    // The TTL is out of range: the edit comes back with 422.
+    for (source, masked_row) in [(&masked, true), (&plain, false)] {
+        let body = urlencoded(&[
+            ("_csrf", &csrf),
+            ("name", source.name.as_str()),
+            ("slug", source.slug.as_deref().unwrap_or_default()),
+            ("url", source.url.as_str()),
+            ("cache_ttl_seconds", "5"),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!("/admin/sources/{}/edit", source.id),
+                &body,
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let html = body_text(response).await;
+        assert_eq!(
+            html.contains("Значения скрыты маской"),
+            masked_row,
+            "{}: the headers note must follow the stored row",
+            source.id
+        );
+        assert_eq!(
+            html.contains("Токен хранится в виде хэша"),
+            masked_row,
+            "{}: the token note must follow the stored row",
+            source.id
+        );
+    }
+
+    // Neither rejected attempt touched the rows.
+    let stored = fumox_core::repo::sources::get(&state.pool, "srcNote0001")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.headers.as_ref().unwrap()["X-Token"], "hush");
+    assert_eq!(stored.access_token.as_deref(), Some(stored_token.as_str()));
+    assert_eq!(stored.cache_ttl_seconds, 3600);
 }
 
 /// L-139: the delete of a source retires the proxies it fed — but only

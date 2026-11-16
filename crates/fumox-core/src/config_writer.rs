@@ -1132,7 +1132,18 @@ fn can_create_in_with(
         );
         return Ok(Writability::ReadOnlyMode);
     }
-    match probe(dir) {
+    dir_probe_verdict(dir, probe(dir))
+}
+
+/// The verdict on a probe write into `dir`: a created probe and a
+/// taken probe name both mean the directory accepts new files, a
+/// read-only-filesystem refusal is the read-only-mount answer, any
+/// other refusal is reported as-is. Every refusal is logged.
+fn dir_probe_verdict(
+    dir: &Path,
+    probe: Result<(), std::io::Error>,
+) -> Result<Writability, std::io::Error> {
+    match probe {
         Ok(()) => Ok(Writability::Writable),
         // The probe name is taken: somebody else managed to create a
         // file in this directory, which is the very question asked.
@@ -1180,29 +1191,6 @@ fn create_probe_file(dir: &Path) -> std::io::Result<()> {
         .map(drop)?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
-}
-
-/// Create `path` with `contents` and mode `0600`.
-///
-/// The config file can carry `[admin].token`, so it must never exist
-/// world-readable, not even for the moment between the create and a
-/// later chmod. The mode is therefore set at creation time.
-///
-/// On non-Unix platforms the platform's ACL model governs and the mode
-/// is not applied.
-pub fn create_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()
 }
 
 /// Write `contents` to `path` through the same atomic path a save
@@ -1638,24 +1626,6 @@ mod tests {
             0o600,
             "a fresh config must not be readable by others"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The *Create from defaults* path writes the reference config through
-    /// the same helper, with the same mode.
-    #[cfg(unix)]
-    #[test]
-    fn create_private_file_writes_with_mode_0600() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tmp_dir("create-private");
-        let path = dir.join("app.toml");
-        create_private_file(&path, REFERENCE_CONFIG).unwrap();
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        assert!(std::fs::read_to_string(&path).unwrap().contains("[server]"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2265,22 +2235,11 @@ mod tests {
         let updated = b"[server]\nbind = \"127.0.0.1:9999\"\n";
         std::fs::write(&tmp, updated).unwrap();
 
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = std::sync::Arc::clone(&captured);
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
+        let (make_writer, captured) = crate::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::ERROR)
-            .with_writer(move || Captured(std::sync::Arc::clone(&writer)))
+            .with_writer(make_writer)
             .finish();
 
         let no_rename = |_: &Path, _: &Path| -> std::io::Result<()> {
@@ -2533,22 +2492,11 @@ mod tests {
         let path = dir.join("app.toml");
         std::fs::write(&path, "[server]\nbind = \"0.0.0.0:8080\"\n").unwrap();
 
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = std::sync::Arc::clone(&captured);
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
+        let (make_writer, captured) = crate::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::WARN)
-            .with_writer(move || Captured(std::sync::Arc::clone(&writer)))
+            .with_writer(make_writer)
             .finish();
 
         let always_fails = |_: &Path| -> std::io::Result<()> {

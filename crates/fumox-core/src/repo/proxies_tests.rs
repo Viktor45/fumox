@@ -2,7 +2,7 @@ use super::*;
 use crate::ingest::IngestPolicy;
 use crate::models::ProxyStatus;
 use crate::models::Scheme;
-use crate::models::{Encoding, Source};
+use crate::models::Source;
 use crate::repo::sources as sources_repo;
 use crate::repo::tests::temp_pool;
 
@@ -46,33 +46,9 @@ async fn make_source(pool: &DbPool, id: &str) {
 /// read the name the card resolves: a name distinct from the id is what
 /// keeps such an assertion from passing on the id alone.
 async fn make_source_named(pool: &DbPool, id: &str, name: &str) {
-    let now = crate::models::now_ts();
-    sources_repo::create(
-        pool,
-        &Source {
-            id: id.to_string(),
-            slug: None,
-            access_token: None,
-            name: name.into(),
-            url: "https://example.com".into(),
-            enabled: true,
-            encoding: Encoding::Auto,
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
-        },
-    )
-    .await
-    .unwrap();
+    let mut source = Source::fixture(id, crate::models::now_ts());
+    source.name = name.into();
+    sources_repo::create(pool, &source).await.unwrap();
 }
 
 /// The staged probe state of a row, named so the call sites read as
@@ -1016,7 +992,11 @@ async fn quarantined_linger_survives_the_next_refresh() {
 /// The gate itself still works: with `keep_alive_linger = false`
 /// (`drop_gate = true` on a source with drop rules) the sweep is not
 /// skipped, so a proxy that vanished from the feed is unlinked and
-/// retired as before.
+/// retired as before. The retire is a "move to removed" transition like
+/// any other: the fixture row sits in `quarantine` on a live recheck
+/// ladder when the feed drops it, and the ladder bookkeeping has to go
+/// with the retirement (a stale `ladder_at` on a `removed` row describes
+/// a schedule nobody walks any more).
 #[tokio::test]
 async fn drop_gate_still_retires_proxies_that_left_the_feed() {
     let (_dir, pool) = temp_pool().await;
@@ -1032,7 +1012,18 @@ async fn drop_gate_still_retires_proxies_that_left_the_feed() {
     )
     .await
     .unwrap();
-    set_status_by_fingerprint(&pool, &e.fingerprint(), "quarantine").await;
+    let now = crate::models::now_ts();
+    set_status_columns_by_fingerprint(
+        &pool,
+        &e.fingerprint(),
+        "quarantine",
+        &[
+            ("quarantined_at", now),
+            ("ladder_at", now + 100),
+            ("ladder_step", 2),
+        ],
+    )
+    .await;
 
     let stats = reconcile_source(
         &pool,
@@ -1046,7 +1037,23 @@ async fn drop_gate_still_retires_proxies_that_left_the_feed() {
     .unwrap();
     assert_eq!(stats.unlinked, 1);
     assert_eq!(stats.removed, 1);
-    assert_eq!(status_of(&pool, &e).await.status, "removed");
+    let row = get_by_fingerprint(&pool, &e.fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "removed");
+    assert_eq!(
+        row.quarantined_at, None,
+        "the retired row must not keep its quarantine stamp"
+    );
+    assert_eq!(
+        row.ladder_at, None,
+        "the retired row must not keep its recheck schedule"
+    );
+    assert_eq!(
+        row.ladder_step, 0,
+        "the retired row must not keep its ladder step"
+    );
 }
 
 #[tokio::test]

@@ -1430,7 +1430,10 @@ async fn meow_config_permissions_are_reasserted_on_an_existing_file() {
 /// every payload change.
 #[test]
 fn heartbeat_payload_reports_the_effective_beat_and_cycle_periods() {
-    let payload: serde_json::Value = serde_json::from_str(&heartbeat_payload(30, 60)).unwrap();
+    let payload = serde_json::from_str::<serde_json::Value>(
+        &heartbeat_payload(30, 60).expect("the heartbeat payload serializes"),
+    )
+    .unwrap();
     assert_eq!(payload["interval_secs"], 30);
     assert_eq!(payload["cycle_interval_secs"], 60);
     assert!(payload["ts"].as_i64().is_some());
@@ -1438,7 +1441,9 @@ fn heartbeat_payload_reports_the_effective_beat_and_cycle_periods() {
     assert!(payload["version"].as_str().is_some());
     // The same payload parses back through the shared contract with
     // the reported periods intact.
-    let hb: probe_repo::meta::Heartbeat = serde_json::from_str(&heartbeat_payload(30, 60)).unwrap();
+    let hb: probe_repo::meta::Heartbeat =
+        serde_json::from_str(&heartbeat_payload(30, 60).expect("the heartbeat payload serializes"))
+            .unwrap();
     assert_eq!(hb.interval_secs, Some(30));
     assert_eq!(hb.cycle_interval_secs, Some(60));
     assert_eq!(hb.pid, std::process::id());
@@ -1599,6 +1604,72 @@ async fn quarantine_due_check_runs_after_second_chance_and_removes_after_ladder(
     let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
     assert_eq!(row.status, "removed");
     assert!(row.removed_at.is_some());
+}
+
+/// A quarantined row the stored data cannot describe (an unknown scheme
+/// here; the same skip covers an out-of-range port and unparseable
+/// parameters) can never converge on its own: a skip that leaves the
+/// ladder where it was brings the row back due every cycle and spends
+/// the quarantine quota on a verdict it can never get. The skip is a
+/// failed recheck now: it is journaled and the ladder advances — removal
+/// after the last configured step — the same verdict the revival-class
+/// handlers make.
+#[tokio::test]
+async fn an_unverifiable_quarantine_row_walks_the_ladder_to_removal() {
+    let (_dir, pool) = temp_pool().await;
+
+    // A scheme the parser does not know: the stored row cannot be
+    // checked, whatever its parameters say.
+    let id = seed_proxy(&pool, "bogus", "127.0.0.1", 443, "quarantine").await;
+    // Second chance already due (in the past).
+    sqlx::query(
+        "UPDATE proxies SET quarantined_at = 100, ladder_at = 200, ladder_step = 0 WHERE id = ?",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_dir, config) = test_config_with_dir(3, "127.0.0.1:1");
+    let ctx = Arc::new(
+        Context::new(config, pool.clone())
+            .await
+            .expect("test context"),
+    );
+
+    // Each cycle advances one ladder step; the due moment is set back
+    // into the past, so consecutive cycles walk the whole ladder.
+    for (due_at, expected_step) in [(200, 1), (300, 2), (400, 3)] {
+        sqlx::query("UPDATE proxies SET ladder_at = ? WHERE id = ?")
+            .bind(due_at)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_cycle(ctx.clone()).await.unwrap();
+        let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "quarantine");
+        assert_eq!(
+            row.ladder_step, expected_step,
+            "the skip must advance the ladder"
+        );
+        assert!(row.ladder_at.is_some());
+    }
+
+    // Past the last step, the final failed recheck removes the row.
+    sqlx::query("UPDATE proxies SET ladder_at = 500 WHERE id = ?")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    run_cycle(ctx).await.unwrap();
+    let row = proxies::get_by_id(&pool, id).await.unwrap().unwrap();
+    assert_eq!(row.status, "removed");
+    assert!(row.removed_at.is_some());
+
+    // Every skip is journaled as the failed recheck it counts as.
+    let error = last_probe_error(&pool, id, Some("tcp")).await;
+    assert!(error.contains("unknown scheme"), "{error}");
 }
 
 /// A quarantined hysteria2 row is revived by the T2 tunnel check, not a T1
@@ -2599,6 +2670,45 @@ async fn the_meow_backoff_survives_a_restart() {
         version_calls.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "the restarted daemon must not contact meow-rs during the saved pause"
+    );
+}
+
+/// A saved backoff stamp that does not parse must not disappear silently:
+/// `retry_at` gates the T2 lanes, so a value lost without a word would
+/// send a restarted daemon at a still-down engine. The fallback reads as
+/// the honest zero — and says so, naming the key it dropped.
+#[test]
+fn a_corrupted_meow_backoff_stamp_falls_back_loudly() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let logged = capture_log(|| {
+        runtime.block_on(async {
+            let (_dir, pool) = temp_pool().await;
+            meta_set(&pool, probe_repo::meta::MEOW_RETRY_AT_KEY, "not-a-number")
+                .await
+                .unwrap();
+            meta_set(&pool, probe_repo::meta::MEOW_BACKOFF_SECS_KEY, "1800s")
+                .await
+                .unwrap();
+            let (retry_at, backoff) = restore_meow_backoff(&pool).await.unwrap();
+            assert_eq!(retry_at, 0, "an unparseable gate stamp reads as absent");
+            assert_eq!(backoff, 0, "an unparseable length reads as absent");
+        });
+    });
+    assert!(
+        logged.contains("does not parse"),
+        "the fallback must be logged, not silent: {logged}"
+    );
+    // Both keys are named, so the operator knows which stamp was dropped.
+    assert!(
+        logged.contains(probe_repo::meta::MEOW_RETRY_AT_KEY),
+        "the gate key must be named: {logged}"
+    );
+    assert!(
+        logged.contains(probe_repo::meta::MEOW_BACKOFF_SECS_KEY),
+        "the length key must be named: {logged}"
     );
 }
 

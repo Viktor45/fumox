@@ -21,7 +21,9 @@
 
 // The freshness cap lives once, next to the cache it governs: the same
 // window `/sub`, `/src` and the alive exports serve under.
-use crate::cache::{Caches, InlineClaim, InlineOutcome, RENDER_FRESHNESS_CAP_SECS, Rendered};
+use crate::cache::{
+    Caches, InlineClaim, InlineOutcome, InlineRenderGuard, RENDER_FRESHNESS_CAP_SECS, Rendered,
+};
 use crate::pipeline::{self, Candidate, CompiledPipeline, PipelineIssue};
 use crate::security::{ClientKeySource, RateLimiter, client_key, fmt_rfc3339_utc};
 use axum::Router;
@@ -317,11 +319,7 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
         // Warn once per client key per window, debug after: a scraping
         // burst must be visible without one line per 429. The client key
         // is the only identity named — no token, no query string.
-        if should_warn_rate_limit(&ip) {
-            tracing::warn!(client = %ip, "public rate-limit window exhausted");
-        } else {
-            tracing::debug!(client = %ip, "public rate-limit window exhausted");
-        }
+        log_rate_limit_refusal(&ip);
         return error_response_with_retry(
             StatusCode::TOO_MANY_REQUESTS,
             "too many requests, try again later",
@@ -329,6 +327,12 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
         );
     }
     let response = next.run(req).await;
+    post_response_limit(&state, &ip, response).await
+}
+
+/// The response-side half of [`public_rate_limit`]: log a failed secret
+/// check the handler marked, then apply the auth-failure window to a 403.
+async fn post_response_limit(state: &AppState, ip: &str, response: Response) -> Response {
     if let Some(check) = response.extensions().get::<AuthFailure>().copied() {
         // A failed secret check on a public route (profile access token,
         // source access token, export capability token): warn once per
@@ -336,19 +340,15 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
         // shared warn registry gives the host gate, so a token-guessing
         // campaign is visible without one log line per request. The client
         // key is logged, never the rejected token value.
-        if should_warn_auth_failure(&ip) {
-            tracing::warn!(client = %ip, check = check.0, "public secret check failed");
-        } else {
-            tracing::debug!(client = %ip, check = check.0, "public secret check failed");
-        }
+        log_auth_failure(ip, check.0);
     }
     if response.status() == StatusCode::FORBIDDEN
-        && let Some(retry_after) = state.limits.auth_failures.check(&ip).await.err()
+        && let Some(retry_after) = state.limits.auth_failures.check(ip).await.err()
     {
         // The failure window rejected the request, give the hit back to the
         // generous window so one brute-force attempt does not cost the
         // caller two windows.
-        state.limits.all.refund(&ip).await;
+        state.limits.all.refund(ip).await;
         tracing::warn!(
             client = %ip,
             "auth-failure rate limit window exhausted; rejecting the request"
@@ -360,6 +360,30 @@ async fn public_rate_limit(State(state): State<AppState>, req: Request, next: Ne
         );
     }
     response
+}
+
+/// Log one refusal by the shared public window: warn once per client key
+/// per window, debug after (a scraping burst must be visible without one
+/// line per 429). The client key is the only identity named — no token,
+/// no query string.
+fn log_rate_limit_refusal(ip: &str) {
+    if should_warn_rate_limit(ip) {
+        tracing::warn!(client = %ip, "public rate-limit window exhausted");
+    } else {
+        tracing::debug!(client = %ip, "public rate-limit window exhausted");
+    }
+}
+
+/// Log one failed secret check with the same per-window coalescing as
+/// [`log_rate_limit_refusal`] (the [`AUTH_FAIL_LOG`] registry): warn once
+/// per client key per window, debug after. The checked token itself is
+/// never logged, only which check rejected it.
+fn log_auth_failure(ip: &str, check: &'static str) {
+    if should_warn_auth_failure(ip) {
+        tracing::warn!(client = %ip, check, "public secret check failed");
+    } else {
+        tracing::debug!(client = %ip, check, "public secret check failed");
+    }
 }
 
 /// Response extension a handler attaches when it rejected a request on a
@@ -721,83 +745,102 @@ where
             );
             return to_response(&rendered);
         }
-        if let Some(claim) = state.caches.try_start_revalidate(&key).await {
-            let state = state.clone();
-            let key = key.clone();
-            let generation = claim.generation();
-            tokio::spawn(async move {
-                // The claim is released when `claim` drops, panic included.
-                let _claim = claim;
-                // The same deadline the leader of an inline render gets: a
-                // background re-render that wedges must not hold the claim
-                // forever, or the key would never be revalidated again.
-                match tokio::time::timeout(WAIT_FOR_LEADER, make_render()).await {
-                    Ok(Ok(rendered)) => {
-                        // An invalidation that landed while this render ran
-                        // supersedes it: storing pre-change data with a full
-                        // TTL would resurrect the very staleness the
-                        // invalidation ended.
-                        if state
-                            .caches
-                            .processed_put_guarded(&key, Arc::new(rendered), generation)
-                            .await
-                            .is_none()
-                        {
-                            tracing::debug!(
-                                key = %key,
-                                "revalidation result dropped: the key was invalidated while rendering"
-                            );
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        // An unrecoverable upstream answer is the endpoint's
-                        // answer now: drop the snapshot so the next request
-                        // re-renders and returns the upstream status instead
-                        // of the last good body with frozen headers.
-                        if err.drop_cached {
-                            state.caches.processed_invalidate(&key).await;
-                        }
-                        tracing::warn!(key = %key, status = %err.status, "revalidation failed");
-                    }
-                    Err(_) => {
-                        // The claim drops with the task, so the next request
-                        // can start a revalidation again.
-                        tracing::warn!(
-                            key = %key,
-                            deadline_secs = WAIT_FOR_LEADER.as_secs(),
-                            "revalidation timed out; the cached snapshot stays until the next attempt"
-                        );
-                    }
-                }
-            });
-        }
-        tracing::debug!(
-            key = %key,
-            elapsed_ms = serve_started.elapsed().as_millis() as u64,
-            outcome = "stale",
-            "stale snapshot served while a re-render runs"
-        );
-        return to_response(&rendered);
+        return stale_serve(state, key, rendered, serve_started, make_render).await;
     }
+    cold_serve(state, key, key_sources, make_render, serve_started).await
+}
 
-    // Cold key: claim the render so a burst of requests on a
-    // just-invalidated key runs one render instead of one per request.
-    // The leader renders; a waiter wakes when the leader's claim ends and
-    // serves the stored entry, claiming its own render only when the
-    // leader stored none. A leader that *failed* publishes the failure, so
-    // a broken upstream costs one render rather than one per waiter.
-    // Claiming before rendering stays mandatory for the same reason as
-    // before: this key has no entry, so without the claim an invalidation
-    // landing now would not see it and the put below would store
-    // pre-change rows as fresh for a full TTL.
-    //
-    // The claim's sources are resolved once, here: the waiter loop can run
-    // several times and the lookup is a database query.
-    let claim_sources = key_sources().await;
+/// The stale half of [`serve_cached`]: the stale snapshot is the answer
+/// while a background re-render refreshes the entry behind it. The
+/// re-render is single-flighted through the cache's revalidation claim;
+/// the claim is released when the task ends, panic included.
+async fn stale_serve<F, Fut>(
+    state: &AppState,
+    key: String,
+    rendered: Arc<Rendered>,
+    serve_started: Instant,
+    make_render: F,
+) -> Response
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Rendered, ErrorReply>> + Send + 'static,
+{
+    if let Some(claim) = state.caches.try_start_revalidate(&key).await {
+        tokio::spawn(revalidate_stale(
+            state.clone(),
+            key.clone(),
+            claim,
+            make_render,
+        ));
+    }
+    tracing::debug!(
+        key = %key,
+        elapsed_ms = serve_started.elapsed().as_millis() as u64,
+        outcome = "stale",
+        "stale snapshot served while a re-render runs"
+    );
+    to_response(&rendered)
+}
+
+/// The body of the background re-render task [`stale_serve`] spawns: a
+/// re-render whose `drop_cached` failure is the unrecoverable upstream
+/// verdict invalidates the snapshot (the next request answers with the
+/// upstream status, not the last good body), anything else leaves the
+/// snapshot in place for the next stale request to retry.
+async fn revalidate_stale<F, Fut>(
+    state: AppState,
+    key: String,
+    claim: crate::cache::RevalidateGuard,
+    make_render: F,
+) where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Rendered, ErrorReply>> + Send + 'static,
+{
+    let generation = claim.generation();
+    let _claim = claim;
+    match tokio::time::timeout(WAIT_FOR_LEADER, make_render()).await {
+        Ok(Ok(rendered)) => {
+            if state
+                .caches
+                .processed_put_guarded(&key, Arc::new(rendered), generation)
+                .await
+                .is_none()
+            {
+                tracing::debug!(
+                    key = %key,
+                    "revalidation result dropped: the key was invalidated while rendering"
+                );
+            }
+        }
+        Ok(Err(err)) => {
+            if err.drop_cached {
+                state.caches.processed_invalidate(&key).await;
+            }
+            tracing::warn!(key = %key, status = %err.status, "revalidation failed");
+        }
+        Err(_) => {}
+    }
+}
+
+/// The outcome of asking for a cold render claim: either this request now
+/// leads the render, or a ready answer was produced without rendering
+/// (a published failure verdict, a fresh entry another leader stored, or
+/// a leader that did not finish in time).
+enum ColdClaim {
+    Leader(InlineRenderGuard),
+    Answered(Response),
+}
+
+/// Acquire the inline-render claim of a cold key
+/// ([`Caches::begin_inline_render`]): loop until this request leads
+/// ([`ColdClaim::Leader`]) or a render already in flight resolves into an
+/// answer instead (the `Failed` verdict repeated, a leader that did not
+/// finish in time, or a fresh entry the leader stored).
+async fn claim_cold_render(state: &AppState, key: &str, claim_sources: &[String]) -> ColdClaim {
     let claim = loop {
         match state
             .caches
-            .begin_inline_render(&key, claim_sources.clone())
+            .begin_inline_render(key, claim_sources.to_vec())
             .await
         {
             InlineClaim::Leader(claim) => break claim,
@@ -805,7 +848,7 @@ where
             // answer, a second render would fail the same way.
             InlineClaim::Failed { status, message } => {
                 let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-                return retryable_render_error(status, &message);
+                return ColdClaim::Answered(retryable_render_error(status, &message));
             }
             InlineClaim::Wait(mut ended) => {
                 // The leader's guard drop is the wake-up. The channel then
@@ -819,27 +862,63 @@ where
                     // lock, say). Answering beats parking the connection
                     // for as long as the leader lives.
                     tracing::warn!(key = %key, "inline render leader did not finish in time");
-                    return error_response_with_retry(
+                    return ColdClaim::Answered(error_response_with_retry(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "render in progress, try again",
                         RENDER_RETRY_AFTER_SECS,
-                    );
+                    ));
                 }
                 match ended.borrow_and_update().clone() {
                     InlineOutcome::Failed { status, message } => {
                         let status =
                             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-                        return retryable_render_error(status, &message);
+                        return ColdClaim::Answered(retryable_render_error(status, &message));
                     }
                     InlineOutcome::Stored => {}
                 }
-                if let Some(rendered) = state.caches.processed_get(&key).await
+                if let Some(rendered) = state.caches.processed_get(key).await
                     && rendered.is_fresh(fumox_core::models::now_ts())
                 {
-                    return to_response(&rendered);
+                    return ColdClaim::Answered(to_response(&rendered));
                 }
+                // Nothing fresh stored: claim the render again, the key
+                // still has no entry to serve.
             }
         }
+    };
+    ColdClaim::Leader(claim)
+}
+
+/// The cold half of [`serve_cached`]: a cache miss renders inline,
+/// single-flighted through the cache's inline-render claim. Cold key:
+/// claim the render so a burst of requests on a just-invalidated key runs
+/// one render instead of one per request. A leader that *failed*
+/// publishes the failure, so a broken upstream costs one render rather
+/// than one per waiter.
+async fn cold_serve<F, Fut, S, SFut>(
+    state: &AppState,
+    key: String,
+    key_sources: S,
+    make_render: F,
+    serve_started: Instant,
+) -> Response
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Rendered, ErrorReply>> + Send + 'static,
+    S: FnOnce() -> SFut,
+    SFut: Future<Output = Vec<String>>,
+{
+    // Claiming before rendering stays mandatory for the same reason as
+    // before: this key has no entry, so without the claim an invalidation
+    // landing now would not see it and the put below would store
+    // pre-change rows as fresh for a full TTL.
+    //
+    // The claim's sources are resolved once, here: the waiter loop can run
+    // several times and the lookup is a database query.
+    let claim_sources = key_sources().await;
+    let claim = match claim_cold_render(state, &key, &claim_sources).await {
+        ColdClaim::Answered(response) => return response,
+        ColdClaim::Leader(claim) => claim,
     };
     let generation = claim.generation();
     // The leader gets the same deadline as its waiters: without one it can
@@ -856,34 +935,64 @@ where
             rendered
         }
         Ok(Err(err)) => {
-            tracing::warn!(key = %key, status = %err.status, "inline render failed");
-            claim.fail(err.status.as_u16(), err.message.clone());
+            let response = publish_inline_failure(&key, &claim, &err);
             drop(claim);
-            return retryable_render_error(err.status, &err.message);
+            return response;
         }
         Err(_) => {
-            tracing::warn!(
-                key = %key,
-                deadline_secs = WAIT_FOR_LEADER.as_secs(),
-                "inline render timed out"
-            );
-            claim.fail(
-                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                "render timed out".to_string(),
-            );
+            let response = publish_inline_timeout(&key, &claim);
             drop(claim);
-            return error_response_with_retry(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "render timed out",
-                RENDER_RETRY_AFTER_SECS,
-            );
+            return response;
         }
     };
-    let rendered = Arc::new(rendered);
+    let response = store_cold_render(state, &key, Arc::new(rendered), generation).await;
+    drop(claim);
+    response
+}
+
+/// The leader's render returned an error: publish it on the claim (so the
+/// waiters answer from the verdict instead of each re-running a render
+/// that is known to fail), then answer the leader with it.
+fn publish_inline_failure(key: &str, claim: &InlineRenderGuard, err: &ErrorReply) -> Response {
+    tracing::warn!(key = %key, status = %err.status, "inline render failed");
+    claim.fail(err.status.as_u16(), err.message.clone());
+    retryable_render_error(err.status, &err.message)
+}
+
+/// The leader's render did not finish within the shared deadline: publish
+/// a retryable timeout verdict on the claim, then answer the leader with
+/// it.
+fn publish_inline_timeout(key: &str, claim: &InlineRenderGuard) -> Response {
+    tracing::warn!(
+        key = %key,
+        deadline_secs = WAIT_FOR_LEADER.as_secs(),
+        "inline render timed out"
+    );
+    claim.fail(
+        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+        "render timed out".to_string(),
+    );
+    error_response_with_retry(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "render timed out",
+        RENDER_RETRY_AFTER_SECS,
+    )
+}
+
+/// Store a successful cold render (200 only, generation-guarded so an
+/// invalidation that landed mid-render supersedes it) and answer with
+/// what the cache holds afterwards: the stored entry, or the render
+/// itself when the status is not cacheable or the put was refused.
+async fn store_cold_render(
+    state: &AppState,
+    key: &str,
+    rendered: Arc<Rendered>,
+    generation: u64,
+) -> Response {
     let cached = if rendered.status == 200 {
         let stored = state
             .caches
-            .processed_put_guarded(&key, rendered.clone(), generation)
+            .processed_put_guarded(key, rendered.clone(), generation)
             .await;
         if stored.is_none() {
             tracing::debug!(
@@ -895,7 +1004,6 @@ where
     } else {
         None
     };
-    drop(claim);
     to_response(cached.as_ref().unwrap_or(&rendered))
 }
 
@@ -903,53 +1011,28 @@ where
 /// `limit.count`) → merge → dedup → sort → profile-level cap → encode,
 /// with the serving outcome policy.
 async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, ErrorReply> {
-    let links = profiles::get_sources(&state.pool, &profile.id)
-        .await
-        .map_err(|err| ErrorReply::internal(&format!("sub:{}", profile.id), err))?;
-
-    // Load member sources in profile order with one `WHERE id IN (...)`
-    // read: the per-member indexed fetch this replaced ran one query per
-    // source, on the public serving path once per cold render. Disabled or
-    // vanished sources drop out of the output.
-    let member_ids: Vec<&str> = links
-        .iter()
-        .map(|(source_id, _)| source_id.as_str())
-        .collect();
-    let loaded = sources::get_many(&state.pool, &member_ids)
-        .await
-        .map_err(|err| ErrorReply::internal(&format!("sub:{}", profile.id), err))?;
-    let mut members: Vec<(Source, Arc<CompiledPipeline>)> = Vec::new();
-    for (source_id, _position) in links {
-        let Some(source) = loaded.get(&source_id) else {
-            continue;
-        };
-        if !source.enabled {
-            continue;
-        }
-        let merged = pipeline::merge_configs(source.pipeline.as_ref(), profile.pipeline.as_ref());
-        let compiled = CompiledPipeline::from_json_cached(merged.as_ref()).map_err(|errors| {
-            ErrorReply::corrupted_pipeline(&format!("sub:{}", profile.id), &errors)
-        })?;
-        members.push((source.clone(), compiled));
-    }
+    // The target of this render (`sub:{profile_id}`, the same identifier
+    // the cache and the invalidations use): every failure below names it.
+    let target = format!("sub:{}", profile.id);
+    let members = load_sub_members(state, profile, &target).await?;
 
     // An unrecoverable source error short-circuits the whole profile to
     // the upstream status code, not cached.
-    for (source, _) in &members {
-        if source.error_class == Some(ErrorClass::HttpClient) {
-            return Err(upstream_unavailable_reply(state, source).await);
-        }
+    if let Some(source) = members
+        .iter()
+        .map(|(source, _)| source)
+        .find(|source| source.error_class == Some(ErrorClass::HttpClient))
+    {
+        return Err(upstream_unavailable_reply(state, source).await);
     }
 
-    let profile_pipeline =
-        CompiledPipeline::from_json_cached(profile.pipeline.as_ref()).map_err(|errors| {
-            ErrorReply::corrupted_pipeline(&format!("sub:{}", profile.id), &errors)
-        })?;
+    let profile_pipeline = CompiledPipeline::from_json_cached(profile.pipeline.as_ref())
+        .map_err(|errors| ErrorReply::corrupted_pipeline(&target, &errors))?;
 
     let source_ids: Vec<String> = members.iter().map(|(s, _)| s.id.clone()).collect();
     let rows = proxies::list_with_source(&state.pool, &source_ids)
         .await
-        .map_err(|err| ErrorReply::internal(&format!("sub:{}", profile.id), err))?;
+        .map_err(|err| ErrorReply::internal(&target, err))?;
     let mut by_source: HashMap<String, Vec<proxies::ProxyRow>> = HashMap::new();
     for linked in rows {
         by_source
@@ -958,72 +1041,11 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
             .push(linked.proxy);
     }
 
-    // Profile-level country allowlist: when the profile lists
-    // countries, only proxies whose stored geo fact matches are served.
-    // Proxies without a determined country stay out while the filter is
-    // active, "only these countries" means confirmed facts, not guesses.
-    let allowed_countries: Option<std::collections::HashSet<String>> =
-        if profile.countries.is_empty() {
-            None
-        } else {
-            Some(
-                profile
-                    .countries
-                    .iter()
-                    .map(|code| code.trim().to_ascii_uppercase())
-                    .filter(|code| !code.is_empty())
-                    .collect(),
-            )
-        };
-
-    let mut all: Vec<Candidate> = Vec::new();
-    let mut loaded_statuses: Vec<ProxyStatus> = Vec::new();
-    let mut any_stale = false;
-    let mut any_parse_error = false;
-    let mut skipped = SkippedRows::default();
-
-    for (position, (source, compiled)) in members.iter().enumerate() {
-        match source.error_class {
-            None => {}
-            Some(ErrorClass::Network) | Some(ErrorClass::HttpServer) => any_stale = true,
-            // The last payload could not be stored: what is served is
-            // older than the feed, exactly like an unreachable upstream.
-            Some(ErrorClass::Storage) => any_stale = true,
-            Some(ErrorClass::ParseError) => any_parse_error = true,
-            Some(ErrorClass::HttpClient) => unreachable!("handled above"),
-        }
-        let rows = by_source.remove(&source.id).unwrap_or_default();
-        let mut candidates = rows_to_candidates(rows, position as i64, &mut skipped);
-        // The tiers the source holds before the country filter, the same
-        // pre-filter bookkeeping `render_src` does: the "everything is
-        // hidden" verdict below is about the sources' health, so proxies a
-        // country allowlist removed must not make an alive source look
-        // quarantined (nor a quarantined one look healthy).
-        loaded_statuses.extend(candidates.iter().map(|c| c.status));
-        if let Some(allowed) = &allowed_countries {
-            pipeline::retain_allowed_countries(&mut candidates, allowed);
-        }
-        // Full per-source run, not just the per-source steps: the source's
-        // own `limit.count` caps that source's contribution, and the
-        // profile-level cap is applied again to the merged list below.
-        // Running the cap only in the sort-winning `finalize` would make a
-        // source's limit conditional on that same source also setting an
-        // explicit `sort`, while `/src` (one source, one `apply`) always
-        // honoured it.
-        all.extend(compiled.apply(candidates, &state.geo).await);
-    }
-    // "All proxies quarantined/removed" verdict: the profile
-    // does hold proxies, but every one of them was dropped by a health
-    // filter. Only the two hidden tiers count: `ready` is a served tier, a
-    // verified proxy is not part of the "everything is hidden" story (and
-    // neither is a proxy a `filter`/ASN/drop rule removed, which is a
-    // configuration fact the operator reads in the pipeline, not a health
-    // one).
-    let all_quarantined = !loaded_statuses.is_empty()
-        && all.is_empty()
-        && loaded_statuses
-            .iter()
-            .all(|status| matches!(status, ProxyStatus::Quarantine | ProxyStatus::Removed));
+    let allowed = allowed_countries(profile);
+    let mut merged =
+        merge_sub_candidates(&members, &mut by_source, allowed.as_ref(), &state.geo).await;
+    // "All proxies quarantined/removed" verdict: see [`all_quarantined`].
+    let quarantined = all_quarantined(&merged.loaded_statuses, &merged.all);
 
     // Global sort: the profile's explicit `sort` wins, otherwise the first
     // source (in profile order) that set one, otherwise source order.
@@ -1043,49 +1065,32 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
     let finalizer = CompiledPipeline::from_json_cached(
         finalize_config(profile.pipeline.as_ref(), source_sort).as_ref(),
     )
-    .map_err(|errors| ErrorReply::corrupted_pipeline(&format!("sub:{}", profile.id), &errors))?;
-    finalizer.finalize(&mut all);
+    .map_err(|errors| ErrorReply::corrupted_pipeline(&target, &errors))?;
+    finalizer.finalize(&mut merged.all);
 
     // The metadata block goes only into plain uri_list output: base64 blobs
     // must stay decodable to a bare list (the block would double-encode as
     // base64 text), and structured formats have their own document shape.
-    let interval_hours: u64 = update_interval_hours(&members).parse().unwrap_or(1);
-    let (body, content_type, skipped_entries) = encode(&all, profile.output_format, || {
-        url_list_header_block(&profile.name, Some(interval_hours), all.len())
+    let interval = update_interval_hours(&members);
+    let interval_hours: u64 = interval.parse().unwrap_or(1);
+    let (body, content_type, skipped_entries) = encode(&merged.all, profile.output_format, || {
+        url_list_header_block(&profile.name, Some(interval_hours), merged.all.len())
     });
-
-    // The name is user input and becomes an HTTP header value: kill line
-    // breaks so a crafted name cannot split the header (the body block
-    // applies the same sanitisation).
-    let mut extra_headers: Vec<(String, String)> = vec![
-        (
-            "profile-title".to_string(),
-            profile.name.replace(['\n', '\r'], " "),
-        ),
-        (
-            "profile-update-interval".to_string(),
-            update_interval_hours(&members),
-        ),
-    ];
-    if any_stale {
-        extra_headers.push(("X-Fumox-Stale".to_string(), "true".to_string()));
-    }
-    let mut warnings: Vec<&str> = Vec::new();
-    if any_parse_error {
-        warnings.push("parse-error");
-    } else if all_quarantined {
-        warnings.push("all-proxies-quarantined");
-    }
-    if skipped_entries > 0 {
-        warnings.push("incompatible-entries-skipped");
-    }
-    if !warnings.is_empty() {
-        extra_headers.push(("X-Fumox-Warning".to_string(), warnings.join(", ")));
-    }
-    if skipped_entries > 0 {
-        extra_headers.push(("X-Fumox-Skipped".to_string(), skipped_entries.to_string()));
-    }
-    skipped.log();
+    let health_warning = if merged.any_parse_error {
+        Some("parse-error")
+    } else if quarantined {
+        Some("all-proxies-quarantined")
+    } else {
+        None
+    };
+    let extra_headers = sub_render_headers(
+        profile,
+        &interval,
+        merged.any_stale,
+        health_warning,
+        skipped_entries,
+    );
+    merged.skipped.log();
 
     // The shortest member TTL bounds how long a cached render stays
     // fresh; the freshness cap is smaller than every fallback in
@@ -1100,6 +1105,183 @@ async fn render_sub(state: &AppState, profile: &Profile) -> Result<Rendered, Err
         fresh_until: fumox_core::models::now_ts() + min_ttl.min(RENDER_FRESHNESS_CAP_SECS),
         source_ids,
     })
+}
+
+/// The member sources of one `/sub` render, in profile order, each with
+/// its compiled pipeline (the source's pipeline merged under the
+/// profile's). Disabled or vanished sources drop out of the output.
+async fn load_sub_members(
+    state: &AppState,
+    profile: &Profile,
+    target: &str,
+) -> Result<Vec<(Source, Arc<CompiledPipeline>)>, ErrorReply> {
+    let links = profiles::get_sources(&state.pool, &profile.id)
+        .await
+        .map_err(|err| ErrorReply::internal(target, err))?;
+
+    // Load member sources in profile order with one `WHERE id IN (...)`
+    // read: the per-member indexed fetch this replaced ran one query per
+    // source, on the public serving path once per cold render.
+    let member_ids: Vec<&str> = links
+        .iter()
+        .map(|(source_id, _)| source_id.as_str())
+        .collect();
+    let loaded = sources::get_many(&state.pool, &member_ids)
+        .await
+        .map_err(|err| ErrorReply::internal(target, err))?;
+    let mut members: Vec<(Source, Arc<CompiledPipeline>)> = Vec::new();
+    for (source_id, _position) in links {
+        let Some(source) = loaded.get(&source_id) else {
+            continue;
+        };
+        if !source.enabled {
+            continue;
+        }
+        let merged = pipeline::merge_configs(source.pipeline.as_ref(), profile.pipeline.as_ref());
+        let compiled = CompiledPipeline::from_json_cached(merged.as_ref())
+            .map_err(|errors| ErrorReply::corrupted_pipeline(target, &errors))?;
+        members.push((source.clone(), compiled));
+    }
+    Ok(members)
+}
+
+/// The profile-level country allowlist: when the profile lists
+/// countries, only proxies whose stored geo fact matches are served.
+/// Proxies without a determined country stay out while the filter is
+/// active, "only these countries" means confirmed facts, not guesses.
+/// `None` disables the filter.
+fn allowed_countries(profile: &Profile) -> Option<std::collections::HashSet<String>> {
+    if profile.countries.is_empty() {
+        return None;
+    }
+    Some(
+        profile
+            .countries
+            .iter()
+            .map(|code| code.trim().to_ascii_uppercase())
+            .filter(|code| !code.is_empty())
+            .collect(),
+    )
+}
+
+/// What one `/sub` render accumulates while running its member sources'
+/// pipelines: the merged candidates, the health tiers the sources held
+/// *before* the country filter (the quarantine verdict reads them), the
+/// source-health flags that drive the response headers and the corrupt
+/// rows skipped along the way.
+struct SubMerge {
+    all: Vec<Candidate>,
+    loaded_statuses: Vec<ProxyStatus>,
+    any_stale: bool,
+    any_parse_error: bool,
+    skipped: SkippedRows,
+}
+
+/// Run every member's rows through its own pipeline and merge the results
+/// in profile order. The country allowlist is applied before the
+/// pipeline: the tiers are recorded pre-filter, so proxies a country
+/// allowlist removed must not make an alive source look quarantined (nor
+/// a quarantined one look healthy).
+async fn merge_sub_candidates(
+    members: &[(Source, Arc<CompiledPipeline>)],
+    by_source: &mut HashMap<String, Vec<proxies::ProxyRow>>,
+    allowed_countries: Option<&std::collections::HashSet<String>>,
+    geo: &GeoResolver,
+) -> SubMerge {
+    let mut merged = SubMerge {
+        all: Vec::new(),
+        loaded_statuses: Vec::new(),
+        any_stale: false,
+        any_parse_error: false,
+        skipped: SkippedRows::default(),
+    };
+    for (position, (source, compiled)) in members.iter().enumerate() {
+        match source.error_class {
+            None => {}
+            Some(ErrorClass::Network) | Some(ErrorClass::HttpServer) => merged.any_stale = true,
+            // The last payload could not be stored: what is served is
+            // older than the feed, exactly like an unreachable upstream.
+            Some(ErrorClass::Storage) => merged.any_stale = true,
+            Some(ErrorClass::ParseError) => merged.any_parse_error = true,
+            Some(ErrorClass::HttpClient) => unreachable!("handled above"),
+        }
+        let rows = by_source.remove(&source.id).unwrap_or_default();
+        let mut candidates = rows_to_candidates(rows, position as i64, &mut merged.skipped);
+        // The tiers the source holds before the country filter, the same
+        // pre-filter bookkeeping `render_src` does: the "everything is
+        // hidden" verdict below is about the sources' health, so proxies a
+        // country allowlist removed must not make an alive source look
+        // quarantined (nor a quarantined one look healthy).
+        merged
+            .loaded_statuses
+            .extend(candidates.iter().map(|c| c.status));
+        if let Some(allowed) = allowed_countries {
+            pipeline::retain_allowed_countries(&mut candidates, allowed);
+        }
+        // Full per-source run, not just the per-source steps: the source's
+        // own `limit.count` caps that source's contribution, and the
+        // profile-level cap is applied again to the merged list below.
+        // Running the cap only in the sort-winning `finalize` would make a
+        // source's limit conditional on that same source also setting an
+        // explicit `sort`, while `/src` (one source, one `apply`) always
+        // honoured it.
+        merged.all.extend(compiled.apply(candidates, geo).await);
+    }
+    merged
+}
+
+/// The "all proxies quarantined/removed" verdict shared by `/sub` and
+/// `/src`: the endpoint does hold proxies, but every one of them was
+/// dropped by a health filter. Only the two hidden tiers count: `ready`
+/// is a served tier, a verified proxy is not part of the "everything is
+/// hidden" story (and neither is a proxy a `filter`/ASN/drop rule
+/// removed, which is a configuration fact the operator reads in the
+/// pipeline, not a health one).
+fn all_quarantined(loaded_statuses: &[ProxyStatus], served: &[Candidate]) -> bool {
+    !loaded_statuses.is_empty()
+        && served.is_empty()
+        && loaded_statuses
+            .iter()
+            .all(|status| matches!(status, ProxyStatus::Quarantine | ProxyStatus::Removed))
+}
+
+/// The HTTP headers of one `/sub` render: the subscription title pair
+/// (mihomo convention), the stale flag for a recoverable source error,
+/// the warning table and the skipped-entries count. The name is user
+/// input and becomes an HTTP header value: line breaks are killed so a
+/// crafted name cannot split the header (the body block applies the same
+/// sanitisation).
+fn sub_render_headers(
+    profile: &Profile,
+    interval: &str,
+    any_stale: bool,
+    health_warning: Option<&'static str>,
+    skipped_entries: usize,
+) -> Vec<(String, String)> {
+    let mut extra_headers: Vec<(String, String)> = vec![
+        (
+            "profile-title".to_string(),
+            profile.name.replace(['\n', '\r'], " "),
+        ),
+        ("profile-update-interval".to_string(), interval.to_string()),
+    ];
+    if any_stale {
+        extra_headers.push(("X-Fumox-Stale".to_string(), "true".to_string()));
+    }
+    let mut warnings: Vec<&str> = Vec::new();
+    if let Some(warning) = health_warning {
+        warnings.push(warning);
+    }
+    if skipped_entries > 0 {
+        warnings.push("incompatible-entries-skipped");
+    }
+    if !warnings.is_empty() {
+        extra_headers.push(("X-Fumox-Warning".to_string(), warnings.join(", ")));
+    }
+    if skipped_entries > 0 {
+        extra_headers.push(("X-Fumox-Skipped".to_string(), skipped_entries.to_string()));
+    }
+    extra_headers
 }
 
 /// Render a single source for `/src/{id}`: the source's own pipeline,
@@ -1136,11 +1318,7 @@ async fn render_src(state: &AppState, source: &Source) -> Result<Rendered, Error
 
     // The same verdict /sub reports: the source holds proxies, but every
     // one of them is out of the live tiers.
-    let all_quarantined = !loaded_statuses.is_empty()
-        && out.is_empty()
-        && loaded_statuses
-            .iter()
-            .all(|status| matches!(status, ProxyStatus::Quarantine | ProxyStatus::Removed));
+    let all_quarantined = all_quarantined(&loaded_statuses, &out);
 
     // Same ttl-derived interval rule as the sub profile: whole hours
     // rounded up from the source TTL, at least 1.
@@ -2272,27 +2450,10 @@ mod tests {
     }
 
     async fn make_source(state: &AppState, id: &str) -> Source {
-        let now = fumox_core::models::now_ts();
         let source = Source {
-            id: id.to_string(),
-            slug: None,
-            access_token: None,
             name: format!("source {id}"),
             url: "https://example.com/list".to_string(),
-            enabled: true,
-            encoding: Default::default(),
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: now,
-            updated_at: now,
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
+            ..Source::fixture(id, fumox_core::models::now_ts())
         };
         sources::create(&state.pool, &source).await.unwrap();
         source
@@ -2393,27 +2554,11 @@ mod tests {
     #[test]
     fn min_member_ttl_and_whole_hours_match_the_inline_predecessors() {
         fn source(ttl: i64) -> Source {
-            let now = fumox_core::models::now_ts();
             Source {
-                id: "ttl-src".to_string(),
-                slug: None,
-                access_token: None,
                 name: "ttl source".to_string(),
                 url: "https://example.com/list".to_string(),
-                enabled: true,
-                encoding: Default::default(),
-                input_format: None,
-                protocols: None,
                 cache_ttl_seconds: ttl,
-                tags: None,
-                pipeline: None,
-                headers: None,
-                ip_family: None,
-                created_at: now,
-                updated_at: now,
-                last_fetched_at: None,
-                last_error: None,
-                error_class: None,
+                ..Source::fixture("ttl-src", fumox_core::models::now_ts())
             }
         }
         let members = |ttls: &[i64]| -> Vec<(Source, Arc<CompiledPipeline>)> {

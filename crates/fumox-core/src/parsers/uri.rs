@@ -185,27 +185,42 @@ pub static NAIVE_SPEC: UriSchemeSpec = UriSchemeSpec {
     credential_required: true,
 };
 
-/// The scheme registry: one lookup from the lower-cased wire spelling onto
-/// the shared spec, with the aliases real feeds use (`hy2` for
-/// `hysteria2`). Both directions read it — `parse_line` maps a line's
-/// scheme onto its parser and `serialize` maps an entry's scheme onto its
-/// serializer — so a spelling one side accepts the other accepts too.
+/// The scheme registry: the shared spec of every URI-family [`Scheme`],
+/// keyed by the enum itself. The match is exhaustive over `Scheme`, so a
+/// new variant without a registry entry is a compile error here — not a
+/// runtime panic on the serialization path (`serialize` reads this table;
+/// `parse_line` reaches it through [`spec_for`]).
 ///
 /// Not in the table: `ss` and `vmess` (bespoke payload formats) and the
 /// `naive+<transport>` family (the transport is scheme identity, see
-/// [`NAIVE_SPEC`]).
-pub fn spec_for(scheme: &str) -> Option<&'static UriSchemeSpec> {
+/// [`NAIVE_SPEC`]) — they have their own serializers.
+pub fn spec_of_scheme(scheme: Scheme) -> Option<&'static UriSchemeSpec> {
     Some(match scheme {
-        "vless" => &VLESS_SPEC,
-        "trojan" => &TROJAN_SPEC,
-        "hysteria2" | "hy2" => &HYSTERIA2_SPEC,
-        "tuic" => &TUIC_SPEC,
-        "mieru" => &MIERU_SPEC,
-        "socks5" => &SOCKS5_SPEC,
-        "snell" => &SNELL_SPEC,
-        "anytls" => &ANYTLS_SPEC,
-        _ => return None,
+        Scheme::Vless => &VLESS_SPEC,
+        Scheme::Trojan => &TROJAN_SPEC,
+        Scheme::Hysteria2 => &HYSTERIA2_SPEC,
+        Scheme::Tuic => &TUIC_SPEC,
+        Scheme::Mieru => &MIERU_SPEC,
+        Scheme::Socks5 => &SOCKS5_SPEC,
+        Scheme::Snell => &SNELL_SPEC,
+        Scheme::AnyTls => &ANYTLS_SPEC,
+        Scheme::Ss | Scheme::Vmess | Scheme::Naive => return None,
     })
+}
+
+/// The wire-spelling half of the registry: one lookup from the lower-cased
+/// scheme string onto the shared spec, with the aliases real feeds use
+/// (`hy2` for `hysteria2`). The spellings come from [`Scheme::aliases`] —
+/// the same source `FromStr` reads — so a spelling one side accepts the
+/// other accepts too. The loop instead of `str::parse` keeps the
+/// unknown-scheme hot path allocation-free (`FromStr` builds its error
+/// message eagerly).
+pub fn spec_for(scheme: &str) -> Option<&'static UriSchemeSpec> {
+    let parsed = Scheme::all()
+        .iter()
+        .copied()
+        .find(|s| s.aliases().contains(&scheme))?;
+    spec_of_scheme(parsed)
 }
 
 /// Decomposed URI with every component kept verbatim.
@@ -618,34 +633,50 @@ fn encode_structural<'a>(raw: &'a str, chars: &[char]) -> Cow<'a, str> {
 
 /// The userinfo to emit for `entry`.
 ///
-/// A URI-sourced entry keeps its userinfo byte-for-byte (`raw_line` is set),
-/// and it cannot contain a structural character anyway: the parser splits the
-/// fragment and the query off before the userinfo. An entry from a structured
-/// format carries *decoded* text, where a raw `#` or `?` would truncate the
-/// emitted line and swallow the host.
+/// The structural characters are percent-encoded unconditionally, without
+/// asking where the entry came from. An entry parsed from a URI cannot carry
+/// them (the parser splits the fragment and the query off before the
+/// userinfo), so the encoding is a no-op there and the byte-exact round-trip
+/// holds; an entry whose fields were *decoded* on another path — a
+/// structured-format record rebuilt with a source line, or a merge of rows —
+/// cannot smuggle a raw `#` or `?` into the emitted line regardless of how
+/// it was built, instead of relying on the `raw_line` sentinel to tell the
+/// two apart.
 pub fn credential_for_output(entry: &ProxyEntry) -> Cow<'_, str> {
-    if !entry.raw_line.is_empty() {
-        return Cow::Borrowed(entry.credential.as_str());
-    }
     encode_structural(&entry.credential, &['#', '?'])
 }
 
 /// The host to emit for `entry`.
 ///
-/// A URI-sourced entry keeps its host byte-for-byte (`raw_line` is set); the
-/// parser splits the userinfo, the path and the query apart, so such a host
-/// never carries a structural character. An entry from a structured format
-/// carries *decoded* text, where a raw `#` or `?` truncates the line, an `@`
-/// moves the userinfo boundary and a `/` starts the path.
+/// As with [`credential_for_output`] the structural characters are
+/// percent-encoded unconditionally: a URI-parsed host never carries one, so
+/// the encoding is a no-op on the stored spelling, while a decoded host is
+/// escaped into a line that re-parses (`#` truncates the line, `@` moves the
+/// userinfo boundary, `/` starts the path) and the IPv6 literal stays
+/// bracketed in the `host:port` context.
 pub fn host_for_output(entry: &ProxyEntry) -> Cow<'_, str> {
-    if !entry.raw_line.is_empty() {
-        return Cow::Owned(host_for_uri(&entry.host));
+    Cow::Owned(host_for_uri(&encode_structural(
+        &entry.host,
+        &['#', '?', '@', '/'],
+    )))
+}
+
+/// The `host:port[?query][#name]` tail of a URI-syntax line, shared by the
+/// generic serializer below and the ss one (whose head renders the base64
+/// credential itself): one body, so the two serializers cannot drift apart
+/// on the IPv6 bracketing or the empty-name spelling.
+pub fn emit_tail(entry: &ProxyEntry, out: &mut String) {
+    out.push_str(&host_for_output(entry));
+    out.push(':');
+    out.push_str(&entry.port.to_string());
+    out.push_str(&entry.raw_path);
+    if !entry.params.is_empty() {
+        out.push('?');
+        out.push_str(&serialize_query(&entry.params));
     }
-    let encoded = encode_structural(&entry.host, &['#', '?', '@', '/']);
-    if encoded.contains(':') && !encoded.starts_with('[') {
-        Cow::Owned(format!("[{encoded}]"))
-    } else {
-        Cow::Owned(encoded.into_owned())
+    if !entry.name.is_empty() {
+        out.push('#');
+        out.push_str(&encode_fragment(&entry.name));
     }
 }
 
@@ -663,18 +694,7 @@ pub fn serialize_with_spec(spec: &UriSchemeSpec, entry: &ProxyEntry) -> String {
         out.push_str(&credential_for_output(entry));
         out.push('@');
     }
-    out.push_str(&host_for_output(entry));
-    out.push(':');
-    out.push_str(&entry.port.to_string());
-    out.push_str(&entry.raw_path);
-    if !entry.params.is_empty() {
-        out.push('?');
-        out.push_str(&serialize_query(&entry.params));
-    }
-    if !entry.name.is_empty() {
-        out.push('#');
-        out.push_str(&encode_fragment(&entry.name));
-    }
+    emit_tail(entry, &mut out);
     out
 }
 
@@ -795,6 +815,58 @@ mod tests {
         let parsed =
             parse_with_spec(&VLESS_SPEC, line.strip_prefix("vless://").unwrap(), line).unwrap();
         assert_eq!(serialize_with_spec(&VLESS_SPEC, &parsed), line);
+    }
+
+    /// The hybrid state — decoded text in a field of an entry that also
+    /// carries a source line — is not producible by the parsers, but it is
+    /// one assignment away on the public struct and reachable through a
+    /// cross-row merge. The emitted line must stay URI-safe regardless: a
+    /// raw `#` in the userinfo truncates it and swallows the host.
+    #[test]
+    fn a_structural_character_in_a_hybrid_entry_is_escaped_on_output() {
+        let entry = ProxyEntry {
+            scheme: Scheme::Trojan,
+            name: "node".into(),
+            host: "h.example".into(),
+            port: 443,
+            credential: "pa#ss".into(),
+            params: vec![],
+            raw_path: String::new(),
+            raw_line: "trojan://seed@h.example:443#node".into(),
+            canonical: None,
+        };
+        let line = serialize_with_spec(&TROJAN_SPEC, &entry);
+        assert_eq!(line, "trojan://pa%23ss@h.example:443#node", "{line}");
+        // The line parses again, with the userinfo boundary intact.
+        let parsed =
+            parse_with_spec(&TROJAN_SPEC, line.strip_prefix("trojan://").unwrap(), &line).unwrap();
+        assert_eq!(parsed.credential, "pa%23ss");
+        assert_eq!(parsed.host, "h.example");
+        assert_eq!(parsed.port, 443);
+    }
+
+    /// Same hybrid state, `@` spelling: verbatim emission would move the
+    /// userinfo boundary and dial a different host.
+    #[test]
+    fn a_decoded_at_sign_in_a_hybrid_host_cannot_shift_the_userinfo_boundary() {
+        let entry = ProxyEntry {
+            scheme: Scheme::Trojan,
+            name: "node".into(),
+            host: "h@example".into(),
+            port: 443,
+            credential: "pw".into(),
+            params: vec![],
+            raw_path: String::new(),
+            raw_line: "trojan://seed@h.example:443#node".into(),
+            canonical: None,
+        };
+        let line = serialize_with_spec(&TROJAN_SPEC, &entry);
+        assert_eq!(line, "trojan://pw@h%40example:443#node", "{line}");
+        let parsed =
+            parse_with_spec(&TROJAN_SPEC, line.strip_prefix("trojan://").unwrap(), &line).unwrap();
+        assert_eq!(parsed.credential, "pw");
+        assert_eq!(parsed.host, "h%40example");
+        assert_eq!(parsed.port, 443);
     }
 
     #[test]

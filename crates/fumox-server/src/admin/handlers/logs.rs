@@ -3,7 +3,7 @@
 //! pagination. Probe history intentionally has no page of its own, it
 //! lives on the proxy card.
 
-use super::{FormMap, clamp_limit, fmt_bytes, server_error};
+use super::{FormMap, clamp_limit, fmt_opt_bytes, server_error};
 use crate::admin::AdminState;
 use crate::admin::i18n::{Lang, impl_i18n};
 use crate::admin::render_html;
@@ -45,8 +45,7 @@ struct FetchLogsTemplate {
 
 impl FetchLogsTemplate {
     fn bytes(&self, n: &Option<i64>) -> String {
-        n.map(|bytes| fmt_bytes(&self.lang, bytes))
-            .unwrap_or_else(|| ",".into())
+        fmt_opt_bytes(&self.lang, *n)
     }
 
     fn source_selected(&self, id: &str) -> bool {
@@ -142,6 +141,48 @@ pub(super) fn journal_page_link(
     link
 }
 
+/// The body and the navigation neighbours of a keyset page, from the
+/// over-fetched row list the repo read — the shared shape of the global
+/// journal, the source card's log and the proxy browser, so a fix to the
+/// edge cases lands in all three or in none.
+///
+/// The rows over-fetch by one: the extra row says whether a further page
+/// exists without a second count. The side of the cursor the page takes
+/// decides what to drop: a page reached backwards holds the rows right
+/// before the cursor, the rows closest to it come last, so the
+/// over-fetched row is the farthest one and leaves from the front. The
+/// neighbours follow the same asymmetry: a page reached forwards has a
+/// predecessor as soon as it is not the first one, a page reached
+/// backwards has a successor even when the list ends there.
+pub(super) fn keyset_page<T, C>(
+    rows: &mut Vec<T>,
+    paged: bool,
+    backward: bool,
+    per_page: i64,
+    cursor_of: impl Fn(&T) -> C,
+) -> (Option<C>, Option<C>) {
+    let has_more = rows.len() as i64 > per_page;
+    if backward && has_more {
+        rows.remove(0);
+    }
+    rows.truncate(per_page as usize);
+    let first_cursor = rows.first().map(&cursor_of);
+    let last_cursor = rows.last().map(&cursor_of);
+    if backward {
+        (
+            // Further back only when the list holds rows before this page.
+            if has_more { first_cursor } else { None },
+            // Forwards again: the rows after this page.
+            last_cursor,
+        )
+    } else {
+        (
+            if paged { first_cursor } else { None },
+            if has_more { last_cursor } else { None },
+        )
+    }
+}
+
 /// The `ok` half of [`FetchLogFilter`] from the `result` query parameter:
 /// `ok` keeps only the successful fetches, `error` only the failures,
 /// anything else (including an absent parameter) filters nothing.
@@ -203,53 +244,17 @@ pub async fn fetch_logs(
         .as_ref()
         .is_some_and(|page| page.direction == FetchLogDirection::Backward);
 
-    let has_more = rows.len() as i64 > per_page;
-    if backward && has_more {
-        // The rows closest to the cursor come last, so the over-fetched
-        // row is the farthest one: the page keeps the rows right before
-        // the cursor, and the extra row stays the proof that the journal
-        // holds more of them.
-        rows.remove(0);
-    }
-    rows.truncate(per_page as usize);
-
-    // The neighbours of the page: a page reached forwards has a
-    // predecessor as soon as it is not the first one, a page reached
-    // backwards has a successor even when the journal ends there.
-    let first_cursor = rows.first().map(|row| FetchLogCursor {
-        fetched_at: row.fetched_at,
-        id: row.id,
-    });
-    let last_cursor = rows.last().map(|row| FetchLogCursor {
-        fetched_at: row.fetched_at,
-        id: row.id,
-    });
-    let (prev, next) = if backward {
-        (
-            // Further back only when the journal holds rows before this
-            // page.
-            if has_more {
-                first_cursor.map(|cursor| (cursor, FetchLogDirection::Backward))
-            } else {
-                None
-            },
-            // Forwards again: the rows after this page.
-            last_cursor.map(|cursor| (cursor, FetchLogDirection::Forward)),
-        )
-    } else {
-        (
-            if page.is_some() {
-                first_cursor.map(|cursor| (cursor, FetchLogDirection::Backward))
-            } else {
-                None
-            },
-            if has_more {
-                last_cursor.map(|cursor| (cursor, FetchLogDirection::Forward))
-            } else {
-                None
-            },
-        )
-    };
+    // The page body and its neighbours, the shape shared with the source
+    // card's log and the proxy browser (`keyset_page`).
+    let (prev_cursor, next_cursor) =
+        keyset_page(&mut rows, page.is_some(), backward, per_page, |row| {
+            FetchLogCursor {
+                fetched_at: row.fetched_at,
+                id: row.id,
+            }
+        });
+    let prev = prev_cursor.map(|cursor| (cursor, FetchLogDirection::Backward));
+    let next = next_cursor.map(|cursor| (cursor, FetchLogDirection::Forward));
 
     let suffix = filter_query_suffix(&f_result, &f_class, &f_source);
     let nav_first = page
@@ -309,10 +314,40 @@ pub async fn fetch_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        FetchLogCursor, FetchLogDirection, URL_SAFE_NO_PAD, decode_fetch_cursor,
-        encode_fetch_cursor, filter_query_suffix, result_ok_filter,
+        FetchLogCursor, FetchLogDirection, FetchLogsTemplate, Theme, URL_SAFE_NO_PAD,
+        decode_fetch_cursor, encode_fetch_cursor, filter_query_suffix, keyset_page,
+        result_ok_filter,
     };
+    use crate::admin::i18n::Locales;
     use base64::Engine;
+    use std::path::Path;
+
+    /// The shared page assembly, case by case: the over-fetched row is
+    /// dropped from the front on a backwards page, the page body is
+    /// truncated to `per_page`, and the neighbours follow the
+    /// backward/forward asymmetry — a forward page has no predecessor
+    /// when it is the first one and no successor when the over-fetch saw
+    /// nothing, a backwards page has a successor even when the list ends
+    /// there.
+    #[test]
+    fn the_keyset_page_trims_the_overfetch_and_places_the_neighbours() {
+        let case = |count: usize, paged: bool, backward: bool, per_page: i64| {
+            let mut rows: Vec<usize> = (0..count).collect();
+            let (prev, next) = keyset_page(&mut rows, paged, backward, per_page, |&row| row);
+            (rows, prev, next)
+        };
+        // First forward page: no predecessor, a successor while the
+        // over-fetch saw one.
+        assert_eq!(case(4, false, false, 3), (vec![0, 1, 2], None, Some(2)));
+        // A later forward page: the over-fetch saw nothing more.
+        assert_eq!(case(3, true, false, 3), (vec![0, 1, 2], Some(0), None));
+        // A page reached backwards keeps the rows right before the
+        // cursor: the over-fetched row is the farthest one.
+        assert_eq!(case(4, true, true, 3), (vec![1, 2, 3], Some(1), Some(3)));
+        // A backwards page with nothing further back still has a
+        // successor.
+        assert_eq!(case(2, true, true, 3), (vec![0, 1], None, Some(1)));
+    }
 
     /// The cursor token round-trips, and a token this browser did not
     /// write decodes to nothing: the journal falls back to its first page
@@ -377,5 +412,33 @@ mod tests {
         assert_eq!(result_ok_filter(""), None);
         assert_eq!(result_ok_filter("OK"), None);
         assert_eq!(result_ok_filter("failed"), None);
+    }
+
+    /// A journal row without a byte count shows the neutral `common.na`
+    /// placeholder, the same one every other card renders through
+    /// `fmt_opt_bytes` — never a bare comma, which reads as markup, not
+    /// as a missing value. A present size still goes through the shared
+    /// byte formatter.
+    #[test]
+    fn the_bytes_cell_shows_the_neutral_placeholder_when_the_size_is_missing() {
+        let lang = Locales::load(Path::new("/nonexistent-locales-dir")).resolve("en");
+        let template = FetchLogsTemplate {
+            lang,
+            langs: Vec::new(),
+            theme: Theme::default(),
+            active: "",
+            csrf: String::new(),
+            rows: Vec::new(),
+            total: 0,
+            nav_first: None,
+            nav_prev: None,
+            nav_next: None,
+            f_result: String::new(),
+            f_source: String::new(),
+            sources: Vec::new(),
+            error_classes: Vec::new(),
+        };
+        assert_eq!(template.bytes(&None), template.lang.t("common.na"));
+        assert_eq!(template.bytes(&Some(2048)), "2.0 KB");
     }
 }

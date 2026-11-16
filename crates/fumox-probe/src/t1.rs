@@ -80,18 +80,30 @@ pub fn check_kind(scheme: Scheme, entry: &ProxyEntry) -> CheckKind {
 /// Health checks only care that the endpoint completes a handshake; many
 /// proxy servers use self-signed certificates, so verification would
 /// produce false deaths. This is deliberately not a trust boundary.
-fn tls_connector() -> &'static TlsConnector {
-    static CONNECTOR: OnceLock<TlsConnector> = OnceLock::new();
-    CONNECTOR.get_or_init(|| {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("static protocol versions are valid")
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
-            .with_no_client_auth();
-        TlsConnector::from(Arc::new(config))
-    })
+///
+/// The pinned `ring` provider always speaks the safe default protocol
+/// versions, so the builder error cannot happen in practice — but that
+/// fact lives in the provider's runtime data, not in the types, so the
+/// error is propagated to the check instead of unwrapped here.
+fn tls_connector() -> Result<&'static TlsConnector, String> {
+    static CONNECTOR: OnceLock<Result<TlsConnector, String>> = OnceLock::new();
+    CONNECTOR
+        .get_or_init(|| {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map(|builder| {
+                    TlsConnector::from(Arc::new(
+                        builder
+                            .dangerous()
+                            .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
+                            .with_no_client_auth(),
+                    ))
+                })
+                .map_err(|error| format!("rustls rejects the default protocol versions: {error}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// Accepts any server certificate and signature: see [`tls_connector`].
@@ -263,7 +275,7 @@ async fn attempt(
     let Plan::Tls(server_name) = plan else {
         return Ok(());
     };
-    let handshake = tls_connector().connect(server_name.clone(), stream);
+    let handshake = tls_connector()?.connect(server_name.clone(), stream);
     match tokio::time::timeout(tls_timeout, handshake).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(format!("tls handshake failed for {addr}: {error}")),

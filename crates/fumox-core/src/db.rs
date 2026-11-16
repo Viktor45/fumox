@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use sqlx::SqlitePool;
-use sqlx::migrate::{MigrateError, Migrator};
+use sqlx::migrate::{MigrateError, Migration, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::config::{DatabaseConfig, SynchronousMode};
@@ -434,11 +434,15 @@ pub async fn migrate_with(pool: &SqlitePool, repair: ChecksumRepair) -> crate::R
                         // Nothing was rewritten, so the retry below would
                         // fail with the very same error. Report the
                         // original mismatch instead of claiming a repair
-                        // that did not happen.
+                        // that did not happen. The recorded mismatch is
+                        // always `Some` here — it is set above in this very
+                        // branch — but if it ever were not, the fallback
+                        // names the version sqlx reported in this same
+                        // error instead of panicking.
                         return Err(original
                             .take()
-                            .map(crate::Error::from)
-                            .unwrap_or_else(|| crate::Error::Database(String::new())));
+                            .unwrap_or_else(|| MigrateError::VersionMismatch(version))
+                            .into());
                     }
                     // The breadcrumb and the error log go out *before* the
                     // retry: a crash in the middle of it must still leave
@@ -746,37 +750,52 @@ pub async fn repair_migration_checksums(pool: &SqlitePool) -> crate::Result<Vec<
         .map(|migration| migration.version)
         .collect();
     if !re_stamped.is_empty() {
-        // One `UPDATE` for the whole set: the `CASE` arms pick the checksum
-        // each version must carry, the `IN` list scopes the rewrite to the
-        // versions the read above found disagreeing.
-        let mut sql = String::from("UPDATE _sqlx_migrations SET checksum = CASE version");
-        for _ in &mismatches {
-            sql.push_str(" WHEN ? THEN ?");
-        }
-        sql.push_str(" END WHERE success = 1 AND version IN (");
-        for index in 0..mismatches.len() {
-            if index > 0 {
-                sql.push_str(", ");
-            }
-            sql.push('?');
-        }
-        sql.push(')');
-        let mut update = sqlx::query(sqlx::AssertSqlSafe(sql));
-        for migration in &mismatches {
-            update = update.bind(migration.version).bind(&*migration.checksum);
-        }
-        for migration in &mismatches {
-            update = update.bind(migration.version);
-        }
-        update.execute(&mut *tx).await?;
+        re_stamp_checksums(&mut tx, &mismatches).await?;
     }
     tx.commit().await?;
 
-    // Force the WAL log through so a second `migrate()` from the same
-    // process sees the new values without a checkpoint race. Best-effort: a
-    // concurrent reader can make the PASS checkpoint return busy, and the
-    // re-stamp is idempotent, so the failure is logged, not fatal.
-    //
+    checkpoint_wal(pool).await;
+    Ok(re_stamped)
+}
+
+/// The rewrite [`repair_migration_checksums`] performs inside its
+/// transaction: one `UPDATE` for the whole set, where the `CASE` arms pick
+/// the checksum each version must carry and the `IN` list scopes the
+/// rewrite to the versions the read found disagreeing. Split off so the
+/// caller stays focused on the repair's flow, not on the query assembly.
+async fn re_stamp_checksums(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    mismatches: &[&Migration],
+) -> crate::Result<()> {
+    let mut sql = String::from("UPDATE _sqlx_migrations SET checksum = CASE version");
+    for _ in mismatches {
+        sql.push_str(" WHEN ? THEN ?");
+    }
+    sql.push_str(" END WHERE success = 1 AND version IN (");
+    for index in 0..mismatches.len() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+    }
+    sql.push(')');
+    let mut update = sqlx::query(sqlx::AssertSqlSafe(sql));
+    for migration in mismatches {
+        update = update.bind(migration.version).bind(&*migration.checksum);
+    }
+    for migration in mismatches {
+        update = update.bind(migration.version);
+    }
+    update.execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Forces the WAL log through so a second `migrate()` from the same process
+/// sees the values [`repair_migration_checksums`] re-stamped without a
+/// checkpoint race. Best-effort: a concurrent reader can make the PASS
+/// checkpoint return busy, and the re-stamp is idempotent, so the failure
+/// is logged, not fatal.
+async fn checkpoint_wal(pool: &SqlitePool) {
     // `wal_checkpoint` reports busy as a *row* (`busy, log, checkpointed`),
     // not as an error, so `execute` discarded it and this line could never
     // fire for the case the comment names. Read the row.
@@ -797,7 +816,6 @@ pub async fn repair_migration_checksums(pool: &SqlitePool) -> crate::Result<Vec<
             tracing::warn!(error = %err, "wal_checkpoint(PASS) after migration re-stamp failed")
         }
     }
-    Ok(re_stamped)
 }
 
 /// Test-only switch, and process-global state: when set, the inner
@@ -1167,22 +1185,11 @@ mod unix_db_tests {
         // production call site runs inside `spawn_blocking`, whose threads
         // cannot see the thread-local test subscriber, so the call is
         // repeated here on the test thread purely to capture the log line.
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = std::sync::Arc::clone(&captured);
-        struct CapturedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for CapturedWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
+        let (make_writer, captured) = crate::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::WARN)
-            .with_writer(move || CapturedWriter(std::sync::Arc::clone(&writer)))
+            .with_writer(make_writer)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             restrict_file_permissions(&path).unwrap();
@@ -1494,6 +1501,16 @@ pub mod tempdir_lite {
                 unique
             ));
             let _ = std::fs::remove_dir_all(&base);
+            // Kept as an `expect` deliberately: this helper has no
+            // production call sites (see the module docs), a test cannot
+            // recover from its scratch directory failing to appear, and the
+            // panic is the documented `# Panics` contract above — the
+            // message carries the I/O cause. A `Result` here would ripple
+            // through every sibling crate's test call site for nothing.
+            #[expect(
+                clippy::expect_used,
+                reason = "test helper with a documented # Panics contract; see the comment above"
+            )]
             std::fs::create_dir_all(&base).expect("failed to create the test tempdir");
             // The created path stays inside the system temp dir even when
             // TMPDIR itself resolves through a symlink (/var ->

@@ -14,8 +14,10 @@
 //!
 //! The rules are an allow-list: a table the probe has no write business
 //! with is denied, so a table added later is denied by default instead
-//! of silently becoming writable. The schema is applied before the
-//! restricted connections exist (see
+//! of silently becoming writable. Schema changes are refused outright,
+//! and a pragma may only be queried: both would alter the shared file
+//! without touching a table the rules govern. The schema is applied
+//! before the restricted connections exist (see
 //! [`crate::db::connect_probe_pool`]), so the restriction never has to
 //! let a migration through.
 
@@ -161,6 +163,37 @@ unsafe extern "C" fn authorizer(
                 ffi::SQLITE_DENY
             }
         }
+        // The schema belongs to the migration that runs before the
+        // restricted connections exist, so no DDL has business here.
+        // SQLite already refuses most of it on its own: preparing a
+        // schema change compiles into writes on `sqlite_master`, which
+        // `write_allowed` denies. The explicit deny keeps that
+        // guarantee a property of the guard, not of that implementation
+        // detail.
+        ffi::SQLITE_CREATE_TABLE
+        | ffi::SQLITE_CREATE_INDEX
+        | ffi::SQLITE_CREATE_TRIGGER
+        | ffi::SQLITE_CREATE_VIEW
+        | ffi::SQLITE_CREATE_VTABLE
+        | ffi::SQLITE_DROP_INDEX
+        | ffi::SQLITE_DROP_TRIGGER
+        | ffi::SQLITE_DROP_VIEW
+        | ffi::SQLITE_DROP_VTABLE
+        | ffi::SQLITE_ALTER_TABLE
+        | ffi::SQLITE_REINDEX => ffi::SQLITE_DENY,
+        // The authorizer hands a pragma over as the table argument (the
+        // name) and the column argument (the value, absent for a bare
+        // read). A pragma with a value reconfigures what it names — and
+        // the ones that name a file property (`journal_mode`,
+        // `user_version`) write the shared file itself, outside every
+        // table the rules govern.
+        ffi::SQLITE_PRAGMA => {
+            if pragma_allowed(cstr(table).unwrap_or_default(), cstr(column)) {
+                ffi::SQLITE_OK
+            } else {
+                ffi::SQLITE_DENY
+            }
+        }
         _ => ffi::SQLITE_OK,
     }
 }
@@ -195,6 +228,33 @@ fn write_allowed(table: &str, action: c_int, column: Option<&str>) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+/// The argument-taking pragmas whose argument is the subject of the
+/// question, not a value to set: `PRAGMA table_info(proxies)` reads the
+/// columns of `proxies`, it configures nothing. Any other pragma handed
+/// a value is a write to the shared file and is refused.
+const PRAGMA_READS: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "index_info",
+    "index_xinfo",
+    "index_list",
+    "foreign_key_list",
+    "foreign_key_check",
+    "function_list",
+    "module_list",
+    "pragma_list",
+    "compile_options",
+];
+
+/// Whether the probe may run the pragma `name` with the value `value`
+/// (`None` for a bare read). A read asks, it does not configure.
+fn pragma_allowed(name: &str, value: Option<&str>) -> bool {
+    match value {
+        None => true,
+        Some(_) => PRAGMA_READS.contains(&name),
     }
 }
 
@@ -328,5 +388,23 @@ mod tests {
             ffi::SQLITE_INSERT,
             Some("x")
         ));
+    }
+
+    #[test]
+    fn pragma_writes_are_refused_but_reads_are_not() {
+        // A bare pragma asks, it does not configure.
+        assert!(pragma_allowed("journal_mode", None));
+        assert!(pragma_allowed("foreign_keys", None));
+        assert!(pragma_allowed("integrity_check", None));
+        // The file's own metadata is not the probe's to stamp.
+        assert!(!pragma_allowed("user_version", Some("7")));
+        assert!(!pragma_allowed("journal_mode", Some("DELETE")));
+        assert!(!pragma_allowed("application_id", Some("x")));
+        // The introspection pragmas' argument is part of the question.
+        assert!(pragma_allowed("table_info", Some("proxies")));
+        assert!(pragma_allowed("index_list", Some("proxies")));
+        // Any other pragma handed a value is a write.
+        assert!(!pragma_allowed("wal_checkpoint", Some("TRUNCATE")));
+        assert!(!pragma_allowed("busy_timeout", Some("5000")));
     }
 }

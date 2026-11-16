@@ -167,9 +167,13 @@ pub(crate) fn encode_entries<V: Rename>(
     key: &str,
     mut mapper: impl FnMut(&ProxyEntry) -> Option<V>,
 ) -> Vec<V> {
-    let mut mapped: Vec<Option<V>> = entries.iter().map(&mut mapper).collect();
-    let kept: Vec<usize> = (0..entries.len())
-        .filter(|&i| mapped[i].is_some())
+    // The mapped value travels with its entry, so every value `kept`
+    // carries is by construction one the mapper produced — the earlier
+    // `Vec<Option<_>>` plus indices needed an `expect` to reestablish
+    // that at the pairing below.
+    let kept: Vec<(&ProxyEntry, V)> = entries
+        .iter()
+        .filter_map(|entry| mapper(entry).map(|value| (entry, value)))
         .collect();
     if kept.len() < entries.len() {
         tracing::debug!(
@@ -180,10 +184,10 @@ pub(crate) fn encode_entries<V: Rename>(
     }
     // The names are deduplicated among the kept entries only: an
     // unsupported entry consumes no name slot.
-    let names = dedupe_names(kept.iter().map(|&i| entries[i].name.as_str()));
+    let names = dedupe_names(kept.iter().map(|(entry, _)| entry.name.as_str()));
     let mut renamed = 0;
-    for (i, name) in kept.iter().zip(&names) {
-        if entries[*i].name != *name {
+    for ((entry, _), name) in kept.iter().zip(&names) {
+        if entry.name.as_str() != name.as_str() {
             renamed += 1;
         }
     }
@@ -196,11 +200,8 @@ pub(crate) fn encode_entries<V: Rename>(
     }
     kept.into_iter()
         .zip(names)
-        .map(|(i, name)| {
-            let mut value = mapped[i]
-                .take()
-                .expect("a kept entry carries a mapped value");
-            if name != entries[i].name {
+        .map(|((entry, mut value), name)| {
+            if entry.name != name {
                 value.rename(key, &name);
             }
             value

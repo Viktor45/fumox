@@ -18,7 +18,9 @@
 Description=meow-rs kernel for T2 checks (REST API 9090, pod-internal)
 
 [Container]
-Image=ghcr.io/viktor45/fumox-meow@sha256:49e91fa751672db22916982ed4cb97423d7aaaa667cf4984e973f613f2406e7b
+#Image=ghcr.io/viktor45/fumox-meow@sha256:49e91fa751672db22916982ed4cb97423d7aaaa667cf4984e973f613f2406e7b
+#Image=ghcr.io/viktor45/fumox-meow:latest
+Image=localhost/fumox-meow:local
 ContainerName=fumox-meow
 Pod=fumox-worker.pod
 

@@ -417,6 +417,24 @@ pub struct ProxyEntry {
 }
 
 impl ProxyEntry {
+    /// An entry that carries nothing but a scheme, for the support
+    /// question the output encoders answer (`formats::clash::is_supported`,
+    /// `formats::singbox::is_supported`): the mapping reads the scheme
+    /// alone, every other field stays at its zero value.
+    pub fn scheme_only(scheme: Scheme) -> Self {
+        Self {
+            scheme,
+            name: String::new(),
+            host: String::new(),
+            port: 0,
+            credential: String::new(),
+            params: Vec::new(),
+            raw_path: String::new(),
+            raw_line: String::new(),
+            canonical: None,
+        }
+    }
+
     /// First parameter value with the exact key, if present.
     pub fn param(&self, key: &str) -> Option<&str> {
         self.params
@@ -553,6 +571,42 @@ pub struct Source {
     pub error_class: Option<ErrorClass>,
 }
 
+impl Source {
+    /// A test fixture: the `https://example.com` source the repo tests
+    /// seed, every optional field unset, both timestamps at `now`.
+    ///
+    /// Production code has no use for a fixed row; the constructor lives
+    /// under `cfg(any(test, feature = "test-util"))` so the fixture shape
+    /// (cache TTL, the timestamp pair) cannot drift between the test
+    /// modules that seed a source — in this crate and, via the `test-util`
+    /// feature the sibling crates enable in their dev-dependencies, in
+    /// theirs too.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn fixture(id: &str, now: i64) -> Self {
+        Self {
+            id: id.to_string(),
+            slug: None,
+            access_token: None,
+            name: "s".into(),
+            url: "https://example.com".into(),
+            enabled: true,
+            encoding: Encoding::Auto,
+            input_format: None,
+            protocols: None,
+            cache_ttl_seconds: 3600,
+            tags: None,
+            pipeline: None,
+            headers: None,
+            ip_family: None,
+            created_at: now,
+            updated_at: now,
+            last_fetched_at: None,
+            last_error: None,
+            error_class: None,
+        }
+    }
+}
+
 /// IP protocol family used to reach a source URL (`sources.ip_family`,
 /// `[fetch] ip_family`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -629,9 +683,9 @@ pub struct Profile {
     /// while `countries` is set. `false` (the default) is the historical
     /// semantics: the geo filter passes confirmed facts only, so a profile
     /// pinned to a country serves nothing while geo enrichment is off and
-    /// every row of it looks silently gone. Setting the flag keeps those
-    /// rows in; the count of the geo-filtered-out rows is what the UI can
-    /// report (`X-Fumox-Skipped`) to explain an empty state.
+    /// every row of it looks silently gone. The flag is persisted
+    /// (`profiles.include_unknown_country`) and round-trips through the
+    /// document formats; the runtime geo filter does not honor it yet.
     #[serde(default)]
     pub include_unknown_country: bool,
     pub enabled: bool,
@@ -793,6 +847,10 @@ pub fn new_id() -> String {
 /// across the schema. Panicking on a pre-epoch clock is deliberate: a clock
 /// error that far off would poison every stored timestamp, and failing the
 /// first write is easier to diagnose than silently negative ages.
+#[expect(
+    clippy::expect_used,
+    reason = "a pre-epoch clock would poison every stored timestamp; see the docs above"
+)]
 pub fn now_ts() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

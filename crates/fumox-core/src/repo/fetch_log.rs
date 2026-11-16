@@ -366,14 +366,6 @@ pub async fn list_for_source(
 /// How many journal rows one purge batch deletes.
 const PURGE_BATCH_SIZE: i64 = 10_000;
 
-/// The pause between two purge batches.
-///
-/// The purge holds the WAL write lock for the duration of a batch, and
-/// the probe daemon and the ingest want that lock for their own writes.
-/// The pause gives them a window between two batches instead of making
-/// them wait for the whole sweep.
-const PURGE_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// Delete journal entries older than the cutoff (retention).
 ///
 /// The delete runs in bounded batches, one statement each: a single
@@ -383,25 +375,15 @@ const PURGE_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 /// Each statement is its own transaction, so the lock is released between
 /// the batches.
 pub async fn purge_before(pool: &DbPool, cutoff: i64) -> crate::Result<u64> {
-    let mut total = 0u64;
-    loop {
-        let affected = sqlx::query(
-            "DELETE FROM fetch_log WHERE id IN (
-                 SELECT id FROM fetch_log WHERE fetched_at < ? ORDER BY id LIMIT ?
-             )",
-        )
-        .bind(cutoff)
-        .bind(PURGE_BATCH_SIZE)
-        .execute(pool)
-        .await?
-        .rows_affected();
-        total += affected;
-        if affected < PURGE_BATCH_SIZE as u64 {
-            break;
-        }
-        tokio::time::sleep(PURGE_BATCH_PAUSE).await;
-    }
-    Ok(total)
+    super::purge_batched(
+        pool,
+        "DELETE FROM fetch_log WHERE id IN (
+             SELECT id FROM fetch_log WHERE fetched_at < ? ORDER BY id LIMIT ?
+         )",
+        Some(cutoff),
+        PURGE_BATCH_SIZE,
+    )
+    .await
 }
 
 /// Total journal size. Reported on the probe page next to the rotation

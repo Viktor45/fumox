@@ -11,8 +11,7 @@ Fumox fetches proxy lists from many sources, filters and refines them in real ti
 The project is in active development.
 
 **Fastest start: prebuilt images from GHCR** (multi-arch `linux/amd64` +
-`linux/arm64`, build-provenance attested; the meow-rs wrapper image is
-refreshed by a manual workflow):
+`linux/arm64`, build-provenance attested):
 
 ```bash
 cp .env.example .env   # set a real FUMOX_ADMIN__TOKEN
@@ -22,15 +21,12 @@ docker compose up -d   # pulls the images and starts the whole stack
 Subscriptions: `http://<host>:8080/sub/{id}` · admin panel:
 <http://127.0.0.1:8081/admin> (log in with the token).
 
-**Build from source instead?** Add `--build` to compile the images locally:
-
-```bash
-docker compose up -d --build
-```
-
+**Build from source instead?** Add `--build` to compile the images locally,
 or run the binaries without containers:
 
 ```bash
+docker compose up -d --build
+
 cargo build                 # tests: cargo test
 cargo run -p fumox-server   # subscription server + admin panel (http://127.0.0.1:8081/admin)
 cargo run -p fumox-probe    # proxy health-check daemon
@@ -40,15 +36,16 @@ On Podman instead of Docker? [`docker/README.md`](./docker/README.md) deploys
 the same stack as a systemd-managed podman pod (quadlet units or a kube-play
 manifest).
 
-See [`USERGUIDE.md`](./USERGUIDE.md)
-for the details.
-
 Configuration lives in [`config/app.toml`](./config/app.toml); every key has a
 default and can be overridden through the environment: `FUMOX_SECTION__KEY`
 (e.g. `FUMOX_ADMIN__TOKEN=secret`).
 
+---
+
+## Geo enrichment
+
 Geo enrichment uses MaxMind GeoLite2 databases (`.mmdb`, not part of the
-repository). **The server downloads them itself**: at startup it checks
+repository) and **the server downloads them itself**: at startup it checks
 `[geo].db_dir` (default `config/`) and fetches any database that is missing,
 broken or older than a month, waiting at most
 `[geo].startup_download_budget_secs` (60 s) before it starts serving; a
@@ -56,27 +53,19 @@ slower download continues in the background and takes effect on the next
 start. No manual step is required.
 
 To ship your own files instead (e.g. with your own MaxMind license, sign up
-at <https://www.maxmind.com/en/geolite2/signup>):
-
-1. Download the databases you need via
-   [Account → Manage License Keys / Download Databases](https://dev.maxmind.com/geoip/docs/databases/):
-   Fumox opens the **City** database (`GeoLite2-City.mmdb`, country/city
-   facts) and the **ASN** database (`GeoLite2-ASN.mmdb`, AS
-   numbers/organizations) and merges their facts in one name template;
-   `GeoLite2-Country.mmdb` is not read and is ignored (City carries every
-   fact it has).
-2. Place each file under its canonical name in `[geo].db_dir` (`config/` for
-   source runs). **The shipped Compose stack overrides the
-   directory to `/shared/geo`** (`FUMOX_GEO__DB_DIR` in `docker-compose.yml`,
-   the dedicated geo volume), and the environment outranks `app.toml`,
-   so a `.mmdb` dropped into `./config` is never read there: copy it into
-   the `fumox-geo` volume
-   (`docker compose cp GeoLite2-City.mmdb server:/shared/geo/`) or drop the
-   override and set `[geo].db_dir` instead.
+at <https://www.maxmind.com/en/geolite2/signup>), place them under their
+canonical names in `[geo].db_dir` — `GeoLite2-City.mmdb` (country/city facts)
+and `GeoLite2-ASN.mmdb` (AS numbers/organizations); `GeoLite2-Country.mmdb` is
+not read. **The shipped Compose stack overrides the directory to
+`/shared/geo`** (`FUMOX_GEO__DB_DIR` in `docker-compose.yml`), and the
+environment outranks `app.toml`, so a `.mmdb` dropped into `./config` is never
+read there: copy it into the `fumox-geo` volume
+(`docker compose cp GeoLite2-City.mmdb server:/shared/geo/`) or drop the
+override and set `[geo].db_dir` instead.
 
 Without a database file, geo enrichment disables itself automatically (a
-warning is logged) and the server keeps running. MaxMind databases are updated
-weekly.
+warning is logged) and the server keeps running. See
+[section 11 of the user guide](./USERGUIDE.md#11-geo-enrichment).
 
 ---
 
@@ -98,8 +87,7 @@ the `Host`-header allowlist behave correctly:
   listener can render URLs pointing at a host they control.
 
 Both keys default to `[]` to preserve the historical behavior behind a
-direct connection. See the [User Guide](./USERGUIDE.md#8-configuration-reference)
-configuration reference and the production checklist for context.
+direct connection.
 
 - `[admin].secure_cookies` (or the matching `FUMOX_ADMIN__SECURE_COOKIES`
   env override): keep `false` when the panel is reached over plain HTTP

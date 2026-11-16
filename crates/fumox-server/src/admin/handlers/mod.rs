@@ -266,11 +266,13 @@ pub async fn dashboard(State(state): State<AdminState>, headers: HeaderMap) -> R
     render_html(lang.clone(), "dashboard.html", &template, StatusCode::OK)
 }
 
-/// The dashboard's reads. Every fallible step maps its error to the
-/// finished 500 response with the name of the failed query in the log,
-/// so the `?`s below stay one-liners; the two widgets the operator
-/// triages from (source errors, per-source health) degrade on their own
-/// instead ([`DashboardTemplate::recent_errors_unavailable`]).
+/// The dashboard's reads. The orchestration below keeps the transaction
+/// and the template assembly; the queries themselves live in the section
+/// helpers after it, each mapping its own query errors to the finished
+/// 500 response with the name of the failed query in the log, so the
+/// `?`s stay one-liners; the two widgets the operator triages from
+/// (source errors, per-source health) degrade on their own instead
+/// ([`DashboardTemplate::recent_errors_unavailable`]).
 #[allow(clippy::result_large_err)] // the Err is a finished Response, by design
 async fn dashboard_inner(
     state: &AdminState,
@@ -291,167 +293,25 @@ async fn dashboard_inner(
         .await
         .map_err(|err| server_error(state, headers, "dashboard.begin", &err))?;
 
-    let (src_total, src_enabled, src_errors): (i64, i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(SUM(enabled), 0),
-                COALESCE(SUM(error_class IS NOT NULL), 0) FROM sources",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|err| server_error(state, headers, "dashboard.sources", &err))?;
-
-    let profiles_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profiles")
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|err| server_error(state, headers, "dashboard.profiles", &err))?;
-
-    // The proxy counters come from one grouped pass over the table, so
-    // the breakdown by status and the scalar counters cannot disagree.
-    let aggregates = fumox_core::repo::proxies::status_aggregates(&mut *tx)
-        .await
-        .map_err(|err| server_error(state, headers, "dashboard.status_aggregates", &err))?;
-    let proxy_counts = aggregates.counts.clone();
-
     let day_ago = fumox_core::models::now_ts() - 86_400;
-    let (fetch_total_24h, fetch_ok_24h): (i64, i64) =
-        fumox_core::repo::fetch_log::success_counts_since(&mut *tx, day_ago)
-            .await
-            .map_err(|err| server_error(state, headers, "dashboard.fetch_24h", &err))?;
-
-    // The two widgets the operator triages from degrade independently: a
-    // failed read leaves the block empty with an inline note instead of
-    // taking the whole screen down.
-    let (recent_errors, recent_errors_unavailable): (Vec<SourceErrorRow>, bool) =
-        match sqlx::query_as(
-            "SELECT id, name, error_class, last_error, last_fetched_at FROM sources
-             WHERE error_class IS NOT NULL
-             ORDER BY COALESCE(last_fetched_at, 0) DESC LIMIT ?",
-        )
-        .bind(top_n.as_i64())
-        .fetch_all(&mut *tx)
-        .await
-        {
-            Ok(rows) => (rows, false),
-            Err(err) => {
-                tracing::warn!(error = %err, "the dashboard source-errors widget failed to load");
-                (Vec::new(), true)
-            }
-        };
-
-    // Per-source health counters (single aggregate over the join table).
-    let (sources, sources_unavailable): (Vec<SourceStatRow>, bool) = match source_health_split(
-        &mut *tx,
-    )
-    .await
-    {
-        Ok(rows) => (rows, false),
-        Err(err) => {
-            tracing::warn!(error = %err, "the dashboard per-source health widget failed to load");
-            (Vec::new(), true)
-        }
-    };
-
-    // Longest-living ready proxies: oldest `created_at` first, the
-    // tunnel-verified tier (`ready`) is a strict subset of `alive`, set
-    // only by a successful T2, so showing the top-N there surfaces the
-    // proxies that have stayed end-to-end working the longest. The tier
-    // is bound like every status value on this screen: no inline status
-    // literal survives in the dashboard's SQL. The picked ids come from
-    // a CTE, so the LIMIT applies before the source-links fan-out joins
-    // in their names.
-    let top_alive: Vec<TopAliveRow> = sqlx::query_as(
-        "WITH picked AS (
-             SELECT id FROM proxies WHERE status = ?
-             ORDER BY created_at ASC, id ASC LIMIT ?
-         )
-         SELECT p.id, p.name, p.scheme, p.host, p.port, p.latency_ms, p.geo_country,
-                p.created_at,
-                COALESCE(GROUP_CONCAT(s.name, ', '), '') AS source_names
-         FROM picked
-         JOIN proxies p ON p.id = picked.id
-         JOIN proxy_source_links l ON l.proxy_id = p.id
-         JOIN sources s ON s.id = l.source_id
-         GROUP BY p.id
-         ORDER BY p.created_at ASC, p.id ASC",
-    )
-    .bind(ProxyStatus::Ready.as_str())
-    .bind(top_n.as_i64())
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|err| server_error(state, headers, "dashboard.top_alive", &err))?;
-
-    let schemes = scheme_split(&mut *tx)
-        .await
-        .map_err(|err| server_error(state, headers, "dashboard.scheme_split", &err))?;
-    let countries = country_split(&mut *tx, top_n.as_i64())
-        .await
-        .map_err(|err| server_error(state, headers, "dashboard.country_split", &err))?;
-
-    // Latency of the live pool (`alive` and `ready`): the same set the
-    // dashboard's other widgets count. SQLite has no median builtin, so
-    // the median is a separate window-function query.
+    let (
+        (src_total, src_enabled, src_errors),
+        profiles_total,
+        aggregates,
+        (fetch_total_24h, fetch_ok_24h),
+    ) = dashboard_counters(state, headers, &mut tx, day_ago).await?;
+    let proxy_counts = aggregates.counts.clone();
     let (latency_min, latency_avg) = (aggregates.latency_min, aggregates.latency_avg);
-    let latency_median = fumox_core::repo::proxies::latency_median(&mut *tx)
-        .await
-        .map_err(|err| server_error(state, headers, "dashboard.latency_median", &err))?;
-
-    // Probe success rate over the last 24 hours. Speed probes are
-    // excluded (see `probe::success_counts_since`): they measure
-    // transfer bandwidth, not liveness.
-    let (probes_total_24h, probes_ok_24h): (i64, i64) =
-        fumox_core::repo::probe::success_counts_since(&mut *tx, day_ago)
-            .await
-            .map_err(|err| server_error(state, headers, "dashboard.probes_24h", &err))?;
-
-    // Top failure reasons over the rolling 24h window, the operator's
-    // most actionable signal after the source-errors block at the top:
-    // "what kind of probe failure is happening most often right now?"
-    let top_failures: Vec<(String, i64)> =
-        fumox_core::repo::probe::top_failure_reasons(&mut *tx, day_ago, top_n.as_i64())
-            .await
-            .map_err(|err| server_error(state, headers, "dashboard.top_failures", &err))?;
-
-    // Ingest dynamics: proxies created per day over the last 7 days,
-    // zero-filled for gap days (the chart must not silently skip a day).
-    let rows: Vec<IngestDayRow> = sqlx::query_as(
-        "SELECT (created_at / 86400) * 86400 AS day, COUNT(*) AS created
-         FROM proxies
-         WHERE created_at >= ?
-         GROUP BY day ORDER BY day",
-    )
-    .bind(day_ago - 6 * 86_400)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|err| server_error(state, headers, "dashboard.ingest_days", &err))?;
+    let ((recent_errors, recent_errors_unavailable), (sources, sources_unavailable)) =
+        dashboard_triage_widgets(&mut tx, top_n.as_i64()).await;
+    let (top_alive, schemes, countries) =
+        dashboard_splits(state, headers, &mut tx, top_n.as_i64()).await?;
+    let (latency_median, (probes_total_24h, probes_ok_24h), top_failures) =
+        dashboard_probe_stats(state, headers, &mut tx, day_ago, top_n.as_i64()).await?;
     let now = fumox_core::models::now_ts();
-    let ingest_days = fill_ingest_days(&rows, now);
-    let ingest_max = ingest_days
-        .iter()
-        .map(|(_, count)| *count)
-        .max()
-        .unwrap_or(0);
-
-    // Age of the scheduler's last sweep (the stamp is written at sweep
-    // start, so a hung sweep shows as aging). A negative clock skew clamps
-    // to zero rather than rendering "-3 s". A stamp that does not parse
-    // is its own "corrupt" state, not the clean "no sweep yet".
-    let server_cycle_raw =
-        fumox_core::repo::meta_get(&mut *tx, fumox_core::repo::probe::meta::SERVER_CYCLE_KEY)
-            .await
-            .map_err(|err| server_error(state, headers, "dashboard.server_cycle", &err))?;
-    let (server_cycle_age_secs, server_cycle_corrupt) = match server_cycle_raw {
-        Some(raw) => match raw.parse::<i64>() {
-            Ok(ts) => (Some((now - ts).max(0)), false),
-            Err(_) => {
-                tracing::warn!(
-                    key = fumox_core::repo::probe::meta::SERVER_CYCLE_KEY,
-                    raw_len = raw.len(),
-                    "unparseable server cycle stamp"
-                );
-                (None, true)
-            }
-        },
-        None => (None, false),
-    };
+    let (ingest_days, ingest_max) = dashboard_ingest(state, headers, &mut tx, day_ago, now).await?;
+    let (server_cycle_age_secs, server_cycle_corrupt) =
+        dashboard_server_cycle(state, headers, &mut tx, now).await?;
 
     tx.commit()
         .await
@@ -493,6 +353,253 @@ async fn dashboard_inner(
         top_n,
         top_failures,
     })
+}
+
+/// The dashboard's scalar counters, one snapshot: the source totals
+/// (with the errored-source count), the profile count, the per-status
+/// aggregates the breakdown and the panel counters come from, and the
+/// 24h fetch pair.
+#[allow(clippy::result_large_err)] // the Err is a finished Response, by design
+async fn dashboard_counters(
+    state: &AdminState,
+    headers: &HeaderMap,
+    conn: &mut sqlx::SqliteConnection,
+    day_ago: i64,
+) -> Result<
+    (
+        (i64, i64, i64),
+        i64,
+        fumox_core::repo::proxies::StatusAggregates,
+        (i64, i64),
+    ),
+    Response,
+> {
+    let (src_total, src_enabled, src_errors): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(enabled), 0),
+                COALESCE(SUM(error_class IS NOT NULL), 0) FROM sources",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| server_error(state, headers, "dashboard.sources", &err))?;
+
+    let profiles_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profiles")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.profiles", &err))?;
+
+    // The proxy counters come from one grouped pass over the table, so
+    // the breakdown by status and the scalar counters cannot disagree.
+    let aggregates = fumox_core::repo::proxies::status_aggregates(&mut *conn)
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.status_aggregates", &err))?;
+
+    let (fetch_total_24h, fetch_ok_24h): (i64, i64) =
+        fumox_core::repo::fetch_log::success_counts_since(&mut *conn, day_ago)
+            .await
+            .map_err(|err| server_error(state, headers, "dashboard.fetch_24h", &err))?;
+
+    Ok((
+        (src_total, src_enabled, src_errors),
+        profiles_total,
+        aggregates,
+        (fetch_total_24h, fetch_ok_24h),
+    ))
+}
+
+/// The two widgets the operator triages from: the source-errors block
+/// and the per-source health table. They read the same snapshot but
+/// degrade independently: a failed read leaves its block empty with an
+/// inline note (`*_unavailable`) instead of taking the whole screen
+/// down.
+async fn dashboard_triage_widgets(
+    conn: &mut sqlx::SqliteConnection,
+    limit: i64,
+) -> ((Vec<SourceErrorRow>, bool), (Vec<SourceStatRow>, bool)) {
+    let (recent_errors, recent_errors_unavailable): (Vec<SourceErrorRow>, bool) =
+        match sqlx::query_as(
+            "SELECT id, name, error_class, last_error, last_fetched_at FROM sources
+             WHERE error_class IS NOT NULL
+             ORDER BY COALESCE(last_fetched_at, 0) DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await
+        {
+            Ok(rows) => (rows, false),
+            Err(err) => {
+                tracing::warn!(error = %err, "the dashboard source-errors widget failed to load");
+                (Vec::new(), true)
+            }
+        };
+
+    // Per-source health counters (single aggregate over the join table).
+    let (sources, sources_unavailable): (Vec<SourceStatRow>, bool) = match source_health_split(
+        &mut *conn,
+    )
+    .await
+    {
+        Ok(rows) => (rows, false),
+        Err(err) => {
+            tracing::warn!(error = %err, "the dashboard per-source health widget failed to load");
+            (Vec::new(), true)
+        }
+    };
+
+    (
+        (recent_errors, recent_errors_unavailable),
+        (sources, sources_unavailable),
+    )
+}
+
+/// The dashboard's distribution tables: the longest-living ready
+/// proxies top and the per-scheme and per-country splits.
+#[allow(clippy::result_large_err)] // the Err is a finished Response, by design
+async fn dashboard_splits(
+    state: &AdminState,
+    headers: &HeaderMap,
+    conn: &mut sqlx::SqliteConnection,
+    limit: i64,
+) -> Result<(Vec<TopAliveRow>, Vec<SchemeSplitRow>, Vec<CountrySplitRow>), Response> {
+    // Longest-living ready proxies: oldest `created_at` first, the
+    // tunnel-verified tier (`ready`) is a strict subset of `alive`, set
+    // only by a successful T2, so showing the top-N there surfaces the
+    // proxies that have stayed end-to-end working the longest. The tier
+    // is bound like every status value on this screen: no inline status
+    // literal survives in the dashboard's SQL. The picked ids come from
+    // a CTE, so the LIMIT applies before the source-links fan-out joins
+    // in their names.
+    let top_alive: Vec<TopAliveRow> = sqlx::query_as(
+        "WITH picked AS (
+             SELECT id FROM proxies WHERE status = ?
+             ORDER BY created_at ASC, id ASC LIMIT ?
+         )
+         SELECT p.id, p.name, p.scheme, p.host, p.port, p.latency_ms, p.geo_country,
+                p.created_at,
+                COALESCE(GROUP_CONCAT(s.name, ', '), '') AS source_names
+         FROM picked
+         JOIN proxies p ON p.id = picked.id
+         JOIN proxy_source_links l ON l.proxy_id = p.id
+         JOIN sources s ON s.id = l.source_id
+         GROUP BY p.id
+         ORDER BY p.created_at ASC, p.id ASC",
+    )
+    .bind(ProxyStatus::Ready.as_str())
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| server_error(state, headers, "dashboard.top_alive", &err))?;
+
+    let schemes = scheme_split(&mut *conn)
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.scheme_split", &err))?;
+    let countries = country_split(&mut *conn, limit)
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.country_split", &err))?;
+
+    Ok((top_alive, schemes, countries))
+}
+
+/// The probe-side figures of the dashboard: the latency median, the 24h
+/// probe success pair and the top failure reasons.
+#[allow(clippy::result_large_err)] // the Err is a finished Response, by design
+async fn dashboard_probe_stats(
+    state: &AdminState,
+    headers: &HeaderMap,
+    conn: &mut sqlx::SqliteConnection,
+    day_ago: i64,
+    limit: i64,
+) -> Result<(Option<i64>, (i64, i64), Vec<(String, i64)>), Response> {
+    // Latency of the live pool (`alive` and `ready`): the same set the
+    // dashboard's other widgets count. SQLite has no median builtin, so
+    // the median is a separate window-function query.
+    let latency_median = fumox_core::repo::proxies::latency_median(&mut *conn)
+        .await
+        .map_err(|err| server_error(state, headers, "dashboard.latency_median", &err))?;
+
+    // Probe success rate over the last 24 hours. Speed probes are
+    // excluded (see `probe::success_counts_since`): they measure
+    // transfer bandwidth, not liveness.
+    let (probes_total_24h, probes_ok_24h): (i64, i64) =
+        fumox_core::repo::probe::success_counts_since(&mut *conn, day_ago)
+            .await
+            .map_err(|err| server_error(state, headers, "dashboard.probes_24h", &err))?;
+
+    // Top failure reasons over the rolling 24h window, the operator's
+    // most actionable signal after the source-errors block at the top:
+    // "what kind of probe failure is happening most often right now?"
+    let top_failures: Vec<(String, i64)> =
+        fumox_core::repo::probe::top_failure_reasons(&mut *conn, day_ago, limit)
+            .await
+            .map_err(|err| server_error(state, headers, "dashboard.top_failures", &err))?;
+
+    Ok((
+        latency_median,
+        (probes_total_24h, probes_ok_24h),
+        top_failures,
+    ))
+}
+
+/// Ingest dynamics: proxies created per day over the last 7 days,
+/// zero-filled for gap days (the chart must not silently skip a day),
+/// with the largest per-day value for the bar scale.
+#[allow(clippy::result_large_err)] // the Err is a finished Response, by design
+async fn dashboard_ingest(
+    state: &AdminState,
+    headers: &HeaderMap,
+    conn: &mut sqlx::SqliteConnection,
+    day_ago: i64,
+    now: i64,
+) -> Result<(Vec<(i64, i64)>, i64), Response> {
+    let rows: Vec<IngestDayRow> = sqlx::query_as(
+        "SELECT (created_at / 86400) * 86400 AS day, COUNT(*) AS created
+         FROM proxies
+         WHERE created_at >= ?
+         GROUP BY day ORDER BY day",
+    )
+    .bind(day_ago - 6 * 86_400)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| server_error(state, headers, "dashboard.ingest_days", &err))?;
+    let ingest_days = fill_ingest_days(&rows, now);
+    let ingest_max = ingest_days
+        .iter()
+        .map(|(_, count)| *count)
+        .max()
+        .unwrap_or(0);
+    Ok((ingest_days, ingest_max))
+}
+
+/// Age of the scheduler's last sweep, read from the meta table: the
+/// stamp is written at sweep start, so a hung sweep shows as aging. A
+/// negative clock skew clamps to zero rather than rendering "-3 s". A
+/// stamp that does not parse is its own "corrupt" state, not the clean
+/// "no sweep yet".
+#[allow(clippy::result_large_err)] // the Err is a finished Response, by design
+async fn dashboard_server_cycle(
+    state: &AdminState,
+    headers: &HeaderMap,
+    conn: &mut sqlx::SqliteConnection,
+    now: i64,
+) -> Result<(Option<i64>, bool), Response> {
+    let server_cycle_raw =
+        fumox_core::repo::meta_get(&mut *conn, fumox_core::repo::probe::meta::SERVER_CYCLE_KEY)
+            .await
+            .map_err(|err| server_error(state, headers, "dashboard.server_cycle", &err))?;
+    let (server_cycle_age_secs, server_cycle_corrupt) = match server_cycle_raw {
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(ts) => (Some((now - ts).max(0)), false),
+            Err(_) => {
+                tracing::warn!(
+                    key = fumox_core::repo::probe::meta::SERVER_CYCLE_KEY,
+                    raw_len = raw.len(),
+                    "unparseable server cycle stamp"
+                );
+                (None, true)
+            }
+        },
+        None => (None, false),
+    };
+    Ok((server_cycle_age_secs, server_cycle_corrupt))
 }
 
 /// The 7-day ingest series, oldest first, zero-filled for gap days: a
@@ -796,6 +903,27 @@ pub(super) fn header_safe(value: &str) -> String {
     out
 }
 
+/// A [`HeaderValue`] from a string this module has made wire-safe: the
+/// flash message is percent-encoded by [`header_safe`], the toast level
+/// is a code word and the toast envelope is built from their output.
+/// Such bytes are always visible ASCII, which `HeaderValue::from_str`
+/// cannot refuse — the `Err` arm exists only because the type system
+/// cannot see that, and it degrades by dropping the header (with a log
+/// line) instead of panicking a live request handler.
+fn wire_safe_header_value(value: &str) -> Option<HeaderValue> {
+    match HeaderValue::from_str(value) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                len = value.len(),
+                "wire-safe header value refused, dropping the header"
+            );
+            None
+        }
+    }
+}
+
 /// Response for a mutating action: HTMX callers receive the fragment plus
 /// a toast event; plain browsers are redirected back. The toast message
 /// rides in the `HX-Trigger` header percent-encoded ([`header_safe`]).
@@ -856,14 +984,12 @@ fn action_response_with_level(
 pub(super) fn flash_redirect(redirect_to: &str, toast: &str, level: &str) -> Response {
     let mut response = Redirect::to(redirect_to).into_response();
     let headers = response.headers_mut();
-    headers.insert(
-        crate::admin::flash::FLASH_HEADER,
-        HeaderValue::from_str(&header_safe(toast)).expect("header_safe output is visible ASCII"),
-    );
-    headers.insert(
-        crate::admin::flash::FLASH_LEVEL_HEADER,
-        HeaderValue::from_str(level).expect("the flash level is a plain word"),
-    );
+    if let Some(value) = wire_safe_header_value(&header_safe(toast)) {
+        headers.insert(crate::admin::flash::FLASH_HEADER, value);
+    }
+    if let Some(value) = wire_safe_header_value(level) {
+        headers.insert(crate::admin::flash::FLASH_LEVEL_HEADER, value);
+    }
     response
 }
 
@@ -876,7 +1002,10 @@ pub(super) fn toast_trigger(level: &str, message: &str) -> HeaderValue {
         "{{\"toast\": {{\"message\": \"{}\", \"level\": \"{level}\"}}}}",
         header_safe(message)
     );
-    HeaderValue::from_str(&payload).expect("header_safe output is visible ASCII")
+    // An empty object parses as JSON for the client but carries no toast
+    // event: the degradation of an envelope that (impossibly) was refused
+    // as a header value, so a broken toast cannot break the response.
+    wire_safe_header_value(&payload).unwrap_or_else(|| HeaderValue::from_static("{}"))
 }
 
 fn is_htmx(headers: &HeaderMap) -> bool {
@@ -967,11 +1096,20 @@ pub mod caps {
 
 /// Slug rules shared by the source and profile forms and the import
 /// validation: starts alphanumeric, then `[A-Za-z0-9_-]`, total length
-/// 2–64. Compiled once; the form paths used to rebuild it on every
-/// validation call.
-static SLUG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$").expect("valid slug regex")
-});
+/// 2–64. A plain predicate, equivalent to the former
+/// `^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$` regex: both classes are
+/// ASCII-only and anchored to the whole input, so a match is pure ASCII
+/// and byte length equals character length. The rules are fixed
+/// literals, so there is nothing to fail at runtime (a `Regex::new`
+/// behind an `expect` had no error path to propagate into anyway).
+fn is_valid_slug(slug: &str) -> bool {
+    let b = slug.as_bytes();
+    (2..=64).contains(&b.len())
+        && b[0].is_ascii_alphanumeric()
+        && b[1..]
+            .iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
 
 /// The id of a repo row: what the shared slug-uniqueness check compares
 /// against the row being edited. Both slug tables (`sources`, `profiles`)
@@ -993,7 +1131,7 @@ impl RowId for fumox_core::models::Profile {
 }
 
 /// Validate the optional `slug` field shared by the source and profile
-/// forms: format rules ([`SLUG_RE`]), then uniqueness. `lookup` resolves
+/// forms: format rules ([`is_valid_slug`]), then uniqueness. `lookup` resolves
 /// the row of one slug table already holding the value; the future is
 /// built eagerly but only awaited after the format check passes, and a DB
 /// error counts as "free" (a slug that sneaks through still fails the
@@ -1083,7 +1221,7 @@ pub(super) fn ttl_range_message(lang: &Lang) -> String {
 /// Validate a slug's format (the uniqueness check is per table and stays
 /// with the caller).
 pub(super) fn validate_slug_format(slug: &str, lang: &Lang) -> Result<(), String> {
-    if SLUG_RE.is_match(slug) {
+    if is_valid_slug(slug) {
         Ok(())
     } else {
         Err(lang.t("val.slug_format").into())
@@ -1665,17 +1803,17 @@ mod tests {
         assert!(errors[0].1.contains("many"), "{errors:?}");
     }
 
-    /// The slug rules are shared and compiled once: the same format rules
-    /// the import path applies, matched against a `LazyLock` regex.
+    /// The slug rules are shared: the same format rules the import path
+    /// applies, checked by a plain predicate.
     #[test]
-    fn slug_re_holds_the_shared_format_rules() {
-        assert!(SLUG_RE.is_match("ab"));
-        assert!(SLUG_RE.is_match("a-b_c9"));
-        assert!(!SLUG_RE.is_match("a")); // too short
-        assert!(!SLUG_RE.is_match("-ab")); // must start alphanumeric
-        assert!(!SLUG_RE.is_match("a b")); // space outside the charset
-        assert!(!SLUG_RE.is_match(&"a".repeat(65))); // too long
-        assert!(SLUG_RE.is_match(&"a".repeat(64)));
+    fn slug_rules_hold_the_shared_format_rules() {
+        assert!(is_valid_slug("ab"));
+        assert!(is_valid_slug("a-b_c9"));
+        assert!(!is_valid_slug("a")); // too short
+        assert!(!is_valid_slug("-ab")); // must start alphanumeric
+        assert!(!is_valid_slug("a b")); // space outside the charset
+        assert!(!is_valid_slug(&"a".repeat(65))); // too long
+        assert!(is_valid_slug(&"a".repeat(64)));
     }
 
     /// The uniqueness half of the shared slug validation, against a stub

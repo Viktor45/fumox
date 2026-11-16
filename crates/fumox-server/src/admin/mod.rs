@@ -242,14 +242,14 @@ impl AdminState {
     /// through the settings screen must change the effective key at once,
     /// not at the next restart. One SHA-256 is noise next to the indexed
     /// read of the revocation epoch every authenticated request does.
-    pub fn session_key(&self) -> Vec<u8> {
+    pub fn session_key(&self) -> [u8; 32] {
         auth::derive_key(b"fumox-admin-session", &self.admin_token())
     }
 
     /// HMAC key for the CSRF tokens, derived from the live token like
     /// [`AdminState::session_key`] but with its own purpose tag, so the
     /// two keys never coincide.
-    pub fn csrf_key(&self) -> Vec<u8> {
+    pub fn csrf_key(&self) -> [u8; 32] {
         auth::derive_key(b"fumox-admin-csrf", &self.admin_token())
     }
 
@@ -398,8 +398,8 @@ pub(crate) const PREF_COOKIE_MAX_AGE_SECS: u64 = 365 * 24 * 3600;
 /// Value of the first cookie named `name` across the `Cookie` headers:
 /// each header splits on `;`, each pair on the first `=`. `None` when no
 /// header carries the name. The one cookie scanner of the panel — the
-/// language, theme and Top-N readers parse only their own value on top of
-/// it.
+/// language, theme, Top-N and session readers parse only their own value
+/// on top of it.
 pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     for header_value in headers.get_all(header::COOKIE) {
         let Ok(text) = header_value.to_str() else {
@@ -587,8 +587,8 @@ async fn capture_flash(State(state): State<AdminState>, req: Request, next: Next
     if let Some(message) = message {
         let message = message.to_str().unwrap_or_default().to_string();
         let level = level
-            .and_then(|value| value.to_str().ok().map(str::to_string))
-            .unwrap_or_else(|| "ok".to_string());
+            .and_then(|value| value.to_str().ok().map(flash::FlashLevel::from_header))
+            .unwrap_or(flash::FlashLevel::Ok);
         state.flashes.put(&session, message, level);
     }
     response
@@ -605,23 +605,24 @@ async fn take_flash(State(state): State<AdminState>, headers: HeaderMap) -> Resp
         Some((message, level)) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-            // The message is percent-encoded (see `header_safe`), so it
-            // carries no quote or backslash that would break the JSON.
-            format!("{{\"message\": \"{message}\", \"level\": \"{level}\"}}"),
+            // Built by serde_json, so the body is valid JSON whatever a
+            // producer parked in the store. The message itself stays
+            // percent-encoded (see `header_safe`): a response header is
+            // Latin-1 on the wire and the client decodes it back.
+            serde_json::json!({ "message": message, "level": level.as_str() }).to_string(),
         )
             .into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
-/// Build the admin router. Mounted only when the panel is active
-/// (enabled + non-empty token); otherwise the listener serves 404.
-pub fn router(state: AdminState) -> axum::Router {
+/// Sources and profiles CRUD: list, form, detail, and the per-entity
+/// actions (toggle, refresh, delete, dry-run). Merged into
+/// [`protected_router`] in the original registration order.
+fn source_profile_routes() -> axum::Router<AdminState> {
     use axum::routing::{get, post};
 
-    // Middleware execution is outside-in: `require_auth` (added last) runs
-    // first, then CSRF, then the handler.
-    let protected = axum::Router::new()
+    axum::Router::new()
         .route("/", get(handlers::dashboard))
         .route("/sources", get(handlers::sources_list))
         .route(
@@ -654,6 +655,14 @@ pub fn router(state: AdminState) -> axum::Router {
         )
         .route("/profiles/{id}/toggle", post(handlers::profile_toggle))
         .route("/profiles/{id}/delete", post(handlers::profile_delete))
+}
+
+/// Proxy inventory: list, detail, and the bulk cleanup/revival actions.
+/// Merged into [`protected_router`] in the original registration order.
+fn proxy_routes() -> axum::Router<AdminState> {
+    use axum::routing::{get, post};
+
+    axum::Router::new()
         .route("/proxies", get(handlers::proxies_list))
         .route(
             "/proxies/purge-removed",
@@ -709,6 +718,15 @@ pub fn router(state: AdminState) -> axum::Router {
             "/proxies/{id}/probe-history",
             get(handlers::proxy_probe_history),
         )
+}
+
+/// Journals, probe overview, settings, pipeline builder, import/export,
+/// SSE, the toast endpoint and the UI-preference setters. Merged into
+/// [`protected_router`] in the original registration order.
+fn admin_content_routes() -> axum::Router<AdminState> {
+    use axum::routing::{get, post};
+
+    axum::Router::new()
         .route("/logs/fetch", get(handlers::fetch_logs))
         .route("/probe", get(handlers::probe_overview))
         .route("/settings", get(handlers::settings_overview))
@@ -757,6 +775,16 @@ pub fn router(state: AdminState) -> axum::Router {
         // `require_auth` and `csrf_protect` run; the form in `base.html`
         // already ships the `_csrf` field the layer checks.
         .route("/logout", post(auth::logout))
+}
+
+/// The `/admin/*` surface behind auth: the merged route groups wrapped in
+/// the CSRF and authentication layers.
+fn protected_router(state: &AdminState) -> axum::Router<AdminState> {
+    // Middleware execution is outside-in: `require_auth` (added last) runs
+    // first, then CSRF, then the handler.
+    source_profile_routes()
+        .merge(proxy_routes())
+        .merge(admin_content_routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::csrf_protect,
@@ -764,12 +792,18 @@ pub fn router(state: AdminState) -> axum::Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
-        ));
+        ))
+}
+
+/// Build the admin router. Mounted only when the panel is active
+/// (enabled + non-empty token); otherwise the listener serves 404.
+pub fn router(state: AdminState) -> axum::Router {
+    use axum::routing::get;
 
     // axum's nesting matches `/admin` but not `/admin/`; the trailing-slash
     // variant is a plain redirect to the canonical entry point.
     axum::Router::new()
-        .nest("/admin", protected)
+        .nest("/admin", protected_router(&state))
         .route("/admin/", get(|| async { Redirect::to("/admin") }))
         .route(
             "/admin/login",
@@ -1093,6 +1127,42 @@ pub(crate) async fn admin_state_on_tmp_db(
 pub(crate) fn askama_html_escape(text: &str) -> String {
     askama::filters::escape(text, askama::filters::Html)
         .expect("askama's escape filter is infallible")
+        .to_string()
+}
+
+/// Build a request with the `ConnectInfo` extension the rate limiter
+/// extracts; a real listener attaches it via
+/// `into_make_service_with_connect_info`.
+#[cfg(test)]
+pub(crate) fn request(method: &str, uri: &str, body: &str, cookie: Option<&str>) -> Request {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .extension(axum::extract::ConnectInfo::<SocketAddr>(
+            "127.0.0.1:41000".parse().unwrap(),
+        ));
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    builder
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// The `name=value` pair of a `Set-Cookie` header: everything up to the
+/// first attribute separator.
+#[cfg(test)]
+pub(crate) fn cookie_from(response: &axum::response::Response) -> String {
+    response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("the response must set a cookie")
+        .to_str()
+        .expect("the cookie is header-safe")
+        .split(';')
+        .next()
+        .unwrap()
         .to_string()
 }
 

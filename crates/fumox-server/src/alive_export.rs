@@ -274,41 +274,10 @@ async fn serve_tier(
     // Origin check first (before token check): the response on rejection is
     // identical to a wrong token (404 "link not found") so probing cannot
     // distinguish "bad host" from "bad token".
-    if let Err(err) = host_gate::validate_request_host(&headers, &state.allowed_hosts) {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("<missing>");
-        if should_warn_host_reject(host, Instant::now()) {
-            tracing::warn!(
-                host,
-                error = %err,
-                "alive-export: host rejected by the allowlist"
-            );
-        } else {
-            tracing::debug!(host, error = %err, "alive-export: host rejected by the allowlist");
-        }
-        return serve::error_response(StatusCode::NOT_FOUND, "link not found");
+    if let Some(response) = host_gate_rejection(&state, &headers) {
+        return response;
     }
-    let expected = match state.export.token.current(&state.pool).await {
-        Ok(expected) => expected,
-        Err(err) => {
-            tracing::error!(error = %err, "export token lookup failed");
-            return serve::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error",
-            );
-        }
-    };
-    // Constant-time comparison: the token is a public capability link.
-    if !crate::security::ct_eq(&expected, &token) {
-        let mut response = serve::error_response(StatusCode::NOT_FOUND, "link not found");
-        // Flag the failure for the public rate-limit middleware, which
-        // logs it with the client key it computed (this handler never sees
-        // the peer address); the token value itself is never logged.
-        response
-            .extensions_mut()
-            .insert(serve::AuthFailure("export capability token"));
+    if let Some(response) = token_gate_rejection(&state, &token).await {
         return response;
     }
     // The ?format= refusal comes after both gates: a request the host gate
@@ -334,19 +303,87 @@ async fn serve_tier(
     };
 
     let mut response = serve::to_response(&rendered);
-    if params.contains_key("download") {
-        let date = export_date();
-        // ASCII-only value (fixed prefix + calendar date), try_from cannot fail.
-        if let Ok(value) = header::HeaderValue::try_from(format!(
-            "attachment; filename=\"fumox-{}-{date}.txt\"",
-            tier.as_str()
-        )) {
-            response
-                .headers_mut()
-                .insert(header::CONTENT_DISPOSITION, value);
-        }
+    if params.contains_key("download")
+        && let Some(value) = download_disposition(tier)
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
     }
     response
+}
+
+/// The host-gate half of [`serve_tier`]: validates the request `Host`
+/// against the allowlist and, on rejection, logs it through the shared
+/// registry and answers with the same 404 a wrong token produces.
+/// `None` lets the request proceed to the token gate.
+fn host_gate_rejection(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let err = host_gate::validate_request_host(headers, &state.allowed_hosts).err()?;
+    // The raw `Host` header is attacker-controlled and the gate
+    // deliberately refuses to echo it (see `host_gate::HostRejected`):
+    // log the canonical host from the rejection — empty for a missing
+    // or malformed value — and key the warn registry with it too, so a
+    // raw value cannot reach a log through the window summary either.
+    if should_warn_host_reject(&err.host, Instant::now()) {
+        tracing::warn!(
+            host = %err.host,
+            error = %err,
+            "alive-export: host rejected by the allowlist"
+        );
+    } else {
+        tracing::debug!(
+            host = %err.host,
+            error = %err,
+            "alive-export: host rejected by the allowlist"
+        );
+    }
+    Some(serve::error_response(
+        StatusCode::NOT_FOUND,
+        "link not found",
+    ))
+}
+
+/// The token half of [`serve_tier`]: loads the capability token and
+/// compares it in constant time. A mismatch is answered with the same 404
+/// the host gate produces, flagged for the rate-limit middleware; `None`
+/// lets the request proceed. A failed token *lookup* is a broken server,
+/// not a rejected request, so it answers 500 instead.
+async fn token_gate_rejection(state: &AppState, token: &str) -> Option<Response> {
+    let expected = match state.export.token.current(&state.pool).await {
+        Ok(expected) => expected,
+        Err(err) => {
+            tracing::error!(error = %err, "export token lookup failed");
+            return Some(serve::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error",
+            ));
+        }
+    };
+    // Constant-time comparison: the token is a public capability link.
+    if !crate::security::ct_eq(&expected, token) {
+        let mut response = serve::error_response(StatusCode::NOT_FOUND, "link not found");
+        // Flag the failure for the public rate-limit middleware, which
+        // logs it with the client key it computed (this handler never sees
+        // the peer address); the token value itself is never logged.
+        response
+            .extensions_mut()
+            .insert(serve::AuthFailure("export capability token"));
+        return Some(response);
+    }
+    None
+}
+
+/// The `Content-Disposition` value of a `?download=1` request: the file
+/// name carries the tier and the calendar date. The value is a fixed ASCII
+/// prefix plus [`export_date`], so `try_from` cannot fail; the `None`
+/// path would only drop the header, never the body.
+fn download_disposition(tier: Tier) -> Option<header::HeaderValue> {
+    let date = export_date();
+    header::HeaderValue::try_from(format!(
+        "attachment; filename=\"fumox-{}-{date}.txt\"",
+        tier.as_str()
+    ))
+    .ok()
 }
 
 /// Processed-cache key of one export tier.
@@ -653,6 +690,51 @@ mod tests {
         assert_eq!(body, "link not found\n");
     }
 
+    /// A malformed `Host` value is attacker-controlled and the gate
+    /// deliberately refuses to echo it ([`host_gate::HostRejected`] carries
+    /// the canonical host only, empty for a malformed value). The rejection
+    /// log here must obey the same contract — name the canonical host, and
+    /// never the raw header — and so must the warn-registry key, whose
+    /// values the window summary prints back into the log.
+    #[tokio::test]
+    async fn a_malformed_host_is_rejected_without_reaching_the_log() {
+        let (app, token, _state) =
+            app_with_token(vec!["vpn.example.com".to_string()], default_cap()).await;
+        let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(make_writer)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        crate::test_support::stabilize_callsite_interests();
+        tracing::callsite::rebuild_interest_cache();
+
+        // A value the gate classifies as Malformed while staying readable
+        // as text: a literal `@` (the userinfo separator, which
+        // `host_gate::canonicalize_host_str` rejects). This is the shape
+        // whose raw bytes reach the log when the handler echoes the header
+        // instead of the gate's canonical host; a non-ASCII value would
+        // not (it fails `HeaderValue::to_str` and logs as `<missing>`).
+        let (status, _) = get_with_host(
+            &app,
+            &format!("/export/alive/{token}"),
+            Some("vpn.example.com@evil.com"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("alive-export: host rejected by the allowlist"),
+            "the rejection must still be logged: {logs}"
+        );
+        assert!(
+            !logs.contains("vpn.example.com@evil.com"),
+            "the raw malformed host must never reach a log: {logs}"
+        );
+    }
+
     /// Two distinct failure modes (bad host vs bad token) must yield
     /// byte-identical responses, same status, same body, same
     /// Content-Type, so an attacker cannot probe the link to learn
@@ -761,25 +843,9 @@ mod tests {
     async fn export_body_is_rendered_once_per_window() {
         let (app, token, state) = app_with_token(Vec::new(), default_cap()).await;
         let source = fumox_core::models::Source {
-            id: "srcA0000000".to_string(),
-            slug: None,
-            access_token: None,
             name: "source".to_string(),
             url: "https://example.com/list".to_string(),
-            enabled: true,
-            encoding: Default::default(),
-            input_format: None,
-            protocols: None,
-            cache_ttl_seconds: 3600,
-            tags: None,
-            pipeline: None,
-            headers: None,
-            ip_family: None,
-            created_at: fumox_core::models::now_ts(),
-            updated_at: fumox_core::models::now_ts(),
-            last_fetched_at: None,
-            last_error: None,
-            error_class: None,
+            ..fumox_core::models::Source::fixture("srcA0000000", fumox_core::models::now_ts())
         };
         fumox_core::repo::sources::create(&state.pool, &source)
             .await
@@ -1021,22 +1087,11 @@ mod tests {
             .unwrap();
         }
 
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let make_writer = captured.clone();
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
+        let (make_writer, captured) = fumox_core::logging::capture::captured_writer();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_max_level(tracing::Level::WARN)
-            .with_writer(move || Captured(std::sync::Arc::clone(&make_writer)))
+            .with_writer(make_writer)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 

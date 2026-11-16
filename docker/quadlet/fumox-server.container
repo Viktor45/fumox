@@ -14,6 +14,7 @@ Description=Fumox server (subscription endpoints + admin panel)
 
 [Container]
 Image=localhost/fumox:local
+#Image=ghcr.io/viktor45/fumox:latest
 ContainerName=fumox-server
 Pod=fumox.pod
 

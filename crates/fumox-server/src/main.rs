@@ -68,113 +68,31 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Before anything builds an HTTP client: reqwest is compiled without a
-    // crypto provider, so one has to be installed first.
-    fumox_core::tls::install_crypto_provider();
-
     let cli = Cli::parse();
-    let loaded = fumox_core::config::load(cli.config.as_deref())?;
-    let config = loaded.config;
-
-    if cli.print_config {
-        print!("{}", fumox_core::config::dump(&config)?);
+    let Some(loaded) =
+        fumox_core::bootstrap::load_or_print(cli.config.as_deref(), cli.print_config)?
+    else {
         return Ok(());
-    }
+    };
+    let config = loaded.config;
 
     // Before tracing, the pool and the migrations: a probe must not make
     // any of that side effect happen just to be measured. It reports the
     // server's readiness, and migrations complete before the listeners
     // bind, so a 200 here means the schema is current.
     if cli.health_check {
-        return match probe_healthz(config.server.bind).await {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                // The URL, not the bare endpoint: the address the probe
-                // derived from the bind is the first thing to compare
-                // against the listener the server actually opened.
-                eprintln!(
-                    "{} did not answer 200: {error}",
-                    health_probe_url(config.server.bind)
-                );
-                std::process::exit(1);
-            }
-        };
+        return run_health_check(config.server.bind).await;
     }
 
     fumox_core::logging::init_tracing(config.log.server);
-
-    // Security audit (2026-08-30): the panel is only reachable with a
-    // token the operator set. An empty token and the historical
-    // "change-me" placeholder both mean "panel off" (see
-    // `AdminConfig::is_active`), so the listener is never started for
-    // them; say which mode this is, since "the admin URL answers 404" is
-    // otherwise indistinguishable from a routing mistake.
-    if config.admin.enabled && !config.admin.is_active() {
-        tracing::warn!(
-            bind = %config.admin.bind,
-            "admin panel is disabled: set admin.token (or FUMOX_ADMIN__TOKEN) to enable it"
-        );
-    }
-    // A panel that listens on a public address and sends its session
-    // cookie without `Secure` hands the token to everyone on the path.
-    if config.admin.insecure_cookies_on_a_public_bind() {
-        tracing::warn!(
-            bind = %config.admin.bind,
-            "admin session cookie is not marked Secure while the panel listens on a public \
-             address: the session token travels in clear text; set admin.secure_cookies = true \
-             behind an HTTPS front, or bind the panel to a loopback address"
-        );
-    }
-
+    log_admin_posture_warnings(&config);
     for warning in startup_warnings(&config) {
         tracing::warn!("{warning}");
     }
 
-    // The loader cannot log (its own level comes from the config); report
-    // the file actually used once tracing is up.
-    match &loaded.path {
-        fumox_core::config::ResolvedConfigPath::Loaded(file) => {
-            tracing::info!(config = %file.display(), "config file loaded");
-        }
-        fumox_core::config::ResolvedConfigPath::Missing => {
-            tracing::info!(
-                "no config file found (looked at {} or {}); using built-in defaults",
-                fumox_core::config::CONFIG_PATH_ENV,
-                fumox_core::DEFAULT_CONFIG_PATH
-            );
-        }
-    }
-
-    // A save that died between creating its temporary file and renaming
-    // it leaves a copy of the config behind, and the config carries
-    // `[admin].token`. The leftovers of writers that are gone are
-    // removed here, on the only start that can produce them.
-    let config_dir = match &loaded.path {
-        fumox_core::config::ResolvedConfigPath::Loaded(file) => {
-            file.parent().map(Path::to_path_buf)
-        }
-        fumox_core::config::ResolvedConfigPath::Missing => {
-            Path::new(fumox_core::DEFAULT_CONFIG_PATH)
-                .parent()
-                .map(Path::to_path_buf)
-        }
-    };
-    if let Some(dir) = config_dir {
-        fumox_core::config_writer::cleanup_stale_tmp_files(&dir);
-    }
-
-    // figment layers `FUMOX_*` variables over the file (config.rs, `Env::
-    // prefixed("FUMOX_")`); count them so a surprise override is at least
-    // attributable; names and values stay out of the log. The resolved
-    // database path is otherwise only visible on /admin/settings.
-    let env_overrides = std::env::vars()
-        .filter(|(key, _)| key.starts_with("FUMOX_"))
-        .count();
-    tracing::info!(
-        path = %config.database.path.display(),
-        env_overrides,
-        "database configured"
-    );
+    fumox_core::bootstrap::report_config_file(&loaded.path);
+    cleanup_config_tmp_leftovers(&loaded.path);
+    fumox_core::bootstrap::report_database(&config);
 
     let pool = fumox_core::db::connect_pool(&config.database).await?;
     fumox_core::db::migrate_with(
@@ -182,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         fumox_core::db::ChecksumRepair::from_config(config.database.allow_checksum_repair),
     )
     .await?;
+
     // The public «all alive» export link: the capability token is
     // generated on first startup; it persists in `meta`, so the link is
     // stable across restarts until rotated from the admin panel. The
@@ -190,58 +109,9 @@ async fn main() -> anyhow::Result<()> {
     // the listener share the instance, so a rotation reaches both.
     let export_token = alive_export::TokenCache::new();
     export_token.current(&pool).await?;
+    run_legacy_data_upgrades(&pool).await?;
 
-    // Profile access tokens are stored as hashes. A row written before
-    // that still holds the token in plain text, so it is rewritten in
-    // place on the first start after the upgrade.
-    let hashed = fumox_core::repo::profiles::hash_legacy_tokens(&pool).await?;
-    if hashed > 0 {
-        tracing::info!(count = hashed, "profile access tokens hashed");
-    }
-
-    // The fingerprint version is part of the pre-image, so a change of the
-    // canonical form changes every key: the rows written before the change
-    // keep keys the ingest no longer produces. They are recomputed once,
-    // on the first start after the upgrade, before the first ingest — the
-    // rows that describe the same node twice are merged into one.
-    match fumox_core::repo::proxies::ensure_fingerprint_version(&pool).await? {
-        Some(stats) => {
-            tracing::info!(
-                version = fumox_core::fingerprint::FINGERPRINT_VERSION,
-                rewritten = stats.rewritten,
-                merged = stats.merged,
-                "stored fingerprints recomputed"
-            );
-        }
-        None => {
-            tracing::info!(
-                version = fumox_core::fingerprint::FINGERPRINT_VERSION,
-                "stored fingerprints are current"
-            );
-        }
-    }
-
-    // Best-effort GeoLite2 database download into [geo].db_dir: fetch what
-    // is missing, broken or older than a month.
-    //
-    // The download runs in its own task and the listeners are bound
-    // without waiting for it: a mirror must not keep the public surface
-    // dark. The resolver asks the process-wide registry for the databases
-    // on every lookup, so a file that lands later is picked up without a
-    // restart. The budget is how long startup waits for the file
-    // afterwards, not how long the download may run.
-    let geo_config = config.clone();
-    let geo_download =
-        tokio::spawn(async move { geo_download::ensure_geo_databases(&geo_config).await });
-    if config.geo.startup_download_budget_secs
-        > fumox_core::config::MAX_STARTUP_DOWNLOAD_BUDGET_SECS
-    {
-        tracing::warn!(
-            configured = config.geo.startup_download_budget_secs,
-            capped = fumox_core::config::MAX_STARTUP_DOWNLOAD_BUDGET_SECS,
-            "[geo].startup_download_budget_secs is above the cap; the effective budget is the cap"
-        );
-    }
+    let geo_download = spawn_geo_download(&config);
 
     // Background source refresh loop: fetch → parse → reconcile → journal.
     let fetcher = Fetcher::new(
@@ -263,18 +133,7 @@ async fn main() -> anyhow::Result<()> {
     let (refresh_tx, refresh_rx) =
         tokio::sync::mpsc::channel::<String>(scheduler::REFRESH_CHANNEL_CAP);
     let scheduler_task = tokio::spawn(scheduler::run(
-        scheduler::IngestEnv {
-            pool: pool.clone(),
-            fetcher: fetcher.clone(),
-            caches: caches.clone(),
-            geo: geo.clone(),
-            settings: ingest::IngestSettings {
-                refresh_check_limit: config.ingest.refresh_check_limit,
-                drop_gate: config.ingest.drop_gate,
-                removed_as_unknown: config.ingest.removed_as_unknown,
-            },
-            budget: scheduler::ingest_budget(&config.fetch),
-        },
+        scheduler_ingest_env(&pool, &config, &fetcher, &caches, &geo),
         scheduler_state.clone(),
         events.clone(),
         refresh_rx,
@@ -284,26 +143,7 @@ async fn main() -> anyhow::Result<()> {
         scheduler::ServerRetention::from_config(&config),
     ));
 
-    // Public listener: /sub/{id}, /src/{id}, /export/alive/{token} and
-    // /export/ready/{token}.
-    //
-    // `/healthz` gets a pool of its own, one connection, so its answer does
-    // not queue behind renders. An orchestrator reads 503 as "restart me",
-    // and a busy render pool is this process's own load, not a fault. The
-    // type (`serve::HealthPool`) is what proves the pool stays dedicated.
-    let health_pool = serve::HealthPool::dedicated(&config.database).await?;
-
-    let state = serve::AppState::new(
-        pool.clone(),
-        caches.clone(),
-        geo.clone(),
-        serve::PublicRateLimits::from_config(&config.server),
-        admin::parse_trusted_cidrs(&config.server.trust_proxy_ips),
-        config.server.trust_proxy_header,
-        config.server.allowed_hosts.clone(),
-        alive_export::ExportState::new(config.server.export_max_rows, export_token.clone()),
-    );
-    let app = serve::public_app(state, health_pool.clone());
+    let app = build_public_app(&pool, &config, &caches, &geo, &export_token).await?;
 
     // Admin listener: a separate loopback interface. With
     // an empty token or enabled=false the panel is inert, the listener
@@ -328,104 +168,37 @@ async fn main() -> anyhow::Result<()> {
         axum::Router::new()
     };
 
-    // The binds do not shortcut with `?`: a failed bind takes the same
-    // completion as a server that served and stopped — the scheduler drain
-    // and the in-flight warning run on this path too, and the error is
-    // reported after the exit line rather than in place of it.
-    let (listener, admin_listener) = match (
-        tokio::net::TcpListener::bind(config.server.bind).await,
-        tokio::net::TcpListener::bind(config.admin.bind).await,
-    ) {
-        (Ok(listener), Ok(admin_listener)) => (listener, admin_listener),
-        (listener, admin_listener) => {
-            let error = listener
-                .err()
-                .or(admin_listener.err())
-                .expect("the arm above took the both-ok case");
-            tracing::error!(error = %error, "cannot bind the listeners");
-            // The admin router holds the channel's other sender: drop it,
-            // so the scheduler below sees the close, not the timeout.
-            drop(admin_router);
-            finish_shutdown(refresh_tx, scheduler_task, &scheduler_state).await;
-            return Err(error.into());
-        }
+    // Every exit behind the startup needs the whole scheduler run at once:
+    // the refresh channel's sender, the loop's task handle and the shared
+    // state its in-flight fetches are marked on move together into the
+    // drain (see `finish_shutdown`).
+    let scheduler_run = SchedulerRun {
+        refresh_tx,
+        task: scheduler_task,
+        state: scheduler_state,
     };
-    tracing::info!(bind = %config.server.bind, "fumox-server listening");
-
-    // The listeners are bound; the download still runs. Give it its
-    // budget, then look at the geo state: a profile that filters by
-    // country cannot serve anything without the country facts, and a
-    // GeoIP failure must not stay silent.
-    await_geo_within_budget(geo_download, config.geo.startup_download_budget()).await;
-    if config.geo.enabled && profiles_require_country(&pool).await? && !geo.state().has_country() {
-        anyhow::bail!(
-            "a profile filters by country, but no GeoLite2 City database is available \
-             (geo state: {}, directory: {}); put the database into the directory, \
-             point [geo].db_dir at it, or drop the country allowlist",
-            geo.state().as_str(),
-            config.geo.db_dir.display(),
-        );
-    }
-    // Fill the geo columns of proxies ingested before a database existed
-    // (background: never blocks startup), bounded like the geo download
-    // above by the configured startup budget. It runs after the download
-    // had its budget, so it sees the database that just landed.
-    tokio::spawn(geo_backfill::backfill_missing_geo_within_budget(
-        pool.clone(),
-        geo.clone(),
-        config.geo.startup_download_budget(),
-    ));
-
-    // The public rate limiter also keys requests by peer address.
-    //
-    // The graceful shutdown waits for the open connections to finish, and
-    // the admin panel holds an SSE stream that never ends on its own. The
-    // wait therefore has a deadline — and the deadline starts when the
-    // signal arrives, not when the listeners start.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut public_server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+    run_listeners(
+        &pool,
+        &config,
+        &geo,
+        geo_download,
+        app,
+        admin_router,
+        scheduler_run,
     )
-    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
-    .into_future();
-    let mut admin_server = axum::serve(
-        admin_listener,
-        admin_router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
-    .into_future();
-
-    // A listener's error surfaces only at the end, after the shared
-    // completion below — the same drain the failed binds above take, so
-    // no exit path skips it.
-    let serving = tokio::select! {
-        // A listener that fails ends the wait right away.
-        result = async {
-            tokio::try_join!(&mut public_server, &mut admin_server).map(|_| ())
-        } => result,
-        () = shutdown_signal() => {
-            // The listeners stop accepting and drain what they have.
-            // The drain is bounded: an SSE stream or a slow download
-            // never ends on its own, and an orchestrator kills the
-            // process at its own grace period anyway — with the drain
-            // below skipped, since it sits behind the wait.
-            let _ = shutdown_tx.send(true);
-            drain_listeners(SHUTDOWN_DRAIN_TIMEOUT, async {
-                tokio::try_join!(&mut public_server, &mut admin_server).map(|_| ())
-            })
-            .await
-        }
-    };
-    // The listeners are done: their sockets close here rather than at the
-    // end of the process, so nothing new arrives during the scheduler
-    // drain below.
-    drop(public_server);
-    drop(admin_server);
-
-    finish_shutdown(refresh_tx, scheduler_task, &scheduler_state).await;
-    serving?;
+    .await?;
     Ok(())
+}
+
+/// The scheduler run the process is driving, owned as one unit because
+/// every exit behind the startup needs all of it: the refresh channel's
+/// sender (the admin panel and the serving state hold clones), the loop's
+/// task handle and the shared state its in-flight fetches are marked on.
+/// Closing the channel and waiting for the loop is [`finish_shutdown`].
+struct SchedulerRun {
+    refresh_tx: tokio::sync::mpsc::Sender<String>,
+    task: tokio::task::JoinHandle<()>,
+    state: SchedulerState,
 }
 
 /// The one completion every exit behind the startup takes: close the
@@ -434,25 +207,34 @@ async fn main() -> anyhow::Result<()> {
 /// line. Called both after the listeners end — a shutdown signal, or a
 /// listener that failed — and when a bind fails, so no exit path skips
 /// the drain the old `?` shortcuts used to.
-async fn finish_shutdown(
-    refresh_tx: tokio::sync::mpsc::Sender<String>,
-    scheduler_task: tokio::task::JoinHandle<()>,
-    scheduler_state: &SchedulerState,
-) {
+async fn finish_shutdown(scheduler_run: SchedulerRun) {
     // Dropping the last sender closes the channel (the admin router's
     // clone went with its server, or was dropped by the caller), and the
-    // loop treats that as its shutdown signal. The await is bounded so a
-    // wedged loop cannot hold the process past its shutdown.
-    drop(refresh_tx);
-    match tokio::time::timeout(Duration::from_secs(5), scheduler_task).await {
+    // loop treats that as its shutdown signal.
+    drop(scheduler_run.refresh_tx);
+    await_scheduler_stop(scheduler_run.task).await;
+    warn_abandoned_fetches(&scheduler_run.state).await;
+
+    tracing::info!("shutdown complete");
+}
+
+/// Wait, bounded, for the scheduler loop to stop after its channel closed.
+/// The await cannot hold the process past its shutdown: past the deadline
+/// a wedged loop is abandoned with a warning, and a loop that ended in an
+/// unwind is a warning too, not a crash of the shutdown itself.
+async fn await_scheduler_stop(task: tokio::task::JoinHandle<()>) {
+    match tokio::time::timeout(Duration::from_secs(5), task).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => tracing::warn!(error = %err, "scheduler task ended with a join error"),
         Err(_) => tracing::warn!("scheduler task did not stop within 5 s; abandoning it"),
     }
-    // In-flight fetches are detached tasks and cannot be awaited here;
-    // name what is being abandoned so a gap in an upstream's log or in
-    // `fetch_log` has an explanation in this one.
-    let abandoned = scheduler_state.in_flight_ids().await;
+}
+
+/// Name the in-flight fetches the shutdown is abandoning, so a gap in an
+/// upstream's log or in `fetch_log` has an explanation in this one. They
+/// are detached tasks and cannot be awaited here.
+async fn warn_abandoned_fetches(state: &SchedulerState) {
+    let abandoned = state.in_flight_ids().await;
     if !abandoned.is_empty() {
         tracing::warn!(
             count = abandoned.len(),
@@ -460,8 +242,20 @@ async fn finish_shutdown(
             "shutdown: fetches in flight are abandoned mid-request"
         );
     }
+}
 
-    tracing::info!("shutdown complete");
+/// Exit 0 when the running server answers 200 on `/healthz`, print the
+/// probe URL and exit 1 otherwise. The URL, not the bare endpoint: the
+/// address the probe derived from the bind is the first thing to compare
+/// against the listener the server actually opened.
+async fn run_health_check(bind: SocketAddr) -> anyhow::Result<()> {
+    match probe_healthz(bind).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            eprintln!("{} did not answer 200: {error}", health_probe_url(bind));
+            std::process::exit(1);
+        }
+    }
 }
 
 /// GET the local public listener's `/healthz` and accept only 200. The
@@ -506,6 +300,68 @@ fn health_probe_url(bind: SocketAddr) -> String {
     format!("http://{}/healthz", health_probe_addr(bind))
 }
 
+/// Bind the public and the admin listener at once. Both binds are
+/// attempted (the tuple shape the caller cleans up after), and when both
+/// fail the public bind's error wins — it is the address the clients come
+/// to, so the reported error names it first.
+async fn bind_listeners(
+    server_bind: SocketAddr,
+    admin_bind: SocketAddr,
+) -> std::io::Result<(tokio::net::TcpListener, tokio::net::TcpListener)> {
+    match (
+        tokio::net::TcpListener::bind(server_bind).await,
+        tokio::net::TcpListener::bind(admin_bind).await,
+    ) {
+        (Ok(listener), Ok(admin_listener)) => Ok((listener, admin_listener)),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+/// The completion a startup failure behind the scheduler spawn takes:
+/// log the error, release the admin router — it holds the refresh
+/// channel's other sender, so dropping it lets the scheduler see the
+/// close rather than the timeout — run the shared drain (see
+/// [`finish_shutdown`]), and hand the error back for the exit value.
+async fn abort_startup(
+    message: &'static str,
+    error: anyhow::Error,
+    admin_router: axum::Router,
+    scheduler_run: SchedulerRun,
+) -> anyhow::Error {
+    tracing::error!(error = %error, "{message}");
+    drop(admin_router);
+    finish_shutdown(scheduler_run).await;
+    error
+}
+
+/// The public router: `/sub/{id}`, `/src/{id}`, `/export/alive/{token}`
+/// and `/export/ready/{token}`.
+///
+/// `/healthz` gets a pool of its own, one connection, so its answer does
+/// not queue behind renders. An orchestrator reads 503 as "restart me",
+/// and a busy render pool is this process's own load, not a fault. The
+/// type (`serve::HealthPool`) is what proves the pool stays dedicated.
+async fn build_public_app(
+    pool: &fumox_core::db::DbPool,
+    config: &fumox_core::AppConfig,
+    caches: &Caches,
+    geo: &Arc<fumox_core::geo::GeoResolver>,
+    export_token: &alive_export::TokenCache,
+) -> anyhow::Result<axum::Router> {
+    let health_pool = serve::HealthPool::dedicated(&config.database).await?;
+    let state = serve::AppState::new(
+        pool.clone(),
+        caches.clone(),
+        geo.clone(),
+        serve::PublicRateLimits::from_config(&config.server),
+        admin::parse_trusted_cidrs(&config.server.trust_proxy_ips),
+        config.server.trust_proxy_header,
+        config.server.allowed_hosts.clone(),
+        alive_export::ExportState::new(config.server.export_max_rows, export_token.clone()),
+    );
+    Ok(serve::public_app(state, health_pool))
+}
+
 /// Wait for the listeners to drain, but no longer than `deadline`.
 ///
 /// A graceful shutdown waits for the open connections, and some of them
@@ -546,6 +402,135 @@ async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+/// Serve both listeners until a shutdown signal or a listener failure
+/// ends the wait, then close the sockets and take the shared completion:
+/// the scheduler drain (see [`finish_shutdown`]) and the serving outcome.
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    admin_listener: tokio::net::TcpListener,
+    app: axum::Router,
+    admin_router: axum::Router,
+    scheduler_run: SchedulerRun,
+) -> anyhow::Result<()> {
+    // The public rate limiter also keys requests by peer address.
+    //
+    // The graceful shutdown waits for the open connections to finish, and
+    // the admin panel holds an SSE stream that never ends on its own. The
+    // wait therefore has a deadline — and the deadline starts when the
+    // signal arrives, not when the listeners start.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut public_server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
+    .into_future();
+    let mut admin_server = axum::serve(
+        admin_listener,
+        admin_router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
+    .into_future();
+
+    // A listener's error surfaces only at the end, after the shared
+    // completion below — the same drain the failed binds take, so no exit
+    // path skips it.
+    let serving = tokio::select! {
+        // A listener that fails ends the wait right away.
+        result = async {
+            tokio::try_join!(&mut public_server, &mut admin_server).map(|_| ())
+        } => result.map_err(anyhow::Error::from),
+        result = shutdown_signal() => {
+            // The listeners stop accepting and drain what they have.
+            // The drain is bounded: an SSE stream or a slow download
+            // never ends on its own, and an orchestrator kills the
+            // process at its own grace period anyway — with the drain
+            // below skipped, since it sits behind the wait.
+            //
+            // The signal handlers are installed before the wait, so a
+            // failure here is a startup error, not a received signal:
+            // the listeners stop the same way either way — the send, the
+            // bounded drain — and the installation error, where there is
+            // one, outranks the drain result as the exit value.
+            let _ = shutdown_tx.send(true);
+            let drained = drain_listeners(SHUTDOWN_DRAIN_TIMEOUT, async {
+                tokio::try_join!(&mut public_server, &mut admin_server).map(|_| ())
+            })
+            .await
+            .map_err(anyhow::Error::from);
+            result.and(drained)
+        }
+    };
+    // The listeners are done: their sockets close here rather than at the
+    // end of the process, so nothing new arrives during the scheduler
+    // drain below.
+    drop(public_server);
+    drop(admin_server);
+
+    finish_shutdown(scheduler_run).await;
+    serving
+}
+
+/// Bind the listeners, run the geo startup gate, and serve until the
+/// process stops. Neither gate shortcuts with `?`: both route their
+/// failures through [`abort_startup`], the one completion every exit
+/// behind the startup takes.
+async fn run_listeners(
+    pool: &fumox_core::db::DbPool,
+    config: &fumox_core::AppConfig,
+    geo: &Arc<fumox_core::geo::GeoResolver>,
+    geo_download: tokio::task::JoinHandle<()>,
+    app: axum::Router,
+    admin_router: axum::Router,
+    scheduler_run: SchedulerRun,
+) -> anyhow::Result<()> {
+    let (listener, admin_listener) =
+        match bind_listeners(config.server.bind, config.admin.bind).await {
+            Ok(pair) => pair,
+            Err(error) => {
+                return Err(abort_startup(
+                    "cannot bind the listeners",
+                    error.into(),
+                    admin_router,
+                    scheduler_run,
+                )
+                .await);
+            }
+        };
+    tracing::info!(bind = %config.server.bind, "fumox-server listening");
+
+    // The listeners are bound; the download still runs. Give it its
+    // budget, then look at the geo state: a profile that filters by
+    // country cannot serve anything without the country facts, and a
+    // GeoIP failure must not stay silent.
+    await_geo_within_budget(geo_download, config.geo.startup_download_budget()).await;
+    // The gate does not shortcut with `?`: a refusal behind the binds and
+    // the scheduler spawn takes the same completion as the failed bind
+    // above — the scheduler drain and the in-flight warning run on this
+    // path too, and the error is reported after the exit line rather
+    // than in place of it.
+    if let Err(error) = geo_startup_gate(pool, config, geo).await {
+        return Err(abort_startup(
+            "cannot serve the profiles that filter by country",
+            error,
+            admin_router,
+            scheduler_run,
+        )
+        .await);
+    }
+    // Fill the geo columns of proxies ingested before a database existed
+    // (background: never blocks startup), bounded like the geo download
+    // above by the configured startup budget. It runs after the download
+    // had its budget, so it sees the database that just landed.
+    tokio::spawn(geo_backfill::backfill_missing_geo_within_budget(
+        pool.clone(),
+        geo.clone(),
+        config.geo.startup_download_budget(),
+    ));
+
+    serve_until_shutdown(listener, admin_listener, app, admin_router, scheduler_run).await
+}
+
 /// Wait for the GeoLite2 download task, but no longer than `budget`. On
 /// elapse the handle drops, which detaches the task rather than aborting it;
 /// the install is an atomic rename, so a late finish never exposes a partial
@@ -575,6 +560,172 @@ async fn await_geo_within_budget(task: tokio::task::JoinHandle<()>, budget: Dura
 async fn profiles_require_country(pool: &fumox_core::db::DbPool) -> anyhow::Result<bool> {
     let profiles = fumox_core::repo::profiles::list(pool, true).await?;
     Ok(profiles.iter().any(|profile| !profile.countries.is_empty()))
+}
+
+/// The last startup gate: a profile that filters by country cannot serve
+/// anything without the country facts, and a GeoIP failure must not stay
+/// silent. Both the gate verdict and the profile read behind it fail
+/// here, and both happen behind the binds and the scheduler spawn — so
+/// the caller routes a refusal through the shared completion (see
+/// [`finish_shutdown`]), like every exit behind the startup.
+async fn geo_startup_gate(
+    pool: &fumox_core::db::DbPool,
+    config: &fumox_core::AppConfig,
+    geo: &fumox_core::geo::GeoResolver,
+) -> anyhow::Result<()> {
+    if config.geo.enabled && profiles_require_country(pool).await? && !geo.state().has_country() {
+        anyhow::bail!(
+            "a profile filters by country, but no GeoLite2 City database is available \
+             (geo state: {}, directory: {}); put the database into the directory, \
+             point [geo].db_dir at it, or drop the country allowlist",
+            geo.state().as_str(),
+            config.geo.db_dir.display(),
+        );
+    }
+    Ok(())
+}
+
+/// The admin panel's security posture, said before any request arrives.
+///
+/// Security audit (2026-08-30): the panel is only reachable with a
+/// token the operator set. An empty token and the historical
+/// "change-me" placeholder both mean "panel off" (see
+/// `AdminConfig::is_active`), so the listener is never started for
+/// them; say which mode this is, since "the admin URL answers 404" is
+/// otherwise indistinguishable from a routing mistake.
+///
+/// A panel that listens on a public address and sends its session
+/// cookie without `Secure` hands the token to everyone on the path.
+fn log_admin_posture_warnings(config: &fumox_core::AppConfig) {
+    if config.admin.enabled && !config.admin.is_active() {
+        tracing::warn!(
+            bind = %config.admin.bind,
+            "admin panel is disabled: set admin.token (or FUMOX_ADMIN__TOKEN) to enable it"
+        );
+    }
+    if config.admin.insecure_cookies_on_a_public_bind() {
+        tracing::warn!(
+            bind = %config.admin.bind,
+            "admin session cookie is not marked Secure while the panel listens on a public \
+             address: the session token travels in clear text; set admin.secure_cookies = true \
+             behind an HTTPS front, or bind the panel to a loopback address"
+        );
+    }
+}
+
+/// A save that died between creating its temporary file and renaming
+/// it leaves a copy of the config behind, and the config carries
+/// `[admin].token`. The leftovers of writers that are gone are
+/// removed here, on the only start that can produce them.
+fn cleanup_config_tmp_leftovers(path: &fumox_core::config::ResolvedConfigPath) {
+    let config_dir = match path {
+        fumox_core::config::ResolvedConfigPath::Loaded(file) => {
+            file.parent().map(Path::to_path_buf)
+        }
+        fumox_core::config::ResolvedConfigPath::Missing => {
+            Path::new(fumox_core::DEFAULT_CONFIG_PATH)
+                .parent()
+                .map(Path::to_path_buf)
+        }
+    };
+    if let Some(dir) = config_dir {
+        fumox_core::config_writer::cleanup_stale_tmp_files(&dir);
+    }
+}
+
+/// The one-time rewrites of rows written by older versions, run between
+/// the schema migration and the first ingest: legacy plain-text access
+/// tokens are hashed, and fingerprint keys an older canonical form
+/// produced are recomputed. Each upgrade is a step of its own; see them
+/// for what they rewrite and when.
+async fn run_legacy_data_upgrades(pool: &fumox_core::db::DbPool) -> anyhow::Result<()> {
+    hash_legacy_profile_tokens(pool).await?;
+    recompute_stored_fingerprints(pool).await?;
+    Ok(())
+}
+
+/// Profile access tokens are stored as hashes. A row written before
+/// that still holds the token in plain text, so it is rewritten in
+/// place on the first start after the upgrade.
+async fn hash_legacy_profile_tokens(pool: &fumox_core::db::DbPool) -> anyhow::Result<()> {
+    let hashed = fumox_core::repo::profiles::hash_legacy_tokens(pool).await?;
+    if hashed > 0 {
+        tracing::info!(count = hashed, "profile access tokens hashed");
+    }
+    Ok(())
+}
+
+/// The fingerprint version is part of the pre-image, so a change of the
+/// canonical form changes every key: the rows written before the change
+/// keep keys the ingest no longer produces. They are recomputed once,
+/// on the first start after the upgrade, before the first ingest — the
+/// rows that describe the same node twice are merged into one.
+async fn recompute_stored_fingerprints(pool: &fumox_core::db::DbPool) -> anyhow::Result<()> {
+    match fumox_core::repo::proxies::ensure_fingerprint_version(pool).await? {
+        Some(stats) => {
+            tracing::info!(
+                version = fumox_core::fingerprint::FINGERPRINT_VERSION,
+                rewritten = stats.rewritten,
+                merged = stats.merged,
+                "stored fingerprints recomputed"
+            );
+        }
+        None => {
+            tracing::info!(
+                version = fumox_core::fingerprint::FINGERPRINT_VERSION,
+                "stored fingerprints are current"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort GeoLite2 database download into [geo].db_dir: fetch what
+/// is missing, broken or older than a month.
+///
+/// The download runs in its own task and the listeners are bound
+/// without waiting for it: a mirror must not keep the public surface
+/// dark. The resolver asks the process-wide registry for the databases
+/// on every lookup, so a file that lands later is picked up without a
+/// restart. The budget is how long startup waits for the file
+/// afterwards, not how long the download may run.
+fn spawn_geo_download(config: &fumox_core::AppConfig) -> tokio::task::JoinHandle<()> {
+    let geo_config = config.clone();
+    let download =
+        tokio::spawn(async move { geo_download::ensure_geo_databases(&geo_config).await });
+    if config.geo.startup_download_budget_secs
+        > fumox_core::config::MAX_STARTUP_DOWNLOAD_BUDGET_SECS
+    {
+        tracing::warn!(
+            configured = config.geo.startup_download_budget_secs,
+            capped = fumox_core::config::MAX_STARTUP_DOWNLOAD_BUDGET_SECS,
+            "[geo].startup_download_budget_secs is above the cap; the effective budget is the cap"
+        );
+    }
+    download
+}
+
+/// The shared environment the scheduler's ingestion tasks run with,
+/// cloned out of the state main built for the whole process.
+fn scheduler_ingest_env(
+    pool: &fumox_core::db::DbPool,
+    config: &fumox_core::AppConfig,
+    fetcher: &Fetcher,
+    caches: &Caches,
+    geo: &Arc<fumox_core::geo::GeoResolver>,
+) -> scheduler::IngestEnv {
+    scheduler::IngestEnv {
+        pool: pool.clone(),
+        fetcher: fetcher.clone(),
+        caches: caches.clone(),
+        geo: geo.clone(),
+        settings: ingest::IngestSettings {
+            refresh_check_limit: config.ingest.refresh_check_limit,
+            drop_gate: config.ingest.drop_gate,
+            removed_as_unknown: config.ingest.removed_as_unknown,
+        },
+        budget: scheduler::ingest_budget(&config.fetch),
+    }
 }
 
 /// The configuration mistakes that change what the server accepts but
@@ -627,29 +778,33 @@ fn startup_warnings(config: &fumox_core::AppConfig) -> Vec<String> {
 }
 
 /// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
-    };
+///
+/// The handlers are installed before the wait, so a failed installation
+/// is an error the caller reports like any other startup failure — not a
+/// panic inside the shutdown path.
+async fn shutdown_signal() -> anyhow::Result<()> {
+    let ctrl_c = tokio::signal::ctrl_c();
 
     #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+    let terminate = {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| anyhow::anyhow!("failed to install SIGTERM handler: {error}"))?;
+        async move {
+            sigterm.recv().await;
+        }
     };
 
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        () = ctrl_c => {},
+        result = ctrl_c => {
+            result.map_err(|error| anyhow::anyhow!("failed to install Ctrl-C handler: {error}"))?
+        }
         () = terminate => {},
     }
     tracing::info!("shutdown signal received, draining connections");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -778,6 +933,95 @@ mod tests {
         .await;
         assert!(result.is_ok(), "an abandoned drain is not a failure");
         assert_eq!(began.elapsed(), Duration::from_secs(10));
+    }
+
+    /// Fresh migrated SQLite in a scoped temp directory (the shape the
+    /// probe tests keep): the guard in scope removes the directory when
+    /// it drops.
+    async fn temp_pool() -> (fumox_core::tempdir_lite::TempDir, fumox_core::db::DbPool) {
+        let dir = fumox_core::tempdir_lite::TempDir::new("server-gate");
+        let pool = fumox_core::db::connect_pool(&fumox_core::config::DatabaseConfig {
+            path: dir.path().join("test.db"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        fumox_core::db::migrate(&pool).await.unwrap();
+        (dir, pool)
+    }
+
+    /// Seed one enabled profile with the given country allowlist.
+    async fn seed_profile(pool: &fumox_core::db::DbPool, countries: Vec<String>) {
+        let now = fumox_core::models::now_ts();
+        let profile = fumox_core::models::Profile {
+            id: format!("prof{}", fumox_core::models::new_id()),
+            slug: None,
+            access_token: None,
+            name: "p".into(),
+            output_format: Default::default(),
+            pipeline: None,
+            countries,
+            include_unknown_country: false,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        fumox_core::repo::profiles::create(pool, &profile)
+            .await
+            .unwrap();
+    }
+
+    /// The startup geo gate refuses when an enabled profile filters by
+    /// country and the country facts are missing: the subscription would
+    /// come out empty, whatever the feed holds. The refusal happens
+    /// behind the binds and the scheduler spawn, so `main` routes it
+    /// through the shared completion (see `finish_shutdown`); the
+    /// decision itself is what this gate owns.
+    #[tokio::test]
+    async fn the_geo_startup_gate_refuses_without_the_country_facts() {
+        let (_dir, pool) = temp_pool().await;
+        seed_profile(&pool, vec!["US".into()]).await;
+
+        let config = fumox_core::AppConfig::default();
+        let geo = Arc::new(fumox_core::geo::GeoResolver::new(&config.geo));
+        assert!(
+            !geo.state().has_country(),
+            "the test needs an installation without GeoLite2 databases"
+        );
+
+        let error = geo_startup_gate(&pool, &config, &geo)
+            .await
+            .expect_err("a country allowlist without the facts must refuse");
+        assert!(error.to_string().contains("filters by country"), "{error}");
+    }
+
+    /// Nothing needs the facts — no enabled profile, or no allowlist on
+    /// any — so the gate passes and startup goes on. A broken profile
+    /// read is an error like any other startup failure, not a pass.
+    #[tokio::test]
+    async fn the_geo_startup_gate_passes_when_nothing_needs_the_facts() {
+        let (_dir, pool) = temp_pool().await;
+        let config = fumox_core::AppConfig::default();
+        let geo = Arc::new(fumox_core::geo::GeoResolver::new(&config.geo));
+
+        assert!(
+            geo_startup_gate(&pool, &config, &geo).await.is_ok(),
+            "an installation without profiles needs no geo"
+        );
+
+        seed_profile(&pool, Vec::new()).await;
+        assert!(
+            geo_startup_gate(&pool, &config, &geo).await.is_ok(),
+            "a profile without an allowlist needs no geo"
+        );
+
+        // The gate reads the profiles table behind `?`: a failed read
+        // must surface, not silently count as "nothing needs the facts".
+        sqlx::query("DROP TABLE profiles")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(geo_startup_gate(&pool, &config, &geo).await.is_err());
     }
 
     /// The health probe must reach the listener the operator configured.

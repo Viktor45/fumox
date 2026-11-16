@@ -39,5 +39,7 @@ ipnet = { workspace = true }
 
 [dev-dependencies]
 serde_norway = { workspace = true }
+# `test-util` compiles `Source::fixture`, the shared source-row fixture.
+fumox-core = { workspace = true, features = ["test-util"] }
 # `test-util` drives the paused clock the timeout tests need.
 tokio = { workspace = true, features = ["test-util"] }

@@ -17,7 +17,10 @@
 #
 # The musl build is fully static; the runtime base only adds ca-certificates
 # (meow-rs performs outbound TLS to proxies and to [meow].test_url) and tini
-# for signal forwarding.
+# for signal forwarding. The base is Alpine, the same one the fumox image
+# uses, so the two containers of the stack share one distro and one musl
+# snapshot. The health check that looks for the controller therefore uses
+# busybox nc, not bash: an Alpine image ships neither bash nor curl.
 #
 # The Clash external-controller REST API is enabled by config.yaml.template
 # and bound to 0.0.0.0:9090 by default, so fumox-probe can reach it over
@@ -43,10 +46,11 @@
 #
 # Multi-arch: BuildKit supplies TARGETARCH (linux/amd64, linux/arm64).
 #
-# Base image: debian:trixie-slim, the same base as the fumox-server runtime
-# stage, so both containers in the compose stack share a distro and glibc.
-# Nothing meow-rs needs is distro-sensitive (the binary is static musl; the
-# base only contributes ca-certificates and tini).
+# Base image: alpine:3.24, the same base and the same pinned digest the
+# fumox image's runtime stage uses, so the two containers of the stack
+# share one distro and one musl snapshot. Nothing meow-rs needs is
+# distro-sensitive: the binary is static musl, and the base only
+# contributes ca-certificates and tini.
 
 ARG MEOW_VERSION=v0.29.0
 # sha256 of meow-<version>-<target>.tar.gz, as published in the release's
@@ -55,26 +59,27 @@ ARG MEOW_SHA256_AMD64=92fe902cca5e95799af02a42fcda9a4f9195aa61ec126057b51b15a8d2
 ARG MEOW_SHA256_ARM64=6fa37f13ddeaafae605e65bc9f2ab0c538b9ab3fad11c8b12180f0a52b4c06b7
 
 # ---- Stage 1: fetch the release binary ---------------------------------------
-# trixie-slim pinned by digest — the same multi-arch index the fumox image's
-# runtime stage pins, so the compose stack shares one distro snapshot. Bump
-# the pin deliberately, together with security updates.
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS fetch
+# alpine:3.24 pinned by digest, the same multi-arch index the fumox image
+# pins. Bump the pin deliberately, together with security updates.
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS fetch
 ARG MEOW_VERSION
 ARG MEOW_SHA256_AMD64
 ARG MEOW_SHA256_ARM64
 ARG TARGETARCH
 # The helper packages float with the mirror, same reasoning as the root
-# Dockerfile: the digest pins the base, the apt layer follows Debian, and
+# Dockerfile: the digest pins the base, the apk layer follows Alpine, and
 # an exact-version pin would only turn every security update into a build
 # outage. The package SET is fixed, so both architectures fetch the same
 # helpers. What the fetch actually depends on is verified separately: the
 # release archive is checked against the pinned sha256 below, so the
 # version of curl cannot influence what lands in the image.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# No `apk upgrade` here: this stage contributes one file (the meow binary),
+# so upgrading its base packages would only cost build time.
+RUN apk add --no-cache \
         ca-certificates \
         curl \
         file \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/cache/apk/*
 RUN set -eux; \
     # The target triple is part of the asset name: without it the download
     # URL would silently point at the wrong architecture.
@@ -115,19 +120,28 @@ RUN set -eux; \
 
 # ---- Stage 2: minimal runtime ------------------------------------------------
 # Same pinned digest as the fetch stage above.
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
 # The runtime packages float with the mirror, same reasoning as above.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `apk upgrade` first, so the base image's own packages move with the
+# mirror as well: the digest pins the base filesystem, not the package set
+# on top of it. The upgrade is a no-op for a base that is already current.
+RUN apk upgrade -U --no-cache \
+    && apk add --no-cache \
         ca-certificates \
         tini \
-    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apk/* \
     # The gid is shared with the fumox image (999), the uid is not: the
     # proxy kernel reads the generated config through the group and must
     # not be able to open the SQLite database, which the probe writes under
     # uid 999. The uid and the gid are pinned, not allocated, so the two
     # images agree on them no matter what the base image ships.
-    && groupadd --system --gid 999 meow \
-    && useradd --system --uid 998 --gid 999 --home-dir /etc/meow --shell /usr/sbin/nologin meow \
+    # Alpine's base image gives gid 999 to the `ping` group, so it is
+    # dropped first, for the same reason the fumox image drops it: the gid
+    # is a contract between the two images, and the setgid ping applet this
+    # image does not ship would otherwise hold it.
+    && delgroup ping \
+    && addgroup --system --gid 999 meow \
+    && adduser --system --uid 998 --ingroup meow --home /etc/meow --shell /sbin/nologin meow \
     && mkdir -p /etc/meow \
     # The exchange volume root, shared with the probe: group-writable, so
     # the probe can write the generated config and the kernel can read it,
@@ -159,4 +173,5 @@ EXPOSE 9090
 # orchestrator mounts at /run/meow (the rendered file carries the
 # controller secret, so it must not land on a disk) and then execs the
 # kernel with the data directory on the same tmpfs.
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/meow-entrypoint"]
+# The path is Alpine's: the tini package installs /sbin/tini.
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/meow-entrypoint"]

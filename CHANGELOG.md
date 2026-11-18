@@ -126,6 +126,28 @@ are stamped when the batch is published.
 
 ### Changed
 
+- The image is Alpine-based now: the builder and the runtime move from
+  Debian (glibc) to Alpine (musl), the shipped binaries are statically
+  linked, and the runtime carries no C library for the app itself. The
+  meow wrapper image follows onto the same pinned base: its binary was
+  static musl already, so only the base and the health check changed.
+  The base images stay pinned by digest, and the built images shrink to a
+  fraction of their size (the fumox image is 20 MB, the meow wrapper
+  12 MB). A cold build takes longer than the glibc one did (the musl
+  toolchain compiles the workspace slower). **Migration:** the image
+  installs `tini` under `/sbin/tini`, the probe's and the kernel's
+  health checks are busybox `nc` connects instead of bash ones, and a
+  deployment that patches the image with `apt` has to use `apk`.
+- Both images bump their own packages during the build: the runtime stage
+  runs `apk upgrade -U --no-cache` before it installs anything, so the base
+  image's own packages (busybox, musl, zlib) move with the mirror and a
+  rebuild picks up an Alpine security update without a Dockerfile edit. The
+  digest pins the base filesystem, not the package set on top of it, so two
+  builds of the same commit can differ. The meow wrapper upgrades its
+  runtime stage, not its fetch stage (that stage contributes one file, so
+  there is nothing to gain there). The builder stage is left alone: the
+  Rust toolchain in it is installed by rustup, not by apk, and none of its
+  packages ship.
 - CI is reusable by the Fumox image publisher and checks the releasing commit
   before building. Pull requests also build all three Docker images on
   amd64 and arm64 without starting containers. The quality gate includes
@@ -1794,6 +1816,11 @@ are stamped when the batch is published.
 
 ### Security
 
+- The SQLite the app links is compiled from the bundled amalgamation now
+  (sqlx 0.9.1 over libsqlite3-sys 0.40, SQLite 3.54.1): the release that
+  fixes CVE-2026-119375 (RUSTSEC-2026-0459). The build needs no system
+  SQLite headers and cannot fall back to the system library any more, so
+  the patched version is the one that ships.
 - The backups the repair scripts write hold the whole database, the
   credentials included. They are created under `umask 077` with mode
   0600 now, a backup path that already exists is refused instead of
@@ -1920,6 +1947,9 @@ are stamped when the batch is published.
 
 ### Docs
 
+- The user guide describes the image as it is now: Alpine instead of
+  Debian, `apk` instead of `apt` in the backup command, and no system
+  SQLite package in the build requirements (the library is bundled).
 - The podman guide describes the deployment as it is now: the quadlet
   variant installs two environment files, the kube variant creates two
   `podman secret`s from random values, the cookie note moved into the

@@ -264,10 +264,10 @@ services:
     # Readiness gate for the probe (condition: service_healthy above): the
     # kernel's REST API must be listening before the probe drives it. The
     # image ships no curl or wget, so the check is a plain TCP connect via
-    # bash's /dev/tcp (the controller secret is checked per-request by the
+    # busybox nc (the controller secret is checked per-request by the
     # kernel itself, not by the probe).
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9090"]
+      test: ["CMD", "sh", "-c", "nc -w 2 127.0.0.1 9090 </dev/null >/dev/null 2>&1"]
       interval: 5s
       timeout: 4s
       retries: 12

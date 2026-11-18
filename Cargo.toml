@@ -63,15 +63,25 @@ toml = "1"
 toml_edit = { version = "0.25", features = ["display"] }
 
 # Database
-# sqlx 0.9: query*() takes `impl SqlSafeStr`, `&'static str` directly,
-# dynamic SQL wrapped in `sqlx::AssertSqlSafe`.
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate"] }
+# sqlx 0.9.1: query*() takes `impl SqlSafeStr`, `&'static str` directly,
+# dynamic SQL wrapped in `sqlx::AssertSqlSafe`. The floor is 0.9.1 because
+# it is the first release whose sqlx-sqlite accepts a patched
+# libsqlite3-sys: 0.9.0 capped it at `<0.38.0`, and every release below
+# 0.39 bundles the SQLite affected by RUSTSEC-2026-0459 (CVE-2026-119375).
+sqlx = { version = "0.9.1", features = ["runtime-tokio", "sqlite", "migrate"] }
 # The SQLite C API, for the authorizer that restricts the probe's
 # database connection. The version has to match the one sqlx-sqlite
 # resolves to: the authorizer is installed on the very handle sqlx
 # hands out, so both crates must link the same library. sqlx-sqlite
-# allows `>=0.30.1, <0.38.0`; 0.37 is what the lockfile pins.
-libsqlite3-sys = { version = "0.37", default-features = false, features = [
+# allows `>=0.30.1, <0.41.0`; 0.40.0 is what the lockfile pins, and it
+# bundles SQLite 3.54.1, which is past the 3.54.0 fix.
+# `default-features = false` drops the `min_sqlite_version_3_45_3` floor,
+# which only ever applies to the SYSTEM library. The `pkg-config` feature
+# does NOT mean the system library is linked: libsqlite3-sys's build
+# script compiles the vendored amalgamation whenever `bundled` is on,
+# and sqlx's `sqlite` feature turns it on. The build therefore links
+# the vendored SQLite, never the system one.
+libsqlite3-sys = { version = "0.40", default-features = false, features = [
     "pkg-config",
 ] }
 
@@ -84,7 +94,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Caching / geo
 moka = { version = "0.12", features = ["future"] }
-maxminddb = "0.32"
+maxminddb = "0.33"
 
 # Utilities
 nanoid = "0.5"

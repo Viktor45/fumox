@@ -46,10 +46,10 @@ Environment=FUMOX_MEOW_API_BIND=127.0.0.1:9090
 Volume=fumox-meow.volume:/shared/meow
 
 # Liveness: the external-controller (the one port the probe drives) must
-# answer on the pod loopback. A plain TCP connect via bash's /dev/tcp: the
-# image ships no curl, and the controller secret is checked per-request by
-# the kernel itself, not by the probe.
-HealthCmd=bash -c "exec 3<>/dev/tcp/127.0.0.1/9090"
+# answer on the pod loopback. A plain TCP connect via busybox nc: the
+# image is Alpine and ships no curl, no bash, and the controller secret is
+# checked per-request by the kernel itself, not by the probe.
+HealthCmd=sh -c "nc -w 2 127.0.0.1 9090 </dev/null >/dev/null 2>&1"
 HealthInterval=10s
 HealthTimeout=4s
 HealthRetries=6

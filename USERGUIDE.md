@@ -378,8 +378,8 @@ stack already references this image: `docker compose up -d` pulls it,
 Requirements:
 
 - Rust toolchain **≥ 1.98** (edition 2024).
-- System SQLite development package: sqlx links the system library, it is not
-  bundled. On Debian/Ubuntu: `sudo apt install libsqlite3-dev pkg-config`.
+- No SQLite development package needed: sqlx compiles the bundled SQLite
+  amalgamation, so the system library is never linked.
 - No OpenSSL needed (rustls), no frontend build step.
 
 ```bash
@@ -1675,7 +1675,7 @@ mkdir -p backups
 docker compose run --rm --no-deps --user root \
   -v "$PWD/backups:/backups" \
   --entrypoint sh server \
-  -c "apt-get update >/dev/null && apt-get install -y --no-install-recommends sqlite3 >/dev/null && sqlite3 /app/data/fumox.db '.backup /backups/fumox-${STAMP}.db'"
+  -c "apk add --no-cache sqlite >/dev/null && sqlite3 /app/data/fumox.db '.backup /backups/fumox-${STAMP}.db'"
 ```
 
 The install needs the network once; every later run reuses the image
@@ -1841,7 +1841,7 @@ against `/`.
 | `scripts/revive-xhttp-proxies.sh --restore` exits 75                 | Something still has the database open. Stop the daemon (`docker compose stop server probe`) and re-run; `FUMOX_REVIVE_CONFIRM_STOPPED=1` overrides the check when you know it is stopped. |
 | `scripts/revive-xhttp-proxies.sh --restore` exits 67                 | The backup is empty, damaged, or is not a Fumox database. Nothing was touched: pick another backup.                                            |
 | Country / ASN on old rows is wrong                                   | Rows ingested before 2026-10-02 carry a neighbour's geo stamps. Run `scripts/repair-geo-stamps.sh` with the server stopped, then restart the server. |
-| Build fails: `sqlite3.h: No such file`                                | Install the system SQLite dev package (`libsqlite3-dev` on Debian/Ubuntu).                                                                         |
+| Container dies at start: `exec /usr/local/bin/fumox-server: not found` | The binary was linked against glibc but the runtime base is Alpine (musl). The shipped image carries a statically linked musl binary — rebuild the image instead of dropping a foreign binary into it. |
 | Compose refuses to start: "set FUMOX_ADMIN__TOKEN"                    | Create `.env` from `.env.example` and set the token.                                                                                               |
 
 ## 15. Where to read more

@@ -378,8 +378,8 @@ meow-rs сам прочитает), укажите адрес ядра в `[meow
 Требования:
 
 - Rust-тулчейн **≥ 1.98** (edition 2024).
-- Системный dev-пакет SQLite: sqlx линкует системную библиотеку, а не
-  встроенную. Debian/Ubuntu: `sudo apt install libsqlite3-dev pkg-config`.
+- Dev-пакет SQLite не нужен: sqlx компилирует встроенную амальгамацию
+  SQLite, системная библиотека не линкуется.
 - OpenSSL не нужен (rustls), фронтенд-сборки нет.
 
 ```bash
@@ -1685,7 +1685,7 @@ mkdir -p backups
 docker compose run --rm --no-deps --user root \
   -v "$PWD/backups:/backups" \
   --entrypoint sh server \
-  -c "apt-get update >/dev/null && apt-get install -y --no-install-recommends sqlite3 >/dev/null && sqlite3 /app/data/fumox.db '.backup /backups/fumox-${STAMP}.db'"
+  -c "apk add --no-cache sqlite >/dev/null && sqlite3 /app/data/fumox.db '.backup /backups/fumox-${STAMP}.db'"
 ```
 
 Установке нужен интернет — один раз; дальше образ кеширует слой. То же
@@ -1848,7 +1848,7 @@ WantedBy=multi-user.target
 | `scripts/revive-xhttp-proxies.sh --restore` завершился с кодом 75 | База еще кем-то открыта. Остановите демон (`docker compose stop server probe`) и повторите; `FUMOX_REVIVE_CONFIRM_STOPPED=1` снимает проверку, если вы уверены, что демон остановлен. |
 | `scripts/revive-xhttp-proxies.sh --restore` завершился с кодом 67 | Бэкап пуст, поврежден или не является базой Fumox. Ничего не тронуто: возьмите другой бэкап. |
 | Страна / ASN на старых строках неверны                         | Строки, загруженные до 2026-10-02, несут гео-штампы соседнего хоста. Запустите `scripts/repair-geo-stamps.sh` при остановленном сервере, потом перезапустите сервер. |
-| Сборка падает: `sqlite3.h: No such file`                     | Установите системный dev-пакет SQLite (`libsqlite3-dev` на Debian/Ubuntu).                                                                            |
+| Контейнер падает на старте: `exec /usr/local/bin/fumox-server: not found` | Бинарник собран под glibc, а базовый образ — Alpine (musl). В поставляемом образе лежит статически собранный musl-бинарник — пересоберите образ, а не кладите в него чужой бинарник. |
 | Compose отказывается стартовать: «set FUMOX_ADMIN__TOKEN»    | Создайте `.env` из `.env.example` и задайте токен.                                                                                                    |
 
 ## 15. Где читать дальше

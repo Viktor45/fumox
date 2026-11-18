@@ -35,7 +35,7 @@ STUB="$WORK/bin"
 FIX="$WORK/fixtures"
 mkdir -p "$STUB" "$FIX/tags" "$FIX/manifests"
 
-# --- the digests the fixture describes ---------------------------------------
+# the digests the fixture describes
 # The merged index behind the `latest` tag and its two per-arch children.
 D_LATEST="sha256:1111111111111111111111111111111111111111111111111111111111111111"
 D_CHILD1="sha256:2222222222222222222222222222222222222222222222222222222222222222"
@@ -89,7 +89,7 @@ cat >"$FIX/page-1.json" <<JSON
 JSON
 printf '[]\n' >"$FIX/page-2.json"
 
-# --- the stubs ----------------------------------------------------------------
+# the stubs
 cat >"$STUB/gh" <<'STUB'
 #!/bin/sh
 # gh stub. Answers from the fixture directory, records every DELETE.
@@ -225,7 +225,7 @@ assert_not_deleted() { # assert_not_deleted <id> <deleted paths> <label>
     fi
 }
 
-# --- 1. the default pass keeps every untagged version ------------------------
+# 1. the default pass keeps every untagged version
 run --owner viktor45 --packages fumox --dry-run
 [ "$CODE" -eq 0 ] || fail "the default dry run exited $CODE"
 assert_says "would delete id=1" "$OUT" "the sha-*-only version"
@@ -237,7 +237,7 @@ assert_not_says "would delete id=7" "$OUT" "the recent build"
 assert_says "packages processed: 1, skipped: 0" "$OUT" "the package counters"
 note "without --prune-untagged only the sha-*-only version is a candidate"
 
-# --- 2. with --prune-untagged the orphan goes, the referenced ones stay ------
+# 2. with --prune-untagged the orphan goes, the referenced ones stay
 run --owner viktor45 --packages fumox --dry-run --prune-untagged
 [ "$CODE" -eq 0 ] || fail "the pruning dry run exited $CODE"
 assert_says "would delete id=1" "$OUT" "the sha-*-only version"
@@ -248,7 +248,7 @@ assert_not_says "would delete id=6" "$OUT" "the attestation subject"
 assert_not_says "would delete id=7" "$OUT" "the recent build"
 note "with --prune-untagged the unreferenced orphan is a candidate too"
 
-# --- 3. the deletion itself only touches the candidates ----------------------
+# 3. the deletion itself only touches the candidates
 : >"$FIX/deleted"
 run --owner viktor45 --packages fumox --no-dry-run --prune-untagged
 [ "$CODE" -eq 0 ] || fail "the real run exited $CODE"
@@ -260,7 +260,7 @@ for id in 2 3 5 6 7; do
 done
 note "only the two candidates are deleted"
 
-# --- 4. a response that is not the documented shape is not read as a list ----
+# 4. a response that is not the documented shape is not read as a list
 cp "$FIX/page-1.json" "$FIX/page-1.json.bak"
 printf '{"message":"Not Found"}\n' >"$FIX/page-1.json"
 run --owner viktor45 --packages fumox --dry-run
@@ -270,7 +270,7 @@ assert_says "does not match the expected schema" "$OUT" "the schema complaint"
 mv "$FIX/page-1.json.bak" "$FIX/page-1.json"
 note "a response that does not match the schema aborts the package"
 
-# --- 5. the owner type decides the API root ---------------------------------
+# 5. the owner type decides the API root
 run --owner viktor45 --packages fumox --dry-run
 assert_says "Owner viktor45 → /users/viktor45" "$OUT" "a user-owned account"
 
@@ -299,7 +299,7 @@ STUB_OWNER_TYPE=fail STUB_ORG_LOOKUP=fail \
 assert_says "Owner viktor45 → /users/viktor45" "$OUT" "the default API root"
 note "when no lookup answers /users is used"
 
-# --- 6. the arguments are validated -----------------------------------------
+# 6. the arguments are validated
 set +e
 PATH="$STUB:$PATH" "$SCRIPT" --bogus >/dev/null 2>&1
 CODE=$?

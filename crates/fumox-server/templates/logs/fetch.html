@@ -43,7 +43,17 @@
 
 <div class="panel">
   {% if rows.is_empty() %}
-    <p class="muted">{{ self.t("log.no_entries") }}</p>
+    {#- Two empty states. With a result/source filter set the split is
+        exact: the entries the filters hide (the link clears them). The
+        template cannot see the class filter (no f_class in the
+        context), so without a result/source filter the line names both
+        possible causes — empty journal or the class filter — and both
+        remedies; each reader lands on the one that applies. -#}
+    {% if f_result != "" || f_source != "" %}
+    <p class="muted">{{ self.t("log.no_entries_filtered") }} <a href="/admin/logs/fetch">{{ self.t("px.clear_filters") }}</a></p>
+    {% else %}
+    <p class="muted">{{ self.t("log.no_entries") }} <a href="/admin/sources">{{ self.t("nav.sources") }}</a> · <a href="/admin/logs/fetch">{{ self.t("px.clear_filters") }}</a></p>
+    {% endif %}
   {% else %}
     <div class="table-scroll">
       <table class="data journal">

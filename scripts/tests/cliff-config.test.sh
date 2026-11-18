@@ -71,7 +71,7 @@ assert_draft_lacks() { # assert_draft_lacks <needle>
     fi
 }
 
-# --- the kept subjects land in their Keep a Changelog groups ------------------
+# the kept subjects land in their Keep a Changelog groups
 assert_draft_has "Added" "Add the thing"
 assert_draft_has "Fixed" "Repair the other thing"
 assert_draft_has "Docs" "Update the guide"
@@ -80,7 +80,7 @@ assert_draft_has "Changed" "Speed the export up"
 assert_draft_has "Changed" "Split the parser"
 note "feat/fix/docs/manual/perf/refactor keep their groups"
 
-# --- the noise never reaches the draft at all ---------------------------------
+# the noise never reaches the draft at all
 assert_draft_lacks "|Internal|"
 assert_draft_lacks "Tidy the tree"
 assert_draft_lacks "Bump a crate"

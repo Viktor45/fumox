@@ -107,7 +107,7 @@ run_up() { # run_up [env assignments...] -- <script args...>
     set -e
 }
 
-# ── a successful bring-up ────────────────────────────────────────────
+# a successful bring-up
 run_up -- --no-build
 [ "$CODE" -eq 0 ] || fail "smoke-up.sh exited $CODE, expected 0:
 $OUT"
@@ -146,14 +146,14 @@ case "$MEOW_TOKEN" in
 esac
 note "the stand generates a controller secret for the kernel"
 
-# ── the port is taken: the stand must not come up ───────────────────
+# the port is taken: the stand must not come up
 run_up "STUB_BUSY_PORTS=18080" -- --no-build
 [ "$CODE" -eq 1 ] || fail "a taken port must abort with exit 1, got $CODE:
 $OUT"
 grep -q -- "up -d" "$WORK/compose.args" && fail "compose was started although the port was taken"
 note "a taken host port aborts before compose up"
 
-# ── a token the operator supplied is used as it is ──────────────────
+# a token the operator supplied is used as it is
 run_up "FUMOX_ADMIN__TOKEN=operator-supplied-token" -- --no-build
 [ "$CODE" -eq 0 ] || fail "smoke-up.sh exited $CODE, expected 0:
 $OUT"
@@ -165,7 +165,7 @@ case "$OUT" in
 esac
 note "a supplied token is passed through unchanged"
 
-# ── a generated token lands in a private file, not on the terminal ───
+# a generated token lands in a private file, not on the terminal
 run_up -- --no-build
 [ "$CODE" -eq 0 ] || fail "smoke-up.sh exited $CODE, expected 0:
 $OUT"
@@ -177,12 +177,12 @@ MODE="$(stat -c '%a' "$TOKEN_PATH" 2>/dev/null || stat -f '%Lp' "$TOKEN_PATH" 2>
 [ "$MODE" = "600" ] || fail "the token file must be mode 0600, got '${MODE:-unknown}'"
 note "the generated token is written to a 0600 file"
 
-# ── an unknown argument is refused ──────────────────────────────────
+# an unknown argument is refused
 run_up -- --bogus
 [ "$CODE" -eq 64 ] || fail "an unknown argument must exit 64, got $CODE"
 note "an unknown argument exits 64"
 
-# ── --help prints the header with the Environment block ─────────────
+# --help prints the header with the Environment block
 # It must answer before any environment probing: no docker, curl or free
 # port is needed to read the usage.
 run_up -- --help

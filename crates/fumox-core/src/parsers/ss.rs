@@ -202,8 +202,7 @@ mod tests {
 
     /// An IPv6 host round-trips: the URI carries the bracketed
     /// `[2001:db8::1]:8388` form, the entry stores the bare literal, and
-    /// re-parsing the serialized output yields the same host (regression
-    /// fixed 2026-09-11).
+    /// re-parsing the serialized output yields the same host.
     #[test]
     fn ipv6_host_round_trips_bracketed() {
         let blob = base64::engine::general_purpose::STANDARD_NO_PAD.encode(b"aes-256-gcm:pass");

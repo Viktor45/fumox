@@ -738,8 +738,7 @@ mod tests {
 
     /// The serializer must bracket an IPv6 literal in the `host:port`
     /// context: the unbracketed `2001:db8::1:8443` is not a parseable
-    /// `host:port` at all, so the subscription output used to be broken for
-    /// every IPv6 proxy (regression fixed 2026-09-11).
+    /// `host:port` at all.
     #[test]
     fn serializes_ipv6_host_bracketed_and_round_trips() {
         let entry = ProxyEntry {

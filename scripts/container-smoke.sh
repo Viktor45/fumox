@@ -66,7 +66,7 @@ fail() {
 
 echo ">> image: $IMAGE"
 
-# --- 1. the server starts and answers -----------------------------------------
+# 1. the server starts and answers
 echo ">> starting the server with the deployment mounts"
 "${CLI[@]}" run -d --name "$NAME" \
     -p 127.0.0.1::8080 \
@@ -92,7 +92,7 @@ until curl -fsS --max-time 3 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; d
 done
 echo ">> /healthz answers 200"
 
-# --- 2. the database is created in the data mount -----------------------------
+# 2. the database is created in the data mount
 if [ ! -f "$WORK/data/fumox.db" ]; then
     fail "the SQLite database was not created in the data mount"
 fi
@@ -100,7 +100,7 @@ echo ">> the database was created in the data mount"
 
 "${CLI[@]}" rm -f "$NAME" >/dev/null 2>&1 || true
 
-# --- 3. a read-only data mount must fail, not hang ---------------------------
+# 3. a read-only data mount must fail, not hang
 echo ">> starting the server with a read-only data mount (must fail fast)"
 "${CLI[@]}" run -d --name "$RO_NAME" \
     -v "$WORK/ro-data:/app/data:ro" \

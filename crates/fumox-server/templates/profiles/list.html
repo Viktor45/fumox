@@ -40,7 +40,18 @@
                 {% when None %}<span class="muted">–</span>
               {% endmatch %}
             </td>
-            <td class="mono small"><span title="{{ self.format_title(&row.output_format) }}">{{ self.format_label(&row.output_format) }}</span></td>
+            {#- The format hint rides on title only in every other cell of
+                the panel; here the title is the only place the content
+                description exists at all, and a touch device cannot open
+                it — the hint is duplicated as visible text under the
+                label. -#}
+            <td class="mono small"><span title="{{ self.format_title(&row.output_format) }}">{{ self.format_label(&row.output_format) }}</span>
+              {% if row.output_format == "uri_list" %}<div class="hint">{{ self.t("prof.format_uri_list_hint") }}</div>
+              {% else if row.output_format == "base64" %}<div class="hint">{{ self.t("prof.format_base64_hint") }}</div>
+              {% else if row.output_format == "clash" %}<div class="hint">{{ self.t("prof.format_clash_hint") }}</div>
+              {% else if row.output_format == "sing_box" %}<div class="hint">{{ self.t("prof.format_sing_box_hint") }}</div>
+              {% endif %}
+            </td>
             <td>
               {% if row.protected %}
                 <span class="badge neutral">{{ self.t("prof.token_protected") }}</span>

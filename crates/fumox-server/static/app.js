@@ -22,12 +22,23 @@
     var isError = detail.level === 'error';
     div.className = 'toast' + (isError ? ' error' : '');
     // role=status/alert makes the toast announced by screen readers;
-    // errors stay longer and are dismissable by click.
+    // errors stay longer.
     div.setAttribute('role', isError ? 'alert' : 'status');
     var message = detail.message || '';
     try { message = decodeURIComponent(message); } catch (_) {}
-    div.textContent = message || String(e.detail);
-    div.addEventListener('click', function () { div.remove(); });
+    // A missing message falls back to the localized "action failed"
+    // string the wrap carries, never to a debug String(detail) (which
+    // would print "[object Object]").
+    div.textContent = message || wrap.getAttribute('data-fallback') || '';
+    // Dismissal is a real button: reachable from the keyboard, with the
+    // pointer cursor on a control instead of the whole toast.
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'toast-close';
+    close.setAttribute('aria-label', wrap.getAttribute('data-dismiss') || 'Dismiss');
+    close.textContent = '✕';
+    close.addEventListener('click', function () { div.remove(); });
+    div.appendChild(close);
     wrap.appendChild(div);
     setTimeout(function () { div.remove(); }, isError ? 10000 : 4000);
   });

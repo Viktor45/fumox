@@ -105,7 +105,7 @@ set -e
 [[ ! -s "$WORK/compose.args" ]] || fail "a refused project name still ran compose"
 note "a project name outside the allow-list is refused"
 
-# ── podman-compose and --remove-orphans ─────────────────────────
+# podman-compose and --remove-orphans
 # The standalone front-end grew the flag late; a version that does not
 # know it must not be handed it, or the whole down call is rejected and
 # the stand never goes away. The engine decision is driven through stubs:

@@ -63,7 +63,7 @@ fail() {
     exit 1
 }
 
-# --- the manifest, with the hostPath and the images pointed at the test ------
+# the manifest, with the hostPath and the images pointed at the test
 # The shipped manifest names /opt/fumox/config as the hostPath of the config
 # directory; the test uses its own directory instead, so it never touches the
 # configuration of a real deployment. The PVC names are suffixed too: the
@@ -115,7 +115,7 @@ echo ">> image:  $FUMOX_MEOW_IMAGE"
 echo ">> podman kube play"
 podman kube play "$WORK/fumox-pod.yaml" >/dev/null
 
-# --- the server comes up and answers -----------------------------------------
+# the server comes up and answers
 echo ">> waiting for /healthz on 127.0.0.1:8080"
 deadline=$((SECONDS + TIMEOUT))
 until curl -fsS --max-time 3 "http://127.0.0.1:8080/healthz" >/dev/null 2>&1; do
@@ -126,7 +126,7 @@ until curl -fsS --max-time 3 "http://127.0.0.1:8080/healthz" >/dev/null 2>&1; do
 done
 echo ">> /healthz answers 200"
 
-# --- the probe comes up too, and neither container restarted -----------------
+# the probe comes up too, and neither container restarted
 deadline=$((SECONDS + TIMEOUT))
 probe=""
 while [ "$SECONDS" -lt "$deadline" ]; do

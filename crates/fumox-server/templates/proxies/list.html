@@ -201,7 +201,8 @@
   {% if rows.is_empty() %}
     <p class="muted">
       {{ self.t("px.nothing_found") }}
-      {% if self.filters_active() %} <a href="/admin/proxies">{{ self.t("px.clear_filters") }}</a>{% endif %}
+      {% if self.filters_active() %} <a href="/admin/proxies">{{ self.t("px.clear_filters") }}</a>
+      {% else %}{{ self.t("px.empty_base_hint") }} <a href="/admin/sources/new">{{ self.t("src.add") }}</a>{% endif %}
     </p>
   {% else %}
     <div class="table-scroll">

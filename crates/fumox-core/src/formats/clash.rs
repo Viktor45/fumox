@@ -53,8 +53,7 @@ pub fn entry_to_clash_named(entry: &ProxyEntry, name: &str) -> Option<Value> {
     put("server", Value::String(entry.host.clone()));
     put("port", num(i64::from(entry.port)));
 
-    // One writer per scheme arm keeps the dispatcher readable; the arm
-    // bodies are unchanged.
+    // One writer per scheme arm keeps the dispatcher readable.
     match entry.scheme {
         Scheme::Vless => put_vless(entry, &blocks, &mut put),
         Scheme::Vmess => put_vmess(entry, &blocks, &mut put),

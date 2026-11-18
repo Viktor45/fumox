@@ -2607,7 +2607,6 @@ mod tests {
             assert!(text.contains("meow.test_url entry"), "{entry}: {text}");
             assert!(text.contains("allow_private_targets"), "{entry}: {text}");
 
-            // The flag opens it.
             config.probe.allow_private_targets = true;
             config
                 .validate()

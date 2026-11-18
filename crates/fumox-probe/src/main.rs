@@ -221,12 +221,10 @@ impl CycleBudget {
         }
     }
 
-    /// Whether the budget is spent.
     fn expired(&self) -> bool {
         tokio::time::Instant::now() >= self.deadline
     }
 
-    /// What is left of the budget, in milliseconds.
     fn remaining_ms(&self) -> u64 {
         self.deadline
             .saturating_duration_since(tokio::time::Instant::now())

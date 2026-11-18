@@ -31,7 +31,7 @@
 <div class="panel">
   <h2>{{ self.t("dash.sources_with_errors") }}</h2>
   {% if recent_errors_unavailable %}
-    <p class="muted">{{ self.t("dash.load_failed") }}</p>
+    <p class="muted">{{ self.t("dash.load_failed") }} <a href="/admin/logs/fetch">{{ self.t("dash.full_journal") }}</a></p>
   {% else if recent_errors.is_empty() %}
     <p class="muted">{{ self.t("dash.no_source_errors") }}</p>
   {% else %}
@@ -150,9 +150,9 @@
 <div class="panel">
   <h2>{{ self.t("stats.by_source") }}</h2>
   {% if sources_unavailable %}
-    <p class="muted">{{ self.t("dash.load_failed") }}</p>
+    <p class="muted">{{ self.t("dash.load_failed") }} <a href="/admin/logs/fetch">{{ self.t("dash.full_journal") }}</a></p>
   {% else if sources.is_empty() %}
-    <p class="muted">{{ self.t("stats.no_sources") }}</p>
+    <p class="muted">{{ self.t("stats.no_sources") }} <a href="/admin/sources/new">{{ self.t("src.add") }}</a></p>
   {% else %}
     <div class="table-scroll">
       <table class="data">
@@ -247,6 +247,7 @@
   <h2>{{ self.t("stats.top_alive") }}</h2>
   {% if top_alive.is_empty() %}
     <p class="muted">{{ self.t("stats.no_alive") }}</p>
+    <p class="muted small">{{ self.t("stats.no_alive_hint") }}</p>
   {% else %}
     <div class="table-scroll">
       <table class="data">
@@ -297,6 +298,7 @@
     <h2>{{ self.t("stats.by_scheme") }}</h2>
     {% if schemes.is_empty() %}
       <p class="muted">{{ self.t("stats.no_proxies") }}</p>
+      <p class="muted small">{{ self.t("stats.no_proxies_hint") }} <a href="/admin/sources">{{ self.t("nav.sources") }}</a></p>
     {% else %}
       {% include "partials/_status_legend.html" %}
       <div class="stat-split">
@@ -323,6 +325,7 @@
     <h2>{{ self.t("stats.by_country") }}</h2>
     {% if countries.is_empty() %}
       <p class="muted">{{ self.t("stats.no_proxies") }}</p>
+      <p class="muted small">{{ self.t("stats.no_proxies_hint") }} <a href="/admin/sources">{{ self.t("nav.sources") }}</a></p>
     {% else %}
       {% include "partials/_status_legend.html" %}
       <div class="stat-split">

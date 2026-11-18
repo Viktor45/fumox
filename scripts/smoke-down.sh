@@ -54,7 +54,7 @@ run_with_timeout() { # <seconds> <command...>
     wait "$pid"
 }
 
-# --- container engine --------------------------------------------------------
+# container engine
 # `compose version` only proves the plugin is installed; the daemon behind
 # it may be down. `info` is the check that actually matters, and it is what
 # decides which engine this run talks to. The candidates are tried in turn,

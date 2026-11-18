@@ -203,7 +203,7 @@ sql_literal() {
     printf "%s%s%s" "$quoted" "${1//\'/$quoted$quoted}" "$quoted"
 }
 
-# ── helpers ──────────────────────────────────────────────────────
+# helpers
 # The one output that must be exactly "ok". Anything else means the file is
 # damaged, and a restore on top of a damaged file is not worth attempting.
 integrity_is_ok() {
@@ -246,7 +246,7 @@ file_uid() {
     stat -f '%u' "$1" 2>/dev/null || stat -c '%u' "$1" 2>/dev/null || echo ""
 }
 
-# ── occupancy ────────────────────────────────────────────────────
+# occupancy
 # Whether anything still holds the database open.
 #
 # Two probes, because one is not enough in both journal modes.
@@ -278,7 +278,7 @@ db_is_closed() {
     return 0
 }
 
-# ── the exclusive hold ───────────────────────────────────────────
+# the exclusive hold
 # The restore replaces the database file. Anything that writes to it while
 # the copy is in flight writes into the file being replaced, and the result
 # is a database that is neither the old one nor the new one. So the lock is
@@ -386,7 +386,7 @@ install_over_db() {
     mv -f "$staged" "$DB"
 }
 
-# ── --restore ────────────────────────────────────────────────────
+# --restore
 run_restore() {
     if [[ -n "$ADOPT_SOURCE" || "$INCLUDE_UNLINKED" -eq 1 || "$ADOPT" -eq 0 ]]; then
         echo "error: --restore does the undo, it does not revive anything, so it" >&2
@@ -803,7 +803,7 @@ if [[ "$REVIVABLE" -eq 0 ]]; then
     exit 0
 fi
 
-# ── Adoption target ──────────────────────────────────────────────
+# Adoption target
 # Only the unlinked half is adopted; rows that already have a link keep the
 # one they have, since a second link would make reconciliation of either
 # source responsible for the other's proxies.

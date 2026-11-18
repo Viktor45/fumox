@@ -29,15 +29,16 @@
       dialog button[data-dialog-close] { display: none; }
       button[data-dialog-open] { display: none; }
       /* Pipeline widget controls that act through htmx endpoints only:
-         the mode switch, the presets and the add-row buttons. The
-         hidden `pipeline_mode` input still submits, so the rendered
-         mode survives the save; a note in the widget explains it. */
-      .ped-modes button, .ped-presets button, .ped-inner > button { display: none; }
+         the mode switch, the presets, the add-row buttons and the
+         per-row remove buttons (the ✕ of each rule row). The hidden
+         `pipeline_mode` input still submits, so the rendered mode
+         survives the save; a note in the widget explains it. */
+      .ped-modes button, .ped-presets button, .ped-inner > button, .ped-row > button { display: none; }
     </style>
   </noscript>
 </head>
 <body>
-  <div class="topbar">
+  <header class="topbar">
     <span class="brand">Fumox</span>
     <nav aria-label="Primary">
       <a href="/admin" {% if active == "dashboard" %}class="active" aria-current="page"{% endif %}>{{ self.t("nav.dashboard") }}</a>
@@ -101,10 +102,19 @@
       <input type="hidden" name="_csrf" value="{{ csrf }}">
       <button class="btn small" type="submit">{{ self.t("nav.logout") }}</button>
     </form>
-  </div>
-  <div class="container">
+  </header>
+  {#- The app shell landmarks: the topbar is the header, the content is
+      the main region — class selectors only, so the styles are
+      untouched. -#}
+  <main class="container">
     {% block content %}{% endblock %}
-  </div>
-  <div class="toast-wrap" id="toast-wrap"></div>
+  </main>
+  {#- The toast layer carries the two strings the toast handler needs:
+      the fallback message for a toast without a usable message and the
+      accessible name of its dismissal button (base.html is the only
+      place the catalogs are reachable from the static script). -#}
+  <div class="toast-wrap" id="toast-wrap"
+       data-fallback="{{ self.t("common.action_failed") }}"
+       data-dismiss="{{ self.t("common.dismiss") }}"></div>
 </body>
 </html>

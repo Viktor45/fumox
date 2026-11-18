@@ -57,7 +57,7 @@ for f in "${PIN_FILES[@]}"; do
     printf '%s  %s\n' "$(sha256_of "$ROOT/$f")" "$f"
 done >"$REAL_SNAPSHOT"
 
-# --- the fixture releases -----------------------------------------------------
+# the fixture releases
 # A version that is not the current pin, with archives whose real sums the
 # published .sha256 assets carry.
 NEW_VERSION="v0.99.0"
@@ -90,7 +90,7 @@ for pair in "x86_64-unknown-linux-musl:$CUR_AMD64" "aarch64-unknown-linux-musl:$
     printf '%s  %s\n' "${pair#*:}" "$asset" >"$CUR_ASSETS/$asset.sha256"
 done
 
-# --- the stubs ----------------------------------------------------------------
+# the stubs
 STUB="$WORK/bin"
 mkdir -p "$STUB"
 
@@ -169,7 +169,7 @@ count_of() { # count_of <needle> <file>
     grep -oF -- "$1" "$2" | wc -l | tr -d '[:space:]'
 }
 
-# --- a bump reaches every pin, and only the pins ------------------------------
+# a bump reaches every pin, and only the pins
 new_repo bump
 export STUB_ASSETS="$NEW_ASSETS"
 : >"$STUB_FETCHED"
@@ -225,7 +225,7 @@ if [ -n "$(find "$REPO" -name '*.bak' -print -quit)" ]; then
 fi
 note "no .bak files are left behind"
 
-# --- an already-current pin is a no-op, without the archive downloads ---------
+# an already-current pin is a no-op, without the archive downloads
 new_repo noop
 export STUB_ASSETS="$CUR_ASSETS"
 : >"$STUB_FETCHED"
@@ -240,7 +240,7 @@ if grep -q '\.tar\.gz$' "$STUB_FETCHED"; then
 fi
 note "an already-current pin changes nothing and skips the archive downloads"
 
-# --- an archive that does not match the published sum fails closed ------------
+# an archive that does not match the published sum fails closed
 new_repo mismatch
 export STUB_ASSETS="$BAD_ASSETS"
 before="$(cat "$REPO/docker/meow/Dockerfile")"
@@ -252,14 +252,14 @@ grep -q 'does not match the sum the release publishes' "$WORK/err" \
     || fail "a failed verification must leave the tree untouched"
 note "a sum mismatch fails before anything is written"
 
-# --- a missing published sum fails closed ------------------------------------
+# a missing published sum fails closed
 new_repo nosum
 export STUB_ASSETS="$CUR_ASSETS"
 run_script --version "$NEW_VERSION"
 [ "$CODE" -ne 0 ] || fail "a release without the .sha256 assets must fail"
 note "a release without usable checksum assets fails"
 
-# --- the version rule is the one docker-meow.yml applies ----------------------
+# the version rule is the one docker-meow.yml applies
 new_repo badversion
 before="$(cat "$REPO/docker/meow/Dockerfile")"
 run_script --version latest
@@ -267,7 +267,7 @@ run_script --version latest
 [ "$before" = "$(cat "$REPO/docker/meow/Dockerfile")" ] || fail "a refused version must not write"
 note "a non-versioned tag is refused by the shared validator"
 
-# --- a missing anchor fails instead of half-applying -------------------------
+# a missing anchor fails instead of half-applying
 new_repo anchor
 grep -v '^ARG MEOW_SHA256_ARM64=' "$REPO/docker/meow/Dockerfile" >"$REPO/docker/meow/Dockerfile.tmp"
 mv "$REPO/docker/meow/Dockerfile.tmp" "$REPO/docker/meow/Dockerfile"
@@ -277,7 +277,7 @@ grep -q 'expected exactly one ARG MEOW_SHA256_ARM64=' "$WORK/err" \
     || fail "expected a missing-anchor diagnostic, got: $(cat "$WORK/err")"
 note "a missing ARG anchor fails loudly"
 
-# --- argument parsing --------------------------------------------------------
+# argument parsing
 new_repo args
 run_script --nonsense
 [ "$CODE" -eq 64 ] || fail "an unknown flag must exit 64, got $CODE"
@@ -285,7 +285,7 @@ run_script --version
 [ "$CODE" -eq 64 ] || fail "--version without a value must exit 64, got $CODE"
 note "the argument parsing is validated"
 
-# --- the real working tree was never touched ---------------------------------
+# the real working tree was never touched
 for f in "${PIN_FILES[@]}"; do
     printf '%s  %s\n' "$(sha256_of "$ROOT/$f")" "$f"
 done >"$WORK/real-after"

@@ -65,7 +65,7 @@ $1"
     note "no output matches /$2/"
 }
 
-# ── Scratch database ─────────────────────────────────────────────
+# Scratch database
 # Mirrors the production column names/types the script reads and writes
 # (proxies, sources, proxy_source_links, probe_requests), not the whole
 # schema: the tool must keep working against exactly what it queries.
@@ -115,11 +115,11 @@ INSERT INTO proxy_source_links (proxy_id, source_id, seen_at)
 VALUES (1, 'srcA0000000', 500);
 SQL
 
-# ── --help ───────────────────────────────────────────────────────
+# --help
 OUT="$("$SCRIPT" --help)"
 assert_output "$OUT" "revive-xhttp-proxies.sh"
 
-# ── Dry run: counts only, nothing written ────────────────────────
+# Dry run: counts only, nothing written
 OUT="$("$SCRIPT" --dry-run "$DB" 2>&1)" || fail "dry run failed:
 $OUT"
 assert_output "$OUT" "xhttp transport: 3"
@@ -129,7 +129,7 @@ assert_output "$OUT" "would revive 1 row\(s\)"
 expect_eq "dry run leaves status" "$(q "SELECT status FROM proxies WHERE id = 1")" "removed"
 expect_eq "dry run writes no backup" "$(count_backups)" "0"
 
-# ── Real run, default scope: linked rows only ────────────────────
+# Real run, default scope: linked rows only
 OUT="$("$SCRIPT" "$DB" 2>&1)" || fail "revive run failed:
 $OUT"
 assert_output "$OUT" "revived: +1"
@@ -150,7 +150,7 @@ expect_eq "revived row enqueued for priority check" \
 
 BACKUP="$(ls "$WORK"/fumox.db.pre-xhttp-revival-*)"
 
-# ── --restore: the undo, with its integrity guards ───────────────
+# --restore: the undo, with its integrity guards
 OUT="$("$SCRIPT" --restore "$BACKUP" "$DB" 2>&1)" || fail "restore failed:
 $OUT"
 assert_output "$OUT" "restored database passes integrity_check"
@@ -176,7 +176,7 @@ set -e
 expect_eq "conflicting options exit code" "$CODE" "64"
 assert_output "$OUT" "takes none of the revival options"
 
-# ── the adoption flags need --include-unlinked ──────────────────
+# the adoption flags need --include-unlinked
 # They only have a subject together with it: the linked half keeps the
 # link it already has. A flag that is silently ignored is worse than a
 # refusal, because the operator believes a target was chosen.
@@ -194,7 +194,7 @@ set -e
 expect_eq "no-adopt without include-unlinked exit code" "$CODE" "64"
 assert_output "$OUT" "only apply together with"
 
-# ── --include-unlinked with an explicit adoption target ──────────
+# --include-unlinked with an explicit adoption target
 OUT="$("$SCRIPT" --include-unlinked --adopt-source srcA0000000 "$DB" 2>&1)" || fail "adoption run failed:
 $OUT"
 assert_output "$OUT" "revived: +2"
@@ -206,7 +206,7 @@ expect_eq "unlinked row adopted into the source" \
 expect_eq "both rows enqueued" "$(q "SELECT COUNT(*) FROM probe_requests")" "2"
 expect_eq "non-xhttp row still untouched" "$(q "SELECT status FROM proxies WHERE id = 3")" "removed"
 
-# ── --adopt-source never reaches SQL raw ─────────────────────────
+# --adopt-source never reaches SQL raw
 # A fresh unlinked removed row so the adoption block runs below; every run
 # in this block is dry, so it survives all of them.
 q "INSERT INTO proxies (id, scheme, params, status, fail_count, removed_at, updated_at)
@@ -233,13 +233,13 @@ assert_output "$OUT" "enabled, no drop rules"
 assert_output "$OUT" "would revive 1 row\(s\)"
 expect_eq "dry run still writes no backup" "$(count_backups)" "2"
 
-# ── a pipe in a source name cannot shift the report's split ──────
+# a pipe in a source name cannot shift the report's split
 # The name rides last in the sqlite3 rows so the fields the classification
 # reads (enabled, drops) cannot be pushed out of place by a 'foo|bar' name.
 q "INSERT INTO sources (id, slug, name, enabled, pipeline, created_at)
    VALUES ('srcB0000000', 'beta', 'Beta|Gamma', 1, NULL, 900)"
 
-# ── a source id that carries a quote is never interpolated ───────
+# a source id that carries a quote is never interpolated
 # The id reaches a SQL string literal, so only a plain nanoid may be used.
 # The ranked path has to skip such a source rather than paste its id
 # into the statement; created_at 800 puts it first in the ranking, so a
@@ -272,7 +272,7 @@ assert_output "$OUT" "adopt into: Beta|Gamma \(srcB0000000\)"
 assert_output "$OUT" "enabled, no drop rules"
 assert_no_output "$OUT" "has 1 drop rule"
 
-# ── a database the script cannot read is a hard error ────────────
+# a database the script cannot read is a hard error
 # An exclusive lock used to leave the census empty and the run saying
 # "Nothing to revive." with exit 0, with no hint anything had gone wrong.
 LOCK_FIFO="$WORK/census-lock.fifo"
@@ -308,7 +308,7 @@ assert_output "$OUT" "could not read the census"
 assert_no_output "$OUT" '^Nothing to revive\.$'
 expect_eq "locked run left the row removed" "$(q 'SELECT status FROM proxies WHERE id = 5')" "removed"
 
-# ── the error path cannot offer the bare cp the header forbids ───
+# the error path cannot offer the bare cp the header forbids
 # A stub sqlite3 that corrupts exactly the revival batch drives the run
 # down the count-parse-failure exit, whose undo advice must not be a bare cp.
 REAL_SQLITE3="$(command -v sqlite3)"
@@ -335,12 +335,12 @@ BACKUP_PATH="$(grep -oE "$DB\.pre-xhttp-revival-[0-9]+-[0-9]+" <<<"$OUT" | head 
 note "the undo advice names a backup that exists"
 expect_eq "parse failure left row 5 removed" "$(q 'SELECT status FROM proxies WHERE id = 5')" "removed"
 
-# ── the backup is not readable by anyone else ────────────────────
+# the backup is not readable by anyone else
 # It holds the whole database, credentials included.
 BACKUP_MODE="$(stat -f '%Lp' "$BACKUP" 2>/dev/null || stat -c '%a' "$BACKUP" 2>/dev/null || echo '')"
 expect_eq "backup permissions" "$BACKUP_MODE" "600"
 
-# ── the restore refuses the paths it must not follow ─────────────
+# the restore refuses the paths it must not follow
 # A symlink at the database path is a link to something else, and a
 # symlink at the backup path would restore whatever it points at.
 ln -s "$DB" "$WORK/link.db"
@@ -379,7 +379,7 @@ expect_eq "foreign schema exit code" "$CODE" "67"
 assert_output "$OUT" "does not carry the Fumox schema"
 expect_eq "the refusals left the row alone" "$(q 'SELECT status FROM proxies WHERE id = 1')" "unknown"
 
-# ── a database that carries a write-ahead log ────────────────────
+# a database that carries a write-ahead log
 # The log belongs to the file the restore replaces, so it goes with it.
 # The restore reports the branch it took, because a database that was
 # not closed cleanly is worth knowing about.
@@ -418,7 +418,7 @@ expect_eq "the write-ahead log is gone" \
 expect_eq "the shared memory file is gone" \
     "$([[ -e "${WAL_DB}-shm" ]] && echo yes || echo no)" "no"
 
-# ── a database that is still open is not restored over ──────────
+# a database that is still open is not restored over
 # A restore under a live writer is what produces "database disk image
 # is malformed", or a restore that quietly changes nothing.
 HOLD_DB="$WORK/hold.db"
@@ -446,7 +446,7 @@ assert_output "$OUT" "still has"
 expect_eq "the held database was not touched" \
     "$(q_on "$HOLD_DB" 'SELECT status FROM proxies WHERE id = 1;')" "$HOLD_BEFORE"
 
-# ── relative paths resolve against the invocation directory ──────
+# relative paths resolve against the invocation directory
 # The script cd's to the repository root before it parses the arguments,
 # so a relative db or backup path must be expanded against the caller's
 # cwd — a run from another directory must not silently open the

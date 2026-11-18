@@ -209,6 +209,21 @@
           source form carries no toggle), server-side so the state matches
           the rendered radios before the JS runs. -#}
       <div class="ped-inner" data-ped-inner="rename"{% if profile && !builder.rename_section_active() %} hidden{% endif %}>
+        {#- Visible column captions for the rule rows: the fields carry
+            only a placeholder (gone once a value is typed) and an
+            aria-label. Sits outside #ped-rows — htmx re-renders that
+            container wholesale — and is aria-hidden: the inputs keep
+            their own labels, the captions must not double-announce.
+            The hidden arrow and the trailing spacer mirror the row
+            layout so each caption sits over its column. -#}
+        <div class="ped-row-head" aria-hidden="true">
+          <span class="head-grow">{{ self.t("ped.rename_match") }}</span>
+          <span class="ped-arrow">→</span>
+          <span class="head-grow">{{ self.t("ped.rename_replace") }}</span>
+          <span class="head-flags">{{ self.t("ped.rename_flags") }}</span>
+          <span>{{ self.t("ped.rename_target") }}</span>
+          <span></span>
+        </div>
         <div id="ped-rows" class="ped-rows">
           {% include "pipeline/_rows_rename.html" %}
         </div>
@@ -244,6 +259,15 @@
       {% endif %}
       <div class="hint">{{ self.t("ped.drop_hint") }}</div>
       <div class="ped-inner" data-ped-inner="drop"{% if profile && !builder.drop_section_active() %} hidden{% endif %}>
+        {#- Column captions as on the rename rows above; the first
+            column holds a regex or (for the ASN target) AS numbers,
+            which the caption names. -#}
+        <div class="ped-row-head" aria-hidden="true">
+          <span class="head-grow">{{ self.t("ped.drop_match_column") }}</span>
+          <span class="head-flags">{{ self.t("ped.drop_flags") }}</span>
+          <span>{{ self.t("ped.drop_target") }}</span>
+          <span></span>
+        </div>
         <div id="ped-drop-rows" class="ped-rows">
           {% include "pipeline/_rows_drop.html" %}
         </div>
@@ -371,6 +395,7 @@
         </div>
         <div class="ped-inner" data-ped-inner="limit"{% if !builder.limit_section_active() %} hidden{% endif %}>
           <input type="number" min="1" step="1" name="ped_limit_count" id="ped-limit-count" value="{{ builder.state.limit_count }}"
+                 aria-labelledby="ped-section-limit"
                  placeholder="{{ self.t("ped.limit_placeholder") }}">
           <div class="hint">{{ self.t("ped.limit_hint") }}</div>
         </div>

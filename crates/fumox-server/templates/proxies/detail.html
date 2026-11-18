@@ -5,12 +5,20 @@
 {% block content %}
 <div class="page-head">
   <h1 class="mono">{{ proxy.scheme }}:// {{ proxy.host }}:<wbr>{{ proxy.port }}</h1>
-  <span id="status-badge" aria-live="polite" aria-atomic="true">
-    {% if proxy.status == "alive" %}<span class="badge alive">{{ self.t("common.status_alive") }}</span>
-    {% else if proxy.status == "ready" %}<span class="badge ready">{{ self.t("common.status_ready") }}</span>
-    {% else if proxy.status == "quarantine" %}<span class="badge quarantine">{{ self.t("common.status_quarantine") }}</span>
-    {% else if proxy.status == "removed" %}<span class="badge removed">{{ self.t("common.status_removed") }}</span>
-    {% else %}<span class="badge unknown">{{ self.t("common.status_unknown") }}</span>{% endif %}
+  {#- The live region is the outer span and is never touched by a swap:
+      a live region that is recreated with every swap is never announced
+      (the pattern of profiles/detail.html). The reset action swaps
+      outerHTML of the inner #status-badge — the server fragment carries
+      its own id — so this wrapper stays in the DOM and announces every
+      status change. -#}
+  <span aria-live="polite" aria-atomic="true">
+    <span id="status-badge" aria-live="polite" aria-atomic="true">
+      {% if proxy.status == "alive" %}<span class="badge alive">{{ self.t("common.status_alive") }}</span>
+      {% else if proxy.status == "ready" %}<span class="badge ready">{{ self.t("common.status_ready") }}</span>
+      {% else if proxy.status == "quarantine" %}<span class="badge quarantine">{{ self.t("common.status_quarantine") }}</span>
+      {% else if proxy.status == "removed" %}<span class="badge removed">{{ self.t("common.status_removed") }}</span>
+      {% else %}<span class="badge unknown">{{ self.t("common.status_unknown") }}</span>{% endif %}
+    </span>
   </span>
   {# Unprobeable: UDP-based schemes the probe daemon cannot health-check
      (tuic, mieru, meow-rs cannot tunnel through them); they stay `unknown`
@@ -147,7 +155,11 @@
       since the last poll: a live region on a table that is re-rendered
       wholesale would read the whole table out every time. -#}
   <span id="probe-status" class="live-status" role="status" aria-live="polite" data-new-records="{{ self.t("common.new_records") }}"></span>
-  <div id="probe-history" data-live-status="probe-status"
+  {#- The slot the error handler prints into when the poll itself fails
+      (the network dropped, the server answered with an error): without
+      it the table would silently go stale. -#}
+  <span id="probe-history-error" class="error-text" role="alert" data-error-fallback="{{ self.t("common.action_failed") }}"></span>
+  <div id="probe-history" data-live-status="probe-status" data-error-target="probe-history-error"
        hx-get="/admin/proxies/{{ proxy.id }}/probe-history"
        hx-trigger="every 10s" hx-swap="innerHTML">
     {% include "proxies/_history.html" %}

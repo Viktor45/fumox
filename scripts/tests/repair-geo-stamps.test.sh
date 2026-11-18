@@ -61,7 +61,7 @@ INSERT INTO proxies (geo_country, geo_city, geo_asn) VALUES
 SQL
 }
 
-# ── a missing database is refused ────────────────────────────────
+# a missing database is refused
 set +e
 OUT="$("$SCRIPT" "$WORK/absent.db" 2>&1)"
 CODE=$?
@@ -82,7 +82,7 @@ $1"
 }
 assert_output "$OUT" "no database at"
 
-# ── a symlinked database is refused ──────────────────────────────
+# a symlinked database is refused
 make_db "$WORK/real.db"
 ln -s "$WORK/real.db" "$WORK/link.db"
 set +e
@@ -92,7 +92,7 @@ set -e
 expect_eq "symlinked database exit code" "$CODE" "66"
 assert_output "$OUT" "is a symlink"
 
-# ── a directory others may write to is refused ──────────────────
+# a directory others may write to is refused
 SHARED="$WORK/shared"
 mkdir -p "$SHARED"
 chmod 777 "$SHARED"
@@ -105,7 +105,7 @@ expect_eq "shared directory exit code" "$CODE" "73"
 assert_output "$OUT" "writable by group or others"
 expect_eq "no backup was written" "$(ls "$SHARED" | grep -c 'pre-geo-repair' || true)" "0"
 
-# ── a running server stops the run ──────────────────────────────
+# a running server stops the run
 # The repair and the running backfill write the same rows, so the script
 # refuses while a server process is visible.
 STUB="$WORK/stub"
@@ -133,7 +133,7 @@ CODE=$?
 set -e
 expect_eq "override exit code" "$CODE" "0"
 
-# ── the happy path ──────────────────────────────────────────────
+# the happy path
 DB="$WORK/fumox.db"
 make_db "$DB"
 OUT="$("$SCRIPT" "$DB" 2>&1)" || fail "the repair failed:
@@ -156,7 +156,7 @@ expect_eq "the backup keeps the old stamps" \
 MODE="$(stat -f '%Lp' "$BACKUP" 2>/dev/null || stat -c '%a' "$BACKUP")"
 expect_eq "the backup mode" "$MODE" "600"
 
-# ── an existing backup is never overwritten ──────────────────────
+# an existing backup is never overwritten
 DB2="$WORK/second.db"
 make_db "$DB2"
 "$SCRIPT" "$DB2" >/dev/null 2>&1
@@ -171,7 +171,7 @@ expect_eq "existing backup exit code" "$CODE" "73"
 assert_output "$OUT" "already exists"
 expect_eq "the planted file is untouched" "$(wc -c <"$PLANTED" | tr -d ' ')" "0"
 
-# ── a symlink at the backup path is refused ─────────────────────
+# a symlink at the backup path is refused
 SYMLINKED="$WORK/symlinked.db"
 make_db "$SYMLINKED"
 TARGET="$WORK/target.db"
@@ -186,7 +186,7 @@ assert_output "$OUT" "already exists"
 expect_eq "the symlink target is untouched" \
     "$(q "$TARGET" "SELECT COUNT(*) FROM proxies WHERE geo_asn IS NOT NULL")" "2"
 
-# ── the clearing runs in batches ────────────────────────────────
+# the clearing runs in batches
 # One transaction over the whole table holds the write lock for as long
 # as it takes; a batch of rows at a time releases it between the batches.
 BATCHED="$WORK/batched.db"
@@ -215,7 +215,7 @@ set -e
 expect_eq "bad batch size exit code" "$CODE" "64"
 expect_eq "the table is still there" "$(q "$WORK/second.db" "SELECT COUNT(*) FROM proxies")" "3"
 
-# ── a row stamped with only a city is counted and cleared ────────
+# a row stamped with only a city is counted and cleared
 # The counters and the clearing must agree on all three geo columns: a
 # row carrying only geo_city used to fall out of the count.
 CITY_DB="$WORK/city-only.db"
@@ -234,7 +234,7 @@ assert_output "$OUT" "rows with a geo stamp before repair: 1"
 assert_output "$OUT" "rows cleared: 1"
 assert_output "$OUT" "rows with a geo stamp after repair:  0"
 
-# ── a relative path resolves against the invocation directory ────
+# a relative path resolves against the invocation directory
 # The script cd's to the repository root, but the path the operator types
 # is where they are standing: a run from another directory must touch that
 # directory's database, not the repository's own fumox.db.
@@ -264,7 +264,7 @@ $OUT"
     || fail "the relative backup path did not resolve against the invocation directory"
 note "the pinned relative backup resolved against the invocation directory"
 
-# ── a control character in a path is refused before any output ───
+# a control character in a path is refused before any output
 CTRL_DB="$WORK/$(printf 'bad\nname.db')"
 make_db "$CTRL_DB"
 set +e

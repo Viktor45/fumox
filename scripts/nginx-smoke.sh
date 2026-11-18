@@ -95,11 +95,11 @@ until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port80/" 2>/dev/null;
     sleep 1
 done
 
-# --- 1. the configuration is valid ---------------------------------------------
+# 1. the configuration is valid
 echo ">> nginx -t"
 "${CLI[@]}" exec "$NAME" nginx -t || fail "nginx -t rejected the configuration"
 
-# --- 2. ACME challenges are not redirected --------------------------------------
+# 2. ACME challenges are not redirected
 echo ">> /.well-known/acme-challenge/ on :80 (must NOT redirect)"
 code="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port80/.well-known/acme-challenge/smoke-token")"
 if [ "$code" != "404" ]; then
@@ -107,7 +107,7 @@ if [ "$code" != "404" ]; then
 fi
 echo ">> no redirect for the ACME location (404)"
 
-# --- 3. every other HTTP request redirects to HTTPS -----------------------------
+# 3. every other HTTP request redirects to HTTPS
 echo ">> /sub on :80 (must redirect 301 to HTTPS)"
 out="$(curl -s --max-time 10 -o /dev/null -w '%{http_code} %{redirect_url}' "http://127.0.0.1:$port80/sub?x=1")"
 case "$out" in
@@ -115,7 +115,7 @@ case "$out" in
     *) fail "expected '301 https://…', got: $out" ;;
 esac
 
-# --- 4. the TLS handshake succeeds ----------------------------------------------
+# 4. the TLS handshake succeeds
 echo ">> TLS handshake on :443"
 fp_before="$(served_fingerprint "$port443")"
 case "$fp_before" in
@@ -124,7 +124,7 @@ case "$fp_before" in
 esac
 echo ">> handshake ok ($fp_before)"
 
-# --- 5. the access log masks the /export tokens ---------------------------------
+# 5. the access log masks the /export tokens
 echo ">> requesting /export/alive and /export/ready with a known token"
 TOKEN="smoke-token-0123456789abcdef"
 # The upstream is deliberately absent (nothing listens on the front's own
@@ -140,7 +140,7 @@ fi
     || fail "the masked URI is not in the access log"
 echo ">> the token is masked in the access log"
 
-# --- 6. a replaced certificate + SIGHUP reload serves the new one ---------------
+# 6. a replaced certificate + SIGHUP reload serves the new one
 echo ">> replacing the certificate and reloading with SIGHUP"
 gen_cert
 "${CLI[@]}" kill -s HUP "$NAME" >/dev/null 2>&1 || fail "SIGHUP delivery failed"

@@ -35,7 +35,7 @@ for f in "$POD" "$WORKER_POD" "$KUBE"; do
     [ -f "$f" ] || fail "$f not found"
 done
 
-# --- quadlet pod ---------------------------------------------------------------
+# quadlet pod
 mapfile -t publishes < <(grep -E '^PublishPort=' "$POD" || true)
 count="${#publishes[@]}"
 
@@ -60,7 +60,7 @@ if grep -qE '^PublishPort=' "$WORKER_POD"; then
 fi
 note "the worker pod publishes nothing"
 
-# --- kube manifest -------------------------------------------------------------
+# kube manifest
 # hostPort 8081 must sit inside an entry that also declares hostIP 127.0.0.1.
 if ! grep -E 'hostPort: 8081' -A2 "$KUBE" | grep -E 'hostIP: "127\.0\.0\.1"' >/dev/null; then
     fail "the kube manifest must declare hostPort 8081 with hostIP \"127.0.0.1\""

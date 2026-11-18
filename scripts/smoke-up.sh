@@ -69,7 +69,7 @@ case "$SMOKE_PROJECT" in
         ;;
 esac
 
-# --- compose command ----------------------------------------------------------
+# compose command
 if docker compose version >/dev/null 2>&1; then
     COMPOSE=(docker compose)
 elif podman compose version >/dev/null 2>&1; then
@@ -86,7 +86,7 @@ fi
 # always runs the local build, that is the point of it.
 COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.build.yml)
 
-# --- container CLI ------------------------------------------------------------
+# container CLI
 # The binary that owns the containers is not `${COMPOSE[0]}`: for
 # podman-compose that is a compose front-end with no `inspect` at all. The
 # engine is the binary that has one.
@@ -103,7 +103,7 @@ case "${COMPOSE[0]}" in
     *) CONTAINER_CLI=() ;;
 esac
 
-# --- pre-flight ----------------------------------------------------------------
+# pre-flight
 # The checks below are curl one-liners: a missing curl would otherwise
 # surface as a failed wait_for a minute into the bring-up, which reads like
 # a stand that did not come up rather than like a missing tool.
@@ -150,7 +150,6 @@ MEOW_TOKEN_FILE=""
 GENERATED_TOKEN=0
 GENERATED_MEOW_TOKEN=0
 
-# A random secret for the stand: 32 bytes of hex.
 random_secret() {
     if command -v openssl >/dev/null 2>&1; then
         openssl rand -hex 32
@@ -249,7 +248,7 @@ smoke_teardown_on_fail() {
 }
 trap smoke_teardown_on_fail EXIT
 
-# --- wait for startup and run the checks ----------------------------------------
+# wait for startup and run the checks
 wait_for() { # wait_for <what> <url> <expected_code> <timeout_s>
     local what="$1" url="$2" expected="$3" deadline=$((SECONDS + $4)) code
     while [ "$SECONDS" -lt "$deadline" ]; do

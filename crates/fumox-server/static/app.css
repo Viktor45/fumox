@@ -158,6 +158,12 @@
    attribute silently stopped working (rule counters showed "0"). */
 [hidden] { display: none !important; }
 
+/* Clickable form controls and the labels wired to them, once in the
+   base layer: a label or select that acts on click must promise it
+   with the pointer cursor, not the default arrow (labels of the
+   settings checkboxes, the filters, the source and profile forms). */
+label[for], select, input[type="checkbox"] { cursor: pointer; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -200,6 +206,7 @@ a:hover { text-decoration: underline; }
   white-space: nowrap;
 }
 .topbar nav a:hover { background: var(--topbar-hover); text-decoration: none; }
+.topbar nav a:active { background: var(--topbar-active); }
 .topbar nav a.active { background: var(--topbar-active); color: var(--topbar-brand); }
 .topbar .spacer { flex: 1; }
 .topbar form.inline { margin: 0; }
@@ -608,6 +615,7 @@ input.tab-input {
    focused. */
 :where(.btn,
        .btn.primary, .btn.danger,
+       .toast-close,
        .topbar nav a,
        .lang-switch button, .lang-switch.login-lang a,
        .pagination a, .pagination span.page):focus-visible {
@@ -676,12 +684,17 @@ input.tab-input {
   white-space: nowrap;
 }
 .btn:hover { background: var(--btn-hover); text-decoration: none; }
+/* Pressed: distinct from hover (the same fill plus a 1px drop), so a
+   click registers even when the pointer never leaves the button. */
+.btn:active { background: var(--btn-hover); transform: translateY(1px); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .btn.primary:hover { background: var(--accent-hover); }
+.btn.primary:active { background: var(--accent-hover); transform: translateY(1px); }
 .btn.danger { color: var(--danger); border-color: var(--danger); }
 .btn.danger:hover { background: var(--danger-bg); }
+.btn.danger:active { background: var(--danger-bg); transform: translateY(1px); }
 .btn.small { padding: 3px 10px; font-size: 13px; }
-.btn:disabled { opacity: 0.55; cursor: default; }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
 
 /* flash / toast */
 
@@ -703,8 +716,25 @@ input.tab-input {
   animation: toast-in 0.18s ease-out;
   /* Never wider than the viewport minus the wrap's offsets. */
   max-width: min(380px, calc(100vw - 40px));
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
 }
-.toast.error { background: var(--danger); color: var(--on-accent); cursor: pointer; }
+.toast.error { background: var(--danger); color: var(--on-accent); }
+/* The dismissal control: a real button (keyboard-reachable), styled to
+   read as part of the toast it closes. */
+.toast-close {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin-left: auto;
+  font: inherit;
+  line-height: inherit;
+  color: inherit;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
 @keyframes toast-in {
   from { transform: translateY(8px); opacity: 0; }
   to { transform: none; opacity: 1; }
@@ -776,6 +806,7 @@ pre.mono { white-space: pre-wrap; }
   background: var(--btn-bg);
 }
 .pagination span.current { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.pagination a:active { background: var(--btn-hover); }
 
 .filters {
   display: flex;
@@ -973,6 +1004,24 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
 .ped-row input[type="text"]:not(.mono) { flex: 1 1 160px; }
 .ped-row input.mono { flex: 0 0 70px; }
 .ped-row input[name$="_key"] { flex: 0 1 110px; }
+/* Column captions above the rule rows: the row fields carry only a
+   placeholder (it vanishes once a value is typed) and an aria-label,
+   so a filled row shows no visible field names. The caption div sits
+   outside the rows container (htmx re-renders the rows wholesale), is
+   aria-hidden in the markup (the inputs keep their own labels) and
+   mirrors the row flex so every caption sits over its column. */
+.ped-row-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.ped-row-head .head-grow { flex: 1 1 160px; }
+.ped-row-head .head-flags { flex: 0 0 70px; }
+.ped-row-head .ped-arrow { visibility: hidden; }
 /* The rows sit inside a `.field`, so `.field select { width: 100% }` gave
    every target select the full panel width and wrapped a rule over three
    ragged lines. */
@@ -1100,7 +1149,7 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
     white-space: nowrap;
     padding: 6px 12px;
   }
-  .lang-switch a {
+  .lang-switch a, .lang-switch button {
     display: inline-flex;
     align-items: center;
     min-height: 44px;
@@ -1127,12 +1176,17 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
      at 13px it both triggered the zoom and stayed a 23px-tall target. */
   .field input[type="text"], .field input[type="number"],
   .field input[type="password"], .field input[type="url"],
-  .field select, .field textarea,
+  .field input[type="file"], .field select, .field textarea,
   .filters .field input, .filters .field select,
   .cleanup-op input, .cleanup-op select,
   .topn-picker select { font-size: 16px; }
-  /* 16px text only lifts a select to 39px, still under the target. */
-  .field select, .filters .field select, .ped-row select,
+  /* 16px text only lifts a select to 39px, still under the target; the
+     text inputs of the same forms land at ~41px (16px text + padding +
+     border), the file input stays at its UA height — all under. */
+  .field input[type="text"], .field input[type="number"],
+  .field input[type="password"], .field input[type="url"],
+  .field input[type="file"], .field select,
+  .filters .field select, .ped-row select,
   .cleanup-op input, .cleanup-op select,
   .topn-picker select { min-height: 44px; }
 
@@ -1179,8 +1233,25 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
   .endpoints td:first-child { min-width: 150px; }
 
   /* Distribution rows (stats): counters drop onto their own line
-     instead of squeezing the bar. */
+     instead of squeezing the bar. The counter badges are links with a
+     ~21px box and sat 4px apart — under the touch target once they
+     are the only things on the line. */
   .stat-split-row { flex-wrap: wrap; }
+  .stat-split-counts { gap: 8px; }
+  .stat-split-counts .badge {
+    min-height: 44px;
+    padding: 8px 12px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* The rule-row captions describe side-by-side columns; stacked rows
+     have no columns to describe. */
+  .ped-row-head { display: none; }
+
+  /* The topbar switchers are the only controls left under the target:
+     ~25px tall buttons with a 2px gap between them. */
+  .lang-switch { gap: 8px; }
 
   /* Ingest chart: the label is a column-flex child sized to its content
      (up to the 64px cap), so on a narrow screen the seven 64px labels
@@ -1230,6 +1301,45 @@ div.inline-controls { display: flex; gap: 6px; align-items: center; flex-wrap: w
      inside the panel padding without truncation of the bar label. */
   .stat-bar-col { max-width: 36px; }
   .stat-bar-label { font-size: 9.5px; }
+}
+
+/* Touch targets do not depend on the viewport width: a tablet in the
+   701–1300px band taps with a finger too, and neither the base rules
+   (~38px buttons, ~27px small ones) nor the 700px block above reach
+   it. The same minimums as the mobile block, keyed to the input
+   modality instead of the width; CSS has no mixins, so the selector
+   lists repeat. With a mouse every rule here is inert. */
+@media (pointer: coarse) {
+  .btn, .btn.primary, .btn.danger { min-height: 44px; padding-top: 9px; padding-bottom: 9px; }
+  .btn.small { padding: 8px 12px; min-height: 44px; }
+  .check-row { min-height: 44px; }
+  .check-row input { width: 18px; height: 18px; }
+  .pagination a, .pagination span.page {
+    padding: 8px 13px;
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  .field input[type="text"], .field input[type="number"],
+  .field input[type="password"], .field input[type="url"],
+  .field input[type="file"], .field select, .field textarea,
+  .filters .field input, .filters .field select,
+  .ped-row select, .cleanup-op input, .cleanup-op select,
+  .topn-picker select { font-size: 16px; }
+  .field input[type="text"], .field input[type="number"],
+  .field input[type="password"], .field input[type="url"],
+  .field input[type="file"], .field select,
+  .filters .field select, .ped-row select,
+  .cleanup-op input, .cleanup-op select,
+  .topn-picker select { min-height: 44px; }
+  .stat-split-counts { gap: 8px; }
+  .stat-split-counts .badge {
+    min-height: 44px;
+    padding: 8px 12px;
+    display: inline-flex;
+    align-items: center;
+  }
+  .lang-switch button { min-height: 44px; }
 }
 
 /* Very narrow phones (iPhone SE 1st gen, older Android): a second

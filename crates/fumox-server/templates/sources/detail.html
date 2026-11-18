@@ -37,7 +37,8 @@
       <button class="btn" type="submit">{{ self.t("src.refresh_now") }}</button>
     </form>
     <form method="post" action="/admin/sources/{{ source.id }}/dry-run"
-          hx-post="/admin/sources/{{ source.id }}/dry-run" hx-target="#dryrun-target" hx-swap="innerHTML">
+          hx-post="/admin/sources/{{ source.id }}/dry-run" hx-target="#dryrun-target" hx-swap="innerHTML"
+          hx-disabled-elt="find button" data-error-target="dryrun-error">
       <input type="hidden" name="_csrf" value="{{ csrf }}">
       <button class="btn" type="submit">{{ self.t("src.dry_run") }}<span class="htmx-indicator">&nbsp;…</span></button>
     </form>
@@ -45,6 +46,10 @@
   </div>
 </div>
 
+{#- The slot for a refused dry-run request (the network dropped, the
+    server answered with an error): the previous result must not stand
+    in for the failed one. Same pattern as #toggle-error/#refresh-error. -#}
+<span id="dryrun-error" class="error-text" role="alert" data-error-fallback="{{ self.t("common.action_failed") }}"></span>
 <div id="dryrun-target" aria-live="polite"></div>
 
 <div class="grid cols-2">
@@ -142,7 +147,10 @@
       would read the whole table out every time. The status line next to
       it counts the rows that appeared since the last poll. -#}
   <span id="log-status" class="live-status" role="status" aria-live="polite" data-new-records="{{ self.t("common.new_records") }}"></span>
-  <div id="log-live" data-live-status="log-status"
+  {#- The slot for a failed poll of the log itself (the SSE chip only
+      reports the EventSource, not this endpoint's errors). -#}
+  <span id="log-error" class="error-text" role="alert" data-error-fallback="{{ self.t("common.action_failed") }}"></span>
+  <div id="log-live" data-live-status="log-status" data-error-target="log-error"
        hx-get="/admin/sources/{{ source.id }}/log"
        hx-trigger="every 15s, fumox:refresh" hx-swap="innerHTML">
     {% include "sources/_log.html" %}

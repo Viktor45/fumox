@@ -43,7 +43,7 @@ assert_says() { # assert_says <needle> <haystack> <label>
     fi
 }
 
-# --- the table: input|exit|stdout ("-" = no stdout expected) ------------------
+# the table: input|exit|stdout ("-" = no stdout expected)
 CASES=(
     "v0.27.0|0|v0.27.0"
     "0.27.0|0|0.27.0"
@@ -84,7 +84,7 @@ if grep -qF "evil" <(sed -n 's/^::error:://p' "$WORK/err"); then
 fi
 note "the rejected value is not embedded in the ::error:: command"
 
-# --- the argument count is validated ------------------------------------------
+# the argument count is validated
 set +e
 "$SCRIPT" >/dev/null 2>&1
 CODE=$?
